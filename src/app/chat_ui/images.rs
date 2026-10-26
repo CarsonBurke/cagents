@@ -815,6 +815,63 @@ pub(super) fn subscriptions(runtime: &Runtime) -> Vec<Subscription<Message>> {
         .collect()
 }
 
+const IMAGE_LABEL_CHARS: usize = 120;
+const IMAGE_DETAIL_CHARS: usize = 160;
+
+// Bound the input before trimming, splitting or shaping it: provider metadata
+// can itself be a whole prompt or a data URL. Never clone its complete source.
+fn bounded_image_metadata(raw: &str, limit: usize) -> String {
+    let prefix: String = raw
+        .chars()
+        .take(limit + 1)
+        .take_while(|character| !matches!(character, '\n' | '\r'))
+        .filter(|character| !character.is_control())
+        .collect();
+    Runtime::short_description(prefix.trim(), limit)
+}
+fn inline_image_label(item: &chat::Item) -> String {
+    let ItemContent::Image {
+        description,
+        reference,
+        ..
+    } = &item.content
+    else {
+        return "Image".into();
+    };
+    let label = bounded_image_metadata(description, IMAGE_LABEL_CHARS);
+    if !label.is_empty()
+        && !label.starts_with("data:")
+        && !label.starts_with('/')
+        && !label.starts_with("file:")
+        && !label.starts_with("http:")
+        && !label.starts_with("https:")
+    {
+        label
+    } else {
+        reference
+            .as_ref()
+            .map(chat::ImageReference::label)
+            .unwrap_or_else(|| "Image".into())
+    }
+}
+fn inline_image_detail(raw: &str) -> String {
+    let prefix = bounded_image_metadata(raw, IMAGE_DETAIL_CHARS * 2);
+    // Diagnostics may carry absolute local/remote paths or an inline payload.
+    // Retain the useful reason while replacing path-like tokens before display.
+    let detail = prefix
+        .split_whitespace()
+        .map(|word| {
+            if word.contains('/') || word.contains('\\') || word.starts_with("data:") {
+                "[image]"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    bounded_image_metadata(&detail, IMAGE_DETAIL_CHARS)
+}
+
 // Paths and provider descriptions are untrusted metadata. In particular a
 // data URL is image content, never a filename to shape in a toolbar.
 fn gallery_label(
@@ -836,7 +893,7 @@ fn gallery_label(
                 .find(|line| !line.is_empty())
         })
         .unwrap_or("Image");
-    Runtime::short_description(label, 120)
+    bounded_image_metadata(label, IMAGE_LABEL_CHARS)
 }
 
 struct Entry {
@@ -1191,43 +1248,40 @@ impl Runtime {
         item: &chat::Item,
         cached: &CachedItem,
     ) -> Element<'static, Message> {
-        let label = match &item.content {
-            ItemContent::Image { description, .. } if !description.is_empty() => {
-                description.clone()
-            }
-            _ => "Image".into(),
-        };
+        let label = inline_image_label(item);
         let Some(handle) = &cached.image else {
             let placeholder: Element<'static, Message> = if cached.image_unavailable {
-                let notice = design::caption(
-                    cached
-                        .image_error
-                        .clone()
-                        .unwrap_or_else(|| format!("{label} · Preview unavailable")),
-                );
+                let detail = cached
+                    .image_error
+                    .as_deref()
+                    .map(inline_image_detail)
+                    .filter(|detail| !detail.is_empty());
+                let mut notices = vec![design::caption("Preview unavailable").into()];
+                if let Some(detail) = detail {
+                    notices.push(design::caption(detail).into());
+                }
                 let can_retry =
                     matches!(&item.content, ItemContent::Image { path, .. } if !path.is_empty());
-                widget::column::with_children(std::iter::once(notice.into()).chain(can_retry.then(
-                    || {
-                        crate::ui_controls::button::secondary("Retry preview")
-                            .on_press(action(Action::LoadImage(self.target, item.id.clone())))
-                            .into()
-                    },
-                )))
+                widget::column::with_children(notices.into_iter().chain(can_retry.then(|| {
+                    crate::ui_controls::button::secondary("Retry preview")
+                        .name(format!("Retry preview for {label}"))
+                        .on_press(action(Action::LoadImage(self.target, item.id.clone())))
+                        .into()
+                })))
                 .spacing(step::GAP_XS)
                 .into()
             } else if cached.image_wait.is_some() {
-                design::caption(format!("{label} · Waiting for preview memory…")).into()
+                design::caption("Waiting for preview memory…").into()
             } else if cached.image_source.is_some()
                 && interest(self)
                     .iter()
                     .any(|candidate| candidate.id == item.id)
             {
-                design::caption(format!("{label} · Loading preview…")).into()
+                design::caption("Loading preview…").into()
             } else {
                 widget::column::with_children(vec![
-                    design::caption(label.clone()).into(),
                     crate::ui_controls::button::secondary("Load preview")
+                        .name(format!("Load preview for {label}"))
                         .on_press(action(Action::LoadImage(self.target, item.id.clone())))
                         .into(),
                 ])
@@ -1263,6 +1317,7 @@ impl Runtime {
         widget::container(
             widget::column::with_children(vec![
                 widget::button::custom(preview)
+                    .name(format!("Inspect {label}"))
                     .class(crate::ui_controls::control_style(false, None))
                     .padding(0)
                     .on_press_maybe(self.active_item(&item.id).cloned().map(|source| {

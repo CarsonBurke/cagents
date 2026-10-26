@@ -384,3 +384,99 @@ fn uncached_managed_user_image_keeps_its_stable_label() {
             .any(|message| matches!(message, Message::ChatUi(Action::OpenImageFrom(..))))
     );
 }
+
+#[test]
+fn inline_metadata_and_failure_paths_remain_bounded_in_every_preview_state() {
+    let mut item = image("bounded-inline-metadata", 61);
+    let ItemContent::Image {
+        path, description, ..
+    } = &mut item.content
+    else {
+        unreachable!()
+    };
+    *path = format!(
+        "/private/never-display-this-path/{}",
+        "p".repeat(1024 * 1024)
+    );
+    *description = "caption".repeat(180_000);
+    let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+    let renderer = crate::app::tests::headless_renderer();
+    let source = runtime.active_item(&item.id).unwrap().clone();
+    for state in ["ready", "loading", "waiting", "unavailable"] {
+        let cached = runtime.cache.get_mut(&item.id).unwrap();
+        ready(cached);
+        if state != "ready" {
+            cached.image = None;
+        }
+        if state == "loading" {
+            cached.image_source = Some(source.clone());
+        }
+        if state == "waiting" {
+            let images::Loaded::Deferred(pressure) = images::deferred_for_test() else {
+                unreachable!()
+            };
+            cached.image_wait = Some(pressure);
+        }
+        if state == "unavailable" {
+            cached.image_unavailable = true;
+            let ItemContent::Image { path, .. } = &item.content else {
+                unreachable!()
+            };
+            cached.image_error = Some(format!("Cannot read {path}: No such file or directory"));
+        }
+        let cached = &runtime.cache[&item.id];
+        let mut element = runtime.image_preview(&item, cached);
+        let mut tree = Tree::new(element.as_widget());
+        let bounds = Rectangle::with_size(Size::new(360.0, 600.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, bounds.size()),
+        );
+        #[derive(Default)]
+        struct Text(Vec<String>);
+        impl Operation for Text {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: Rectangle, text: &str) {
+                self.0.push(text.to_owned());
+            }
+        }
+        let mut visible = Text::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut visible);
+        let accessible =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        visible.0.extend(
+            accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .filter_map(|node| node.node().label().map(str::to_owned)),
+        );
+        assert!(!visible.0.is_empty());
+        for text in &visible.0 {
+            assert!(
+                text.chars().count() <= 180,
+                "{state} metadata exceeds its display bound"
+            );
+            assert!(
+                !text.contains("/private") && !text.contains("never-display-this-path"),
+                "{state} diagnostics must not dump image paths"
+            );
+        }
+        if state == "ready" {
+            let (_, messages) = click_prompt(&renderer, &runtime, &item);
+            assert!(
+                matches!(messages.as_slice(),
+                [Message::ChatUi(Action::OpenImageFrom(target, _, clicked))]
+                    if *target == runtime.target && Arc::ptr_eq(clicked, &source)),
+                "bounded metadata must preserve the exact clicked source"
+            );
+        }
+    }
+}
