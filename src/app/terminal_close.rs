@@ -357,8 +357,9 @@ impl Cagents {
         // docked inspector. Query native focus when the operation runs; a
         // visible workspace alone is not permission to take that focus.
         workspace_widget::focus_after_loading(self.card_keyboard_focus(handoff.unmounting), target)
-            .chain(Task::done(Message::CommitClose(handoff.unmounting)))
-            .map(cosmic::Action::App)
+            .chain(cosmic::task::message(Message::CommitClose(
+                handoff.unmounting,
+            )))
     }
 
     /// Commits the workspace reservation before retiring any runtime or saved
