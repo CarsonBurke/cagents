@@ -5,7 +5,7 @@
 //! The daemon owns the board and pushes each changed one; this state only
 //! filters and presents it. A pin is shown at once and confirmed by the next
 //! board, so a card moves the moment it is moved.
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use cosmic::{
     Element, Theme,
@@ -16,7 +16,7 @@ use cosmic::{
 use crate::{
     agent::ActivityState,
     design::{self, Tone, space},
-    model::TerminalId,
+    model::{CardId, ChannelId, ProjectId, TerminalId, WorktreeId},
     ui_controls::{Icon, badge, icon_button, placeholder, popover, popover_item},
     work::{
         ActivitySource, Board, CheckOutcome, Column, Forge, Item, ItemKey, PullRequestState, Review,
@@ -50,6 +50,97 @@ impl CardRef {
 
     fn names(&self, item: &Item) -> bool {
         item.project == self.project && item.key == self.key
+    }
+}
+
+/// Prepared local navigation, never a path-derived claim of pane ownership.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum Destination {
+    Channel {
+        registry: uuid::Uuid,
+        project: ProjectId,
+        channel: ChannelId,
+        panes: Vec<(TerminalId, CardId)>,
+        worktree: Option<(WorktreeId, PathBuf)>,
+    },
+    Worktree {
+        project: ProjectId,
+        worktree: WorktreeId,
+        path: PathBuf,
+    },
+    PullRequest {
+        project: ProjectId,
+        number: u64,
+        url: String,
+    },
+    Unavailable(&'static str),
+}
+
+#[derive(Clone)]
+pub(crate) struct Navigation {
+    pub origin: CardId,
+    pub epoch: u64,
+    pub available: bool,
+    pub destinations: HashMap<CardRef, Destination>,
+}
+
+/// Both a rendered destination and the board facts that established its scope.
+/// Status/clock updates retain it; a different owner cancels native presses.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OpenCard {
+    pub(crate) card: CardRef,
+    pub(crate) origin: Option<CardId>,
+    pub(crate) available: bool,
+    epoch: u64,
+    pub(crate) destination: Destination,
+    worktree: Option<PathBuf>,
+    sessions: Vec<TerminalId>,
+    pull_request: Option<(u64, String)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenKind {
+    Primary,
+    Worktree,
+    PullRequest,
+}
+
+impl OpenCard {
+    pub(crate) fn of(item: &Item, navigation: Option<&Navigation>) -> Self {
+        let card = CardRef::of(item);
+        let mut sessions = item
+            .sessions
+            .iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        sessions.sort_unstable();
+        sessions.dedup();
+        Self {
+            destination: navigation
+                .and_then(|navigation| navigation.destinations.get(&card))
+                .cloned()
+                .unwrap_or(Destination::Unavailable(
+                    "This card has no current navigation target.",
+                )),
+            origin: navigation.map(|navigation| navigation.origin),
+            available: navigation.is_none_or(|navigation| navigation.available),
+            epoch: navigation.map_or(0, |navigation| navigation.epoch),
+            card,
+            worktree: item.worktree.as_ref().map(|worktree| worktree.path.clone()),
+            sessions,
+            pull_request: item
+                .pull_request
+                .as_ref()
+                .map(|pull_request| (pull_request.number, pull_request.url.clone())),
+        }
+    }
+
+    pub(crate) fn names(&self, item: &Item) -> bool {
+        let current = Self::of(item, None);
+        self.card == current.card
+            && self.worktree == current.worktree
+            && self.sessions == current.sessions
+            && self.pull_request == current.pull_request
     }
 }
 
@@ -90,14 +181,14 @@ pub enum Action {
     /// Rescans every project and polls GitHub now.
     Refresh,
     Refreshed(Result<(), String>),
-    /// The card's main action: its worktree, else its pull request.
-    Open(CardRef),
+    /// Opens the exact currently presented channel, worktree or pull request.
+    Open(OpenCard),
     Menu(Option<CardRef>),
     CloseMenu(CardRef),
     PlacementMenu(CardRef, bool),
     Details(CardRef),
-    OpenWorktree(CardRef),
-    OpenPullRequest(CardRef),
+    OpenWorktree(OpenCard),
+    OpenPullRequest(OpenCard),
     OpenUrl(String),
     FocusSession(TerminalId),
     Copy(String),
@@ -120,20 +211,12 @@ impl Action {
 /// What only the application can do for this pane.
 #[derive(Debug, Clone)]
 pub enum Effect {
+    Open(OpenCard, OpenKind),
     Refresh,
     Pin {
         project: PathBuf,
         item: String,
         column: Option<Column>,
-    },
-    OpenWorktree {
-        project: PathBuf,
-        path: PathBuf,
-    },
-    OpenPullRequest {
-        project: PathBuf,
-        number: u64,
-        url: String,
     },
     OpenUrl(String),
     FocusSession(TerminalId),
@@ -205,6 +288,11 @@ impl State {
     }
 
     pub fn update(&mut self, action: Action) -> Option<Effect> {
+        let open_kind = match &action {
+            Action::OpenWorktree(_) => OpenKind::Worktree,
+            Action::OpenPullRequest(_) => OpenKind::PullRequest,
+            _ => OpenKind::Primary,
+        };
         match action {
             Action::Watched(Watch::Board {
                 epoch,
@@ -292,13 +380,18 @@ impl State {
                 self.error = result.err();
                 None
             }
-            Action::Open(card) => {
-                let item = self.item(&card)?;
-                if item.worktree.is_some() {
-                    self.update(Action::OpenWorktree(card))
-                } else {
-                    self.update(Action::OpenPullRequest(card))
+            Action::Open(target)
+            | Action::OpenWorktree(target)
+            | Action::OpenPullRequest(target) => {
+                let item = self.item(&target.card)?;
+                if !target.available
+                    || !target.names(item)
+                    || (target.origin.is_some()
+                        && (target.epoch != self.watch_epoch || self.navigation_board().is_none()))
+                {
+                    return None;
                 }
+                Some(Effect::Open(target, open_kind))
             }
             Action::Menu(menu) => {
                 if let Some(card) = &menu {
@@ -327,24 +420,6 @@ impl State {
                 self.menu = None;
                 self.details = (self.details.as_ref() != Some(&card)).then_some(card);
                 None
-            }
-            Action::OpenWorktree(card) => {
-                self.menu = None;
-                let item = self.item(&card)?;
-                Some(Effect::OpenWorktree {
-                    project: item.project.clone(),
-                    path: item.worktree.as_ref()?.path.clone(),
-                })
-            }
-            Action::OpenPullRequest(card) => {
-                self.menu = None;
-                let item = self.item(&card)?;
-                let pull_request = item.pull_request.as_ref()?;
-                Some(Effect::OpenPullRequest {
-                    project: item.project.clone(),
-                    number: pull_request.number,
-                    url: pull_request.url.clone(),
-                })
             }
             Action::OpenUrl(url) => {
                 self.menu = None;
@@ -390,6 +465,12 @@ impl State {
             .find(|item| card.names(item))
     }
 
+    pub(crate) fn navigation_board(&self) -> Option<&Board> {
+        (self.listening && !self.awaiting_current && self.lost.is_none())
+            .then(|| self.board.as_deref())
+            .flatten()
+    }
+
     /// The cards in scope that match the query, newest activity first.
     fn visible(&self) -> impl Iterator<Item = &Item> {
         let query = self.query.trim().to_lowercase();
@@ -406,10 +487,19 @@ impl State {
     }
 
     pub fn view(&self) -> Element<'_, Action> {
-        crate::ui_controls::responsive(move |size| self.layout_view(size.width)).into()
+        crate::ui_controls::responsive(move |size| self.layout_view(size.width, None)).into()
     }
 
-    fn layout_view(&self, width: f32) -> Element<'_, Action> {
+    pub(crate) fn view_with_navigation(&self, navigation: Navigation) -> Element<'_, Action> {
+        crate::ui_controls::responsive(move |size| self.layout_view(size.width, Some(&navigation)))
+            .into()
+    }
+
+    fn layout_view<'a>(
+        &'a self,
+        width: f32,
+        navigation: Option<&Navigation>,
+    ) -> Element<'a, Action> {
         let header = self.header();
         let body = match &self.board {
             None => self.waiting(),
@@ -420,8 +510,8 @@ impl State {
                 )
                 .into(),
             Some(_) => match self.layout {
-                Layout::Board => self.board_view(width),
-                Layout::List => self.list_view(),
+                Layout::Board => self.board_view(width, navigation),
+                Layout::List => self.list_view(navigation),
             },
         };
         widget::column::with_children(vec![header, design::horizontal_rule(), body])
@@ -647,7 +737,11 @@ impl State {
         )
     }
 
-    fn board_view(&self, width: f32) -> Element<'_, Action> {
+    fn board_view<'a>(
+        &'a self,
+        width: f32,
+        navigation: Option<&Navigation>,
+    ) -> Element<'a, Action> {
         let mut columns: [Vec<&Item>; 5] = Default::default();
         for item in self.visible() {
             columns[column_index(item.column)].push(item);
@@ -662,7 +756,7 @@ impl State {
         let lanes = Column::ALL
             .into_iter()
             .zip(columns)
-            .map(|(column, items)| self.lane(column, items, column_width))
+            .map(|(column, items)| self.lane(column, items, column_width, navigation))
             .collect::<Vec<_>>();
         let row = widget::row::with_children(lanes)
             .spacing(space::S)
@@ -687,6 +781,7 @@ impl State {
         column: Column,
         items: Vec<&'a Item>,
         width: Length,
+        navigation: Option<&Navigation>,
     ) -> Element<'a, Action> {
         let header = widget::row::with_children(vec![
             widget::container(widget::Space::new().width(8).height(8))
@@ -713,7 +808,7 @@ impl State {
                 widget::column::with_children(
                     items
                         .into_iter()
-                        .map(|item| self.card(item))
+                        .map(|item| self.item_view(item, false, navigation))
                         .collect::<Vec<_>>(),
                 )
                 .spacing(space::S)
@@ -741,10 +836,10 @@ impl State {
         .into()
     }
 
-    fn list_view(&self) -> Element<'_, Action> {
+    fn list_view<'a>(&'a self, navigation: Option<&Navigation>) -> Element<'a, Action> {
         let rows = self
             .visible()
-            .map(|item| self.row(item))
+            .map(|item| self.item_view(item, true, navigation))
             .collect::<Vec<_>>();
         if rows.is_empty() {
             return self.no_match();
@@ -782,19 +877,37 @@ impl State {
         }
     }
 
-    fn card<'a>(&'a self, item: &'a Item) -> Element<'a, Action> {
-        self.item_view(item, false)
-    }
-
+    #[cfg(test)]
     fn row<'a>(&'a self, item: &'a Item) -> Element<'a, Action> {
-        self.item_view(item, true)
+        self.item_view(item, true, None)
     }
 
     /// The human title leads in both layouts; technical facts are disclosed
     /// deliberately instead of competing with the title and lifecycle.
-    fn item_view<'a>(&'a self, item: &'a Item, compact: bool) -> Element<'a, Action> {
+    fn item_view<'a>(
+        &'a self,
+        item: &'a Item,
+        compact: bool,
+        navigation: Option<&Navigation>,
+    ) -> Element<'a, Action> {
         let card = CardRef::of(item);
+        let target = OpenCard::of(item, navigation);
         let title = item_title(item);
+        let open_label = match &target.destination {
+            Destination::PullRequest { number, .. } => {
+                format!("Open pull request #{number}: {title}")
+            }
+            _ => format!("Open {title}"),
+        };
+        let unavailable = if !target.available {
+            Some(
+                "Navigation is unavailable while this board is updating, another surface owns input, or a pane is closing.",
+            )
+        } else if let Destination::Unavailable(reason) = &target.destination {
+            Some(*reason)
+        } else {
+            None
+        };
         let top = widget::row::with_children(vec![
             status_glyph(item),
             crate::interaction::tooltip(
@@ -816,7 +929,10 @@ impl State {
         let button = widget::button::custom(
             widget::column::with_children(vec![top.into(), facts.into()]).spacing(space::XS),
         )
-        .name(format!("Open {title}"))
+        .id(card_open_id(&card))
+        .name(unavailable.map_or(open_label.clone(), |reason| {
+            format!("{open_label} — unavailable: {reason}")
+        }))
         .class(card_style(self.menu.as_ref() == Some(&card)))
         .padding(if compact {
             Padding::from([space::XS + space::XXS, space::S])
@@ -824,18 +940,23 @@ impl State {
             Padding::from(space::S)
         })
         .width(Length::Fill)
-        .on_press(Action::Open(card.clone()));
+        .on_press_maybe(unavailable.is_none().then(|| Action::Open(target.clone())));
+        let button: Element<'a, Action> = match unavailable {
+            Some(reason) => crate::interaction::tooltip(button, reason).into(),
+            None => button.into(),
+        };
         // The menu is a sibling, so its keyboard/pointer activation can never
         // bubble into the main Open action.
-        let primary = widget::row::with_children(vec![button.into(), self.card_menu(item, &card)])
-            .spacing(space::XXS)
-            .align_y(Alignment::Center);
+        let primary =
+            widget::row::with_children(vec![button.into(), self.card_menu(item, &card, &target)])
+                .spacing(space::XXS)
+                .align_y(Alignment::Center);
         let mut content: Vec<Element<'a, Action>> = vec![primary.into()];
         if self.details.as_ref() == Some(&card) {
             content.push(self.item_details(item));
         }
         crate::ui_controls::owned(
-            card.clone(),
+            target,
             widget::mouse_area(widget::column::with_children(content).spacing(space::XXS))
                 .on_right_press(Action::Menu(Some(card))),
         )
@@ -1068,7 +1189,12 @@ impl State {
     }
 
     /// The card's actions: open what it names, and move it between columns.
-    fn card_menu<'a>(&'a self, item: &'a Item, card: &CardRef) -> Element<'a, Action> {
+    fn card_menu<'a>(
+        &'a self,
+        item: &'a Item,
+        card: &CardRef,
+        target: &OpenCard,
+    ) -> Element<'a, Action> {
         let open = self.menu.as_ref() == Some(card);
         let anchor = icon_button(Icon::More, format!("Actions for {}", item_title(item)))
             .compact()
@@ -1102,7 +1228,7 @@ impl State {
                         Icon::OpenFolder.handle(),
                         "Open worktree",
                         crate::app::display_path(&worktree.path),
-                        Action::OpenWorktree(card.clone()),
+                        Action::OpenWorktree(target.clone()),
                     )
                     .into(),
                 );
@@ -1113,7 +1239,7 @@ impl State {
                         Icon::PullRequest.handle(),
                         "Open pull request",
                         format!("#{}", pull_request.number),
-                        Action::OpenPullRequest(card.clone()),
+                        Action::OpenPullRequest(target.clone()),
                     )
                     .into(),
                 );
@@ -1227,6 +1353,15 @@ impl State {
 fn card_actions_id(card: &CardRef) -> widget::Id {
     format!(
         "work-actions:{}:{}",
+        card.project.display(),
+        card.key.storage_key()
+    )
+    .into()
+}
+
+fn card_open_id(card: &CardRef) -> widget::Id {
+    format!(
+        "work-open:{}:{}",
         card.project.display(),
         card.key.storage_key()
     )
@@ -1712,6 +1847,107 @@ mod tests {
     }
 
     #[test]
+    fn narrow_card_exposes_destination_or_disabled_reason_and_keeps_menu_keyboard_separate() {
+        use iced::advanced::widget::operation;
+        for available in [true, false] {
+            let mut state = State::default();
+            connected(&mut state, 1, board(vec![pull_request_item()]));
+            let item = &state.board.as_ref().unwrap().items[0];
+            let card = CardRef::of(item);
+            let destination = if available {
+                Destination::PullRequest {
+                    project: ProjectId::new(),
+                    number: 42,
+                    url: item.pull_request.as_ref().unwrap().url.clone(),
+                }
+            } else {
+                Destination::Unavailable(
+                    "This card's sessions belong to different channels; choose a channel in the sidebar.",
+                )
+            };
+            let navigation = Navigation {
+                origin: CardId::new(),
+                epoch: state.watch_epoch,
+                available: true,
+                destinations: HashMap::from([(card.clone(), destination)]),
+            };
+            let target = OpenCard::of(item, Some(&navigation));
+            let expected_label = if available {
+                format!("Open pull request #42: {}", item_title(item))
+            } else {
+                format!(
+                    "Open {} — unavailable: This card's sessions belong to different channels; choose a channel in the sidebar.",
+                    item_title(item)
+                )
+            };
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let mut ui = Ui::build(
+                state.item_view(item, true, Some(&navigation)),
+                iced::Size::new(260.0, 400.0),
+                iced::runtime::user_interface::Cache::new(),
+                &mut renderer,
+            );
+            draw(&mut ui, &mut renderer);
+            let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+            let primary = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|node| {
+                    node.node().role() == iced_accessibility::accesskit::Role::Button
+                        && node.node().label() == Some(expected_label.as_str())
+                })
+                .expect("native primary control exposes useful scope or recovery");
+            assert_eq!(primary.node().is_disabled(), !available);
+            let bounds = control_bounds(&ui, &expected_label);
+            assert!(
+                bounds.width > 0.0
+                    && bounds.height > 0.0
+                    && bounds.x >= 0.0
+                    && bounds.x + bounds.width <= 260.0
+            );
+            drop(nodes);
+            ui.operate(
+                &renderer,
+                &mut operation::focusable::focus::<()>(card_open_id(&card)),
+            );
+            let key = iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter);
+            let mut actions = Vec::new();
+            ui.update(
+                &[iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: key.clone(),
+                    modified_key: key,
+                    physical_key: iced::keyboard::key::Physical::Code(
+                        iced::keyboard::key::Code::Enter,
+                    ),
+                    location: iced::keyboard::Location::Standard,
+                    modifiers: iced::keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                })],
+                iced::mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut actions,
+            );
+            if available {
+                assert!(matches!(actions.as_slice(), [Action::Open(actual)] if actual == &target));
+            } else {
+                assert!(
+                    actions.is_empty(),
+                    "disabled destination cannot activate through keyboard focus"
+                );
+            }
+            let more = control_bounds(&ui, &format!("Actions for {}", item_title(item)));
+            assert!(more.width >= 20.0 && more.x >= 0.0 && more.x + more.width <= 260.0);
+            assert!(
+                matches!(press(&mut ui, &mut renderer, more.center()).as_slice(), [Action::Menu(Some(actual))] if actual == &card),
+                "nested menu must not activate the primary destination"
+            );
+        }
+    }
+
+    #[test]
     fn retained_row_press_does_not_open_a_replacement_and_old_menu_close_keeps_the_current_owner() {
         let mut second = pull_request_item();
         second.key = ItemKey::Branch("second".into());
@@ -1720,14 +1956,40 @@ mod tests {
         connected(&mut state, 1, board(vec![pull_request_item(), second]));
         let a = CardRef::of(&state.board.as_ref().unwrap().items[0]);
         let b = CardRef::of(&state.board.as_ref().unwrap().items[1]);
+        let navigation = Navigation {
+            origin: CardId::new(),
+            epoch: state.watch_epoch,
+            available: true,
+            destinations: state
+                .board
+                .as_ref()
+                .unwrap()
+                .items
+                .iter()
+                .map(|item| {
+                    (
+                        CardRef::of(item),
+                        Destination::PullRequest {
+                            project: ProjectId::from_uuid(uuid::Uuid::nil()),
+                            number: 42,
+                            url: item.pull_request.as_ref().unwrap().url.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        };
         let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let size = iced::Size::new(400.0, 300.0);
         let title = format!(
-            "Open {}",
+            "Open pull request #42: {}",
             item_title(&state.board.as_ref().unwrap().items[0])
         );
         let mut original = Ui::build(
-            state.row(&state.board.as_ref().unwrap().items[0]),
+            state.item_view(
+                &state.board.as_ref().unwrap().items[0],
+                true,
+                Some(&navigation),
+            ),
             size,
             iced::runtime::user_interface::Cache::new(),
             &mut renderer,
@@ -1747,7 +2009,11 @@ mod tests {
         assert!(actions.is_empty());
         let cache = original.into_cache();
         let mut replacement = Ui::build(
-            state.row(&state.board.as_ref().unwrap().items[1]),
+            state.item_view(
+                &state.board.as_ref().unwrap().items[1],
+                true,
+                Some(&navigation),
+            ),
             size,
             cache,
             &mut renderer,
@@ -1767,7 +2033,7 @@ mod tests {
             "held press must not migrate to another card: {actions:?}"
         );
         assert!(
-            matches!(press(&mut replacement, &mut renderer, hit).as_slice(), [Action::Open(card)] if card == &b)
+            matches!(press(&mut replacement, &mut renderer, hit).as_slice(), [Action::Open(target)] if target.card == b)
         );
         drop(replacement);
         state.update(Action::Menu(Some(a.clone())));
@@ -1853,7 +2119,7 @@ mod tests {
         state.update(Action::Menu(Some(card.clone())));
         let shown = &state.board.as_ref().unwrap().items[0];
         let mut ui = Ui::build(
-            state.card_menu(shown, &card),
+            state.card_menu(shown, &card, &OpenCard::of(shown, None)),
             iced::Size::new(400.0, 600.0),
             iced::runtime::user_interface::Cache::new(),
             &mut renderer,
