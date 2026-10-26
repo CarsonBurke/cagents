@@ -36,6 +36,17 @@ fn transcript_body(text: impl Into<String>, target: Target) -> Element<'static, 
     .width(Length::Fill)
     .into()
 }
+/// Invocation and kind together are the exact command/skill identity. Rows
+/// keep their native focus and press state when a live catalog reorders.
+fn composer_action_key(kind: &str, insertion: &str) -> [u8; 32] {
+    use sha2::Digest;
+    let mut hash = sha2::Sha256::new();
+    hash.update(kind.as_bytes());
+    hash.update([0]);
+    hash.update(insertion.as_bytes());
+    hash.finalize().into()
+}
+
 /// The composer's own line height and inner padding.
 ///
 /// Named because the composer's height is computed from the draft rather than
@@ -3329,27 +3340,28 @@ impl Runtime {
                     .spacing(step::GAP_S)
                     .into()
             } else {
-                let first = self
-                    .composer_action_candidates()
-                    .into_iter()
+                let candidates = self.composer_action_candidates();
+                let first = candidates
+                    .iter()
                     .find(|candidate| {
                         available && (candidate.kind == completion::Kind::Skill || enabled)
                     })
-                    .map(|candidate| candidate.insertion.into_owned());
-                let mut choices: Vec<Element<'_, Message>> =
-                    vec![crate::interaction::keyboard_list_entry(
-                        crate::ui_controls::field::search(
-                            "Search skills and actions",
-                            &self.composer_actions_query,
-                        )
-                        .id(card_control_id(target.card, "chat-actions-search"))
-                        .on_input(move |query| action(Action::ComposerActionsQuery(target, query)))
-                        .on_submit_maybe(first.map(|insertion| {
-                            move |_| action(Action::ComposerAction(target, insertion.clone()))
-                        })),
-                    )];
+                    .map(|candidate| candidate.insertion.clone().into_owned());
+                let search = crate::interaction::keyboard_list_entry(
+                    crate::ui_controls::field::search(
+                        "Search skills and actions",
+                        &self.composer_actions_query,
+                    )
+                    .id(card_control_id(target.card, "chat-actions-search"))
+                    .on_input(move |query| action(Action::ComposerActionsQuery(target, query)))
+                    .on_submit_maybe(first.map(|insertion| {
+                        move |_| action(Action::ComposerAction(target, insertion.clone()))
+                    })),
+                );
+                let mut choices: Vec<([u8; 32], Element<'_, Message>)> = Vec::new();
                 if snapshot.capabilities.attachments && self.composer_actions_query.is_empty() {
-                    choices.push(
+                    choices.push((
+                        composer_action_key("native", "attachments"),
                         crate::ui_controls::button::secondary("Attach files or images…")
                             .icon(Icon::Attachment)
                             .width(Length::Fill)
@@ -3358,9 +3370,9 @@ impl Runtime {
                                     .then(|| action(Action::Attach(target))),
                             )
                             .into(),
-                    );
+                    ));
                 }
-                for candidate in self.composer_action_candidates() {
+                for candidate in candidates {
                     let is_skill = candidate.kind == completion::Kind::Skill;
                     let label = if is_skill {
                         format!("Skill · {}", candidate.name)
@@ -3371,16 +3383,23 @@ impl Runtime {
                             _ => candidate.label().into_owned(),
                         }
                     };
-                    choices.push(crate::interaction::tooltip(
-                        crate::ui_controls::button::secondary(label)
-                            .width(Length::Fill)
-                            .on_press_maybe((available && (is_skill || enabled)).then(|| {
-                                action(Action::ComposerAction(
-                                    target,
-                                    candidate.insertion.into_owned(),
-                                ))
-                            })),
-                        candidate.description,
+                    let key = composer_action_key(
+                        if is_skill { "skill" } else { "command" },
+                        &candidate.insertion,
+                    );
+                    choices.push((
+                        key,
+                        crate::interaction::tooltip(
+                            crate::ui_controls::button::secondary(label)
+                                .width(Length::Fill)
+                                .on_press_maybe((available && (is_skill || enabled)).then(|| {
+                                    action(Action::ComposerAction(
+                                        target,
+                                        candidate.insertion.into_owned(),
+                                    ))
+                                })),
+                            candidate.description,
+                        ),
                     ));
                 }
                 if !snapshot.capabilities.interrupt_modes.is_empty()
@@ -3389,7 +3408,8 @@ impl Runtime {
                 {
                     let mode = snapshot.interrupt_mode.as_deref().unwrap_or("immediate");
                     let next = if mode == "wait" { "immediate" } else { "wait" };
-                    choices.push(
+                    choices.push((
+                        composer_action_key("native", "steering"),
                         crate::ui_controls::button::secondary(if mode == "wait" {
                             "Steering: after turn"
                         } else {
@@ -3404,10 +3424,11 @@ impl Runtime {
                             ))
                         }))
                         .into(),
-                    );
+                    ));
                 }
                 if snapshot.capabilities.branch {
-                    choices.push(
+                    choices.push((
+                        composer_action_key("native", "fork"),
                         crate::ui_controls::button::secondary("Fork conversation…")
                             .icon(Icon::Branch)
                             .id(card_control_id(target.card, "chat-actions-fork"))
@@ -3416,10 +3437,11 @@ impl Runtime {
                                 enabled.then(|| action(Action::BranchPicker(target, true))),
                             )
                             .into(),
-                    );
+                    ));
                 }
                 if snapshot.capabilities.compact {
-                    choices.push(
+                    choices.push((
+                        composer_action_key("native", "compact"),
                         crate::ui_controls::button::secondary("Compact conversation")
                             .icon(Icon::Compress)
                             .id(card_control_id(target.card, "chat-actions-compact"))
@@ -3431,17 +3453,19 @@ impl Runtime {
                                 enabled.then(|| action(Action::Command(target, Command::Compact))),
                             )
                             .into(),
-                    );
+                    ));
                 }
-                widget::column::with_children(choices.into_iter().enumerate().map(
-                    |(index, choice)| {
-                        if index == 0 {
-                            choice
-                        } else {
-                            crate::interaction::keyboard_list_row(choice)
-                        }
-                    },
-                ))
+                widget::column::with_children(vec![
+                    search,
+                    crate::interaction::keyed_list_rows(
+                        choices
+                            .into_iter()
+                            .map(|(key, choice)| {
+                                (key, crate::interaction::keyboard_list_row(choice))
+                            })
+                            .collect(),
+                    ),
+                ])
                 .spacing(space::XS)
                 .into()
             };
@@ -5808,9 +5832,9 @@ mod frame_cost;
 mod issue1506_tests;
 
 #[cfg(test)]
-mod user_image_preview_tests;
-#[cfg(test)]
 mod image_viewer_tests;
+#[cfg(test)]
+mod user_image_preview_tests;
 
 #[cfg(test)]
 pub(super) fn prepared_runtime_for_test(items: &[chat::Item]) -> (Runtime, Arc<ClientHandle>) {
@@ -13571,6 +13595,132 @@ mod tests {
             "later layouts cannot reset newer widget scroll before its callback arrives"
         );
     }
+    #[test]
+    fn composer_menu_native_focus_follows_exact_skill_through_live_catalog_reorder_and_removal() {
+        use iced::advanced::{
+            clipboard,
+            widget::{Operation, operation},
+        };
+        use iced::runtime::{UserInterface, user_interface::Cache};
+        fn menu(runtime: &Runtime) -> Element<'_, Message> {
+            widget::container(runtime.composer_actions(true, 620.0))
+                .height(Length::Fill)
+                .align_y(Alignment::End)
+                .into()
+        }
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        runtime.composer_actions = true;
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.ready = true;
+        snapshot.busy = false;
+        snapshot.skills = ["alpha", "beta"]
+            .into_iter()
+            .map(|name| chat::Skill {
+                name: name.into(),
+                description: "Live skill".into(),
+                invocation: format!("${name}"),
+            })
+            .collect();
+        let mut renderer = crate::app::tests::headless_renderer();
+        let viewport = iced::Size::new(620.0, 720.0);
+        let mut ui = UserInterface::build(menu(&runtime), viewport, Cache::new(), &mut renderer);
+        let mut messages = Vec::new();
+        ui.update(
+            &[],
+            iced::mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        let accessible = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+        let beta = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .find(|node| node.node().label() == Some("Skill · beta"))
+            .expect("the real action row is accessible")
+            .id()
+            .clone();
+        let iced_accessibility::A11yId::Widget(beta_id) = beta.clone() else {
+            panic!("native button ID");
+        };
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(beta_id.clone()),
+        );
+        let cache = ui.into_cache();
+        Arc::make_mut(&mut runtime.snapshot).skills.swap(0, 1);
+        let mut ui = UserInterface::build(menu(&runtime), viewport, cache, &mut renderer);
+        let accessible = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+        assert_eq!(
+            accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .find(|node| node.node().label() == Some("Skill · beta"))
+                .unwrap()
+                .id(),
+            &beta,
+            "native accessibility identity follows the exact invocation"
+        );
+        #[derive(Default)]
+        struct Focus(Option<widget::Id>);
+        impl Operation for Focus {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if state.is_focused() {
+                    self.0 = id.cloned();
+                }
+            }
+        }
+        let mut focused = Focus::default();
+        ui.operate(&renderer, &mut focused);
+        assert_eq!(focused.0, Some(beta_id));
+        let enter = iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        });
+        messages.clear();
+        ui.update(
+            &[enter.clone()],
+            iced::mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert!(messages.iter().any(|message| matches!(message,
+            Message::ChatUi(Action::ComposerAction(_, invocation)) if invocation == "$beta")));
+        let cache = ui.into_cache();
+        Arc::make_mut(&mut runtime.snapshot).skills.remove(0);
+        let mut ui = UserInterface::build(menu(&runtime), viewport, cache, &mut renderer);
+        messages.clear();
+        ui.update(
+            &[enter],
+            iced::mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| matches!(message, Message::ChatUi(Action::ComposerAction(..)))),
+            "removed skill focus cannot transfer to another action"
+        );
+    }
+
     #[test]
     fn busy_actions_search_escape_dismisses_without_interrupting() {
         use iced::advanced::clipboard;
