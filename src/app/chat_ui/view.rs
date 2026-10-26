@@ -1183,8 +1183,9 @@ impl Runtime {
     }
 
     /// A single derived row, never a persisted message or a sticky footer.
-    /// Historic pages and terminal/disconnected snapshots must not narrate
-    /// current work beneath an unrelated turn.
+    /// Historic parent pages and terminal/disconnected snapshots must not narrate
+    /// current work beneath an unrelated turn. Child tabs have their own current
+    /// excerpt; the parent's pagination cursor does not describe that transcript.
     fn timeline_activity(&self, transitioning: bool) -> Option<(Option<Icon>, String)> {
         let snapshot = &self.snapshot;
         if self.closed_elsewhere || self.disconnected || snapshot.exited {
@@ -6702,7 +6703,8 @@ mod tests {
         runtime.selected_subagent = Some("native-child".into());
         assert_eq!(
             runtime.timeline_activity(false).unwrap().0,
-            Some(Icon::AgentWaiting)
+            Some(Icon::AgentWaiting),
+            "parent pagination does not make the selected child's live excerpt historical"
         );
         let child = &mut Arc::make_mut(&mut runtime.snapshot).subagents[0];
         child.status = chat::ToolStatus::Succeeded;

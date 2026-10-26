@@ -60,18 +60,38 @@ fn direct_tabs<'a>(
     selected: Option<&str>,
     focused: Option<&str>,
 ) -> Vec<&'a chat::Subagent> {
-    let mut rows: Vec<_> = children.iter().collect();
-    rows.sort_by_key(|child| rank(child));
-    let pins: Vec<_> = rows
-        .iter()
-        .skip(MAX_DIRECT_TABS)
-        .copied()
-        .filter(|child| selected == Some(child.id.as_str()) || focused == Some(child.id.as_str()))
-        .collect();
-    rows.truncate(MAX_DIRECT_TABS);
-    rows.extend(pins);
-    rows.sort_by_key(|child| rank(child));
-    rows
+    // Each rank needs at most one strip's prefix. Never allocate or sort a
+    // reference for every child just to mount at most 26 native controls.
+    let mut groups: [Vec<_>; 4] = std::array::from_fn(|_| Vec::new());
+    let mut pins = [None, None];
+    for (index, child) in children.iter().enumerate() {
+        let row = (index, child);
+        let group = &mut groups[usize::from(rank(child))];
+        if group.len() < MAX_DIRECT_TABS {
+            group.push(row);
+        }
+        for (pin, identity) in pins.iter_mut().zip([selected, focused]) {
+            if pin.is_none() && identity == Some(child.id.as_str()) {
+                *pin = Some(row);
+            }
+        }
+    }
+    let mut rows = Vec::with_capacity(MAX_DIRECT_TABS + 2);
+    let mut remaining = MAX_DIRECT_TABS;
+    for group in groups {
+        let count = remaining.min(group.len());
+        rows.extend(group.into_iter().take(count));
+        remaining -= count;
+    }
+    for pin in pins.into_iter().flatten() {
+        if !rows.iter().any(|(index, _)| *index == pin.0) {
+            rows.push(pin);
+        }
+    }
+    // Only the bounded strip is sorted. Source indices retain the provider's
+    // order within each status group, including selected/focused pins.
+    rows.sort_unstable_by_key(|(index, child)| (rank(child), *index));
+    rows.into_iter().map(|(_, child)| child).collect()
 }
 
 impl Picker {
@@ -447,6 +467,50 @@ mod tests {
             1000,
             "the chooser keeps every child reachable"
         );
+    }
+
+    #[test]
+    fn direct_tabs_preserve_full_catalog_status_order_and_both_pins_without_mounting_it() {
+        use chat::ToolStatus::*;
+        let children: Vec<_> = (0..5000)
+            .map(|index| {
+                let (status, waiting) = match index % 6 {
+                    0 => (Succeeded, false),
+                    1 => (Running, true),
+                    2 => (Failed, false),
+                    3 => (Running, false),
+                    4 => (Stopped, false),
+                    _ => (Denied, false),
+                };
+                child(&index.to_string(), status, waiting)
+            })
+            .collect();
+        for (selected, focused) in [
+            (None, None),
+            (Some("3"), Some("9")),
+            (Some("4998"), Some("4999")),
+            (Some("4997"), Some("4995")),
+            (Some("4997"), Some("4997")),
+        ] {
+            // Compare against the complete catalog's presentation contract:
+            // a stable working-first prefix plus selected/focused identities.
+            let mut catalog: Vec<_> = children.iter().collect();
+            catalog.sort_by_key(|child| rank(child));
+            let expected: Vec<_> = catalog
+                .iter()
+                .enumerate()
+                .filter(|(index, child)| {
+                    *index < MAX_DIRECT_TABS
+                        || selected == Some(child.id.as_str())
+                        || focused == Some(child.id.as_str())
+                })
+                .map(|(_, child)| child.id.as_str())
+                .collect();
+            let visible = direct_tabs(&children, selected, focused);
+            assert!(visible.len() <= MAX_DIRECT_TABS + 2);
+            let actual: Vec<_> = visible.iter().map(|child| child.id.as_str()).collect();
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]
