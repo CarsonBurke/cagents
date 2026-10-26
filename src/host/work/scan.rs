@@ -821,4 +821,54 @@ mod tests {
         );
         assert_eq!(plan.worktrees.len(), second.worktrees.len());
     }
+
+    #[test]
+    fn polling_retries_a_discovered_checkout_after_its_plan_read_failed() {
+        let fixture = fixture();
+        let first = run(&fixture, None, &git_watch::Change::default());
+        let added = fixture.root.parent().unwrap().join("added");
+        git(
+            &fixture.root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "added",
+                added.to_str().unwrap(),
+            ],
+        );
+        // The administrative worktree list still names this checkout, but
+        // its temporarily invalid marker prevents reading its watch plan.
+        let marker = added.join(".git");
+        let original = std::fs::read(&marker).unwrap();
+        std::fs::write(&marker, "gitdir: /nonexistent/cagents-work-scan\n").unwrap();
+        let failed = run(&fixture, Some(&first), &git_watch::Change::default());
+        assert!(failed.plan_error.is_some());
+        assert!(Arc::ptr_eq(
+            first.plan.as_ref().unwrap(),
+            failed.plan.as_ref().unwrap()
+        ));
+        assert!(
+            failed
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.path == added)
+        );
+
+        // A later scan no longer has a new record relative to Local. Its
+        // retained plan must remain the authority for detecting the mismatch.
+        std::fs::write(&marker, original).unwrap();
+        let recovered = run(&fixture, Some(&failed), &git_watch::Change::default());
+        assert!(recovered.plan_error.is_none());
+        assert!(
+            recovered
+                .plan
+                .as_ref()
+                .unwrap()
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.root == added)
+        );
+    }
 }
