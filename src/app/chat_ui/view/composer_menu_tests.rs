@@ -8,6 +8,7 @@ use iced_accessibility::accesskit::{Action as AxAction, ActionData, ActionReques
 enum Expected {
     Attach,
     Goal,
+    Plan,
     Skill,
     Fork,
     Compact,
@@ -23,6 +24,9 @@ fn observed(messages: &[Message], target: Target) -> Option<Expected> {
             Action::Attach(owner) => (*owner, Expected::Attach),
             Action::ComposerAction(owner, insertion) if insertion == "/goal" => {
                 (*owner, Expected::Goal)
+            }
+            Action::ComposerAction(owner, insertion) if insertion == "/plan" => {
+                (*owner, Expected::Plan)
             }
             Action::ComposerAction(owner, insertion) if insertion == "$review" => {
                 (*owner, Expected::Skill)
@@ -72,6 +76,15 @@ fn popup_search_enter_matches_first_enabled_visible_native_or_provider_action() 
             true,
             true,
             false,
+            false,
+            false,
+            Some(("Plan mode", Expected::Plan)),
+        ),
+        (
+            "",
+            true,
+            true,
+            true,
             false,
             false,
             Some(("Goal…", Expected::Goal)),
