@@ -20437,7 +20437,9 @@ mod tests {
                     app.card_state_mut(card).unwrap().title = "Arrived while saving".into();
                 }
                 "writer" => install_window_close_storage(&mut app, directory.path()),
-                "window" => app.core.set_main_window_id(Some(window::Id::unique())),
+                "window" => {
+                    app.core.set_main_window_id(Some(window::Id::unique()));
+                }
                 "settings" => app.settings.sidebar_width += 1.0,
                 "view" => app.context_inspector_open = !app.context_inspector_open,
                 _ => unreachable!(),
