@@ -275,7 +275,7 @@ pub(super) fn install_verified(
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(staging.path())?;
-    let mut files = BTreeMap::new();
+    let mut files: BTreeMap<String, VerifiedMember> = BTreeMap::new();
     for name in std::iter::once("runtime/bin/sherpa-onnx-offline").chain(
         MODEL_MEMBERS
             .iter()
