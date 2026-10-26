@@ -22581,7 +22581,57 @@ mod tests {
             assert_eq!(app.workspace.focused(), Some(card));
             CloseSaveFixture::assert_saving(&app, card);
         }
-        let completion = task_app_message(save);
+        // The actual Save and deferred focus persistence run concurrently.
+        // A slow durable write may let FocusSaveDue arrive first.
+        let completion = {
+            let mut stream = iced::runtime::task::into_stream(save)
+                .expect("the real save batch has an output");
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    loop {
+                        let action = stream
+                            .next()
+                            .await
+                            .expect("the save batch ended before its retained-save callback");
+                        match action {
+                            iced::runtime::Action::Output(cosmic::Action::App(
+                                message @ Message::Repository(
+                                    RepositoryAction::RetainedSaveFinished { .. },
+                                ),
+                            )) => {
+                                assert!(matches!(
+                                    &message,
+                                    Message::Repository(
+                                        RepositoryAction::RetainedSaveFinished { identity, .. }
+                                    ) if identity.card == card
+                                ));
+                                break message;
+                            }
+                            iced::runtime::Action::Output(cosmic::Action::App(
+                                Message::FocusSaveDue,
+                            )) => {
+                                drop(app.update(Message::FocusSaveDue));
+                                // The worker may have finished, but the UI owns
+                                // the save until its callback is applied.
+                                assert!(app.focused_repository_is_saving());
+                                assert!(matches!(
+                                    app.cards.get(&card),
+                                    Some(CardRuntime::Repository(runtime))
+                                        if runtime.is_saving()
+                                            && !runtime.can_abandon_unsaved_changes()
+                                ));
+                                assert_eq!(app.workspace.focused(), Some(card));
+                                assert!(!app.channel_work_is_main());
+                                assert!(!app.channel_work.view.saved_is_shown());
+                            }
+                            _ => panic!("unexpected action from the real editor-save batch"),
+                        }
+                    }
+                })
+        };
         assert!(matches!(
             &completion,
             Message::Repository(RepositoryAction::RetainedSaveFinished { result: Ok(_), .. })
