@@ -965,7 +965,10 @@ impl State {
             rows.push(line("Branch", branch.clone()));
         }
         if let Some(worktree) = &item.worktree {
-            rows.push(line("Worktree", crate::app::display_path(&worktree.path)));
+            rows.push(line(
+                "Worktree",
+                crate::app::display_path(&worktree.path).into_owned(),
+            ));
         }
         if let Some(comparison) = &item.comparison {
             rows.push(line(
