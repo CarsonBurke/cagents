@@ -171,10 +171,11 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
     // Between the baseline and this observation the only effectful request is
     // that one Goal Set: no Prompt, turn/start or mutation retry can make a
     // metadata-only implementation pass. The model counter alone also cannot
-    // pass (e.g. a prediction request is not an original-thread completed turn).
+    // pass (e.g. a prediction request is not a new original-thread response).
+    // Do not require a sampled idle gap while the goal may continue again.
     let (continued_turn, continued_requests) = until(
         Duration::from_secs(30),
-        "Goal Set alone to produce a model response and complete a new native turn",
+        "Goal Set alone to produce a model response in a new native turn",
         || {
             let snapshot = window.read(chat.id);
             assert_eq!(snapshot.session_id, baseline.session_id);
@@ -198,12 +199,47 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
             });
             (requests > baseline_requests
                 && snapshot.turn_generation > baseline.turn_generation
-                && snapshot.finished_at.is_some()
-                && !snapshot.busy
                 && snapshot.error.is_none()
                 && snapshot.requests.is_empty()
                 && new_final_response)
                 .then_some((snapshot.turn_generation, requests))
+        },
+    );
+    // This is the existing first Pause, moved directly after positive work:
+    // Pause prevents further Goal continuation but does not stop a live turn.
+    let paused = pause(&mut window, &chat);
+    assert_eq!(paused.objective, active.objective);
+    assert_eq!(paused.token_budget, active.token_budget);
+    let settled_turn = until(
+        Duration::from_secs(30),
+        "the autonomous native turn to settle after explicit Goal Pause",
+        || {
+            let snapshot = window.read(chat.id);
+            assert_eq!(snapshot.session_id, baseline.session_id);
+            assert!(
+                !snapshot.exited,
+                "the original actor exited before settlement"
+            );
+            assert!(
+                !fixture
+                    .model
+                    .over_limit
+                    .load(std::sync::atomic::Ordering::Acquire)
+            );
+            let still_paused = snapshot.goal.as_ref().is_some_and(|goal| {
+                goal.support == Support::Supported
+                    && !goal.pending
+                    && !goal.uncertain
+                    && matches!(&goal.read, ReadState::Known(Some(goal))
+                        if goal.objective == OBJECTIVE && goal.status == Status::Paused)
+            });
+            (snapshot.turn_generation >= continued_turn
+                && snapshot.finished_at.is_some()
+                && !snapshot.busy
+                && snapshot.error.is_none()
+                && snapshot.requests.is_empty()
+                && still_paused)
+                .then_some(snapshot.turn_generation)
         },
     );
     eprintln!(
@@ -212,6 +248,7 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
             "thread_id": chat.launch.session_id.as_deref(),
             "baseline_turn": baseline.turn_generation,
             "continued_turn": continued_turn,
+            "settled_turn_after_pause": settled_turn,
             "baseline_model_requests": baseline_requests,
             "continued_model_requests": continued_requests
         })
@@ -219,9 +256,6 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
     // The operation has no budget field. A provider-returned default is an
     // observation, not proof this client supplied a budget.
     eprintln!("SDK-observed Goal budget: {:?}", active.token_budget);
-    let paused = pause(&mut window, &chat);
-    assert_eq!(paused.objective, active.objective);
-    assert_eq!(paused.token_budget, active.token_budget);
     control(&mut window, &chat, Operation::Resume);
     let resumed = observed(&mut window, &chat, |goal| is_status(goal, Status::Active)).unwrap();
     assert_eq!(resumed.objective, active.objective);
