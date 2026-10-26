@@ -4034,6 +4034,108 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
 
 #[cfg(test)]
 mod tests {
+    fn codex_child_name_adapter(directory: &std::path::Path) -> Box<dyn Adapter> {
+        let launch = super::super::Launch {
+            provider: crate::agent::Provider::Codex,
+            session_id: Some("parent-exact".into()),
+            recipe: crate::model::LaunchRecipe {
+                program: "codex".into(),
+                arguments: Vec::new(),
+                working_directory: directory.into(),
+                environment: BTreeMap::from([(
+                    "CODEX_HOME".into(),
+                    directory.to_str().unwrap().into(),
+                )]),
+                unset_environment: Default::default(),
+            },
+        };
+        // Parse real adapter publications without starting a process or socket.
+        super::super::protocol::codex::create_with_listener(&launch, directory.join("unused.sock"))
+            .unwrap()
+            .1
+    }
+
+    #[test]
+    fn codex_child_nickname_survives_role_only_blank_and_reconnected_publications() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut adapter = codex_child_name_adapter(directory.path());
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        let started = adapter
+            .receive(json!({"method":"thread/started","params":{"thread":{
+                "id":"child-exact","parentThreadId":"parent-exact","agentNickname":"Scout",
+                "agentRole":"worker","status":{"type":"active"}
+            }}}))
+            .unwrap();
+        for event in started.events {
+            apply_event(&mut state, &mut indices, event);
+        }
+        assert_eq!(state.subagents[0].kind, "Scout");
+        for nickname in [Value::Null, json!(""), json!(" \t\n")] {
+            let sparse = adapter
+                .receive(json!({"method":"thread/started","params":{"thread":{
+                    "id":"child-exact","parentThreadId":"parent-exact","agentNickname":nickname,
+                    "agentRole":"worker","status":{"type":"active"}
+                }}}))
+                .unwrap();
+            assert!(sparse.events.iter().any(|event| matches!(event,
+                Event::Subagent { kind, .. } if kind.is_empty()
+            )));
+            for event in sparse.events {
+                apply_event(&mut state, &mut indices, event);
+            }
+            assert_eq!(state.subagents[0].kind, "Scout");
+        }
+        // Restored metadata retains its name when a newly connected adapter
+        // discovers the same child before the server supplies its nickname.
+        state = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        let mut reconnected = codex_child_name_adapter(directory.path());
+        let sparse = reconnected
+            .receive(json!({"method":"thread/started","params":{"thread":{
+                "id":"child-exact","parentThreadId":"parent-exact","agentRole":"worker"
+            }}}))
+            .unwrap();
+        for event in sparse.events {
+            apply_event(&mut state, &mut indices, event);
+        }
+        assert_eq!(state.subagents[0].kind, "Scout");
+        assert_eq!(state.subagents[0].id, "child-exact");
+    }
+
+    #[test]
+    fn codex_unnamed_children_project_exact_ids_without_role_or_task_as_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut adapter = codex_child_name_adapter(directory.path());
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        for (id, nickname) in [
+            ("role-only", Value::Null),
+            ("blank-nickname", json!(" \t\n")),
+        ] {
+            let mut metadata = json!({
+                "id":id,"parentThreadId":"parent-exact","agentRole":"worker",
+                "message":"Review the implementation","status":{"type":"active"},
+                "model":"gpt-child"
+            });
+            if !nickname.is_null() {
+                metadata["agentNickname"] = nickname;
+            }
+            let discovered = adapter
+                .receive(json!({"method":"thread/started","params":{"thread":metadata}}))
+                .unwrap();
+            for event in discovered.events {
+                apply_event(&mut state, &mut indices, event);
+            }
+            let child = state.subagents.iter().find(|child| child.id == id).unwrap();
+            assert!(child.kind.is_empty());
+            assert_eq!(child.description, "Review the implementation");
+            assert_eq!(child.model.as_deref(), Some("gpt-child"));
+            assert_eq!(child.status, ToolStatus::Running);
+            assert!(child.background);
+        }
+        assert_eq!(state.subagents.len(), 2);
+    }
+
     #[test]
     fn typed_provider_error_items_keep_full_provenance_and_ids_through_store_hydration() {
         let mut store = Store::new().unwrap();

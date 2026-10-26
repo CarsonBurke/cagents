@@ -444,6 +444,55 @@ mod tests {
     }
 
     #[test]
+    fn unnamed_child_navigation_mounts_exact_id_labels_without_task_identity() {
+        use cosmic::iced::advanced::{Layout, layout, widget::Tree};
+        let (mut runtime, _handle) = super::super::view::prepared_runtime_for_test(&[]);
+        std::sync::Arc::make_mut(&mut runtime.snapshot).subagents = ["role-only", "blank-nickname"]
+            .into_iter()
+            .map(|id| chat::Subagent {
+                // Actual adapter/runtime regressions in the HOST lane
+                // prove absent/blank nickname publications project this.
+                kind: String::new(),
+                ..child(id, chat::ToolStatus::Running, false)
+            })
+            .collect();
+        let renderer = crate::app::tests::headless_renderer();
+        let mut element = runtime.child_navigation(800.0);
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(800.0, 100.0)),
+        );
+        let accessible = element.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            iced::mouse::Cursor::Unavailable,
+        );
+        for id in ["role-only", "blank-nickname"] {
+            let native = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .find(|node| {
+                    node.id()
+                        == &iced_accessibility::A11yId::Widget(card_control_id(
+                            runtime.target.card,
+                            &format!("chat-subagent-tab-{id}"),
+                        ))
+                        && node.node().role() == iced_accessibility::accesskit::Role::Button
+                })
+                .expect("the exact unnamed child mounts a real native tab");
+            let label = native.node().label().expect("native tab identity");
+            assert!(label.contains(&format!("native subagent · {id} ·")));
+            assert!(!label.contains("long task description"));
+            let bounds = native.node().bounds().expect("mounted native bounds");
+            assert!(bounds.width() > 0.0 && bounds.height() > 0.0);
+        }
+        assert!(runtime.child_cache.is_empty());
+    }
+
+    #[test]
     fn direct_tabs_bound_large_catalog_while_retaining_selected_identity_and_working_prefix() {
         let children: Vec<_> = (0..1000)
             .map(|index| {

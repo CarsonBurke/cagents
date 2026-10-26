@@ -858,10 +858,14 @@ impl Codex {
             waiting: None,
             detail: None,
             id: id.into(),
+            // Roles describe capabilities, not identity. Empty sparse metadata
+            // preserves a known nickname in the runtime; an unnamed child
+            // otherwise uses its exact ID in navigation.
             kind: metadata["agentNickname"]
                 .as_str()
-                .or_else(|| metadata["agentRole"].as_str())
-                .unwrap_or(if discovered { "Codex agent" } else { "" })
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or_default()
                 .into(),
             description: metadata["message"]
                 .as_str()
@@ -6460,6 +6464,32 @@ mod tests {
         assert!(sparse.events.iter().any(
             |event| matches!(event, Event::Subagent {kind, status:None, ..} if kind.is_empty())
         ));
+    }
+
+    #[test]
+    fn child_identity_uses_only_reported_nonblank_nickname_without_guessing_roles() {
+        let mut parent = adapter();
+        for (nickname, expected) in [
+            (Value::Null, ""),
+            (json!(""), ""),
+            (json!(" \t\n"), ""),
+            (json!(" Scout "), "Scout"),
+            // A real nickname may happen to equal a role or the old default.
+            (json!("worker"), "worker"),
+            (json!("Codex agent"), "Codex agent"),
+        ] {
+            let mut step = Step::default();
+            parent
+                .discover_child(
+                    "child",
+                    &json!({"agentNickname":nickname,"agentRole":"worker"}),
+                    &mut step,
+                )
+                .unwrap();
+            assert!(step.events.iter().any(|event| matches!(event,
+                Event::Subagent { id, kind, .. } if id == "child" && kind == expected
+            )));
+        }
     }
 
     #[test]
