@@ -2013,7 +2013,12 @@ mod tests {
             "real x wins rather than cancelling a diagonal trackpad gesture"
         );
         let cache = ui.into_cache();
-        let mut ui = Ui::build(state.board_view(size.width, None), size, cache, &mut renderer);
+        let mut ui = Ui::build(
+            state.board_view(size.width, None),
+            size,
+            cache,
+            &mut renderer,
+        );
         draw(&mut ui, &mut renderer);
         board_event(
             &mut ui,
