@@ -3449,7 +3449,7 @@ impl Runtime {
                 true,
             )
         });
-        crate::ui_controls::popover(
+        crate::interaction::composer_popover(
             anchor,
             popup.map(|content: Element<'_, Message>| {
                 widget::container(content)
@@ -3459,7 +3459,6 @@ impl Runtime {
                     .max_height(260.0)
                     .into()
             }),
-            widget::popover::Position::Top,
             action(Action::ComposerActions(target, false)),
         )
     }

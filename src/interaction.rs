@@ -15,6 +15,8 @@ use cosmic::iced::{
 use cosmic::{Element, Renderer, Theme, widget};
 use serde::Deserialize;
 
+mod composer_popover;
+pub use composer_popover::composer_popover;
 mod context_menu;
 mod keyed_list;
 mod list_navigation;
