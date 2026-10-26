@@ -14104,6 +14104,7 @@ impl Application for Cagents {
             app.lifecycle = LifecycleManager::new(LifecycleBudget::default());
             app.context_inspector_open = false;
             let chrome = app.sync_chrome();
+            app.sync_work_watch_visibility();
             return (app, chrome);
         }
         let scope = app.restore_worktree_scope();
@@ -14147,6 +14148,7 @@ impl Application for Cagents {
         );
         let task = Task::batch(tasks);
         let chrome = app.sync_chrome();
+        app.sync_work_watch_visibility();
         (app, Task::batch([task, chrome]))
     }
 
@@ -17768,6 +17770,7 @@ impl Application for Cagents {
         let activation = self.retry_notification_activation();
         let visibility = self.sync_visible_attention();
         self.sync_notification_presence();
+        self.sync_work_watch_visibility();
         Task::batch([task, activation, visibility])
     }
 
