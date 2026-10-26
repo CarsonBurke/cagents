@@ -701,3 +701,70 @@ fn real_cosmic_dialog_keeps_modal_arrows_enter_and_captured_query_without_native
     assert_eq!(app.resume_ui.query, "q");
     assert_eq!(app.recently_closed.len(), 1);
 }
+
+#[test]
+fn native_editor_f3_keeps_open_find_navigation_after_query_loses_focus() {
+    let (mut app, card) = editor_app();
+    drop(app.update(Message::Repository(RepositoryAction::OpenFind { card })));
+    drop(
+        app.update(Message::Repository(RepositoryAction::FindInputFocus {
+            card,
+            focused: false,
+        })),
+    );
+    let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+        panic!("repository");
+    };
+    assert!(runtime.find_is_open());
+    assert!(!runtime.find_input_is_focused());
+    let mut renderer = super::tests::headless_renderer();
+    let press = named(keyboard::key::Named::F3, keyboard::key::Code::F3);
+    let (_cache, messages) = native(
+        &app,
+        &mut renderer,
+        Cache::new(),
+        Some(repository_widget::editor_focus_id(card)),
+        &[press],
+    );
+    let mut navigated = 0;
+    for message in messages {
+        if matches!(&message, Message::NativeKeyEvent {
+            event: keyboard::Event::KeyPressed { .. },
+            owner: KeyboardOwner {pane: FocusedPane::Editor, card: Some(found), ..},
+            ..
+        } if *found == card)
+        {
+            let action = super::tests::task_app_message(app.update(message));
+            assert!(matches!(action,
+                Message::Repository(RepositoryAction::FindNext { card: found }) if found == card));
+            navigated += 1;
+        } else {
+            drop(app.update(message));
+        }
+    }
+    assert_eq!(
+        navigated, 1,
+        "real editor-owned F3 retains Main's navigation"
+    );
+    // A queued owner for a different card still cannot navigate this editor.
+    let iced::Event::Keyboard(event) = named(keyboard::key::Named::F3, keyboard::key::Code::F3)
+    else {
+        unreachable!()
+    };
+    let generation = app.workspace_view_generation;
+    let task = app.update(Message::NativeKeyEvent {
+        event,
+        captured: false,
+        owner: KeyboardOwner {
+            pane: FocusedPane::Editor,
+            card: Some(CardId::new()),
+            generation: None,
+        },
+        generation,
+    });
+    assert_eq!(
+        task.units(),
+        0,
+        "a foreign event cannot use the current Find bar"
+    );
+}

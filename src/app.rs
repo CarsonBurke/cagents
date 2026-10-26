@@ -17218,7 +17218,6 @@ impl Application for Cagents {
                     && !modifiers.logo()
                     && let Some(card) = self.focused_repository_card_with_find()
                     && native_owner.is_none_or(|owner| owner.card == Some(card))
-                    && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.find_input_is_focused())
                 {
                     return cosmic::task::message(Message::Repository(if modifiers.shift() {
                         RepositoryAction::FindPrevious { card }
