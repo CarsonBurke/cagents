@@ -215,3 +215,125 @@ async fn clean_reload_retains_caret_scroll_and_preview_mode() {
         panic!("text document lost");
     }
 }
+
+#[tokio::test]
+async fn native_alias_parent_deduplicates_and_survives_other_owner_close() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("real")).unwrap();
+    std::os::unix::fs::symlink("real", root.path().join("alias")).unwrap();
+    let real = root.path().join("real");
+    let alias = root.path().join("alias");
+    std::fs::write(real.join("live.txt"), "first").unwrap();
+    let (a, mut first) = opened(&real, "live.txt").await;
+    let (b, mut second) = opened(&alias, "live.txt").await;
+    std::fs::write(real.join("live.txt"), "both updated").unwrap();
+    text(a, &mut first, "both updated").await;
+    text(b, &mut second, "both updated").await;
+    drop(second);
+    // Command ordering makes arm an acknowledgement of preceding unwatch.
+    first
+        .document_watch
+        .as_ref()
+        .unwrap()
+        .arm(vec![real.join("live.txt")]);
+    std::fs::write(real.join("live.txt"), "still watched").unwrap();
+    text(a, &mut first, "still watched").await;
+}
+#[tokio::test]
+async fn native_rapid_parent_recreation_and_atomic_write_bursts_converge() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("nested/deep")).unwrap();
+    let path = root.path().join("nested/deep/live.txt");
+    std::fs::write(&path, "first").unwrap();
+    let (card, mut runtime) = opened(root.path(), "nested/deep/live.txt").await;
+    std::fs::rename(root.path().join("nested"), root.path().join("moved")).unwrap();
+    std::fs::create_dir_all(root.path().join("nested/deep")).unwrap();
+    std::fs::write(&path, "immediate").unwrap();
+    text(card, &mut runtime, "immediate").await;
+    for n in 0..64 {
+        std::fs::write(path.with_extension("tmp"), format!("marker {n:02}")).unwrap();
+        std::fs::rename(path.with_extension("tmp"), &path).unwrap();
+    }
+    text(card, &mut runtime, "marker 63").await;
+    std::fs::write(&path, "independent later write").unwrap();
+    text(card, &mut runtime, "independent later write").await;
+}
+#[tokio::test]
+async fn clean_reload_invalidates_revision_zero_find_cache() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("live.txt");
+    std::fs::write(&path, "needle needle").unwrap();
+    let (card, mut runtime) = opened(root.path(), "live.txt").await;
+    runtime.find_open = true;
+    runtime.find_query = "needle".into();
+    let task = runtime.find_task(card);
+    settle(&mut runtime, task).await;
+    assert_eq!(runtime.find_total, 2);
+    let old_key = runtime.find_cache.clone();
+    std::fs::write(&path, "needle erased").unwrap();
+    text(card, &mut runtime, "needle erased").await;
+    assert_ne!(old_key, runtime.find_cache);
+    assert_eq!(runtime.find_total, 1);
+    assert!(runtime.take_restored_editor_focus(card).is_none());
+}
+
+#[test]
+fn native_registration_failure_is_visible_and_explicit_retry_restores_delivery() {
+    const CHILD: &str = "CAGENTS_DOCUMENT_WATCH_LIMIT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "repository_widget::live_tests::native_registration_failure_is_visible_and_explicit_retry_restores_delivery", "--nocapture"])
+            .env(CHILD, "1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("live.txt");
+    std::fs::write(&path, "before").unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let watch = DocumentWatch::new();
+    // Only this disposable child changes its own limit. Exhaust real native
+    // descriptors, then release them and explicitly rearm the same watch.
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
+    limit.rlim_cur = limit.rlim_cur.min(64);
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+    let mut held = Vec::new();
+    while let Ok(file) = std::fs::File::open("/dev/null") {
+        held.push(file);
+    }
+    watch.arm(vec![path.clone()]);
+    assert!(
+        watch.error().is_some(),
+        "native registration failure was hidden"
+    );
+    drop(held);
+    watch.arm(vec![path.clone()]);
+    assert!(
+        watch.error().is_none(),
+        "explicit native rearm failed: {:?}",
+        watch.error()
+    );
+    while watch.receiver().try_recv().is_ok() {}
+    std::fs::write(&path, "after!").unwrap();
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), watch.receiver().recv())
+            .await
+            .expect("recovered real native watch did not deliver")
+            .unwrap();
+    });
+}

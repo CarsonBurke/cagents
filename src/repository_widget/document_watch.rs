@@ -4,7 +4,7 @@ use notify::{Event, EventKind, RecursiveMode, Watcher};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, Weak, mpsc},
+    sync::{Arc, Mutex, Weak, mpsc},
 };
 
 #[derive(Clone, Debug)]
@@ -31,7 +31,7 @@ impl State {
 }
 impl Drop for State {
     fn drop(&mut self) {
-        if let Some(Ok(service)) = SERVICE.get() {
+        if let Some(service) = SERVICE.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
             let _ = service.send(Command::Remove(self.id));
         }
     }
@@ -69,25 +69,36 @@ impl DocumentWatch {
     }
     /// Called on the file worker, and acknowledged before its first read.
     pub fn arm(&self, targets: Vec<PathBuf>) {
-        let service = SERVICE.get_or_init(start);
-        let result = match service {
-            Ok(service) => {
-                let (reply, response) = mpsc::sync_channel(1);
-                service
-                    .send(Command::Register(Arc::downgrade(&self.0), targets, reply))
-                    .map_err(|e| e.to_string())
-                    .and_then(|()| response.recv().map_err(|e| e.to_string()))
+        let service = {
+            let mut slot = SERVICE.lock().unwrap_or_else(|p| p.into_inner());
+            if slot.is_none() {
+                match start() {
+                    Ok(service) => *slot = Some(service),
+                    Err(error) => {
+                        if self.error().as_ref() != Some(&error) {
+                            self.0.signal(Some(error));
+                        }
+                        return;
+                    }
+                }
             }
-            Err(error) => Err(error.clone()),
+            slot.as_ref().unwrap().clone()
         };
+        let (reply, response) = mpsc::sync_channel(1);
+        let result = service
+            .send(Command::Register(Arc::downgrade(&self.0), targets, reply))
+            .map_err(|error| error.to_string())
+            .and_then(|()| response.recv().map_err(|error| error.to_string()));
         if let Err(error) = result {
+            // A terminated coordinator must be restartable on explicit retry.
+            *SERVICE.lock().unwrap_or_else(|p| p.into_inner()) = None;
             if self.error().as_ref() != Some(&error) {
                 self.0.signal(Some(error));
             }
         }
     }
 }
-static SERVICE: OnceLock<Result<mpsc::Sender<Command>, String>> = OnceLock::new();
+static SERVICE: Mutex<Option<mpsc::Sender<Command>>> = Mutex::new(None);
 enum Command {
     Register(Weak<State>, Vec<PathBuf>, mpsc::SyncSender<()>),
     Remove(uuid::Uuid),
@@ -103,6 +114,68 @@ struct Pending {
 struct Entry {
     state: Weak<State>,
     targets: Vec<PathBuf>,
+    matched: Vec<PathBuf>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum DirectoryKey {
+    #[cfg(unix)]
+    Native(u64, u64),
+    #[cfg(not(unix))]
+    Path(PathBuf),
+}
+fn directory_key(path: &Path) -> Option<DirectoryKey> {
+    let metadata = path.metadata().ok().filter(|metadata| metadata.is_dir())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(DirectoryKey::Native(metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Some(DirectoryKey::Path(path.canonicalize().ok()?))
+    }
+}
+struct Directory {
+    path: PathBuf,
+    owners: BTreeSet<uuid::Uuid>,
+}
+fn plan(
+    entries: &mut BTreeMap<uuid::Uuid, Entry>,
+    registered: &BTreeMap<DirectoryKey, PathBuf>,
+) -> BTreeMap<DirectoryKey, Directory> {
+    let mut desired: BTreeMap<DirectoryKey, Directory> = BTreeMap::new();
+    for (&id, entry) in entries {
+        entry.matched.clear();
+        for target in &entry.targets {
+            for ancestor in target.ancestors().skip(1) {
+                let Ok(canonical) = ancestor.canonicalize() else {
+                    continue;
+                };
+                let Some(key) = directory_key(&canonical) else {
+                    continue;
+                };
+                // notify indexes native descriptors by path: two aliases of
+                // one directory would steal routing and unwatch each other.
+                // Keep one representative per physical directory, including
+                // bind mounts, and project every owner's path onto it.
+                let representative = registered
+                    .get(&key)
+                    .filter(|path| directory_key(path).as_ref() == Some(&key))
+                    .cloned()
+                    .unwrap_or(canonical);
+                let directory = desired.entry(key).or_insert_with(|| Directory {
+                    path: representative,
+                    owners: BTreeSet::new(),
+                });
+                directory.owners.insert(id);
+                if let Ok(suffix) = target.strip_prefix(ancestor) {
+                    entry.matched.push(directory.path.join(suffix));
+                }
+            }
+        }
+    }
+    desired
 }
 fn relevant(event: &Event, targets: &[PathBuf]) -> bool {
     event.need_rescan()
@@ -114,86 +187,153 @@ fn relevant(event: &Event, targets: &[PathBuf]) -> bool {
 fn start() -> Result<mpsc::Sender<Command>, String> {
     let (sender, commands) = mpsc::channel();
     let wake = sender.clone();
-    std::thread::Builder::new().name("document-watch".into()).spawn(move || {
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        let create = || {
-            let pending = pending.clone();
-            let wake = wake.clone();
-            notify::recommended_watcher(move |event: notify::Result<Event>| {
-                if event.as_ref().is_ok_and(|event| matches!(event.kind, EventKind::Access(kind) if !matches!(kind, notify::event::AccessKind::Close(notify::event::AccessMode::Write)))) { return; }
-                let mut pending = pending.lock().unwrap_or_else(|p| p.into_inner());
-                match event {
-                    Ok(event) if pending.events.len() < 256 => pending.events.push(event),
-                    Ok(_) => pending.overflow = true,
-                    Err(error) => pending.fault = Some(error.to_string()),
+    std::thread::Builder::new()
+        .name("document-watch".into())
+        .spawn(move || run(commands, wake))
+        .map_err(|error| error.to_string())?;
+    Ok(sender)
+}
+fn run(commands: mpsc::Receiver<Command>, wake: mpsc::Sender<Command>) {
+    let pending = Arc::new(Mutex::new(Pending::default()));
+    let create = || {
+        let pending = pending.clone();
+        let wake = wake.clone();
+        notify::recommended_watcher(move |event: notify::Result<Event>| {
+            if event.as_ref().is_ok_and(|event| {
+                matches!(event.kind,
+                EventKind::Access(kind) if !matches!(kind,
+                    notify::event::AccessKind::Close(notify::event::AccessMode::Write)))
+            }) {
+                return;
+            }
+            let mut pending = pending.lock().unwrap_or_else(|p| p.into_inner());
+            match event {
+                Ok(event) if pending.events.len() < 256 => pending.events.push(event),
+                Ok(_) => pending.overflow = true,
+                Err(error) => pending.fault = Some(error.to_string()),
+            }
+            if !pending.queued {
+                pending.queued = true;
+                let _ = wake.send(Command::Events);
+            }
+        })
+    };
+    let mut watcher = create();
+    let mut entries: BTreeMap<uuid::Uuid, Entry> = BTreeMap::new();
+    let mut registered = BTreeMap::<DirectoryKey, PathBuf>::new();
+    while let Ok(command) = commands.recv() {
+        let mut reply = None;
+        let mut changes = None;
+        match command {
+            Command::Register(state, targets, ack) => {
+                if let Some(live) = state.upgrade() {
+                    let matched = entries
+                        .remove(&live.id)
+                        .map(|entry| entry.matched)
+                        .unwrap_or_default();
+                    entries.insert(
+                        live.id,
+                        Entry {
+                            state,
+                            targets,
+                            matched,
+                        },
+                    );
                 }
-                if !pending.queued {
-                    pending.queued = true;
-                    let _ = wake.send(Command::Events);
-                }
+                reply = Some(ack);
+            }
+            Command::Remove(id) => {
+                entries.remove(&id);
+            }
+            Command::Events => {
+                changes = Some(std::mem::take(
+                    &mut *pending.lock().unwrap_or_else(|p| p.into_inner()),
+                ));
+            }
+        }
+        entries.retain(|_, entry| entry.state.strong_count() > 0);
+        let changed: BTreeSet<_> = entries
+            .iter()
+            .filter(|(_, entry)| {
+                changes.as_ref().is_some_and(|pending| {
+                    pending.overflow
+                        || pending.fault.is_some()
+                        || pending
+                            .events
+                            .iter()
+                            .any(|event| relevant(event, &entry.matched))
+                })
             })
-        };
-        let mut watcher = create();
-        let mut entries: BTreeMap<uuid::Uuid, Entry> = BTreeMap::new();
-        let mut registered = BTreeSet::<PathBuf>::new();
-        while let Ok(command) = commands.recv() {
-            let mut reply = None;
-            let mut added = None;
-            let mut changes = None;
-            match command {
-                Command::Register(state, targets, ack) => {
-                    if let Some(live) = state.upgrade() {
-                        added = Some(live.id);
-                        entries.insert(live.id, Entry { state, targets });
+            .map(|(&id, _)| id)
+            .collect();
+        let fault = changes.as_ref().and_then(|pending| pending.fault.clone());
+        let lost = changes.as_ref().is_some_and(|pending| {
+            pending.overflow || pending.events.iter().any(Event::need_rescan)
+        });
+        if watcher.is_err() || fault.is_some() || lost {
+            // Release the old instance first: opening a replacement while
+            // still holding it can itself exceed the native instance quota.
+            drop(watcher);
+            watcher = create();
+            registered.clear();
+        }
+        let desired = plan(&mut entries, &registered);
+        let mut failures: BTreeMap<uuid::Uuid, String> = BTreeMap::new();
+        match &mut watcher {
+            Ok(watcher) => {
+                let removed: Vec<_> = registered
+                    .iter()
+                    .filter(|(key, path)| {
+                        desired
+                            .get(*key)
+                            .is_none_or(|directory| directory.path != **path)
+                    })
+                    .map(|(key, path)| (key.clone(), path.clone()))
+                    .collect();
+                for (key, path) in removed {
+                    let _ = watcher.unwatch(&path);
+                    registered.remove(&key);
+                }
+                for (key, directory) in &desired {
+                    if registered.contains_key(key) {
+                        continue;
                     }
-                    reply = Some(ack);
-                }
-                Command::Remove(id) => { entries.remove(&id); }
-                Command::Events => {
-                    changes = Some(std::mem::take(&mut *pending.lock().unwrap_or_else(|p| p.into_inner())));
-                }
-            }
-            entries.retain(|_, entry| entry.state.strong_count() > 0);
-            let fault = changes.as_ref().and_then(|p| p.fault.clone());
-            if watcher.is_err() || fault.is_some() {
-                // A native failure is visible. Recreate only on a real event or
-                // explicit registration/reload, never a periodic retry.
-                watcher = create();
-                registered.clear();
-            }
-            let desired: BTreeSet<_> = entries.values().flat_map(|entry| entry.targets.iter())
-                .flat_map(|target| target.ancestors().skip(1))
-                .filter(|path| path.is_dir()).map(Path::to_path_buf).collect();
-            let mut failures = BTreeMap::new();
-            match &mut watcher {
-                Ok(watcher) => {
-                    let removed: Vec<_> = registered.iter().filter(|path| !desired.contains(*path) || changes.as_ref().is_some_and(|pending| pending.events.iter().any(|event| {
-                        matches!(event.kind, EventKind::Remove(_) | EventKind::Create(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))) && event.paths.iter().any(|changed| path.starts_with(changed))
-                    }))).cloned().collect();
-                    for path in removed { let _ = watcher.unwatch(&path); registered.remove(&path); }
-                    for path in desired.difference(&registered).cloned().collect::<Vec<_>>() {
-                        match watcher.watch(&path, RecursiveMode::NonRecursive) {
-                            Ok(()) => { registered.insert(path); }
-                            Err(error) => { failures.insert(path, error.to_string()); }
+                    match watcher.watch(&directory.path, RecursiveMode::NonRecursive) {
+                        Ok(()) => {
+                            registered.insert(key.clone(), directory.path.clone());
+                        }
+                        Err(error) => {
+                            for &id in &directory.owners {
+                                failures.insert(id, error.to_string());
+                            }
                         }
                     }
                 }
-                Err(error) => { failures.insert(PathBuf::from("/"), error.to_string()); }
             }
-            for (&id, entry) in &entries {
-                let error = entry.targets.iter().find_map(|target| failures.iter().find(|(path, _)| target.starts_with(path)).map(|(_, error)| error.clone())).or_else(|| fault.clone());
-                if let Some(state) = entry.state.upgrade() {
-                    let changed = changes.as_ref().is_some_and(|pending| pending.overflow || pending.fault.is_some() || pending.events.iter().any(|event| relevant(event, &entry.targets)));
-                    // Clear a previous watch failure when an event or explicit
-                    // registration successfully rearms it. Preserve failure
-                    // visibility until then.
-                    if changed || (added == Some(id) && state.status.lock().unwrap_or_else(|p| p.into_inner()).error != error) {
-                        state.signal(error);
-                    }
+            Err(error) => {
+                for &id in entries.keys() {
+                    failures.insert(id, error.to_string());
                 }
             }
-            if let Some(reply) = reply { let _ = reply.send(()); }
         }
-    }).map_err(|error| error.to_string())?;
-    Ok(sender)
+        for (&id, entry) in &entries {
+            let error = failures.get(&id).cloned().or_else(|| fault.clone());
+            if let Some(state) = entry.state.upgrade() {
+                let relevant_now = changes.as_ref().is_some_and(|pending| {
+                    pending
+                        .events
+                        .iter()
+                        .any(|event| relevant(event, &entry.matched))
+                });
+                let status_changed =
+                    state.status.lock().unwrap_or_else(|p| p.into_inner()).error != error;
+                if changed.contains(&id) || relevant_now || status_changed {
+                    state.signal(error);
+                }
+            }
+        }
+        if let Some(reply) = reply {
+            let _ = reply.send(());
+        }
+    }
 }
