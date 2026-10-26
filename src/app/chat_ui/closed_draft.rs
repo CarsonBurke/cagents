@@ -144,6 +144,8 @@ mod tests {
     use crate::workspace_model::views::{Pane, Scope, View};
     use cosmic::iced::futures::{FutureExt, StreamExt};
 
+    const COMPLETED_REPORT: &str = "The completed report stays readable.";
+
     fn fixture(draft: &str) -> (Cagents, Target, crate::model::ChannelId, Arc<ClientHandle>) {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         drop(app.new_native_chat(Provider::Claude, Some(PathBuf::from("/project"))));
@@ -171,7 +173,7 @@ mod tests {
                     at: Some(42),
                     started_at: None,
                     content: ItemContent::Text {
-                        text: "The completed report stays readable.".into(),
+                        text: COMPLETED_REPORT.into(),
                         thinking: false,
                         phase: chat::Phase::Final,
                     },
@@ -262,6 +264,19 @@ mod tests {
             fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
                 self.0.push(text.to_owned());
             }
+            fn custom(
+                &mut self,
+                _: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                // Rich Markdown is a native selectable widget, not an iced
+                // Text. Inspect its mounted state, as transcript selection
+                // does, rather than consulting the retained logical items.
+                if let Some(prose) = state.downcast_ref::<selectable_prose::State>() {
+                    self.0.push(prose.plain.to_string());
+                }
+            }
         }
         // These tests set the local error directly instead of dispatching a
         // provider callback. Run the same postlude as handle_chat_ui, then
@@ -274,10 +289,40 @@ mod tests {
         let renderer = crate::app::tests::headless_renderer();
         let mut element = app.chat_view(card);
         let mut tree = Tree::new(element.as_widget());
+        let viewport = iced::Rectangle::with_size(iced::Size::new(900.0, 980.0));
         let node = element.as_widget_mut().layout(
             &mut tree,
             &renderer,
-            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(900.0, 980.0)),
+            &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+        );
+        // The completed report must also be exposed by the actual native
+        // accessibility tree, in the visible viewport. A logical snapshot or
+        // a cached Markdown source would not establish this presentation.
+        let accessible = element.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            iced::mouse::Cursor::Unavailable,
+        );
+        let report = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .find(|node| {
+                node.node().role() == iced_accessibility::accesskit::Role::Label
+                    && node.node().value() == Some(COMPLETED_REPORT)
+            })
+            .expect("completed report is exposed by the mounted native prose widget");
+        let bounds = report.node().bounds().expect("native report bounds");
+        let bounds = iced::Rectangle {
+            x: bounds.x0 as f32,
+            y: bounds.y0 as f32,
+            width: (bounds.x1 - bounds.x0) as f32,
+            height: (bounds.y1 - bounds.y0) as f32,
+        };
+        assert!(bounds.width > 0.0 && bounds.height > 0.0, "{bounds:?}");
+        assert!(
+            bounds.intersection(&viewport).is_some(),
+            "completed report must be visible: {bounds:?} in {viewport:?}"
         );
         let mut text = Texts::default();
         element
