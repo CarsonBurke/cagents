@@ -24677,7 +24677,7 @@ mod tests {
                             description: "Review changes".into(),
                             invocation: invocation.into(),
                         }];
-                        snapshot.skill_reach = if provider == Provider::Omp {
+                        snapshot.capabilities.skill_reach = if provider == Provider::Omp {
                             chat::SkillReach::First
                         } else {
                             chat::SkillReach::Anywhere
@@ -24786,7 +24786,7 @@ mod tests {
                             completion::unloaded(
                                 &expected,
                                 &runtime.snapshot.skills,
-                                runtime.snapshot.skill_reach
+                                runtime.snapshot.capabilities.skill_reach
                             )
                             .is_empty()
                         );
@@ -24826,7 +24826,7 @@ mod tests {
                 description: "Review changes".into(),
                 invocation: "/skill:review".into(),
             }];
-            snapshot.skill_reach = chat::SkillReach::First;
+            snapshot.capabilities.skill_reach = chat::SkillReach::First;
             runtime.replace_draft(text_editor::Content::with_text(&format!(
                 "{token} 中中中 tail"
             )));
