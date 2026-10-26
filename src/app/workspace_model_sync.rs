@@ -132,6 +132,7 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
                 | ModelEdit::SuggestConversationTitle { .. }
                 | ModelEdit::ReorderNavigation { .. }
                 | ModelEdit::ResetNavigation { .. }
+                | ModelEdit::RetireEmptyChannel { .. }
         ) {
             let model = client
                 .read_workspace_model()
@@ -372,7 +373,12 @@ fn send(
             ordinal: channel.ordinal,
         });
     }
-    if reordered || matches!(&request, ModelEdit::SuggestConversationTitle { .. }) {
+    if reordered
+        || matches!(
+            &request,
+            ModelEdit::SuggestConversationTitle { .. } | ModelEdit::RetireEmptyChannel { .. }
+        )
+    {
         let _ = updates.send_blocking(ModelUpdate::Read(model.clone()));
     }
     if let Some(repository) = reopened {
@@ -568,6 +574,7 @@ impl Cagents {
                     .and_then(|operation| self.shared_views.requested_transfer_card(operation));
                 self.install_workspace_model_snapshot(model);
                 self.acknowledge_view_edit(scope, operation);
+                self.retire_settled_empty_channels();
                 self.retarget_transferred_pane_updates(transferred);
                 self.reconcile_workspace_model()
             }
@@ -620,6 +627,26 @@ impl Cagents {
                 self.apply_closed_project_tombstones()
             }
             ModelUpdate::Edited { sequence, edit } => {
+                // Work commits and metadata announcements can cross between
+                // independent WAL connections. Even an older invalidation
+                // must refresh its exact home; it never replays a model edit.
+                if let ModelEdit::ChannelWorkChanged { home } = &edit {
+                    if home.registry != self.workspace_model.identity {
+                        return Task::none();
+                    }
+                    // This is an independent invalidation, not a folded
+                    // canonical edit. Advancing that watermark could discard
+                    // a delayed, lower-sequence channel/project edit.
+                    return if self.channel_work.view.home() == Some(*home) {
+                        self.channel_work
+                            .view
+                            .refresh()
+                            .map_or_else(Task::none, |effect| self.channel_work_effect(effect))
+                    } else {
+                        Task::none()
+                    };
+                }
+
                 if sequence <= self.workspace_model.sequence {
                     return Task::none();
                 }

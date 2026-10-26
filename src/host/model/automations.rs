@@ -1532,6 +1532,7 @@ fn accept_firing(
                     ],
                 )
                 .map_err(|error| error.to_string())?;
+                super::channel_work::renamed_in(tx, channel)?;
             }
             tx.execute_batch("RELEASE automation_accept")
                 .map_err(|error| error.to_string())?;
@@ -2968,9 +2969,32 @@ mod tests {
         let model = registry.model().unwrap();
         let channel = model.channel(accepted.agent.channel().unwrap()).unwrap();
         assert_eq!(channel.title, "Current standup name");
+        let work_title: String = registry
+            .db
+            .query_row(
+                "SELECT title FROM channel_work_homes WHERE channel=?1 AND incarnation=?2",
+                params![channel.id.to_string(), channel.ordinal],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(work_title, channel.title);
         assert_eq!(
             channel.title_source,
             crate::model::ChannelTitleSource::Manual
+        );
+        let home = crate::channel_work::Home {
+            registry: model.identity,
+            channel: channel.id,
+            creation_ordinal: channel.ordinal,
+        };
+        registry
+            .apply(&ModelEdit::CloseProject {
+                repository: channel.repository.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            registry.read_channel_work_home(&home).unwrap().lifecycle,
+            crate::channel_work::HomeLifecycle::Deleted
         );
     }
 
@@ -3566,7 +3590,14 @@ mod tests {
             .unwrap();
         registry
             .db
-            .execute_batch("DROP TABLE automation_lifecycle; PRAGMA user_version=15;")
+            .execute_batch(
+                "DROP TABLE channel_work_placement_epochs;
+                DROP TABLE channel_work_placement_clock;
+                DROP TABLE channel_work_operations;
+                DROP TABLE channel_work_entries;
+                DROP TABLE channel_work_homes;
+                DROP TABLE automation_lifecycle; PRAGMA user_version=15;",
+            )
             .unwrap();
         drop(registry);
         let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
