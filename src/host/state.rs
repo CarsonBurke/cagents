@@ -4249,6 +4249,12 @@ fn start_terminal_view_owned_reserved(
             }
         })
     };
+    // Fresh holders receive this exact daemon-issued source. Retain it after
+    // successful startup instead of the caller's proofless relaunch projection.
+    // Adoption keeps its independently installed previous source above.
+    let registered_session = holder_recovery
+        .as_ref()
+        .map_or_else(|| session.clone(), |recovery| recovery.source.clone());
 
     let agent_authority = if paired {
         match super::agent_execution::registry(shared) {
@@ -4522,7 +4528,7 @@ fn start_terminal_view_owned_reserved(
         } else {
             state.finish_spawn_with_execution(
                 client_id,
-                session,
+                registered_session,
                 handle,
                 options.initially_visible,
                 execution_recipe.clone(),

@@ -947,7 +947,14 @@ fn orphan_authority_restore_failure_keeps_the_committed_original_in_recovery_unt
             .lock()
             .unwrap()
             .install_model(crate::host::model::Registry::at(&registry_path).unwrap());
-        let fault = rusqlite::Connection::open(&registry_path).unwrap();
+        let mut fault = rusqlite::Connection::open(&registry_path).unwrap();
+        let authority_sql: String = fault
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name='agent_authorities'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         if unavailable_registry_table {
             // A real SQLite query failure AFTER holder commit/activation, not
             // an injected replacement result or a synthetic source DTO.
@@ -1006,11 +1013,58 @@ fn orphan_authority_restore_failure_keeps_the_committed_original_in_recovery_unt
             assert!(!successor.lock().unwrap().is_shutting_down());
             assert!(successor.lock().unwrap().graceful_shutdown().0.is_empty());
             assert!(owner.root.is_current() && owner.holder.is_current());
-            fault
+            let error = super::super::client::process_request(
+                &successor,
+                0,
+                ClientRequest::CloseTerminalChecked {
+                    terminal_id: source.id,
+                    allow_active: true,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+            assert!(owner.root.is_current() && owner.holder.is_current());
+            assert!(!adopted.worker_joined_for_test());
+            // Renaming back quotes the table name in sqlite_schema. Recreate
+            // its exact original DDL and preserve every actual row instead;
+            // published-layout admission remains strict throughout.
+            let repair = fault
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            repair.execute_batch(&authority_sql).unwrap();
+            repair
                 .execute_batch(
-                    "ALTER TABLE unavailable_agent_authorities RENAME TO agent_authorities",
+                    "INSERT INTO agent_authorities(token, session_id, source)
+                     SELECT token, session_id, source FROM unavailable_agent_authorities",
                 )
                 .unwrap();
+            let rows_preserved: bool = repair
+                .query_row(
+                    "SELECT NOT EXISTS(
+                        SELECT token, session_id, source FROM unavailable_agent_authorities
+                        EXCEPT SELECT token, session_id, source FROM agent_authorities
+                     ) AND (SELECT count(*) FROM agent_authorities) =
+                           (SELECT count(*) FROM unavailable_agent_authorities)",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                rows_preserved,
+                "repair must preserve every actual authority row"
+            );
+            repair
+                .execute_batch("DROP TABLE unavailable_agent_authorities")
+                .unwrap();
+            repair.commit().unwrap();
+            let repaired_sql: String = fault
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE type='table' AND name='agent_authorities'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(repaired_sql, authority_sql);
             // Repairing the query does not retry adoption or clear quarantine.
             assert!(successor.lock().unwrap().startup_recovery().is_some());
             assert_eq!(adopted.holder_identity(), Some(&owner));

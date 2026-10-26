@@ -492,16 +492,38 @@ fn pending_exit_keeps_actual_checked_close_and_fences_late_registration() {
     let serving = thread::spawn(move || client::serve(server, 1, serve_host));
     let mut rpc = Rpc::from_stream(peer);
     let source = session(&root);
-    rpc.request(ClientRequest::Spawn {
-        session: source.clone(),
-        options: TerminalSpawnOptions::default(),
-    })
-    .unwrap();
-    let owner = host.lock().unwrap().terminals[&source.id]
-        .handle
-        .holder_identity()
+    assert!(source.continuity.live_proof().is_none());
+    let ServerResponse::Spawned { terminal } = rpc
+        .request(ClientRequest::Spawn {
+            session: source.clone(),
+            options: TerminalSpawnOptions::default(),
+        })
         .unwrap()
-        .clone();
+    else {
+        panic!("actual Spawn must return its original terminal");
+    };
+    let (owner, registered, current_proof) = {
+        let state = host.lock().unwrap();
+        let record = &state.terminals[&source.id];
+        (
+            record.handle.holder_identity().unwrap().clone(),
+            record.session.clone(),
+            state.proof().clone(),
+        )
+    };
+    assert_eq!(terminal.session.id, source.id);
+    assert_eq!(
+        terminal.session.continuity.live_proof(),
+        Some(current_proof.clone())
+    );
+    let socket =
+        crate::terminal::holder::socket(&crate::terminal::holder::directory().unwrap(), source.id);
+    let (issued, _) = crate::terminal::inspect_holder(&socket, &owner, &current_proof).unwrap();
+    assert!(
+        registered == issued.source,
+        "fresh registration must retain the actual holder's authenticated source"
+    );
+    assert!(registered.continuity.live_proof().is_some());
     let mut root_pin = OriginalPin::new(owner.root.pid as u32);
     let mut holder_pin = OriginalPin::new(owner.holder.pid as u32);
     let drain = begin_ordinary_exit(&host).expect("ordinary fixture, no committed successor");

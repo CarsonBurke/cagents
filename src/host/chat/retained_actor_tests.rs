@@ -631,9 +631,9 @@ fn retained_turn_final_action(action: &str) {
     let attention_fault = rusqlite::Connection::open(&attention_path).unwrap();
     attention_fault.execute_batch("CREATE TRIGGER reject_retained_attention BEFORE INSERT ON seen BEGIN SELECT RAISE(ABORT, 'fixture attention commit failure'); END;").unwrap();
     // A real holder-owned thin console shares this native actor's exact ID.
-    // The raw terminal record will retain RelaunchAvailable on later adoption;
-    // recovery must project the authenticated current worker, not trust that raw
-    // saved continuity or replace its PTY process.
+    // Adoption retains the authenticated source in its private cleanup owner;
+    // native recovery must separately bind that exact worker and project its
+    // current daemon proof, without replacing the original PTY process.
     host.lock().unwrap().enable_holder_recovery();
     let console_recipe = crate::model::LaunchRecipe {
         program: "/bin/cat".into(),
@@ -824,19 +824,40 @@ fn retained_turn_final_action(action: &str) {
     .unwrap();
     successor.lock().unwrap().notifications = Some(_notifications.handle());
     super::super::state::restore_orphaned_holders(&successor).unwrap();
-    assert!(
-        matches!(
-            successor.lock().unwrap().terminals[&id].session.continuity,
-            crate::model::TerminalContinuity::RelaunchAvailable { .. }
-        ),
-        "raw restored console intentionally remains unpublished until native binding"
-    );
+    let restored_console = {
+        let state = successor.lock().unwrap();
+        let terminal = &state.terminals[&id];
+        // Orphan discovery appends the actual inspected holder source to these
+        // issued aliases. Keep that proof for cleanup, independently of UI state.
+        assert_eq!(Some(&terminal.session), terminal.upgrade_sources.last());
+        assert_eq!(
+            terminal.session.continuity.live_proof(),
+            Some(first.clone())
+        );
+        assert_eq!(terminal.handle.holder_identity(), Some(&pair));
+        assert!(!terminal.handle.is_completed());
+        assert!(!state.chats.contains_key(&id));
+        assert!(!state.chat_bindings.contains_key(&id));
+        assert!(!state.native_actor_startups.contains_key(&id));
+        let descriptor = state.descriptor(0, id).unwrap();
+        assert!(!descriptor.attached);
+        assert!(matches!(
+            descriptor.session.continuity,
+            crate::model::TerminalContinuity::DetachedSameBoot { .. }
+        ));
+        assert_eq!(
+            descriptor.session.continuity.live_proof().as_ref(),
+            Some(state.proof())
+        );
+        terminal.handle.clone()
+    };
     // One real restore attempt exposes its exact refusal in the surviving raw
     // panic log; orphan discovery otherwise logs and intentionally skips errors.
     super::native_recovery::restore(&successor, 0, &hosted_source).unwrap();
     {
         let state = successor.lock().unwrap();
         let record = &state.chats[&id];
+        assert!(state.terminals[&id].handle.same_worker(&restored_console));
         assert_eq!(state.terminals[&id].handle.holder_identity(), Some(&pair));
         assert!(
             pair.root.is_current(),
