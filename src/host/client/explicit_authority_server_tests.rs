@@ -541,67 +541,121 @@ fn actual_server_reauthenticates_the_issued_caller_and_never_replays_accepted_pt
             .collect::<String>()
             .contains("SEEN:SECOND_AFTER_AUTH")
     });
+    // Retain the actual registered source and worker's original physical
+    // evidence before public Shutdown. The raw offered recipe has no cleanup
+    // authority, and no live-holder Inspect is supported or needed here.
+    let original_source = {
+        let state = server.host.lock().unwrap();
+        let record = &state.terminals[&child.id];
+        assert!(record.handle.same_worker(&original));
+        assert_eq!(record.session.id, child.id);
+        assert_eq!(record.session.launch, child.launch);
+        assert_eq!(
+            record.session.continuity.live_proof(),
+            Some(server.proof.clone())
+        );
+        record.session.clone()
+    };
+    let original_holder = original.holder_identity().unwrap().clone();
+    assert_eq!(original_holder.terminal, child.id);
+    assert!(original_holder.root.is_current() && original_holder.holder.is_current());
+    let root_pidfd = original.original_root_pidfd_for_test().unwrap();
+    let mut root_event = libc::pollfd {
+        fd: root_pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    assert_eq!(unsafe { libc::poll(&mut root_event, 1, 0) }, 0);
+
     handle.shutdown().unwrap();
     wait_until("original child worker cleanup", || original.is_completed());
-    // Shutdown deliberately retains this exact completed worker for history;
-    // it is not a request to retire its descriptor. The ordinary daemon poll
-    // does not remove these records either (close_terminal_attention contract).
-    wait_until("actual completion delivery", || {
-        server
+    wait_until("explicit original metadata retirement", || {
+        !server
             .host
             .lock()
             .unwrap()
-            .replay_events(child.id, 0)
-            .unwrap()
-            .iter()
-            .any(|(_, event)| matches!(event, WireTerminalEvent::Completed { .. }))
+            .terminals
+            .contains_key(&child.id)
     });
-    {
-        let state = server.host.lock().unwrap();
-        assert!(state.terminals[&child.id].handle.same_worker(&original));
-        let ended = state.descriptor(reconnect, child.id).unwrap();
-        assert_eq!(ended.session.id, child.id);
-        assert_eq!(ended.session.launch, child.launch);
-        assert!(matches!(ended.session.continuity,
-            TerminalContinuity::RelaunchAvailable { ref recipe, .. } if recipe == &child.launch));
-        assert!(
-            state
-                .history_handle(reconnect, child.id)
-                .unwrap()
-                .same_worker(&original)
-        );
-        assert!(matches!(
-            state.surface_handle(reconnect, child.id),
-            Err(ProtocolError {
-                code: ProtocolErrorCode::TerminalUnavailable,
-                retryable: false,
-                ..
-            })
-        ));
-    }
-    // The public framed path must also refuse later input before any effect,
-    // while leaving the ended original available for read-only history.
-    handle
-        .input(b"MUST_NOT_REACH_CLOSED_PTY\n".to_vec())
-        .unwrap();
+    assert_eq!(unsafe { libc::poll(&mut root_event, 1, 0) }, 1);
+    assert_ne!(root_event.revents & libc::POLLIN, 0);
+    assert_eq!(root_event.revents & (libc::POLLERR | libc::POLLNVAL), 0);
+    // Retention retires an explicitly closed original only after actual join,
+    // its held holder pidfd exit and an authenticated exact-source receipt.
+    assert!(matches!(
+        original.completed_retirement(&original_source, &server.proof),
+        crate::terminal::TerminalRetirement::Released
+    ));
+    assert!(matches!(
+        original.completed_retirement(&child, &server.proof),
+        crate::terminal::TerminalRetirement::Retained(_)
+    ));
+    wait_until("original root and holder reap", || {
+        !original_holder.root.is_current() && !original_holder.holder.is_current()
+    });
+    assert!(
+        !server
+            .host
+            .lock()
+            .unwrap()
+            .terminals
+            .contains_key(&child.id)
+    );
+
+    // Retired records also lose their subscription. The SAME attached adapter
+    // must receive the precise real server refusal, never replay this input or
+    // create a replacement actor. Absence alone does not establish cleanup.
+    let closed_input = b"MUST_NOT_REACH_CLOSED_PTY\n";
+    handle.input(closed_input.to_vec()).unwrap();
     let events = handle.events();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let event = events
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .expect("closed PTY input refusal");
-        if let TerminalEvent::InputRejected { operation, message } = event {
-            assert_eq!(operation, "write terminal input");
-            assert!(message.contains("this input was not sent"));
+            .expect("retired PTY input refusal");
+        if let TerminalEvent::Error { operation, message } = event
+            && operation == "write terminal input"
+        {
+            assert!(message.contains("client is not attached to terminal"));
             break;
         }
-        assert!(Instant::now() < deadline, "missing closed PTY refusal");
+        assert!(Instant::now() < deadline, "missing retired PTY refusal");
     }
+    let operations = server.operations();
+    for bytes in [FIRST, SECOND, closed_input.as_slice()] {
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|event| event.operation == Operation::Input(child.id, bytes.to_vec()))
+                .count(),
+            1
+        );
+    }
+    assert!(operations.iter().any(|event| {
+        event.client == reconnect
+            && event.operation == Operation::Input(child.id, closed_input.to_vec())
+            && event.refused == Some(ProtocolErrorCode::PermissionDenied)
+    }));
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|event| matches!(&event.operation, Operation::Spawn(id) if *id == child.id))
+            .count(),
+        1,
+        "only the original accepted spawn may exist"
+    );
     assert_eq!(
         fs::read(child.launch.working_directory.join("input")).unwrap(),
         expected
     );
-    assert!(server.worker(child.id).same_worker(&original));
+    assert!(
+        !server
+            .host
+            .lock()
+            .unwrap()
+            .terminals
+            .contains_key(&child.id)
+    );
     handle.stop_for_test();
     drop(handle);
     drop(bootstrap);
