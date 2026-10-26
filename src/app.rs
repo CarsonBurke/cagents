@@ -12107,6 +12107,9 @@ impl Cagents {
         if self.automation_approval_open() {
             return self.cancel_automation_approval();
         }
+        if self.device_dialog_on_top() {
+            return self.update_device(device_ui::Action::Close);
+        }
         if self.session_recovery.open() {
             return self.update_session_recovery(session_recovery::Action::Cancel);
         }
@@ -12137,6 +12140,15 @@ impl Cagents {
         self.focus_context_overlay_if_exposed()
     }
 
+    /// Device tools are drawn above recovery and other form dialogs, but below
+    /// approvals and pending-work confirmations. Their keys share that order.
+    pub(super) fn device_dialog_on_top(&self) -> bool {
+        self.device_ui.open
+            && !self.automation_approval_open()
+            && self.transient_work_close.is_none()
+            && !self.automation_ui.draft_dialog_open()
+    }
+
     /// Whether a form dialog is the dialog on screen, not one under another.
     fn form_dialog_on_top(&self) -> bool {
         self.form_dialog_is_open()
@@ -12151,7 +12163,8 @@ impl Cagents {
         if self.browser_import.open() {
             return true;
         }
-        self.session_recovery.open()
+        self.device_ui.open
+            || self.session_recovery.open()
             || self.daemon_health_ui.confirmation
             || self.automation_approval_open()
             || self.dirty_repository_close.is_some()
@@ -16830,6 +16843,18 @@ impl Application for Cagents {
                 }
                 if let Some(task) = self.automation_approval_key(&event, captured) {
                     return task;
+                }
+                if self.device_dialog_on_top() {
+                    if let keyboard::Event::ModifiersChanged(modifiers) = &event {
+                        self.keyboard_modifiers = *modifiers;
+                    }
+                    // Native device fields have already received the key. Do
+                    // not let a retained recovery or Resume dialog answer it.
+                    return if is_escape_press(&event) {
+                        self.update_device(device_ui::Action::Close)
+                    } else {
+                        Task::none()
+                    };
                 }
                 #[cfg(feature = "integrated-browser")]
                 if is_escape_press(&event) && self.browser_import_on_top() {
@@ -23914,6 +23939,30 @@ mod tests {
                 .is_some_and(|details| details.contains("refused the handoff"))),
             "the refusal is recorded as a notice, not a process abort: {:?}",
             app.notices.entries
+        );
+    }
+
+    #[test]
+    fn device_close_focuses_visible_dirty_confirmation_before_retained_resume() {
+        let (mut app, card) = editing_repository_app();
+        drop(app.begin_dirty_close(DirtyCloseIntent::Card(card), VecDeque::from([card])));
+        app.dirty_repository_close.as_mut().unwrap().focused = DirtyCloseControl::Save;
+        app.resume_ui.open = true;
+        app.device_ui.open = true;
+        let task = app.update(Message::KeyEvent {
+            event: dialog_ui::tests::key_press(keyboard::key::Named::Escape),
+            captured: false,
+        });
+        assert!(!app.device_ui.open);
+        assert!(app.resume_ui.open);
+        assert!(app.dirty_repository_close.is_some());
+        assert_eq!(
+            app.dirty_repository_close.as_ref().unwrap().focused,
+            DirtyCloseControl::Cancel
+        );
+        assert_eq!(
+            focused_element(cosmic::Application::dialog(&app).unwrap(), task),
+            Some(dirty_close_control_id(card, DirtyCloseControl::Cancel)),
         );
     }
 

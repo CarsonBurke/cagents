@@ -187,7 +187,7 @@ impl Cagents {
                     Err(error) => self.session_recovery.error = Some(error),
                 }
                 self.session_recovery.focus = 0;
-                recovery_focus(0)
+                self.focus_session_recovery_if_exposed()
             }
             Action::Cancel if self.session_recovery.open() && !self.session_recovery.pending => {
                 self.close_session_recovery()
@@ -202,7 +202,7 @@ impl Cagents {
                         "The refused pane changed. Cancel and review the current save notice."
                             .into(),
                     );
-                    return recovery_focus(0);
+                    return self.focus_session_recovery_if_exposed();
                 }
                 let snapshot = self.persistent_workspace();
                 let receipt = self
@@ -235,11 +235,24 @@ impl Cagents {
                     Err(error) => {
                         self.session_recovery.error = Some(error);
                         self.session_recovery.focus = 0;
-                        recovery_focus(0)
+                        self.focus_session_recovery_if_exposed()
                     }
                 }
             }
             _ => Task::none(),
+        }
+    }
+
+    pub(super) fn focus_session_recovery_after_cover(&mut self) -> Task<Message> {
+        self.session_recovery.focus = 0;
+        self.focus_session_recovery_if_exposed()
+    }
+
+    fn focus_session_recovery_if_exposed(&self) -> Task<Message> {
+        if self.device_ui.open {
+            Task::none()
+        } else {
+            recovery_focus(0)
         }
     }
 
@@ -250,6 +263,9 @@ impl Cagents {
         self.session_recovery.error = None;
         if let Some(restore) = self.session_recovery.restore_keyboard_nav.take() {
             self.core.set_keyboard_nav(restore);
+        }
+        if self.device_ui.open {
+            return Task::none();
         }
         let target = self
             .workspace
@@ -434,6 +450,100 @@ mod tests {
         app.save_health = Some(save_health);
         app.core.set_keyboard_nav(true);
         (directory, app, card)
+    }
+
+    #[test]
+    fn device_files_keys_preserve_hidden_session_recovery_and_restore_its_focus() {
+        for captured in [false, true] {
+            let (_directory, mut app, card) = fixture();
+            let opening = app.update_session_recovery(Action::Open(card));
+            let prepared = reply(opening);
+            drop(app.update(prepared));
+            assert!(app.session_recovery.review.is_some());
+            let confirm_focus = app.update(Message::KeyEvent {
+                event: key(keyboard::key::Named::Tab, false),
+                captured: false,
+            });
+            assert_eq!(
+                super::super::tests::focused_element(
+                    app.session_recovery_dialog().unwrap(),
+                    confirm_focus,
+                ),
+                Some(widget::Id::new("session-recovery.confirm")),
+            );
+            assert_eq!(app.session_recovery.focus, 1);
+            app.device_ui.open = true;
+            for named in [keyboard::key::Named::Tab, keyboard::key::Named::Enter] {
+                let task = app.update(Message::KeyEvent {
+                    event: key(named, false),
+                    captured,
+                });
+                assert!(iced::runtime::task::into_stream(task).is_none());
+                assert_eq!(app.session_recovery.focus, 1);
+                assert!(app.session_recovery.open());
+            }
+            let task = app.update(Message::KeyEvent {
+                event: key(keyboard::key::Named::Escape, false),
+                captured,
+            });
+            assert!(!app.device_ui.open);
+            assert!(app.session_recovery.open());
+            assert_eq!(
+                super::super::tests::focused_element(app.session_recovery_dialog().unwrap(), task),
+                Some(widget::Id::new("session-recovery.cancel")),
+            );
+            assert_eq!(app.session_recovery.focus, 0);
+            drop(app.update(Message::KeyEvent {
+                event: key(keyboard::key::Named::Enter, false),
+                captured: false,
+            }));
+            assert!(
+                !app.session_recovery.open(),
+                "Enter follows the visible Cancel focus"
+            );
+            drop(app.update_session_recovery(Action::Open(card)));
+            app.device_ui.open = true;
+            drop(app.update(Message::CancelDialog));
+            assert!(!app.device_ui.open);
+            assert!(app.session_recovery.open());
+        }
+    }
+
+    #[test]
+    fn session_recovery_completions_do_not_focus_beneath_device_files() {
+        let (_directory, mut app, card) = fixture();
+        drop(app.update_session_recovery(Action::Open(card)));
+        app.device_ui.open = true;
+        let task = app.update(Message::SessionRecovery(Action::Prepared {
+            generation: app.session_recovery.generation,
+            result: Err("fixture preparation error".into()),
+        }));
+        assert!(iced::runtime::task::into_stream(task).is_none());
+        assert_eq!(
+            app.session_recovery.error.as_deref(),
+            Some("fixture preparation error")
+        );
+        assert!(app.device_ui.open);
+        app.session_recovery.pending = true;
+        let task = app.update(Message::SessionRecovery(Action::Finished(Err(
+            "fixture write error".into(),
+        ))));
+        assert!(iced::runtime::task::into_stream(task).is_none());
+        assert!(app.session_recovery.open());
+        assert!(app.device_ui.open);
+        app.session_recovery.pending = true;
+        let task = app.update(Message::SessionRecovery(Action::Finished(Ok(()))));
+        assert!(iced::runtime::task::into_stream(task).is_none());
+        assert!(!app.session_recovery.open());
+        assert!(app.device_ui.open);
+        // Explicit cancellation follows the same covered-close focus rule.
+        app.device_ui.open = false;
+        drop(app.update_session_recovery(Action::Open(card)));
+        app.device_ui.open = true;
+        let task = app.update(Message::SessionRecovery(Action::Cancel));
+        assert!(iced::runtime::task::into_stream(task).is_none());
+        assert!(!app.session_recovery.open());
+        assert!(app.device_ui.open);
     }
 
     #[test]

@@ -314,6 +314,68 @@ impl Cagents {
         self.reconcile_shared_views()
     }
 
+    /// Restore only the surface exposed by closing Device files. In
+    /// particular, a retained recovery must keep keyboard ownership rather
+    /// than returning it to a background terminal or composer.
+    fn focus_after_device_close(&mut self) -> Task<Message> {
+        // The image viewer handles keys at the app level and has no native
+        // focus target. Leave the workspace unfocused while it is exposed.
+        if self.chat_ui.image_viewer.is_some() {
+            return Task::none();
+        }
+        let target = if self.terminal_paste.is_some() {
+            Some(widget::Id::new("terminal-paste-cancel"))
+        } else {
+            #[cfg(feature = "integrated-browser")]
+            if self.browser_import.open() {
+                return iced::widget::operation::focus(widget::Id::new(
+                    "dialog.browser-import.cancel",
+                ))
+                .map(cosmic::Action::App);
+            }
+            if self.session_recovery.open() {
+                return self.focus_session_recovery_after_cover();
+            } else if self.daemon_health_ui.confirmation {
+                return self.focus_daemon_health_after_cover();
+            } else if self.update_ui.confirmation.is_some() {
+                Some(widget::Id::new("update.cancel"))
+            } else if self.terminal_close_dialog_visible() {
+                return self.focus_terminal_close_after_cover();
+            } else if self.settings_reset_confirm {
+                self.settings_reset_focus_confirm = false;
+                Some(widget::Id::new("dialog.reset-settings.cancel"))
+            } else if self.sidebar_state.pending_discard().is_some() {
+                Some(sidebar::discard_cancel_id())
+            } else if let Some(close) = &mut self.dirty_repository_close {
+                close.focused = DirtyCloseControl::Cancel;
+                Some(dirty_close_control_id(
+                    close.card,
+                    DirtyCloseControl::Cancel,
+                ))
+            } else if let Some(dialog) = &self.sidebar_selection_ui.dialog {
+                Some(dialog.focus_target())
+            } else if self.project_ui.modal_open() {
+                Some(self.project_ui.focus_target())
+            } else if self.channel_ui.modal_open() {
+                Some(channel_ui::State::focus_target())
+            } else if self.worktree_dialog.is_some() {
+                Some(worktree_dialog_focus_id())
+            } else if self.resume_ui.open {
+                Some(resume_ui::focus_id())
+            } else if self.pull_request_dialog.is_some() {
+                Some(pull_request_dialog_focus_id())
+            } else if self.context_inspector_is_overlay() {
+                Some(context_inspector_toggle_id())
+            } else {
+                self.workspace
+                    .focused()
+                    .map(|card| self.card_keyboard_focus(card))
+            }
+        };
+        iced::widget::operation::focus(target.unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)))
+            .map(cosmic::Action::App)
+    }
+
     pub(super) fn update_device(&mut self, action: Action) -> Task<Message> {
         if let Action::Menu(open) = action {
             self.device_ui.menu_open =
@@ -569,6 +631,7 @@ impl Cagents {
                 return Task::none();
             }
             Action::Close => {
+                let restore_focus = self.device_dialog_on_top();
                 if let Some(image) = self.device_ui.image.take() {
                     image.task.abort();
                     self.device_ui.generation = self.device_ui.generation.wrapping_add(1);
@@ -577,6 +640,9 @@ impl Cagents {
                 }
                 if !self.device_ui.busy {
                     self.device_ui.open = false;
+                    if restore_focus {
+                        return self.focus_after_device_close();
+                    }
                 }
                 return Task::none();
             }
@@ -1088,6 +1154,7 @@ impl Cagents {
                     state.directory.parent().is_some(),
                 ),
                 crate::ui_controls::field::text("Directory", &state.path)
+                    .id(widget::Id::new("device-tools.directory"))
                     .on_input(|value| Message::Device(Action::Path(value)))
                     .on_submit(|_| Message::Device(Action::Browse))
                     .width(Length::Fill)
@@ -1427,7 +1494,192 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::Provider;
+    use crate::{agent::Provider, chat, persistence::SavedConversation};
+
+    fn device_key(app: &mut Cagents, named: keyboard::key::Named, captured: bool) -> Task<Message> {
+        app.update(Message::KeyEvent {
+            event: super::super::dialog_ui::tests::key_press(named),
+            captured,
+        })
+    }
+
+    #[test]
+    fn focused_device_directory_captured_escape_closes_only_device_files() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.daemon_health_ui.confirmation = true;
+        app.device_ui.open = true;
+        let event = super::super::dialog_ui::tests::key_press(keyboard::key::Named::Escape);
+        let (_, captured) = super::super::dialog_ui::tests::key_control(
+            app.device_dialog(),
+            widget::Id::new("device-tools.directory"),
+            event.clone(),
+        );
+        assert!(
+            captured,
+            "the mounted COSMIC directory field owns Escape before App dispatch"
+        );
+        let task = app.update(Message::KeyEvent { event, captured });
+        assert!(!app.device_ui.open);
+        assert!(app.daemon_health_ui.confirmation);
+        assert_eq!(
+            super::super::tests::focused_element(app.daemon_health_dialog().unwrap(), task),
+            Some(widget::Id::new("daemon-health.cancel")),
+        );
+    }
+
+    #[test]
+    fn device_files_keys_preserve_hidden_daemon_recovery_and_restore_its_focus() {
+        for captured in [false, true] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            app.daemon_health_ui.confirmation = true;
+            app.device_ui.open = true;
+            assert!(app.device_dialog_on_top());
+            assert!(!app.form_dialog_on_top());
+            for named in [keyboard::key::Named::Tab, keyboard::key::Named::Enter] {
+                assert!(
+                    iced::runtime::task::into_stream(device_key(&mut app, named, captured))
+                        .is_none()
+                );
+                assert!(app.daemon_health_ui.confirmation);
+            }
+            let task = device_key(&mut app, keyboard::key::Named::Escape, captured);
+            assert!(!app.device_ui.open);
+            assert!(app.daemon_health_ui.confirmation);
+            assert_eq!(
+                super::super::tests::focused_element(app.daemon_health_dialog().unwrap(), task),
+                Some(widget::Id::new("daemon-health.cancel")),
+            );
+            drop(device_key(&mut app, keyboard::key::Named::Escape, captured));
+            assert!(!app.daemon_health_ui.confirmation);
+        }
+        // Generic cancellation follows the same foreground order as Escape.
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.daemon_health_ui.confirmation = true;
+        app.device_ui.open = true;
+        drop(app.update(Message::CancelDialog));
+        assert!(!app.device_ui.open);
+        assert!(app.daemon_health_ui.confirmation);
+    }
+
+    #[test]
+    fn device_files_keys_leave_retained_resume_unchanged_and_restore_search_focus() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.resume_ui.open = true;
+        drop(app.update_resume(resume_ui::Action::More));
+        let entries = (0..2)
+            .map(|index| SavedConversation {
+                card: CardId::new(),
+                title: format!("Retained conversation {index}"),
+                session: chat::fresh_session(
+                    Provider::Claude,
+                    TerminalId::new(),
+                    PathBuf::from("/fixture"),
+                    &crate::account::Account::system(Provider::Claude),
+                )
+                .unwrap(),
+                open: false,
+                updated_at_unix_ms: index,
+            })
+            .collect();
+        drop(app.update_resume(resume_ui::Action::Indexed(
+            0,
+            resume_ui::Progress::Saved {
+                entries,
+                seeds: Arc::from([]),
+                error: None,
+            },
+        )));
+        app.device_ui.open = true;
+        assert!(!app.form_dialog_on_top());
+        for named in [
+            keyboard::key::Named::ArrowDown,
+            keyboard::key::Named::ArrowUp,
+            keyboard::key::Named::Enter,
+        ] {
+            // Resume navigation produces a reveal operation. No operation may
+            // escape from the retained picker while Device files is visible.
+            assert!(iced::runtime::task::into_stream(device_key(&mut app, named, false)).is_none());
+            assert!(app.resume_ui.open);
+        }
+        let task = device_key(&mut app, keyboard::key::Named::Escape, true);
+        assert!(!app.device_ui.open);
+        assert!(app.resume_ui.open);
+        assert_eq!(
+            super::super::tests::focused_element(app.resume_dialog().unwrap(), task),
+            Some(resume_ui::focus_id()),
+        );
+    }
+
+    #[test]
+    fn device_files_escape_preserves_dirty_and_busy_operations_and_higher_dialogs() {
+        let mut app = loaded_file();
+        app.daemon_health_ui.confirmation = true;
+        let task = device_key(&mut app, keyboard::key::Named::Escape, true);
+        assert!(iced::runtime::task::into_stream(task).is_none());
+        assert!(app.device_ui.open && app.device_ui.dirty());
+        assert_eq!(app.device_ui.content.text(), "unsaved draft");
+        assert!(app.daemon_health_ui.confirmation);
+        assert!(
+            app.device_ui
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains("Unsaved changes")
+        );
+        drop(app.update_device(Action::DiscardChanges));
+        app.device_ui.busy = true;
+        app.device_ui.pending = Some(Operation::List {
+            path: "/fixture".into(),
+        });
+        let generation = app.device_ui.generation;
+        let task = device_key(&mut app, keyboard::key::Named::Escape, false);
+        assert!(iced::runtime::task::into_stream(task).is_none());
+        assert!(app.device_ui.open && app.device_ui.busy);
+        assert!(app.device_ui.pending.is_some());
+        assert_eq!(app.device_ui.generation, generation);
+        assert!(app.daemon_health_ui.confirmation);
+
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.device_ui.open = true;
+        let window = cosmic::iced::window::Id::unique();
+        app.transient_work_close = Some(window);
+        assert!(!app.device_dialog_on_top());
+        // A stale close may retire Device files, but cannot move focus away
+        // from the confirmation that is still mounted above it.
+        let task = app.update_device(Action::Close);
+        assert!(iced::runtime::task::into_stream(task).is_none());
+        assert_eq!(app.transient_work_close, Some(window));
+    }
+
+    #[test]
+    fn device_files_escape_cancels_only_its_pending_image_read() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        drop(app.update_device(Action::OpenFile {
+            path: "/fixture/image.png".into(),
+            fragment: None,
+        }));
+        assert!(app.device_ui.open && app.device_ui.busy && app.device_ui.image.is_some());
+        let image = app.device_ui.image.as_ref().unwrap().task.clone();
+        app.daemon_health_ui.confirmation = true;
+        drop(device_key(&mut app, keyboard::key::Named::Escape, false));
+        assert!(image.is_aborted());
+        assert!(!app.device_ui.open && !app.device_ui.busy);
+        assert!(app.device_ui.pending.is_none());
+        assert!(app.daemon_health_ui.confirmation);
+    }
+
+    #[test]
+    fn device_files_close_restores_workspace_focus_only_when_exposed() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        app.workspace.resize_viewport(1200.0);
+        app.device_ui.open = true;
+        let target = app.card_keyboard_focus(app.workspace.focused().unwrap());
+        let task = device_key(&mut app, keyboard::key::Named::Escape, false);
+        assert!(!app.device_ui.open);
+        assert_eq!(super::super::tests::focused(&app, task), Some(target));
+        assert!(iced::runtime::task::into_stream(app.update_device(Action::Close)).is_none());
+    }
 
     #[test]
     fn devices_menu_and_keyboard_chat_picker_transfer_keyboard_ownership() {

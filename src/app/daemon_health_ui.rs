@@ -121,6 +121,12 @@ impl Cagents {
             _ => Task::none(),
         }
     }
+    // Shared support seam for the Device files foreground-key follow-up.
+    pub(super) fn focus_daemon_health_after_cover(&mut self) -> Task<Message> {
+        self.daemon_health_ui.focus = 0;
+        health_focus(0)
+    }
+
     fn daemon_health_restore_focus(&self) -> Task<Message> {
         let target = self
             .workspace
