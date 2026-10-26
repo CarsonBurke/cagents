@@ -342,6 +342,12 @@ impl State {
     pub fn pending_homes(&self) -> impl Iterator<Item = Home> + '_ {
         self.pending.iter().map(|pending| pending.mutation.home)
     }
+    pub fn has_context_draft(&self) -> bool {
+        self.view
+            .as_ref()
+            .is_some_and(|view| view.form.is_some() || view.confirmation.is_some())
+    }
+
     pub fn has_confirmation(&self) -> bool {
         self.view
             .as_ref()
@@ -394,17 +400,22 @@ impl State {
         }
         self.read(owner)
     }
-    pub fn escape(&mut self) -> Option<Effect> {
+    /// Capture the exact visible owner before a native Escape is queued.
+    pub fn escape_action(&self) -> Option<Action> {
         let view = self.view.as_ref()?;
         if let Some(confirmation) = &view.confirmation {
-            return self.update(Action::Keep(view.owner, confirmation.id));
+            return Some(Action::Keep(view.owner, confirmation.id));
         }
-        self.update(match view.form.as_ref() {
+        Some(match view.form.as_ref() {
             Some(form) if self.pending_for(view.owner.home).is_none() => {
                 Action::Dismiss(form.owner)
             }
             _ => Action::Close(view.owner),
         })
+    }
+
+    pub fn escape(&mut self) -> Option<Effect> {
+        self.update(self.escape_action()?)
     }
     fn leave(&mut self, owner: ViewOwner, intent: Leave) -> Option<Effect> {
         if !self.current(owner) || self.has_confirmation() {
@@ -989,6 +1000,225 @@ impl State {
 }
 
 impl State {
+    /// Related PRs are context beside a conversation, never a replacement workspace.
+    /// Keep the existing owner, requests and forms so navigation cannot retarget
+    /// an edited draft or turn an uncertain operation into a new mutation.
+    pub fn context_view(&self, width: f32, height: f32) -> Element<'_, Action> {
+        self.context_view_for_home(width, height, true)
+    }
+
+    pub fn context_view_for_home(
+        &self,
+        width: f32,
+        height: f32,
+        current: bool,
+    ) -> Element<'_, Action> {
+        let Some(view) = &self.view else {
+            return widget::Space::new().into();
+        };
+        let owner = view.owner;
+        let narrow = width < 420.0;
+        let refresh = ui_controls::owned(
+            (owner, "context-refresh", current),
+            ui_controls::icon_button(
+                if view.loading.is_some() {
+                    Icon::Loading
+                } else {
+                    Icon::Refresh
+                },
+                if view.loading.is_some() {
+                    "Updating related pull requests…"
+                } else {
+                    "Refresh related pull requests"
+                },
+            )
+            .on_press_maybe((current && view.loading.is_none()).then_some(Action::Refresh(owner))),
+        );
+        let attach = ui_controls::owned(
+            (owner, "context-attach", current && self.writable(owner)),
+            ui_controls::icon_button(Icon::Plus, "Add a related pull request")
+                .id(attach_id(owner))
+                .on_press_maybe((current && self.writable(owner)).then_some(Action::Attach(owner))),
+        );
+        let header = widget::row::with_children(vec![
+            design::heading("Pull requests").width(Length::Fill).into(),
+            refresh,
+            attach,
+        ])
+        .align_y(Alignment::Center)
+        .spacing(space::XXS);
+        let mut status = Vec::new();
+        if let Some(confirmation) = &view.confirmation {
+            status.push(panel(vec![
+                design::heading("Discard this PR draft?").into(),
+                flow(
+                    vec![
+                        ui_controls::owned(
+                            (owner, confirmation.id, "keep"),
+                            button::primary("Keep editing")
+                                .id(confirmation_id(confirmation.id))
+                                .on_press(Action::Keep(owner, confirmation.id)),
+                        ),
+                        ui_controls::owned(
+                            (owner, confirmation.id, "discard"),
+                            button::destructive("Discard draft")
+                                .on_press(Action::Discard(owner, confirmation.id)),
+                        ),
+                    ],
+                    narrow,
+                ),
+            ]));
+        }
+        if let Some(error) = &view.error {
+            status.push(message(error, true));
+        }
+        if let Some(notice) = &view.notice {
+            status.push(message(notice, false));
+        }
+        if let Some(pending) = self.pending_for(owner.home) {
+            let mut rows = vec![
+                design::caption(match pending.delivery {
+                    Delivery::Sending => "Saving PR changes…",
+                    Delivery::Checking => "Checking PR changes…",
+                    Delivery::Unknown => "PR changes are not confirmed yet.",
+                })
+                .into(),
+            ];
+            if pending.delivery == Delivery::Unknown {
+                rows.push(flow(
+                    vec![
+                        ui_controls::owned(
+                            (owner, pending.mutation.operation, "context-check"),
+                            button::secondary("Check result")
+                                .on_press(Action::Check(owner, pending.mutation.operation)),
+                        ),
+                        ui_controls::owned(
+                            (owner, pending.mutation.operation, "context-retry"),
+                            button::quiet("Retry")
+                                .name("Retry the original PR change")
+                                .on_press(Action::Retry(owner, pending.mutation.operation)),
+                        ),
+                    ],
+                    narrow,
+                ));
+            }
+            status.push(panel(rows));
+        }
+        let mut body = Vec::new();
+        if let Some(form) = &view.form {
+            body.push(design::caption(format!("PR draft · {}", view.title)).into());
+            body.push(self.form_view_with_submission(view, form, narrow, current));
+        }
+        if let Some(snapshot) = &view.snapshot
+            && current
+        {
+            let mut seen = std::collections::HashSet::new();
+            let entries: Vec<_> = snapshot
+                .entries
+                .iter()
+                .chain(&snapshot.history)
+                .filter(|entry| {
+                    matches!(entry.target, Target::PullRequest(_))
+                        && !entry.suppressed
+                        && seen.insert(entry.id)
+                })
+                .collect();
+            if entries.is_empty() && view.form.is_none() {
+                body.push(design::caption("No related pull requests").into());
+            }
+            for entry in entries.iter().take(view.visible) {
+                let row_owner = RowOwner {
+                    view: owner,
+                    id: entry.id,
+                    target: entry.target.clone(),
+                    revision: entry.revision,
+                    bucket: entry.bucket(),
+                };
+                let title = entry
+                    .observation
+                    .as_ref()
+                    .and_then(|observation| observation.title.as_deref())
+                    .filter(|title| !title.is_empty());
+                let mut text = vec![
+                    design::body(title.map_or_else(|| target_label(&entry.target), str::to_owned))
+                        .width(Length::Fill)
+                        .into(),
+                ];
+                if title.is_some() {
+                    text.push(design::caption(target_label(&entry.target)).into());
+                }
+                text.push(design::caption(entry_status(entry)).into());
+                let content = widget::row::with_children(vec![
+                    widget::icon(Icon::PullRequest.handle()).size(16).into(),
+                    widget::column::with_children(text)
+                        .spacing(space::XXS)
+                        .width(Length::Fill)
+                        .into(),
+                ])
+                .spacing(space::XS)
+                .align_y(Alignment::Start);
+                body.push(ui_controls::owned(
+                    (owner, entry.id, entry.target.clone(), "context-open"),
+                    widget::button::custom(content)
+                        .id(context_pr_id(owner, entry.id))
+                        .width(Length::Fill)
+                        .name(format!("Open {}", target_label(&entry.target)))
+                        .on_press(Action::Open(row_owner)),
+                ));
+            }
+            if entries.len() > view.visible {
+                body.push(ui_controls::owned(
+                    (owner, "context-more"),
+                    button::quiet("Show more pull requests").on_press(Action::More(owner)),
+                ));
+            }
+            let ready = view.loading.is_none();
+            if view.page.current_before.is_some() {
+                body.push(ui_controls::owned(
+                    (owner, "context-latest"),
+                    button::quiet("Latest pull requests")
+                        .on_press_maybe(ready.then_some(Action::LatestCurrent(owner))),
+                ));
+            }
+            if let Some(before) = snapshot.next_current {
+                body.push(ui_controls::owned(
+                    (owner, before, "context-next"),
+                    button::quiet("More pull requests")
+                        .on_press_maybe(ready.then_some(Action::NextCurrent(owner, before))),
+                ));
+            }
+            if view.page.before.is_some() {
+                body.push(ui_controls::owned(
+                    (owner, "context-latest-history"),
+                    button::quiet("Recent history")
+                        .on_press_maybe(ready.then_some(Action::Latest(owner))),
+                ));
+            }
+            if let Some(before) = snapshot.next_history {
+                body.push(ui_controls::owned(
+                    (owner, before, "context-older"),
+                    button::quiet("Older pull requests")
+                        .on_press_maybe(ready.then_some(Action::Earlier(owner, before))),
+                ));
+            }
+        } else if view.form.is_none() {
+            body.push(
+                design::caption(if view.loading.is_some() {
+                    "Loading pull requests…"
+                } else {
+                    "Pull requests are unavailable"
+                })
+                .into(),
+            );
+        }
+        let content = mount(header, status, body, height);
+        if let Some(escape) = self.escape_action() {
+            crate::interaction::focused_escape(content, move || escape.clone())
+        } else {
+            content
+        }
+    }
+
     pub fn view(&self, width: f32, height: f32) -> Element<'_, Action> {
         let Some(view) = &self.view else {
             return widget::Space::new().into();
@@ -1340,6 +1570,16 @@ impl State {
         form: &'a Form,
         narrow: bool,
     ) -> Element<'a, Action> {
+        self.form_view_with_submission(view, form, narrow, true)
+    }
+
+    fn form_view_with_submission<'a>(
+        &'a self,
+        view: &'a View,
+        form: &'a Form,
+        narrow: bool,
+        can_submit: bool,
+    ) -> Element<'a, Action> {
         let enabled = self.writable(view.owner);
         let owner = form.owner;
         let target = form.target();
@@ -1359,7 +1599,7 @@ impl State {
         let submit = target
             .as_ref()
             .ok()
-            .filter(|_| enabled)
+            .filter(|_| enabled && can_submit)
             .map(|target| Action::Submit {
                 owner,
                 target: target.clone(),
@@ -1828,6 +2068,10 @@ fn mount<'a>(
 #[cfg(test)]
 mod tests;
 
+fn context_pr_id(owner: ViewOwner, entry: Uuid) -> widget::Id {
+    widget::Id::new(format!("channel-context-pr-{}-{entry}", owner.generation))
+}
+
 fn attach_id(owner: ViewOwner) -> widget::Id {
     widget::Id::new(format!("channel-work-attach-{}", owner.generation))
 }
@@ -1848,4 +2092,228 @@ fn form_input_id(owner: FormOwner, field: Field) -> widget::Id {
 
 fn confirmation_id(id: Uuid) -> widget::Id {
     widget::Id::new(format!("channel-work-keep-{id}"))
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+    use cosmic::iced::{self, advanced::widget::operation, keyboard, mouse};
+
+    fn state(entries: Vec<Entry>) -> State {
+        let home = Home {
+            registry: Uuid::from_u128(1),
+            channel: crate::model::ChannelId::from_uuid(Uuid::from_u128(2)),
+            creation_ordinal: 1,
+        };
+        let mut state = State::default();
+        let Effect::Read { ticket, .. } = state.open(home, "Conversation".into()).unwrap() else {
+            panic!()
+        };
+        let (history, entries) = entries
+            .into_iter()
+            .partition(|e: &Entry| e.bucket() == Bucket::History);
+        let snapshot = Snapshot {
+            home,
+            lifecycle: HomeLifecycle::Active,
+            revision: 1,
+            entries,
+            history,
+            next_current: None,
+            next_history: None,
+        };
+        assert!(snapshot.validate().is_ok());
+        assert!(
+            state
+                .update(Action::Loaded {
+                    ticket,
+                    result: Ok(snapshot)
+                })
+                .is_none()
+        );
+        state
+    }
+
+    fn entry(number: u64, status: PrState, freshness: Freshness) -> Entry {
+        Entry {
+            id: Uuid::from_u128(100 + u128::from(number)),
+            target: Target::PullRequest(
+                PullRequestKey::new(
+                    GitHubRepoKey::new("github.com", None, "owner", "project").unwrap(),
+                    number,
+                )
+                .unwrap(),
+            ),
+            claims: vec![crate::channel_work::Claim {
+                source: Source::User,
+                role: Role::Reference,
+                active: true,
+                confirmed_generation: 0,
+            }],
+            contexts: Vec::new(),
+            suppressed: false,
+            user_ended: false,
+            observation: Some(crate::channel_work::Observation {
+                generation: 1,
+                state: status,
+                freshness,
+                title: Some(format!(
+                    "PR {number}: a useful improvement with a long but readable title 水"
+                )),
+                node_id: None,
+                head: None,
+                observed_at_ms: 0,
+            }),
+            last_terminal_generation: 0,
+            ever_claimed: true,
+            revision: 1,
+        }
+    }
+
+    fn mount<'a>(
+        state: &'a State,
+        renderer: &mut cosmic::Renderer,
+        width: f32,
+    ) -> iced::runtime::UserInterface<'a, Action, cosmic::Theme, cosmic::Renderer> {
+        let mut ui = iced::runtime::UserInterface::build(
+            state.context_view(width, 600.0),
+            iced::Size::new(width, 600.0),
+            iced::runtime::user_interface::Cache::new(),
+            renderer,
+        );
+        ui.draw(
+            renderer,
+            &cosmic::theme::active(),
+            &iced::advanced::renderer::Style::default(),
+            mouse::Cursor::Unavailable,
+        );
+        ui
+    }
+
+    #[test]
+    fn compact_pr_context_exposes_real_rows_status_and_keyboard_links_without_dashboard_or_mutation()
+     {
+        let first = entry(1, PrState::Open { draft: false }, Freshness::Current);
+        let key = match &first.target {
+            Target::PullRequest(key) => key.clone(),
+            _ => unreachable!(),
+        };
+        let mut state = state(vec![
+            first,
+            entry(2, PrState::Merged, Freshness::Current),
+            entry(3, PrState::Closed, Freshness::Stale),
+            entry(4, PrState::Unknown, Freshness::Unavailable),
+        ]);
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        for width in [260.0, 640.0] {
+            let before =
+                serde_json::to_value(state.view.as_ref().unwrap().snapshot.as_ref().unwrap())
+                    .unwrap();
+            let mut ui = mount(&state, &mut renderer, width);
+            let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+            let labels: Vec<_> = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .flat_map(|n| [n.node().label(), n.node().value()])
+                .flatten()
+                .collect();
+            assert!(labels.iter().any(|s| *s == "Open PR"));
+            assert!(labels.iter().any(|s| *s == "Merged PR"));
+            assert!(labels.iter().any(|s| *s == "Last known: Closed PR"));
+            assert!(!labels.iter().any(|s| s.contains("Counts describe")
+                || s.contains("Ongoing")
+                || s.contains("Why here?")
+                || s.contains("channel work")));
+            let name = "Open owner/project · #1 · github.com";
+            let button = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|n| {
+                    n.node().role() == iced_accessibility::accesskit::Role::Button
+                        && n.node().label() == Some(name)
+                })
+                .unwrap_or_else(|| panic!("missing real PR button: {labels:?}"));
+            let b = button.node().bounds().unwrap();
+            assert!(b.x0 >= 0.0 && b.x1 <= f64::from(width) + 0.01 && b.x1 > b.x0 && b.y1 > b.y0);
+            // Native focus reaches the exact owned link. Enter must publish
+            // the same concrete PR identity as a click, without a mutation.
+            ui.operate(
+                &renderer,
+                &mut operation::focusable::focus::<()>(context_pr_id(
+                    state.owner().unwrap(),
+                    Uuid::from_u128(101),
+                )),
+            );
+            let mut messages = Vec::new();
+            let enter = iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            });
+            ui.update(
+                &[enter],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut messages,
+            );
+            let _ = ui.into_cache();
+            let [Action::Open(owner)] = messages.as_slice() else {
+                panic!("native PR Enter: {messages:?}")
+            };
+            let Some(Effect::OpenPullRequest { key: actual, .. }) =
+                state.update(Action::Open(owner.clone()))
+            else {
+                panic!("read-only link")
+            };
+            assert_eq!(actual, key);
+            assert!(state.pending.is_empty());
+            assert_eq!(
+                serde_json::to_value(state.view.as_ref().unwrap().snapshot.as_ref().unwrap())
+                    .unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn compact_pr_context_empty_loading_and_error_states_are_quiet_and_keep_owned_data() {
+        let mut state = state(Vec::new());
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        for phase in 0..3 {
+            if phase == 1 {
+                state.view.as_mut().unwrap().snapshot = None;
+                state.refresh();
+            }
+            if phase == 2 {
+                let view = state.view.as_mut().unwrap();
+                view.loading = None;
+                view.error = Some("Could not refresh pull requests".into());
+            }
+            let ui = mount(&state, &mut renderer, 260.0);
+            let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+            let labels: Vec<_> = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .flat_map(|n| [n.node().label(), n.node().value()])
+                .flatten()
+                .collect();
+            let expected = [
+                "No related pull requests",
+                "Loading pull requests…",
+                "Could not refresh pull requests",
+            ][phase];
+            assert!(labels.contains(&expected), "{labels:?}");
+            assert!(!labels.iter().any(|s| s.contains("Ongoing")
+                || s.contains("Counts describe")
+                || s.contains("work relations")));
+            assert!(state.pending.is_empty());
+        }
+    }
 }

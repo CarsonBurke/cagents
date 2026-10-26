@@ -632,6 +632,9 @@ pub struct Workspace {
     visibility: HashMap<CardId, VisibilityClass>,
     visibility_bands: Option<VisibilityBands>,
     pending_widget_focus: Option<CardId>,
+    /// Deferred close handoffs must not replace a control chosen while the
+    /// survivor is offscreen. Explicit navigation keeps its ordinary focus.
+    pending_widget_focus_from_close: bool,
     pending_close: Option<PendingClose>,
     resize_limits: Option<(CardId, WidthLimits)>,
     config: WorkspaceConfig,
@@ -653,6 +656,7 @@ impl Workspace {
             visibility: HashMap::new(),
             visibility_bands: None,
             pending_widget_focus: None,
+            pending_widget_focus_from_close: false,
             pending_close: None,
             resize_limits: None,
             config,
@@ -859,6 +863,7 @@ impl Workspace {
         if self.focused.is_none() || focus {
             self.focused = Some(id);
             self.pending_widget_focus = Some(id);
+            self.pending_widget_focus_from_close = false;
         }
         self.rebuild_geometry();
         if let Some(previous) = previous {
@@ -978,6 +983,7 @@ impl Workspace {
         // Retarget the running spring without restarting on held-key repeats.
         self.focused = Some(id);
         self.pending_widget_focus = Some(id);
+        self.pending_widget_focus_from_close = false;
         if reveal {
             self.reveal_focused();
         }
@@ -1010,10 +1016,15 @@ impl Workspace {
         self.focus(id)
     }
 
+    pub fn pending_widget_focus_is_close_handoff(&self) -> bool {
+        self.pending_widget_focus.is_some() && self.pending_widget_focus_from_close
+    }
+
     pub fn take_widget_focus_request(&mut self) -> Option<CardId> {
         let id = self.pending_widget_focus?;
         if self.visibility(id).is_some_and(VisibilityClass::is_mounted) {
             self.pending_widget_focus = None;
+            self.pending_widget_focus_from_close = false;
             Some(id)
         } else {
             None
@@ -1069,6 +1080,7 @@ impl Workspace {
         self.visibility.remove(&id);
         if self.pending_widget_focus == Some(id) {
             self.pending_widget_focus = None;
+            self.pending_widget_focus_from_close = false;
         }
         if self.focused == Some(id) {
             self.focused = match pending.handoff.target {
@@ -1086,11 +1098,13 @@ impl Workspace {
             };
             if !matches!(pending.handoff.target, FocusTarget::Card(_)) {
                 self.pending_widget_focus = self.focused;
+                self.pending_widget_focus_from_close = self.focused.is_some();
             }
         }
         if self.cards.is_empty() {
             self.focused = None;
             self.pending_widget_focus = None;
+            self.pending_widget_focus_from_close = false;
         }
         self.rebuild_geometry();
         if !self.cards.is_empty() && self.viewport_width > 0.0 {
@@ -2362,6 +2376,43 @@ mod tests {
         }
         assert!(!camera.is_animating());
         assert_eq!(camera.offset(), passing);
+    }
+
+    #[test]
+    fn deferred_close_focus_keeps_its_custody_until_mounted_and_explicit_navigation_replaces_it() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(1920.0); 3], 640.0);
+        let ids = workspace.order().collect::<Vec<_>>();
+        assert_eq!(workspace.take_widget_focus_request(), Some(ids[0]));
+        assert!(!workspace.pending_widget_focus_is_close_handoff());
+        assert_eq!(
+            workspace.visibility(ids[1]),
+            Some(VisibilityClass::Offscreen)
+        );
+        let handoff = workspace.request_close(ids[0]).unwrap();
+        assert_eq!(handoff.target, FocusTarget::WorkspaceToolbar);
+        workspace.commit_close(ids[0]).unwrap();
+        assert_eq!(workspace.focused(), Some(ids[1]));
+        assert!(workspace.pending_widget_focus_is_close_handoff());
+
+        // A deferred survivor can leave the mounted band before its widget
+        // request is consumed. Its ownership must survive that delay.
+        workspace.tick(Duration::from_secs(1));
+        let far = workspace.geometry().max_offset(640.0);
+        workspace.native_scroll(far, 640.0);
+        assert_eq!(
+            workspace.visibility(ids[1]),
+            Some(VisibilityClass::Offscreen)
+        );
+        assert_eq!(workspace.take_widget_focus_request(), None);
+        assert!(workspace.pending_widget_focus_is_close_handoff());
+        workspace.native_scroll(0.0, 640.0);
+        assert_eq!(workspace.take_widget_focus_request(), Some(ids[1]));
+        assert!(!workspace.pending_widget_focus_is_close_handoff());
+
+        // A deliberate navigation remains entitled to move native focus.
+        workspace.focus(ids[2]).unwrap();
+        assert!(!workspace.pending_widget_focus_is_close_handoff());
+        assert_eq!(workspace.take_widget_focus_request(), Some(ids[2]));
     }
 
     #[test]

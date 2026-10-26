@@ -343,16 +343,22 @@ impl Cagents {
     pub(super) fn card_removal(&self, handoff: crate::workspace::FocusHandoff) -> Task<Message> {
         if !self.workspace_surfaces_visible() {
             // The accepted close still commits, but its hidden pane cannot
-            // take native focus from Work or the contextual inspector.
+            // take native focus from the contextual inspector.
             return cosmic::task::message(Message::CommitClose(handoff.unmounting));
         }
-        workspace_widget::focus_handoff_then(
-            handoff,
-            widget::Id::new(TOOLBAR_FOCUS_ID),
-            |next| self.card_keyboard_focus(next),
-            Message::CommitClose(handoff.unmounting),
-        )
-        .map(cosmic::Action::App)
+        let target = match handoff.target {
+            crate::workspace::FocusTarget::Card(next) => self.card_keyboard_focus(next),
+            crate::workspace::FocusTarget::WorkspaceToolbar => widget::Id::new(TOOLBAR_FOCUS_ID),
+            crate::workspace::FocusTarget::Unchanged => {
+                return cosmic::task::message(Message::CommitClose(handoff.unmounting));
+            }
+        };
+        // The accepted close may finish after the user starts typing in the
+        // docked inspector. Query native focus when the operation runs; a
+        // visible workspace alone is not permission to take that focus.
+        workspace_widget::focus_after_loading(self.card_keyboard_focus(handoff.unmounting), target)
+            .chain(Task::done(Message::CommitClose(handoff.unmounting)))
+            .map(cosmic::Action::App)
     }
 
     /// Commits the workspace reservation before retiring any runtime or saved
@@ -472,13 +478,15 @@ impl Cagents {
             && handoff
                 .is_some_and(|handoff| handoff.target != crate::workspace::FocusTarget::Unchanged)
         {
-            iced::widget::operation::focus(
-                self.workspace
-                    .focused()
-                    .map(|card| self.card_keyboard_focus(card))
-                    .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
-            )
-            .map(cosmic::Action::App)
+            let target = self
+                .workspace
+                .focused()
+                .map(|card| self.card_keyboard_focus(card))
+                .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID));
+            // Recover only an absent focus (or the target already selected by
+            // the handoff). Never replace a control chosen between the close's
+            // focus operation and its asynchronous commit.
+            workspace_widget::focus_after_loading(target.clone(), target).map(cosmic::Action::App)
         } else {
             Task::none()
         };

@@ -70,6 +70,52 @@ fn open(app: &mut Cagents) {
     assert!(app.attention_is_open());
 }
 
+/// Establish the current channel before capturing an Attention callback: a
+/// later Arc replacement would reject it as stale rather than test the overlay.
+fn prepare_pr_inspector(app: &mut Cagents) -> ChannelId {
+    let channel = ChannelId::new();
+    app.workspace_model
+        .channels
+        .push(crate::workspace_model::ModelChannel {
+            id: channel,
+            repository: "/attention-work-fixture".into(),
+            title: "Original".into(),
+            title_source: Default::default(),
+            ordinal: 1,
+        });
+    Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+    app.sidebar_model.projects.push(SidebarProject::new(
+        ProjectId::new(),
+        RepositoryId::new(),
+        "Attention fixture".into(),
+        "/attention-work-fixture".into(),
+        Vec::new(),
+        Vec::new(),
+    ));
+    drop(app.update(Message::WindowResized(640.0, 900.0)));
+    channel
+}
+
+fn open_pr_overlay(app: &mut Cagents, channel: ChannelId) {
+    drop(app.open_channel_work(channel));
+    assert!(app.context_inspector_open);
+    assert_eq!(app.context_tab, ContextTab::PullRequest);
+    assert_eq!(app.channel_work.view.home().unwrap().channel, channel);
+    assert!(app.context_inspector_is_overlay());
+    assert!(!app.workspace_surfaces_visible());
+    assert!(app.workspace_inputs_blocked());
+}
+
+fn assert_current_notice_workspace(app: &Cagents, message: &Message) {
+    let Message::NotificationUi(Action::OpenNotice(clicked)) = message else {
+        panic!("real Attention row callback");
+    };
+    assert_eq!(clicked.workspace.as_ptr(), Arc::as_ptr(&app.durable));
+    assert_eq!(clicked.registry, app.workspace_model.identity);
+    assert_eq!(clicked.host, app.notification_ui.host);
+    assert_eq!(clicked.backend, lifecycle_backend());
+}
+
 fn label(app: &Cagents, id: uuid::Uuid) -> String {
     let position = app
         .attention_notices()
@@ -570,10 +616,11 @@ fn queued_rendered_row_refuses_changed_identity_target_host_backend_registry_or_
 }
 
 #[test]
-fn current_row_refusal_during_modal_draft_or_work_retains_attention_for_explicit_reclick() {
+fn current_row_refusal_during_modal_draft_or_pr_overlay_retains_attention_for_explicit_reclick() {
     let mut renderer = super::super::tests::headless_renderer();
     for blocked in ["modal", "draft", "work"] {
         let mut app = fixture(1);
+        let channel = (blocked == "work").then(|| prepare_pr_inspector(&mut app));
         open(&mut app);
         let message = click(&app, &mut renderer, notice(0).id);
         match blocked {
@@ -582,23 +629,13 @@ fn current_row_refusal_during_modal_draft_or_work_retains_attention_for_explicit
                 drop(app.update_automation_ui(crate::automation_ui::Action::New));
             }
             "work" => {
-                let channel = ChannelId::new();
-                app.workspace_model
-                    .channels
-                    .push(crate::workspace_model::ModelChannel {
-                        id: channel,
-                        repository: "/attention-work-fixture".into(),
-                        title: "Original".into(),
-                        title_source: Default::default(),
-                        ordinal: 1,
-                    });
-                drop(app.open_channel_work(channel));
-                assert!(app.channel_work_is_main());
+                open_pr_overlay(&mut app, channel.unwrap());
             }
             _ => unreachable!(),
         }
         let original = app.durable.cards.clone();
         let focus = app.workspace.focused();
+        assert_current_notice_workspace(&app, &message);
         reduce(&mut app, message);
         assert!(app.notification_ui.lifecycle_read.is_none(), "{blocked}");
         assert_eq!(app.durable.cards, original);
@@ -610,8 +647,14 @@ fn current_row_refusal_during_modal_draft_or_work_retains_attention_for_explicit
                 drop(app.update_automation_ui(crate::automation_ui::Action::CancelEdit));
             }
             "work" => {
-                drop(app.escape_channel_work());
-                assert!(!app.channel_work_is_main());
+                let owner = app.channel_work.view.owner().unwrap();
+                drop(app.update_channel_work(crate::channel_work_ui::Action::Close(owner)));
+                assert!(!app.context_inspector_open);
+                drop(app.advance_context_inspector_transition(
+                    Instant::now() + DIALOG_TRANSITION_DURATION,
+                ));
+                assert!(!app.context_inspector_is_overlay());
+                assert!(app.workspace_surfaces_visible());
             }
             _ => unreachable!(),
         }
@@ -1003,6 +1046,7 @@ fn public_attention_row_closes_only_its_popup_and_starts_exact_read_after_existi
     // other input owners. Existing focused-save parent stays unchanged too.
     for blocked in ["modal", "draft", "work"] {
         let mut app = fixture(1);
+        let channel = (blocked == "work").then(|| prepare_pr_inspector(&mut app));
         let snapshot = app.notification_ui.snapshot.clone();
         drop(app.update(Message::NotificationUi(Action::Snapshot(snapshot))));
         drop(app.update(Message::ChromeUi(
@@ -1016,23 +1060,13 @@ fn public_attention_row_closes_only_its_popup_and_starts_exact_read_after_existi
                 assert!(app.automation_ui.has_draft());
             }
             "work" => {
-                let channel = ChannelId::new();
-                app.workspace_model
-                    .channels
-                    .push(crate::workspace_model::ModelChannel {
-                        id: channel,
-                        repository: "/attention-work-fixture".into(),
-                        title: "Original".into(),
-                        title_source: Default::default(),
-                        ordinal: 1,
-                    });
-                drop(app.open_channel_work(channel));
-                assert!(app.channel_work_is_main());
+                open_pr_overlay(&mut app, channel.unwrap());
             }
             _ => unreachable!(),
         }
         let cards = app.durable.cards.clone();
         let focus = app.workspace.focused();
+        assert_current_notice_workspace(&app, &queued);
         drop(app.update(queued));
         assert!(
             app.notification_ui.lifecycle_activation.is_none(),
@@ -1044,7 +1078,7 @@ fn public_attention_row_closes_only_its_popup_and_starts_exact_read_after_existi
         match blocked {
             "modal" => assert!(app.settings_reset_confirm),
             "draft" => assert!(app.automation_ui.has_draft()),
-            "work" => assert!(app.channel_work_is_main()),
+            "work" => assert!(app.context_inspector_open && app.context_inspector_is_overlay()),
             _ => unreachable!(),
         }
         no_ack(&app, notice(0).id);

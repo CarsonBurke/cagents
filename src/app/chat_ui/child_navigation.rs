@@ -601,6 +601,11 @@ mod tests {
         assert_eq!(ids(picker.rows(&children)), ["second"]);
         assert_eq!(Runtime::native_child_name(&children[0]), "Agent done");
         children[0].kind.clear();
-        assert_eq!(Runtime::native_child_name(&children[0]), "done");
+        assert_eq!(Runtime::native_child_name(&children[0]), "Agent");
+        assert_ne!(Runtime::native_child_name(&children[0]), children[0].id);
+        assert_ne!(
+            Runtime::native_child_name(&children[0]),
+            children[0].description
+        );
     }
 }

@@ -18541,27 +18541,30 @@ mod tests {
 
     // Tasks are deliberately dropped: these fixtures only cross the actual
     // app reducers and never connect to a daemon or start a provider.
-    fn open_work_over_chat(app: &mut Cagents) {
-        let channel = crate::model::ChannelId::new();
-        app.workspace_model.identity = uuid::Uuid::new_v4();
-        app.workspace_model
-            .channels
-            .push(crate::workspace_model::ModelChannel {
-                id: channel,
-                repository: FIXTURE_DIRECTORY.into(),
-                title: "Chat input fixture".into(),
-                title_source: Default::default(),
-                ordinal: 1,
-            });
-        drop(app.open_channel_work(channel));
-        assert!(app.channel_work_is_main());
+    fn open_inspector_over_chat(app: &mut Cagents) {
+        // The real PR inspector overlays the workspace at this width. Its
+        // visibility transition retires hidden transcript presentation while
+        // retaining the underlying runtime, draft and accepted work.
+        drop(app.update(Message::WindowResized(620.0, 720.0)));
+        if !app.context_inspector_open {
+            drop(app.update(Message::ToggleContextInspector));
+        }
+        assert!(app.context_inspector_open);
+        assert!(app.context_inspector_is_overlay());
+        assert!(app.context_inspector_overlay_active);
         assert!(!app.workspace_surfaces_visible());
     }
 
     fn return_to_chat(app: &mut Cagents) {
-        let owner = app.channel_work.view.owner().unwrap();
-        drop(app.update_channel_work(crate::channel_work_ui::Action::Close(owner)));
-        assert!(!app.channel_work_is_main());
+        drop(app.update(Message::ContextInspector(
+            crate::app::InspectorAction::Close,
+        )));
+        drop(app.advance_context_inspector_transition(
+            Instant::now() + crate::app::DIALOG_TRANSITION_DURATION,
+        ));
+        assert!(!app.context_inspector_open);
+        assert!(!app.context_inspector_is_overlay());
+        assert!(!app.context_inspector_overlay_active);
         assert!(app.workspace_surfaces_visible());
     }
 
@@ -18605,7 +18608,8 @@ mod tests {
     }
 
     #[test]
-    fn main_work_refuses_queued_native_composer_edits_and_submit_but_conversations_accepts_them() {
+    fn inspector_overlay_refuses_queued_native_composer_edits_and_submit_but_visible_chat_accepts_them()
+     {
         let renderer = crate::app::tests::headless_renderer();
         for started in [false, true] {
             let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -18638,7 +18642,7 @@ mod tests {
             )));
             let revision = chat_runtime(&app, card).revision;
 
-            open_work_over_chat(&mut app);
+            open_inspector_over_chat(&mut app);
             for message in queued_edit.into_iter().chain(queued_submit) {
                 drop(app.update(message));
             }
@@ -18669,7 +18673,7 @@ mod tests {
     }
 
     #[test]
-    fn main_work_keeps_accepted_paste_bookmarks_and_submission_completions_live() {
+    fn inspector_overlay_keeps_accepted_paste_bookmarks_and_submission_completions_live() {
         let _admission = attachment_draft::test_admission();
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
@@ -18695,7 +18699,7 @@ mod tests {
         );
         assert!(chat_runtime(&app, card).pending.is_none());
 
-        open_work_over_chat(&mut app);
+        open_inspector_over_chat(&mut app);
         drop(app.update(Message::ChatUi(Action::PastedText(
             target,
             bookmark,
@@ -18721,7 +18725,7 @@ mod tests {
         assert!(runtime.pending.is_none());
         assert_eq!(runtime.composer.text(), "");
         assert!(!runtime.visible.load(Ordering::Relaxed));
-        assert!(app.channel_work_is_main());
+        assert!(app.context_inspector_is_overlay());
 
         // Hidden transcript-derived history is disposable. The daemon hydrates
         // it again only after the reader returns to the actual visible pane.
@@ -18754,7 +18758,7 @@ mod tests {
     }
 
     #[test]
-    fn late_ready_attaches_behind_main_work_then_returns_to_visible_conversations() {
+    fn late_ready_attaches_behind_inspector_then_returns_to_visible_chat() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let (card, target) = starting_chat(&mut app);
         let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
@@ -18762,7 +18766,7 @@ mod tests {
             generation: app.workspace_view_generation,
             event: WorkspaceViewportEvent::Resized(1_600.0),
         }));
-        open_work_over_chat(&mut app);
+        open_inspector_over_chat(&mut app);
         assert_eq!(
             app.workspace.visibility(card),
             Some(VisibilityClass::Visible)
@@ -18806,7 +18810,7 @@ mod tests {
             generation: app.workspace_view_generation,
             event: WorkspaceViewportEvent::Resized(1_600.0),
         }));
-        open_work_over_chat(&mut app);
+        open_inspector_over_chat(&mut app);
         assert_eq!(
             app.workspace.visibility(card),
             Some(VisibilityClass::Visible)
@@ -18827,7 +18831,7 @@ mod tests {
     }
 
     #[test]
-    fn offscreen_late_ready_stays_hidden_when_main_work_returns_to_conversations() {
+    fn offscreen_late_ready_stays_hidden_when_inspector_closes() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let (card, target) = starting_chat(&mut app);
         let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
@@ -18864,7 +18868,7 @@ mod tests {
         );
         assert_eq!(app.card_state(card).unwrap().exposure, Exposure::Offscreen);
 
-        open_work_over_chat(&mut app);
+        open_inspector_over_chat(&mut app);
         answer_start(&mut app, target, Ok(handle.clone()));
         assert!(app.chat_ui.attempt(card).is_none(), "Ready is consumed");
         assert!(Arc::ptr_eq(

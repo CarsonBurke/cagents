@@ -1142,10 +1142,8 @@ impl Runtime {
         // description is the assigned task, which must never become identity.
         if !agent.kind.trim().is_empty() {
             agent.kind.trim()
-        } else if !agent.id.trim().is_empty() {
-            agent.id.trim()
         } else {
-            "Subagent"
+            "Agent"
         }
     }
 
@@ -1325,6 +1323,48 @@ impl Runtime {
             chat::failure::FailureKind::Connection => "Connection interrupted",
             chat::failure::FailureKind::Interrupted => "Interrupted",
         });
+        // A completed turn does not complete its native goal. Keep the two
+        // observations distinct without changing turn activity or admission.
+        if !snapshot.busy
+            && !snapshot.waiting
+            && snapshot.requests.is_empty()
+            && working == 0
+            && waiting == 0
+            && let Some((goal_glyph, goal_label)) = self.observed_goal_status()
+        {
+            let last_turn = failure_label.or_else(|| {
+                if self.error.is_some() || snapshot.error.is_some() {
+                    Some("Conversation has an error")
+                } else if snapshot.finished_at.is_some() {
+                    Some(match snapshot.detail.as_str() {
+                        "Turn interrupted" => "Last turn interrupted",
+                        "Turn failed" => "Last turn failed",
+                        _ => "Last turn finished",
+                    })
+                } else {
+                    None
+                }
+            });
+            let mut label = last_turn.map_or_else(
+                || goal_label.to_owned(),
+                |last_turn| format!("{goal_label} · {last_turn}"),
+            );
+            if failed > 0 {
+                label.push_str(&format!(" · {failed} failed"));
+            }
+            return (
+                if failure_label.is_some()
+                    || self.error.is_some()
+                    || snapshot.error.is_some()
+                    || failed > 0
+                {
+                    Some(Icon::Warning)
+                } else {
+                    goal_glyph
+                },
+                label,
+            );
+        }
         let mut parts = Vec::new();
         if let Some(label) = failure_label {
             parts.push(label.to_owned());
@@ -1362,6 +1402,35 @@ impl Runtime {
             }
         }
         (glyph, Self::short_description(label, 100))
+    }
+
+    fn observed_goal_status(&self) -> Option<(Option<Icon>, &'static str)> {
+        use chat::goal::{ReadState, Status, Support};
+        let goal = self.snapshot.goal.as_ref()?;
+        if goal.support == Support::Unsupported {
+            return None;
+        }
+        Some(if goal.pending || self.goal_pending.is_some() {
+            (Some(Icon::AgentWorking), "Goal updating")
+        } else if goal.uncertain
+            || goal.support == Support::Unknown
+            || matches!(goal.read, ReadState::Unknown)
+        {
+            (Some(Icon::Warning), "Goal unconfirmed")
+        } else {
+            match &goal.read {
+                ReadState::Known(Some(goal)) => match goal.status {
+                    Status::Active => (Some(Icon::AgentWorking), "Goal active"),
+                    Status::Blocked => (Some(Icon::Warning), "Goal blocked"),
+                    Status::UsageLimited => (Some(Icon::Warning), "Goal usage limited"),
+                    Status::BudgetLimited => (Some(Icon::Warning), "Goal budget limited"),
+                    Status::Paused => (None, "Goal paused"),
+                    Status::Complete => (Some(Icon::Check), "Goal complete"),
+                },
+                ReadState::Known(None) => return None,
+                ReadState::Unknown => unreachable!("unknown observations are qualified above"),
+            }
+        })
     }
 
     fn conversation_status_base(&self, transitioning: bool) -> (Option<Icon>, &str) {
@@ -4048,10 +4117,18 @@ impl Runtime {
                 (
                     &agent.id,
                     &agent.kind,
-                    &agent.description,
                     agent.status,
-                    &agent.model,
                     agent.waiting,
+                    if matches!(
+                        agent.status,
+                        chat::ToolStatus::Failed
+                            | chat::ToolStatus::Denied
+                            | chat::ToolStatus::Stopped
+                    ) {
+                        agent.detail.as_str()
+                    } else {
+                        ""
+                    },
                 )
                     .hash(&mut hasher);
             }
@@ -4763,7 +4840,7 @@ impl Runtime {
         let ItemContent::Delivery {
             kind,
             from,
-            sender,
+            sender: _,
             summary,
             body,
         } = &item.content
@@ -4788,18 +4865,9 @@ impl Runtime {
                 .into()
         };
         if *kind == chat::DeliveryKind::Report {
-            let heading = chat::delivery_heading(*kind, from, sender, summary);
-            // Preserve an explicit task outcome even when its name needs to
-            // shorten. This is report presentation, not failure inference:
-            // arbitrary report prose never becomes a parent account error.
-            let short = [" was stopped", " finished", " failed"]
-                .into_iter()
-                .find_map(|ending| {
-                    heading
-                        .strip_suffix(ending)
-                        .map(|subject| format!("{}{ending}", Self::short_description(subject, 72)))
-                })
-                .unwrap_or_else(|| Self::short_description(&heading, 96));
+            // The source body remains exact. One identity-keyed header owns
+            // disclosure and copy; it does not manufacture another report.
+            let heading = chat::delivery_heading(*kind, from, "", summary);
             let disclosure = widget::button::custom(design::caption(if expanded {
                 "Hide details"
             } else {
@@ -4809,10 +4877,18 @@ impl Runtime {
                 "{} report details: {heading}",
                 if expanded { "Hide" } else { "Show" }
             ))
+            .id(card_control_id(
+                self.target.card,
+                &format!("delivery-{}-{}-details", self.target.generation, item.id),
+            ))
             .class(crate::ui_controls::control_style(false, None))
             .on_press(action(Action::Toggle(self.target, item.id.clone())));
             let copy = widget::button::custom(design::caption("Copy report"))
                 .name(format!("Copy original report: {heading}"))
+                .id(card_control_id(
+                    self.target.card,
+                    &format!("delivery-{}-{}-copy", self.target.generation, item.id),
+                ))
                 .class(crate::ui_controls::control_style(false, None))
                 .on_press(action(Action::Copy(
                     self.target,
@@ -4820,44 +4896,22 @@ impl Runtime {
                     CopyPart::Text,
                 )));
             let mut rows = vec![
-                widget::row::with_children(vec![
-                    glyph(Icon::Chat),
-                    crate::interaction::tooltip(
-                        design::caption(short).width(Length::Fill),
-                        heading.clone(),
-                    )
-                    .into(),
+                widget::flex_row(vec![
+                    design::caption(heading).into(),
+                    disclosure.into(),
+                    copy.into(),
                 ])
-                .spacing(step::GAP_S)
-                .align_y(Alignment::Center)
+                .spacing(step::GAP_XS as u16)
+                .align_items(Alignment::Center)
                 .into(),
-                widget::row::with_children(vec![disclosure.into(), copy.into()])
-                    .spacing(step::GAP_S)
-                    .into(),
             ];
-            if expanded {
-                if !sender.is_empty() && !heading.contains(sender) {
-                    rows.push(selectable_prose::plain(
-                        format!("Sender: {sender}"),
-                        design::TEXT_CAPTION,
-                        iced::Font::MONOSPACE,
-                        self.target,
-                    ));
-                }
-                rows.push(selectable_prose::plain(
-                    heading,
-                    design::TEXT_CAPTION,
-                    iced::Font::default(),
+            if expanded && !body.is_empty() {
+                rows.push(prose::view(
+                    cached,
+                    settings,
                     self.target,
+                    self.find.as_deref(),
                 ));
-                if !body.is_empty() {
-                    rows.push(prose::view(
-                        cached,
-                        settings,
-                        self.target,
-                        self.find.as_deref(),
-                    ));
-                }
             }
             return widget::container(widget::column::with_children(rows).spacing(step::GAP_XS))
                 .max_width(design::READABLE_MEASURE)
@@ -4881,23 +4935,17 @@ impl Runtime {
                 .into(),
             ];
             if notice.body.full.len() != 0 {
-                rows.push(literal_content::notice_body(
-                    self, item, cached, settings, None,
-                ));
-                if notice.body.long {
-                    rows.push(toggle("Show more"));
+                rows.push(toggle("Details"));
+                if expanded {
+                    rows.push(literal_content::notice_body(
+                        self, item, cached, settings, None,
+                    ));
                 }
             }
-            return widget::container(message_actions(
-                widget::column::with_children(rows)
-                    .spacing(step::GAP_XS)
-                    .into(),
-                self.message_copy(item),
-                Alignment::Start,
-            ))
-            .max_width(design::READABLE_MEASURE)
-            .width(Length::Fill)
-            .into();
+            return widget::container(widget::column::with_children(rows).spacing(step::GAP_XS))
+                .max_width(design::READABLE_MEASURE)
+                .width(Length::Fill)
+                .into();
         }
         // A named sender leads and its own summary follows; an unnamed one is
         // described by the harness's summary, as `chat::delivery_heading`.
@@ -4907,15 +4955,7 @@ impl Runtime {
             heading.push(chat_title(summary.clone()).into());
         } else {
             heading.push(design::caption(kind.verb()).into());
-            heading.push(chat_title(chat::delivery_sender(from, sender)).into());
-            // A named sender's ID only tells two of the same name apart.
-            if !from.is_empty() && !sender.is_empty() {
-                heading.push(
-                    design::caption(sender.chars().take(8).collect::<String>())
-                        .font(iced::Font::MONOSPACE)
-                        .into(),
-                );
-            }
+            heading.push(chat_title(chat::delivery_sender(from, "")).into());
             if !summary.is_empty() {
                 subtitle = Some(design::caption(summary.clone()));
             }
@@ -4928,18 +4968,18 @@ impl Runtime {
         ];
         rows.extend(subtitle.map(Element::from));
         if !body.is_empty() {
-            rows.push(fold::fold(
-                prose::view(cached, settings, self.target, self.find.as_deref()),
-                toggle(if *kind == chat::DeliveryKind::Report {
-                    "Show full report"
-                } else {
-                    "Show full message"
-                }),
-                !expanded,
-                DELIVERY_FOLDED_HEIGHT,
-                step::GAP_S,
-                design::sunken,
-            ));
+            let long = body.chars().take(161).count() > 160;
+            if expanded || !long {
+                rows.push(prose::view(
+                    cached,
+                    settings,
+                    self.target,
+                    self.find.as_deref(),
+                ));
+            }
+            if long {
+                rows.push(toggle("Read message"));
+            }
         }
         let card = widget::container(
             widget::column::with_children(rows)
@@ -5796,6 +5836,8 @@ mod footer_responsive_tests;
 mod frame_cost;
 #[cfg(test)]
 mod issue1506_tests;
+#[cfg(test)]
+mod presentation_tests;
 
 #[cfg(test)]
 mod image_viewer_tests;

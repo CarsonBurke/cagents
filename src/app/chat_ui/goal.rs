@@ -115,25 +115,28 @@ pub(super) fn panel_with_ids<'a, Message: Clone + 'a>(
         operation,
         observation_revision: state.observation_revision,
     };
-    let mut rows: Vec<Element<'a, Message>> = vec![design::heading("Native goal").into()];
-    match state.support {
-        Support::Unsupported => rows.push(
-            design::caption("Native goal controls are not supported by this conversation.")
-                .width(Length::Fill)
-                .wrapping(iced::widget::text::Wrapping::Word)
-                .into(),
-        ),
-        Support::Unknown => rows.push(
-            design::caption("Native goal support has not been checked for this conversation.")
-                .width(Length::Fill)
-                .wrapping(iced::widget::text::Wrapping::Word)
-                .into(),
-        ),
-        Support::Supported => {}
-    }
+    let mut rows: Vec<Element<'a, Message>> = Vec::new();
     if let Some(goal) = goal {
+        // The human objective is the panel's primary heading. Status and
+        // accounting qualify it rather than competing as repeated titles.
         rows.push(
-            design::heading(format!(
+            widget::container(
+                widget::scrollable(
+                    design::heading(goal.objective.as_str())
+                        .width(Length::Fill)
+                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+                )
+                .height(Length::Shrink)
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    design::scrollbar(),
+                )),
+            )
+            .width(Length::Fill)
+            .max_height(96.0)
+            .into(),
+        );
+        rows.push(
+            design::caption(format!(
                 "{} · {}",
                 if confirmed {
                     "Goal"
@@ -143,23 +146,7 @@ pub(super) fn panel_with_ids<'a, Message: Clone + 'a>(
                 status_label(goal.status)
             ))
             .width(Length::Fill)
-            .wrapping(iced::widget::text::Wrapping::Word)
-            .into(),
-        );
-        rows.push(
-            widget::container(
-                widget::scrollable(
-                    design::body(goal.objective.as_str())
-                        .width(Length::Fill)
-                        .wrapping(iced::widget::text::Wrapping::Word),
-                )
-                .height(Length::Shrink)
-                .direction(iced::widget::scrollable::Direction::Vertical(
-                    design::scrollbar(),
-                )),
-            )
-            .width(Length::Fill)
-            .max_height(96.0)
+            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
             .into(),
         );
         let mut accounting = format!(
@@ -189,6 +176,21 @@ pub(super) fn panel_with_ids<'a, Message: Clone + 'a>(
     } else if state.support != Support::Unsupported {
         rows.push(design::caption("The current goal has not been read.").into());
     }
+    match state.support {
+        Support::Unsupported => rows.push(
+            design::caption("Native goal controls are not supported by this conversation.")
+                .width(Length::Fill)
+                .wrapping(iced::widget::text::Wrapping::Word)
+                .into(),
+        ),
+        Support::Unknown => rows.push(
+            design::caption("Native goal support has not been checked for this conversation.")
+                .width(Length::Fill)
+                .wrapping(iced::widget::text::Wrapping::Word)
+                .into(),
+        ),
+        Support::Supported => {}
+    }
     if state.pending {
         rows.push(
             design::caption("Goal request awaiting provider confirmation.")
@@ -204,9 +206,10 @@ pub(super) fn panel_with_ids<'a, Message: Clone + 'a>(
                 .into(),
         );
     }
-    if !state.current {
+    if !state.current && !state.pending && !state.uncertain && state.support != Support::Unsupported
+    {
         rows.push(
-            design::caption("Reconnect to confirm the goal for this conversation.")
+            design::caption("The current goal is unconfirmed for this conversation. Goal controls are unavailable.")
                 .width(Length::Fill)
                 .wrapping(iced::widget::text::Wrapping::Word)
                 .into(),
@@ -214,6 +217,22 @@ pub(super) fn panel_with_ids<'a, Message: Clone + 'a>(
     }
     let pause = state.control_enabled(&Operation::Pause);
     let resume = state.control_enabled(&Operation::Resume);
+    if confirmed
+        && !state.work_ready
+        && goal.is_some_and(|goal| {
+            matches!(
+                goal.status,
+                Status::Paused | Status::Blocked | Status::UsageLimited | Status::BudgetLimited
+            )
+        })
+    {
+        rows.push(
+            design::caption("Resume is unavailable because this conversation is not ready for new work. Check and Clear remain available.")
+                .width(Length::Fill)
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                .into(),
+        );
+    }
     let controls = widget::column::with_children(vec![
         widget::row::with_children(vec![
             button::secondary("Check")
@@ -608,5 +627,121 @@ mod tests {
                 .iter()
                 .any(|text| text.contains("Token budget: 7777"))
         );
+    }
+
+    #[test]
+    fn objective_leads_native_panel_and_availability_never_invents_reconnect_advice() {
+        use iced::advanced::widget::Operation as WidgetOperation;
+        #[derive(Default)]
+        struct Texts(Vec<(String, iced::Rectangle)>);
+        impl WidgetOperation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn WidgetOperation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                self.0.push((text.to_owned(), bounds));
+            }
+        }
+        let observed = goal("Preserve the actual objective λ", Status::Paused);
+        let mut renderer = ui_controls::accessibility_probe::headless_renderer();
+        for width in [280.0, 620.0] {
+            for (state, expected, excluded) in [
+                (presentation(&observed), "Goal · Paused", "unconfirmed"),
+                (
+                    Presentation {
+                        current: false,
+                        ..presentation(&observed)
+                    },
+                    "The current goal is unconfirmed for this conversation",
+                    "awaiting provider confirmation",
+                ),
+                (
+                    Presentation {
+                        current: false,
+                        pending: true,
+                        ..presentation(&observed)
+                    },
+                    "Goal request awaiting provider confirmation",
+                    "Goal controls are unavailable",
+                ),
+                (
+                    Presentation {
+                        current: false,
+                        uncertain: true,
+                        ..presentation(&observed)
+                    },
+                    "Current goal is unconfirmed. Check before changing it",
+                    "awaiting provider confirmation",
+                ),
+                (
+                    Presentation {
+                        work_ready: false,
+                        ..presentation(&observed)
+                    },
+                    "Resume is unavailable because this conversation is not ready for new work",
+                    "unconfirmed",
+                ),
+            ] {
+                let mut ui = cached(state, Cache::new(), &mut renderer, width);
+                let mut text = Texts::default();
+                ui.operate(&renderer, &mut text);
+                let (objective, objective_bounds) =
+                    text.0.first().expect("native objective heading");
+                assert_eq!(objective, "Preserve the actual objective λ");
+                let (_, status_bounds) = text
+                    .0
+                    .iter()
+                    .find(|(text, _)| text.contains(" · Paused"))
+                    .unwrap();
+                assert!(
+                    objective_bounds.height > status_bounds.height,
+                    "human objective has the primary native text hierarchy"
+                );
+                assert!(
+                    text.0.iter().any(|(text, _)| text.contains(expected)),
+                    "actual panel explains the observed availability at {width}"
+                );
+                assert!(
+                    !text
+                        .0
+                        .iter()
+                        .any(|(text, _)| text.contains(excluded) || text.contains("Reconnect")),
+                    "presentation cannot infer a disconnect from current=false"
+                );
+                for name in [
+                    "Check native goal",
+                    "Pause native goal",
+                    "Resume native goal",
+                    "Clear native goal",
+                ] {
+                    let bounds = bounds(&ui, name);
+                    assert!(
+                        bounds.width > 0.0
+                            && bounds.height > 0.0
+                            && bounds.x >= 0.0
+                            && bounds.y >= 0.0
+                            && bounds.x + bounds.width <= width
+                            && bounds.y + bounds.height <= 650.0
+                    );
+                }
+                if state.current && !state.work_ready {
+                    assert!(click(&mut ui, &mut renderer, "Resume native goal").is_empty());
+                    assert_eq!(
+                        click(&mut ui, &mut renderer, "Check native goal"),
+                        vec![Intent {
+                            operation: Operation::Get,
+                            observation_revision: 17
+                        }]
+                    );
+                    assert_eq!(
+                        click(&mut ui, &mut renderer, "Clear native goal"),
+                        vec![Intent {
+                            operation: Operation::Clear,
+                            observation_revision: 17
+                        }]
+                    );
+                }
+            }
+        }
     }
 }
