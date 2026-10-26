@@ -889,8 +889,9 @@ activity stays in the scrolling conversation so the composer remains available.
 
 ### Local dictation
 
-Local dictation currently requires x86-64 Linux and uses this computer's
-microphone, including when the conversation works on a remote device. Click the
+Local dictation currently requires x86-64 Linux with a working PipeWire
+microphone input. It uses this computer's microphone, including when the
+conversation works on a remote device. Click the
 microphone to open setup, then choose **Download and set up** to approve the
 optional **821 MiB** speech download. Allow additional disk space for the speech
 files. Opening a conversation or setup does not start a download or recording.
@@ -1014,8 +1015,11 @@ and restores that message as an editable draft in the branched conversation.
 Its steering control chooses delivery between tool calls or after the current
 turn completes, using OMP's own interrupt mode.
 
-Child agent tabs show isolated transcripts and lifecycle status for all three
-providers. Codex child approvals remain explicit and are labeled as child
+Child agent tabs use the agent's name and a status icon. Working agents appear
+first, followed by waiting, failed, and settled agents. **Choose subagent** opens
+the full searchable list, with filters for working agents or those needing
+attention. Selecting an agent opens its isolated transcript; choose **Main
+conversation** to return to the parent. Codex child approvals remain explicit and are labeled as child
 requests. OMP child activity is read-only: its installed RPC API has no child
 messaging, stop, or restart command. Large optional child histories are omitted
 without disconnecting the parent, while live activity remains available.
