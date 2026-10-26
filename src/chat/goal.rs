@@ -223,6 +223,7 @@ pub struct Request {
     thread_id: String,
     observation: u64,
     input_revision: u64,
+    binding: u64,
     operation: Operation,
 }
 
@@ -245,6 +246,7 @@ impl Request {
 pub struct State {
     thread_id: String,
     observation: u64,
+    binding: u64,
     next: u64,
     support: Support,
     read: ReadState,
@@ -259,6 +261,7 @@ impl State {
         Ok(Self {
             thread_id,
             observation: 0,
+            binding: 0,
             next: 0,
             support: Support::Unknown,
             read: ReadState::Unknown,
@@ -315,8 +318,10 @@ impl State {
     pub fn rebind(&mut self, thread_id: String) -> Result<(), Error> {
         validate_thread(&thread_id)?;
         let observation = self.observation.checked_add(1).ok_or(Error::Exhausted)?;
+        let binding = self.binding.checked_add(1).ok_or(Error::Exhausted)?;
         self.thread_id = thread_id;
         self.observation = observation;
+        self.binding = binding;
         self.support = Support::Unknown;
         self.read = ReadState::Unknown;
         self.uncertain = self.pending.is_some();
@@ -339,6 +344,7 @@ impl State {
             thread_id: self.thread_id.clone(),
             observation,
             input_revision: self.observation,
+            binding: self.binding,
             operation,
         };
         self.next = id;
@@ -377,21 +383,28 @@ impl State {
         if self.pending.as_ref() != Some(request) {
             return Ok(false);
         }
-        let current =
-            request.thread_id == self.thread_id && request.observation == self.observation;
+        let same_binding = request.binding == self.binding && request.thread_id == self.thread_id;
+        let current = same_binding && request.observation == self.observation;
         self.pending = None;
         // A response or refusal changes the publication too. A queued control
         // from before this request must not act on the newly observed goal,
         // even when no provider notification accompanied the response.
         let Some(next) = self.observation.checked_add(1) else {
             self.uncertain = true;
-            self.last_result = Some(Completion {
-                revision: request.input_revision,
-                outcome: Outcome::Uncertain,
-            });
+            if same_binding {
+                self.last_result = Some(Completion {
+                    revision: request.input_revision,
+                    outcome: Outcome::Uncertain,
+                });
+            }
             return Err(Error::Exhausted);
         };
         self.observation = next;
+        if !same_binding {
+            // Retiring an old physical request is not a result for this
+            // thread/owner, including a same-thread reconnect or invalidation.
+            return Ok(false);
+        }
         let validated = match &result {
             Err(Failure::Unsupported) => Ok(Outcome::Unsupported),
             Err(Failure::Unavailable) => Ok(Outcome::Uncertain),
@@ -616,6 +629,36 @@ mod tests {
                 outcome: Outcome::Unsupported,
             })
         );
+    }
+
+    #[test]
+    fn a_rebound_owner_never_inherits_the_previous_owners_native_result() {
+        for next_thread in ["original-thread", "another-thread"] {
+            let mut state = State::new("original-thread".into()).unwrap();
+            let original = state.snapshot();
+            let request = state
+                .begin_for(&original.thread_id, original.revision, Operation::Get)
+                .unwrap();
+            state.rebind(next_thread.into()).unwrap();
+            let newer = goal(next_thread, "Current owner's goal", Status::Paused);
+            state.observe(next_thread, Some(newer.clone())).unwrap();
+            let held = state.snapshot();
+            assert!(held.pending && held.last_result.is_none());
+            assert!(!state.complete(&request, Ok(Reply::Read(None))).unwrap());
+            let settled = state.snapshot();
+            assert!(!settled.pending && settled.revision > held.revision);
+            assert_eq!(settled.thread_id, next_thread);
+            assert_eq!(settled.read, ReadState::Known(Some(newer)));
+            assert!(settled.last_result.is_none());
+            assert_eq!(
+                state.begin_for(&original.thread_id, original.revision, Operation::Clear),
+                Err(if next_thread == original.thread_id {
+                    Error::StaleObservation
+                } else {
+                    Error::ThreadMismatch
+                })
+            );
+        }
     }
 
     #[test]
