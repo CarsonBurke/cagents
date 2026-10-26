@@ -843,6 +843,7 @@ impl Adapter for Omp {
                 for attachment in &attachments { crate::chat::attachment_assets::retain(attachment)?; }
                 step.writes.push(request);
             }
+            Command::Goal { .. } => return Err("Native thread goals are not supported by OMP".into()),
             Command::Interrupt => step.writes.push(self.request("abort")),
             // OMP cancels one background job only through the model's own
             // `hub` tool; its RPC offers no command that stops one subagent.

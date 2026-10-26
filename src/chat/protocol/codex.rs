@@ -14,7 +14,12 @@ use serde_json::{Value, json};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::{collections::BTreeMap, path::PathBuf};
 
+mod goal;
 mod images;
+
+#[cfg(test)]
+#[path = "codex/goal_tests.rs"]
+mod goal_tests;
 
 /// The Codex configuration key for a thread's reasoning effort. A launch
 /// recipe names it as `--config model_reasoning_effort=<effort>`, the way the
@@ -421,6 +426,7 @@ fn create_inner(
             server_identity: None,
             retained_identity,
             thread: launch.session_id.clone(),
+            goal: None,
             start,
             alias,
             cwd: launch.recipe.working_directory.clone(),
@@ -479,6 +485,9 @@ fn create_inner(
 
 #[derive(Clone)]
 enum Pending {
+    Goal {
+        request: chat::goal::Request,
+    },
     LoginRecovery {
         failure: String,
         expected: Option<crate::account::Identity>,
@@ -566,6 +575,7 @@ struct Codex {
     server_identity: Option<ServerIdentity>,
     retained_identity: Option<ServerIdentity>,
     thread: Option<String>,
+    goal: Option<chat::goal::State>,
     start: Value,
     alias: Option<PathBuf>,
     cwd: PathBuf,
@@ -659,6 +669,69 @@ impl Drop for Codex {
     }
 }
 impl Codex {
+    fn goal_state(&mut self) -> Result<&mut chat::goal::State, String> {
+        let thread = self
+            .thread
+            .as_ref()
+            .ok_or("The original Codex thread is unavailable")?;
+        if self.goal.is_none() {
+            self.goal =
+                Some(chat::goal::State::new(thread.clone()).map_err(|error| error.to_string())?);
+        }
+        let state = self.goal.as_mut().expect("goal state was initialized");
+        if state.snapshot().thread_id != *thread {
+            return Err("The original Codex goal thread changed".into());
+        }
+        Ok(state)
+    }
+
+    fn publish_goal(&self, step: &mut Step) {
+        if let Some(state) = &self.goal {
+            step.events.push(Event::Goal(state.snapshot()));
+        }
+    }
+
+    fn request_goal(
+        &mut self,
+        step: &mut Step,
+        thread: &str,
+        revision: u64,
+        operation: chat::goal::Operation,
+    ) -> Result<(), String> {
+        if self.thread.as_deref() != Some(thread) {
+            return Err("The goal control belongs to a different Codex thread".into());
+        }
+        let (method, params) = goal::request(thread, &operation)?;
+        // Check transport capacity before reserving the domain's physical slot.
+        // No fallible transport allocation remains after begin_for succeeds.
+        if self.pending.len() >= MAX_PENDING || self.next_id == u64::MAX {
+            return Err("Too many outstanding Codex requests".into());
+        }
+        let request = self
+            .goal_state()?
+            .begin_for(thread, revision, operation)
+            .map_err(|error| error.to_string())?;
+        self.call(step, method, params, Pending::Goal { request })?;
+        self.publish_goal(step);
+        Ok(())
+    }
+
+    fn read_goal(&mut self, step: &mut Step) -> Result<(), String> {
+        let state = self.goal_state()?;
+        // A reconnect never replays an unresolved mutation or releases its slot.
+        if state.pending().is_some() || state.support() == chat::goal::Support::Unsupported {
+            self.publish_goal(step);
+            return Ok(());
+        }
+        let snapshot = state.snapshot();
+        self.request_goal(
+            step,
+            &snapshot.thread_id,
+            snapshot.revision,
+            chat::goal::Operation::Get,
+        )
+    }
+
     fn discover_child(
         &mut self,
         id: &str,
@@ -1715,6 +1788,14 @@ impl Adapter for Codex {
         let mut step = Step::default();
         self.ready = false;
         self.attached = false;
+        if let Some(state) = &mut self.goal {
+            let thread = self
+                .thread
+                .clone()
+                .ok_or("The original Codex thread is unavailable")?;
+            state.rebind(thread).map_err(|error| error.to_string())?;
+            self.publish_goal(&mut step);
+        }
         self.call(&mut step, "initialize", json!({"clientInfo":{"name":"cagents","title":"cagents native chat","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}), Pending::Initialize)?;
         Ok(step)
     }
@@ -1724,6 +1805,9 @@ impl Adapter for Codex {
             return Err("Codex native connection is not ready".into());
         }
         match command {
+            Command::Goal { thread_id, revision, operation } => {
+                self.request_goal(&mut step, &thread_id, revision, operation)?;
+            }
             Command::Prompt { text, attachments, mode } => {
                 if !self.direct_input { return Err("This Codex thread does not advertise direct input support".into()); }
                 let input = self.input(text, attachments.clone())?;
@@ -1904,6 +1988,33 @@ impl Adapter for Codex {
                 }
                 return Ok(step);
             }
+            if let Pending::Goal { request } = pending {
+                // The exact RPC resolved (including an invalid response). Only
+                // this request can release its slot; notification epochs decide
+                // whether its observation may still be adopted.
+                let result = if let Some(error) = frame.get("error") {
+                    Err(if error["code"].as_i64() == Some(-32601) {
+                        chat::goal::Failure::Unsupported
+                    } else {
+                        chat::goal::Failure::Unavailable
+                    })
+                } else {
+                    frame
+                        .get("result")
+                        .ok_or(chat::goal::Failure::Unavailable)
+                        .and_then(|result| {
+                            goal::response(request.thread_id(), request.operation(), result)
+                                .map_err(|_| chat::goal::Failure::Unavailable)
+                        })
+                };
+                if let Some(state) = &mut self.goal {
+                    state
+                        .complete(&request, result)
+                        .map_err(|error| error.to_string())?;
+                }
+                self.publish_goal(&mut step);
+                return Ok(step);
+            }
             if matches!(pending, Pending::History { .. }) {
                 self.history_loading = false;
             }
@@ -2047,6 +2158,7 @@ impl Adapter for Codex {
                 .get("result")
                 .ok_or("Codex RPC response is missing result/error")?;
             match pending {
+                Pending::Goal { .. } => unreachable!("goal responses are handled above"),
                 Pending::LoginRecovery {
                     failure,
                     expected,
@@ -2175,6 +2287,14 @@ impl Adapter for Codex {
                         self.history(&mut step, None)?;
                     }
                     self.finish_setup(&mut step);
+                    // Optional metadata read, never a goal mutation or prompt.
+                    // Runtime admission guards the earlier native resume write.
+                    if let Err(message) = self.read_goal(&mut step) {
+                        step.events.push(Event::Error {
+                            message,
+                            fatal: false,
+                        });
+                    }
                 }
                 Pending::Models => {
                     for value in array(result, "data")? {
@@ -2722,6 +2842,36 @@ impl Adapter for Codex {
                 }
                 let content = self.children.get_mut(id).unwrap().receive(frame.clone())?;
                 self.child_step(id, content, &mut step)?;
+            }
+            return Ok(step);
+        }
+        if matches!(method, "thread/goal/updated" | "thread/goal/cleared") {
+            let Some(original) = self.thread.clone() else {
+                return Ok(step);
+            };
+            match goal::notification(&original, method, params) {
+                Ok(Some(observation)) => {
+                    self.goal_state()?
+                        .observe(&original, observation)
+                        .map_err(|error| error.to_string())?;
+                    self.publish_goal(&mut step);
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    // Malformed current-thread data cannot leave an old goal
+                    // looking confirmed. Rebinding the same exact thread drops
+                    // only its observation; an unresolved physical RPC remains.
+                    self.goal_state()?
+                        .rebind(original)
+                        .map_err(|error| error.to_string())?;
+                    self.publish_goal(&mut step);
+                    step.events.push(Event::Error {
+                        message:
+                            "Codex returned an invalid goal observation; check its current state"
+                                .into(),
+                        fatal: false,
+                    });
+                }
             }
             return Ok(step);
         }
@@ -5812,6 +5962,7 @@ mod tests {
             server_identity: None,
             retained_identity: None,
             thread: Some("thread-exact".into()),
+            goal: None,
             start: json!({}),
             alias: None,
             cwd: PathBuf::from("/tmp"),
