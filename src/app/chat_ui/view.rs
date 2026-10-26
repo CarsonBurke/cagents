@@ -3057,7 +3057,9 @@ impl Runtime {
             let (label, tooltip) = cost_estimate_label(estimate);
             spend.push(crate::interaction::tooltip(design::caption(label), tooltip));
         }
-        let compact_footer = content_width < 900.0;
+        // The reading column is capped at 752px; the old 900px breakpoint put
+        // model, effort and spend behind More at every window width.
+        let compact_footer = content_width < 640.0;
         let mut secondary = if compact_footer {
             status.split_off(primary_status_count)
         } else {
@@ -3111,10 +3113,19 @@ impl Runtime {
                 .into(),
             );
         }
-        let spend = widget::row::with_children(spend)
-            .spacing(step::GAP_S)
-            .align_y(Alignment::Center)
-            .into();
+        let spend: Element<'_, Message> = if compact_footer {
+            // The details popup can be narrower than the model label alone.
+            // Let its individual controls wrap instead of clipping the tail.
+            widget::flex_row(spend)
+                .spacing(step::GAP_S as u16)
+                .align_items(Alignment::Center)
+                .into()
+        } else {
+            widget::row::with_children(spend)
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center)
+                .into()
+        };
         if compact_footer {
             // Model/reasoning/account popovers are anchored inside this
             // overflow. Keyboard shortcuts can open them while More is closed.
@@ -3155,19 +3166,11 @@ impl Runtime {
                 spend,
             ];
         }
-        let footer_row: Element<'_, Message> = if compact_footer {
-            widget::row::with_children(footer)
-                .spacing(step::GAP_S)
-                .align_y(Alignment::Center)
-                .width(Length::Fill)
-                .into()
-        } else {
-            widget::row::with_children(footer)
-                .spacing(step::GAP_S)
-                .align_y(Alignment::Center)
-                .width(Length::Fill)
-                .into()
-        };
+        let footer_row: Element<'_, Message> = widget::row::with_children(footer)
+            .spacing(step::GAP_S)
+            .align_y(Alignment::Center)
+            .width(Length::Fill)
+            .into();
         let footer = crate::ui_controls::popover(
             footer_row,
             self.permission_picker
@@ -5873,6 +5876,8 @@ fn model_list<'a>(
     .into()
 }
 
+#[cfg(test)]
+mod footer_responsive_tests;
 #[cfg(test)]
 mod frame_cost;
 #[cfg(test)]
