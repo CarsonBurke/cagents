@@ -450,14 +450,27 @@ mod tests {
     fn intentional_stop_retains_pcm_beyond_the_generic_failure_excerpt() {
         let stop = CancellationToken::new();
         let cancel = CancellationToken::new();
-        let command = producer("import os,time\nos.write(1,b'\\x12\\x34'*65536)\ntime.sleep(30)");
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("all-written");
+        let command = producer("import os,time\nos.write(1,b'\\x12\\x34'*65536)\nopen(os.environ['READY_FILE'],'w').close()\ntime.sleep(30)")
+            .env("READY_FILE", ready.as_os_str());
+        let stopping = {
+            let stop = stop.clone();
+            thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !ready.exists() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                assert!(ready.exists(), "producer finished its complete test clip");
+                stop.cancel();
+            })
+        };
         let mut progress = 0;
         let bytes = run(&command, Some(&stop), &cancel, Arc::new(()), || {
             progress += 1;
-            stop.cancel();
-        })
-        .unwrap();
-        assert_eq!(bytes, vec![0x12, 0x34].repeat(65536));
+        });
+        stopping.join().unwrap();
+        assert_eq!(bytes.unwrap(), vec![0x12, 0x34].repeat(65536));
         assert_eq!(progress, 1);
     }
     #[test]
@@ -495,7 +508,7 @@ mod tests {
     fn stop_never_promotes_an_already_failed_recorder() {
         let directory = tempfile::tempdir().unwrap();
         let pid_file = directory.path().join("pid");
-        let command = producer("import os\nopen(os.environ['PID_FILE'],'w').write(str(os.getpid()))\nos.write(1,b'x'*131072)\nos._exit(7)")
+        let command = producer("import os\nopen(os.environ['PID_FILE'],'w').write(str(os.getpid()))\nos.write(1,b'x'*1024)\nos._exit(7)")
             .env("PID_FILE", pid_file.as_os_str());
         let stop = CancellationToken::new();
         let cancel = CancellationToken::new();
