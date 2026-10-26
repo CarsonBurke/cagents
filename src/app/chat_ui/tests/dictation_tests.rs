@@ -526,6 +526,45 @@ fn native_record_press_and_focus_do_not_cross_operations_without_intermediate_fr
             }
         }
     }
+    struct HitBounds {
+        ids: [widget::Id; 3],
+        bounds: [Option<iced::Rectangle>; 3],
+    }
+    impl Operation for HitBounds {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn focusable(
+            &mut self,
+            id: Option<&widget::Id>,
+            bounds: iced::Rectangle,
+            _: &mut dyn operation::Focusable,
+        ) {
+            for (wanted, saved) in self.ids.iter().zip(&mut self.bounds) {
+                if id == Some(wanted) {
+                    *saved = Some(bounds);
+                }
+            }
+        }
+    }
+    fn safe_message_kind(message: &Message) -> String {
+        if let Message::ChatUi(Action::Composer(_, event)) = message {
+            match event {
+                text_editor::Action::Click(point) => format!("Composer::Click({point:?})"),
+                text_editor::Action::Drag(point) => format!("Composer::Drag({point:?})"),
+                text_editor::Action::Move(motion) => format!("Composer::Move({motion:?})"),
+                text_editor::Action::Select(motion) => format!("Composer::Select({motion:?})"),
+                text_editor::Action::SelectWord => "Composer::SelectWord".into(),
+                text_editor::Action::SelectLine => "Composer::SelectLine".into(),
+                text_editor::Action::SelectAll => "Composer::SelectAll".into(),
+                text_editor::Action::ClearSelection => "Composer::ClearSelection".into(),
+                text_editor::Action::Scroll { lines } => format!("Composer::Scroll({lines})"),
+                text_editor::Action::Edit(_) => "Composer::Edit(payload omitted)".into(),
+            }
+        } else {
+            format!("{message:?}")
+        }
+    }
     let mut renderer = crate::app::tests::headless_renderer();
     let viewport = iced::Size::new(620.0, 720.0);
     for stop in [true, false] {
@@ -569,6 +608,16 @@ fn native_record_press_and_focus_do_not_cross_operations_without_intermediate_fr
                     &mut renderer,
                 );
                 let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+                let mut hit = HitBounds {
+                    ids: [
+                        card_control_id(card, "chat-composer"),
+                        dictation::Action::StopRecording(first.clone()).control_id(target),
+                        dictation::Action::Cancel(first.clone()).control_id(target),
+                    ],
+                    bounds: [None; 3],
+                };
+                ui.operate(&renderer, &mut hit);
+                assert!(hit.bounds.iter().all(Option::is_some));
                 let bounds = nodes
                     .root()
                     .iter()
@@ -605,7 +654,18 @@ fn native_record_press_and_focus_do_not_cross_operations_without_intermediate_fr
                 );
                 assert!(
                     messages.is_empty(),
-                    "release owns the native control action; mouseDown emitted {messages:?}"
+                    "release owns the native control action; stop={stop} replace={replace} AX={bounds:?} pointer={pointer:?} actual[editor,record,cancel]={:?}; mouseDown emitted {:?}",
+                    hit.bounds,
+                    messages.iter().map(safe_message_kind).collect::<Vec<_>>(),
+                );
+                let actual = hit.bounds[if stop { 1 } else { 2 }].unwrap();
+                assert!(
+                    actual.contains(pointer),
+                    "AX center must hit the actual control: {bounds:?} versus {actual:?}"
+                );
+                assert!(
+                    !hit.bounds[0].unwrap().contains(pointer),
+                    "native editor and dictation controls must not overlap"
                 );
                 let id = control(first.clone()).control_id(target);
                 ui.operate(
