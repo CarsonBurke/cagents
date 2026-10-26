@@ -396,6 +396,8 @@ fn live_terminal_own_launch_selection_keeps_actor_origin_and_exact_replay_after_
     let (host, directory, home) = fixture();
     let repository = project(&host, home);
     let checkout = repository.canonicalize().unwrap();
+    let common = repository.join(".git").canonicalize().unwrap();
+    assert_ne!(common, checkout, "Git common metadata is not the checkout");
     let id = TerminalId::new();
     let session = TerminalDescriptor::relaunchable(
         id,
@@ -604,7 +606,7 @@ fn live_terminal_own_launch_selection_keeps_actor_origin_and_exact_replay_after_
     };
     selected.validate().unwrap();
     assert_eq!(selected.home, home);
-    assert_eq!(selected.context.repository, checkout);
+    assert_eq!(selected.context.repository, common);
     assert_eq!(selected.context.path, checkout);
     assert_eq!(selected.context.dirty, None);
     let mutation = claim(&selected);
