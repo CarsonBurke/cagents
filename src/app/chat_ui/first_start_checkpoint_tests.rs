@@ -610,88 +610,92 @@ fn old_writer_candidate_is_never_projected_into_a_replacement_store() {
 
 #[test]
 fn saved_first_prompt_keeps_exact_whitespace_and_original_images_before_later_edits() {
-    let (mut app, directory, card, target) = fixture();
-    let first = "  original first prompt\t \n\n";
-    match app.cards.get_mut(&card).unwrap() {
-        CardRuntime::Chat(runtime) => runtime.replace_draft(text_editor::Content::with_text(first)),
-        _ => unreachable!(),
-    }
-    let original_image = runtime(&app, card).attachments[0].clone();
-    let save = app.start_chat_draft(target);
-    let (target, attempt, result) = checkpoint(save);
-    assert!(result.is_ok());
-    let starter = app.draft_start_checkpointed(target, attempt, result);
-    let later = "independent later text\t  \n";
-    let later_image = Attachment {
-        path: directory.path().join("later-image.png"),
-        reference: Some(chat::ImageReference {
-            id: uuid::Uuid::new_v4(),
-            number: 2,
-            device: uuid::Uuid::new_v4(),
-            name: "later-image.png".into(),
-            sha256: "b".repeat(64),
-            extension: "png".into(),
-        }),
-    };
-    match app.cards.get_mut(&card).unwrap() {
-        CardRuntime::Chat(runtime) => {
-            runtime.replace_draft(text_editor::Content::with_text(later));
-            runtime.attachments.push(later_image.clone());
-            runtime.attachments.push(original_image.clone());
+    for later in ["independent later text\t  \n", " \t\n\n"] {
+        let (mut app, directory, card, target) = fixture();
+        let first = "  original first prompt\t \n\n";
+        match app.cards.get_mut(&card).unwrap() {
+            CardRuntime::Chat(runtime) => {
+                runtime.replace_draft(text_editor::Content::with_text(first))
+            }
+            _ => unreachable!(),
         }
-        _ => unreachable!(),
+        let original_image = runtime(&app, card).attachments[0].clone();
+        let save = app.start_chat_draft(target);
+        let (target, attempt, result) = checkpoint(save);
+        assert!(result.is_ok());
+        let starter = app.draft_start_checkpointed(target, attempt, result);
+
+        let later_image = Attachment {
+            path: directory.path().join("later-image.png"),
+            reference: Some(chat::ImageReference {
+                id: uuid::Uuid::new_v4(),
+                number: 2,
+                device: uuid::Uuid::new_v4(),
+                name: "later-image.png".into(),
+                sha256: "b".repeat(64),
+                extension: "png".into(),
+            }),
+        };
+        match app.cards.get_mut(&card).unwrap() {
+            CardRuntime::Chat(runtime) => {
+                runtime.replace_draft(text_editor::Content::with_text(later));
+                runtime.attachments.push(later_image.clone());
+                runtime.attachments.push(original_image.clone());
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            runtime(&app, card).queued.as_ref().unwrap().source.text(),
+            first
+        );
+        assert_eq!(runtime(&app, card).composer.text(), later);
+        app.persist();
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        let store = app.session.as_ref().unwrap().operation_store();
+        let restored = store.load_workspace(app.durable.id, None).unwrap().unwrap();
+        assert_eq!(restored.chat_drafts[&card], format!("{first}\n{later}"));
+        assert_eq!(
+            restored.chat_draft_attachments[&card],
+            vec![original_image, later_image]
+        );
+        // Loading this field is recovery data, not a provider submission, and
+        // preparing the snapshot has not changed either independent source.
+        assert_eq!(
+            runtime(&app, card).queued.as_ref().unwrap().source.text(),
+            first
+        );
+        assert_eq!(runtime(&app, card).composer.text(), later);
+        drop(starter);
+        let started = app.chat_ui.attempt(card).unwrap().target;
+        drop(app.handle_chat_ui(Action::Ready(
+            started,
+            Ready(Arc::new(Mutex::new(Some(Err(chat::StartFailure::retry(
+                "fixture refused before accepting a user item",
+            )))))),
+        )));
+        assert_eq!(
+            runtime(&app, card).composer.text(),
+            format!("{first}\n{later}")
+        );
+        assert_eq!(
+            runtime(&app, card).attachments,
+            restored.chat_draft_attachments[&card]
+        );
+        app.persist();
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        let failed = store.load_workspace(app.durable.id, None).unwrap().unwrap();
+        assert_eq!(failed.chat_drafts[&card], format!("{first}\n{later}"));
+        assert_eq!(
+            failed.chat_draft_attachments[&card],
+            restored.chat_draft_attachments[&card]
+        );
     }
-    assert_eq!(
-        runtime(&app, card).queued.as_ref().unwrap().source.text(),
-        first
-    );
-    assert_eq!(runtime(&app, card).composer.text(), later);
-    app.persist();
-    app.session
-        .as_ref()
-        .unwrap()
-        .flush(Duration::from_secs(5))
-        .unwrap();
-    let store = app.session.as_ref().unwrap().operation_store();
-    let restored = store.load_workspace(app.durable.id, None).unwrap().unwrap();
-    assert_eq!(restored.chat_drafts[&card], format!("{first}\n{later}"));
-    assert_eq!(
-        restored.chat_draft_attachments[&card],
-        vec![original_image, later_image]
-    );
-    // Loading this field is recovery data, not a provider submission, and
-    // preparing the snapshot has not changed either independent source.
-    assert_eq!(
-        runtime(&app, card).queued.as_ref().unwrap().source.text(),
-        first
-    );
-    assert_eq!(runtime(&app, card).composer.text(), later);
-    drop(starter);
-    let started = app.chat_ui.attempt(card).unwrap().target;
-    drop(app.handle_chat_ui(Action::Ready(
-        started,
-        Ready(Arc::new(Mutex::new(Some(Err(chat::StartFailure::retry(
-            "fixture refused before accepting a user item",
-        )))))),
-    )));
-    assert_eq!(
-        runtime(&app, card).composer.text(),
-        format!("{first}\n{later}")
-    );
-    assert_eq!(
-        runtime(&app, card).attachments,
-        restored.chat_draft_attachments[&card]
-    );
-    app.persist();
-    app.session
-        .as_ref()
-        .unwrap()
-        .flush(Duration::from_secs(5))
-        .unwrap();
-    let failed = store.load_workspace(app.durable.id, None).unwrap().unwrap();
-    assert_eq!(failed.chat_drafts[&card], format!("{first}\n{later}"));
-    assert_eq!(
-        failed.chat_draft_attachments[&card],
-        restored.chat_draft_attachments[&card]
-    );
 }

@@ -3183,7 +3183,7 @@ impl Runtime {
         // connection that has gone has nothing to be told.
         let _ = self.present();
         let written = self.composer.text();
-        let text = if written.trim().is_empty() {
+        let text = if written.is_empty() {
             queued.source.text().to_owned()
         } else {
             format!("{}\n{written}", queued.source.text())
