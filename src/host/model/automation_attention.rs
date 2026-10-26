@@ -789,6 +789,12 @@ mod tests {
                 .iter()
                 .any(|table| table == "automation_run_attention")
         );
+        // The new history column has an exact insertion-order backfill;
+        // original payload projection must not hide its value or lineage.
+        let expected_previous = db.prepare(
+            "SELECT id,lag(id) OVER(PARTITION BY automation ORDER BY rowid) FROM automation_firings ORDER BY rowid"
+        ).unwrap().query_map([], |row| Ok((row.get::<_,String>(0)?, row.get::<_,Option<String>>(1)?)))
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
         let before = tables
             .iter()
             .map(|table| (table.clone(), rows(&db, table)))
@@ -808,6 +814,30 @@ mod tests {
         drop(db);
         for _ in 0..2 {
             let registry = Registry::at(&legacy).unwrap();
+            let previous = registry
+                .db
+                .prepare("SELECT id,previous_firing FROM automation_firings ORDER BY rowid")
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(previous, expected_previous);
+            for table in [
+                "automation_precheck_history_cleanup",
+                "automation_retired_manual_requests",
+            ] {
+                assert_eq!(
+                    registry
+                        .db
+                        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                            .get::<_, u64>(0))
+                        .unwrap(),
+                    0
+                );
+            }
             assert_eq!(registry.model().unwrap(), expected_model);
             assert_eq!(
                 registry
