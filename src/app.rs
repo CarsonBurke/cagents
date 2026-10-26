@@ -101,10 +101,10 @@ use crate::{
     location::SanitizedLocation,
     lsp::{LspCoordinates, LspDocumentId, LspError, LspEvent, LspManager, LspPosition, LspStatus},
     model::{
-        CardId, CardKind, CardState, ChannelId, Existence, Exposure, HostSessionProof, LaunchRecipe,
-        ProjectId, ProjectKind, ProjectState, RepositoryView, Residency, RuntimeError,
-        TerminalContinuity, TerminalExit, TerminalId, TerminalSession, WorkspaceDestination,
-        WorkspaceState, WorktreeState,
+        CardId, CardKind, CardState, ChannelId, Existence, Exposure, HostSessionProof,
+        LaunchRecipe, ProjectId, ProjectKind, ProjectState, RepositoryView, Residency,
+        RuntimeError, TerminalContinuity, TerminalExit, TerminalId, TerminalSession,
+        WorkspaceDestination, WorkspaceState, WorktreeState,
     },
     pull_request_review,
     repository::{
@@ -2792,6 +2792,17 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
         )
 }
 
+fn user_message_blocked_during_close(message: &Message) -> bool {
+    user_message_blocked_during_update(message)
+        || matches!(
+            message,
+            Message::Palette(_) | Message::RunCommand(_) | Message::ActivateSession { .. }
+        )
+        || matches!(message, Message::Device(action) if !matches!(action,
+            device_ui::Action::ConfigSaved(_) | device_ui::Action::Loaded { .. }
+                | device_ui::Action::ImageLoaded { .. } | device_ui::Action::DeviceOpened { .. }))
+}
+
 fn focused_save_in_flight(
     focused: Option<CardId>,
     mut is_saving: impl FnMut(CardId) -> bool,
@@ -4312,6 +4323,12 @@ pub enum Message {
     CloseCard(CardId),
     CloseCardUnasked(CardId),
     WindowCloseRequested(window::Id),
+    WindowCloseFlushed {
+        generation: u64,
+        window: window::Id,
+        saved: Result<SettingsSaved, String>,
+        result: Result<(), String>,
+    },
     CancelTransientWorkClose,
     ReturnToDeviceBeforeClose,
     ReturnToAutomationBeforeClose,
@@ -4615,6 +4632,20 @@ pub enum Message {
     ExpireNotices,
     /// The retiring notices control has finished its conditional focus handoff.
     NoticeControlRetired,
+}
+
+// The writer Arc is a lifetime token, not a path comparison: reopening the
+// same database cannot make an old writer's acknowledgement authorize a close.
+// Keep the snapshot private; it can contain unsent conversation text.
+struct PendingWindowClose {
+    generation: u64,
+    window: window::Id,
+    writer: Option<Arc<crate::persistence::StateStore>>,
+    snapshot: Arc<WorkspaceState>,
+    settings_generation: u64,
+    settings: AppSettings,
+    view: Result<serde_json::Value, String>,
+    updater: Option<(u64, std::sync::mpsc::SyncSender<String>)>,
 }
 
 /// An application exit in progress.
@@ -5146,6 +5177,8 @@ pub struct Cagents {
     settings_ack_generation: u64,
     settings_reset_generation: Option<u64>,
     settings_save_lane: Arc<std::sync::Mutex<Option<SettingsSaved>>>,
+    pending_window_close: Option<PendingWindowClose>,
+    window_close_generation: u64,
     update_prepared: bool,
     update_flush_pending: bool,
     update_generation: u64,
@@ -6060,10 +6093,8 @@ impl Cagents {
         let width = if self.workspace.cards().is_empty() {
             // The welcome view has no WorkspaceSurface to replace the startup
             // width estimate. Use the window's current bounds until one mounts.
-            let sidebar = sidebar::effective_width(
-                self.projects_sidebar_mode(),
-                self.settings.sidebar_width,
-            );
+            let sidebar =
+                sidebar::effective_width(self.projects_sidebar_mode(), self.settings.sidebar_width);
             let inspector = if matches!(
                 self.context_inspector_mount(),
                 Some(InspectorLayout::Docked)
@@ -12285,7 +12316,9 @@ impl Cagents {
     // Shell navigation remains usable over main Work without admitting input
     // to the conversation panes it replaces.
     fn shell_inputs_blocked(&self) -> bool {
-        self.modal_is_open()
+        self.pending_window_close.is_some()
+            || self.exit.is_some()
+            || self.modal_is_open()
             || self.context_inspector_is_overlay()
             || self.chrome_ui.is_open()
             || self.palette.is_open()
@@ -12590,7 +12623,11 @@ impl Cagents {
         let repository_blocks = self.workspace.focused().is_some_and(|card| {
             matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
         });
-        if self.modal_is_open() || repository_blocks {
+        if self.pending_window_close.is_some()
+            || self.exit.is_some()
+            || self.modal_is_open()
+            || repository_blocks
+        {
             return Task::none();
         }
         Task::batch(
@@ -12603,10 +12640,10 @@ impl Cagents {
     /// Leaves the application: the window first, the process once the window
     /// is gone and the language servers have actually been reaped.
     ///
-    /// The window is the only part of the exit anyone sees, so it goes at
-    /// once. What follows - the reap below, the final session flush in
-    /// `Drop`, the renderer and runtime teardown after `run` returns - takes
-    /// seconds on a busy machine, and winit destroys a closed toplevel only on
+    /// Save the latest workspace and settings before committing the close.
+    /// Refusal keeps the window available for copying drafts or retrying.
+    /// After acknowledgement, server reap and renderer/runtime teardown can
+    /// take seconds, and winit destroys a closed toplevel only on
     /// an event-loop pass after the close: an exit that reaches iced first
     /// leaves the window on screen, unresponsive, until the process is gone.
     ///
@@ -12617,16 +12654,141 @@ impl Cagents {
     /// application that spawned it. The wait is bounded by the module's own
     /// reap timeout, so a server that refuses to die cannot hold the exit.
     fn exit_after_language_servers(&mut self) -> Task<Message> {
+        self.begin_window_close(None)
+    }
+
+    fn begin_window_close(
+        &mut self,
+        updater: Option<(u64, std::sync::mpsc::SyncSender<String>)>,
+    ) -> Task<Message> {
+        if self.exit.is_some() || self.pending_window_close.is_some() {
+            return Task::none();
+        }
         if self.operation_recovery_pending() {
             self.status = Some(TransientNotice::error(
                 "Finish or resolve retained file operations before closing this window.",
             ));
+            if let Some((_, response)) = updater {
+                self.update_prepared = false;
+                self.update_flush_pending = false;
+                let _ = response.try_send("error: retained file operations block closing".into());
+            }
             return Task::none();
         }
+        let Some(window) = self.core.main_window_id() else {
+            if let Some((_, response)) = updater {
+                self.update_prepared = false;
+                self.update_flush_pending = false;
+                let _ = response.try_send("error: window is no longer available".into());
+            }
+            return Task::none();
+        };
+        // Fold pending settings without dispatching new effects. Capture the
+        // latest composer/editor state before putting the writer barrier behind it.
+        self.fold_settings_drafts();
+        self.persist();
+        let snapshot = self.persistent_workspace();
+        let writer = self.session.as_ref().map(SessionRuntime::operation_store);
+        let save = self.capture_workspace_save();
+        self.window_close_generation = self.window_close_generation.wrapping_add(1);
+        let generation = self.window_close_generation;
+        self.status = Some(TransientNotice::warning(
+            "Saving this window before closing…",
+        ));
+        self.pending_window_close = Some(PendingWindowClose {
+            generation,
+            window,
+            writer,
+            snapshot,
+            settings_generation: self.settings_save_generation,
+            settings: self.settings.clone(),
+            view: serde_json::to_value(self.capture_window_view())
+                .map_err(|error| error.to_string()),
+            updater,
+        });
+        cosmic::task::future(async move {
+            let (saved, result) = flush_workspace(save).await;
+            Message::WindowCloseFlushed {
+                generation,
+                window,
+                saved,
+                result,
+            }
+        })
+    }
 
-        if self.exit.is_some() {
+    fn finish_window_close(
+        &mut self,
+        generation: u64,
+        window: window::Id,
+        saved: Result<SettingsSaved, String>,
+        result: Result<(), String>,
+    ) -> Task<Message> {
+        if !self
+            .pending_window_close
+            .as_ref()
+            .is_some_and(|pending| pending.generation == generation && pending.window == window)
+        {
             return Task::none();
         }
+        let pending = self
+            .pending_window_close
+            .take()
+            .expect("matched close attempt");
+        if pending.updater.is_some() {
+            self.update_flush_pending = false;
+        }
+        let current_writer = self.session.as_ref().map(SessionRuntime::operation_store);
+        let same_writer = matches!((&pending.writer, &current_writer),
+            (Some(original), Some(current)) if Arc::ptr_eq(original, current));
+        let current = self.persistent_workspace();
+        let result = result.and_then(|()| {
+            if self.core.main_window_id() != Some(window) || !same_writer {
+                Err("The window's storage changed while saving. Close it again to save the current window.".into())
+            } else if pending.snapshot != current
+                || pending.settings_generation != self.settings_save_generation
+                || pending.settings != self.settings
+                || pending.view != serde_json::to_value(self.capture_window_view()).map_err(|error| error.to_string())
+                || self.window_close_transient_blocker().is_some()
+            {
+                Err("The window changed while saving. Close it again to save the latest work.".into())
+            } else if pending.updater.as_ref().is_some_and(|(generation, _)|
+                !self.update_prepared || *generation != self.update_generation)
+            {
+                Err("Window update preparation was cancelled.".into())
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = result {
+            if let Some((_, response)) = pending.updater {
+                self.update_prepared = false;
+                self.update_committed = false;
+                let _ = response.try_send(format!("error: {error}").replace('\n', " "));
+            }
+            self.status = Some(TransientNotice::error(format!(
+                "Could not save this window; it remains open. Copy unsent drafts before retrying close. {error}"
+            )));
+            return Task::none();
+        }
+        if let Ok(saved) = saved {
+            self.acknowledge_settings_save(saved);
+        }
+        if let Some((_, response)) = pending.updater {
+            if response.try_send("ok".into()).is_err() {
+                self.update_prepared = false;
+                self.status = Some(TransientNotice::warning(
+                    "Updater disconnected; the saved window remains open.",
+                ));
+                return Task::none();
+            }
+            self.update_committed = true;
+        }
+        self.commit_window_exit()
+    }
+
+    // Only a current successful final-save acknowledgement can enter here.
+    fn commit_window_exit(&mut self) -> Task<Message> {
         if let Err(error) = crate::performance::chat_stage::flush() {
             tracing::warn!(target: "cagents::chat_stage", error_code = ?error.raw_os_error(),
                 "Could not flush opt-in chat stage measurements");
@@ -12637,9 +12799,9 @@ impl Cagents {
         // launcher waits for this process to release the window lease and
         // starts a fresh window.
         self.activation_rx.close();
-        // `Drop` writes the final state; this snapshot is queued now because
-        // someone who has watched the window close may power off before then.
-        self.persist();
+        // The final snapshot and settings have already been acknowledged.
+        // Do not queue a newer, unacknowledged snapshot between that barrier
+        // and closing the window. Lifecycle cleanup continues; user edits stay frozen.
         let reaped = self.lsp.begin_shutdown();
         let reap = cosmic::task::future(async move {
             reaped.await;
@@ -13129,17 +13291,7 @@ impl Cagents {
             .retain(|id, _| retained.contains(id));
     }
 
-    fn capture_settings_save(&mut self) -> Result<SettingsSave, String> {
-        if self.settings_write_blocked {
-            return Err(
-                "settings were not loaded successfully; use Reset all settings to replace them"
-                    .to_owned(),
-            );
-        }
-        let path = match self.settings_path.clone() {
-            Some(path) => path,
-            None => settings::default_path().map_err(|error| error.to_string())?,
-        };
+    fn capture_window_view(&mut self) -> WindowView {
         self.prune_pane_title_overrides();
         let mut view = WindowView {
             user_titles: self.chrome_ui.user_titles.clone(),
@@ -13157,6 +13309,21 @@ impl Cagents {
             view.worktree_offsets
                 .insert(path.clone(), self.workspace.camera().offset());
         }
+        view
+    }
+
+    fn capture_settings_save(&mut self) -> Result<SettingsSave, String> {
+        if self.settings_write_blocked {
+            return Err(
+                "settings were not loaded successfully; use Reset all settings to replace them"
+                    .to_owned(),
+            );
+        }
+        let path = match self.settings_path.clone() {
+            Some(path) => path,
+            None => settings::default_path().map_err(|error| error.to_string())?,
+        };
+        let view = self.capture_window_view();
         self.settings_save_generation += 1;
         Ok(SettingsSave {
             generation: self.settings_save_generation,
@@ -13883,6 +14050,8 @@ impl Application for Cagents {
             settings_ack_generation: 0,
             settings_reset_generation: None,
             settings_save_lane: Arc::new(std::sync::Mutex::new(None)),
+            pending_window_close: None,
+            window_close_generation: 0,
             update_prepared: false,
             update_flush_pending: false,
             update_generation: 0,
@@ -14141,6 +14310,11 @@ impl Application for Cagents {
             Message::UtilityPaneUi(message) => (*message, true),
             message => (message, false),
         };
+        if (self.pending_window_close.is_some() || self.exit.is_some())
+            && user_message_blocked_during_close(&message)
+        {
+            return Task::none();
+        }
         let notice_control = self.notice_control_severity();
         let attention_scope_changed = matches!(
             &message,
@@ -15907,6 +16081,10 @@ impl Application for Cagents {
                 self.refresh_settings_feedback();
                 Task::none()
             }
+            Message::UiUpdate(request) if self.pending_window_close.is_some() => {
+                let _ = request.response.try_send("error: window is saving before closing".into());
+                Task::none()
+            }
             Message::UiUpdate(request) => match request.action {
                 instance::UiUpdateAction::Prepare => {
                     if self.update_prepared {
@@ -15975,20 +16153,8 @@ impl Application for Cagents {
                         let _ = request.response.send(format!("error: {reason}"));
                         return Task::none();
                     }
-                    self.persist();
-                    let save = self.capture_workspace_save();
                     self.update_flush_pending = true;
-                    let generation = self.update_generation;
-                    cosmic::task::future(async move {
-                        let (saved, result) = flush_workspace(save).await;
-                        Message::UiUpdateFlushed {
-                            generation,
-                            committing: true,
-                            response: request.response,
-                            saved,
-                            result,
-                        }
-                    })
+                    self.begin_window_close(Some((self.update_generation, request.response)))
                 }
             },
             Message::UiUpdateFlushed {
@@ -16009,16 +16175,15 @@ impl Application for Cagents {
                 self.update_flush_pending = false;
                 match result {
                     Ok(()) => {
+                        if committing {
+                            return self.begin_window_close(Some((generation, response)));
+                        }
                         if response.try_send("ok".into()).is_err() {
                             self.update_prepared = false;
                             self.status = Some(TransientNotice::warning(
                                 "Updater disconnected; window is ready.",
                             ));
                             return Task::none();
-                        }
-                        if committing {
-                            self.update_committed = true;
-                            return self.exit_after_language_servers();
                         }
                     }
                     Err(error) => {
@@ -16049,10 +16214,16 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
+            Message::WindowCloseFlushed { generation, window, saved, result } => {
+                self.finish_window_close(generation, window, saved, result)
+            }
             Message::WindowCloseRequested(window) => {
                 // libcosmic reports the closed window through this same
                 // request, and a second close must not reopen the exit.
-                if self.exit.is_some() || self.dirty_repository_close.is_some() {
+                if self.exit.is_some()
+                    || self.dirty_repository_close.is_some()
+                    || self.core.main_window_id() != Some(window)
+                {
                     return Task::none();
                 }
                 if self.window_close_transient_blocker().is_some() {
@@ -20044,17 +20215,321 @@ mod tests {
         );
     }
 
+    fn install_window_close_storage(app: &mut Cagents, directory: &Path) {
+        let (writer, _) = SessionRuntime::open(
+            directory.join("window.sqlite3"),
+            crate::model::BootId::new("window-close-test"),
+        )
+        .unwrap();
+        app.session = Some(writer);
+        app.settings_path = Some(directory.join("settings.toml"));
+        app.settings_write_blocked = false;
+    }
+
+    fn acknowledge_test_window_close(app: &mut Cagents, window: window::Id) {
+        let task = app.update(Message::WindowCloseRequested(window));
+        assert!(app.pending_window_close.is_some());
+        assert!(app.exit.is_none());
+        assert_eq!(app.core.main_window_id(), Some(window));
+        let completed = task_app_message(task);
+        assert!(matches!(
+            &completed,
+            Message::WindowCloseFlushed { result: Ok(()), .. }
+        ));
+        drop(app.update(completed));
+        assert!(app.pending_window_close.is_none());
+    }
+
+    fn window_close_draft_app(directory: &Path) -> (Cagents, CardId, window::Id) {
+        let mut app = context_inspector_test_app(false);
+        app.active_workspace = Some(directory.to_path_buf());
+        drop(app.new_native_chat(crate::agent::Provider::Codex, Some(directory.to_path_buf())));
+        let card = app.workspace.focused().unwrap();
+        let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
+        install_window_close_storage(&mut app, directory);
+        type_window_close_draft(&mut app, card, "UNSENT before close");
+        (app, card, window)
+    }
+
+    fn type_window_close_draft(app: &mut Cagents, card: CardId, text: &str) {
+        let CardRuntime::Chat(runtime) = &app.cards[&card] else {
+            panic!("chat draft")
+        };
+        let target = runtime.target;
+        drop(app.update(Message::ChatUi(chat_ui::Action::Composer(
+            target,
+            widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(Arc::new(
+                text.to_owned(),
+            ))),
+        ))));
+    }
+
+    #[test]
+    fn window_close_acknowledges_latest_draft_before_shutdown_and_freezes_user_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, card, window) = window_close_draft_app(directory.path());
+        let (activations, receiver) = async_channel::unbounded();
+        app.activation_rx = receiver;
+        let store = app.session.as_ref().unwrap().operation_store();
+        let task = app.update(Message::WindowCloseRequested(window));
+        let generation = app.pending_window_close.as_ref().unwrap().generation;
+        assert!(app.exit.is_none());
+        assert_eq!(app.core.main_window_id(), Some(window));
+        assert!(!activations.is_closed());
+        drop(app.update(Message::WindowCloseRequested(window)));
+        assert_eq!(
+            app.pending_window_close.as_ref().unwrap().generation,
+            generation
+        );
+        type_window_close_draft(&mut app, card, "must not be accepted during flush");
+        let completed = task_app_message(task);
+        assert!(matches!(
+            &completed,
+            Message::WindowCloseFlushed { result: Ok(()), .. }
+        ));
+        let saved = store.load_workspace(app.durable.id, None).unwrap().unwrap();
+        assert_eq!(saved.chat_drafts[&card].trim_end(), "UNSENT before close");
+        // Storage has answered, but only the current reducer can close a window.
+        assert!(app.exit.is_none());
+        assert!(!activations.is_closed());
+        let duplicate = completed.clone();
+        drop(app.update(completed));
+        assert!(app.exit.is_some());
+        assert_eq!(app.core.main_window_id(), None);
+        assert!(activations.is_closed());
+        type_window_close_draft(&mut app, card, "must not be accepted after commit");
+        assert_eq!(
+            app.persistent_workspace().chat_drafts[&card].trim_end(),
+            "UNSENT before close"
+        );
+        drop(app.update(duplicate));
+        assert_eq!(app.window_close_generation, generation);
+    }
+
+    #[test]
+    fn window_close_storage_identity_refusal_keeps_draft_window_and_activation_alive() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, card, window) = window_close_draft_app(directory.path());
+        app.persist();
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        let original = app.card_state(card).unwrap().kind.clone();
+        let CardKind::Chat(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            panic!("chat")
+        };
+        session.id = TerminalId::new(); // A real refused identity rewrite, not a fake failed barrier.
+        let (activations, receiver) = async_channel::unbounded();
+        app.activation_rx = receiver;
+        let task = app.update(Message::WindowCloseRequested(window));
+        let completed = task_app_message(task);
+        assert!(matches!(
+            &completed,
+            Message::WindowCloseFlushed { result: Err(_), .. }
+        ));
+        drop(app.update(completed));
+        assert!(app.exit.is_none());
+        assert!(app.pending_window_close.is_none());
+        assert_eq!(app.core.main_window_id(), Some(window));
+        assert!(!activations.is_closed());
+        assert!(
+            app.notices
+                .entries
+                .iter()
+                .any(|entry| entry.notice.message.contains("Copy unsent drafts"))
+        );
+        assert_eq!(
+            app.persistent_workspace().chat_drafts[&card].trim_end(),
+            "UNSENT before close"
+        );
+        let saved = app
+            .session
+            .as_ref()
+            .unwrap()
+            .operation_store()
+            .load_workspace(app.durable.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved
+                .cards
+                .iter()
+                .find(|state| state.id == card)
+                .unwrap()
+                .kind,
+            original
+        );
+        // Refusal re-enables ordinary draft editing; it neither kills the writer
+        // nor automatically retries a permanent storage quarantine.
+        type_window_close_draft(&mut app, card, " still editable");
+        assert!(app.persistent_workspace().chat_drafts[&card].contains("still editable"));
+        let retry = task_app_message(app.update(Message::WindowCloseRequested(window)));
+        assert!(matches!(
+            &retry,
+            Message::WindowCloseFlushed { result: Err(_), .. }
+        ));
+        drop(app.update(retry));
+        assert_eq!(app.core.main_window_id(), Some(window));
+        assert!(!activations.is_closed());
+    }
+
+    #[test]
+    fn window_close_rejects_changed_snapshot_writer_window_and_stale_acknowledgements() {
+        for changed in ["snapshot", "writer", "window", "settings", "view"] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, card, window) = window_close_draft_app(directory.path());
+            let completed = task_app_message(app.update(Message::WindowCloseRequested(window)));
+            assert!(matches!(
+                &completed,
+                Message::WindowCloseFlushed { result: Ok(()), .. }
+            ));
+            let stale = completed.clone();
+            match changed {
+                "snapshot" => {
+                    // Model/lifecycle completions stay serviceable during a flush.
+                    // Their durable changes cannot be certified by the older ACK.
+                    app.card_state_mut(card).unwrap().title = "Arrived while saving".into();
+                }
+                "writer" => install_window_close_storage(&mut app, directory.path()),
+                "window" => app.core.set_main_window_id(Some(window::Id::unique())),
+                "settings" => app.settings.sidebar_width += 1.0,
+                "view" => app.context_inspector_open = !app.context_inspector_open,
+                _ => unreachable!(),
+            }
+            drop(app.update(completed));
+            assert!(app.exit.is_none(), "{changed}");
+            assert!(app.pending_window_close.is_none());
+            assert!(app.core.main_window_id().is_some());
+            // A later close is an explicit new attempt, never a replay of old ACK.
+            let current_window = app.core.main_window_id().unwrap();
+            let task = app.update(Message::WindowCloseRequested(current_window));
+            let generation = app.pending_window_close.as_ref().unwrap().generation;
+            drop(app.update(stale));
+            assert!(app.exit.is_none());
+            assert_eq!(
+                app.pending_window_close.as_ref().unwrap().generation,
+                generation
+            );
+            let completed = task_app_message(task);
+            assert!(matches!(
+                &completed,
+                Message::WindowCloseFlushed { result: Ok(()), .. }
+            ));
+            drop(app.update(completed));
+            assert!(app.exit.is_some(), "fresh {changed} close");
+        }
+    }
+
+    #[test]
+    fn window_close_settings_failure_and_missing_storage_do_not_commit_exit() {
+        for missing in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, card, window) = window_close_draft_app(directory.path());
+            if missing {
+                app.session = None;
+            } else {
+                // An actual settings write failure also vetoes the final barrier.
+                app.settings_path = Some(directory.path().to_path_buf());
+            }
+            let completed = task_app_message(app.update(Message::WindowCloseRequested(window)));
+            assert!(matches!(
+                &completed,
+                Message::WindowCloseFlushed { result: Err(_), .. }
+            ));
+            drop(app.update(completed));
+            assert!(app.exit.is_none());
+            assert_eq!(app.core.main_window_id(), Some(window));
+            assert_eq!(
+                app.persistent_workspace().chat_drafts[&card].trim_end(),
+                "UNSENT before close"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn window_close_updater_commit_waits_for_current_final_save() {
+        for changed in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, card, window) = window_close_draft_app(directory.path());
+            let (response, prepared) = std::sync::mpsc::sync_channel(1);
+            let task = app.update(Message::UiUpdate(instance::UiUpdateRequest {
+                action: instance::UiUpdateAction::Prepare,
+                response,
+            }));
+            let mut stream = iced::runtime::task::into_stream(task).expect("prepare flush");
+            let mut flushed = false;
+            while let Some(action) = stream.next().await {
+                if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                    let finished = matches!(message, Message::UiUpdateFlushed { .. });
+                    drop(app.update(message));
+                    if finished {
+                        flushed = true;
+                        break;
+                    }
+                }
+            }
+            assert!(flushed);
+            assert_eq!(prepared.try_recv().unwrap(), "ok");
+            let (response, committed) = std::sync::mpsc::sync_channel(1);
+            let task = app.update(Message::UiUpdate(instance::UiUpdateRequest {
+                action: instance::UiUpdateAction::Commit,
+                response,
+            }));
+            assert!(app.pending_window_close.is_some());
+            assert!(matches!(
+                committed.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            assert_eq!(app.core.main_window_id(), Some(window));
+            let mut stream = iced::runtime::task::into_stream(task).expect("commit flush");
+            let Some(iced::runtime::Action::Output(cosmic::Action::App(message))) =
+                stream.next().await
+            else {
+                panic!("final save acknowledgement");
+            };
+            assert!(matches!(
+                &message,
+                Message::WindowCloseFlushed { result: Ok(()), .. }
+            ));
+            assert!(matches!(
+                committed.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            if changed {
+                app.card_state_mut(card).unwrap().title = "New model state".into();
+            }
+            drop(app.update(message));
+            let result = committed.try_recv().unwrap();
+            if changed {
+                assert!(result.starts_with("error:"));
+                assert!(!app.update_prepared);
+                assert!(!app.update_committed);
+                assert!(app.exit.is_none());
+                assert_eq!(app.core.main_window_id(), Some(window));
+            } else {
+                assert_eq!(result, "ok");
+                assert!(app.update_committed);
+                assert!(app.exit.is_some());
+            }
+        }
+    }
+
     /// The window is the only part of an exit anyone sees, so it closes as
-    /// soon as the exit is committed; the language-server reap, the final
-    /// session flush and the process teardown all happen after it has gone.
+    /// soon as the final save commits; language-server reap and process
+    /// teardown happen after it has gone.
     #[test]
     fn committed_exit_closes_the_window_before_the_process_exits() {
+        let directory = tempfile::tempdir().unwrap();
         let mut app = context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
         let window = window::Id::unique();
         app.core.set_main_window_id(Some(window));
 
-        let _ = app.update(Message::WindowCloseRequested(window));
+        install_window_close_storage(&mut app, directory.path());
+        acknowledge_test_window_close(&mut app, window);
 
         let closing = Some(ApplicationExit {
             closing: Some(window),
@@ -20261,6 +20736,7 @@ mod tests {
 
     #[test]
     fn automation_draft_window_close_keeps_work_and_restarts_close_after_discard() {
+        let directory = tempfile::tempdir().unwrap();
         let mut app = context_inspector_test_app(false);
         let window = window::Id::unique();
         app.core.set_main_window_id(Some(window));
@@ -20286,7 +20762,8 @@ mod tests {
         // The discard schedules a fresh close request so device/repository/chat
         // blockers are checked again instead of entering exit directly.
         assert!(app.exit.is_none());
-        drop(app.update(Message::WindowCloseRequested(window)));
+        install_window_close_storage(&mut app, directory.path());
+        acknowledge_test_window_close(&mut app, window);
         assert!(app.exit.is_some());
     }
     #[test]
@@ -20345,6 +20822,7 @@ mod tests {
     /// one that is already running.
     #[test]
     fn committed_exit_stops_accepting_activations() {
+        let directory = tempfile::tempdir().unwrap();
         let mut app = context_inspector_test_app(false);
         let (activations, receiver) = async_channel::unbounded();
         app.activation_rx = receiver;
@@ -20352,7 +20830,8 @@ mod tests {
         app.core.set_main_window_id(Some(window));
         assert!(!activations.is_closed());
 
-        let _ = app.update(Message::WindowCloseRequested(window));
+        install_window_close_storage(&mut app, directory.path());
+        acknowledge_test_window_close(&mut app, window);
 
         assert!(activations.is_closed());
         assert!(
@@ -20373,10 +20852,12 @@ mod tests {
     #[test]
     fn exit_waits_for_both_the_window_and_the_language_servers() {
         for window_first in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
             let mut app = context_inspector_test_app(false);
             let window = window::Id::unique();
             app.core.set_main_window_id(Some(window));
-            let _ = app.update(Message::WindowCloseRequested(window));
+            install_window_close_storage(&mut app, directory.path());
+            acknowledge_test_window_close(&mut app, window);
 
             let (first, second) = if window_first {
                 (
@@ -20399,10 +20880,12 @@ mod tests {
     /// Only the window the exit closed can finish it.
     #[test]
     fn another_window_closing_does_not_finish_the_exit() {
+        let directory = tempfile::tempdir().unwrap();
         let mut app = context_inspector_test_app(false);
         let window = window::Id::unique();
         app.core.set_main_window_id(Some(window));
-        let _ = app.update(Message::WindowCloseRequested(window));
+        install_window_close_storage(&mut app, directory.path());
+        acknowledge_test_window_close(&mut app, window);
 
         let _ = app.update(Message::LanguageServersReaped);
         let _ = app.update(Message::WindowClosed(window::Id::unique()));
@@ -28434,6 +28917,8 @@ mod tests {
             settings_ack_generation: 0,
             settings_reset_generation: None,
             settings_save_lane: Arc::new(std::sync::Mutex::new(None)),
+            pending_window_close: None,
+            window_close_generation: 0,
             update_prepared: false,
             update_flush_pending: false,
             update_generation: 0,
