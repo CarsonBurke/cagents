@@ -615,10 +615,29 @@ mod tests {
                 before.x1 > before.x0 && before.y1 > before.y0,
                 "{label}: {before:?}"
             );
-            assert_eq!(after.x0, before.x0 + 29.0, "{label}");
-            assert_eq!(after.x1, before.x1 + 29.0, "{label}");
-            assert_eq!(after.y0, before.y0 + 57.0, "{label}");
-            assert_eq!(after.y1, before.y1 + 57.0, "{label}");
+            assert!(
+                after.x1 > after.x0 && after.y1 > after.y0,
+                "{label}: {after:?}"
+            );
+            // Layout translation, virtual-offset subtraction and edge sums
+            // happen in f32 before AX widens them to f64. Widening first and
+            // adding the exact delta can differ by a few f32 ULPs. Two relative
+            // f32 epsilons stay below 0.0001 logical pixels in this fixture.
+            for (edge, actual, origin, delta) in [
+                ("x0", after.x0, before.x0, 29.0),
+                ("x1", after.x1, before.x1, 29.0),
+                ("y0", after.y0, before.y0, 57.0),
+                ("y1", after.y1, before.y1, 57.0),
+            ] {
+                let expected = origin + delta;
+                let tolerance = 2.0
+                    * f64::from(f32::EPSILON)
+                    * expected.abs().max(origin.abs()).max(delta.abs()).max(1.0);
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "{label} {edge}: expected {expected}, actual {actual}, tolerance {tolerance}"
+                );
+            }
         }
         let viewport = Rectangle::with_size(Size::new(500.0, 400.0));
         let mut dispatch = |event: Event| {
