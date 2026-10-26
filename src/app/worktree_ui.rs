@@ -501,6 +501,19 @@ impl Cagents {
     /// Root discovery is shared for this pass, and unchanged grid output skips
     /// it entirely.
     pub(super) fn refresh_sidebar_worktree_panes(&mut self) {
+        // A passive Folder load has no worktree row and need not select its
+        // scope. Admit its root before deriving ownership, including cached
+        // attention, without requiring a navigation/read acknowledgement.
+        // Resolve aliases and rebuild owners only when a new boundary appears;
+        // unchanged output and ordinary structural passes retain the cache.
+        if self.sidebar_model.projects.iter().any(|project| {
+            project.kind == ProjectKind::Folder
+                && !self.known_worktree_roots.contains(&project.repository)
+        }) {
+            #[cfg(test)]
+            terminal_output_tests::record_folder_root_refresh();
+            self.refresh_worktree_owners(None);
+        }
         let roots = self.indexed_worktree_roots();
         let channeled = self
             .durable
@@ -529,8 +542,8 @@ impl Cagents {
             .collect();
         // Attention chooses the first matching loaded row, unlike occupancy:
         // the latter deliberately marks every project sharing an exact path.
-        // Folder keys participate only in exact loaded-path lookup, never in
-        // root discovery for a launch in a subdirectory.
+        // Folder boundaries were admitted above; their keys identify the
+        // exact loaded row once the longest-root lookup resolves a directory.
         let mut loaded = HashMap::new();
         for project in &self.sidebar_model.projects {
             if let Some(key) = project.folder_key() {

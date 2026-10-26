@@ -20,6 +20,7 @@ thread_local! {
     static PROJECTIONS: Cell<usize> = const { Cell::new(0) };
     static PROTECTIONS: Cell<usize> = const { Cell::new(0) };
     static OWNER_RESOLUTIONS: Cell<usize> = const { Cell::new(0) };
+    static FOLDER_ROOT_REFRESHES: Cell<usize> = const { Cell::new(0) };
 }
 pub(super) fn record_projection() {
     PROJECTIONS.set(PROJECTIONS.get() + 1);
@@ -29,6 +30,9 @@ pub(super) fn record_protection() {
 }
 pub(super) fn record_owner_resolution() {
     OWNER_RESOLUTIONS.set(OWNER_RESOLUTIONS.get() + 1);
+}
+pub(super) fn record_folder_root_refresh() {
+    FOLDER_ROOT_REFRESHES.set(FOLDER_ROOT_REFRESHES.get() + 1);
 }
 fn counts() -> (usize, usize) {
     (PROJECTIONS.get(), PROTECTIONS.get())
@@ -491,7 +495,6 @@ fn confirmed_host_proof_refreshes_uncertain_terminal_metadata() {
     assert_eq!(counts(), (0, 0));
 }
 
-
 #[test]
 fn indexed_owners_preserve_duplicate_rows_folder_precedence_and_explicit_filing() {
     use crate::{
@@ -604,10 +607,43 @@ fn indexed_owners_preserve_duplicate_rows_folder_precedence_and_explicit_filing(
         session.launch.working_directory = root.join("unregistered-child");
     }
     drop(app.update(Message::WindowResized(1200.0, 800.0)));
+    assert!(app.known_worktree_roots.contains(&root));
+    assert_eq!(app.worktree_owners.get(&card), Some(&root));
     assert_eq!(
         app.sidebar_state.agent_activity(first, folder.worktree_id),
-        None,
-        "an exact folder key is not a newly discovered ancestor root"
+        Some(ActivityState::Working),
+        "a loaded Folder establishes its boundary without selection"
+    );
+    assert!(
+        app.sidebar_state
+            .has_agent_update(first, folder.worktree_id)
+    );
+    assert!(app.sidebar_state.has_card_update(card));
+    assert_eq!(app.sidebar_state.card_activity(card), Some(working));
+
+    // The boundary is still a component-aware ancestor, not a catch-all
+    // destination for a terminal outside any loaded Folder/worktree.
+    let outside = root.parent().unwrap().join(format!(
+        "{}-outside-loaded-folder",
+        root.file_name().unwrap().to_string_lossy()
+    ));
+    assert!(!outside.starts_with(&root));
+    app.worktree_owners.remove(&card);
+    if let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind {
+        session.launch.working_directory = outside.clone();
+    }
+    drop(app.update(Message::WindowResized(1200.0, 800.0)));
+    assert_eq!(
+        app.card_worktree(app.card_state(card).unwrap()),
+        Some(outside.as_path())
+    );
+    assert_eq!(
+        app.sidebar_state.agent_activity(first, folder.worktree_id),
+        None
+    );
+    assert!(
+        !app.sidebar_state
+            .has_agent_update(first, folder.worktree_id)
     );
     assert!(app.sidebar_state.has_card_update(card));
     assert_eq!(app.sidebar_state.card_activity(card), Some(working));
@@ -1681,4 +1717,223 @@ fn worker_closed_wording_in_a_real_wire_error_remains_fatal() {
             .iter()
             .any(|entry| entry.notice.message.contains("Terminal input rejected"))
     );
+}
+
+#[test]
+fn passive_folder_loads_rebind_cached_attention_without_navigation_or_losing_explicit_filing() {
+    use crate::{
+        agent::{Activity, ActivityState, Provider},
+        model::{BootId, HostIncarnation, HostSessionId, TerminalId},
+    };
+
+    fn passive_load(app: &mut Cagents, directory: &Path) -> ProjectId {
+        let loaded = load_project(
+            directory,
+            None,
+            CancellationToken::default(),
+            Some(ProjectKind::Folder),
+        )
+        .unwrap();
+        assert!(loaded.worktrees.is_empty());
+        let project = loaded.project.id;
+        app.repository_generations.insert(project, 1);
+        drop(app.update(Message::RepositoryLoaded {
+            open_cards: false,
+            project_id: project,
+            generation: 1,
+            result: Ok(Box::new(loaded)),
+        }));
+        project
+    }
+
+    for explicitly_filed in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let control = root.join("control");
+        let parent = root.join("parent");
+        let nested = parent.join("nested");
+        for path in [&control, &nested] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let mut app = super::tests::context_inspector_test_app(true);
+        let control_card = app.workspace.focused().unwrap();
+        let CardKind::Terminal(control_session) =
+            &mut app.card_state_mut(control_card).unwrap().kind
+        else {
+            panic!("original control pane is a terminal")
+        };
+        control_session.launch.working_directory = control.clone();
+        let mut session = control_session.clone();
+        drop(app.select_worktree(control.clone(), false));
+        app.refresh_ui.focused = false;
+        let original_focus = app.workspace.focused();
+        let original_strip = app.workspace.order().collect::<Vec<_>>();
+        FOLDER_ROOT_REFRESHES.set(0);
+
+        let parent_id = passive_load(&mut app, &parent);
+        let parent_key = app.sidebar_model.worktree_at(&parent).unwrap();
+        assert_eq!(parent_key.project_id, parent_id);
+        assert!(app.known_worktree_roots.contains(&parent));
+        assert_eq!(FOLDER_ROOT_REFRESHES.get(), 1);
+        assert_eq!(app.active_workspace.as_ref(), Some(&control));
+        assert_eq!(app.workspace.focused(), original_focus);
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), original_strip);
+
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("passive-folder-test"),
+            boot_id: BootId::new("passive-folder-test"),
+            host_incarnation: HostIncarnation::new("passive-folder-test"),
+        };
+        session.id = TerminalId::new();
+        session.launch.working_directory = nested.clone();
+        session.continuity = TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        let terminal = session.id;
+        let mut peer = Peer::new(session.clone(), proof.clone());
+        let mut descriptor =
+            TerminalDescriptor::relaunchable(terminal, session.launch.clone(), None);
+        descriptor.session = session;
+        drop(app.update(Message::HostedTerminalsObserved(vec![descriptor])));
+        let adopted = app
+            .durable
+            .cards
+            .iter()
+            .filter(|entry| matches!(&entry.kind, CardKind::Terminal(session) if session.id == terminal))
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        assert_eq!(adopted.len(), 1);
+        let card = adopted[0];
+        assert!(!app.durable.card_scopes.contains_key(&card));
+        assert_eq!(
+            app.card_worktree(app.card_state(card).unwrap()),
+            Some(parent.as_path())
+        );
+        app.cards
+            .insert(card, CardRuntime::Terminal(peer.handle.clone().into()));
+        if explicitly_filed {
+            // An established user filing is durable authority, unlike the
+            // derived owner cache that a new Folder boundary must invalidate.
+            Arc::make_mut(&mut app.durable)
+                .card_scopes
+                .insert(card, parent.clone());
+        }
+        let working = Activity {
+            provider: Provider::Omp,
+            state: ActivityState::Working,
+        };
+        apply(
+            &mut app,
+            card,
+            &mut peer,
+            Some(WireTerminalEvent::AgentActivityChanged {
+                activity: Some(working),
+            }),
+        );
+        apply(&mut app, card, &mut peer, Some(WireTerminalEvent::Bell));
+        assert_eq!(
+            app.sidebar_state
+                .agent_activity(parent_key.project_id, parent_key.worktree_id),
+            Some(ActivityState::Working)
+        );
+        assert!(
+            app.sidebar_state
+                .has_agent_update(parent_key.project_id, parent_key.worktree_id)
+        );
+        let session_before = match &app.card_state(card).unwrap().kind {
+            CardKind::Terminal(session) => session.clone(),
+            _ => panic!(),
+        };
+        let generation = peer.handle.generation();
+
+        let nested_id = passive_load(&mut app, &nested);
+        let nested_key = app.sidebar_model.worktree_at(&nested).unwrap();
+        assert_eq!(nested_key.project_id, nested_id);
+        assert!(app.known_worktree_roots.contains(&nested));
+        assert_eq!(FOLDER_ROOT_REFRESHES.get(), 2);
+        assert_eq!(app.active_workspace.as_ref(), Some(&control));
+        assert_eq!(app.workspace.focused(), original_focus);
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), original_strip);
+        assert_eq!(app.sidebar_state.card_activity(card), Some(working));
+        assert!(app.sidebar_state.has_card_update(card));
+        assert_eq!(peer.handle.terminal_id(), terminal);
+        assert_eq!(peer.handle.proof(), Some(proof.clone()));
+        assert_eq!(
+            peer.handle.generation(),
+            generation,
+            "no fresh terminal event authorizes reattribution"
+        );
+        match &app.card_state(card).unwrap().kind {
+            CardKind::Terminal(session) => assert_eq!(*session, session_before),
+            _ => panic!(),
+        }
+        assert_eq!(app.durable.cards.iter().filter(|entry| matches!(&entry.kind, CardKind::Terminal(session) if session.id == terminal)).count(), 1);
+        let owner = if explicitly_filed { &parent } else { &nested };
+        let owner_key = if explicitly_filed {
+            &parent_key
+        } else {
+            &nested_key
+        };
+        let other_key = if explicitly_filed {
+            &nested_key
+        } else {
+            &parent_key
+        };
+        assert_eq!(
+            app.card_worktree(app.card_state(card).unwrap()),
+            Some(owner.as_path())
+        );
+        assert_eq!(
+            app.sidebar_state
+                .agent_activity(owner_key.project_id, owner_key.worktree_id),
+            Some(ActivityState::Working)
+        );
+        assert!(
+            app.sidebar_state
+                .has_agent_update(owner_key.project_id, owner_key.worktree_id)
+        );
+        assert_eq!(
+            app.sidebar_state
+                .agent_activity(other_key.project_id, other_key.worktree_id),
+            None
+        );
+        assert!(
+            !app.sidebar_state
+                .has_agent_update(other_key.project_id, other_key.worktree_id)
+        );
+        assert_eq!(
+            app.durable.card_scopes.get(&card),
+            explicitly_filed.then_some(&parent)
+        );
+
+        // Repeated passive loads/ordinary layout and output events do not
+        // repeat canonicalization or rescan all original card owners.
+        passive_load(&mut app, &nested);
+        drop(app.update(Message::WindowResized(1200.0, 800.0)));
+        for _ in 0..4 {
+            apply(&mut app, card, &mut peer, None);
+        }
+        assert_eq!(FOLDER_ROOT_REFRESHES.get(), 2);
+        assert_eq!(app.sidebar_state.card_activity(card), Some(working));
+        assert!(
+            app.sidebar_state
+                .has_agent_update(owner_key.project_id, owner_key.worktree_id)
+        );
+        let requests = peer.observed.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(request, ObservedInput::Connect))
+                .count(),
+            1
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| matches!(request, ObservedInput::Connect)),
+            "Folder adoption must not synthesize terminal input"
+        );
+    }
 }
