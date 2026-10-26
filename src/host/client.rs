@@ -23,6 +23,9 @@ use super::{
     state::{ClientId, SharedHost, send_error, spawn_terminal},
 };
 
+#[cfg(all(test, target_os = "linux"))]
+mod explicit_authority_server_tests;
+
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 struct HandshakeReader<'a> {
     stream: &'a mut UnixStream,
