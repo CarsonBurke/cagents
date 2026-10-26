@@ -11446,7 +11446,11 @@ mod tests {
                     cancellation: &CancellationToken,
                 ) -> Result<ProcessOutput, ProcessFailure> {
                     let output = IsolatedExecutor.execute(command, cancellation)?;
-                    if command.arguments.iter().any(|argument| argument == "ls-files") {
+                    if command
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "ls-files")
+                    {
                         assert!(output.success);
                         assert!(output.stdout.is_empty(), "the original index is empty");
                         fs::rename(&self.root, &self.parked).unwrap();

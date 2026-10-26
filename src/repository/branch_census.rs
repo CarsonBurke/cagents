@@ -22,8 +22,7 @@ pub struct Divergence {
     pub behind: u32,
 }
 
-const TIP_FORMAT: &str =
-    "%(refname)%00%(objectname)%00%(committerdate:unix)%00%(worktreepath)%00";
+const TIP_FORMAT: &str = "%(refname)%00%(objectname)%00%(committerdate:unix)%00%(worktreepath)%00";
 const TIP_FIELDS: usize = 4;
 
 /// `for-each-ref` ends every record with a newline that its fields cannot
@@ -247,7 +246,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             // A pattern also matches refs below it (`refs/heads/fix` matches
             // `refs/heads/fix/a`); keep exactly the refs asked about.
             let parsed = invalid_output(parse_divergence(&output.stdout), output)?;
-            counts.extend(parsed.into_iter().filter(|(refname, _)| batch.contains(refname)));
+            counts.extend(
+                parsed
+                    .into_iter()
+                    .filter(|(refname, _)| batch.contains(refname)),
+            );
         }
         Ok(counts)
     }
@@ -406,8 +409,7 @@ mod tests {
 
     #[test]
     fn divergence_counts_parse_per_ref() {
-        let counts =
-            parse_divergence(b"refs/heads/a\x009 77\0\nrefs/heads/b\x000 0\0\n").unwrap();
+        let counts = parse_divergence(b"refs/heads/a\x009 77\0\nrefs/heads/b\x000 0\0\n").unwrap();
         assert_eq!(
             counts["refs/heads/a"],
             Divergence {
@@ -447,7 +449,12 @@ mod tests {
                 .arg("-C")
                 .arg(&root)
                 .args(["-c", "user.name=Test", "-c", "user.email=me@example.com"])
-                .args(["-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main"])
+                .args([
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
                 .args(arguments)
                 .env_remove("GIT_DIR")
                 .env_remove("GIT_WORK_TREE")
@@ -469,7 +476,14 @@ mod tests {
             "refs/remotes/origin/main",
         ]);
         let linked = directory.path().join("linked");
-        git(&["worktree", "add", "-q", "-b", "feature", linked.to_str().unwrap()]);
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            linked.to_str().unwrap(),
+        ]);
         std::fs::write(root.join("README"), "two\n").unwrap();
         git(&["commit", "-q", "-am", "two"]);
         std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
@@ -497,7 +511,11 @@ mod tests {
             .unwrap();
         assert!(main.committed_at_unix_ms.is_some());
         assert_eq!(
-            main.worktree.as_deref().map(fs::canonicalize).transpose().unwrap(),
+            main.worktree
+                .as_deref()
+                .map(fs::canonicalize)
+                .transpose()
+                .unwrap(),
             Some(fs::canonicalize(&root).unwrap())
         );
         assert!(main.committed_at_unix_ms.is_some());
@@ -506,7 +524,12 @@ mod tests {
             .find(|tip| tip.refname == "refs/heads/feature")
             .unwrap();
         assert_eq!(
-            feature.worktree.as_deref().map(fs::canonicalize).transpose().unwrap(),
+            feature
+                .worktree
+                .as_deref()
+                .map(fs::canonicalize)
+                .transpose()
+                .unwrap(),
             Some(fs::canonicalize(&linked).unwrap())
         );
 
@@ -529,7 +552,12 @@ mod tests {
         // The per-ref fallback for Git older than 2.41 agrees.
         assert_eq!(
             service
-                .revision_divergence(&root, "refs/remotes/origin/main", "refs/heads/main", &cancellation)
+                .revision_divergence(
+                    &root,
+                    "refs/remotes/origin/main",
+                    "refs/heads/main",
+                    &cancellation
+                )
                 .unwrap(),
             counts["refs/heads/main"]
         );
@@ -560,7 +588,11 @@ mod tests {
         );
         assert_eq!(
             service
-                .commit_times(&root, &[main.oid.clone(), feature.oid.clone()], &cancellation)
+                .commit_times(
+                    &root,
+                    &[main.oid.clone(), feature.oid.clone()],
+                    &cancellation
+                )
                 .unwrap(),
             BTreeMap::from([
                 (main.oid.clone(), main.committed_at_unix_ms.unwrap()),
@@ -582,7 +614,11 @@ mod tests {
 
         // A fork compares with its parent, not with itself.
         git(&["update-ref", "refs/remotes/upstream/main", "HEAD"]);
-        git(&["symbolic-ref", "refs/remotes/upstream/HEAD", "refs/remotes/upstream/main"]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/upstream/HEAD",
+            "refs/remotes/upstream/main",
+        ]);
         assert_eq!(
             service
                 .default_branch_ref(&root, &cancellation)

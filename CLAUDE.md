@@ -62,6 +62,6 @@ You are a senior app developer tasked with creating a great Agent Development En
 - For UI changes, launch the actual native UI with the development runner and exercise the changed path. A successful compile alone is insufficient.
   - If you need live testing with an agent (fixture isn't sufficient) you must use the cheapest model, such as haiku/luna on low reasoning.
 - For browser or feature-boundary changes, verify both browserless and integrated lanes.
-- Use `cargo fmt --check` after Rust edits.
+- Use `scripts/check-format` after Rust edits. It checks Cargo roots and the Rust source trees hidden behind `include!` macros without rewriting files.
 
 The full runner option reference, test lanes, resource guidance, and troubleshooting are in `docs/development.md`.
