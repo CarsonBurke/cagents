@@ -49,7 +49,7 @@ mod tests {
         assert_eq!(app.terminal_context.as_ref().unwrap().terminal, terminal);
         let message = super::super::dialog_ui::tests::enter_control(
             app.terminal_menu(card).unwrap(),
-            review_id(card),
+            review_id(card, terminal, app.terminal_review_revision, true),
         );
         let Message::TerminalFind(Action::ReviewFromMenu(target, origin, revision, true)) = message
         else {
@@ -150,7 +150,12 @@ mod tests {
                     &mut tree,
                     Layout::new(&node),
                     &renderer,
-                    &mut operation::focusable::focus::<()>(review_id(card)),
+                    &mut operation::focusable::focus::<()>(review_id(
+                        card,
+                        terminal,
+                        app.terminal_review_revision,
+                        false,
+                    )),
                 );
                 let physical_key = keyboard::key::Physical::Code(
                     if matches!(&key, keyboard::Key::Named(keyboard::key::Named::Enter)) {
@@ -282,7 +287,7 @@ mod tests {
             card: CardId,
             renderer: &mut cosmic::Renderer,
             cache: &mut Cache,
-            event: iced::mouse::Event,
+            event: iced::Event,
         ) -> Vec<Message> {
             let mut ui = UserInterface::build(
                 app.terminal_menu(card).unwrap(),
@@ -291,7 +296,12 @@ mod tests {
                 renderer,
             );
             let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
-            let target = iced_accessibility::A11yId::from(review_id(card));
+            let target = iced_accessibility::A11yId::from(review_id(
+                card,
+                app.terminal_context.as_ref().unwrap().terminal,
+                app.terminal_review_revision,
+                app.terminal_review_card != Some(card),
+            ));
             let bounds = nodes
                 .root()
                 .iter()
@@ -307,7 +317,7 @@ mod tests {
             );
             let mut messages = Vec::new();
             let _ = ui.update(
-                &[iced::Event::Mouse(event)],
+                &[event],
                 iced::mouse::Cursor::Available(pointer),
                 renderer,
                 &mut clipboard::Null,
@@ -331,6 +341,14 @@ mod tests {
                 None,
                 None,
             )));
+            let old_target: iced_accessibility::accesskit::NodeId =
+                iced_accessibility::A11yId::from(review_id(
+                    card,
+                    terminal,
+                    app.terminal_review_revision,
+                    true,
+                ))
+                .into();
             let mut cache = Cache::new();
             assert!(
                 frame(
@@ -338,7 +356,9 @@ mod tests {
                     card,
                     &mut renderer,
                     &mut cache,
-                    iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)
+                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                        iced::mouse::Button::Left
+                    ))
                 )
                 .is_empty()
             );
@@ -387,7 +407,9 @@ mod tests {
                 card,
                 &mut renderer,
                 &mut cache,
-                iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )),
             );
             if changed == "unchanged" {
                 assert!(
@@ -400,13 +422,30 @@ mod tests {
                     "held pointer must not migrate to a changed menu action: {changed}"
                 );
             }
+            if changed != "unchanged" {
+                let stale = iced::Event::A11y(
+                    widget::Id::from(old_target.0),
+                    iced_accessibility::accesskit::ActionRequest {
+                        action: iced_accessibility::accesskit::Action::Click,
+                        target_tree: iced_accessibility::accesskit::TreeId::ROOT,
+                        target_node: old_target,
+                        data: None,
+                    },
+                );
+                assert!(
+                    frame(&app, card, &mut renderer, &mut cache, stale).is_empty(),
+                    "the old advertised native action ID cannot invoke the new mode"
+                );
+            }
             assert!(
                 frame(
                     &app,
                     card,
                     &mut renderer,
                     &mut cache,
-                    iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)
+                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                        iced::mouse::Button::Left
+                    ))
                 )
                 .is_empty()
             );
@@ -415,7 +454,9 @@ mod tests {
                 card,
                 &mut renderer,
                 &mut cache,
-                iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )),
             );
             assert_eq!(
                 fresh.len(),
@@ -931,8 +972,15 @@ fn input_id(card: CardId) -> iced::widget::Id {
     iced::widget::Id::from(format!("terminal-find-{card}"))
 }
 
-fn review_id(card: CardId) -> iced::widget::Id {
-    iced::widget::Id::new(format!("terminal-review-{card}"))
+fn review_id(
+    card: CardId,
+    terminal: crate::model::TerminalId,
+    revision: u64,
+    active: bool,
+) -> iced::widget::Id {
+    iced::widget::Id::new(format!(
+        "terminal-review-{card}-{terminal}-{revision}-{active}"
+    ))
 }
 
 impl Cagents {
@@ -1354,7 +1402,7 @@ impl Cagents {
                 } else {
                     "Review visible text"
                 })
-                .id(review_id(card))
+                .id(review_id(card, context.terminal, revision, active))
                 .width(Length::Fill)
                 .on_press(review.clone()),
                 move |event| {
