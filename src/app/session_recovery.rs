@@ -62,9 +62,25 @@ impl Review {
     }
 }
 
+/// Exact action authority captured by the rendered recovery control.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OpenIntent {
+    card: CardId,
+    terminal: TerminalSession,
+}
+
+impl std::fmt::Debug for OpenIntent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Terminal evidence contains the launch environment; never log it.
+        f.debug_struct("OpenIntent")
+            .field("card", &self.card)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Action {
-    Open(CardId),
+    Open(OpenIntent),
     Prepared {
         generation: u64,
         result: Result<Review, String>,
@@ -110,13 +126,18 @@ impl Cagents {
         let CardKind::Terminal(terminal) = &self.card_state(card)?.kind else {
             return None;
         };
+        let intent = OpenIntent {
+            card,
+            terminal: terminal.clone(),
+        };
         Some(crate::ui_controls::owned(
-            (card, terminal.clone()),
+            intent.clone(),
             crate::ui_controls::button::secondary("Recover terminal ownership…")
                 .id(widget::Id::new("session-recovery.open"))
                 .name("Review recovery of the refused terminal from its closed pane")
                 .on_press_maybe(
-                    (!self.modal_is_open()).then_some(Message::SessionRecovery(Action::Open(card))),
+                    (!self.modal_is_open())
+                        .then_some(Message::SessionRecovery(Action::Open(intent))),
                 ),
         ))
     }
@@ -128,10 +149,14 @@ impl Cagents {
 
     pub(super) fn update_session_recovery(&mut self, action: Action) -> Task<Message> {
         match action {
-            Action::Open(card)
+            Action::Open(intent)
                 if !self.modal_is_open()
-                    && self.refused_terminal_recovery_target() == Some(card) =>
+                    && self.refused_terminal_recovery_target() == Some(intent.card)
+                    && self.card_state(intent.card).is_some_and(|card| {
+                        matches!(&card.kind, CardKind::Terminal(terminal) if terminal == &intent.terminal)
+                    }) =>
             {
+                let card = intent.card;
                 let snapshot = self.persistent_workspace();
                 let Some(target) = snapshot.cards.iter().find(|state| state.id == card) else {
                     return Task::none();
@@ -139,6 +164,9 @@ impl Cagents {
                 let CardKind::Terminal(terminal) = &target.kind else {
                     return Task::none();
                 };
+                if terminal != &intent.terminal {
+                    return Task::none();
+                }
                 let terminal = terminal.id;
                 let store = self.session.as_ref().unwrap().operation_store();
                 let state = &mut self.session_recovery;
@@ -439,6 +467,36 @@ mod tests {
         (directory, app, card)
     }
 
+    fn open(app: &Cagents, card: CardId) -> Action {
+        let CardKind::Terminal(terminal) = &app.card_state(card).unwrap().kind else {
+            panic!("recovery fixture must hold a terminal");
+        };
+        Action::Open(OpenIntent {
+            card,
+            terminal: terminal.clone(),
+        })
+    }
+
+    #[test]
+    fn recovery_open_intent_debug_does_not_expose_terminal_evidence() {
+        let (_directory, mut app, card) = fixture();
+        let mut action = open(&app, card);
+        let Action::Open(intent) = &mut action else {
+            unreachable!();
+        };
+        intent.terminal.launch.program = "PRIVATE_RECOVERY_PROGRAM".into();
+        intent.terminal.launch.environment.insert(
+            "PRIVATE_RECOVERY_ENVIRONMENT".into(),
+            "PRIVATE_RECOVERY_VALUE".into(),
+        );
+        intent.terminal.transcript_path = Some("PRIVATE_RECOVERY_TRANSCRIPT".into());
+        intent.terminal.resume_hint = Some("PRIVATE_RECOVERY_RESUME".into());
+        let diagnostic = format!("{action:?}");
+        assert!(diagnostic.contains("OpenIntent"));
+        assert!(!diagnostic.contains("PRIVATE_RECOVERY"));
+        app.session.as_mut().unwrap().shutdown();
+    }
+
     #[test]
     fn retained_recovery_control_keeps_press_and_focus_with_its_original_terminal() {
         use iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
@@ -449,6 +507,7 @@ mod tests {
             for replacement in [0, 1, 2] {
                 let (_directory, mut app, original) = fixture();
                 assert_eq!(app.refused_terminal_recovery_target(), Some(original));
+                let queued = open(&app, original);
                 let viewport = Rectangle::with_size(Size::new(500.0, 80.0));
                 let mut element = app.session_recovery_action().unwrap();
                 let mut tree = Tree::new(element.as_widget());
@@ -535,7 +594,7 @@ mod tests {
                 if replacement == 0 {
                     assert!(matches!(
                         messages.as_slice(),
-                        [Message::SessionRecovery(Action::Open(card))] if *card == original
+                        [Message::SessionRecovery(Action::Open(intent))] if intent.card == original
                     ));
                 } else {
                     assert!(messages.is_empty(), "old gesture/focus retargeted recovery");
@@ -572,16 +631,20 @@ mod tests {
                     );
                     assert!(matches!(
                         messages.as_slice(),
-                        [Message::SessionRecovery(Action::Open(card))] if *card == expected
+                        [Message::SessionRecovery(Action::Open(intent))] if intent.card == expected
                     ));
                 }
                 drop(element);
-                if replacement == 1 {
-                    drop(app.update_session_recovery(Action::Open(original)));
+                if replacement != 0 {
+                    let generation = app.session_recovery.generation;
+                    drop(app.update_session_recovery(queued));
                     assert!(
                         !app.session_recovery.open(),
-                        "queued old target was accepted"
+                        "queued old card or terminal evidence was accepted"
                     );
+                    assert!(!app.session_recovery.preparing);
+                    assert!(!app.session_recovery.pending);
+                    assert_eq!(app.session_recovery.generation, generation);
                 }
                 let Message::SessionRecovery(action) = messages.pop().unwrap() else {
                     panic!("rendered recovery control emitted another action");
@@ -699,7 +762,7 @@ mod tests {
         let (_directory, mut app, card) = fixture();
         let before = Arc::clone(&app.durable);
         let quarantine = app.save_health.as_ref().unwrap().quarantined.clone();
-        let preparation = reply(app.update_session_recovery(Action::Open(card)));
+        let preparation = reply(app.update_session_recovery(open(&app, card)));
         assert!(app.modal_is_open());
         assert!(!app.core.keyboard_nav());
         drop(app.update_session_recovery(Action::Confirm));
@@ -771,7 +834,7 @@ mod tests {
     #[test]
     fn ownership_recovery_confirmation_saves_current_drafts_and_keeps_the_barrier_until_commit() {
         let (_directory, mut app, card) = fixture();
-        let preparation = reply(app.update_session_recovery(Action::Open(card)));
+        let preparation = reply(app.update_session_recovery(open(&app, card)));
         drop(app.update(preparation));
         app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(
             card,
@@ -811,11 +874,11 @@ mod tests {
     #[test]
     fn ownership_recovery_fences_stale_preparation_review_and_filtered_default_panes() {
         let (_directory, mut app, card) = fixture();
-        let preparation = reply(app.update_session_recovery(Action::Open(card)));
+        let preparation = reply(app.update_session_recovery(open(&app, card)));
         drop(app.update_session_recovery(Action::Cancel));
         drop(app.update(preparation.clone()));
         assert!(!app.modal_is_open());
-        let newer = reply(app.update_session_recovery(Action::Open(card)));
+        let newer = reply(app.update_session_recovery(open(&app, card)));
         drop(app.update(preparation));
         assert!(app.session_recovery.preparing);
         drop(app.update(newer));
@@ -838,7 +901,7 @@ mod tests {
         Arc::make_mut(&mut app.durable).cards[1].kind = CardKind::Terminal(original.clone());
         app.shared_views.defaults.insert(card, original);
         assert!(app.refused_terminal_recovery_target().is_none());
-        drop(app.update_session_recovery(Action::Open(card)));
+        drop(app.update_session_recovery(open(&app, card)));
         assert!(!app.modal_is_open());
         let session = app.session.as_mut().unwrap();
         assert!(
