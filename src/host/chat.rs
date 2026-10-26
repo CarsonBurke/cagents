@@ -807,6 +807,35 @@ fn confirm_fresh_session(
     }
 }
 
+/// A public user request for a newly allocated Codex listener. Missing runtime
+/// custody is never enough: the pristine request must later resolve exactly to
+/// this daemon's admitted allocation before it may acquire a fresh spawn pin.
+struct FreshCodexStart(Session);
+
+impl FreshCodexStart {
+    fn requested(
+        session: &Session,
+        source: Option<&HostSessionProof>,
+        terminate_source: bool,
+    ) -> Option<Self> {
+        (session.launch.provider == Provider::Codex
+            && source.is_none()
+            && !terminate_source
+            && session.proof.is_none()
+            && session.terminal.is_none()
+            && session.launch.session_id.is_none()
+            && session.owned_codex_listener.is_none()
+            && session.native_continuity == chat::NativeContinuity::ReconnectOnly
+            && session
+                .launch
+                .recipe
+                .arguments
+                .windows(2)
+                .any(|pair| pair[0] == "--remote" && pair[1] == "unix://"))
+        .then(|| Self(session.clone()))
+    }
+}
+
 fn start(
     host: &SharedHost,
     client: ClientId,
@@ -824,6 +853,7 @@ fn start(
         terminate_source,
         selection,
         execution_environment,
+        None,
         None,
         None,
     )
@@ -844,6 +874,7 @@ pub(super) fn start_execution(
         None,
         Default::default(),
         Some(context),
+        None,
         None,
     )
 }
@@ -874,6 +905,7 @@ fn start_with_execution(
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
     execution: Option<Arc<chat::protocol::ExecutionContext>>,
     restart_launch: Option<&chat::Launch>,
+    fresh_request: Option<FreshCodexStart>,
 ) -> Result<ServerResponse, ProtocolError> {
     // A helper may have committed installation before host publication failed.
     // Recover its durable outbox through authenticated adoption before asking
@@ -1232,7 +1264,7 @@ fn start_with_execution(
             .unwrap_or_else(|| error(message))
     })?;
     let remote = retained_actor::enabled(session.launch.provider, &spec.transport);
-    let execution = if remote && execution.is_none() {
+    let mut execution = if remote && execution.is_none() {
         Some(Arc::new(
             chat::protocol::ExecutionContext::capture(&spec.working_directory)
                 .map_err(unavailable)?,
@@ -1472,6 +1504,43 @@ fn start_with_execution(
                 ));
             }
         }
+        // Only this pristine public fresh request, matched to its exact new
+        // daemon allocation under the held capacity reservation, can acquire
+        // a descriptorless fresh context. Recovery and generic starts have no
+        // such token and retain their original conservative admission.
+        let fresh_gui = if let Some(requested) = &fresh_request {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let admitted = execution.is_none()
+                && !already_hosted
+                && source.is_none()
+                && !terminate_source
+                && selection.is_none()
+                && restart_launch.is_none()
+                && !saved_history_only
+                && matches!(
+                    spec.transport,
+                    chat::protocol::TransportSpec::OwnedUnixWebSocket { .. }
+                )
+                && requested.0.resolved_to_owned_codex_listener(&session)
+                && admission
+                    .as_ref()
+                    .is_some_and(|reservation| reservation.holds(&state, session.id))
+                && !state.chats.contains_key(&session.id)
+                && !state.terminals.contains_key(&session.id)
+                && !state.chat_handoffs.contains_key(&session.id)
+                && !state.native_actor_startups.contains_key(&session.id);
+            drop(state);
+            if admitted {
+                let context = Arc::new(chat::protocol::ExecutionContext::new(None));
+                context
+                    .admit_fresh_native_directory(&session)
+                    .map_err(unavailable)?;
+                execution = Some(context);
+            }
+            admitted
+        } else {
+            false
+        };
         spec.execution = execution.clone();
         if !matches!(spec.transport, chat::protocol::TransportSpec::History)
             && let Some(context) = &spec.execution
@@ -1557,7 +1626,7 @@ fn start_with_execution(
         } else {
             None
         };
-        if remote {
+        if remote || fresh_gui {
             let context = execution
                 .clone()
                 .ok_or_else(|| unavailable("Retained startup lost its pinned execution context"))?;
@@ -1722,10 +1791,12 @@ fn start_with_execution(
         state.inventory_generation += 1;
         drop(state);
         drop(retired);
+        if (remote || fresh_gui)
+            && let Some(context) = &execution
+        {
+            retained_actor::forget_startup(host, &startup_source, context);
+        }
         if remote {
-            if let Some(context) = &execution {
-                retained_actor::forget_startup(host, &startup_source, context);
-            }
             installed_handle.wake_retained_outcomes();
             retained_actor::wake(host, id);
         }
@@ -2507,12 +2578,16 @@ fn process_inner(
             // A client can mount before the provider confirms durable support;
             // normalizing that saved ReconnectOnly descriptor would destroy the
             // holder's immutable evidence before recovery can authenticate it.
-            let session = if has_native_owner(&session)? {
+            let retained = has_native_owner(&session)?;
+            let fresh_request = (!retained)
+                .then(|| FreshCodexStart::requested(&session, source.as_ref(), terminate_source))
+                .flatten();
+            let session = if retained {
                 session
             } else {
                 client_session(host, session)
             };
-            start(
+            start_with_execution(
                 host,
                 client,
                 session,
@@ -2520,6 +2595,9 @@ fn process_inner(
                 terminate_source,
                 None,
                 execution_environment,
+                None,
+                None,
+                fresh_request,
             )
         }
         ClientRequest::ChatAttach { session } => {
@@ -3533,6 +3611,7 @@ pub(super) fn restore_upgrade(
         Default::default(),
         None,
         restart_launch,
+        None,
     )
     .map_err(|error| error.message)?;
     let id = match response {
