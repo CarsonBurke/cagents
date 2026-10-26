@@ -1222,3 +1222,91 @@ fn completed_terminal_review_does_not_relaunch_or_send_input() {
     );
     assert_no_pty_input(&peer.fence());
 }
+
+#[test]
+fn palette_activation_keeps_original_physical_repeat_and_release_out_of_terminal() {
+    for release_in_palette in [false, true] {
+        let peer = Peer::new();
+        let renderer = renderer();
+        let barrier = ReviewInputBarrier::default();
+        let mut widget = widget(&peer, "palette-return", barrier.clone(), true, true);
+        widget.on_shortcut = None;
+        let mut tree = Tree::new(&widget as &dyn Widget<Message, Theme, Renderer>);
+        let initial = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            // A logical Enter does not establish which physical Enter was used.
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::NumpadEnter),
+            location: keyboard::Location::Numpad,
+            modifiers: keyboard::Modifiers::empty(),
+            text: Some("\r".into()),
+            repeat: false,
+        };
+        let mut repeated = initial.clone();
+        if let keyboard::Event::KeyPressed { repeat, .. } = &mut repeated {
+            *repeat = true;
+        }
+        let release = keyboard::Event::KeyReleased {
+            key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::NumpadEnter),
+            location: keyboard::Location::Numpad,
+            modifiers: keyboard::Modifiers::empty(),
+        };
+        assert!(
+            !barrier.capture_activation(&repeated),
+            "a repeat cannot invent its original activation"
+        );
+        assert!(barrier.capture_activation(&initial));
+        assert!(
+            barrier.capture_activation(&initial),
+            "duplicate delivery must not create a second held-key entry"
+        );
+        let mut other_enter = initial.clone();
+        if let keyboard::Event::KeyPressed { physical_key, .. } = &mut other_enter {
+            *physical_key = keyboard::key::Physical::Code(keyboard::key::Code::Enter);
+        }
+        assert!(
+            !barrier.consume_keyboard(&other_enter),
+            "ownership uses the actual physical event, not its logical name"
+        );
+        // The palette, not this terminal widget, saw and consumed the first press.
+        widget.review_active = false;
+        widget.suppress_focus_reports = false;
+        widget.review_revision += 1;
+        tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
+        assert!(!reviewing(&tree));
+        if release_in_palette {
+            assert!(barrier.consume_keyboard(&repeated));
+            assert!(barrier.consume_keyboard(&release));
+            assert!(
+                !barrier.consume_keyboard(&release),
+                "cleanup is complete after one physical release"
+            );
+        } else {
+            dispatch(&mut widget, &mut tree, &renderer, Event::Keyboard(repeated));
+            dispatch(
+                &mut widget,
+                &mut tree,
+                &renderer,
+                Event::Keyboard(release.clone()),
+            );
+        }
+        assert!(!barrier.owns_keyboard(&Event::Keyboard(initial.clone())));
+        assert_no_pty_input(&peer.fence());
+        // Restoring native terminal focus must admit a genuinely fresh press.
+        let node = layout::Node::new(Size::new(640.0, 320.0));
+        let mut focus = operation::focusable::focus::<()>(widget.id.clone().unwrap());
+        widget.operate(&mut tree, Layout::new(&node), &renderer, &mut focus);
+        dispatch(&mut widget, &mut tree, &renderer, Event::Keyboard(initial));
+        dispatch(&mut widget, &mut tree, &renderer, Event::Keyboard(release));
+        assert_eq!(
+            peer.fence()
+                .iter()
+                .filter(|r| matches!(r, ClientRequest::Key { .. }))
+                .count(),
+            2,
+            "fresh Enter press/release works after barrier cleanup"
+        );
+    }
+}

@@ -132,6 +132,43 @@ struct ConsumedInputs {
 #[derive(Clone, Default)]
 pub(crate) struct ReviewInputBarrier(Arc<Mutex<ConsumedInputs>>);
 impl ReviewInputBarrier {
+    /// Transfer the actual key that activated a contextual review command.
+    /// The terminal may never have received this press while a palette owned
+    /// native focus. Do not infer a physical key from a logical submit action.
+    pub fn capture_activation(&self, event: &keyboard::Event) -> bool {
+        let keyboard::Event::KeyPressed {
+            physical_key,
+            repeat: false,
+            ..
+        } = event
+        else {
+            return false;
+        };
+        let mut inputs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if !inputs.keys.contains(physical_key) {
+            inputs.keys.push(physical_key.clone());
+        }
+        true
+    }
+
+    /// Consume owned repeats/releases even while another control retains
+    /// focus, so a covered terminal cannot keep a key pinned after key-up.
+    pub fn consume_keyboard(&self, event: &keyboard::Event) -> bool {
+        let mut inputs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match event {
+            keyboard::Event::KeyPressed { physical_key, .. } => inputs.keys.contains(physical_key),
+            keyboard::Event::KeyReleased { physical_key, .. } => {
+                if let Some(index) = inputs.keys.iter().position(|key| key == physical_key) {
+                    inputs.keys.swap_remove(index);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
     pub fn owns_keyboard(&self, event: &Event) -> bool {
         let physical = match event {
             Event::Keyboard(
