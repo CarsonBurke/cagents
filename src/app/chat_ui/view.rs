@@ -2991,7 +2991,10 @@ impl Runtime {
                     .id(card_control_id(target.card, "chat-goal"))
                     .name("Conversation goal")
                     .selected(goal_panel.is_some())
-                    .class(crate::ui_controls::control_style(goal_panel.is_some(), None))
+                    .class(crate::ui_controls::control_style(
+                        goal_panel.is_some(),
+                        None,
+                    ))
                     .padding(CONTROL_PADDING)
                     .on_press(action(Action::GoalPanel(target, true)))
                     .into(),
