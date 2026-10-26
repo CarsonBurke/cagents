@@ -3,6 +3,33 @@
 use super::*;
 use crate::app::chat_ui::dictation;
 
+fn expose(app: &mut Cagents, card: CardId) {
+    // A newly created pane has no visible editor until the native viewport
+    // publishes its geometry. Exercise the same admission path as the UI.
+    drop(app.update(Message::Viewport {
+        generation: app.workspace_view_generation,
+        event: WorkspaceViewportEvent::Resized(620.0),
+    }));
+    assert_eq!(
+        app.workspace.visibility(card),
+        Some(VisibilityClass::Visible)
+    );
+    assert!(chat_runtime(app, card).visible.load(Ordering::Relaxed));
+}
+
+fn assert_no_effects(task: Task<Message>) {
+    use iced::futures::StreamExt;
+    // Public dispatch batches its postlude even when every component is empty.
+    // An allocated stream is not an emitted effect.
+    if let Some(mut effects) = iced::runtime::task::into_stream(task) {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert!(executor.block_on(effects.next()).is_none());
+    }
+}
+
 fn capture(app: &mut Cagents, target: Target) -> crate::speech::Ticket<Target> {
     let runtime = app.chat_runtime_mut(target).unwrap();
     runtime
@@ -47,6 +74,7 @@ fn result(ticket: &crate::speech::Ticket<Target>, text: &str) -> Action {
 fn microphone_discovery_requires_explicit_setup_and_preserves_draft() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
     let card = draft_chat(&mut app);
+    expose(&mut app, card);
     write(&mut app, card, "keep this draft");
     let target = chat_runtime(&app, card).target;
     drop(app.handle_chat_ui(start(&app, target)));
@@ -423,17 +451,26 @@ fn stale_setup_cancel_and_presentation_cannot_replace_current_job() {
 fn palette_blocks_queued_dictation_start_setup_and_retained_insertion() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
     let card = draft_chat(&mut app);
+    expose(&mut app, card);
     write(&mut app, card, "base");
     let target = chat_runtime(&app, card).target;
+    // Prove this exact visible editor can discover setup before the palette
+    // takes input ownership; a hidden-editor guard must not mask this test.
+    drop(app.handle_chat_ui(start(&app, target)));
+    assert!(app.chat_ui.dictation_setup.shown(target));
+    drop(app.handle_chat_ui(dismiss(&app, target)));
     let queued_start = start(&app, target);
     drop(app.update(Message::Palette(crate::app::palette_ui::Action::Open)));
+    assert!(app.palette.is_open());
+    assert!(app.workspace_inputs_blocked());
     drop(app.update(Message::ChatUi(queued_start)));
     assert!(!app.chat_ui.dictation_setup.shown(target));
     app.chat_ui.dictation_setup.show(target);
     let queued_install = install(&app, target);
     let task = app.update(Message::ChatUi(queued_install));
-    assert!(iced::runtime::task::into_stream(task).is_none());
     assert!(app.chat_ui.dictation_setup.phase().is_none());
+    assert!(app.chat_ui.dictation_setup.job_ticket().is_none());
+    assert_no_effects(task);
     let ticket = capture(&mut app, target);
     app.chat_runtime_mut(target)
         .unwrap()
@@ -498,7 +535,16 @@ fn native_record_press_and_focus_do_not_cross_operations_without_intermediate_fr
         for replace in [true, false] {
             let mut app = crate::app::tests::context_inspector_test_app(false);
             let card = live_chat(&mut app, Some("dictation-held-press"));
+            expose(&mut app, card);
+            // Visibility requests a full publication. Deliver the fixture's
+            // real client snapshot/wake before measuring native controls.
+            let handle = chat_runtime(&app, card).handle().unwrap().clone();
+            let mut snapshot = (*handle.snapshot()).clone();
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot);
             let target = chat_runtime(&app, card).target;
+            drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+            assert!(chat_runtime(&app, card).snapshot.ready);
             let first = capture(&mut app, target);
             app.chat_runtime_mut(target).unwrap().dictation.progress(
                 target,
@@ -533,11 +579,19 @@ fn native_record_press_and_focus_do_not_cross_operations_without_intermediate_fr
                     .find(|node| {
                         node.node().role() == iced_accessibility::accesskit::Role::Button
                             && node.node().label() == Some(label)
+                            && !node.node().is_disabled()
                     })
                     .unwrap()
                     .node()
                     .bounds()
                     .unwrap();
+                assert!(
+                    bounds.x0 >= 0.0
+                        && bounds.y0 >= 0.0
+                        && bounds.x1 <= f64::from(viewport.width)
+                        && bounds.y1 <= f64::from(viewport.height),
+                    "the actual enabled control must be inside the native viewport: {bounds:?}"
+                );
                 let pointer = iced::Point::new(
                     ((bounds.x0 + bounds.x1) / 2.0) as f32,
                     ((bounds.y0 + bounds.y1) / 2.0) as f32,
@@ -554,7 +608,7 @@ fn native_record_press_and_focus_do_not_cross_operations_without_intermediate_fr
                 );
                 assert!(
                     messages.is_empty(),
-                    "release owns the native control action"
+                    "release owns the native control action; mouseDown emitted {messages:?}"
                 );
                 let id = control(first.clone()).control_id(target);
                 ui.operate(
