@@ -1329,13 +1329,27 @@ impl Runtime {
                 )
             })
             .count();
-        let active = self
-            .error
-            .as_deref()
-            .into_iter()
-            .chain(snapshot.error.as_deref())
-            .find_map(|message| {
-                chat::failure::Failure::parse(self.session.launch.provider, message)
+        let errors = [
+            (self.error.as_deref(), true),
+            (snapshot.error.as_deref(), false),
+        ];
+        let represented = errors.map(|(message, local)| {
+            message.is_some_and(|message| self.current_limit_notice_presented(message, local))
+        });
+        let has_unrepresented_error = errors
+            .iter()
+            .zip(represented)
+            .any(|((message, _), shown)| message.is_some() && !shown);
+        let limit_notice_only =
+            represented.into_iter().any(|shown| shown) && !has_unrepresented_error;
+        let active = errors
+            .iter()
+            .zip(represented)
+            .filter(|(_, shown)| !shown)
+            .find_map(|((message, _), _)| {
+                message.and_then(|message| {
+                    chat::failure::Failure::parse(self.session.launch.provider, message)
+                })
             });
         let failure_label = active.map(|failure| match failure.kind {
             chat::failure::FailureKind::AccountLimit => "Account limit reached",
@@ -1354,9 +1368,9 @@ impl Runtime {
             && let Some((goal_glyph, goal_label)) = self.observed_goal_status()
         {
             let last_turn = failure_label.or_else(|| {
-                if self.error.is_some() || snapshot.error.is_some() {
+                if has_unrepresented_error {
                     Some("Conversation has an error")
-                } else if snapshot.finished_at.is_some() {
+                } else if snapshot.finished_at.is_some() && !limit_notice_only {
                     Some(match snapshot.detail.as_str() {
                         "Turn interrupted" => "Last turn interrupted",
                         "Turn failed" => "Last turn failed",
@@ -1374,16 +1388,62 @@ impl Runtime {
                 label.push_str(&format!(" · {failed} failed"));
             }
             return (
-                if failure_label.is_some()
-                    || self.error.is_some()
-                    || snapshot.error.is_some()
-                    || failed > 0
-                {
+                if failure_label.is_some() || has_unrepresented_error || failed > 0 {
                     Some(Icon::Warning)
                 } else {
                     goal_glyph
                 },
                 label,
+            );
+        }
+        if limit_notice_only {
+            // The reset/recovery notice already owns this failure. Keep real
+            // concurrent activity here without a second error banner, or a
+            // misleading Ready/Finished label for the blocked conversation.
+            let mut parts = Vec::new();
+            if snapshot.busy || snapshot.waiting || !snapshot.requests.is_empty() {
+                let repeated_limit =
+                    chat::failure::Failure::parse(self.session.launch.provider, label).is_some_and(
+                        |detail| {
+                            detail.kind == chat::failure::FailureKind::AccountLimit
+                                && errors.iter().zip(represented).any(|((message, _), shown)| {
+                                    shown
+                                        && message.is_some_and(|message| {
+                                            chat::failure::Failure::parse(
+                                                self.session.launch.provider,
+                                                message,
+                                            )
+                                            .is_some_and(|current| current.key == detail.key)
+                                        })
+                                })
+                        },
+                    );
+                parts.push(if repeated_limit {
+                    "Working".to_owned()
+                } else {
+                    Self::short_description(label, 72)
+                });
+            }
+            if working > 0 {
+                parts.push(format!("{working} working"));
+            }
+            if waiting > 0 {
+                parts.push(format!("{waiting} waiting"));
+            }
+            if failed > 0 {
+                parts.push(format!("{failed} failed"));
+            }
+            return (
+                if snapshot.busy || working > 0 {
+                    Some(Icon::AgentWorking)
+                } else if snapshot.waiting || !snapshot.requests.is_empty() || waiting > 0 {
+                    Some(Icon::AgentWaiting)
+                } else if failed > 0 {
+                    Some(Icon::Warning)
+                } else {
+                    None
+                },
+                parts.join(" · "),
             );
         }
         let mut parts = Vec::new();
@@ -1691,6 +1751,9 @@ impl Runtime {
         &'a self,
         incident: &failure::Incident,
     ) -> Option<(u64, &'a str)> {
+        if !incident.has_diagnostics {
+            return None;
+        }
         self.failure_ui
             .expanded
             .contains(&incident.key)

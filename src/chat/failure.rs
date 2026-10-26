@@ -106,6 +106,11 @@ impl<'a> Failure<'a> {
         } else if contains(&[
             "you've hit your limit",
             "you have hit your limit",
+            "you've hit your session limit",
+            "you have hit your session limit",
+            "you’ve hit your session limit",
+            "you've hit your usage limit",
+            "you have hit your usage limit",
             "usage limit is reached",
             "usage limit reached",
             "session limit reached",
@@ -202,6 +207,202 @@ impl<'a> Failure<'a> {
             details: message,
         })
     }
+}
+
+/// Whether a failure contains information beyond the compact account-limit
+/// notice. This is presentation-only: callers retain the complete original.
+/// Unknown, oversized, partial, or annotated diagnostics always remain distinct.
+pub fn has_distinct_diagnostic(provider: Provider, message: &str) -> bool {
+    // Inspect the complete bounded source, never a prefix that could hide a
+    // request ID or meaningful tail. Check bytes before allocating/parsing.
+    if message.len() > 8192
+        || !Failure::parse(provider, message)
+            .is_some_and(|failure| failure.kind == FailureKind::AccountLimit)
+    {
+        return true;
+    }
+    let trimmed = message.trim();
+    let json = if trimmed.starts_with('{') {
+        Some(trimmed)
+    } else if let Some(tail) = trimmed.strip_prefix("API Error:") {
+        let Some(at) = tail.find('{') else {
+            return true;
+        };
+        let (status, body) = tail.split_at(at);
+        if status.trim() != "429" {
+            return true;
+        }
+        Some(body)
+    } else {
+        None
+    };
+    match json {
+        Some(json) => {
+            !unique_limit_envelope_fields(json)
+                || !serde_json::from_str::<serde_json::Value>(json)
+                    .ok()
+                    .is_some_and(|value| redundant_limit_envelope(&value, true).is_some())
+        }
+        None => !redundant_limit_sentence(trimmed),
+    }
+}
+
+// Validation-only shape: deriving Deserialize rejects duplicate known fields,
+// including escaped duplicates, before Value could silently discard originals.
+fn unique_limit_envelope_fields(json: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Envelope {
+        #[serde(rename = "type")]
+        _kind: Option<String>,
+        #[serde(rename = "code")]
+        _code: Option<String>,
+        #[serde(rename = "message")]
+        _message: Option<String>,
+        #[serde(rename = "error")]
+        _error: Option<Error>,
+    }
+    #[allow(dead_code)] // Both variants exist only to validate the original shape.
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Error {
+        Text(String),
+        Envelope(Box<Envelope>),
+    }
+    serde_json::from_str::<Envelope>(json).is_ok()
+}
+
+fn redundant_limit_envelope(value: &serde_json::Value, nested: bool) -> Option<&str> {
+    let object = value.as_object()?;
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "type" | "code" | "message" | "error"))
+    {
+        return None;
+    }
+    for key in ["type", "code"] {
+        if let Some(value) = object.get(key) {
+            let kind = value.as_str()?;
+            if !(key == "type" && kind == "error")
+                && structured_kind(kind) != Some(FailureKind::AccountLimit)
+            {
+                return None;
+            }
+        }
+    }
+    let message = match object.get("message") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|text| redundant_limit_sentence(text))?,
+        ),
+    };
+    let error = match object.get("error") {
+        None => None,
+        Some(serde_json::Value::String(text)) if redundant_limit_sentence(text) => {
+            Some(text.as_str())
+        }
+        Some(value) if nested => Some(redundant_limit_envelope(value, false)?),
+        Some(_) => return None,
+    };
+    match (message, error) {
+        (Some(message), Some(error)) if message.trim() == error.trim() => Some(message),
+        (Some(message), None) => Some(message),
+        (None, Some(error)) => Some(error),
+        _ => None,
+    }
+}
+
+fn redundant_limit_sentence(message: &str) -> bool {
+    let trimmed = message.trim();
+    if trimmed.contains(['\n', '\r']) {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let Some(tail) = [
+        "you've hit your session limit",
+        "you have hit your session limit",
+        "you’ve hit your session limit",
+        "you've hit your usage limit",
+        "you have hit your usage limit",
+        "you've hit your limit",
+        "you have hit your limit",
+        "usage limit is reached",
+        "usage limit reached",
+        "session limit reached",
+        "quota exceeded",
+    ]
+    .into_iter()
+    .find_map(|prefix| lower.strip_prefix(prefix)) else {
+        return false;
+    };
+    let tail = tail.trim();
+    if tail.is_empty() || tail == "." {
+        return true;
+    }
+    let reset = [
+        "· resets at ",
+        "· resets ",
+        "resets at ",
+        "resets ",
+        "; resets at ",
+        "; resets ",
+    ]
+    .into_iter()
+    .find_map(|prefix| tail.strip_prefix(prefix));
+    reset.is_some_and(strict_reset_clock)
+}
+
+fn strict_reset_clock(reset: &str) -> bool {
+    let (clock, zone) = match reset.split_once(" (") {
+        Some((clock, tail)) => {
+            let Some(zone) = tail.strip_suffix(')') else {
+                return false;
+            };
+            (clock, Some(zone))
+        }
+        None => (reset, None),
+    };
+    if let Some(zone) = zone {
+        if zone.is_empty()
+            || zone.len() > 80
+            || !zone
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"/_+-".contains(&byte))
+            || !(zone.contains('/') || matches!(zone, "utc" | "gmt"))
+            || zone.split('/').any(str::is_empty)
+        {
+            return false;
+        }
+    }
+    let (clock, twelve_hour) = if let Some(clock) = clock
+        .strip_suffix("am")
+        .or_else(|| clock.strip_suffix("pm"))
+    {
+        (clock, true)
+    } else {
+        (clock, false)
+    };
+    let (hour, minute) = match clock.split_once(':') {
+        Some((hour, minute)) => (hour, Some(minute)),
+        None if twelve_hour => (clock, None),
+        None => return false,
+    };
+    if hour.is_empty() || hour.len() > 2 || !hour.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(hour) = hour.parse::<u8>() else {
+        return false;
+    };
+    if (twelve_hour && !(1..=12).contains(&hour)) || (!twelve_hour && hour > 23) {
+        return false;
+    }
+    minute.is_none_or(|minute| {
+        minute.len() == 2
+            && minute.bytes().all(|byte| byte.is_ascii_digit())
+            && minute.parse::<u8>().is_ok_and(|minute| minute < 60)
+    })
 }
 
 /// Inspect only the provider error fields, never a quoted request, prompt, or
@@ -374,6 +575,150 @@ mod tests {
             .unwrap()
             .key
         );
+    }
+
+    #[test]
+    fn session_limit_notices_keep_reported_reset_and_semantic_provider_identity() {
+        let raw = "You've hit your session limit · resets 3:40pm (America/Vancouver)";
+        let first = Failure::parse(Provider::Claude, raw).unwrap();
+        assert_eq!(first.kind, FailureKind::AccountLimit);
+        assert_eq!(first.reset.as_deref(), Some("3:40pm (America/Vancouver)"));
+        assert_eq!(
+            first.summary,
+            "Claude usage limit reached · resets 3:40pm (America/Vancouver)"
+        );
+        assert_eq!(first.details, raw);
+        assert_eq!(first.details.as_ptr(), raw.as_ptr());
+        for wording in [
+            "You've hit your limit",
+            "You have hit your session limit",
+            "You’ve hit your session limit",
+            "Session limit reached",
+            "You've hit your usage limit",
+            "You have hit your usage limit",
+            "Usage limit reached",
+        ] {
+            let equivalent = format!("{wording} · resets at 3:40pm (America/Vancouver)");
+            let parsed = Failure::parse(Provider::Claude, &equivalent).unwrap();
+            assert_eq!(parsed.kind, FailureKind::AccountLimit);
+            assert_eq!(parsed.key, first.key, "{wording}");
+            assert_eq!(parsed.details, equivalent);
+        }
+        for different in [
+            "You've hit your session limit · resets 4:40pm (America/Vancouver)",
+            "You've hit your session limit · resets 3:40pm (America/Toronto)",
+        ] {
+            assert_ne!(
+                first.key,
+                Failure::parse(Provider::Claude, different).unwrap().key
+            );
+        }
+        assert_ne!(first.key, Failure::parse(Provider::Codex, raw).unwrap().key);
+        assert_ne!(first.key, Failure::parse(Provider::Omp, raw).unwrap().key);
+        let no_reset = "You've hit your session limit";
+        let parsed = Failure::parse(Provider::Claude, no_reset).unwrap();
+        assert_eq!(parsed.kind, FailureKind::AccountLimit);
+        assert!(parsed.reset.is_none());
+        assert_eq!(parsed.key, no_reset);
+    }
+
+    #[test]
+    fn only_complete_redundant_limit_notices_hide_diagnostic_details() {
+        let notice = "You've hit your session limit · resets 3:40pm (America/Vancouver)";
+        for message in [
+            notice,
+            "You've hit your limit",
+            "Usage limit reached · resets 15:40 (UTC)",
+        ] {
+            assert!(
+                !has_distinct_diagnostic(Provider::Claude, message),
+                "{message}"
+            );
+            for raw in [
+                serde_json::json!({"type":"rate_limit_error", "message":message}).to_string(),
+                serde_json::json!({"error":{"type":"rate_limit_error", "message":message}}).to_string(),
+                serde_json::json!({"type":"error", "error":{"type":"rate_limit_error", "message":message}}).to_string(),
+                serde_json::json!({"error":message}).to_string(),
+            ] {
+                assert!(!has_distinct_diagnostic(Provider::Claude, &raw), "{raw}");
+                assert!(!has_distinct_diagnostic(Provider::Claude, &format!("API Error: 429 {raw}")));
+            }
+        }
+        for raw in [
+            format!("{notice}\nrequest-id: actual-first"),
+            format!("{notice} · request-id: actual-second"),
+            format!("{notice} Please contact support with code 1234"),
+            format!("Review quoted notice: {notice}"),
+            serde_json::json!({"type":"rate_limit_error", "message":notice, "request_id":"first"}).to_string(),
+            serde_json::json!({"type":"rate_limit_error", "message":notice, "unknown":null}).to_string(),
+            serde_json::json!({"type":"error", "error":{"type":"rate_limit_error", "message":notice, "exchange":{"status":429}}}).to_string(),
+            serde_json::json!({"type":"connection_error", "message":notice}).to_string(),
+            serde_json::json!({"type":"invalid_request_error", "code":"insufficient_quota", "message":notice}).to_string(),
+            serde_json::json!({"type":"rate_limit_error", "message":notice, "error":"Another account limit"}).to_string(),
+            serde_json::json!({"type":"rate_limit_error", "message":notice, "code":null}).to_string(),
+            format!("API Error: 403 {}", serde_json::json!({"type":"rate_limit_error", "message":notice})),
+            format!("API Error: 429 {{\"type\":\"rate_limit_error\",\"message\":{notice:?}"),
+        ] {
+            assert!(has_distinct_diagnostic(Provider::Claude, &raw), "{raw}");
+        }
+        // Value alone would discard the original first message; keep it visible.
+        let duplicate = format!(
+            "{{\"type\":\"rate_limit_error\",\"message\":\"request id 123\",\"message\":{notice:?}}}"
+        );
+        assert!(has_distinct_diagnostic(Provider::Claude, &duplicate));
+        let nested_duplicate = format!(
+            "{{\"error\":{{\"type\":\"rate_limit_error\",\"message\":\"request id 123\",\"message\":{notice:?}}}}}"
+        );
+        assert!(has_distinct_diagnostic(Provider::Claude, &nested_duplicate));
+        let large = format!("{notice}{}\nrequest-id: retained", " ".repeat(8192));
+        assert!(has_distinct_diagnostic(Provider::Claude, &large));
+        for reset in [
+            "25:40",
+            "0pm",
+            "3:99pm",
+            "3:40pm (America/Vancouver) extra",
+            "3:40pm (Tomorrow)",
+            "3:40pm (America//Vancouver)",
+        ] {
+            assert!(
+                has_distinct_diagnostic(
+                    Provider::Claude,
+                    &format!("You've hit your session limit · resets {reset}")
+                ),
+                "{reset}"
+            );
+        }
+        for raw in [
+            "Connection reset by peer",
+            "Quota exceeded: account B",
+            "Request was interrupted",
+            "Unknown error",
+        ] {
+            assert!(has_distinct_diagnostic(Provider::Claude, raw));
+        }
+    }
+
+    #[test]
+    fn session_limit_quotations_do_not_override_structured_error_authority() {
+        let quoted = "You've hit your session limit · resets 3:40pm (America/Vancouver)";
+        for raw in [
+            serde_json::json!({"request":{"prompt":quoted}}).to_string(),
+            serde_json::json!({"type":"invalid_request_error", "message":"Unknown model", "request":{"prompt":quoted}}).to_string(),
+            serde_json::json!({"type":"error", "error":{"request":{"prompt":quoted}}}).to_string(),
+        ] {
+            assert!(Failure::parse(Provider::Claude, &raw).is_none(), "{raw}");
+        }
+        let connection = serde_json::json!({"type":"connection_error", "message":quoted, "request_id":"distinct"}).to_string();
+        let parsed = Failure::parse(Provider::Claude, &connection).unwrap();
+        assert_eq!(parsed.kind, FailureKind::Connection);
+        assert!(parsed.reset.is_none());
+        assert_eq!(parsed.key, connection);
+        assert_eq!(parsed.details, connection);
+        let limited = serde_json::json!({"type":"rate_limit_error", "message":quoted, "request":{"prompt":"resets 9:30pm"}}).to_string();
+        let parsed = Failure::parse(Provider::Claude, &limited).unwrap();
+        assert_eq!(parsed.kind, FailureKind::AccountLimit);
+        assert_eq!(parsed.reset.as_deref(), Some("3:40pm (America/Vancouver)"));
+        assert_eq!(parsed.details, limited);
     }
 
     #[test]
