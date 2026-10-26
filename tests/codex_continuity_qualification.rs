@@ -47,6 +47,8 @@ mod hosted_agent_cleanup;
 
 #[path = "codex_continuity_qualification/goal.rs"]
 mod goal;
+#[path = "support/codex_goal_model.rs"]
+mod goal_model;
 
 use cagents::{
     chat::{Command as ChatCommand, NativeContinuity, Session, Snapshot},
@@ -134,6 +136,26 @@ impl Model {
     }
 }
 
+/// Keep the external Goal fixture's header/chunk lines bounded without
+/// changing the existing Continuity parser or Responses implementation.
+fn model_line(
+    reader: &mut impl BufRead,
+    line: &mut String,
+    mode: ModelMode,
+) -> std::io::Result<usize> {
+    if matches!(mode, ModelMode::Goal) {
+        let count = reader.take(16 * 1024 + 1).read_line(line)?;
+        if count > 16 * 1024 {
+            return Err(std::io::Error::other(
+                "Goal model line exceeded fixture bound",
+            ));
+        }
+        Ok(count)
+    } else {
+        reader.read_line(line)
+    }
+}
+
 fn serve(
     stream: TcpStream,
     seen: &Mutex<Vec<ModelRequest>>,
@@ -150,15 +172,23 @@ fn serve(
     }
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
-    if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+    if model_line(&mut reader, &mut request_line, mode).unwrap_or(0) == 0 {
         return;
     }
     let mut length = 0;
     let mut chunked = false;
     let mut conversation = None;
+    let mut header_bytes = request_line.len();
     loop {
         let mut header = String::new();
-        reader.read_line(&mut header).unwrap();
+        model_line(&mut reader, &mut header, mode).unwrap();
+        if matches!(mode, ModelMode::Goal) {
+            header_bytes += header.len();
+            assert!(
+                header_bytes <= 32 * 1024,
+                "Goal model headers exceeded fixture bound"
+            );
+        }
         let header = header.trim_end();
         if header.is_empty() {
             break;
@@ -168,6 +198,9 @@ fn serve(
         match name.to_ascii_lowercase().as_str() {
             "content-length" => length = value.parse().unwrap(),
             "transfer-encoding" => chunked = value.eq_ignore_ascii_case("chunked"),
+            "content-encoding" if matches!(mode, ModelMode::Goal) => {
+                panic!("Goal model does not accept encoded request bodies")
+            }
             "content-encoding" => panic!("the fixture cannot read a {value} request body"),
             "session_id" | "conversation_id" => conversation = Some(value.to_owned()),
             _ => {}
@@ -177,7 +210,7 @@ fn serve(
     if chunked {
         loop {
             let mut size = String::new();
-            reader.read_line(&mut size).unwrap();
+            model_line(&mut reader, &mut size, mode).unwrap();
             let size = usize::from_str_radix(size.trim(), 16).unwrap();
             if matches!(mode, ModelMode::Goal) {
                 assert!(

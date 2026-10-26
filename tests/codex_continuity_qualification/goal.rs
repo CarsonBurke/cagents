@@ -505,3 +505,12 @@ fn a_paused_persisted_goal_can_be_read_before_resuming_an_unloaded_thread() {
             .load(std::sync::atomic::Ordering::Acquire)
     );
 }
+
+/// External model-only fixture for the existing Root native GUI runner.
+/// Invoke the compiled test binary directly, with an owned stdin pipe and
+/// --exact --ignored --nocapture --test-threads=1. Cargo may replace stdin.
+#[test]
+#[ignore = "finite external Goal model; Root must own stdin and normal GUI cleanup"]
+fn native_gui_model_endpoint_until_owned_stdin_eof() {
+    super::goal_model::run().expect("the external Goal model did not retire normally");
+}
