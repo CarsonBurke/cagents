@@ -2068,3 +2068,5 @@ fn closed_or_full_publisher_reports_seed_failure_without_admitting_cached_chat()
     }
     assert!(daemon.requests().is_empty());
 }
+#[path = "../../chat_ui/pending_admission_retry_view_tests.rs"]
+mod retry_view;
