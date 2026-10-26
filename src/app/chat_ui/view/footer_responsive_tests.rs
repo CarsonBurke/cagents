@@ -39,11 +39,26 @@ impl Operation for Probe {
     }
 }
 
-fn enter(ui: &mut Ui<'_>, renderer: &mut cosmic::Renderer) -> Vec<Message> {
-    let mut messages = Vec::new();
-    ui.update(
-        &[
-            iced::Event::Keyboard(keyboard::Event::KeyPressed {
+#[derive(Clone, Copy, Debug)]
+enum Activation {
+    Footer,
+    Model,
+    DefaultModel,
+}
+fn enter(
+    ui: &mut Ui<'_>,
+    renderer: &mut cosmic::Renderer,
+    target: Target,
+    expected: Activation,
+) -> (Action, Vec<Action>) {
+    let mut activated = None;
+    let mut cleanup = Vec::new();
+    // Focusable::unfocus leaves a native ClearSelection pending. Keep each
+    // event's cleanup separate from the one actual button/search activation.
+    for (phase, event) in [
+        (
+            "Enter down",
+            keyboard::Event::KeyPressed {
                 key: keyboard::Key::Named(keyboard::key::Named::Enter),
                 modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
                 physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
@@ -51,21 +66,109 @@ fn enter(ui: &mut Ui<'_>, renderer: &mut cosmic::Renderer) -> Vec<Message> {
                 modifiers: keyboard::Modifiers::empty(),
                 text: None,
                 repeat: false,
-            }),
-            iced::Event::Keyboard(keyboard::Event::KeyReleased {
+            },
+        ),
+        (
+            "Enter release",
+            keyboard::Event::KeyReleased {
                 key: keyboard::Key::Named(keyboard::key::Named::Enter),
                 modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
                 physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
                 location: keyboard::Location::Standard,
                 modifiers: keyboard::Modifiers::empty(),
-            }),
-        ],
-        iced::mouse::Cursor::Unavailable,
-        renderer,
-        &mut clipboard::Null,
-        &mut messages,
-    );
-    messages
+            },
+        ),
+    ] {
+        let mut messages = Vec::new();
+        ui.update(
+            &[iced::Event::Keyboard(event)],
+            iced::mouse::Cursor::Unavailable,
+            renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        let mut blurred = false;
+        for message in messages {
+            let Message::ChatUi(action) = message else {
+                panic!("{expected:?} {phase}: unexpected message {message:?}")
+            };
+            let owner = match (&action, expected) {
+                (Action::Composer(owner, text_editor::Action::ClearSelection), _) => {
+                    assert_eq!(*owner, target, "{expected:?} {phase}: exact blur owner");
+                    assert!(!blurred, "{expected:?} {phase}: one native blur per event");
+                    blurred = true;
+                    cleanup.push(action);
+                    continue;
+                }
+                (Action::FooterPicker(owner, true), Activation::Footer)
+                | (Action::ModelPicker(owner, true), Activation::Model)
+                | (Action::DraftModel(owner, Provider::Codex, None), Activation::DefaultModel) => {
+                    *owner
+                }
+                (Action::Composer(_, event), _) => panic!(
+                    "{expected:?} {phase}: only native blur is allowed, received {}",
+                    composer_event_name(event)
+                ),
+                _ => panic!("{expected:?} {phase}: unexpected activation {action:?}"),
+            };
+            assert_eq!(
+                owner, target,
+                "{expected:?} {phase}: exact activation owner"
+            );
+            assert!(
+                activated.replace(action).is_none(),
+                "{expected:?}: exactly one activation"
+            );
+        }
+    }
+    (
+        activated.expect("native Enter emits exactly one expected activation"),
+        cleanup,
+    )
+}
+fn composer_event_name(event: &text_editor::Action) -> &'static str {
+    match event {
+        text_editor::Action::Click(_) => "Composer::Click",
+        text_editor::Action::Drag(_) => "Composer::Drag",
+        text_editor::Action::Move(_) => "Composer::Move",
+        text_editor::Action::Select(_) => "Composer::Select",
+        text_editor::Action::SelectWord => "Composer::SelectWord",
+        text_editor::Action::SelectLine => "Composer::SelectLine",
+        text_editor::Action::SelectAll => "Composer::SelectAll",
+        text_editor::Action::ClearSelection => "Composer::ClearSelection",
+        text_editor::Action::Scroll { .. } => "Composer::Scroll",
+        text_editor::Action::Edit(_) => "Composer::Edit (payload omitted)",
+    }
+}
+fn settle_blur(app: &mut Cagents, target: Target, cleanup: Vec<Action>) {
+    for blur in cleanup {
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&target.card) else {
+            panic!("same chat draft")
+        };
+        let before = (
+            runtime.composer.text(),
+            runtime.composer.cursor(),
+            runtime.attachments.clone(),
+            runtime.revision,
+            runtime.next_command,
+        );
+        let task = app.handle_chat_ui(blur);
+        assert_eq!(task.units(), 0, "native blur schedules no effects");
+        drop(task);
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&target.card) else {
+            unreachable!()
+        };
+        assert_eq!(
+            (
+                runtime.composer.text(),
+                runtime.composer.cursor(),
+                runtime.attachments.clone(),
+                runtime.revision,
+                runtime.next_command
+            ),
+            before
+        );
+    }
 }
 
 fn focus(ui: &mut Ui<'_>, renderer: &cosmic::Renderer, id: widget::Id) {
@@ -151,6 +254,13 @@ fn real_chat_footer_keeps_right_group_visible_and_narrow_model_selection_keyboar
         assert!(runtime.visible.load(Ordering::Relaxed));
         let target = runtime.target;
         runtime.replace_draft(text_editor::Content::with_text("Keep this 🦀 unsent draft"));
+        attachment_draft::move_to(
+            &mut runtime.composer,
+            text_editor::Cursor {
+                position: text_editor::Position { line: 0, column: 4 },
+                selection: Some(text_editor::Position { line: 0, column: 0 }),
+            },
+        );
         runtime
             .attachments
             .push(Attachment::file(directory.path().join("reference.txt")));
@@ -253,12 +363,10 @@ fn real_chat_footer_keeps_right_group_visible_and_narrow_model_selection_keyboar
                 &renderer,
                 card_control_id(card, "chat-footer-details"),
             );
-            let messages = enter(&mut ui, &mut renderer);
-            assert!(
-                matches!(messages.as_slice(), [Message::ChatUi(Action::FooterPicker(actual, true))] if *actual == target)
-            );
+            let (activation, cleanup) = enter(&mut ui, &mut renderer, target, Activation::Footer);
             let cache = ui.into_cache();
-            drop(app.handle_chat_ui(Action::FooterPicker(target, true)));
+            settle_blur(&mut app, target, cleanup);
+            drop(app.handle_chat_ui(activation));
             ui = UserInterface::build(app.chat_view(card), viewport, cache, &mut renderer);
             // Operate lays out the actual popup before AX inspects its subtree.
             focus(
@@ -289,12 +397,10 @@ fn real_chat_footer_keeps_right_group_visible_and_narrow_model_selection_keyboar
             &renderer,
             card_control_id(card, "chat-model-picker"),
         );
-        let messages = enter(&mut ui, &mut renderer);
-        assert!(
-            matches!(messages.as_slice(), [Message::ChatUi(Action::ModelPicker(actual, true))] if *actual == target)
-        );
+        let (activation, cleanup) = enter(&mut ui, &mut renderer, target, Activation::Model);
         let cache = ui.into_cache();
-        let task = app.handle_chat_ui(Action::ModelPicker(target, true));
+        settle_blur(&mut app, target, cleanup);
+        let task = app.handle_chat_ui(activation);
         let mut ui = UserInterface::build(app.chat_view(card), viewport, cache, &mut renderer);
         focus_effects(&mut ui, &renderer, task);
         let mut focused = Probe::default();
@@ -303,15 +409,9 @@ fn real_chat_footer_keeps_right_group_visible_and_narrow_model_selection_keyboar
             focused.focused,
             Some(card_control_id(card, "chat-model-search"))
         );
-        let mut choices = enter(&mut ui, &mut renderer);
-        assert!(
-            matches!(choices.as_slice(), [Message::ChatUi(Action::DraftModel(actual, Provider::Codex, None))] if *actual == target),
-            "native search Enter reaches the provider's real default-model choice: {choices:?}"
-        );
+        let (choice, cleanup) = enter(&mut ui, &mut renderer, target, Activation::DefaultModel);
         drop(ui);
-        let Message::ChatUi(choice) = choices.pop().unwrap() else {
-            unreachable!()
-        };
+        settle_blur(&mut app, target, cleanup);
         drop(app.handle_chat_ui(choice));
         let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
             unreachable!()

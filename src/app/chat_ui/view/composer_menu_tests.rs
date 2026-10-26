@@ -14,13 +14,31 @@ enum Expected {
     Compact,
     Steering,
 }
-fn observed(messages: &[Message], target: Target) -> Option<Expected> {
+fn observed(
+    messages: Vec<Message>,
+    target: Target,
+    phase: &str,
+) -> (Option<Expected>, Vec<Action>) {
     let mut found = None;
+    let mut cleanup = Vec::new();
     for message in messages {
         let Message::ChatUi(action) = message else {
             panic!("a menu must only emit its existing UI action: {message:?}")
         };
-        let (owner, kind) = match action {
+        let (owner, kind) = match &action {
+            Action::Composer(owner, text_editor::Action::ClearSelection) => {
+                assert_eq!(*owner, target, "{phase}: blur belongs to this composer");
+                assert!(
+                    cleanup.is_empty(),
+                    "{phase}: at most one native blur per event"
+                );
+                cleanup.push(action);
+                continue;
+            }
+            Action::Composer(_, event) => panic!(
+                "{phase}: only native blur is allowed, received {}",
+                composer_event_name(event)
+            ),
             Action::Attach(owner) => (*owner, Expected::Attach),
             Action::ComposerAction(owner, insertion) if insertion == "/goal" => {
                 (*owner, Expected::Goal)
@@ -36,7 +54,7 @@ fn observed(messages: &[Message], target: Target) -> Option<Expected> {
             Action::Command(owner, Command::SetInterruptMode { mode }) if mode == "wait" => {
                 (*owner, Expected::Steering)
             }
-            _ => panic!("unexpected menu dispatch: {action:?}"),
+            _ => panic!("{phase}: unexpected menu dispatch: {action:?}"),
         };
         assert_eq!(owner, target);
         assert!(
@@ -44,7 +62,21 @@ fn observed(messages: &[Message], target: Target) -> Option<Expected> {
             "one activation emits one action"
         );
     }
-    found
+    (found, cleanup)
+}
+fn composer_event_name(event: &text_editor::Action) -> &'static str {
+    match event {
+        text_editor::Action::Click(_) => "Composer::Click",
+        text_editor::Action::Drag(_) => "Composer::Drag",
+        text_editor::Action::Move(_) => "Composer::Move",
+        text_editor::Action::Select(_) => "Composer::Select",
+        text_editor::Action::SelectWord => "Composer::SelectWord",
+        text_editor::Action::SelectLine => "Composer::SelectLine",
+        text_editor::Action::SelectAll => "Composer::SelectAll",
+        text_editor::Action::ClearSelection => "Composer::ClearSelection",
+        text_editor::Action::Scroll { .. } => "Composer::Scroll",
+        text_editor::Action::Edit(_) => "Composer::Edit (payload omitted)",
+    }
 }
 
 #[test]
@@ -161,6 +193,13 @@ fn popup_search_enter_matches_first_enabled_visible_native_or_provider_action() 
             let target = runtime.target;
             assert!(runtime.visible.load(Ordering::Relaxed));
             runtime.replace_draft(text_editor::Content::with_text("Keep 🦀 this unsent draft"));
+            attachment_draft::move_to(
+                &mut runtime.composer,
+                text_editor::Cursor {
+                    position: text_editor::Position { line: 0, column: 4 },
+                    selection: Some(text_editor::Position { line: 0, column: 0 }),
+                },
+            );
             runtime
                 .attachments
                 .push(Attachment::file(directory.path().join("kept.txt")));
@@ -189,6 +228,7 @@ fn popup_search_enter_matches_first_enabled_visible_native_or_provider_action() 
                 runtime.attachments.clone(),
                 runtime.next_command,
                 runtime.attachment_chooser_pending,
+                runtime.revision,
             );
             drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
             let viewport = iced::Size::new(620.0, 760.0);
@@ -276,35 +316,55 @@ fn popup_search_enter_matches_first_enabled_visible_native_or_provider_action() 
                 &mut clipboard::Null,
                 &mut entered,
             );
+            let (entered, mut cleanup) = observed(entered, target, "search Enter");
             assert_eq!(
-                observed(&entered, target),
+                entered,
                 expected.map(|(_, kind)| kind),
                 "{provider:?} query={query:?} pending={pending} busy={busy} read_only={read_only} disconnected={disconnected}"
             );
             if let Some(pointer) = pointer {
-                let mut clicked = Vec::new();
-                ui.update(
-                    &[
-                        iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: pointer }),
-                        iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
-                            iced::mouse::Button::Left,
-                        )),
-                        iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
-                            iced::mouse::Button::Left,
-                        )),
-                    ],
-                    iced::mouse::Cursor::Available(pointer),
-                    &mut renderer,
-                    &mut clipboard::Null,
-                    &mut clicked,
-                );
-                assert_eq!(
-                    observed(&clicked, target),
-                    expected.map(|(_, kind)| kind),
-                    "pointer and search Enter dispatch the same existing action"
-                );
+                // Feed the same complete gesture one event at a time without
+                // rebuilding its native tree. Unfocus schedules one cleanup;
+                // an outside press can separately emit one more native blur.
+                for (phase, event, expected_action) in [
+                    (
+                        "pointer move",
+                        iced::mouse::Event::CursorMoved { position: pointer },
+                        None,
+                    ),
+                    (
+                        "pointer down",
+                        iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left),
+                        None,
+                    ),
+                    (
+                        "pointer release",
+                        iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+                        expected.map(|(_, kind)| kind),
+                    ),
+                ] {
+                    let mut clicked = Vec::new();
+                    ui.update(
+                        &[iced::Event::Mouse(event)],
+                        iced::mouse::Cursor::Available(pointer),
+                        &mut renderer,
+                        &mut clipboard::Null,
+                        &mut clicked,
+                    );
+                    let (invoked, blurred) = observed(clicked, target, phase);
+                    assert_eq!(
+                        invoked, expected_action,
+                        "{phase}: pointer and search Enter dispatch the same existing action"
+                    );
+                    cleanup.extend(blurred);
+                }
             }
             drop(ui);
+            for blur in cleanup {
+                let task = app.handle_chat_ui(blur);
+                assert_eq!(task.units(), 0, "native blur schedules no effects");
+                drop(task);
+            }
             let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
                 unreachable!()
             };
@@ -314,7 +374,8 @@ fn popup_search_enter_matches_first_enabled_visible_native_or_provider_action() 
                     runtime.composer.cursor(),
                     runtime.attachments.clone(),
                     runtime.next_command,
-                    runtime.attachment_chooser_pending
+                    runtime.attachment_chooser_pending,
+                    runtime.revision,
                 ),
                 before
             );
