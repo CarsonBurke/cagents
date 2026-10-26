@@ -211,3 +211,91 @@ fn focused_native_composer_escape_cancels_dictation_without_interrupting_busy_ag
         assert!(runtime.pending.is_none());
     }
 }
+
+#[test]
+fn dictation_control_native_escape_cancels_without_agent_interrupt() {
+    use iced::advanced::{clipboard, widget::operation};
+    use iced::runtime::{UserInterface, user_interface::Cache};
+    let mut renderer = crate::app::tests::headless_renderer();
+    for control in ["chat-dictation-stop", "chat-dictation-cancel"] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("dictation-control-escape"));
+        let target = chat_runtime(&app, card).target;
+        let ticket = capture(&mut app, target);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        Arc::make_mut(&mut runtime.snapshot).busy = true;
+        runtime.dictation.progress(
+            target,
+            &ticket,
+            crate::speech::Phase::Recording,
+            Instant::now(),
+        );
+        let before = runtime.next_command;
+        let messages = {
+            let mut ui = UserInterface::build(
+                app.chat_view(card),
+                iced::Size::new(620.0, 720.0),
+                Cache::new(),
+                &mut renderer,
+            );
+            ui.operate(
+                &renderer,
+                &mut operation::focusable::focus::<()>(card_control_id(card, control)),
+            );
+            let mut messages = Vec::new();
+            ui.update(
+                &[iced::Event::Keyboard(permission_key(
+                    keyboard::key::Named::Escape,
+                    keyboard::Modifiers::empty(),
+                ))],
+                iced::mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            messages
+        };
+        assert!(messages.iter().any(|message| matches!(message,
+            Message::ChatUi(Action::Dictation(actual, dictation::Action::Cancel)) if *actual == target)));
+        assert!(
+            !messages
+                .iter()
+                .any(|message| matches!(message, Message::ChatUi(Action::Interrupt(..))))
+        );
+        for message in messages {
+            drop(app.update(message));
+        }
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.dictation.phase().is_none());
+        assert_eq!(runtime.next_command, before);
+        assert!(runtime.snapshot.busy);
+    }
+}
+
+#[test]
+fn explicit_record_controls_do_not_return_focus_behind_modal_or_update_freeze() {
+    for freeze in [false, true] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("dictation-control-modal"));
+        let target = chat_runtime(&app, card).target;
+        let ticket = capture(&mut app, target);
+        app.chat_runtime_mut(target).unwrap().dictation.progress(
+            target,
+            &ticket,
+            crate::speech::Phase::Recording,
+            Instant::now(),
+        );
+        if freeze {
+            app.update_prepared = true;
+        } else {
+            app.device_ui.open = true;
+        }
+        // Exercise the cleanup reducer directly as an already-admitted callback;
+        // its focus guard must remain effective independently of modal routing.
+        let stopped = app.handle_dictation(target, dictation::Action::StopRecording);
+        assert!(iced::runtime::task::into_stream(stopped).is_none());
+        let cancelled = app.handle_dictation(target, dictation::Action::Cancel);
+        assert!(iced::runtime::task::into_stream(cancelled).is_none());
+        assert!(chat_runtime(&app, card).dictation.phase().is_none());
+    }
+}

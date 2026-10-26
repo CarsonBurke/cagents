@@ -623,12 +623,20 @@ impl super::Runtime {
                       action: Action,
                       enabled: bool|
          -> super::Element<'a, super::Message> {
-            crate::ui_controls::icon_button(icon, label)
-                .compact()
-                .on_press_maybe(
-                    enabled.then_some(super::action(ChatAction::Dictation(target, action))),
-                )
-                .into()
+            let id = if matches!(action, Action::StopRecording) {
+                "chat-dictation-stop"
+            } else {
+                "chat-dictation-cancel"
+            };
+            crate::interaction::focused_escape(
+                crate::ui_controls::icon_button(icon, label)
+                    .compact()
+                    .id(super::card_control_id(target.card, id))
+                    .on_press_maybe(
+                        enabled.then_some(super::action(ChatAction::Dictation(target, action))),
+                    ),
+                move || super::action(ChatAction::Dictation(target, Action::Cancel)),
+            )
         };
         match self.dictation.phase() {
             Some(speech::Phase::Recording) => vec![
@@ -792,6 +800,21 @@ impl super::Runtime {
     }
 }
 impl super::Cagents {
+    pub(super) fn focus_dictation_composer(&self, target: Target) -> super::Task<super::Message> {
+        use super::{CardRuntime, Task};
+        if self.update_prepared
+            || self.workspace_inputs_blocked()
+            || self.workspace.focused() != Some(target.card)
+            || !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime))
+                if runtime.target == target
+                    && runtime.visible.load(std::sync::atomic::Ordering::Relaxed)
+                    && !runtime.closed_elsewhere)
+        {
+            return Task::none();
+        }
+        cosmic::iced::widget::operation::focus(super::card_control_id(target.card, "chat-composer"))
+            .map(cosmic::Action::App)
+    }
     pub(super) fn handle_dictation(
         &mut self,
         target: Target,
@@ -860,16 +883,22 @@ impl super::Cagents {
                         Action::Finished(Delivery::new(ticket, result)),
                     ))
                 });
-                return Task::batch([phases, result]);
+                return Task::batch([phases, result, self.focus_dictation_composer(target)]);
             }
             Action::StopRecording => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.dictation.stop(target);
+                if self
+                    .chat_runtime_mut(target)
+                    .is_some_and(|runtime| runtime.dictation.stop(target))
+                {
+                    return self.focus_dictation_composer(target);
                 }
             }
             Action::Cancel => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.dictation.cancel(target);
+                if self
+                    .chat_runtime_mut(target)
+                    .is_some_and(|runtime| runtime.dictation.cancel(target))
+                {
+                    return self.focus_dictation_composer(target);
                 }
             }
             Action::Progress(ticket, phase, now) => {
