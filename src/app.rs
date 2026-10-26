@@ -2949,7 +2949,7 @@ pub enum SettingsField {
     BrowserSearchUrl,
     EditorFontFamily,
     EditorFontSize,
-    TerminalScrollbackLines,
+    TerminalScrollbackMib,
     ManagedWorktreeDirectory,
     AutoDeleteMergedWorktrees,
     WorktreeSort,
@@ -3081,7 +3081,7 @@ impl SettingsField {
             Self::WorkStaleAfterDays => "Stale after (days)",
             Self::TerminalFontSize => "Font size",
             Self::TerminalFontFamily => "Font family",
-            Self::TerminalScrollbackLines => "Scrollback lines",
+            Self::TerminalScrollbackMib => "Scrollback (MiB)",
             Self::ManagedWorktreeDirectory => "Managed worktree directory",
             Self::WorktreeSort => "Worktree order",
             Self::DefaultWorktreePane => "Default worktree pane",
@@ -3168,7 +3168,7 @@ impl SettingsField {
             | Self::TerminalTheme
             | Self::TerminalFontSize
             | Self::TerminalFontFamily
-            | Self::TerminalScrollbackLines
+            | Self::TerminalScrollbackMib
             | Self::ConfirmTerminalClose
             | Self::ConfirmMultilinePaste
             | Self::RelaunchAgentsOnUpgrade => SettingsCategory::Terminal,
@@ -3360,7 +3360,7 @@ struct SettingsDraft {
     editor_font_size: String,
     confirm_multiline_paste: bool,
     browser_search_url: String,
-    terminal_scrollback_lines: String,
+    terminal_scrollback_mib: String,
     managed_worktree_directory: String,
     auto_delete_merged_worktrees: bool,
     worktree_sort: String,
@@ -3416,7 +3416,7 @@ impl SettingsDraft {
                 .editor_font_size
                 .map(|size| size.to_string())
                 .unwrap_or_default(),
-            terminal_scrollback_lines: settings.terminal_scrollback_lines.to_string(),
+            terminal_scrollback_mib: settings.terminal_scrollback_mib.to_string(),
             managed_worktree_directory: settings.managed_worktree_directory.clone(),
             auto_delete_merged_worktrees: settings.auto_delete_merged_worktrees,
             worktree_sort: match settings.worktree_sort {
@@ -3471,7 +3471,7 @@ impl SettingsDraft {
             SettingsField::BrowserSearchUrl => self.browser_search_url = value,
             SettingsField::EditorFontFamily => self.editor_font_family = value,
             SettingsField::EditorFontSize => self.editor_font_size = value,
-            SettingsField::TerminalScrollbackLines => self.terminal_scrollback_lines = value,
+            SettingsField::TerminalScrollbackMib => self.terminal_scrollback_mib = value,
             SettingsField::ManagedWorktreeDirectory => self.managed_worktree_directory = value,
             SettingsField::AutoDeleteMergedWorktrees => {
                 self.auto_delete_merged_worktrees = value == "true"
@@ -3893,9 +3893,9 @@ fn settings_update(
             next.terminal_font_family = value.to_owned();
             Ok(())
         }
-        SettingsField::TerminalScrollbackLines => value
+        SettingsField::TerminalScrollbackMib => value
             .parse::<usize>()
-            .map(|value| next.terminal_scrollback_lines = value)
+            .map(|value| next.terminal_scrollback_mib = value)
             .map_err(|_| "Terminal scrollback must be a whole number.".to_owned()),
         SettingsField::ManagedWorktreeDirectory => {
             next.managed_worktree_directory = value.to_owned();
@@ -4046,9 +4046,9 @@ fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
             "{label} must be 1–{} lines.",
             settings::MAX_TERMINAL_SCROLL_SIZE
         ),
-        SettingsField::TerminalScrollbackLines => format!(
-            "Scrollback must be 0–{} lines.",
-            grouped_digits(settings::MAX_TERMINAL_SCROLLBACK_LINES)
+        SettingsField::TerminalScrollbackMib => format!(
+            "Scrollback must be 0–{} MiB.",
+            grouped_digits(settings::MAX_TERMINAL_SCROLLBACK_MIB)
         ),
         SettingsField::MaxHotCards => format!("{label} must be a whole number, at least 1."),
         SettingsField::HibernationDelayMs => {
@@ -6050,7 +6050,7 @@ impl Cagents {
     fn terminal_config(&self, visible: bool) -> TerminalConfig {
         TerminalConfig {
             initially_visible: visible,
-            max_scrollback: self.settings.terminal_scrollback_lines,
+            max_scrollback_bytes: self.settings.terminal_scrollback_mib * 1024 * 1024,
             theme: self.effective_terminal_theme(),
             ..TerminalConfig::default()
         }
@@ -19016,6 +19016,37 @@ fn unix_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn terminal_scrollback_settings_draft_reaches_runtime_as_bytes() {
+        let mut app = context_inspector_test_app(false);
+        assert_eq!(app.settings.terminal_scrollback_mib, 16);
+        for mib in [0, 16, 32, settings::MAX_TERMINAL_SCROLLBACK_MIB] {
+            let SettingsDecision::Persist(next) = settings_update(
+                &app.settings,
+                SettingsField::TerminalScrollbackMib,
+                &mib.to_string(),
+            ) else {
+                panic!("valid MiB setting must persist")
+            };
+            let draft = SettingsDraft::from_settings(&next);
+            assert_eq!(draft.terminal_scrollback_mib, mib.to_string());
+            app.settings = next;
+            let config = app.terminal_config(false);
+            assert!(!config.initially_visible);
+            assert_eq!(config.max_scrollback_bytes, mib * 1024 * 1024);
+            assert_eq!(
+                crate::terminal::TerminalSpawnOptions::from(config).max_scrollback_bytes,
+                mib * 1024 * 1024
+            );
+        }
+        for invalid in ["-1", "1025", "18446744073709551615"] {
+            assert!(matches!(
+                settings_update(&app.settings, SettingsField::TerminalScrollbackMib, invalid),
+                SettingsDecision::Invalid(_)
+            ));
+        }
+    }
+
+    #[test]
     fn completed_push_observation_warning_preserves_known_completion() {
         let notice = super::push_report(Ok(crate::repository::PushOutcome::OutcomeUnknown {
             failure: crate::repository::MutationFailure::Reconciliation {
@@ -24535,10 +24566,24 @@ mod tests {
         drop(app.initialize_runtimes());
         assert_eq!(
             app.terminal_starts_in_flight(),
-            0,
-            "ordinary offscreen lifecycle stays deferred"
+            1,
+            "the identified Omp agent already observes background metadata"
         );
+        assert!(app.terminal_start_in_flight(terminals[1].id));
+        assert!(!app.terminal_start_in_flight(terminals[0].id));
+        assert!(!app.terminal_start_in_flight(terminals[2].id));
         assert!(app.restored_agent_attaches.is_empty());
+        let CardKind::Terminal(omp) = &terminals[1].kind else {
+            unreachable!()
+        };
+        drop(app.update(Message::RestoredAgentAttached {
+            card: terminals[1].id,
+            terminal: omp.id,
+            result: Ok(None),
+        }));
+        assert_eq!(app.terminal_starts_in_flight(), 0);
+        // An unavailable original remains unqualified; the explicit startup
+        // check then uses the same serial attach-only path for every owner.
         drop(app.qualify_startup_terminals());
         assert_eq!(app.terminal_starts_in_flight(), 1);
         assert_eq!(app.restored_agent_attaches.len(), 2);
@@ -30308,8 +30353,8 @@ mod tests {
             "Scroll size must be 1–10 lines."
         );
         assert_eq!(
-            refusal(SettingsField::TerminalScrollbackLines, "1000001"),
-            "Scrollback must be 0–1,000,000 lines."
+            refusal(SettingsField::TerminalScrollbackMib, "1025"),
+            "Scrollback must be 0–1,024 MiB."
         );
         assert_eq!(
             refusal(SettingsField::TerminalFontFamily, "F".repeat(129).as_str()),

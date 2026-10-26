@@ -2289,6 +2289,224 @@ sys.exit(7)
     use super::*;
 
     #[test]
+    fn update_preview_replaces_a_nonempty_incompatible_source_and_leaves_compatible_source_untouched()
+     {
+        const CASE: &str = "CAGENTS_TEST_SCROLLBACK_UPDATE_PREVIEW_CASE";
+        let selector = thread::current().name().unwrap().to_owned();
+        let Some(case) = std::env::var_os(CASE) else {
+            for case in ["compatible", "incompatible"] {
+                let directory = tempfile::Builder::new().prefix("u").tempdir().unwrap();
+                for leaf in ["runtime", "config", "data", "cache", "state"] {
+                    let path = directory.path().join(leaf);
+                    fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+                }
+                let mut child = Command::new(std::env::current_exe().unwrap());
+                child
+                    .args(["--exact", &selector, "--nocapture", "--test-threads=1"])
+                    .env(CASE, case)
+                    .env("TMPDIR", directory.path());
+                for (key, leaf) in [
+                    ("XDG_RUNTIME_DIR", "runtime"),
+                    ("XDG_CONFIG_HOME", "config"),
+                    ("XDG_DATA_HOME", "data"),
+                    ("XDG_CACHE_HOME", "cache"),
+                    ("XDG_STATE_HOME", "state"),
+                ] {
+                    child.env(key, directory.path().join(leaf));
+                }
+                // HOME and the opaque invoking authority remain inherited;
+                // this child can contact only its private synthetic source.
+                let output = child.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{case}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let text = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    text.contains("running 1 test")
+                        && text.contains("1 passed; 0 failed; 0 ignored"),
+                    "{text}"
+                );
+            }
+            return;
+        };
+        let incompatible = match case.to_str() {
+            Some("compatible") => false,
+            Some("incompatible") => true,
+            _ => panic!("unexpected private preview fixture case"),
+        };
+        use crate::terminal_ipc::{
+            ClientEnvelope, ClientRequest, ServerEnvelope, ServerMessage, ServerResponse,
+            read_frame, write_frame,
+        };
+        use std::os::unix::net::UnixListener;
+        let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+        let socket = crate::terminal_ipc::daemon_socket_path().unwrap();
+        assert!(
+            socket.starts_with(&runtime),
+            "fixture must never connect outside its private runtime"
+        );
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(socket.parent().unwrap())
+            .unwrap();
+        let proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("private-budget-preview"),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: crate::model::HostIncarnation::new("private-source-incarnation"),
+        };
+        // The current direct client does not require a lease for this fake
+        // peer. Hold a real private lease as well, so the same fixture remains
+        // valid when composed with authenticated source-version discovery.
+        let lease = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(socket.with_file_name("cagentsd.lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        serde_json::to_writer(
+            &lease,
+            &serde_json::json!({"pid": std::process::id(), "proof": &proof}),
+        )
+        .unwrap();
+        lease.sync_all().unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let id = crate::model::TerminalId::new();
+        let expected = impact::DaemonImpact {
+            capability: crate::terminal_ipc::ShutdownCapability {
+                proof: proof.clone(),
+                token: "private-preview-only".into(),
+                inventory_generation: 7,
+                live_terminals: 1,
+                background_subagents: 0,
+                background_identity: "none".into(),
+                expires_at_unix_ms: 100,
+            },
+            policy: impact::Policy::WhenIdle,
+            sessions: vec![impact::SessionImpact {
+                id,
+                kind: impact::SessionKind::Terminal,
+                title: "Existing private terminal".into(),
+                identity: "exact-private-source-identity".into(),
+                disposition: impact::Disposition::Continues,
+                reason: "Synthetic retained source for read-only preview".into(),
+                interrupted_subagents: Vec::new(),
+            }],
+            blockers: Vec::new(),
+        };
+        let response = expected.clone();
+        let (finished, completion) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut connections = 0;
+            let mut impact_requests = 0;
+            loop {
+                assert!(
+                    Instant::now() < deadline,
+                    "private source fixture did not finish"
+                );
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        match completion.recv_timeout(Duration::from_millis(10)) {
+                            Ok(()) => break,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(error) => panic!("private caller disappeared: {error}"),
+                        }
+                    }
+                    Err(error) => panic!("private accept: {error}"),
+                };
+                connections += 1;
+                assert!(connections <= 2, "unexpected discovery/reconnect replay");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                assert_eq!(connect.version, crate::terminal_ipc::PROTOCOL_VERSION);
+                assert_eq!(connect.request_id, 1);
+                assert!(connect.proof.is_none());
+                assert!(
+                    matches!(connect.request, ClientRequest::Connect { expected_host: None, ref resume } if resume.is_empty())
+                );
+                write_frame(
+                    &mut stream,
+                    &ServerEnvelope {
+                        version: crate::terminal_ipc::PROTOCOL_VERSION,
+                        request_id: Some(1),
+                        proof: proof.clone(),
+                        message: ServerMessage::Response {
+                            response: ServerResponse::Connected {
+                                proof: proof.clone(),
+                                resumed: Vec::new(),
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+                let Some(request) = read_frame::<ClientEnvelope>(&mut stream).unwrap() else {
+                    // A header-discovery connection and a compatible preview
+                    // both end without issuing an inventory/mutation request.
+                    continue;
+                };
+                impact_requests += 1;
+                assert!(incompatible && impact_requests == 1);
+                assert_eq!(request.version, crate::terminal_ipc::PROTOCOL_VERSION);
+                assert_eq!(request.request_id, 2);
+                assert_eq!(request.proof, Some(proof.clone()));
+                assert_eq!(
+                    request.request,
+                    ClientRequest::UpgradeImpact {
+                        policy: impact::Policy::WhenIdle
+                    }
+                );
+                write_frame(
+                    &mut stream,
+                    &ServerEnvelope {
+                        version: crate::terminal_ipc::PROTOCOL_VERSION,
+                        request_id: Some(2),
+                        proof: proof.clone(),
+                        message: ServerMessage::Response {
+                            response: ServerResponse::UpgradeImpact(response.clone()),
+                        },
+                    },
+                )
+                .unwrap();
+                assert!(
+                    read_frame::<ClientEnvelope>(&mut stream).unwrap().is_none(),
+                    "preview must never prepare/stop/replay"
+                );
+            }
+            assert_eq!(impact_requests, usize::from(incompatible));
+        });
+        let candidate = impact::Candidate {
+            version: "9.8.7".into(),
+            digest: "private-verified-build".into(),
+            // This synthetic differing version exercises the actual updater
+            // path; it reserves no production protocol beyond allocated125.
+            protocol: crate::terminal_ipc::PROTOCOL_VERSION + u16::from(incompatible),
+        };
+        let observed = observe_impact(&candidate, impact::Policy::WhenIdle).unwrap();
+        assert_eq!(observed.candidate, candidate);
+        assert_eq!(observed.replaces_daemon, incompatible);
+        assert_eq!(observed.daemon, incompatible.then_some(expected));
+        finished.send(()).unwrap();
+        server.join().unwrap();
+        drop(lease);
+    }
+
+    #[test]
     fn installed_entry_routes_ordinary_skew_only_through_its_exact_owned_old_cli() {
         const CASE: &str = "CAGENTS_TEST_INSTALLED_ENTRY_OWNER";
         let selector = thread::current().name().unwrap().to_owned();
