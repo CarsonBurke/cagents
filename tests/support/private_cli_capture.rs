@@ -51,8 +51,10 @@ pub fn capture(spec: CommandSpec, deadline: Instant) -> Result<Output, ProcessFa
             started: false,
         });
     }
-    // The shared executor drains both streams while waiting, bounds capture
-    // and teardown, and reaps the original child on timeout or output overflow.
+    // Preserve the caller's remaining budget across readiness retries. The
+    // executor starts that duration after spawn and allows its existing bounded
+    // termination/reap grace, so this is not a hard wall-clock return deadline.
+    // Both streams drain while waiting, including timeout/output-limit teardown.
     let output = SystemProcessExecutor.execute(
         &spec
             .timeout(remaining)
@@ -98,6 +100,16 @@ mod tests {
     }
 
     #[test]
+    fn preserves_signal_exit_status() {
+        let root = tempfile::tempdir().unwrap();
+        let spec = private_program(root.path(), "/bin/sh").args(["-c", "kill -TERM $$"]);
+        let output = capture(spec, Instant::now() + Duration::from_secs(5)).unwrap();
+        assert!(!output.status.success());
+        assert_eq!(output.status.code(), None);
+        assert_eq!(output.status.signal(), Some(15));
+    }
+
+    #[test]
     fn private_profile_and_directory_survive_capture() {
         let root = tempfile::tempdir().unwrap();
         let spec = private_program(root.path(), "/usr/bin/env");
@@ -138,7 +150,7 @@ mod tests {
     }
 
     #[test]
-    fn live_child_timeout_keeps_bounded_output_and_original_deadline() {
+    fn live_child_timeout_preserves_diagnostics() {
         let root = tempfile::tempdir().unwrap();
         let marker = root.path().join("ready");
         let spec = private_program(root.path(), "/bin/sh")
