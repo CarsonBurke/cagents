@@ -1102,7 +1102,12 @@ impl ControlClient {
         self.attach_and_synchronize(terminal_id)?;
         let action =
             self.expect_accepted(ClientRequest::ShutdownTerminal { terminal_id }, terminal_id);
-        self.finish_attachment(terminal_id, action)
+        match action {
+            // Accepted confirms retirement, which already removed this
+            // subscription. Detaching that retired ID would hide success.
+            Ok(()) => Ok(()),
+            Err(error) => self.finish_attachment(terminal_id, Err(error)),
+        }
     }
 
     pub fn release_completed_terminal(
@@ -1149,7 +1154,14 @@ impl ControlClient {
                 } if actual == terminal_id => Ok(outcome),
                 response => Err(unexpected_response("a checked terminal close", &response)),
             });
-        self.finish_attachment(terminal_id, action)
+        match action {
+            Ok(terminal::ipc::TerminalCloseResult::Closed) => {
+                Ok(terminal::ipc::TerminalCloseResult::Closed)
+            }
+            // Active, unknown, and failed decisions still own the ordinary
+            // attachment cleanup path; preserve its existing error behavior.
+            result => self.finish_attachment(terminal_id, result),
+        }
     }
 
     pub fn snapshot(&mut self, terminal_id: TerminalId) -> Result<RenderedSnapshot, ControlError> {
@@ -5919,6 +5931,257 @@ mod tests {
             })
         ));
         server.join().unwrap();
+    }
+
+    // Exercise the actual public client over framed sockets. A following List
+    // proves whether retirement incorrectly sent another Detach, without a
+    // timeout-based negative or accepting TerminalNotFound as success.
+    fn public_terminal_close_exchange(
+        checked: bool,
+        case: &str,
+    ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
+        use terminal::ipc::TerminalCloseResult;
+        fn reply(
+            stream: &mut UnixStream,
+            pinned: &HostSessionProof,
+            request_id: Option<u64>,
+            message: ServerMessage,
+        ) {
+            write_frame(
+                stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id,
+                    proof: pinned.clone(),
+                    message,
+                },
+            )
+            .unwrap();
+        }
+        fn request(
+            stream: &mut UnixStream,
+            pinned: &HostSessionProof,
+            expected_id: u64,
+        ) -> ClientRequest {
+            let envelope: ClientEnvelope = read_frame(stream).unwrap().unwrap();
+            assert_eq!(envelope.version, PROTOCOL_VERSION);
+            assert_eq!(envelope.request_id, expected_id);
+            assert_eq!(envelope.proof.as_ref(), Some(pinned));
+            envelope.request
+        }
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        server_stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let pinned = proof("close-owner", "boot", "incarnation");
+        let terminal = TerminalDescriptor::relaunchable(
+            TerminalId::new(),
+            LaunchRecipe {
+                program: "/bin/sh".into(),
+                arguments: Vec::new(),
+                working_directory: "/fixture".into(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
+            },
+            None,
+        );
+        let id = terminal.session.id;
+        let case = case.to_owned();
+        let peer_case = case.clone();
+        let server = thread::spawn(move || {
+            let connect: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(matches!(connect.request, ClientRequest::Connect { .. }));
+            assert_eq!(connect.request_id, 1);
+            assert_eq!(connect.proof, None);
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, pinned.clone(), pinned.clone()),
+            )
+            .unwrap();
+            assert!(matches!(
+                request(&mut server_stream, &pinned, 2),
+                ClientRequest::Attach {
+                    terminal_id,
+                    after_generation: 0,
+                    after_event_sequence: 0,
+                } if terminal_id == id
+            ));
+            reply(
+                &mut server_stream,
+                &pinned,
+                Some(2),
+                ServerMessage::Response {
+                    response: ServerResponse::Attached { terminal },
+                },
+            );
+            reply(
+                &mut server_stream,
+                &pinned,
+                None,
+                ServerMessage::Synchronized {
+                    terminal_id: id,
+                    generation: 0,
+                    event_sequence: 0,
+                },
+            );
+            let close = request(&mut server_stream, &pinned, 3);
+            assert_eq!(
+                close,
+                if checked {
+                    ClientRequest::CloseTerminalChecked {
+                        terminal_id: id,
+                        allow_active: false,
+                    }
+                } else {
+                    ClientRequest::ShutdownTerminal { terminal_id: id }
+                }
+            );
+            if peer_case == "disconnect" {
+                return;
+            }
+            let message = match peer_case.as_str() {
+                "remote-error" => ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::TerminalUnavailable,
+                    "original cleanup remains unconfirmed",
+                    true,
+                )),
+                _ if checked => ServerMessage::Response {
+                    response: ServerResponse::TerminalCloseChecked {
+                        terminal_id: if peer_case == "wrong-terminal" {
+                            TerminalId::new()
+                        } else {
+                            id
+                        },
+                        outcome: match peer_case.as_str() {
+                            "active" => TerminalCloseResult::Active,
+                            "unknown" => TerminalCloseResult::Unknown("original retained".into()),
+                            _ => TerminalCloseResult::Closed,
+                        },
+                    },
+                },
+                _ => ServerMessage::Response {
+                    response: ServerResponse::Accepted,
+                },
+            };
+            let mut envelope = ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(3),
+                proof: pinned.clone(),
+                message,
+            };
+            match peer_case.as_str() {
+                "wrong-proof" => envelope.proof = proof("foreign", "boot", "incarnation"),
+                "wrong-version" => envelope.version += 1,
+                "wrong-request" => envelope.request_id = Some(999),
+                _ => {}
+            }
+            write_frame(&mut server_stream, &envelope).unwrap();
+            let mut next = 4;
+            if peer_case != "closed" {
+                assert_eq!(
+                    request(&mut server_stream, &pinned, next),
+                    ClientRequest::Detach { terminal_id: id },
+                    "nonretired/failed close must still balance its attachment"
+                );
+                reply(
+                    &mut server_stream,
+                    &pinned,
+                    Some(next),
+                    if peer_case == "remote-error" {
+                        // This second error must not replace the action error.
+                        ServerMessage::Error(ProtocolError::new(
+                            ProtocolErrorCode::TerminalNotFound,
+                            "detach found no terminal",
+                            false,
+                        ))
+                    } else {
+                        ServerMessage::Response {
+                            response: ServerResponse::Detached,
+                        }
+                    },
+                );
+                next += 1;
+            }
+            assert_eq!(
+                request(&mut server_stream, &pinned, next),
+                ClientRequest::List,
+                "confirmed retirement must be followed by List, never Detach"
+            );
+            reply(
+                &mut server_stream,
+                &pinned,
+                Some(next),
+                ServerMessage::Response {
+                    response: ServerResponse::Listed {
+                        terminals: Vec::new(),
+                    },
+                },
+            );
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let result = if checked {
+            client.close_terminal_checked(id, false)
+        } else {
+            client
+                .close_terminal(id)
+                .map(|()| TerminalCloseResult::Closed)
+        };
+        if case != "disconnect" {
+            assert!(client.list().unwrap().is_empty());
+        }
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn confirmed_public_terminal_closes_do_not_detach_the_retired_id() {
+        for checked in [false, true] {
+            assert_eq!(
+                public_terminal_close_exchange(checked, "closed").unwrap(),
+                terminal::ipc::TerminalCloseResult::Closed
+            );
+        }
+    }
+
+    #[test]
+    fn nonretired_public_terminal_closes_detach_and_preserve_the_original_outcome() {
+        use terminal::ipc::TerminalCloseResult;
+        assert_eq!(
+            public_terminal_close_exchange(true, "active").unwrap(),
+            TerminalCloseResult::Active
+        );
+        assert_eq!(
+            public_terminal_close_exchange(true, "unknown").unwrap(),
+            TerminalCloseResult::Unknown("original retained".into())
+        );
+        for checked in [false, true] {
+            assert!(matches!(
+                public_terminal_close_exchange(checked, "remote-error"),
+                Err(ControlError::Remote { code: ProtocolErrorCode::TerminalUnavailable, message, retryable: true })
+                    if message == "original cleanup remains unconfirmed"
+            ));
+        }
+    }
+
+    #[test]
+    fn public_terminal_close_correlation_and_transport_errors_never_confirm_retirement() {
+        for checked in [false, true] {
+            for case in [
+                "wrong-proof",
+                "wrong-version",
+                "wrong-request",
+                "disconnect",
+            ] {
+                assert!(public_terminal_close_exchange(checked, case).is_err());
+            }
+        }
+        assert!(matches!(
+            public_terminal_close_exchange(true, "wrong-terminal"),
+            Err(ControlError::UnexpectedResponse { .. })
+        ));
     }
 
     #[test]

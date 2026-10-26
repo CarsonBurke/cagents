@@ -553,7 +553,9 @@ fn actual_same_generation_inspection_and_upgrade_keep_the_original_saved_pty() {
         assert!(!receipt_path.exists());
         // Exercise the ordinary ShutdownTerminal route, not another checked
         // close call. Success now requires genuine original-holder proof.
-        client.close_terminal(id).map_err(|e| e.to_string())?;
+        client
+            .close_terminal(id)
+            .map_err(|e| format!("upgraded original public close failed: {e}"))?;
         while live(&pidfd.0) || live(&holder_pidfd) {
             if Instant::now() >= deadline {
                 return Err("original shell/holder did not settle after explicit close".into());
@@ -606,7 +608,7 @@ fn actual_same_generation_inspection_and_upgrade_keep_the_original_saved_pty() {
         assert!(
             client
                 .list()
-                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("inventory after confirmed original close failed: {e}"))?
                 .iter()
                 .all(|entry| entry.session.id != id)
         );
