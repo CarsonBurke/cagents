@@ -896,12 +896,29 @@ fn gallery_label(
     bounded_image_metadata(label, IMAGE_LABEL_CHARS)
 }
 
+fn gallery_external_url(path: &str, root: &Path, remote: bool, managed: bool) -> Option<Url> {
+    // Managed paths are non-authority hints. Verified internal pixels never
+    // authorize a coincident local file, and remote files stay on their owner.
+    if managed || remote || path.starts_with("data:") {
+        return None;
+    }
+    // Preserve the existing conversation-cwd interpretation of relative hints;
+    // a URL-looking hint must not acquire new external authority here.
+    let path = Path::new(path);
+    if path.is_absolute() {
+        Url::from_file_path(path).ok()
+    } else {
+        Url::from_file_path(root.join(path)).ok()
+    }
+}
+
 struct Entry {
     id: String,
-    managed: bool,
-    path: String,
     label: String,
     handle: iced::widget::image::Handle,
+    // Resolve external authority once, after preview admission. Inline payloads
+    // and managed path hints are never retained or parsed by the gallery.
+    external: Option<Url>,
 }
 #[derive(Clone, Copy)]
 pub(in crate::app) enum ViewerCommand {
@@ -933,7 +950,6 @@ pub(in crate::app) struct Gallery {
     identity: u64,
     entries: Vec<Entry>,
     selected: usize,
-    remote: bool,
     pub(super) reset: u64,
     pub(super) actual_size: bool,
     target: Option<Target>,
@@ -949,11 +965,11 @@ impl Gallery {
             identity: next_gallery_identity(),
             entries: vec![Entry {
                 id: "file".into(),
-                managed: false,
                 // Keep non-UTF8 filenames and literal URL characters exact.
-                path: Url::from_file_path(&path)
-                    .map(|url| url.to_string())
-                    .unwrap_or_default(),
+                external: device
+                    .is_none()
+                    .then(|| Url::from_file_path(&path).ok())
+                    .flatten(),
                 label: format!(
                     "{} · {}",
                     device.unwrap_or("This device"),
@@ -962,7 +978,6 @@ impl Gallery {
                 handle,
             }],
             selected: 0,
-            remote: device.is_some(),
             reset: 0,
             actual_size: false,
             target: None,
@@ -981,6 +996,7 @@ impl Gallery {
             }
             None => &runtime.snapshot.items,
         };
+        let remote = crate::device::is_remote();
         let entries: Vec<_> = items
             .iter()
             .filter_map(|item| {
@@ -992,23 +1008,19 @@ impl Gallery {
                 else {
                     return None;
                 };
+                // Unloaded history contributes no metadata work or owned
+                // strings: only already admitted pixel handles enter a gallery.
+                let handle = runtime.presentation_cache().get(&item.id)?.image.as_ref()?;
                 Some(Entry {
                     id: item.id.clone(),
-                    managed: reference.is_some(),
-                    path: if Path::new(path).is_absolute() || path.starts_with("data:image/") {
-                        path.clone()
-                    } else {
-                        runtime
-                            .session
-                            .launch
-                            .recipe
-                            .working_directory
-                            .join(path)
-                            .to_string_lossy()
-                            .into_owned()
-                    },
                     label: gallery_label(path, description, reference.as_ref()),
-                    handle: runtime.presentation_cache().get(&item.id)?.image.clone()?,
+                    handle: handle.clone(),
+                    external: gallery_external_url(
+                        path,
+                        &runtime.session.launch.recipe.working_directory,
+                        remote,
+                        reference.is_some(),
+                    ),
                 })
             })
             .collect();
@@ -1017,7 +1029,6 @@ impl Gallery {
             identity: next_gallery_identity(),
             entries,
             selected,
-            remote: crate::device::is_remote(),
             reset: 0,
             actual_size: false,
             target: Some(runtime.target),
@@ -1067,22 +1078,7 @@ impl Gallery {
         self.reset = self.reset.wrapping_add(1);
     }
     pub(super) fn url(&self) -> Option<Url> {
-        let entry = &self.entries[self.selected];
-        // Managed snapshot paths are non-authority hints. The in-app viewer
-        // owns verified pixels; never hand an unverified hint to another app.
-        if entry.managed {
-            return None;
-        }
-        let path = &entry.path;
-        if Path::new(path).is_absolute() {
-            (!self.remote)
-                .then(|| Url::from_file_path(path).ok())
-                .flatten()
-        } else {
-            Url::parse(path).ok().filter(|url| {
-                matches!(url.scheme(), "http" | "https") || !self.remote && url.scheme() == "file"
-            })
-        }
+        self.entries[self.selected].external.clone()
     }
     pub(in crate::app) fn view(&self) -> Element<'_, Message> {
         let entry = &self.entries[self.selected];
@@ -1112,9 +1108,13 @@ impl Gallery {
                 .on_press(self.message(ViewerCommand::ActualSize))
                 .into(),
             crate::interaction::tooltip(
-                crate::ui_controls::button::secondary("Open externally")
-                    .on_press_maybe(self.url().map(|_| self.message(ViewerCommand::External))),
-                if self.url().is_some() {
+                crate::ui_controls::button::secondary("Open externally").on_press_maybe(
+                    entry
+                        .external
+                        .as_ref()
+                        .map(|_| self.message(ViewerCommand::External)),
+                ),
+                if entry.external.is_some() {
                     "Open the original image in another application"
                 } else {
                     "The original image is unavailable to external applications on this device"
@@ -1599,7 +1599,6 @@ mod tests {
         );
         assert!(remote.entries[0].label.contains("FW16 fixture"));
         let local = Gallery::file(path.clone(), None, handle.clone());
-        assert!(!remote.entries[0].managed && !local.entries[0].managed);
         assert_eq!(local.url().unwrap().to_file_path().unwrap(), path);
 
         use std::os::unix::ffi::OsStringExt;
@@ -1727,7 +1726,6 @@ mod tests {
             cached.image = bytes_handle(backend_bytes);
             runtime.cache.insert(item.id.clone(), cached);
             let gallery = Gallery::new(runtime, &item.id).unwrap();
-            assert!(gallery.entries[0].managed);
             assert!(
                 gallery.url().is_none(),
                 "verified internal pixels must never authorize a coincident external hint"
@@ -1755,12 +1753,146 @@ mod tests {
         cached.image = bytes_handle(png());
         runtime.cache.insert(item.id.clone(), cached);
         let gallery = Gallery::new(runtime, &item.id).unwrap();
-        assert_eq!(gallery.entries[0].path, path);
+        assert!(gallery.entries[0].external.is_none());
         assert!(
             gallery.url().is_none(),
             "inline pixels are not a local filename"
         );
     }
+    #[test]
+    fn large_inline_gallery_keeps_only_admitted_handles_and_small_metadata() {
+        use iced::advanced::{Layout, layout, mouse, widget::Tree};
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        drop(app.new_native_chat(Provider::Codex, Some(PathBuf::from("/tmp/gallery"))));
+        let card = app.workspace.focused().unwrap();
+        let CardRuntime::Chat(runtime) = app.cards.get_mut(&card).unwrap() else {
+            panic!("draft chat")
+        };
+        // The decoder accepts the exact original PNG pixels with trailing
+        // bytes. This exercises a real admitted image with a large legacy
+        // inline payload, not a renderer path that starts another decode.
+        let mut bytes = png();
+        bytes.resize(1024 * 1024, 0);
+        let inline = Arc::new(image_item(format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        )));
+        let budget = Budget::new(bytes.len(), 4);
+        let Loaded::Ready(handle) = bounded_handle(bytes, &budget) else {
+            panic!("original PNG pixels remain valid")
+        };
+        let handle_id = handle.id();
+        let mut cached = CachedItem::new(&inline.content, runtime.syntax_theme);
+        cached.image = Some(handle);
+        runtime.cache.insert(inline.id.clone(), cached);
+        let mut items: Vec<_> = (0..1000)
+            .map(|index| {
+                let mut item = image_item(format!("/not-loaded/{index}.png"));
+                if index == 0 {
+                    if let ItemContent::Image {
+                        path, description, ..
+                    } = &mut item.content
+                    {
+                        *path = format!("data:image/png;base64,{}", "a".repeat(1024 * 1024));
+                        *description = " ".repeat(1024 * 1024);
+                    }
+                }
+                item.id = format!("unloaded-{index}");
+                Arc::new(item)
+            })
+            .collect();
+        items.insert(500, inline.clone());
+        Arc::make_mut(&mut runtime.snapshot).items = items;
+        let source_owners = Arc::strong_count(&inline);
+        let mut gallery = Gallery::new(runtime, &inline.id).unwrap();
+        assert_eq!(
+            gallery.entries.len(),
+            1,
+            "unloaded history has no gallery entries"
+        );
+        assert_eq!(gallery.entries[0].id, inline.id);
+        assert_eq!(gallery.selected_handle_id(), handle_id);
+        assert_eq!(Arc::strong_count(&inline), source_owners);
+        assert!(Arc::ptr_eq(
+            runtime.active_item(&inline.id).unwrap(),
+            &inline
+        ));
+        assert!(gallery.entries[0].external.is_none());
+        assert!(gallery.entries[0].label.len() <= IMAGE_LABEL_CHARS * 4 + 3);
+        assert_eq!(budget.pixels.available_permits(), 0);
+        assert_eq!(budget.encoded.available_permits(), 1024 * 1024);
+        assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+
+        // Drop the transcript owner: repeated native layout and AX traversal
+        // must retain the same admitted handle and bounded visible metadata.
+        runtime.cache.get_mut(&inline.id).unwrap().image = None;
+        let renderer = crate::app::tests::headless_renderer();
+        for _ in 0..3 {
+            let mut element = gallery.view();
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 500.0)),
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                mouse::Cursor::Unavailable,
+            );
+            let nodes: Vec<_> = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .collect();
+            assert!(
+                nodes
+                    .iter()
+                    .any(|node| node.node().label() == Some("Open externally")
+                        && node.node().is_disabled())
+            );
+            assert!(nodes.iter().all(|node| {
+                [node.node().label(), node.node().value()]
+                    .into_iter()
+                    .flatten()
+                    .all(|text| text.len() < 512 && !text.contains("base64,"))
+            }));
+            assert_eq!(gallery.selected_handle_id(), handle_id);
+            assert_eq!(budget.pixels.available_permits(), 0);
+        }
+        gallery.next(true);
+        assert_eq!(gallery.selected_handle_id(), handle_id);
+        drop(gallery);
+        assert_eq!(
+            budget.pixels.available_permits(),
+            4,
+            "last gallery/tree owner releases exact pixels"
+        );
+    }
+
+    #[test]
+    fn gallery_external_authority_preserves_relative_hint_and_device_boundaries() {
+        let root = Path::new("/conversation");
+        for path in [
+            "images/literal #%*.png",
+            "https://example.invalid/image.png",
+            "file:///tmp/image.png",
+        ] {
+            assert_eq!(
+                gallery_external_url(path, root, false, false)
+                    .unwrap()
+                    .to_file_path()
+                    .unwrap(),
+                root.join(path),
+                "relative URL-looking hints retain their previous cwd interpretation"
+            );
+            assert!(gallery_external_url(path, root, true, false).is_none());
+            assert!(gallery_external_url(path, root, false, true).is_none());
+        }
+        let payload = format!("data:image/png;base64,{}", "a".repeat(1024 * 1024));
+        assert!(gallery_external_url(&payload, root, false, false).is_none());
+    }
+
     #[test]
     fn file_preview_rejects_fifos_without_waiting_for_a_writer() {
         let directory = tempfile::tempdir().unwrap();
@@ -2020,8 +2152,7 @@ mod tests {
     fn gallery_navigation_wraps_and_resets_pan_and_zoom() {
         let entry = |id: &str| Entry {
             id: id.into(),
-            managed: false,
-            path: format!("/fixture/{id}.png"),
+            external: Url::from_file_path(format!("/fixture/{id}.png")).ok(),
             label: id.into(),
             handle: iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
         };
@@ -2029,7 +2160,6 @@ mod tests {
             identity: next_gallery_identity(),
             entries: vec![entry("a"), entry("b")],
             selected: 0,
-            remote: false,
             reset: 0,
             actual_size: false,
             target: None,
@@ -2041,9 +2171,8 @@ mod tests {
         gallery.next(true);
         assert_eq!(gallery.selected, 0);
         assert_eq!(gallery.url().unwrap().as_str(), "file:///fixture/a.png");
-        gallery.remote = true;
         assert!(
-            gallery.url().is_none(),
+            gallery_external_url("/fixture/a.png", Path::new("/"), true, false).is_none(),
             "a remote path must never open a local file URL"
         );
     }
