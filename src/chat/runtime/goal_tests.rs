@@ -21,6 +21,7 @@ fn observation(status: Status, revision: u64) -> crate::chat::goal::Snapshot {
         })),
         pending: false,
         uncertain: false,
+        last_result: None,
     }
 }
 

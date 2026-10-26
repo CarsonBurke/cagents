@@ -1806,6 +1806,9 @@ impl Adapter for Codex {
         }
         match command {
             Command::Goal { thread_id, revision, operation } => {
+                if matches!(operation, chat::goal::Operation::SetObjective(_) | chat::goal::Operation::Resume) && !self.direct_input {
+                    return Err("This Codex thread does not accept new goal work".into());
+                }
                 self.request_goal(&mut step, &thread_id, revision, operation)?;
             }
             Command::Prompt { text, attachments, mode } => {

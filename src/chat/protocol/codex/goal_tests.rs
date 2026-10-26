@@ -75,6 +75,49 @@ fn attach(adapter: &mut Codex) -> Step {
 }
 
 #[test]
+fn goal_work_respects_direct_input_while_exact_read_and_stop_remain_usable() {
+    let mut adapter = adapter();
+    adapter.direct_input = false;
+    for operation in [
+        Operation::SetObjective("Do more work".into()),
+        Operation::Resume,
+    ] {
+        let before = snapshot(&mut adapter);
+        assert!(
+            adapter
+                .command(Command::Goal {
+                    thread_id: before.thread_id,
+                    revision: before.revision,
+                    operation,
+                })
+                .unwrap_err()
+                .contains("does not accept new goal work")
+        );
+        assert!(adapter.pending.is_empty());
+        assert!(!snapshot(&mut adapter).pending);
+    }
+    for (operation, reply) in [
+        (
+            Operation::Get,
+            json!({"goal":raw_goal("thread-exact","Original objective","active")}),
+        ),
+        (
+            Operation::Pause,
+            json!({"goal":raw_goal("thread-exact","Original objective","paused")}),
+        ),
+        (Operation::Clear, json!({"cleared":true})),
+    ] {
+        let issued = command(&mut adapter, operation);
+        assert_eq!(issued.writes.len(), 1);
+        assert_ne!(issued.writes[0]["method"], "turn/start");
+        let result = adapter
+            .receive(json!({"id":issued.writes[0]["id"],"result":reply}))
+            .unwrap();
+        assert!(!published(&result).pending);
+    }
+}
+
+#[test]
 fn native_goal_commands_correlate_exact_thread_and_publish_only_actual_responses() {
     let mut adapter = adapter();
     for (operation, method, reply) in [
