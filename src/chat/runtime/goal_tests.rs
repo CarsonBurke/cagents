@@ -25,6 +25,14 @@ fn observation(status: Status, revision: u64) -> crate::chat::goal::Snapshot {
     }
 }
 
+fn identity(home: &std::path::Path) -> super::super::protocol::ServerIdentity {
+    super::super::protocol::ServerIdentity {
+        user_agent: "cagents synthetic goal actor".into(),
+        canonical_home: home.to_owned(),
+        reported_home: home.to_string_lossy().into_owned(),
+    }
+}
+
 fn scope(home: &std::path::Path) -> crate::account::scope::LaunchAccountScope {
     let metadata = std::fs::metadata(home).unwrap();
     crate::account::scope::LaunchAccountScope {
@@ -45,33 +53,78 @@ fn goal_work_requires_original_home_and_descriptor_even_after_restoration() {
     std::fs::create_dir(&cwd).unwrap();
     std::fs::create_dir(&home).unwrap();
     let original = scope(&home);
+    let server = identity(&home);
     let context = super::super::protocol::ExecutionContext::capture(&cwd).unwrap();
     let pin = context.pinned_launch_directory().unwrap();
     let restored = super::super::protocol::ExecutionContext::restored(pin.0);
     assert!(restored.directory_descriptor().is_none());
-    assert!(validate_goal_work(Some(&original), Some(&restored), Some(&pin), &cwd).is_ok());
-    assert!(validate_goal_work(Some(&original), Some(&restored), None, &cwd).is_err());
-    assert!(validate_goal_work(None, Some(&restored), Some(&pin), &cwd).is_err());
+    assert!(
+        validate_goal_work(
+            Some(&original),
+            Some(&server),
+            Some(&restored),
+            Some(&pin),
+            &cwd
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_goal_work(Some(&original), Some(&server), Some(&restored), None, &cwd).is_err()
+    );
+    assert!(validate_goal_work(None, Some(&server), Some(&restored), Some(&pin), &cwd).is_err());
+    assert!(validate_goal_work(Some(&original), None, Some(&restored), Some(&pin), &cwd).is_err());
     // The trusted tuple survives a holder serialization, without recapturing
     // the same pathname's replacement after restart.
     let retained: crate::account::scope::LaunchAccountScope =
         serde_json::from_slice(&serde_json::to_vec(&original).unwrap()).unwrap();
     std::fs::rename(&home, root.path().join("old-codex")).unwrap();
     std::fs::create_dir(&home).unwrap();
-    assert!(validate_goal_work(Some(&retained), Some(&restored), Some(&pin), &cwd).is_err());
+    assert!(
+        validate_goal_work(
+            Some(&retained),
+            Some(&server),
+            Some(&restored),
+            Some(&pin),
+            &cwd
+        )
+        .is_err()
+    );
     assert_ne!(retained, scope(&home));
     std::fs::remove_dir(&home).unwrap();
     std::fs::rename(root.path().join("old-codex"), &home).unwrap();
     std::fs::rename(&cwd, root.path().join("old-work")).unwrap();
     std::fs::create_dir(&cwd).unwrap();
-    assert!(validate_goal_work(Some(&retained), Some(&restored), Some(&pin), &cwd).is_err());
+    assert!(
+        validate_goal_work(
+            Some(&retained),
+            Some(&server),
+            Some(&restored),
+            Some(&pin),
+            &cwd
+        )
+        .is_err()
+    );
     assert_eq!(context.pinned_launch_directory().unwrap().0, pin.0);
     let replacement = super::super::protocol::ExecutionContext::capture(&cwd).unwrap();
-    assert!(validate_goal_work(Some(&retained), Some(&replacement), Some(&pin), &cwd).is_err());
+    assert!(
+        validate_goal_work(
+            Some(&retained),
+            Some(&server),
+            Some(&replacement),
+            Some(&pin),
+            &cwd
+        )
+        .is_err()
+    );
 }
 
-struct GoalAdapter;
+struct GoalAdapter {
+    identity: super::super::protocol::ServerIdentity,
+}
 impl Adapter for GoalAdapter {
+    fn server_identity(&self) -> Option<&super::super::protocol::ServerIdentity> {
+        Some(&self.identity)
+    }
     fn initialize(&mut self) -> Result<Step, String> {
         Ok(Step::default())
     }
@@ -159,7 +212,13 @@ fn active_goal_blocks_idle_between_turns_but_live_stop_controls_survive_path_los
     let home = root.path().join("codex");
     std::fs::create_dir(&cwd).unwrap();
     std::fs::create_dir(&home).unwrap();
-    let handle = start(spec(&cwd), Some(scope(&home)), Box::new(GoalAdapter));
+    let handle = start(
+        spec(&cwd),
+        Some(scope(&home)),
+        Box::new(GoalAdapter {
+            identity: identity(&home),
+        }),
+    );
     handle.command(command(Operation::Get)).unwrap();
     handle
         .command(command(Operation::SetObjective(
@@ -205,8 +264,12 @@ fn resume_revalidates_original_scope_after_adapter_preparation_before_any_frame(
         home: std::path::PathBuf,
         old: std::path::PathBuf,
         frame: serde_json::Value,
+        identity: super::super::protocol::ServerIdentity,
     }
     impl Adapter for SwapBeforeResume {
+        fn server_identity(&self) -> Option<&super::super::protocol::ServerIdentity> {
+            Some(&self.identity)
+        }
         fn initialize(&mut self) -> Result<Step, String> {
             Ok(Step::default())
         }
@@ -241,6 +304,7 @@ fn resume_revalidates_original_scope_after_adapter_preparation_before_any_frame(
                 home: home.clone(),
                 old: root.path().join("old-codex"),
                 frame,
+                identity: identity(&home),
             }),
         );
         let error = handle.command(Command::Compact).unwrap_err();
@@ -314,4 +378,68 @@ fn goal_observations_fence_thread_reset_and_never_make_unknown_or_limited_work_i
         },
     );
     assert!(state.goal.is_none());
+}
+
+#[test]
+fn goal_work_binds_healthy_original_scope_to_the_initialized_server_across_alias_capture() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let home_a = root.path().join("home-a");
+    let home_b = root.path().join("home-b");
+    let alias = root.path().join("selected-home");
+    std::fs::create_dir(&home_a).unwrap();
+    std::fs::create_dir(&home_b).unwrap();
+    symlink(&home_b, &alias).unwrap();
+    // Protocol create captured B before runtime scope capture. The original
+    // A tuple is physically valid, but is not the initialized server's home.
+    let server = identity(&alias.canonicalize().unwrap());
+    std::fs::remove_file(&alias).unwrap();
+    symlink(&home_a, &alias).unwrap();
+    let captured = scope(&alias.canonicalize().unwrap());
+    std::fs::remove_file(&alias).unwrap();
+    symlink(&home_b, &alias).unwrap();
+    captured.revalidate().unwrap();
+    assert_ne!(captured.canonical_home, server.canonical_home);
+    let handle = start(
+        spec(root.path()),
+        Some(captured),
+        Box::new(GoalAdapter { identity: server }),
+    );
+    handle.command(command(Operation::Get)).unwrap();
+    for operation in [
+        Operation::Resume,
+        Operation::SetObjective("Unrelated home must not authorize".into()),
+    ] {
+        let error = handle.command(command(operation)).unwrap_err();
+        assert!(
+            error.contains("does not match this initialized server"),
+            "{error}"
+        );
+        assert_eq!(
+            handle.snapshot(None).unwrap().goal,
+            Some(observation(Status::Active, 1))
+        );
+    }
+    // Denying new work must not prevent stopping the actual original actor B.
+    handle.command(command(Operation::Pause)).unwrap();
+    handle.command(command(Operation::Clear)).unwrap();
+    assert_eq!(
+        handle.snapshot(None).unwrap().goal.unwrap().read,
+        ReadState::Known(None)
+    );
+    handle.close().unwrap();
+    // A genuinely matched B tuple is still allowed, with no fallback to A.
+    let handle = start(
+        spec(root.path()),
+        Some(scope(&home_b)),
+        Box::new(GoalAdapter {
+            identity: identity(&home_b),
+        }),
+    );
+    handle.command(command(Operation::Resume)).unwrap();
+    assert_eq!(
+        handle.check_update_readiness().unwrap(),
+        UpdateReadiness::Busy
+    );
+    handle.close().unwrap();
 }

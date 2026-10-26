@@ -1889,6 +1889,7 @@ type GoalDirectory = (
 /// retained pathname or a later account selection cannot replace either pin.
 fn validate_goal_work(
     scope: Option<&crate::account::scope::LaunchAccountScope>,
+    server: Option<&super::protocol::ServerIdentity>,
     context: Option<&super::protocol::ExecutionContext>,
     directory: Option<&GoalDirectory>,
     working_directory: &std::path::Path,
@@ -1896,6 +1897,12 @@ fn validate_goal_work(
     let scope = scope.ok_or("The original goal account scope is unavailable")?;
     if scope.provider != crate::agent::Provider::Codex {
         return Err("Native goals require the original Codex account scope".into());
+    }
+    let server = server.ok_or("The initialized goal server account identity is unavailable")?;
+    if server.canonical_home != scope.canonical_home {
+        return Err(
+            "The original goal account scope does not match this initialized server".into(),
+        );
     }
     let context = context.ok_or("The original goal launch context is unavailable")?;
     let (identity, directory) =
@@ -2584,6 +2591,7 @@ impl Actor {
             if goal_work
                 && let Err(error) = validate_goal_work(
                     self.launch_account_scope.as_ref(),
+                    self.adapter.server_identity(),
                     self.launch_context.as_deref(),
                     self.goal_directory.as_ref(),
                     &self.working_directory,
@@ -2804,6 +2812,7 @@ impl Actor {
         if goal_work || resumes && (self.goal_resume_requires_scope || goal_can_work) {
             validate_goal_work(
                 self.launch_account_scope.as_ref(),
+                self.adapter.server_identity(),
                 self.launch_context.as_deref(),
                 self.goal_directory.as_ref(),
                 &self.working_directory,
