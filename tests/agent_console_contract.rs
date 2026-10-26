@@ -80,7 +80,7 @@ impl Fixture {
         };
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let output = fixture.output(&["daemon", "status"]);
+            let output = fixture.output_until(&["daemon", "status"], deadline);
             if output.status.success()
                 && serde_json::from_slice::<Value>(&output.stdout).unwrap()["data"]["running"]
                     == true
@@ -101,7 +101,10 @@ impl Fixture {
         } else {
             20
         };
-        let deadline = Instant::now() + Duration::from_secs(timeout);
+        self.output_until(arguments, Instant::now() + Duration::from_secs(timeout))
+    }
+
+    fn output_until(&self, arguments: &[&str], deadline: Instant) -> Output {
         let spec = private_cli_capture::private_cli(self.root.path())
             .env("TERM", "xterm-256color")
             .args(arguments.iter().copied());
