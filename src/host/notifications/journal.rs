@@ -1069,4 +1069,55 @@ mod tests {
         assert_eq!(journal.list().unwrap().len(), 1);
         assert!(journal.list().unwrap()[0].delivered);
     }
+
+    #[test]
+    fn automation_lifecycle_replay_keeps_latest_notice_and_actor_retirement_separate() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("automation.sqlite3");
+        let id = Uuid::new_v4();
+        let make = |sequence, kind| Event {
+            target: Target::Automation { id, sequence },
+            source_session: None,
+            provider: None,
+            directory: None,
+            destination: None,
+            evidence: Evidence {
+                key: format!("automation:{id}:lifecycle:{sequence}"),
+                kind,
+            },
+            content: None,
+        };
+        let old = make(17, Kind::AutomationPaused);
+        let current = make(18, Kind::AutomationBlocked);
+        let mut journal = Journal::open(&path).unwrap();
+        let first = journal.record(old.clone(), false).unwrap().unwrap();
+        journal.acknowledge(first.id).unwrap();
+        let second = journal.record(current.clone(), false).unwrap().unwrap();
+        assert_ne!(first.id, second.id);
+        journal
+            .retire(Target::Session(TerminalId::from_uuid(id)))
+            .unwrap();
+        journal
+            .retire(Target::AgentRun(crate::model::RunId::from_uuid(id)))
+            .unwrap();
+        assert_eq!(
+            journal.list().unwrap(),
+            vec![second.clone()],
+            "actor predecessor retirement cannot own automation history"
+        );
+        journal.acknowledge(first.id).unwrap();
+        assert!(!journal.list().unwrap()[0].acknowledged);
+        drop(journal);
+        let mut reopened = Journal::open(&path).unwrap();
+        assert!(
+            reopened.record(old, false).unwrap().is_none(),
+            "older durable duplicate cannot restore its earlier target or kind"
+        );
+        assert_eq!(reopened.list().unwrap(), vec![second.clone()]);
+        reopened.acknowledge(second.id).unwrap();
+        assert!(reopened.record(current, false).unwrap().is_none());
+        let final_notice = reopened.list().unwrap().pop().unwrap();
+        assert_eq!(final_notice.id, second.id);
+        assert!(final_notice.acknowledged);
+    }
 }
