@@ -810,7 +810,8 @@ impl super::Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                if runtime.closed_elsewhere
+                if !runtime.visible.load(std::sync::atomic::Ordering::Relaxed)
+                    || runtime.closed_elsewhere
                     || runtime.disconnected
                     || runtime.snapshot.exited
                     || runtime.pending.is_some()
@@ -900,7 +901,8 @@ impl super::Cagents {
             }
             Action::Install => {
                 let eligible = self.chat_runtime_mut(target).is_some_and(|runtime| {
-                    !runtime.closed_elsewhere
+                    runtime.visible.load(std::sync::atomic::Ordering::Relaxed)
+                        && !runtime.closed_elsewhere
                         && !runtime.disconnected
                         && !runtime.snapshot.exited
                         && runtime.pending.is_none()

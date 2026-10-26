@@ -43,6 +43,36 @@ fn microphone_discovery_requires_explicit_setup_and_preserves_draft() {
 }
 
 #[test]
+fn queued_start_and_install_cannot_reopen_hidden_or_parked_microphone_owner() {
+    for parked in [false, true] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let target = chat_runtime(&app, card).target;
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .set_visible(false)
+            .unwrap();
+        if parked {
+            let Some(CardRuntime::Chat(runtime)) = app.cards.remove(&card) else {
+                panic!("chat runtime");
+            };
+            app.chat_ui.parked.insert(card, runtime);
+        }
+        drop(app.handle_chat_ui(Action::Dictation(target, dictation::Action::Start)));
+        assert!(
+            !app.chat_ui.dictation_setup.shown(target),
+            "hidden queued Start must not even expose setup"
+        );
+        // A previously open setup panel can outlive its editor's visibility.
+        app.chat_ui.dictation_setup.show(target);
+        let task = app.handle_chat_ui(Action::Dictation(target, dictation::Action::Install));
+        assert!(iced::runtime::task::into_stream(task).is_none());
+        assert!(app.chat_ui.dictation_setup.phase().is_none());
+        assert!(app.chat_ui.dictation_setup.prepared().is_none());
+    }
+}
+
+#[test]
 fn dictation_completion_maps_real_edits_and_pending_image_without_sending() {
     let _admission = attachment_draft::test_admission();
     let mut app = crate::app::tests::context_inspector_test_app(false);
