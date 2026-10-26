@@ -41,10 +41,7 @@ fn transcript_body(text: impl Into<String>, target: Target) -> Element<'static, 
 /// Named because the composer's height is computed from the draft rather than
 /// fixed, so the two constants have to agree with what the editor draws.
 const COMPOSER_LINE_HEIGHT: f32 = 18.0;
-const COMPOSER_PADDING: f32 = crate::tab_strip::EDGE_INSET + space::S;
-// Icon hit targets include their own centered inset; align the visible glyph.
-const COMPOSER_TOOLBAR_PADDING: f32 =
-    COMPOSER_PADDING - (design::PRIMARY_CONTROL_SIZE - design::ROW_ICON_SIZE as f32) / 2.0;
+const COMPOSER_PADDING: f32 = space::S;
 
 /// The widest a user's message is drawn.
 ///
@@ -2811,43 +2808,6 @@ impl Runtime {
                 })
                 .into()
         };
-        let mut actions = Vec::new();
-        if snapshot.capabilities.branch || snapshot.capabilities.compact {
-            actions.push(self.composer_actions(available));
-        }
-        if !snapshot.capabilities.interrupt_modes.is_empty() {
-            let mode = snapshot.interrupt_mode.as_deref().unwrap_or("immediate");
-            let next = if mode == "wait" { "immediate" } else { "wait" };
-            actions.push(
-                crate::ui_controls::icon_button(
-                    Icon::Jump,
-                    if mode == "wait" {
-                        "Steering: after turn"
-                    } else {
-                        "Steering: after tools"
-                    },
-                )
-                .on_press_maybe(available.then(|| {
-                    action(Action::Command(
-                        target,
-                        Command::SetInterruptMode { mode: next.into() },
-                    ))
-                }))
-                .into(),
-            );
-        }
-        if snapshot.capabilities.attachments {
-            actions.push(icon(
-                Icon::Attachment,
-                "Attach files",
-                available && self.attachment_chooser_pending.is_none(),
-                Action::Attach(target),
-            ));
-        }
-        // Commands are reached by typing `/`, which is how every agent surface
-        // a user arrives from works and what the composer already answers to.
-        // A dropdown listing them duplicated that path in a control that was
-        // permanently present for something used occasionally.
         let mut submissions = Vec::new();
         if snapshot.busy {
             // A provider whose interrupt does not spare background subagents
@@ -2871,7 +2831,7 @@ impl Runtime {
                 .on_press_maybe(available.then(|| action(Action::Interrupt(target))))
                 .into()
             } else {
-                icon(
+                crate::ui_controls::icon_button(
                     Icon::Stop,
                     if at_stake > 0 {
                         Cow::Owned(format!(
@@ -2880,17 +2840,24 @@ impl Runtime {
                     } else {
                         Cow::Borrowed("Cancel active turn (Esc)")
                     },
-                    available,
-                    Action::Interrupt(target),
                 )
+                .compact()
+                .on_press_maybe(available.then(|| action(Action::Interrupt(target))))
+                .into()
             });
         }
         // The primary action anchors the trailing edge. Tooltips and
         // accessible names carry the delivery mode and keyboard chord.
-        for (slot, mode) in modes.iter().enumerate().rev() {
+        for (slot, mode) in modes
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|_| !snapshot.busy || has_draft)
+        {
             let (name, tooltip) = submit_control(*mode, slot, enter_sends);
             submissions.push(
                 crate::ui_controls::icon_button(name, tooltip)
+                    .compact()
                     .selected(slot == 0)
                     .tone(crate::design::Tone::Themed(if slot == 0 {
                         design::accent_color
@@ -2903,36 +2870,12 @@ impl Runtime {
                     .into(),
             );
         }
-        // Very narrow panes keep every icon's hit target intact.
-        let toolbar: Element<'_, Message> = if content_width < 360.0 {
-            widget::column::with_children(vec![
-                widget::flex_row(actions)
-                    .spacing(step::GAP_XS as u16)
-                    .align_items(Alignment::Center)
-                    .into(),
-                widget::container(
-                    widget::row::with_children(submissions)
-                        .spacing(step::GAP_XS)
-                        .align_y(Alignment::Center),
-                )
-                .width(Length::Fill)
-                .align_x(Alignment::End)
-                .into(),
-            ])
-            .spacing(space::XS)
-            .into()
-        } else {
-            actions.push(iced::widget::Space::new().width(Length::Fill).into());
-            actions.extend(submissions);
-            widget::row::with_children(actions)
-                .spacing(step::GAP_XS)
-                .align_y(Alignment::Center)
-                .into()
-        };
-        // The editor and its controls are one object: a single raised surface
-        // with the controls tucked inside its lower edge, so the composer
-        // reads as one place to type rather than a field with a toolbar
-        // bolted under it.
+        let mut inline = vec![self.composer_actions(available, content_width), editor];
+        inline.extend(submissions);
+        let composer_row = widget::row::with_children(inline)
+            .spacing(step::GAP_XS)
+            .align_y(Alignment::End)
+            .padding(space::XS);
         content.push(
             widget::container(
                 widget::column::with_children(vec![
@@ -2946,16 +2889,12 @@ impl Runtime {
                     ))
                     .spacing(step::GAP_XS)
                     .into(),
-                    editor,
+                    composer_row.into(),
                     suggestion_hint,
-                    widget::container(toolbar)
-                        .padding(
-                            iced::Padding::from([0.0, COMPOSER_TOOLBAR_PADDING]).bottom(space::S),
-                        )
-                        .into(),
                 ])
                 .width(Length::Fill),
             )
+            .id(card_control_id(target.card, "chat-composer-surface"))
             .class(design::surface(
                 Some(if self.drop_hover {
                     design::accent_wash
@@ -2969,47 +2908,9 @@ impl Runtime {
             .into(),
         );
         let usage = &snapshot.usage;
-        // Prefer a wider chat over hiding its status and settings behind a
-        // scrollbar. Narrow panes keep the primary status on one line and move
-        // secondary details into the overflow control.
-        // The line always says what the conversation is doing, idle
-        // included: a reader glancing at a card should never have to infer
-        // its state from the absence of a word. The order is the order of
-        // what a reader most needs to know first - that the card is between
-        // sessions, that something is being sent, that the agent has stopped
-        // or failed, that it is waiting on them, that it is working.
+        // Context stays on the left; model, effort and spend form one
+        // trailing group. Transient work belongs in the scrolling transcript.
         let mut status: Vec<Element<'_, Message>> = Vec::new();
-        let (glyph, state) = self.conversation_status(transitioning);
-        if let Some(glyph) = glyph {
-            status.push(if glyph == Icon::AgentWorking {
-                crate::ui_controls::activity_spinner(
-                    f32::from(design::ROW_ICON_SIZE),
-                    design::accent_color,
-                )
-            } else {
-                crate::ui_controls::passive_icon(glyph, design::COMPACT_ICON_SIZE)
-            });
-        }
-        if !state.is_empty() {
-            status.push(
-                design::heading(if selected.is_some() {
-                    format!("Main: {state}")
-                } else {
-                    state.to_owned()
-                })
-                .size(design::TEXT_CAPTION)
-                .class(
-                    if glyph == Some(Icon::Warning) && !transitioning && self.pending.is_none() {
-                        cosmic::theme::Text::Custom(design::warning_text)
-                    } else {
-                        cosmic::theme::Text::default()
-                    },
-                )
-                .width(Length::Shrink)
-                .into(),
-            );
-        }
-        let primary_status_count = status.len();
         if let Some(channel) = &place.channel {
             status.push(
                 crate::interaction::tooltip(
@@ -3022,7 +2923,7 @@ impl Runtime {
         }
         if !place.name.is_empty() {
             status.push(
-                design::caption(place.name.clone())
+                design::caption(Self::short_description(&place.name, 24))
                     .wrapping(iced::widget::text::Wrapping::None)
                     .into(),
             );
@@ -3031,7 +2932,7 @@ impl Runtime {
             status.push(
                 widget::row::with_children(vec![
                     crate::ui_controls::passive_icon(crate::sidebar::worktree_icon(), 12),
-                    design::caption(branch.clone())
+                    design::caption(Self::short_description(branch, 24))
                         .class(cosmic::theme::Text::Custom(design::muted_text))
                         .wrapping(iced::widget::text::Wrapping::None)
                         .into(),
@@ -3041,11 +2942,16 @@ impl Runtime {
                 .into(),
             );
         }
+        let mut model_controls = Vec::new();
         if !self.closed_elsewhere {
-            status.extend(self.session_controls(transitioning, accounts, offers, shortcuts));
+            let (context, models) =
+                self.session_controls(transitioning, accounts, offers, shortcuts);
+            status.extend(context);
+            model_controls = models;
         }
+        let primary_status_count = status.len().min(1);
         // Keep budget and cost together when the footer wraps.
-        let mut spend: Vec<Element<'_, Message>> = Vec::new();
+        let mut spend: Vec<Element<'_, Message>> = model_controls;
         if usage.context_limit > 0 {
             // A context budget is a quantity a reader acts on - compact now,
             // or lose the thread - so it is drawn as a ring with its figure
@@ -3092,7 +2998,7 @@ impl Runtime {
             let (label, tooltip) = cost_estimate_label(estimate);
             spend.push(crate::interaction::tooltip(design::caption(label), tooltip));
         }
-        let compact_footer = content_width < 600.0;
+        let compact_footer = content_width < 900.0;
         let mut secondary = if compact_footer {
             status.split_off(primary_status_count)
         } else {
@@ -3161,7 +3067,18 @@ impl Runtime {
                 action(Action::FooterPicker(target, false)),
             ));
         } else {
-            footer.push(spend);
+            let context = widget::container(
+                widget::flex_row(footer)
+                    .spacing(step::GAP_S as u16)
+                    .align_items(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .max_width((content_width - 420.0).max(200.0));
+            footer = vec![
+                context.into(),
+                widget::Space::new().width(Length::Fill).into(),
+                spend,
+            ];
         }
         let footer_row: Element<'_, Message> = if compact_footer {
             widget::row::with_children(footer)
@@ -3170,9 +3087,10 @@ impl Runtime {
                 .width(Length::Fill)
                 .into()
         } else {
-            widget::flex_row(footer)
-                .spacing(step::GAP_S as u16)
-                .align_items(Alignment::Center)
+            widget::row::with_children(footer)
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center)
+                .width(Length::Fill)
                 .into()
         };
         let footer = crate::ui_controls::popover(
@@ -3315,13 +3233,14 @@ impl Runtime {
         )
     }
 
-    fn composer_actions(&self, available: bool) -> Element<'_, Message> {
+    fn composer_actions(&self, available: bool, content_width: f32) -> Element<'_, Message> {
         let target = self.target;
         let snapshot = &self.snapshot;
         let open = self.composer_actions || self.branch_picker;
         let enabled =
             available && snapshot.ready && !snapshot.busy && snapshot.read_only_reason.is_none();
         let anchor = crate::ui_controls::icon_button(Icon::Plus, "Conversation actions")
+            .compact()
             .id(card_control_id(target.card, "chat-actions"))
             .selected(open)
             .on_press(action(Action::ComposerActions(target, !open)));
@@ -3376,7 +3295,83 @@ impl Runtime {
                     .spacing(step::GAP_S)
                     .into()
             } else {
-                let mut choices: Vec<Element<'_, Message>> = Vec::new();
+                let first = self
+                    .composer_action_candidates()
+                    .into_iter()
+                    .find(|candidate| {
+                        available && (candidate.kind == completion::Kind::Skill || enabled)
+                    })
+                    .map(|candidate| candidate.insertion.into_owned());
+                let mut choices: Vec<Element<'_, Message>> =
+                    vec![crate::interaction::keyboard_list_entry(
+                        crate::ui_controls::field::search(
+                            "Search skills and actions",
+                            &self.composer_actions_query,
+                        )
+                        .id(card_control_id(target.card, "chat-actions-search"))
+                        .on_input(move |query| action(Action::ComposerActionsQuery(target, query)))
+                        .on_submit_maybe(first.map(|insertion| {
+                            move |_| action(Action::ComposerAction(target, insertion.clone()))
+                        })),
+                    )];
+                if snapshot.capabilities.attachments && self.composer_actions_query.is_empty() {
+                    choices.push(
+                        crate::ui_controls::button::secondary("Attach files or images…")
+                            .icon(Icon::Attachment)
+                            .width(Length::Fill)
+                            .on_press_maybe(
+                                (available && self.attachment_chooser_pending.is_none())
+                                    .then(|| action(Action::Attach(target))),
+                            )
+                            .into(),
+                    );
+                }
+                for candidate in self.composer_action_candidates() {
+                    let is_skill = candidate.kind == completion::Kind::Skill;
+                    let label = if is_skill {
+                        format!("Skill · {}", candidate.name)
+                    } else {
+                        match candidate.name {
+                            "plan" => "Plan mode".into(),
+                            "goal" => "Goal…".into(),
+                            _ => candidate.label().into_owned(),
+                        }
+                    };
+                    choices.push(crate::interaction::tooltip(
+                        crate::ui_controls::button::secondary(label)
+                            .width(Length::Fill)
+                            .on_press_maybe((available && (is_skill || enabled)).then(|| {
+                                action(Action::ComposerAction(
+                                    target,
+                                    candidate.insertion.into_owned(),
+                                ))
+                            })),
+                        candidate.description,
+                    ));
+                }
+                if !snapshot.capabilities.interrupt_modes.is_empty()
+                    && (self.composer_actions_query.is_empty()
+                        || "steering timing".contains(&self.composer_actions_query.to_lowercase()))
+                {
+                    let mode = snapshot.interrupt_mode.as_deref().unwrap_or("immediate");
+                    let next = if mode == "wait" { "immediate" } else { "wait" };
+                    choices.push(
+                        crate::ui_controls::button::secondary(if mode == "wait" {
+                            "Steering: after turn"
+                        } else {
+                            "Steering: after tools"
+                        })
+                        .icon(Icon::Jump)
+                        .width(Length::Fill)
+                        .on_press_maybe(available.then(|| {
+                            action(Action::Command(
+                                target,
+                                Command::SetInterruptMode { mode: next.into() },
+                            ))
+                        }))
+                        .into(),
+                    );
+                }
                 if snapshot.capabilities.branch {
                     choices.push(
                         crate::ui_controls::button::secondary("Fork conversation…")
@@ -3404,17 +3399,30 @@ impl Runtime {
                             .into(),
                     );
                 }
-                widget::column::with_children(choices)
-                    .spacing(step::GAP_S)
-                    .into()
+                widget::column::with_children(choices.into_iter().enumerate().map(
+                    |(index, choice)| {
+                        if index == 0 {
+                            choice
+                        } else {
+                            crate::interaction::keyboard_list_row(choice)
+                        }
+                    },
+                ))
+                .spacing(space::XS)
+                .into()
             };
-            widget::scrollable(content).height(Length::Shrink).into()
+            crate::interaction::keyboard_list(
+                widget::scrollable(content).height(Length::Shrink),
+                true,
+            )
         });
         crate::ui_controls::popover(
             anchor,
             popup.map(|content: Element<'_, Message>| {
                 widget::container(content)
-                    .width(320)
+                    .width(
+                        (content_width - 2.0 * step::GAP_M - 2.0 * space::XS).clamp(120.0, 320.0),
+                    )
                     .max_height(260.0)
                     .into()
             }),
@@ -3437,13 +3445,14 @@ impl Runtime {
         accounts: Option<ChatAccounts>,
         offers: Vec<Offer<'a>>,
         shortcuts: &crate::settings::KeyboardShortcuts,
-    ) -> Vec<Element<'a, Message>> {
+    ) -> (Vec<Element<'a, Message>>, Vec<Element<'a, Message>>) {
         let target = self.target;
         let snapshot = &self.snapshot;
         let mut controls: Vec<Element<'a, Message>> = Vec::new();
         if let Some(accounts) = accounts {
             controls.push(self.account_picker(accounts, transitioning, shortcuts));
         }
+        let mut models = Vec::new();
         let draft = self.is_draft();
         if (snapshot.capabilities.model_selection && !snapshot.models.is_empty()) || draft {
             let label: Cow<'a, str> = match snapshot
@@ -3465,9 +3474,9 @@ impl Runtime {
                 },
             };
             if transitioning {
-                controls.push(design::caption(label).into());
+                models.push(design::caption(label).into());
             } else {
-                controls.push(self.model_picker(label, offers, shortcuts));
+                models.push(self.model_picker(label, offers, shortcuts));
             }
         }
         if snapshot.capabilities.reasoning_selection
@@ -3482,7 +3491,7 @@ impl Runtime {
                 .iter()
                 .position(|reasoning| Some(reasoning) == snapshot.reasoning.as_ref());
             if transitioning {
-                controls.push(
+                models.push(
                     design::caption(
                         selected.map_or("Reasoning", |index| model.reasoning[index].as_str()),
                     )
@@ -3528,7 +3537,7 @@ impl Runtime {
                     .width(160)
                     .into()
                 });
-                controls.push(crate::ui_controls::popover(
+                models.push(crate::ui_controls::popover(
                     anchor,
                     choices,
                     widget::popover::Position::Top,
@@ -3578,7 +3587,7 @@ impl Runtime {
                 ));
             }
         }
-        controls
+        (controls, models)
     }
 
     /// A draft can explicitly pin its account. Started conversations display
@@ -3759,7 +3768,7 @@ impl Runtime {
                 ))
                 .size(design::COMPACT_ICON_SIZE)
                 .into(),
-                design::caption(label)
+                design::caption(Self::short_description(&label, 28))
                     .wrapping(iced::widget::text::Wrapping::None)
                     .into(),
                 widget::icon(Icon::PanDown.handle())
@@ -10470,7 +10479,7 @@ mod tests {
     fn composer_stays_inset_with_and_without_a_conversation_title() {
         use iced::advanced::{
             Layout, layout,
-            widget::{Operation, Tree, operation},
+            widget::{Operation, Tree},
         };
         struct Probe {
             id: widget::Id,
@@ -10480,12 +10489,7 @@ mod tests {
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
                 visit(self);
             }
-            fn focusable(
-                &mut self,
-                id: Option<&widget::Id>,
-                bounds: iced::Rectangle,
-                _: &mut dyn operation::Focusable,
-            ) {
+            fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
                 if id == Some(&self.id) {
                     self.bounds = Some(bounds);
                 }
@@ -10520,7 +10524,7 @@ mod tests {
                     &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 700.0)),
                 );
                 let mut probe = Probe {
-                    id: card_control_id(runtime.target.card, "chat-composer"),
+                    id: card_control_id(runtime.target.card, "chat-composer-surface"),
                     bounds: None,
                 };
                 element.as_widget_mut().operate(
@@ -10553,17 +10557,10 @@ mod tests {
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
                 visit(self);
             }
-            fn focusable(
-                &mut self,
-                id: Option<&widget::Id>,
-                bounds: iced::Rectangle,
-                _: &mut dyn operation::Focusable,
-            ) {
+            fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
                 if id == Some(&self.composer) {
                     self.editor = Some(bounds);
                 }
-            }
-            fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
                 if id == Some(&scroll::item_id("0-answer")) {
                     self.answer = Some(bounds);
                 }
@@ -10641,7 +10638,7 @@ mod tests {
                     &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 700.0)),
                 );
                 let mut probe = Probe {
-                    composer: card_control_id(runtime.target.card, "chat-composer"),
+                    composer: card_control_id(runtime.target.card, "chat-composer-surface"),
                     transcript: card_control_id(runtime.target.card, "chat-transcript"),
                     editor: None,
                     viewport: None,

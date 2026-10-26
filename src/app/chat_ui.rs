@@ -297,6 +297,8 @@ pub enum Action {
     TakeBackQueued(Target, Option<QueueEntry>),
     RemoveQueued(Target, QueueEntry),
     ComposerActions(Target, bool),
+    ComposerActionsQuery(Target, String),
+    ComposerAction(Target, String),
     BranchPicker(Target, bool),
     ChangesPicker(Target, bool),
     ChangeFiles(Target, Option<chat::FileChangeKey>),
@@ -472,6 +474,7 @@ impl Action {
             | Self::Reconnect(target)
             | Self::SignIn(target, _)
             | Self::ResumeAfterSignIn(target)
+            | Self::ComposerAction(target, _)
             | Self::AcceptSuggestion(target, _)
             | Self::Submit(target, _)
             | Self::DiscardClosedDraft(target, _)
@@ -2037,6 +2040,7 @@ pub(super) struct Runtime {
     /// sending it again queues it unless the reader chooses otherwise.
     resend: Option<PromptMode>,
     composer_actions: bool,
+    composer_actions_query: String,
     branch_picker: bool,
     changes: changes::State,
     fork_requested: bool,
@@ -2322,6 +2326,26 @@ impl Runtime {
         };
         token.fit(&rows);
         (!rows.is_empty()).then_some((token, rows))
+    }
+
+    /// Reuse slash completion's capability filtering and exact skill identity.
+    fn composer_action_candidates(&self) -> Vec<completion::Candidate<'_>> {
+        completion::candidates(
+            &self.snapshot,
+            &completion::Token {
+                line: 0,
+                start: 0,
+                end: 0,
+                sigil: '/',
+                query: self.composer_actions_query.clone(),
+                tail: String::new(),
+                leading: true,
+            },
+        )
+        .into_iter()
+        .filter(|row| row.name != COMPACT_COMMAND)
+        .take(100)
+        .collect()
     }
 
     /// Puts `insertion` over the word being completed when it is one of the
@@ -2954,6 +2978,7 @@ impl Runtime {
             taken_back: Vec::new(),
             resend: None,
             composer_actions: false,
+            composer_actions_query: String::new(),
             branch_picker: false,
             changes: changes::State::default(),
             fork_requested: false,
@@ -7982,6 +8007,7 @@ impl Cagents {
         };
         let restore = match &action {
             Action::AccountPicker(target, false)
+            | Action::ComposerActions(target, false)
             | Action::PermissionPicker(target, false)
             | Action::FooterPicker(target, false)
             | Action::ModelPicker(target, false)
@@ -10098,6 +10124,79 @@ impl Cagents {
                     .map(cosmic::Action::App);
                 }
             }
+            Action::ComposerActionsQuery(target, query) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.composer_actions_query = query;
+                }
+            }
+            Action::ComposerAction(target, insertion) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                let Some(kind) = runtime
+                    .composer_action_candidates()
+                    .into_iter()
+                    .find(|candidate| candidate.insertion == insertion)
+                    .map(|candidate| candidate.kind)
+                else {
+                    return Task::none();
+                };
+                if kind == completion::Kind::Command
+                    && (!runtime.snapshot.ready
+                        || runtime.snapshot.busy
+                        || runtime.snapshot.read_only_reason.is_some()
+                        || runtime.pending.is_some())
+                {
+                    return Task::none();
+                }
+                runtime.composer_actions = false;
+                runtime.branch_picker = false;
+                runtime.picker_keyboard = false;
+                if kind == completion::Kind::Skill {
+                    // The normal editor path maps pending image bookmarks and
+                    // leaves attachment identity and the rest of the draft intact.
+                    let cursor = runtime.composer.cursor().position;
+                    let prefix = runtime
+                        .composer
+                        .line(cursor.line)
+                        .and_then(|line| line.text.get(..cursor.column).map(str::to_owned))
+                        .is_some_and(|before| {
+                            before.chars().last().is_some_and(|c| !c.is_whitespace())
+                        });
+                    let insertion = format!("{}{} ", if prefix { " " } else { "" }, insertion);
+                    return Task::batch([
+                        self.handle_chat_ui(Action::Composer(
+                            target,
+                            text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(
+                                insertion,
+                            ))),
+                        )),
+                        iced::widget::operation::focus(card_control_id(
+                            target.card,
+                            "chat-composer",
+                        ))
+                        .map(cosmic::Action::App),
+                    ]);
+                }
+                if insertion == format!("/{PERMISSIONS_COMMAND}") {
+                    return self.handle_chat_ui(Action::PermissionPicker(target, true));
+                }
+                if insertion == format!("/{RESUME_COMMAND}") {
+                    return self
+                        .open_resume_from(target.card, String::new())
+                        .unwrap_or_else(Task::none);
+                }
+                // Dispatch the same provider command as a typed slash; drafts
+                // and their attachments remain available after a mode change.
+                return Task::batch([
+                    self.handle_chat_ui(Action::Command(
+                        target,
+                        Command::Slash { command: insertion },
+                    )),
+                    iced::widget::operation::focus(card_control_id(target.card, "chat-composer"))
+                        .map(cosmic::Action::App),
+                ]);
+            }
             Action::ComposerActions(target, open) => {
                 if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
                 {
@@ -10109,6 +10208,17 @@ impl Cagents {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.composer_actions = open;
                     runtime.branch_picker = false;
+                    runtime.picker_keyboard = open;
+                    if open {
+                        runtime.composer_actions_query.clear();
+                    }
+                }
+                if open {
+                    return widget::text_input::focus(card_control_id(
+                        target.card,
+                        "chat-actions-search",
+                    ))
+                    .map(cosmic::Action::App);
                 }
             }
             Action::BranchPicker(target, open) => {
@@ -10764,6 +10874,7 @@ impl Cagents {
                     return Task::none();
                 };
                 runtime.attachment_chooser_pending = Some(id.id);
+                runtime.composer_actions = false;
                 let directory = runtime.session.launch.recipe.working_directory.clone();
                 return cosmic::task::future(async move {
                     let result = match file_chooser::open::Dialog::new()
@@ -17989,7 +18100,10 @@ mod tests {
             generation: app.workspace_view_generation,
             event: WorkspaceViewportEvent::Resized(1_600.0),
         }));
-        assert_eq!(app.workspace.visibility(card), Some(VisibilityClass::Visible));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
         let target = chat_runtime(&app, card).target;
         let handle = chat_runtime(&app, card).handle().unwrap().clone();
         write(&mut app, card, "accepted ");
@@ -18035,7 +18149,10 @@ mod tests {
         // Hidden transcript-derived history is disposable. The daemon hydrates
         // it again only after the reader returns to the actual visible pane.
         return_to_chat(&mut app);
-        assert_eq!(app.workspace.visibility(card), Some(VisibilityClass::Visible));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
         let runtime = chat_runtime(&app, card);
         assert!(runtime.visible.load(Ordering::Relaxed));
         assert_eq!(runtime.target, target);
@@ -20900,11 +21017,11 @@ mod tests {
     /// either order, including when its chat never got as far as starting.
     #[test]
     fn a_channel_closes_when_its_last_pane_does() {
+        use super::super::workspace_model_sync::ModelUpdate;
         use crate::workspace_model::{
             ModelChannel, ModelEdit, ModelProject,
             views::{Pane, Scope, View},
         };
-        use super::super::workspace_model_sync::ModelUpdate;
 
         for (chat_first, chat_state) in [(true, 0), (true, 1), (true, 2), (false, 0), (false, 2)] {
             let mut app = crate::app::tests::context_inspector_test_app(true);
@@ -21014,13 +21131,19 @@ mod tests {
                 before_ack.push(edit);
             }
             assert!(
-                !before_ack.iter().any(|edit| matches!(edit, ModelEdit::RetireEmptyChannel { .. })),
+                !before_ack
+                    .iter()
+                    .any(|edit| matches!(edit, ModelEdit::RetireEmptyChannel { .. })),
                 "the occupied canonical view cannot authorize retirement: {before_ack:?}"
             );
 
             let mut settled = app.workspace_model.clone();
             settled.sequence = 11;
-            let view = settled.views.iter_mut().find(|view| view.scope == scope).unwrap();
+            let view = settled
+                .views
+                .iter_mut()
+                .find(|view| view.scope == scope)
+                .unwrap();
             view.panes.clear();
             view.retired = vec![terminal, chat];
             view.revision = 8;
@@ -21033,12 +21156,16 @@ mod tests {
             while let Ok(edit) = published.try_recv() {
                 after_ack.push(edit);
             }
-            let retire_requests = after_ack.iter().filter_map(|edit| match edit {
-                ModelEdit::RetireEmptyChannel { home, expected_view_revision } => {
-                    Some((*home, *expected_view_revision))
-                }
-                _ => None,
-            }).collect::<Vec<_>>();
+            let retire_requests = after_ack
+                .iter()
+                .filter_map(|edit| match edit {
+                    ModelEdit::RetireEmptyChannel {
+                        home,
+                        expected_view_revision,
+                    } => Some((*home, *expected_view_revision)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
             assert_eq!(retire_requests, vec![(home, 8)], "{after_ack:?}");
 
             // These are explicit App model-reply fixtures, not an executed
@@ -21052,7 +21179,9 @@ mod tests {
             // An authoritative no-work retirement reply removes that same Home.
             settled.sequence = 13;
             settled.channels.retain(|entry| entry.id != channel);
-            settled.views.retain(|view| view.scope != Scope::Channel(channel));
+            settled
+                .views
+                .retain(|view| view.scope != Scope::Channel(channel));
             drop(app.apply_workspace_model_update(ModelUpdate::Read(settled)));
             assert!(!channel_exists(&app));
             assert!(app.channel_ui.was_deleted(channel));
@@ -23895,6 +24024,91 @@ mod tests {
         );
         assert!(!Action::OpenChangedFile(target, "/reported".into()).allowed_while_modal());
     }
+    #[test]
+    fn plus_skill_insertion_preserves_unicode_draft_and_pending_image_identity() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("plus-skills"));
+        app.workspace.focus(card).unwrap();
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        Arc::make_mut(&mut runtime.snapshot).skills = vec![chat::Skill {
+            name: "review".into(),
+            description: "Review changes".into(),
+            invocation: "$review".into(),
+        }];
+        runtime.replace_draft(text_editor::Content::with_text("Review 🦀 changes"));
+        runtime.composer.move_to(text_editor::Cursor {
+            position: text_editor::Position {
+                line: 0,
+                column: "Review 🦀".len(),
+            },
+            selection: None,
+        });
+        let pending = runtime
+            .try_attachment_insert()
+            .expect("pending pasted image");
+        let reference = Attachment::file(PathBuf::from("/tmp/reference.txt"));
+        runtime.merge_attachments([reference.clone()]);
+        drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
+        drop(app.handle_chat_ui(Action::ComposerActionsQuery(target, "review".into())));
+        drop(app.handle_chat_ui(Action::ComposerAction(target, "$review".into())));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text(), "Review 🦀 $review  changes");
+        assert_eq!(runtime.attachments, vec![reference]);
+        assert!(
+            runtime.attachment_ticket(pending.id).is_some(),
+            "normal text insertion must map the image bookmark"
+        );
+        assert!(!runtime.composer_actions);
+        assert_eq!(
+            runtime.composer.cursor().position.column,
+            "Review 🦀 $review ".len()
+        );
+    }
+
+    #[test]
+    fn plus_actions_revalidate_catalog_target_and_working_state() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("plus-actions"));
+        app.workspace.focus(card).unwrap();
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.ready = true;
+        snapshot.commands = vec![chat::SlashCommand {
+            name: "plan".into(),
+            description: "Plan mode".into(),
+        }];
+        runtime.replace_draft(text_editor::Content::with_text("Keep this unsent draft"));
+        drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
+        let before = chat_runtime(&app, card).next_command;
+        for action in [
+            Action::ComposerAction(
+                Target {
+                    generation: target.generation + 1,
+                    ..target
+                },
+                "/plan".into(),
+            ),
+            Action::ComposerAction(target, "/unsupported".into()),
+        ] {
+            drop(app.handle_chat_ui(action));
+        }
+        assert_eq!(chat_runtime(&app, card).next_command, before);
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).busy = true;
+        drop(app.handle_chat_ui(Action::ComposerAction(target, "/plan".into())));
+        assert_eq!(chat_runtime(&app, card).next_command, before);
+        assert!(chat_runtime(&app, card).composer_actions);
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).busy = false;
+        drop(app.handle_chat_ui(Action::ComposerAction(target, "/plan".into())));
+        assert_eq!(chat_runtime(&app, card).next_command, before + 1);
+        assert_eq!(
+            chat_runtime(&app, card).composer.text(),
+            "Keep this unsent draft"
+        );
+        assert!(!chat_runtime(&app, card).composer_actions);
+    }
+
     #[test]
     fn composer_actions_navigate_dismiss_and_ignore_stale_targets() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
