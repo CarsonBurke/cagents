@@ -3485,7 +3485,7 @@ fn recovery_discovery_failure_blocks_only_selected_local_submit_and_preserves_me
     let confirmation = view.confirmation.as_ref().unwrap().id;
     assert_eq!(
         state.saved.error.as_deref(),
-        Some("Private recovery unavailable")
+        Some("Could not load saved changes: Private recovery unavailable")
     );
     let view_owner = view.owner;
     let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
@@ -3513,7 +3513,7 @@ fn recovery_discovery_failure_blocks_only_selected_local_submit_and_preserves_me
     );
     assert_eq!(
         state.saved.error.as_deref(),
-        Some("Private recovery unavailable")
+        Some("Could not load saved changes: Private recovery unavailable")
     );
     let mut ui = cached(&state, cache, &mut renderer, 500.0, 1800.0);
     let point = bounds(&ui, "Track PR").center();
