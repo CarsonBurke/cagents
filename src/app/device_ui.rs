@@ -390,8 +390,10 @@ impl Cagents {
             } else {
                 Box::new(operation::focusable::focus_next())
             };
-            return iced::advanced::widget::operate(operation::scoped(scope.clone(), traversal))
-                .map(cosmic::Action::App);
+            return iced::runtime::task::effect(iced::runtime::Action::widget(operation::scoped(
+                scope.clone(),
+                traversal,
+            )));
         }
         if let Action::Menu(open) = action {
             self.device_ui.menu_open =
