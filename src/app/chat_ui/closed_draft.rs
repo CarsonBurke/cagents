@@ -352,6 +352,44 @@ mod tests {
         text.0
     }
 
+    fn assert_visible_button(app: &Cagents, card: CardId, label: &str) {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let renderer = crate::app::tests::headless_renderer();
+        let mut element = app.chat_view(card);
+        let mut tree = Tree::new(element.as_widget());
+        let viewport = iced::Size::new(900.0, 980.0);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, viewport),
+        );
+        let accessible = element.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            iced::mouse::Cursor::Unavailable,
+        );
+        let controls: Vec<_> = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .filter(|node| {
+                node.node().role() == iced_accessibility::accesskit::Role::Button
+                    && node.node().label() == Some(label)
+            })
+            .collect();
+        assert_eq!(controls.len(), 1, "one mounted accessible copy control");
+        let bounds = controls[0].node().bounds().expect("native copy bounds");
+        assert!(
+            bounds.x1 > bounds.x0
+                && bounds.y1 > bounds.y0
+                && bounds.x0 < f64::from(viewport.width)
+                && bounds.y0 < f64::from(viewport.height)
+                && bounds.x1 > 0.0
+                && bounds.y1 > 0.0,
+            "copy control must be in the actual viewport: {bounds:?}"
+        );
+    }
+
     #[test]
     fn canonical_remote_close_retires_dictation_without_editing_retained_draft() {
         let (mut app, target, channel, _) = fixture("unsent draft");
@@ -434,7 +472,22 @@ mod tests {
         assert!(!runtime(&app, target).expected_remote_close_error(error));
         let text = visible_text(&mut app, target.card).join("\n");
         assert!(text.contains(error), "{text}");
-        assert!(text.contains("Copy details"), "{text}");
+        let incident = runtime(&app, target)
+            .failure_ui
+            .incidents
+            .iter()
+            .find(|incident| {
+                runtime(&app, target)
+                    .failure_details(&incident.key)
+                    .as_deref()
+                    == Some(error)
+            })
+            .expect("current failure notice");
+        assert_visible_button(
+            &app,
+            target.card,
+            &format!("Copy original diagnostics for {}", incident.summary),
+        );
         assert!(
             text.contains("The completed report stays readable."),
             "{text}"

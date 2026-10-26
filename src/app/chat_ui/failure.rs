@@ -17,6 +17,7 @@ pub(super) struct Incident {
     pub summary: String,
     pub guidance: &'static str,
     pub kind: Option<FailureKind>,
+    pub has_diagnostics: bool,
     sources: Vec<Source>,
     /// The chronological first transcript source owns the visible notice.
     pub first_item: Option<String>,
@@ -31,6 +32,7 @@ struct Metadata {
     summary: String,
     guidance: &'static str,
     kind: Option<FailureKind>,
+    has_diagnostics: bool,
 }
 
 #[derive(Default)]
@@ -119,18 +121,14 @@ impl State {
                 failure.action,
                 Some(failure.kind),
             ),
-            None => (
-                diagnostic_key(text),
-                fallback_summary(text),
-                "Review the details before trying again.",
-                None,
-            ),
+            None => (diagnostic_key(text), fallback_summary(text), "", None),
         };
         let meta = Metadata {
             key: diagnostic_key(&format!("{context}\0{key}")),
             summary,
             guidance,
             kind,
+            has_diagnostics: chat::failure::has_distinct_diagnostic(provider, text),
         };
         Some(meta)
     }
@@ -154,6 +152,7 @@ impl State {
             .iter_mut()
             .find(|incident| incident.key == meta.key)
         {
+            incident.has_diagnostics |= meta.has_diagnostics;
             if !incident.sources.contains(&source) {
                 incident.sources.push(source);
             }
@@ -167,6 +166,7 @@ impl State {
                 summary: meta.summary,
                 guidance: meta.guidance,
                 kind: meta.kind,
+                has_diagnostics: meta.has_diagnostics,
                 sources: vec![source],
                 first_item,
                 anchor: None,
@@ -242,7 +242,9 @@ impl State {
                     chat::failure::provider_error_carrier(runtime.session.launch.provider, item)
                         .and_then(|carrier| causes.get(carrier))
             {
+                let has_diagnostics = meta.has_diagnostics;
                 meta = cause.clone();
+                meta.has_diagnostics |= has_diagnostics;
             }
             self.push_metadata(meta.clone(), source.clone());
         }
@@ -455,7 +457,12 @@ impl State {
             .failure_ui
             .expanded
             .iter()
-            .filter(|key| state.incidents.iter().any(|incident| &incident.key == *key))
+            .filter(|key| {
+                state
+                    .incidents
+                    .iter()
+                    .any(|incident| &incident.key == *key && incident.has_diagnostics)
+            })
             .cloned()
             .collect();
         state.find_expanded = runtime
@@ -469,6 +476,7 @@ impl State {
             (
                 &incident.key,
                 &incident.summary,
+                incident.has_diagnostics,
                 &incident.sources,
                 &incident.first_item,
                 &incident.active_recovery,
@@ -724,25 +732,77 @@ impl Runtime {
         Some(details.join("\n\n---\n\n"))
     }
 
+    // Only suppress a second footer label when this exact active source has
+    // its notice in the selected transcript. A parent notice is not visible in
+    // a selected child's history, and historical incidents are not authority
+    // for a newly changed error.
+    pub(super) fn current_limit_notice_presented(&self, message: &str, local: bool) -> bool {
+        let Some(current) = Failure::parse(self.session.launch.provider, message) else {
+            return false;
+        };
+        if current.kind != FailureKind::AccountLimit {
+            return false;
+        }
+        self.failure_ui.incidents.iter().any(|incident| {
+            if incident.kind != Some(FailureKind::AccountLimit)
+                || incident.summary != current.summary
+                || !incident.sources.iter().any(|source| match source {
+                    Source::Local(raw) => local && raw.as_ref() == message,
+                    Source::Snapshot => !local && self.snapshot.error.as_deref() == Some(message),
+                    _ => false,
+                })
+            {
+                return false;
+            }
+            match self.selected_subagent.as_deref() {
+                Some(child) => self.snapshot.subagents.iter().any(|agent| {
+                    agent.id == child
+                        && (self.incident_has_child_detail(incident, child)
+                            || agent.items.iter().any(|item| {
+                                self.failure_ui
+                                    .child_item(child, &item.id)
+                                    .is_some_and(|(found, _)| found.key == incident.key)
+                            }))
+                }),
+                None => {
+                    !incident.active_recovery
+                        && incident.child_scope.is_none()
+                        && (incident.anchor.is_none()
+                            || self
+                                .turns
+                                .iter()
+                                .any(|turn| incident.anchor.as_ref() == Some(&turn.key)))
+                }
+            }
+        })
+    }
+
     pub(super) fn failure_view(&self, incident: &Incident) -> Element<'static, Message> {
-        let mut rows = vec![
-            widget::row::with_children(vec![
-                crate::ui_controls::passive_icon(Icon::Warning, design::COMPACT_ICON_SIZE),
-                design::body(incident.summary.clone())
-                    .width(Length::Fill)
-                    .into(),
-            ])
-            .spacing(space::S)
-            .align_y(Alignment::Start)
-            .into(),
-            design::caption(incident.guidance)
+        let mut header = widget::row::with_children(vec![
+            crate::ui_controls::passive_icon(Icon::Warning, design::COMPACT_ICON_SIZE),
+            design::body(incident.summary.clone())
                 .width(Length::Fill)
                 .into(),
-        ];
-        rows.push(self.failure_diagnostics(incident));
+        ])
+        .spacing(space::S)
+        .align_y(Alignment::Center);
+        if incident.has_diagnostics {
+            header = header.push(self.failure_controls(incident));
+        }
+        let mut rows = vec![header.into()];
+        if !incident.guidance.is_empty() {
+            rows.push(
+                design::caption(incident.guidance)
+                    .width(Length::Fill)
+                    .into(),
+            );
+        }
+        if let Some(preview) = self.failure_diagnostic_preview(incident) {
+            rows.push(preview);
+        }
         widget::container(
             widget::column::with_children(rows)
-                .spacing(space::S)
+                .spacing(space::XS)
                 .width(Length::Fill),
         )
         .class(design::surface(
@@ -750,69 +810,97 @@ impl Runtime {
             [design::RADIUS_M; 4],
             false,
         ))
-        .padding([space::S, space::M])
+        .padding(space::S)
         .width(Length::Fill)
         .max_width(design::READABLE_MEASURE)
         .into()
     }
-    pub(super) fn failure_diagnostics(&self, incident: &Incident) -> Element<'static, Message> {
+
+    fn failure_controls(&self, incident: &Incident) -> Element<'static, Message> {
         let target = self.target;
         let open = self.failure_ui.expanded.contains(&incident.key);
-        let mut rows = Vec::new();
-        rows.push(
-            widget::row::with_children(vec![
-                crate::ui_controls::button::quiet(if open { "Hide details" } else { "Details" })
-                    .name(format!(
-                        "{} technical details for {}",
-                        if open { "Hide" } else { "Show" },
-                        incident.summary
-                    ))
-                    .on_press(action(Action::ToggleFailure(target, incident.key.clone())))
-                    .into(),
-                crate::ui_controls::button::quiet("Copy details")
-                    .name(format!(
-                        "Copy original diagnostics for {}",
-                        incident.summary
-                    ))
-                    .on_press(action(Action::CopyFailure(target, incident.key.clone())))
-                    .into(),
-            ])
-            .spacing(space::S)
+        let controls = widget::row::with_children(vec![
+            widget::button::custom(design::caption(if open { "Hide" } else { "Details" }))
+                .name(format!(
+                    "{} technical details for {}",
+                    if open { "Hide" } else { "Show" },
+                    incident.summary
+                ))
+                .class(crate::ui_controls::control_style(false, None))
+                .padding([0.0, space::XS])
+                .height(design::COMPACT_CONTROL_SIZE)
+                .on_press(action(Action::ToggleFailure(target, incident.key.clone())))
+                .into(),
+            crate::ui_controls::icon_button(
+                Icon::Copy,
+                format!("Copy original diagnostics for {}", incident.summary),
+            )
+            .compact()
+            .on_press(action(Action::CopyFailure(target, incident.key.clone())))
             .into(),
-        );
-        if open {
-            // Full bytes are resolved only on expansion/copy. The collapsed
-            // surface never clones or shapes a provider's request dump.
-            if let Some((preview, omitted)) = self.failure_preview(&incident.key) {
-                rows.push(
-                    widget::container(
-                        widget::scrollable(selectable_prose::logical_text(
-                            vec![iced::widget::text::Span::new(preview.to_owned())].into(),
-                            design::TEXT_CAPTION.into(),
-                            iced::Font::MONOSPACE,
-                            target,
-                            None,
-                            selectable_prose::Logical {
-                                identity: diagnostic_preview_identity(&incident.key),
-                                start: 0,
-                            },
-                        ))
-                        .direction(iced::widget::scrollable::Direction::Vertical(
-                            design::scrollbar(),
-                        ))
-                        .height(Length::Shrink),
-                    )
-                    .max_height(240)
-                    .into(),
-                );
-                if omitted {
-                    rows.push(design::caption("Diagnostic preview is limited to 8 KiB. Copy details includes the complete originals.").width(Length::Fill).into());
-                }
+        ])
+        .spacing(space::XXS)
+        .align_y(Alignment::Center);
+        crate::ui_controls::owned(
+            (target, incident.key.clone(), self.selected_subagent.clone()),
+            controls,
+        )
+    }
+
+    pub(super) fn failure_diagnostics(&self, incident: &Incident) -> Element<'static, Message> {
+        let mut rows = Vec::new();
+        if incident.has_diagnostics {
+            rows.push(self.failure_controls(incident));
+            if let Some(preview) = self.failure_diagnostic_preview(incident) {
+                rows.push(preview);
             }
         }
         widget::column::with_children(rows)
-            .spacing(space::S)
+            .spacing(space::XS)
             .width(Length::Fill)
             .into()
+    }
+
+    fn failure_diagnostic_preview(&self, incident: &Incident) -> Option<Element<'static, Message>> {
+        if !incident.has_diagnostics || !self.failure_ui.expanded.contains(&incident.key) {
+            return None;
+        }
+        let (preview, omitted) = self.failure_preview(&incident.key)?;
+        let mut rows = vec![
+            widget::container(
+                widget::scrollable(selectable_prose::logical_text(
+                    vec![iced::widget::text::Span::new(preview.to_owned())].into(),
+                    design::TEXT_CAPTION.into(),
+                    iced::Font::MONOSPACE,
+                    self.target,
+                    None,
+                    selectable_prose::Logical {
+                        identity: diagnostic_preview_identity(&incident.key),
+                        start: 0,
+                    },
+                ))
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    design::scrollbar(),
+                ))
+                .height(Length::Shrink),
+            )
+            .max_height(240)
+            .into(),
+        ];
+        if omitted {
+            rows.push(
+                design::caption(
+                    "Showing part of the diagnostics. Copy includes the complete originals.",
+                )
+                .width(Length::Fill)
+                .into(),
+            );
+        }
+        Some(
+            widget::column::with_children(rows)
+                .spacing(space::XS)
+                .width(Length::Fill)
+                .into(),
+        )
     }
 }
