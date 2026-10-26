@@ -291,7 +291,17 @@ mod tests {
         let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
             panic!("retained chat fixture");
         };
+        assert!(
+            runtime.visible.load(Ordering::Relaxed),
+            "native report inspection requires the visible retained card"
+        );
         preparation::drain_fixture(runtime);
+        assert!(
+            runtime.cache.get("completed-report").is_some_and(|cached| {
+                !cached.placeholder && !cached.preparing && cached.document.is_some()
+            }),
+            "the real presentation worker must finish before native inspection"
+        );
         let renderer = crate::app::tests::headless_renderer();
         let mut element = app.chat_view(card);
         let mut tree = Tree::new(element.as_widget());
@@ -300,6 +310,15 @@ mod tests {
             &mut tree,
             &renderer,
             &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+        );
+        let mut text = Texts::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut text);
+        assert!(
+            text.0.iter().any(|plain| plain == COMPLETED_REPORT),
+            "the exact completed report must own a mounted native selectable state: {:?}",
+            text.0,
         );
         // The completed report must also be exposed by the actual native
         // accessibility tree, in the visible viewport. A logical snapshot or
@@ -330,10 +349,6 @@ mod tests {
             bounds.intersection(&viewport).is_some(),
             "completed report must be visible: {bounds:?} in {viewport:?}"
         );
-        let mut text = Texts::default();
-        element
-            .as_widget_mut()
-            .operate(&mut tree, Layout::new(&node), &renderer, &mut text);
         text.0
     }
 

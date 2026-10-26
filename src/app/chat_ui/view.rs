@@ -174,7 +174,7 @@ pub(super) fn message_actions<'a>(
     actions: Element<'a, Message>,
     alignment: Alignment,
 ) -> Element<'a, Message> {
-    iced::widget::hover(
+    hover::overlay(
         widget::column::with_children(vec![
             message,
             widget::Space::new().height(MESSAGE_ACTION_HEIGHT).into(),
