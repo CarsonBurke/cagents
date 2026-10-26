@@ -352,10 +352,11 @@ mod tests {
             );
             let marker_path = repository.join(".git");
             let original_marker = fs::read(&marker_path).unwrap();
+            let enclosing = place(root.path(), &model);
             for prefix in ["gitdir:", "gitdir:\t", "gitdir:  "] {
                 fs::write(&marker_path, format!("{prefix}{}\n", key.display())).unwrap();
                 assert!(discover(&repository).is_err(), "Git rejects {prefix:?}");
-                assert_eq!(place(&repository, &model), Placement::default());
+                assert_eq!(place(&repository, &model), enclosing);
             }
             fs::write(&marker_path, original_marker).unwrap();
 
