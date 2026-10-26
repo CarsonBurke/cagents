@@ -77,62 +77,182 @@ fn start(fixture: &Fixture) -> (Window, Session) {
     (window, chat)
 }
 
-fn publication(window: &mut Window, chat: &Session) -> cagents::chat::goal::Snapshot {
-    until(
-        Duration::from_secs(30),
-        "a free actual Goal publication",
-        || {
-            let snapshot = window.read(chat.id);
-            assert!(!snapshot.exited, "the original actor exited");
-            let goal = snapshot.goal?;
-            assert_eq!(
-                Some(goal.thread_id.as_str()),
-                chat.launch.session_id.as_deref()
-            );
-            (!goal.pending).then_some(goal)
-        },
-    )
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GoalPublicationDiagnostic {
+    revision: u64,
+    support: Support,
+    pending: bool,
+    uncertain: bool,
+    read: &'static str,
+    status: Option<Status>,
+    last_result: Option<cagents::chat::goal::Completion>,
 }
-
-fn control(window: &mut Window, chat: &Session, operation: Operation) {
-    let before = publication(window, chat);
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GoalWaitDiagnostic {
+    goal: Option<GoalPublicationDiagnostic>,
+    turn_generation: u64,
+    busy: bool,
+    error_present: bool,
+    pending_requests: usize,
+    finished: bool,
+    exited: bool,
+}
+struct GoalWaitDiagnostics {
+    phase: &'static str,
+    input_revision: Option<u64>,
+    latest: Option<GoalWaitDiagnostic>,
+    emitted: u8,
+}
+impl GoalWaitDiagnostics {
+    fn new(phase: &'static str, input_revision: Option<u64>) -> Self {
+        Self {
+            phase,
+            input_revision,
+            latest: None,
+            emitted: 0,
+        }
+    }
+    fn observe(&mut self, snapshot: &Snapshot) {
+        let current = GoalWaitDiagnostic {
+            goal: snapshot.goal.as_ref().map(|goal| {
+                let (read, status) = match &goal.read {
+                    ReadState::Unknown => ("unknown", None),
+                    ReadState::Known(None) => ("known_none", None),
+                    ReadState::Known(Some(goal)) => ("known_goal", Some(goal.status)),
+                };
+                GoalPublicationDiagnostic {
+                    revision: goal.revision,
+                    support: goal.support,
+                    pending: goal.pending,
+                    uncertain: goal.uncertain,
+                    read,
+                    status,
+                    last_result: goal.last_result,
+                }
+            }),
+            turn_generation: snapshot.turn_generation,
+            busy: snapshot.busy,
+            error_present: snapshot.error.is_some(),
+            pending_requests: snapshot.requests.len(),
+            finished: snapshot.finished_at.is_some(),
+            exited: snapshot.exited,
+        };
+        if self.latest.as_ref() == Some(&current) {
+            return;
+        }
+        // Only bounded structural state: never the objective, provider text,
+        // account/home/authority or a complete chat/Goal publication.
+        if self.emitted < 32 {
+            eprintln!(
+                "Goal observation phase={} input_revision={:?} state={current:?}",
+                self.phase, self.input_revision
+            );
+            self.emitted += 1;
+        } else if self.emitted == 32 {
+            eprintln!(
+                "Goal observation phase={} further transitions suppressed",
+                self.phase
+            );
+            self.emitted += 1;
+        }
+        self.latest = Some(current);
+    }
+}
+impl Drop for GoalWaitDiagnostics {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!(
+                "Goal wait failed phase={} input_revision={:?} last_state={:?}",
+                self.phase, self.input_revision, self.latest
+            );
+        }
+    }
+}
+struct FailedGoalModelEvidence<'a>(&'a Model);
+impl Drop for FailedGoalModelEvidence<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            // No waiting on a model handler while unwinding. An unavailable
+            // count is explicit, never inferred as zero; no request text read.
+            let accepted = self
+                .0
+                .requests
+                .try_lock()
+                .ok()
+                .map(|requests| requests.len());
+            eprintln!(
+                "Goal model at failed wait: accepted_requests={accepted:?} over_limit={}",
+                self.0.over_limit.load(std::sync::atomic::Ordering::Acquire)
+            );
+        }
+    }
+}
+fn publication(
+    window: &mut Window,
+    chat: &Session,
+    diagnostics: &mut GoalWaitDiagnostics,
+) -> cagents::chat::goal::Snapshot {
+    until(Duration::from_secs(30), diagnostics.phase, || {
+        let snapshot = window.read(chat.id);
+        diagnostics.observe(&snapshot);
+        assert!(!snapshot.exited, "the original actor exited");
+        let goal = snapshot.goal?;
+        assert_eq!(
+            Some(goal.thread_id.as_str()),
+            chat.launch.session_id.as_deref()
+        );
+        (!goal.pending).then_some(goal)
+    })
+}
+fn control(window: &mut Window, chat: &Session, operation: Operation, phase: &'static str) -> u64 {
+    let mut diagnostics = GoalWaitDiagnostics::new(phase, None);
+    let before = publication(window, chat, &mut diagnostics);
+    let revision = before.revision;
+    let operation_name = match &operation {
+        Operation::Get => "Get",
+        Operation::SetObjective(_) => "SetObjective",
+        Operation::Pause => "Pause",
+        Operation::Resume => "Resume",
+        Operation::Clear => "Clear",
+    };
+    diagnostics.input_revision = Some(revision);
+    eprintln!("Goal command phase={phase} operation={operation_name} input_revision={revision}");
     let response = window.request(ClientRequest::ChatCommand {
         chat_id: chat.id,
         command: ChatCommand::Goal {
             thread_id: before.thread_id,
-            revision: before.revision,
+            revision,
             operation,
         },
     });
     // Admission is deliberately not the test's success condition. Callers
     // subsequently wait for a real provider-derived Goal observation.
     assert!(matches!(response, ServerResponse::Accepted));
+    revision
 }
-
 fn observed(
     window: &mut Window,
     chat: &Session,
+    phase: &'static str,
+    input_revision: u64,
     predicate: impl Fn(&Option<Goal>) -> bool,
 ) -> Option<Goal> {
-    until(
-        Duration::from_secs(30),
-        "provider-confirmed Goal state",
-        || {
-            let state = publication(window, chat);
-            assert_ne!(
-                state.support,
-                Support::Unsupported,
-                "native Goal API unavailable"
-            );
-            if state.support != Support::Supported || state.uncertain {
-                return None;
-            }
-            let ReadState::Known(goal) = state.read else {
-                return None;
-            };
-            predicate(&goal).then_some(goal)
-        },
-    )
+    let mut diagnostics = GoalWaitDiagnostics::new(phase, Some(input_revision));
+    until(Duration::from_secs(30), phase, || {
+        let state = publication(window, chat, &mut diagnostics);
+        assert_ne!(
+            state.support,
+            Support::Unsupported,
+            "native Goal API unavailable"
+        );
+        if state.support != Support::Supported || state.uncertain {
+            return None;
+        }
+        let ReadState::Known(goal) = state.read else {
+            return None;
+        };
+        predicate(&goal).then_some(goal)
+    })
 }
 
 fn is_status(goal: &Option<Goal>, status: Status) -> bool {
@@ -140,15 +260,18 @@ fn is_status(goal: &Option<Goal>, status: Status) -> bool {
         .is_some_and(|goal| goal.objective == OBJECTIVE && goal.status == status)
 }
 
-fn pause(window: &mut Window, chat: &Session) -> Goal {
-    control(window, chat, Operation::Pause);
-    observed(window, chat, |goal| is_status(goal, Status::Paused)).unwrap()
+fn pause(window: &mut Window, chat: &Session, phase: &'static str) -> Goal {
+    let revision = control(window, chat, Operation::Pause, phase);
+    observed(window, chat, phase, revision, |goal| {
+        is_status(goal, Status::Paused)
+    })
+    .unwrap()
 }
 
 fn finish(fixture: &Fixture, window: &mut Window, chat: &Session) {
-    pause(window, chat);
-    control(window, chat, Operation::Clear);
-    assert!(observed(window, chat, Option::is_none).is_none());
+    pause(window, chat, "FinalPause");
+    let revision = control(window, chat, Operation::Clear, "FinalClear");
+    assert!(observed(window, chat, "FinalClearNone", revision, Option::is_none).is_none());
     // A paused goal need not have stopped a turn already in progress.
     until(
         Duration::from_secs(30),
@@ -171,9 +294,19 @@ fn finish(fixture: &Fixture, window: &mut Window, chat: &Session) {
 #[ignore = "needs the explicitly supplied real SDK and matched Goal-enabled binaries"]
 fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_extra_prompt() {
     let fixture = Fixture::with_model_mode(ModelMode::Goal);
+    let _failed_model_evidence = FailedGoalModelEvidence(&fixture.model);
     let (mut window, chat) = start(&fixture);
-    control(&mut window, &chat, Operation::Get);
-    assert!(observed(&mut window, &chat, Option::is_none).is_none());
+    let read_revision = control(&mut window, &chat, Operation::Get, "InitialGet");
+    assert!(
+        observed(
+            &mut window,
+            &chat,
+            "InitialGetNone",
+            read_revision,
+            Option::is_none
+        )
+        .is_none()
+    );
     // A persisted Active goal is metadata, not proof the native runtime did
     // work. Establish an actually completed initial turn before the sole Set.
     let (baseline, baseline_requests) = until(
@@ -205,12 +338,16 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
         },
     );
     let baseline_items: BTreeSet<_> = baseline.items.iter().map(|item| item.id.clone()).collect();
-    control(
+    let set_revision = control(
         &mut window,
         &chat,
         Operation::SetObjective(OBJECTIVE.into()),
+        "SingleSetObjective",
     );
-    let active = observed(&mut window, &chat, |goal| is_status(goal, Status::Active)).unwrap();
+    let active = observed(&mut window, &chat, "SetActive", set_revision, |goal| {
+        is_status(goal, Status::Active)
+    })
+    .unwrap();
     // Between the baseline and this observation the only effectful request is
     // that one Goal Set: no Prompt, turn/start or mutation retry can make a
     // metadata-only implementation pass. The model counter alone also cannot
@@ -254,7 +391,7 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
     let settlement_budget = Duration::from_secs(30).saturating_sub(observation_started.elapsed());
     // This is the existing first Pause, moved directly after positive work:
     // Pause prevents further Goal continuation but does not stop a live turn.
-    let paused = pause(&mut window, &chat);
+    let paused = pause(&mut window, &chat, "PauseAfterAutonomousWork");
     assert_eq!(paused.objective, active.objective);
     assert_eq!(paused.token_budget, active.token_budget);
     let settled_turn = until(
@@ -303,8 +440,15 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
     // The operation has no budget field. A provider-returned default is an
     // observation, not proof this client supplied a budget.
     eprintln!("SDK-observed Goal budget: {:?}", active.token_budget);
-    control(&mut window, &chat, Operation::Resume);
-    let resumed = observed(&mut window, &chat, |goal| is_status(goal, Status::Active)).unwrap();
+    let resume_revision = control(&mut window, &chat, Operation::Resume, "Resume");
+    let resumed = observed(
+        &mut window,
+        &chat,
+        "ResumeActive",
+        resume_revision,
+        |goal| is_status(goal, Status::Active),
+    )
+    .unwrap();
     assert_eq!(resumed.objective, active.objective);
     assert_eq!(resumed.token_budget, active.token_budget);
     // Native continuation can produce model requests. This asserts a finite
@@ -332,12 +476,19 @@ fn an_active_goal_reconnects_with_the_original_server_thread_and_physical_scope(
             provider_version: fixture.version.clone(),
         }
     );
-    control(
+    let set_revision = control(
         &mut window,
         &chat,
         Operation::SetObjective(OBJECTIVE.into()),
+        "DurableInitialSet",
     );
-    observed(&mut window, &chat, |goal| is_status(goal, Status::Active));
+    observed(
+        &mut window,
+        &chat,
+        "DurableInitialActive",
+        set_revision,
+        |goal| is_status(goal, Status::Active),
+    );
     let servers = fixture.servers();
     assert!(!servers.is_empty());
     drop(window);
@@ -348,11 +499,15 @@ fn an_active_goal_reconnects_with_the_original_server_thread_and_physical_scope(
     assert_eq!(restored.id, chat.id);
     assert_eq!(restored.launch, chat.launch);
     window.attach(restored.clone());
-    control(&mut window, &restored, Operation::Get);
-    observed(&mut window, &restored, |goal| {
-        is_status(goal, Status::Active)
-    });
-    pause(&mut window, &restored);
+    let read_revision = control(&mut window, &restored, Operation::Get, "ReconnectGet");
+    observed(
+        &mut window,
+        &restored,
+        "ReconnectActive",
+        read_revision,
+        |goal| is_status(goal, Status::Active),
+    );
+    pause(&mut window, &restored, "PauseBeforeDirectoryReplacement");
     until(
         Duration::from_secs(30),
         "the paused no-tool turn to settle",
@@ -369,7 +524,14 @@ fn an_active_goal_reconnects_with_the_original_server_thread_and_physical_scope(
     let moved = fixture.root.path().join("original-project");
     fs::rename(&original, &moved).unwrap();
     fs::create_dir(&original).unwrap();
-    let before = publication(&mut window, &restored);
+    let before = {
+        let mut diagnostics = GoalWaitDiagnostics::new("OriginalDirectoryResumeInput", None);
+        publication(&mut window, &restored, &mut diagnostics)
+    };
+    eprintln!(
+        "Goal command phase=ReplacementDirectoryResume operation=Resume input_revision={}",
+        before.revision
+    );
     let result = goal_request(
         &mut window,
         ClientRequest::ChatCommand {
@@ -386,10 +548,19 @@ fn an_active_goal_reconnects_with_the_original_server_thread_and_physical_scope(
         error.contains("approved agent directory changed"),
         "a different refusal cannot prove the original-directory guard: {error}"
     );
-    control(&mut window, &restored, Operation::Get);
-    observed(&mut window, &restored, |goal| {
-        is_status(goal, Status::Paused)
-    });
+    let read_revision = control(
+        &mut window,
+        &restored,
+        Operation::Get,
+        "ReadAfterRefusedResume",
+    );
+    observed(
+        &mut window,
+        &restored,
+        "StillPausedAfterRefusal",
+        read_revision,
+        |goal| is_status(goal, Status::Paused),
+    );
     assert_eq!(
         fixture.model.requests().len(),
         model_before_refusal,
@@ -593,13 +764,20 @@ impl Drop for Sdk<'_> {
 fn a_paused_persisted_goal_can_be_read_before_resuming_an_unloaded_thread() {
     let mut fixture = Fixture::with_model_mode(ModelMode::Goal);
     let (mut window, chat) = start(&fixture);
-    control(
+    let set_revision = control(
         &mut window,
         &chat,
         Operation::SetObjective(OBJECTIVE.into()),
+        "BeforeUnloadSet",
     );
-    observed(&mut window, &chat, |goal| is_status(goal, Status::Active));
-    pause(&mut window, &chat);
+    observed(
+        &mut window,
+        &chat,
+        "BeforeUnloadActive",
+        set_revision,
+        |goal| is_status(goal, Status::Active),
+    );
+    pause(&mut window, &chat, "PauseBeforeUnload");
     close(&fixture, &mut window, &chat);
     let before = fixture.model.requests().len();
     let thread_id = chat.launch.session_id.as_deref().unwrap();
