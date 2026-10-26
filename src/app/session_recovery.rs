@@ -272,14 +272,13 @@ impl Cagents {
             .focused()
             .map(|card| self.card_keyboard_focus(card))
             .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID));
-        iced::runtime::task::widget(RecoveryFocus {
+        iced::runtime::task::effect(iced::runtime::Action::widget(RecoveryFocus {
             marker: None,
             target,
             mounted: false,
             present: false,
             foreign_focus: false,
-        })
-        .map(cosmic::Action::App)
+        }))
     }
 
     pub(super) fn adopt_session_recovery_keyboard_nav(&mut self, restore: bool) -> bool {
@@ -411,7 +410,7 @@ fn recovery_marker(state: &State) -> widget::Id {
 }
 
 fn recovery_focus(state: &State, index: usize) -> Task<Message> {
-    iced::runtime::task::widget(RecoveryFocus {
+    iced::runtime::task::effect(iced::runtime::Action::widget(RecoveryFocus {
         marker: Some(recovery_marker(state)),
         target: widget::Id::new(if index == 0 {
             "session-recovery.cancel"
@@ -421,8 +420,7 @@ fn recovery_focus(state: &State, index: usize) -> Task<Message> {
         mounted: false,
         present: false,
         foreign_focus: false,
-    })
-    .map(cosmic::Action::App)
+    }))
 }
 
 /// A receipt can emit focus before another dialog opens, while its widget
