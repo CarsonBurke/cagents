@@ -962,6 +962,33 @@ impl HostedTerminalHandle {
         )
     }
 
+    /// Connect using an explicitly supplied caller scope. Every connection,
+    /// including reconnects, authenticates before restoring or mutating a terminal.
+    /// The authority is retained opaquely; this adapter never reads the environment.
+    pub fn attach_or_spawn_at_with_authority(
+        socket: impl Into<PathBuf>,
+        session: TerminalSession,
+        options: impl Into<TerminalSpawnOptions>,
+        expected_host: Option<HostSessionProof>,
+        authority: crate::agent_execution::Authority,
+        wake: impl Fn(TerminalWake) + Send + Sync + 'static,
+    ) -> Result<Self, HostedTerminalStartError> {
+        let terminal_id = session.id;
+        Self::start(
+            socket.into(),
+            terminal_id,
+            ConnectionIntent::AuthorizedSpawn {
+                spawn: Box::new(SpawnIntent {
+                    session,
+                    options: options.into(),
+                }),
+                authority,
+            },
+            expected_host,
+            Arc::new(wake),
+        )
+    }
+
     fn start(
         socket: PathBuf,
         terminal_id: TerminalId,
@@ -979,7 +1006,9 @@ impl HostedTerminalHandle {
         let (event_tx, event_rx) = crossbeam_channel::bounded(EVENT_CAPACITY);
         let initially_visible = match &intent {
             ConnectionIntent::Attach => true,
-            ConnectionIntent::Spawn(spawn) => spawn.options.initially_visible,
+            ConnectionIntent::Spawn(spawn) | ConnectionIntent::AuthorizedSpawn { spawn, .. } => {
+                spawn.options.initially_visible
+            }
         };
         let published = Arc::new(HostedPublishedState::new(
             expected_host,
@@ -1265,12 +1294,27 @@ impl HostedTerminalHandle {
 enum ConnectionIntent {
     Attach,
     Spawn(Box<SpawnIntent>),
+    AuthorizedSpawn {
+        spawn: Box<SpawnIntent>,
+        authority: crate::agent_execution::Authority,
+    },
 }
 
 #[derive(Clone, Debug)]
 struct SpawnIntent {
     session: TerminalSession,
     options: TerminalSpawnOptions,
+}
+
+impl SpawnIntent {
+    fn matches_source(&self, current: &TerminalSession) -> bool {
+        // Runtime continuity, transcript location and resume hints can evolve.
+        current.id == self.session.id
+            && current.launch == self.session.launch
+            && current.owned_codex_listener == self.session.owned_codex_listener
+            && current.recovery_origin == self.session.recovery_origin
+            && current.predecessor == self.session.predecessor
+    }
 }
 
 #[derive(Debug)]
@@ -1811,6 +1855,13 @@ fn serve_connection(
         stop,
     } = context;
     let terminal_id = *terminal_id;
+    if matches!(intent, ConnectionIntent::AuthorizedSpawn { .. }) {
+        published
+            .attachment
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .confirmed = false;
+    }
     if stop.is_requested() {
         return ConnectionEnd::Stop;
     }
@@ -1841,11 +1892,17 @@ fn serve_connection(
         proof: None,
         request: ClientRequest::Connect {
             expected_host: published.proof(),
-            resume: vec![ResumeCursor {
-                terminal_id,
-                generation: published.snapshot_cursor(),
-                event_sequence: published.event_sequence.load(Ordering::Acquire),
-            }],
+            // Explicit callers must not confirm attachment before authentication.
+            // Trusted GUI connections keep their original atomic resume path.
+            resume: if matches!(intent, ConnectionIntent::AuthorizedSpawn { .. }) {
+                Vec::new()
+            } else {
+                vec![ResumeCursor {
+                    terminal_id,
+                    generation: published.snapshot_cursor(),
+                    event_sequence: published.event_sequence.load(Ordering::Acquire),
+                }]
+            },
         },
     };
     if write_frame(&mut stream, &connect).is_err() {
@@ -1929,6 +1986,19 @@ fn serve_connection(
                         ),
                     );
                 }
+                if matches!(intent, ConnectionIntent::AuthorizedSpawn { .. }) && !resumed.is_empty()
+                {
+                    return reject_handshake(
+                        events,
+                        published,
+                        stop,
+                        ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            "Daemon resumed an explicit caller before authentication",
+                            false,
+                        ),
+                    );
+                }
                 let attached = resumed
                     .iter()
                     .any(|terminal| terminal.session.id == terminal_id && terminal.attached);
@@ -1957,12 +2027,143 @@ fn serve_connection(
         }
     };
 
+    let mut next_request_id = connect_id + 1;
+    let mut authorized_existing = false;
+    if let ConnectionIntent::AuthorizedSpawn { spawn, authority } = intent {
+        // Keep all queued commands untouched until both replies are authenticated,
+        // correlated, and pinned to this connection's exact host proof.
+        let mut exchange = |request| -> Result<ServerResponse, ConnectionEnd> {
+            let request_id = next_request_id;
+            next_request_id += 1;
+            if write_frame(
+                &mut stream,
+                &ClientEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id,
+                    proof: Some(proof.clone()),
+                    request,
+                },
+            )
+            .is_err()
+            {
+                return Err(ConnectionEnd::Retry);
+            }
+            loop {
+                if stop.is_requested() {
+                    return Err(ConnectionEnd::Stop);
+                }
+                if Instant::now() >= handshake_deadline {
+                    return Err(ConnectionEnd::Retry);
+                }
+                let envelope = match handshake_codec.read::<ServerEnvelope>(&mut stream) {
+                    Ok(Some(envelope)) => envelope,
+                    Ok(None) => return Err(ConnectionEnd::Retry),
+                    Err(FrameError::Io(error)) if is_timeout(&error) => continue,
+                    Err(_) => return Err(ConnectionEnd::Retry),
+                };
+                if envelope.version != PROTOCOL_VERSION || envelope.proof != proof {
+                    return Err(reject_handshake(
+                        events,
+                        published,
+                        stop,
+                        ProtocolError::new(
+                            ProtocolErrorCode::ProofMismatch,
+                            "Daemon authentication reply changed protocol or host proof",
+                            false,
+                        ),
+                    ));
+                }
+                if envelope.request_id != Some(request_id) {
+                    return Err(reject_handshake(
+                        events,
+                        published,
+                        stop,
+                        ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            "Daemon authentication reply was not correlated",
+                            false,
+                        ),
+                    ));
+                }
+                match envelope.message {
+                    ServerMessage::Response { response } => return Ok(response),
+                    ServerMessage::Error(error) => {
+                        return Err(reject_handshake(events, published, stop, error));
+                    }
+                    _ => {
+                        return Err(reject_handshake(
+                            events,
+                            published,
+                            stop,
+                            ProtocolError::new(
+                                ProtocolErrorCode::InvalidRequest,
+                                "Unexpected daemon authentication message",
+                                false,
+                            ),
+                        ));
+                    }
+                }
+            }
+        };
+        match exchange(ClientRequest::Authenticate {
+            authority: authority.clone(),
+        }) {
+            Ok(ServerResponse::Accepted) => {}
+            Err(end) => return end,
+            _ => {
+                return reject_handshake(
+                    events,
+                    published,
+                    stop,
+                    ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "Daemon did not accept caller authentication",
+                        false,
+                    ),
+                );
+            }
+        }
+        let terminals = match exchange(ClientRequest::List) {
+            Ok(ServerResponse::Listed { terminals }) => terminals,
+            Err(end) => return end,
+            _ => {
+                return reject_handshake(
+                    events,
+                    published,
+                    stop,
+                    ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "Daemon did not return authenticated terminal inventory",
+                        false,
+                    ),
+                );
+            }
+        };
+        if let Some(terminal) = terminals
+            .iter()
+            .find(|terminal| terminal.session.id == terminal_id)
+        {
+            if !spawn.matches_source(&terminal.session) {
+                return reject_handshake(
+                    events,
+                    published,
+                    stop,
+                    ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "Existing terminal has a different original source",
+                        false,
+                    ),
+                );
+            }
+            authorized_existing = true;
+        }
+    }
+
     let mut connection = match ConnectionIo::new(stream, terminal_id) {
         Ok(connection) => connection,
         Err(_) => return ConnectionEnd::Retry,
     };
 
-    let mut next_request_id = connect_id + 1;
     let mut pending = BTreeMap::new();
     let mut snapshot_pending = false;
     let mut last_acknowledgement = 0;
@@ -1974,6 +2175,14 @@ fn serve_connection(
 
     if !attached {
         let (kind, request) = match intent {
+            ConnectionIntent::AuthorizedSpawn { .. } if authorized_existing => (
+                PendingRequest::Attach,
+                ClientRequest::Attach {
+                    terminal_id,
+                    after_generation: published.snapshot_cursor(),
+                    after_event_sequence: published.event_sequence.load(Ordering::Acquire),
+                },
+            ),
             ConnectionIntent::Attach => (
                 PendingRequest::Attach,
                 ClientRequest::Attach {
@@ -1982,7 +2191,7 @@ fn serve_connection(
                     after_event_sequence: published.event_sequence.load(Ordering::Acquire),
                 },
             ),
-            ConnectionIntent::Spawn(spawn) => {
+            ConnectionIntent::Spawn(spawn) | ConnectionIntent::AuthorizedSpawn { spawn, .. } => {
                 let mut options = spawn.options.clone();
                 options.initially_visible = published.is_visible();
                 (
@@ -2054,6 +2263,11 @@ fn serve_connection(
             return ConnectionEnd::Stop;
         }
         while pending.len() < MAX_IN_FLIGHT_REQUESTS {
+            // An explicit caller also waits for the exact source reply before
+            // consuming queued input: inventory may change before Attach.
+            if matches!(intent, ConnectionIntent::AuthorizedSpawn { .. }) && !attached {
+                break;
+            }
             if stop.is_requested() {
                 connection.close();
                 return ConnectionEnd::Stop;
@@ -2125,7 +2339,9 @@ fn serve_connection(
             }
         }
 
-        let work = if pending.len() < MAX_IN_FLIGHT_REQUESTS {
+        let work = if pending.len() < MAX_IN_FLIGHT_REQUESTS
+            && !(matches!(intent, ConnectionIntent::AuthorizedSpawn { .. }) && !attached)
+        {
             wait_for_client_work(stop, commands, connection.incoming(), published)
         } else {
             wait_for_server_or_stop(stop, connection.incoming(), published)
@@ -2181,6 +2397,20 @@ fn serve_connection(
                     (PendingRequest::Attach, ServerResponse::Attached { terminal })
                         if terminal.session.id == terminal_id =>
                     {
+                        if let ConnectionIntent::AuthorizedSpawn { spawn, .. } = intent
+                            && !spawn.matches_source(&terminal.session)
+                        {
+                            return reject_handshake(
+                                events,
+                                published,
+                                stop,
+                                ProtocolError::new(
+                                    ProtocolErrorCode::InvalidRequest,
+                                    "Attached terminal has a different original source",
+                                    false,
+                                ),
+                            );
+                        }
                         attached = true;
                         published.observe_activity(terminal.activity);
                         if published
@@ -2204,6 +2434,20 @@ fn serve_connection(
                     (PendingRequest::Spawn, ServerResponse::Spawned { terminal })
                         if terminal.session.id == terminal_id =>
                     {
+                        if let ConnectionIntent::AuthorizedSpawn { spawn, .. } = intent
+                            && !spawn.matches_source(&terminal.session)
+                        {
+                            return reject_handshake(
+                                events,
+                                published,
+                                stop,
+                                ProtocolError::new(
+                                    ProtocolErrorCode::InvalidRequest,
+                                    "Attached terminal has a different original source",
+                                    false,
+                                ),
+                            );
+                        }
                         attached = true;
                         published.observe_activity(terminal.activity);
                         if published
@@ -2655,6 +2899,7 @@ fn publish_event(
 
 #[cfg(test)]
 mod tests {
+    mod explicit_authority_tests;
     mod input_rejection_tests;
 
     use std::{os::unix::net::UnixListener, sync::atomic::AtomicUsize};
