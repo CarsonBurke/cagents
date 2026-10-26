@@ -516,14 +516,10 @@ fn pending_exit_keeps_actual_checked_close_and_fences_late_registration() {
         terminal.session.continuity.live_proof(),
         Some(current_proof.clone())
     );
-    let socket =
-        crate::terminal::holder::socket(&crate::terminal::holder::directory().unwrap(), source.id);
-    let (issued, _) = crate::terminal::inspect_holder(&socket, &owner, &current_proof).unwrap();
-    assert!(
-        registered == issued.source,
-        "fresh registration must retain the actual holder's authenticated source"
+    assert_eq!(
+        registered.continuity.live_proof(),
+        Some(current_proof.clone())
     );
-    assert!(registered.continuity.live_proof().is_some());
     let mut root_pin = OriginalPin::new(owner.root.pid as u32);
     let mut holder_pin = OriginalPin::new(owner.holder.pid as u32);
     let drain = begin_ordinary_exit(&host).expect("ordinary fixture, no committed successor");
@@ -555,6 +551,21 @@ fn pending_exit_keeps_actual_checked_close_and_fences_late_registration() {
             ..
         }
     ));
+    // Before Close this worker owns the holder connection; Inspect is orphan-only.
+    // Real checked Close publishes its authenticated original-source receipt.
+    assert!(
+        crate::terminal::holder::cleanup::confirmed(&registered, &owner, &current_proof).unwrap()
+    );
+    assert!(
+        crate::terminal::holder::cleanup::confirmed(&source, &owner, &current_proof).is_err(),
+        "a proofless caller projection must not authenticate the real receipt"
+    );
+    let mut unissued = registered.clone();
+    unissued.launch.arguments.push("unissued-source".into());
+    assert!(
+        !crate::terminal::holder::cleanup::confirmed(&unissued, &owner, &current_proof).unwrap(),
+        "the original receipt must refuse a different source with the same proof"
+    );
     wait_for(|| drain.try_seal_absence());
     root_pin.prove_reaped();
     holder_pin.prove_reaped();

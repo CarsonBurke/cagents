@@ -1022,9 +1022,15 @@ fn orphan_authority_restore_failure_keeps_the_committed_original_in_recovery_unt
                 },
             )
             .unwrap_err();
-            assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+            // Orphan restoration deliberately leaves client 0 detached. Its
+            // unowned Close is refused before any saved-layout query or effect.
+            assert_eq!(error.code, ProtocolErrorCode::PermissionDenied);
             assert!(owner.root.is_current() && owner.holder.is_current());
             assert!(!adopted.worker_joined_for_test());
+            assert!(
+                crate::host::model::Registry::at(&registry_path).is_err(),
+                "the damaged published layout must remain refused"
+            );
             // Renaming back quotes the table name in sqlite_schema. Recreate
             // its exact original DDL and preserve every actual row instead;
             // published-layout admission remains strict throughout.
