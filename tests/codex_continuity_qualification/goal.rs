@@ -168,21 +168,29 @@ impl Drop for GoalWaitDiagnostics {
         }
     }
 }
-struct FailedGoalModelEvidence<'a>(&'a Model);
-impl Drop for FailedGoalModelEvidence<'_> {
+// Own only the two diagnostic publications. A borrowed Model would prevent
+// SDK3's existing mutable Fixture::replace_daemon while this unwind guard lives.
+struct FailedGoalModelEvidence {
+    requests: Arc<Mutex<Vec<ModelRequest>>>,
+    over_limit: Arc<std::sync::atomic::AtomicBool>,
+}
+impl FailedGoalModelEvidence {
+    fn new(model: &Model) -> Self {
+        Self {
+            requests: model.requests.clone(),
+            over_limit: model.over_limit.clone(),
+        }
+    }
+}
+impl Drop for FailedGoalModelEvidence {
     fn drop(&mut self) {
         if std::thread::panicking() {
             // No waiting on a model handler while unwinding. An unavailable
             // count is explicit, never inferred as zero; no request text read.
-            let accepted = self
-                .0
-                .requests
-                .try_lock()
-                .ok()
-                .map(|requests| requests.len());
+            let accepted = self.requests.try_lock().ok().map(|requests| requests.len());
             eprintln!(
                 "Goal model at failed wait: accepted_requests={accepted:?} over_limit={}",
-                self.0.over_limit.load(std::sync::atomic::Ordering::Acquire)
+                self.over_limit.load(std::sync::atomic::Ordering::Acquire)
             );
         }
     }
@@ -320,7 +328,7 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
     // before the fixture performs its existing public cleanup. No other case
     // or external GUI model has response pacing enabled.
     let pacing = fixture.model.pace_goal_responses();
-    let _failed_model_evidence = FailedGoalModelEvidence(&fixture.model);
+    let _failed_model_evidence = FailedGoalModelEvidence::new(&fixture.model);
     let (mut window, chat) = start(&fixture);
     let read_revision = control(&mut window, &chat, Operation::Get, "InitialGet");
     assert!(
@@ -544,7 +552,7 @@ fn an_active_goal_reconnects_with_the_original_server_thread_and_physical_scope(
     // while a replacement daemon starts. This does not change native Goal state
     // or grant any extra request: only the initial response is permitted so far.
     let pacing = fixture.model.pace_goal_responses();
-    let _failed_model_evidence = FailedGoalModelEvidence(&fixture.model);
+    let _failed_model_evidence = FailedGoalModelEvidence::new(&fixture.model);
     let (mut window, chat) = start(&fixture);
     // This prerequisite intentionally fails on e.g. 0.160.0 rather than
     // converting a schema observation into durable continuity qualification.
