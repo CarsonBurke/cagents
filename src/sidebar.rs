@@ -4574,6 +4574,225 @@ impl NavigationCache {
     }
 }
 
+/// The pinned generic Lazy widget does not forward accessibility nodes. Keep
+/// this list's actual element and child Tree together, including named native
+/// state, and use that same child for every widget operation.
+mod cached_projects {
+    use super::SidebarAction;
+    use cosmic::{Element, Renderer, Theme, iced};
+    use iced::advanced::widget::{Operation, Tree, tree};
+    use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer};
+    use iced::{Event, Length, Rectangle, Size, Vector};
+    use std::cell::RefCell;
+
+    type Dependency = (u64, bool, bool);
+
+    pub(super) fn view<'a>(
+        dependency: Dependency,
+        build: impl Fn() -> Element<'static, SidebarAction> + 'a,
+    ) -> Element<'a, SidebarAction> {
+        Element::new(CachedProjects {
+            dependency,
+            build: Box::new(build),
+            initial_child: RefCell::new(None),
+        })
+    }
+
+    struct CachedProjects<'a> {
+        dependency: Dependency,
+        build: Box<dyn Fn() -> Element<'static, SidebarAction> + 'a>,
+        // Tree::new calls state before children. Construct the child from the
+        // exact element just installed in state, without rebuilding its view.
+        initial_child: RefCell<Option<Tree>>,
+    }
+
+    struct State {
+        dependency: Dependency,
+        element: Element<'static, SidebarAction>,
+    }
+
+    impl Widget<SidebarAction, Theme, Renderer> for CachedProjects<'_> {
+        fn tag(&self) -> tree::Tag {
+            tree::Tag::of::<State>()
+        }
+
+        fn state(&self) -> tree::State {
+            let element = (self.build)();
+            *self.initial_child.borrow_mut() = Some(Tree::new(&element));
+            tree::State::new(State {
+                dependency: self.dependency,
+                element,
+            })
+        }
+
+        fn children(&self) -> Vec<Tree> {
+            vec![
+                self.initial_child
+                    .borrow_mut()
+                    .take()
+                    .expect("cached project child"),
+            ]
+        }
+
+        fn diff(&mut self, tree: &mut Tree) {
+            let state = tree.state.downcast_mut::<State>();
+            if state.dependency != self.dependency {
+                let mut element = (self.build)();
+                tree.children[0].diff(element.as_widget_mut());
+                state.element = element;
+                state.dependency = self.dependency;
+            }
+        }
+
+        // project_scroll is Fill/Fill in empty, filtered and populated states.
+        fn size(&self) -> Size<Length> {
+            Size::new(Length::Fill, Length::Fill)
+        }
+
+        fn size_hint(&self) -> Size<Length> {
+            self.size()
+        }
+
+        fn layout(
+            &mut self,
+            tree: &mut Tree,
+            renderer: &Renderer,
+            limits: &layout::Limits,
+        ) -> layout::Node {
+            tree.state
+                .downcast_mut::<State>()
+                .element
+                .as_widget_mut()
+                .layout(&mut tree.children[0], renderer, limits)
+        }
+
+        fn operate(
+            &mut self,
+            tree: &mut Tree,
+            layout: Layout<'_>,
+            renderer: &Renderer,
+            operation: &mut dyn Operation,
+        ) {
+            tree.state
+                .downcast_mut::<State>()
+                .element
+                .as_widget_mut()
+                .operate(&mut tree.children[0], layout, renderer, operation);
+        }
+
+        fn update(
+            &mut self,
+            tree: &mut Tree,
+            event: &Event,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            renderer: &Renderer,
+            clipboard: &mut dyn Clipboard,
+            shell: &mut Shell<'_, SidebarAction>,
+            viewport: &Rectangle,
+        ) {
+            tree.state
+                .downcast_mut::<State>()
+                .element
+                .as_widget_mut()
+                .update(
+                    &mut tree.children[0],
+                    event,
+                    layout,
+                    cursor,
+                    renderer,
+                    clipboard,
+                    shell,
+                    viewport,
+                );
+        }
+
+        fn mouse_interaction(
+            &self,
+            tree: &Tree,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            viewport: &Rectangle,
+            renderer: &Renderer,
+        ) -> mouse::Interaction {
+            tree.state
+                .downcast_ref::<State>()
+                .element
+                .as_widget()
+                .mouse_interaction(&tree.children[0], layout, cursor, viewport, renderer)
+        }
+
+        fn draw(
+            &self,
+            tree: &Tree,
+            renderer: &mut Renderer,
+            theme: &Theme,
+            style: &renderer::Style,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            viewport: &Rectangle,
+        ) {
+            tree.state.downcast_ref::<State>().element.as_widget().draw(
+                &tree.children[0],
+                renderer,
+                theme,
+                style,
+                layout,
+                cursor,
+                viewport,
+            );
+        }
+
+        fn a11y_nodes(
+            &self,
+            layout: Layout<'_>,
+            tree: &Tree,
+            cursor: mouse::Cursor,
+        ) -> iced_accessibility::A11yTree {
+            tree.state
+                .downcast_ref::<State>()
+                .element
+                .as_widget()
+                .a11y_nodes(layout, &tree.children[0], cursor)
+        }
+
+        fn drag_destinations(
+            &self,
+            tree: &Tree,
+            layout: Layout<'_>,
+            renderer: &Renderer,
+            destinations: &mut iced::advanced::clipboard::DndDestinationRectangles,
+        ) {
+            tree.state
+                .downcast_ref::<State>()
+                .element
+                .as_widget()
+                .drag_destinations(&tree.children[0], layout, renderer, destinations);
+        }
+
+        fn overlay<'a>(
+            &'a mut self,
+            tree: &'a mut Tree,
+            layout: Layout<'a>,
+            renderer: &Renderer,
+            viewport: &Rectangle,
+            translation: Vector,
+        ) -> Option<overlay::Element<'a, SidebarAction, Theme, Renderer>> {
+            tree.state
+                .downcast_mut::<State>()
+                .element
+                .as_widget_mut()
+                .overlay(
+                    &mut tree.children[0],
+                    layout,
+                    renderer,
+                    viewport,
+                    translation,
+                )
+        }
+    }
+}
+
 pub fn view_cached<'a>(
     model: &'a SidebarModel,
     state: &'a SidebarState,
@@ -4638,11 +4857,10 @@ fn view_inner<'a>(
                 && !model.projects.is_empty()
                 && !matches!(model.data_state, SidebarDataState::Error(_))
             {
-                cosmic::iced::widget::lazy(
+                cached_projects::view(
                     (cache.generation(model, state), compact, modal_open),
-                    move |_| project_list(model, state, compact, modal_open),
+                    move || project_list(model, state, compact, modal_open),
                 )
-                .into()
             } else {
                 body(model, state, compact, modal_open)
             },
@@ -17099,6 +17317,245 @@ pub(crate) mod tests {
             .chain(nodes.children())
             .filter_map(|node| node.node().label().map(ToOwned::to_owned))
             .collect()
+    }
+
+    #[test]
+    fn cached_project_list_preserves_actual_accessibility_press_focus_and_overlay_state() {
+        use cosmic::iced::{
+            Event, Point, Rectangle, Vector,
+            advanced::{Shell, clipboard, mouse, widget::operation},
+        };
+        use std::cell::Cell;
+        #[derive(Default)]
+        struct Focus(Option<Id>);
+        impl operation::Operation for Focus {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn operation::Operation)) {
+                operate(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&Id>,
+                _bounds: Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if state.is_focused() {
+                    self.0 = id.cloned();
+                }
+            }
+        }
+        let renderer = headless_renderer();
+        let mut folder = project().with_kind(ProjectKind::Folder);
+        folder.worktrees.clear();
+        let expected = SidebarAction::OpenRepository {
+            project_id: folder.id,
+            repository: folder.repository.clone(),
+        };
+        let id = folder.chrome.open_id.clone();
+        let name = format!("Open project {}", folder.name);
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![folder]);
+        let state = SidebarState::default();
+        let builds = Cell::new(0);
+        let make = |generation, modal| {
+            let (model, state, builds) = (&model, &state, &builds);
+            cached_projects::view((generation, false, modal), move || {
+                builds.set(builds.get() + 1);
+                project_list(model, state, false, modal)
+            })
+        };
+        let mut element = make(1, false);
+        assert_eq!(
+            element.as_widget().size(),
+            Size::new(Length::Fill, Length::Fill)
+        );
+        assert_eq!(element.as_widget().size_hint(), element.as_widget().size());
+        let mut tree = Tree::new(&element);
+        let viewport = Rectangle::with_size(Size::new(280.0, 640.0));
+        let limits = layout::Limits::new(Size::ZERO, viewport.size());
+        let mut node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert_eq!(builds.get(), 1);
+        assert!(
+            tree.find(&id).is_some(),
+            "native ID traversal reaches the actual cached child"
+        );
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let target = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|n| n.node().label() == Some(name.as_str()))
+            .unwrap();
+        let ax_id = target.id().clone();
+        let rect = target.node().bounds().unwrap();
+        assert!(rect.x1 > rect.x0 && rect.y1 > rect.y0);
+        let at = Point::new(
+            ((rect.x0 + rect.x1) / 2.0) as f32,
+            ((rect.y0 + rect.y1) / 2.0) as f32,
+        );
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(id.clone()),
+        );
+        let mut focus = Focus::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut focus);
+        assert_eq!(focus.0, Some(id.clone()));
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Layout::new(&node),
+            mouse::Cursor::Available(at),
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &viewport,
+        );
+        assert!(messages.is_empty());
+        element = make(1, false);
+        tree.diff(element.as_widget_mut());
+        node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let retained = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|n| n.node().label() == Some(name.as_str()))
+            .unwrap();
+        assert_eq!(retained.id(), &ax_id);
+        assert!(tree.find(&id).is_some());
+        let mut focus = Focus::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut focus);
+        assert_eq!(
+            focus.0,
+            Some(id.clone()),
+            "the same native focus survives the cache hit"
+        );
+        assert_eq!(
+            builds.get(),
+            1,
+            "unchanged views, layout and AX must not rebuild rows"
+        );
+        assert_eq!(
+            element.as_widget().mouse_interaction(
+                &tree,
+                Layout::new(&node),
+                mouse::Cursor::Available(at),
+                &viewport,
+                &renderer
+            ),
+            mouse::Interaction::Pointer
+        );
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            Layout::new(&node),
+            mouse::Cursor::Available(at),
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &viewport,
+        );
+        assert_eq!(messages, vec![expected]);
+
+        // The menu belongs to the same real child Tree, not an AX-only twin.
+        messages.clear();
+        for event in [
+            mouse::Event::ButtonPressed(mouse::Button::Right),
+            mouse::Event::ButtonReleased(mouse::Button::Right),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(event),
+                Layout::new(&node),
+                mouse::Cursor::Available(at),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+        }
+        assert!(
+            element
+                .as_widget_mut()
+                .overlay(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &viewport,
+                    Vector::ZERO
+                )
+                .is_some()
+        );
+        element = make(1, false);
+        tree.diff(element.as_widget_mut());
+        node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert!(
+            element
+                .as_widget_mut()
+                .overlay(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &viewport,
+                    Vector::ZERO
+                )
+                .is_some()
+        );
+        assert_eq!(
+            builds.get(),
+            1,
+            "the cached open menu survives an unrelated view rebuild"
+        );
+        element = make(2, true);
+        tree.diff(element.as_widget_mut());
+        node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert_eq!(
+            builds.get(),
+            2,
+            "a changed dependency rebuilds exactly once"
+        );
+        assert!(
+            element
+                .as_widget_mut()
+                .overlay(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &viewport,
+                    Vector::ZERO
+                )
+                .is_none()
+        );
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        assert!(
+            nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .any(|n| n.node().label() == Some(name.as_str()) && n.node().is_disabled())
+        );
     }
 
     #[test]
