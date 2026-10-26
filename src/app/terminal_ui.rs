@@ -287,8 +287,8 @@ mod tests {
             card: CardId,
             renderer: &mut cosmic::Renderer,
             cache: &mut Cache,
-            event: iced::Event,
-        ) -> Vec<Message> {
+            event: impl FnOnce(iced_accessibility::accesskit::NodeId) -> iced::Event,
+        ) -> (Vec<Message>, iced_accessibility::accesskit::NodeId) {
             let mut ui = UserInterface::build(
                 app.terminal_menu(card).unwrap(),
                 iced::Size::new(400.0, 500.0),
@@ -302,29 +302,28 @@ mod tests {
                 app.terminal_review_revision,
                 app.terminal_review_card != Some(card),
             ));
-            let bounds = nodes
+            let node = nodes
                 .root()
                 .iter()
                 .chain(nodes.children())
                 .find(|node| iced_accessibility::IdEq::eq(node.id(), &target))
-                .unwrap()
-                .node()
-                .bounds()
                 .unwrap();
+            let advertised = node.id().clone().into();
+            let bounds = node.node().bounds().unwrap();
             let pointer = iced::Point::new(
                 ((bounds.x0 + bounds.x1) / 2.0) as f32,
                 ((bounds.y0 + bounds.y1) / 2.0) as f32,
             );
             let mut messages = Vec::new();
             let _ = ui.update(
-                &[event],
+                &[event(advertised)],
                 iced::mouse::Cursor::Available(pointer),
                 renderer,
                 &mut clipboard::Null,
                 &mut messages,
             );
             *cache = ui.into_cache();
-            messages
+            (messages, advertised)
         }
         let mut renderer = super::super::tests::headless_renderer();
         for changed in ["unchanged", "mode", "revision", "terminal"] {
@@ -341,27 +340,11 @@ mod tests {
                 None,
                 None,
             )));
-            let old_target: iced_accessibility::accesskit::NodeId =
-                iced_accessibility::A11yId::from(review_id(
-                    card,
-                    terminal,
-                    app.terminal_review_revision,
-                    true,
-                ))
-                .into();
             let mut cache = Cache::new();
-            assert!(
-                frame(
-                    &app,
-                    card,
-                    &mut renderer,
-                    &mut cache,
-                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
-                        iced::mouse::Button::Left
-                    ))
-                )
-                .is_empty()
-            );
+            let (messages, old_target) = frame(&app, card, &mut renderer, &mut cache, |_| {
+                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left))
+            });
+            assert!(messages.is_empty());
             match changed {
                 "mode" => {
                     drop(app.update(Message::TerminalReviewMode {
@@ -402,15 +385,11 @@ mod tests {
                 }
                 _ => {}
             }
-            let messages = frame(
-                &app,
-                card,
-                &mut renderer,
-                &mut cache,
+            let (messages, _) = frame(&app, card, &mut renderer, &mut cache, |_| {
                 iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
                     iced::mouse::Button::Left,
-                )),
-            );
+                ))
+            });
             if changed == "unchanged" {
                 assert!(
                     matches!(messages.as_slice(), [Message::TerminalFind(Action::ReviewFromMenu(target, origin, _, true))] if *target == card && *origin == terminal),
@@ -433,31 +412,43 @@ mod tests {
                     },
                 );
                 assert!(
-                    frame(&app, card, &mut renderer, &mut cache, stale).is_empty(),
+                    frame(&app, card, &mut renderer, &mut cache, |_| stale)
+                        .0
+                        .is_empty(),
                     "the old advertised native action ID cannot invoke the new mode"
                 );
             }
-            assert!(
-                frame(
-                    &app,
-                    card,
-                    &mut renderer,
-                    &mut cache,
-                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
-                        iced::mouse::Button::Left
-                    ))
+            let (activated, _) = frame(&app, card, &mut renderer, &mut cache, |current_target| {
+                iced::Event::A11y(
+                    widget::Id::from(current_target.0),
+                    iced_accessibility::accesskit::ActionRequest {
+                        action: iced_accessibility::accesskit::Action::Click,
+                        target_tree: iced_accessibility::accesskit::TreeId::ROOT,
+                        target_node: current_target,
+                        data: None,
+                    },
                 )
+            });
+            let current_terminal = app.terminal_context.as_ref().unwrap().terminal;
+            let current_revision = app.terminal_review_revision;
+            let current_active = app.terminal_review_card != Some(card);
+            assert!(
+                matches!(activated.as_slice(), [Message::TerminalFind(Action::ReviewFromMenu(target, origin, revision, active))]
+                    if *target == card && *origin == current_terminal && *revision == current_revision && *active == current_active),
+                "the exact currently advertised native action must remain usable: {changed}"
+            );
+            assert!(
+                frame(&app, card, &mut renderer, &mut cache, |_| {
+                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left))
+                })
+                .0
                 .is_empty()
             );
-            let mut fresh = frame(
-                &app,
-                card,
-                &mut renderer,
-                &mut cache,
+            let (mut fresh, _) = frame(&app, card, &mut renderer, &mut cache, |_| {
                 iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
                     iced::mouse::Button::Left,
-                )),
-            );
+                ))
+            });
             assert_eq!(
                 fresh.len(),
                 1,
