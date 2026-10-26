@@ -3642,17 +3642,8 @@ impl Cagents {
                     .map(Homes::lifecycle_lock)
                     .transpose()
                     .map_err(|error| error.to_string())?;
-                let chosen = if let Some(relative) = raw_path.strip_prefix("~/") {
-                    std::env::var_os("HOME")
-                        .map(PathBuf::from)
-                        .ok_or("HOME is unavailable")?
-                        .join(relative)
-                } else {
-                    PathBuf::from(raw_path)
-                };
-                if !chosen.is_absolute() {
-                    return Err("Enter an absolute path or one starting with ~/".into());
-                }
+                let chosen =
+                    account::expand_linked_home(raw_path, std::env::var_os("HOME").as_deref())?;
                 let path = std::fs::canonicalize(&chosen)
                     .map_err(|error| format!("{}: {error}", chosen.display()))?;
                 crate::secure_file::validate_owned_directory(&path)

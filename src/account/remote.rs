@@ -80,15 +80,8 @@ pub(crate) fn affected_account(operation: &Operation) -> Result<Option<super::Ac
             key,
             path,
         } => {
-            let chosen = if let Some(relative) = path.trim().strip_prefix("~/") {
-                std::path::PathBuf::from(std::env::var_os("HOME").ok_or("HOME unavailable")?)
-                    .join(relative)
-            } else {
-                std::path::PathBuf::from(path.trim())
-            };
-            if !chosen.is_absolute() {
-                return Err("Enter an absolute account home path".into());
-            }
+            let chosen =
+                super::expand_linked_home(path.trim(), std::env::var_os("HOME").as_deref())?;
             // Keep the user's ORIGINAL operand. Home capture resolves and pins
             // it while retaining this spelling for every later revalidation.
             Ok(Some(Account::linked(*provider, *key, chosen)))
@@ -233,17 +226,8 @@ fn execute_at(
             if !Account::PROVIDERS.contains(&provider) {
                 return Err("Omp manages its own logins".into());
             }
-            let chosen = if let Some(relative) = path.trim().strip_prefix("~/") {
-                std::path::PathBuf::from(
-                    std::env::var_os("HOME").ok_or("Remote HOME is unavailable")?,
-                )
-                .join(relative)
-            } else {
-                std::path::PathBuf::from(path.trim())
-            };
-            if !chosen.is_absolute() {
-                return Err("Enter an absolute device path or one starting with ~/".into());
-            }
+            let chosen =
+                super::expand_linked_home(path.trim(), std::env::var_os("HOME").as_deref())?;
             let path = reservation.link_home(provider, key, &chosen)?;
             crate::secure_file::validate_owned_directory(&path)
                 .map_err(|error| error.to_string())?;
