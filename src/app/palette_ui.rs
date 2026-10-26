@@ -1,4 +1,5 @@
 use super::*;
+use crate::sidebar::ProjectCommand;
 use workspace_widget::GlobalShortcut as Command;
 
 mod row;
@@ -25,6 +26,10 @@ pub enum Action {
     Run(MessageBox),
     Submit,
     FocusPane(CardId),
+    CopyBranch(ProjectId, crate::model::WorktreeId, PathBuf, String),
+    TerminalReview(CardId, crate::model::TerminalId, u64, bool),
+    /// Input-only acknowledgement; this never becomes a palette command.
+    ConsumedActivation,
 }
 // Box breaks the recursive Message/Action representation.
 #[derive(Debug, Clone)]
@@ -42,6 +47,8 @@ enum EntryIdentity {
     Workboard,
     MovePane(CardId, crate::model::ChannelId),
     Diagnostic(CardId, bool),
+    CopyBranch(ProjectId, crate::model::WorktreeId, PathBuf, String),
+    TerminalReview(CardId, crate::model::TerminalId, u64, bool),
 }
 
 impl EntryIdentity {
@@ -72,11 +79,20 @@ impl EntryIdentity {
                 card,
                 action: repository_widget::EditorLspAction::Diagnostic(forward),
             }) => Self::Diagnostic(*card, *forward),
+            Message::Palette(Action::CopyBranch(project, worktree, path, branch)) => {
+                Self::CopyBranch(*project, *worktree, path.clone(), branch.clone())
+            }
+            Message::Palette(Action::TerminalReview(card, terminal, revision, active)) => {
+                Self::TerminalReview(*card, *terminal, *revision, *active)
+            }
             _ => return None,
         })
     }
 
     fn matches(&self, message: &Message) -> bool {
+        if matches!(self, Self::CopyBranch(..) | Self::TerminalReview(..)) {
+            return Self::capture(message).as_ref() == Some(self);
+        }
         match (self, message) {
             (Self::Command(expected), Message::RunCommand(actual)) => expected == actual,
             (Self::Pane(expected), Message::Palette(Action::FocusPane(actual))) => {
@@ -312,6 +328,10 @@ impl Cagents {
                 self.reveal_palette_selection()
             }
             Action::Run(MessageBox(message)) => self.run_palette_command(*message),
+            Action::ConsumedActivation => Task::none(),
+            action @ (Action::CopyBranch(..) | Action::TerminalReview(..)) => {
+                self.run_palette_command(Message::Palette(action))
+            }
             Action::FocusPane(id) => {
                 if self.modal_is_open() || self.focused_repository_is_saving() {
                     return Task::none();
@@ -383,6 +403,27 @@ impl Cagents {
     }
 
     fn run_palette_command(&mut self, message: Message) -> Task<Message> {
+        let dispatch = match &message {
+            Message::Palette(Action::CopyBranch(project, worktree, _, _)) => {
+                if !self.contextual_palette_action_is_current(&message) {
+                    return Task::none();
+                }
+                Some(Message::Sidebar(SidebarAction::ProjectCommand {
+                    project_id: *project,
+                    worktree_id: Some(*worktree),
+                    command: ProjectCommand::CopyBranch,
+                }))
+            }
+            Message::Palette(Action::TerminalReview(card, terminal, _, active)) => {
+                if !self.contextual_palette_action_is_current(&message) {
+                    return Task::none();
+                }
+                Some(Message::TerminalFind(terminal_ui::Action::Review(
+                    *card, *terminal, *active,
+                )))
+            }
+            _ => None,
+        };
         if let Some(key) = entry_key(&message) {
             self.settings
                 .palette_recents
@@ -393,7 +434,7 @@ impl Cagents {
         self.palette.query = None;
         self.palette.move_pane = None;
         self.palette.selected = None;
-        let command = self.update(message);
+        let command = self.update(dispatch.unwrap_or(message));
         let save = if self.settings_path.is_some() {
             self.save_settings_task(false)
         } else {
@@ -491,6 +532,13 @@ impl Cagents {
             return Some(Task::none());
         }
         self.palette.query.as_ref()?;
+        if matches!(
+            event,
+            keyboard::Event::KeyReleased { .. } | keyboard::Event::KeyPressed { repeat: true, .. }
+        ) && self.terminal_review_input.consume_keyboard(event)
+        {
+            return Some(Task::none());
+        }
         if is_escape_press(event) {
             return Some(self.update_palette(Action::Close));
         }
@@ -515,7 +563,18 @@ impl Cagents {
                     self.palette.selected = EntryIdentity::capture(&entries[next].2);
                     return Some(self.reveal_palette_selection());
                 }
-                keyboard::key::Named::Enter => return Some(self.update_palette(Action::Submit)),
+                keyboard::key::Named::Enter => {
+                    if matches!(
+                        self.palette.selected,
+                        Some(EntryIdentity::CopyBranch(..) | EntryIdentity::TerminalReview(..))
+                    ) {
+                        if matches!(event, keyboard::Event::KeyPressed { repeat: true, .. }) {
+                            return Some(Task::none());
+                        }
+                        self.terminal_review_input.capture_activation(event);
+                    }
+                    return Some(self.update_palette(Action::Submit));
+                }
                 _ => {}
             }
         }
@@ -707,6 +766,7 @@ impl Cagents {
                 )
             })
             .collect();
+        entries.extend(self.contextual_palette_entries());
         if self.workspace_surfaces_visible()
             && let Some(card) = self.workspace.focused()
             && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.editor_focus_target(card).is_some())
@@ -772,6 +832,84 @@ impl Cagents {
             }
         }
         self.filter_palette_entries(entries)
+    }
+
+    fn contextual_palette_action_is_current(&self, message: &Message) -> bool {
+        self.palette.query.is_some()
+            && self.palette.move_pane.is_none()
+            && EntryIdentity::capture(message).is_some_and(|identity| {
+                self.contextual_palette_entries()
+                    .iter()
+                    .any(|(_, _, current)| identity.matches(current))
+            })
+    }
+
+    fn contextual_palette_entries(&self) -> Vec<(String, String, Message)> {
+        // These actions name the context the reader can actually see. Their
+        // captured payload is checked again before closing the palette, so a
+        // delayed row cannot borrow a replacement worktree, branch or terminal.
+        if self.update_prepared
+            || self.exit.is_some()
+            || !self.refresh_ui.focused
+            || self.palette.recording.is_some()
+            || self.modal_is_open()
+            || self.context_inspector_is_overlay()
+            || self.chrome_ui.is_open()
+        {
+            return Vec::new();
+        }
+        let mut entries = Vec::with_capacity(2);
+        if let Some(key) = self.sidebar_state.active_worktree()
+            && let Some(project) = self.sidebar_model.project(key.project_id)
+            && project.kind == ProjectKind::Git
+            && let Some(worktree) = project.worktrees.iter().find(|row| {
+                row.id == key.worktree_id && row.path == key.canonical_path && !row.detached
+            })
+            && let Some(branch) = &worktree.branch
+            && !matches!(worktree.deletion, Some(sidebar::RowDeletion::Deleting))
+            && !self.project_ui.deleting_directory(&worktree.path)
+            && !self.project_ui.closing.contains_key(&project.id)
+        {
+            entries.push((
+                format!("Copy branch: {branch}"),
+                project.name.clone(),
+                Message::Palette(Action::CopyBranch(
+                    project.id,
+                    worktree.id,
+                    worktree.path.clone(),
+                    branch.clone(),
+                )),
+            ));
+        }
+        if let Some(card) = self.workspace.focused()
+            && self.pane_is_active(card)
+            && let Some(state) = self.card_state(card)
+            && state.existence.is_open()
+            && state.exposure == Exposure::Visible
+            && let CardKind::Terminal(session) = &state.kind
+            && let Some(CardRuntime::Terminal(runtime)) = self.cards.get(&card)
+            && runtime.terminal_id() == session.id
+            && (self.terminal_review_card != Some(card)
+                || self.terminal_review_identity == Some(session.id))
+        {
+            let active = self.terminal_review_card != Some(card);
+            entries.push((
+                if active {
+                    "Review visible text"
+                } else {
+                    "Return to terminal input"
+                }
+                .into(),
+                state.title.clone(),
+                Message::Palette(Action::TerminalReview(
+                    card,
+                    session.id,
+                    self.terminal_review_revision,
+                    active,
+                )),
+            ));
+        }
+        entries
     }
 
     fn pane_move_palette_entries(&self, card: CardId) -> Vec<(String, String, Message)> {
@@ -852,6 +990,26 @@ impl Cagents {
         )
         .id(widget::Id::new("palette.query"))
         .on_input(|query| Message::Palette(Action::Query(query)));
+        let contextual = matches!(
+            self.palette.selected,
+            Some(EntryIdentity::CopyBranch(..) | EntryIdentity::TerminalReview(..))
+        );
+        let barrier = self.terminal_review_input.clone();
+        // Keep this wrapper's tag stable while query/ranking changes. A
+        // conditional wrapper would replace the focused native search field.
+        let input = crate::interaction::focused_key(input, move |event| {
+            if contextual
+                && matches!(event, keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::Enter), repeat: true, modifiers, .. } if modifiers.is_empty())
+            {
+                return Some(Message::Palette(Action::ConsumedActivation));
+            }
+            if contextual
+                && matches!(event, keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::Enter), repeat: false, modifiers, .. } if modifiers.is_empty())
+            {
+                barrier.capture_activation(event);
+            }
+            None
+        });
         let entries = self.palette_entries();
         let selected = self.selected_palette_index(&entries);
         let rows: Vec<Element<'_, Message>> = entries
@@ -868,6 +1026,7 @@ impl Cagents {
                 ])
                 .spacing(space::M)
                 .align_y(Alignment::Center);
+                let on_press = Message::Palette(Action::Run(MessageBox(Box::new(message))));
                 let button = widget::button::custom(
                     widget::container(row)
                         .height(Length::Fill)
@@ -879,8 +1038,45 @@ impl Cagents {
                 .padding([0, 12])
                 .width(Length::Fill)
                 .height(ROW_HEIGHT)
-                .on_press(Message::Palette(Action::Run(MessageBox(Box::new(message)))))
+                .on_press(on_press.clone())
                 .into();
+                let button = if matches!(
+                    identity,
+                    EntryIdentity::CopyBranch(..) | EntryIdentity::TerminalReview(..)
+                ) {
+                    let barrier = self.terminal_review_input.clone();
+                    crate::interaction::focused_key(button, move |event| {
+                        match event {
+                            keyboard::Event::KeyPressed {
+                                key,
+                                modifiers,
+                                repeat,
+                                ..
+                            } if matches!(
+                                key.as_ref(),
+                                keyboard::Key::Named(keyboard::key::Named::Enter)
+                            ) || (modifiers.is_empty()
+                                && matches!(
+                                    key.as_ref(),
+                                    keyboard::Key::Named(keyboard::key::Named::Space)
+                                        | keyboard::Key::Character(" ")
+                                )) =>
+                            {
+                                if *repeat {
+                                    return Some(Message::Palette(Action::ConsumedActivation));
+                                }
+                                barrier.capture_activation(event);
+                                // Publish only this native focused row's immutable
+                                // payload. Its ordinary reducer revalidates it;
+                                // no half of the activation reaches terminal input.
+                                Some(on_press.clone())
+                            }
+                            _ => None,
+                        }
+                    })
+                } else {
+                    button
+                };
                 Some(row::owned(identity, button))
             })
             .collect();
@@ -896,28 +1092,37 @@ impl Cagents {
         } else {
             widget::column::with_children(rows)
         };
-        Some(
-            widget::container(
-                widget::column::with_children(vec![
-                    input.into(),
-                    widget::container(
-                        widget::scrollable(
-                            widget::container(rows.spacing(ROW_SPACING)).padding([0, 16]),
-                        )
-                        .id(widget::Id::new("palette.commands"))
-                        .height(Length::Shrink),
+        let surface: Element<'_, Message> = widget::container(
+            widget::column::with_children(vec![
+                input.into(),
+                widget::container(
+                    widget::scrollable(
+                        widget::container(rows.spacing(ROW_SPACING)).padding([0, 16]),
                     )
-                    .max_height(360)
-                    .into(),
-                    design::caption("↑ ↓ choose · Enter run · Escape close").into(),
-                ])
-                .spacing(space::S),
-            )
-            .padding(space::M)
-            .width(560)
-            .class(cosmic::theme::Container::Card)
-            .into(),
+                    .id(widget::Id::new("palette.commands"))
+                    .height(Length::Shrink),
+                )
+                .max_height(360)
+                .into(),
+                design::caption("↑ ↓ choose · Enter run · Escape close").into(),
+            ])
+            .spacing(space::S),
         )
+        .padding(space::M)
+        .width(560)
+        .class(cosmic::theme::Container::Card)
+        .into();
+        let barrier = self.terminal_review_input.clone();
+        Some(crate::interaction::focused_key(surface, move |event| {
+            // Capture and retire after focus moves between palette controls,
+            // without forwarding an owned release to another native child.
+            (matches!(
+                event,
+                keyboard::Event::KeyReleased { .. }
+                    | keyboard::Event::KeyPressed { repeat: true, .. }
+            ) && barrier.consume_keyboard(event))
+            .then_some(Message::Palette(Action::ConsumedActivation))
+        }))
     }
 
     pub(super) fn run_workspace_command(
@@ -1531,6 +1736,425 @@ mod tests {
         app.cards.insert(card, CardRuntime::Settings);
         app.card_state_mut(card).unwrap().kind = CardKind::Settings;
         app
+    }
+
+    fn branch_palette_fixture() -> Cagents {
+        let mut app = settings_focus_fixture();
+        app.window_width = 1600.0;
+        app.refresh_ui.focused = true;
+        let path = PathBuf::from("/palette-copy-worktree");
+        let worktree = SidebarWorktree::new(
+            crate::model::WorktreeId::new(),
+            path.clone(),
+            Some("feature/日本語-copy".into()),
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
+        app.sidebar_model.projects = vec![SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "Copy fixture".into(),
+            PathBuf::from("/palette-copy-repository"),
+            vec![worktree],
+            Vec::new(),
+        )];
+        app.sidebar_state.sync_active_worktree(
+            &app.sidebar_model,
+            &SidebarFocus::Repository { worktree: path },
+        );
+        drop(app.update_palette(Action::Open));
+        drop(app.update_palette(Action::Query(">copy branch".into())));
+        app
+    }
+
+    fn clipboard_writes(task: Task<Message>) -> Vec<String> {
+        use iced::futures::StreamExt;
+
+        iced::futures::executor::block_on(async {
+            let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                return Vec::new();
+            };
+            let mut writes = Vec::new();
+            while let Some(effect) = stream.next().await {
+                if let iced::runtime::Action::Clipboard(iced::runtime::clipboard::Action::Write {
+                    target,
+                    contents,
+                }) = effect
+                {
+                    assert_eq!(target, iced::advanced::clipboard::Kind::Standard);
+                    writes.push(contents);
+                }
+            }
+            writes
+        })
+    }
+
+    fn palette_enter(app: &mut Cagents) -> Task<Message> {
+        app.palette_key_event(&keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        })
+        .expect("the open palette owns Enter")
+    }
+
+    fn assert_contextual_palette_button(app: &Cagents, message: &Message, label: &str) {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        use iced::{Size, mouse};
+        use iced_accessibility::accesskit::{Action as A11yAction, Role};
+        let identity = EntryIdentity::capture(message).unwrap();
+        let renderer = crate::app::tests::headless_renderer();
+        let mut element = app.palette_surface().unwrap();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(880.0, 800.0)),
+        );
+        let accessible =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let id: iced_accessibility::A11yId = identity.widget_id().into();
+        let row = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .find(|node| iced_accessibility::IdEq::eq(node.id(), &id))
+            .unwrap();
+        assert_eq!(row.node().role(), Role::Button);
+        assert_eq!(row.node().label(), Some(label));
+        assert!(row.node().supports_action(A11yAction::Focus));
+        assert!(row.node().supports_action(A11yAction::Click));
+    }
+
+    #[test]
+    fn contextual_branch_copy_is_a_named_native_row_and_submit_copies_exact_branch() {
+        let mut app = branch_palette_fixture();
+        let entries = app.palette_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "Copy branch: feature/日本語-copy");
+        assert_contextual_palette_button(&app, &entries[0].2, &entries[0].0);
+        let task = palette_enter(&mut app);
+        assert_eq!(clipboard_writes(task), ["feature/日本語-copy"]);
+        assert!(!app.palette.is_open());
+    }
+
+    #[test]
+    fn contextual_palette_query_keeps_native_focus_and_caret_when_result_kind_changes() {
+        use iced::advanced::widget::Tree;
+        let mut app = branch_palette_fixture();
+        drop(app.update_palette(Action::Query(">settings".into())));
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(focus_fixture_view(&app).as_widget());
+        let focus = Task::batch([
+            iced::widget::operation::focus(widget::Id::new("palette.query"))
+                .map(cosmic::Action::App),
+            widget::text_input::move_cursor_to(widget::Id::new("palette.query"), 1)
+                .map(cosmic::Action::App),
+        ]);
+        drop(focus_fixture_step(&app, &mut tree, &renderer, focus, false));
+        for (index, query) in [">settings", ">copy branch", ">settings"]
+            .into_iter()
+            .enumerate()
+        {
+            drop(app.update_palette(Action::Query(query.into())));
+            let contextual = matches!(app.palette.selected, Some(EntryIdentity::CopyBranch(..)));
+            assert_eq!(contextual, index == 1);
+            let messages = focus_fixture_step(&app, &mut tree, &renderer, Task::none(), true);
+            let mut expected = query.to_owned();
+            expected.insert(index + 1, 'x');
+            assert!(
+                messages.iter().any(|message| matches!(
+                    message, Message::Palette(Action::Query(actual)) if actual == &expected
+                )),
+                "native query focus and its advanced caret survive result-kind transition {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn queued_branch_copy_refuses_changed_context_without_closing_the_palette() {
+        for change in 0..13 {
+            let mut app = branch_palette_fixture();
+            let held = app.palette_entries().pop().unwrap().2;
+            let project = &mut app.sidebar_model.projects[0];
+            match change {
+                0 => project.id = ProjectId::new(),
+                1 => project.worktrees[0].id = crate::model::WorktreeId::new(),
+                2 => project.worktrees[0].path = "/replacement-worktree".into(),
+                3 => project.worktrees[0].branch = Some("replacement-branch".into()),
+                4 => project.worktrees[0].detached = true,
+                5 => project.kind = ProjectKind::Folder,
+                6 => app.device_ui.open = true,
+                7 => drop(app.update_palette(Action::Close)),
+                8 => project.worktrees[0].deletion = Some(sidebar::RowDeletion::Deleting),
+                9 => {
+                    let path = project.worktrees[0].path.clone();
+                    app.project_ui.begin_deleting(path);
+                }
+                10 => {
+                    app.project_ui
+                        .closing
+                        .insert(project.id, project.repository.clone());
+                }
+                11 => app.refresh_ui.focused = false,
+                12 => app.palette.recording = Some(SettingsField::ShortcutCommandPalette),
+                _ => unreachable!(),
+            }
+            let open = app.palette.is_open();
+            let task = app.update_palette(Action::Run(MessageBox(Box::new(held))));
+            assert!(clipboard_writes(task).is_empty(), "case {change}");
+            assert_eq!(app.palette.is_open(), open, "case {change}");
+        }
+    }
+
+    #[test]
+    fn held_branch_palette_press_cannot_transfer_to_a_changed_branch_value() {
+        use iced::advanced::widget::Tree;
+        use iced::mouse::{Button, Event};
+        let mut app = branch_palette_fixture();
+        let renderer = crate::app::tests::headless_renderer();
+        let original = EntryIdentity::capture(&app.palette_entries()[0].2).unwrap();
+        let mut tree = Tree::new(app.palette_surface().unwrap().as_widget());
+        let (point, messages) = palette_pointer_step(
+            &app,
+            &mut tree,
+            &renderer,
+            &original,
+            Event::ButtonPressed(Button::Left),
+            None,
+        );
+        assert!(messages.is_empty());
+        app.sidebar_model.projects[0].worktrees[0].branch = Some("replacement".into());
+        let replacement = EntryIdentity::capture(&app.palette_entries()[0].2).unwrap();
+        assert_ne!(original, replacement);
+        let (_, messages) = palette_pointer_step(
+            &app,
+            &mut tree,
+            &renderer,
+            &replacement,
+            Event::ButtonReleased(Button::Left),
+            Some(point),
+        );
+        assert!(messages.is_empty());
+        drop(palette_enter(&mut app));
+        assert!(
+            app.palette.is_open(),
+            "Enter cannot adopt a replacement identity"
+        );
+    }
+
+    fn terminal_palette_fixture() -> (Cagents, CardId, tempfile::TempDir) {
+        let (mut app, card, directory) =
+            crate::app::tests::live_agent_app("palette-offline-terminal");
+        app.refresh_ui.focused = true;
+        app.card_state_mut(card).unwrap().exposure = Exposure::Visible;
+        drop(app.update_palette(Action::Open));
+        drop(app.update_palette(Action::Query(">review visible text".into())));
+        (app, card, directory)
+    }
+
+    #[test]
+    fn focused_terminal_palette_reviews_and_returns_through_existing_reducer() {
+        let (mut app, card, _directory) = terminal_palette_fixture();
+        let entries = app.palette_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "Review visible text");
+        assert_contextual_palette_button(&app, &entries[0].2, &entries[0].0);
+        drop(palette_enter(&mut app));
+        assert_eq!(app.terminal_review_card, Some(card));
+        assert!(!app.palette.is_open());
+        drop(app.update_palette(Action::Open));
+        drop(app.update_palette(Action::Query(">return to terminal input".into())));
+        let entries = app.palette_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "Return to terminal input");
+        assert_contextual_palette_button(&app, &entries[0].2, &entries[0].0);
+        drop(palette_enter(&mut app));
+        assert_eq!(app.terminal_review_card, None);
+        assert_eq!(app.workspace.focused(), Some(card));
+    }
+
+    #[test]
+    fn native_contextual_palette_activation_captures_query_and_row_keys_before_exit() {
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout,
+            widget::{Tree, operation},
+        };
+        use iced::{Event, Rectangle, Size, mouse};
+        for row_focus in [false, true] {
+            let keys = if row_focus {
+                vec![
+                    (
+                        keyboard::key::Named::Enter,
+                        keyboard::key::Code::Enter,
+                        keyboard::Modifiers::empty(),
+                    ),
+                    (
+                        keyboard::key::Named::Enter,
+                        keyboard::key::Code::NumpadEnter,
+                        keyboard::Modifiers::CTRL,
+                    ),
+                    (
+                        keyboard::key::Named::Space,
+                        keyboard::key::Code::Space,
+                        keyboard::Modifiers::empty(),
+                    ),
+                ]
+            } else {
+                vec![(
+                    keyboard::key::Named::Enter,
+                    keyboard::key::Code::Enter,
+                    keyboard::Modifiers::empty(),
+                )]
+            };
+            for (key, physical, modifiers) in keys {
+                let (mut app, card, _directory) = terminal_palette_fixture();
+                app.set_terminal_review_owner(Some(card));
+                drop(app.update_palette(Action::Query(">return to terminal input".into())));
+                let identity = EntryIdentity::capture(&app.palette_entries()[0].2).unwrap();
+                let renderer = crate::app::tests::headless_renderer();
+                let mut element = app.palette_surface().unwrap();
+                let mut tree = Tree::new(element.as_widget());
+                let bounds = Rectangle::with_size(Size::new(880.0, 800.0));
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, bounds.size()),
+                );
+                let id = if row_focus {
+                    identity.widget_id()
+                } else {
+                    widget::Id::new("palette.query")
+                };
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut operation::focusable::focus::<()>(id),
+                );
+                let press = keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(key),
+                    modified_key: keyboard::Key::Named(key),
+                    physical_key: keyboard::key::Physical::Code(physical),
+                    location: keyboard::Location::Standard,
+                    modifiers,
+                    text: None,
+                    repeat: false,
+                };
+                let mut messages = Vec::new();
+                let mut repeat = press.clone();
+                if let keyboard::Event::KeyPressed { repeat, .. } = &mut repeat {
+                    *repeat = true;
+                }
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Keyboard(repeat.clone()),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &bounds,
+                );
+                assert!(
+                    matches!(
+                        messages.as_slice(),
+                        [Message::Palette(Action::ConsumedActivation)]
+                    ),
+                    "a repeat without its original activation cannot close the palette"
+                );
+                assert!(
+                    !app.terminal_review_input
+                        .owns_keyboard(&Event::Keyboard(repeat.clone()))
+                );
+                messages.clear();
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Keyboard(press.clone()),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &bounds,
+                );
+                assert!(
+                    app.terminal_review_input
+                        .owns_keyboard(&Event::Keyboard(press.clone())),
+                    "the actual focused widget records the original activation before publishing"
+                );
+                drop(element);
+                if row_focus {
+                    assert_eq!(messages.len(), 1);
+                    drop(app.update(messages.pop().unwrap()));
+                } else {
+                    assert!(messages.is_empty());
+                    drop(app.palette_key_event(&press));
+                }
+                assert_eq!(app.terminal_review_card, None);
+                assert!(!app.palette.is_open());
+                assert!(app.terminal_review_input.consume_keyboard(&repeat));
+                let release = keyboard::Event::KeyReleased {
+                    key: keyboard::Key::Named(key),
+                    modified_key: keyboard::Key::Named(key),
+                    physical_key: keyboard::key::Physical::Code(physical),
+                    location: keyboard::Location::Standard,
+                    modifiers,
+                };
+                assert!(app.terminal_review_input.consume_keyboard(&release));
+                assert!(
+                    !app.terminal_review_input.consume_keyboard(&press),
+                    "fresh input is no longer owned"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn queued_terminal_palette_action_rejects_identity_mode_visibility_and_input_owner_changes() {
+        for change in 0..8 {
+            let (mut app, card, _directory) = terminal_palette_fixture();
+            let held = app.palette_entries().pop().unwrap().2;
+            match change {
+                0 => {
+                    if let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind
+                    {
+                        session.id = crate::model::TerminalId::new();
+                    }
+                }
+                1 => app.card_state_mut(card).unwrap().exposure = Exposure::Offscreen,
+                2 => app.refresh_ui.focused = false,
+                3 => app.device_ui.open = true,
+                4 => app.set_terminal_review_owner(Some(card)),
+                5 => {
+                    app.set_terminal_review_owner(Some(card));
+                    app.set_terminal_review_owner(None);
+                }
+                6 => drop(app.update_palette(Action::Close)),
+                7 => app.palette.recording = Some(SettingsField::ShortcutCommandPalette),
+                _ => unreachable!(),
+            }
+            let owner = app.terminal_review_card;
+            let revision = app.terminal_review_revision;
+            let focused = app.workspace.focused();
+            let task = app.update_palette(Action::Run(MessageBox(Box::new(held))));
+            assert!(
+                iced::runtime::task::into_stream(task).is_none(),
+                "case {change}"
+            );
+            assert_eq!(app.terminal_review_card, owner, "case {change}");
+            assert_eq!(app.terminal_review_revision, revision, "case {change}");
+            assert_eq!(app.workspace.focused(), focused, "case {change}");
+        }
     }
 
     #[test]
