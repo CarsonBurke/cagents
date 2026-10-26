@@ -1,4 +1,4 @@
-//! Stable row state with the standard Column's native accessibility tree.
+//! Stable child state with the standard layout's native accessibility tree.
 use super::*;
 
 pub(super) fn view<'a, Message: 'a>(
@@ -9,6 +9,20 @@ pub(super) fn view<'a, Message: 'a>(
         keys,
         content: widget::column::with_children(children)
             .width(Length::Fill)
+            .into(),
+    })
+}
+
+pub(super) fn horizontal<'a, Message: 'a>(
+    rows: Vec<([u8; 32], Element<'a, Message>)>,
+    spacing: f32,
+) -> Element<'a, Message> {
+    let (keys, children): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+    Element::new(KeyedList {
+        keys,
+        content: widget::row::with_children(children)
+            .spacing(spacing)
+            .align_y(cosmic::iced::Alignment::Center)
             .into(),
     })
 }
@@ -32,7 +46,7 @@ impl<Message> Widget<Message, Theme, Renderer> for KeyedList<'_, Message> {
     }
     fn diff(&mut self, tree: &mut Tree) {
         let previous = &mut tree.state.downcast_mut::<Keys>().0;
-        // Reorder the actual Column's row trees before its ordinary diff. Each
+        // Reorder the actual layout's child trees before its ordinary diff. Each
         // prior tree is consumed at most once, including duplicate keys. The
         // chooser mounts at most24 rows, so a bounded linear lookup per row
         // avoids a second map/queue ownership scheme.
@@ -191,30 +205,34 @@ impl<Message> Widget<Message, Theme, Renderer> for KeyedList<'_, Message> {
 mod tests {
     use super::*;
 
-    fn rows(keys: &[u8]) -> Element<'static, &'static str> {
-        view(
-            keys.iter()
-                .map(|key| {
-                    let label = match key {
-                        1 => "One",
-                        2 => "Two",
-                        3 => "Three",
-                        4 => "Four",
-                        _ => unreachable!(),
-                    };
-                    let mut identity = [0; 32];
-                    identity[0] = *key;
-                    (
-                        identity,
-                        widget::button::text(label)
-                            .name(label)
-                            .on_press(label)
-                            .width(Length::Fill)
-                            .into(),
-                    )
-                })
-                .collect(),
-        )
+    fn rows(keys: &[u8], row: bool) -> Element<'static, &'static str> {
+        let controls = keys
+            .iter()
+            .map(|key| {
+                let label = match key {
+                    1 => "One",
+                    2 => "Two",
+                    3 => "Three",
+                    4 => "Four",
+                    _ => unreachable!(),
+                };
+                let mut identity = [0; 32];
+                identity[0] = *key;
+                (
+                    identity,
+                    widget::button::text(label)
+                        .name(label)
+                        .on_press(label)
+                        .width(Length::Fill)
+                        .into(),
+                )
+            })
+            .collect();
+        if row {
+            horizontal(controls, space::XS)
+        } else {
+            view(controls)
+        }
     }
 
     fn layout_rows(
@@ -286,9 +304,18 @@ mod tests {
 
     #[test]
     fn standard_column_accessibility_and_focused_row_follow_keys_through_reorder_and_removal() {
+        retained_focus(false);
+    }
+
+    #[test]
+    fn standard_row_accessibility_and_focused_control_follow_keys_through_reorder_and_removal() {
+        retained_focus(true);
+    }
+
+    fn retained_focus(horizontal: bool) {
         use cosmic::iced::{advanced::clipboard, keyboard};
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
-        let mut element = rows(&[1, 2, 3]);
+        let mut element = rows(&[1, 2, 3], horizontal);
         let mut tree = Tree::new(element.as_widget());
         let node = layout_rows(&mut element, &mut tree, &renderer);
         // Use the real focused button's generated ID, not a named ID that
@@ -315,7 +342,7 @@ mod tests {
             .id()
             .clone();
 
-        let mut reordered = rows(&[3, 1, 2]);
+        let mut reordered = rows(&[3, 1, 2], horizontal);
         tree.diff(reordered.as_widget_mut());
         let node = layout_rows(&mut reordered, &mut tree, &renderer);
         assert_eq!(
@@ -368,7 +395,7 @@ mod tests {
             "input must reach the retained focused real button"
         );
 
-        let mut replaced = rows(&[3, 1, 4]);
+        let mut replaced = rows(&[3, 1, 4], horizontal);
         tree.diff(replaced.as_widget_mut());
         let node = layout_rows(&mut replaced, &mut tree, &renderer);
         assert!(

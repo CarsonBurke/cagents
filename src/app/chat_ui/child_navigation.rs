@@ -1,4 +1,4 @@
-//! A bounded entrance to child transcripts, independent of their name lengths.
+//! Named child tabs with bounded transcript preparation and a searchable chooser.
 use super::*;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -27,19 +27,35 @@ fn child_key(id: &str) -> [u8; 32] {
 
 fn rank(child: &chat::Subagent) -> u8 {
     match child.status {
-        chat::ToolStatus::Failed | chat::ToolStatus::Denied => 0,
-        chat::ToolStatus::Running if child.waiting => 1,
-        chat::ToolStatus::Running => 2,
+        chat::ToolStatus::Running if !child.waiting => 0,
+        chat::ToolStatus::Running => 1,
+        chat::ToolStatus::Failed | chat::ToolStatus::Denied => 2,
         _ => 3,
+    }
+}
+
+fn needs_attention(child: &chat::Subagent) -> bool {
+    (child.status == chat::ToolStatus::Running && child.waiting)
+        || matches!(
+            child.status,
+            chat::ToolStatus::Failed | chat::ToolStatus::Denied
+        )
+}
+
+fn child_icon(child: &chat::Subagent) -> Icon {
+    match child.status {
+        chat::ToolStatus::Running if child.waiting => Icon::AgentWaiting,
+        chat::ToolStatus::Running => Icon::AgentWorking,
+        chat::ToolStatus::Failed | chat::ToolStatus::Denied => Icon::Warning,
+        chat::ToolStatus::Succeeded => Icon::Check,
+        chat::ToolStatus::Stopped => Icon::Cancel,
     }
 }
 
 impl Picker {
     pub fn new(children: &[chat::Subagent]) -> Self {
-        let mut order: Vec<_> = children.iter().collect();
-        order.sort_by_key(|child| rank(child));
         Self {
-            order: order.into_iter().map(|child| child.id.clone()).collect(),
+            order: children.iter().map(|child| child.id.clone()).collect(),
             ..Self::default()
         }
     }
@@ -52,7 +68,7 @@ impl Picker {
                 let admitted = match self.filter {
                     Filter::All => true,
                     Filter::Working => child.status == chat::ToolStatus::Running && !child.waiting,
-                    Filter::Attention => rank(child) < 2,
+                    Filter::Attention => needs_attention(child),
                 };
                 admitted
                     && (query.is_empty()
@@ -74,10 +90,13 @@ impl Picker {
             .map(|(index, id)| (id.as_str(), index))
             .collect();
         rows.sort_by_key(|child| {
-            order
-                .get(child.id.as_str())
-                .copied()
-                .unwrap_or(self.order.len())
+            (
+                rank(child),
+                order
+                    .get(child.id.as_str())
+                    .copied()
+                    .unwrap_or(self.order.len()),
+            )
         });
         rows
     }
@@ -86,102 +105,98 @@ impl Picker {
 impl Runtime {
     pub(super) fn child_navigation(&self, _width: f32) -> Element<'_, Message> {
         let target = self.target;
-        let selected = self
-            .selected_subagent
-            .as_ref()
-            .and_then(|id| self.snapshot.subagents.iter().find(|child| &child.id == id));
-        let working = self
-            .snapshot
-            .subagents
-            .iter()
-            .filter(|child| child.status == chat::ToolStatus::Running && !child.waiting)
-            .count();
-        let attention = self
-            .snapshot
-            .subagents
-            .iter()
-            .filter(|child| rank(child) < 2)
-            .count();
-        let label = selected.map_or_else(
-            || format!("Subagents ({})", self.snapshot.subagents.len()),
-            |child| Self::short_description(Self::native_child_name(child), 24),
-        );
-        let description = format!(
-            "Choose subagent: {} total, {working} working, {attention} need attention{}",
-            self.snapshot.subagents.len(),
-            selected.map_or(String::new(), |child| format!(
-                ". Selected: {}",
-                self.native_child_identity(child)
+        let selected = self.selected_subagent.as_ref();
+        let mut children: Vec<_> = self.snapshot.subagents.iter().collect();
+        // Stable sorting preserves provider order within each live status group.
+        children.sort_by_key(|child| rank(child));
+        let tabs = children
+            .into_iter()
+            .map(|child| {
+                let chosen = selected == Some(&child.id);
+                let description = self.native_child_identity(child);
+                let icon = child_icon(child);
+                let marker = if icon == Icon::AgentWorking {
+                    crate::ui_controls::activity_spinner(
+                        f32::from(design::COMPACT_ICON_SIZE),
+                        design::accent_color,
+                    )
+                } else {
+                    crate::ui_controls::passive_icon(icon, design::COMPACT_ICON_SIZE)
+                };
+                let tab = widget::button::custom(
+                    widget::row::with_children(vec![
+                        marker,
+                        design::caption(Self::short_description(
+                            Self::native_child_name(child),
+                            24,
+                        ))
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .into(),
+                    ])
+                    .spacing(space::XS)
+                    .align_y(Alignment::Center),
+                )
+                .name(description.clone())
+                .id(card_control_id(
+                    target.card,
+                    &format!("chat-subagent-tab-{}", child.id),
+                ))
+                .padding([space::XS, space::S])
+                .class(crate::ui_controls::control_style(chosen, None))
+                .selected(chosen)
+                .on_press(action(Action::SelectSubagent(
+                    target,
+                    Some(child.id.clone()),
+                )));
+                (
+                    child_key(&child.id),
+                    crate::interaction::tooltip(tab, description),
+                )
+            })
+            .collect();
+        let tabs = widget::scrollable(crate::interaction::keyed_control_row(tabs, space::XS))
+            .id(card_control_id(target.card, "chat-subagent-tabs"))
+            .direction(iced::widget::scrollable::Direction::Horizontal(
+                iced::widget::scrollable::Scrollbar::hidden(),
             ))
-        );
-        let trigger = widget::button::custom(
-            widget::row::with_children(vec![
-                design::caption(label)
-                    .width(Length::Fill)
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .into(),
-                crate::ui_controls::passive_icon(Icon::PanDown, design::COMPACT_ICON_SIZE),
-            ])
-            .spacing(space::XS)
-            .align_y(Alignment::Center),
-        )
-        .name(description)
+            .width(Length::Fill);
+        let trigger = widget::button::custom(crate::ui_controls::passive_icon(
+            Icon::PanDown,
+            design::COMPACT_ICON_SIZE,
+        ))
+        .name(format!(
+            "Choose subagent: {} total",
+            self.snapshot.subagents.len()
+        ))
         .id(card_control_id(target.card, "chat-subagent-picker"))
-        .width(Length::Fill)
         .padding([space::XS, space::S])
-        .class(crate::ui_controls::control_style(selected.is_some(), None))
+        .class(crate::ui_controls::control_style(
+            self.child_picker.is_some(),
+            None,
+        ))
         .on_press(action(Action::SubagentPicker(
             target,
             self.child_picker.is_none(),
         )));
-        let mut controls = vec![
-            crate::ui_controls::view_tab(
-                crate::ui_controls::ViewTab {
-                    label: "Conversation".into(),
-                    description: "Main conversation".into(),
-                    count: None,
-                    selected: selected.is_none(),
-                    id: None,
-                    on_press: Some(action(Action::SelectSubagent(target, None))),
-                },
-                true,
-                None,
-            ),
-            trigger.into(),
-        ];
-        if attention > 0 {
-            controls.push(
-                crate::interaction::tooltip(
-                    widget::row::with_children(vec![
-                        crate::ui_controls::passive_icon(Icon::Warning, design::COMPACT_ICON_SIZE),
-                        design::caption(attention.to_string()).into(),
-                    ])
-                    .spacing(space::XS),
-                    format!("{attention} subagents need attention"),
-                )
-                .into(),
-            );
-        }
-        if working > 0 {
-            controls.push(
-                crate::interaction::tooltip(
-                    widget::row::with_children(vec![
-                        crate::ui_controls::activity_spinner(
-                            f32::from(design::COMPACT_ICON_SIZE),
-                            design::accent_color,
-                        ),
-                        design::caption(working.to_string()).into(),
-                    ])
-                    .spacing(space::XS),
-                    format!("{working} subagents working"),
-                )
-                .into(),
-            );
-        }
         widget::container(
-            widget::row::with_children(controls)
-                .spacing(space::S)
-                .align_y(Alignment::Center),
+            widget::row::with_children(vec![
+                crate::ui_controls::view_tab(
+                    crate::ui_controls::ViewTab {
+                        label: "Conversation".into(),
+                        description: "Main conversation".into(),
+                        count: None,
+                        selected: selected.is_none(),
+                        id: None,
+                        on_press: Some(action(Action::SelectSubagent(target, None))),
+                    },
+                    true,
+                    None,
+                ),
+                crate::interaction::overflow_fade_x(crate::interaction::horizontal_wheel(tabs)),
+                crate::interaction::tooltip(trigger, "Search and filter subagents").into(),
+            ])
+            .spacing(space::XS)
+            .align_y(Alignment::Center),
         )
         .width(Length::Fill)
         .clip(true)
@@ -201,13 +216,7 @@ impl Runtime {
         for child in matches.into_iter().skip(page * PAGE_SIZE).take(PAGE_SIZE) {
             let chosen = self.selected_subagent.as_ref() == Some(&child.id);
             let status = Self::native_child_status(child);
-            let marker = match child.status {
-                chat::ToolStatus::Running if child.waiting => Icon::AgentWaiting,
-                chat::ToolStatus::Running => Icon::AgentWorking,
-                chat::ToolStatus::Failed | chat::ToolStatus::Denied => Icon::Warning,
-                chat::ToolStatus::Succeeded => Icon::Check,
-                chat::ToolStatus::Stopped => Icon::Cancel,
-            };
+            let marker = child_icon(child);
             let name = format!(
                 "{} · {status} · {}",
                 Self::native_child_name(child),
@@ -349,5 +358,58 @@ impl Runtime {
             crate::interaction::opaque(panel),
             move || action(Action::SubagentPicker(target, false)),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn child(id: &str, status: chat::ToolStatus, waiting: bool) -> chat::Subagent {
+        chat::Subagent {
+            id: id.into(),
+            kind: format!("Agent {id}"),
+            description: "A long task description is not an agent name".into(),
+            status,
+            waiting,
+            model: None,
+            detail: String::new(),
+            background: true,
+            items: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn picker_resorts_live_states_without_replacing_names_or_changing_tie_order() {
+        use chat::ToolStatus::*;
+        let mut children = vec![
+            child("done", Succeeded, false),
+            child("first", Running, false),
+            child("waiting", Running, true),
+            child("second", Running, false),
+            child("failed", Failed, false),
+        ];
+        let mut picker = Picker::new(&children);
+        let ids =
+            |rows: Vec<&chat::Subagent>| rows.iter().map(|c| c.id.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            ids(picker.rows(&children)),
+            ["first", "second", "waiting", "failed", "done"]
+        );
+        children[0].status = Running;
+        children[1].status = Succeeded;
+        assert_eq!(
+            ids(picker.rows(&children)),
+            ["done", "second", "waiting", "failed", "first"]
+        );
+        picker.filter = Filter::Attention;
+        assert_eq!(ids(picker.rows(&children)), ["waiting", "failed"]);
+        picker.filter = Filter::Working;
+        assert_eq!(ids(picker.rows(&children)), ["done", "second"]);
+        picker.query = "Agent second".into();
+        assert_eq!(ids(picker.rows(&children)), ["second"]);
+        assert_eq!(Runtime::native_child_name(&children[0]), "Agent done");
+        children[0].kind.clear();
+        assert_eq!(Runtime::native_child_name(&children[0]), "done");
     }
 }

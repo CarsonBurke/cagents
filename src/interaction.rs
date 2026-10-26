@@ -110,6 +110,14 @@ pub fn keyed_list_rows<'a, Message: 'a>(
     keyed_list::view(rows)
 }
 
+/// Keyed horizontal controls retain native focus when their order changes.
+pub fn keyed_control_row<'a, Message: 'a>(
+    controls: Vec<([u8; 32], Element<'a, Message>)>,
+    spacing: f32,
+) -> Element<'a, Message> {
+    keyed_list::horizontal(controls, spacing)
+}
+
 /// A filter field at the head of a keyboard list. Down enters its first
 /// result; editing keys (including Home/End) remain the field's own.
 pub fn keyboard_list_entry<'a, Message: 'a>(

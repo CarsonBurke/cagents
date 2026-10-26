@@ -1123,13 +1123,15 @@ impl Runtime {
         }
     }
     pub(super) fn native_child_name(agent: &chat::Subagent) -> &str {
-        agent
-            .description
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .or_else(|| (!agent.kind.trim().is_empty()).then_some(agent.kind.trim()))
-            .unwrap_or("Subagent")
+        // Codex carries agentNickname here; OMP carries its agent name. The
+        // description is the assigned task, which must never become identity.
+        if !agent.kind.trim().is_empty() {
+            agent.kind.trim()
+        } else if !agent.id.trim().is_empty() {
+            agent.id.trim()
+        } else {
+            "Subagent"
+        }
     }
 
     pub(super) fn native_child_status(agent: &chat::Subagent) -> &'static str {
@@ -1166,6 +1168,95 @@ impl Runtime {
             identity.push_str(&Self::short_description(agent.detail.trim(), 120));
         }
         identity
+    }
+
+    /// A single derived row, never a persisted message or a sticky footer.
+    /// Historic pages and terminal/disconnected snapshots must not narrate
+    /// current work beneath an unrelated turn.
+    fn timeline_activity(&self, transitioning: bool) -> Option<(Option<Icon>, String)> {
+        let snapshot = &self.snapshot;
+        if self.closed_elsewhere || self.disconnected || snapshot.exited {
+            return None;
+        }
+        if let Some(child) = self
+            .selected_subagent
+            .as_ref()
+            .and_then(|id| snapshot.subagents.iter().find(|child| &child.id == id))
+        {
+            return (child.status == chat::ToolStatus::Running).then(|| {
+                (
+                    Some(if child.waiting {
+                        Icon::AgentWaiting
+                    } else {
+                        Icon::AgentWorking
+                    }),
+                    if child.detail.trim().is_empty() {
+                        Self::native_child_status(child).to_owned()
+                    } else {
+                        Self::short_description(child.detail.trim(), 100)
+                    },
+                )
+            });
+        }
+        if snapshot.has_later {
+            return None;
+        }
+        let transient = transitioning
+            || self.queued.is_some()
+            || self.pending.is_some()
+            || self.attachment_chooser_pending.is_some();
+        if transient || snapshot.busy || snapshot.waiting || !snapshot.requests.is_empty() {
+            return Some(self.conversation_status(transitioning));
+        }
+        let working = snapshot
+            .subagents
+            .iter()
+            .filter(|child| child.status == chat::ToolStatus::Running && !child.waiting)
+            .count();
+        let waiting = snapshot
+            .subagents
+            .iter()
+            .filter(|child| child.status == chat::ToolStatus::Running && child.waiting)
+            .count();
+        if working > 0 {
+            Some((
+                Some(Icon::AgentWorking),
+                format!(
+                    "{working} {} working{}",
+                    if working == 1 {
+                        "subagent"
+                    } else {
+                        "subagents"
+                    },
+                    if waiting > 0 {
+                        format!(" · {waiting} waiting")
+                    } else {
+                        String::new()
+                    },
+                ),
+            ))
+        } else if waiting > 0 {
+            Some((
+                Some(Icon::AgentWaiting),
+                format!(
+                    "{waiting} {} waiting",
+                    if waiting == 1 {
+                        "subagent"
+                    } else {
+                        "subagents"
+                    },
+                ),
+            ))
+        } else if !self.is_draft()
+            && !snapshot.ready
+            && snapshot.finished_at.is_none()
+            && snapshot.error.is_none()
+            && self.error.is_none()
+        {
+            Some((Some(Icon::AgentWorking), "Connecting".into()))
+        } else {
+            None
+        }
     }
 
     /// Completion requires provider evidence. An unstarted conversation is a
@@ -1976,6 +2067,30 @@ impl Runtime {
             if let Some(queued) = &self.queued {
                 transcript.push(self.queued_view(queued));
             }
+        }
+        if let Some((glyph, label)) = self.timeline_activity(transitioning) {
+            let mut activity = Vec::new();
+            if let Some(glyph) = glyph {
+                activity.push(if glyph == Icon::AgentWorking {
+                    crate::ui_controls::activity_spinner(
+                        f32::from(design::COMPACT_ICON_SIZE),
+                        design::muted_text,
+                    )
+                } else {
+                    crate::ui_controls::passive_icon(glyph, design::COMPACT_ICON_SIZE)
+                });
+            }
+            activity.push(
+                design::caption(label)
+                    .class(cosmic::theme::Text::Custom(design::muted_text))
+                    .into(),
+            );
+            transcript.push(
+                widget::row::with_children(activity)
+                    .spacing(space::XS)
+                    .align_y(Alignment::Center)
+                    .into(),
+            );
         }
         // A chat's heading is the conversation's own name or nothing at all.
         //
@@ -6339,6 +6454,58 @@ mod tests {
             background: true,
             items: Vec::new(),
         }
+    }
+
+    #[test]
+    fn timeline_activity_tracks_live_child_work_and_settles_without_messages() {
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.ready = true;
+        snapshot.busy = false;
+        snapshot.subagents = vec![native_child_fixture()];
+        let items = snapshot.items.clone();
+        assert_eq!(
+            runtime.timeline_activity(false).unwrap().1,
+            "1 subagent working"
+        );
+        Arc::make_mut(&mut runtime.snapshot).subagents[0].waiting = true;
+        assert_eq!(
+            runtime.timeline_activity(false).unwrap().1,
+            "1 subagent waiting"
+        );
+        Arc::make_mut(&mut runtime.snapshot).has_later = true;
+        assert!(
+            runtime.timeline_activity(false).is_none(),
+            "older pages do not narrate live activity"
+        );
+        runtime.selected_subagent = Some("native-child".into());
+        assert_eq!(
+            runtime.timeline_activity(false).unwrap().0,
+            Some(Icon::AgentWaiting)
+        );
+        let child = &mut Arc::make_mut(&mut runtime.snapshot).subagents[0];
+        child.status = chat::ToolStatus::Succeeded;
+        child.waiting = false;
+        assert!(runtime.timeline_activity(false).is_none());
+        runtime.selected_subagent = None;
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.has_later = false;
+        snapshot.finished_at = Some(10);
+        snapshot.ready = false;
+        assert!(
+            runtime.timeline_activity(false).is_none(),
+            "completion removes the transient row"
+        );
+        assert_eq!(
+            runtime.snapshot.items, items,
+            "activity never appends transcript evidence"
+        );
+        Arc::make_mut(&mut runtime.snapshot).subagents[0].status = chat::ToolStatus::Running;
+        runtime.disconnected = true;
+        assert!(
+            runtime.timeline_activity(false).is_none(),
+            "disconnected state cannot claim stale work"
+        );
     }
 
     #[test]
