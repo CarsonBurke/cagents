@@ -304,4 +304,37 @@ mod tests {
         assert!(task.join().unwrap().is_err());
         drop(release);
     }
+
+    #[test]
+    fn an_oversized_request_line_cannot_be_reported_as_normal_owner_eof() {
+        let (release, mut records, task) = start();
+        let ready = record(&mut records, "GOAL_GUI_MODEL_READY ");
+        let address = ready["base_url"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("http://")
+            .unwrap()
+            .strip_suffix("/v1")
+            .unwrap();
+        let mut socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        socket.write_all(&vec![b'A'; 16 * 1024 + 1]).unwrap();
+        // The accepted handler must actually consume/refuse the oversized line
+        // before EOF release; do not let release win the listener accept race.
+        let mut bytes = Vec::new();
+        if let Err(error) = socket.read_to_end(&mut bytes) {
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        }
+        assert!(bytes.is_empty());
+        drop(release);
+        let retired = record(&mut records, "GOAL_GUI_MODEL_RETIRED ");
+        assert_eq!(retired["normal"], false);
+        assert_eq!(retired["model_requests"], 0);
+        assert_eq!(retired["accepted_connections"], 1);
+        assert_eq!(retired["joined_handlers"], 1);
+        assert_eq!(retired["active_handlers"], 0);
+        assert!(task.join().unwrap().is_err());
+    }
 }

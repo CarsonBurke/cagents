@@ -172,7 +172,13 @@ fn serve(
     }
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
-    if model_line(&mut reader, &mut request_line, mode).unwrap_or(0) == 0 {
+    let request_line_read = model_line(&mut reader, &mut request_line, mode);
+    let request_line_bytes = if matches!(mode, ModelMode::Goal) {
+        request_line_read.expect("Goal model request line could not be read")
+    } else {
+        request_line_read.unwrap_or(0)
+    };
+    if request_line_bytes == 0 {
         return;
     }
     let mut length = 0;
