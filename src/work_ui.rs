@@ -33,6 +33,8 @@ const COLUMN_WIDTH: f32 = 280.0;
 const SCOPE_MENU_WIDTH: f32 = 280.0;
 const CARD_MENU_WIDTH: f32 = 264.0;
 
+mod board_scroll;
+
 /// One card on the board, by what identifies it to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CardRef {
@@ -414,7 +416,7 @@ impl State {
         let body = match &self.board {
             None => self.waiting(),
             Some(board) if board.projects.is_empty() => placeholder("No Git projects are open")
-                .icon(Icon::Branch.handle())
+                .icon(Icon::Folder.handle())
                 .detail(
                     "Open a Git project and its worktrees, branches and pull requests appear here.",
                 )
@@ -563,7 +565,7 @@ impl State {
             ];
             items.extend(projects.iter().map(|project| {
                 popover_item(
-                    Icon::Branch.handle(),
+                    Icon::Folder.handle(),
                     project.name.as_str(),
                     cards(count(Some(&project.repository))),
                     Action::Scope(Some(project.repository.clone())),
@@ -671,8 +673,9 @@ impl State {
         if fits {
             row.width(Length::Fill).into()
         } else {
-            crate::interaction::horizontal_wheel(
+            board_scroll::view(
                 widget::scrollable::horizontal(row)
+                    .id(board_scroll::ID)
                     .direction(iced::widget::scrollable::Direction::Horizontal(
                         design::scrollbar(),
                     ))
@@ -768,7 +771,7 @@ impl State {
     fn no_match(&self) -> Element<'_, Action> {
         if self.query.trim().is_empty() {
             placeholder("No work in progress")
-                .icon(Icon::Branch.handle())
+                .icon(Icon::Grid.handle())
                 .detail("Worktrees, branches with commits and your open pull requests appear here.")
                 .into()
         } else {
@@ -1631,6 +1634,400 @@ mod tests {
             updated_at: String::new(),
         });
         value
+    }
+
+    #[derive(Default)]
+    struct BoardScrollProbe {
+        entries: Vec<(
+            iced::advanced::widget::Id,
+            iced::Rectangle,
+            iced::Rectangle,
+            iced::Vector,
+        )>,
+    }
+
+    impl iced::advanced::widget::Operation for BoardScrollProbe {
+        fn traverse(
+            &mut self,
+            operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation),
+        ) {
+            operate(self);
+        }
+        fn scrollable(
+            &mut self,
+            id: Option<&iced::advanced::widget::Id>,
+            bounds: iced::Rectangle,
+            content: iced::Rectangle,
+            translation: iced::Vector,
+            _state: &mut dyn iced::advanced::widget::operation::Scrollable,
+        ) {
+            self.entries
+                .push((id.unwrap().clone(), bounds, content, translation));
+        }
+    }
+
+    #[derive(Default)]
+    struct BoardFocusProbe(Option<iced::advanced::widget::Id>);
+    impl iced::advanced::widget::Operation for BoardFocusProbe {
+        fn traverse(
+            &mut self,
+            operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation),
+        ) {
+            operate(self);
+        }
+        fn focusable(
+            &mut self,
+            id: Option<&iced::advanced::widget::Id>,
+            _bounds: iced::Rectangle,
+            state: &mut dyn iced::advanced::widget::operation::Focusable,
+        ) {
+            if state.is_focused() {
+                self.0 = id.cloned();
+            }
+        }
+    }
+
+    fn scroll_probe(ui: &mut Ui<'_>, renderer: &cosmic::Renderer) -> BoardScrollProbe {
+        let mut probe = BoardScrollProbe::default();
+        ui.operate(renderer, &mut probe);
+        probe
+    }
+
+    fn scroll_offsets(ui: &mut Ui<'_>, renderer: &cosmic::Renderer) -> (f32, f32) {
+        let probe = scroll_probe(ui, renderer);
+        let board = probe
+            .entries
+            .iter()
+            .find(|(id, _, _, _)| id == &iced::advanced::widget::Id::new(board_scroll::ID))
+            .unwrap();
+        let lane = probe
+            .entries
+            .iter()
+            .find(|(_, bounds, content, _)| content.height > bounds.height + 1.0)
+            .unwrap();
+        assert!(
+            board.2.width > board.1.width + 100.0,
+            "real horizontal overflow is required"
+        );
+        (board.3.x, lane.3.y)
+    }
+
+    fn wheel_board_state() -> State {
+        let mut state = State::default();
+        let items = (0..24)
+            .map(|index| {
+                let mut item = item(&format!("task-{index:02}"), "example");
+                item.column = Column::Active;
+                item.derived = Column::Active;
+                item
+            })
+            .collect();
+        connected(&mut state, 1, board(items));
+        state
+    }
+
+    fn board_event(
+        ui: &mut Ui<'_>,
+        renderer: &mut cosmic::Renderer,
+        event: iced::Event,
+        point: iced::Point,
+    ) {
+        let mut actions = Vec::new();
+        let _ = ui.update(
+            &[event],
+            iced::mouse::Cursor::Available(point),
+            renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut actions,
+        );
+        assert!(
+            actions.is_empty(),
+            "scroll/modifier input emitted unrelated actions: {actions:?}"
+        );
+        draw(ui, renderer);
+    }
+
+    fn wheel_event(delta: iced::mouse::ScrollDelta) -> iced::Event {
+        iced::Event::Mouse(iced::mouse::Event::WheelScrolled { delta })
+    }
+
+    #[test]
+    fn board_shift_wheel_routes_to_columns_without_stealing_vertical_lane_transactions() {
+        let state = wheel_board_state();
+        let original = state.board.as_ref().unwrap().clone();
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut ui = Ui::build(
+            state.board_view(800.0),
+            iced::Size::new(800.0, 420.0),
+            iced::runtime::user_interface::Cache::new(),
+            &mut renderer,
+        );
+        draw(&mut ui, &mut renderer);
+        let lane = scroll_probe(&mut ui, &renderer)
+            .entries
+            .into_iter()
+            .find(|(_, bounds, content, _)| content.height > bounds.height + 1.0)
+            .unwrap();
+        let point = lane.1.center();
+        assert_eq!(scroll_offsets(&mut ui, &renderer), (0.0, 0.0));
+        board_event(
+            &mut ui,
+            &mut renderer,
+            wheel_event(iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }),
+            point,
+        );
+        let vertical = scroll_offsets(&mut ui, &renderer);
+        assert_eq!(
+            vertical,
+            (0.0, 60.0),
+            "ordinary wheel scrolls inside the actual populated lane"
+        );
+        board_event(
+            &mut ui,
+            &mut renderer,
+            iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(
+                iced::keyboard::Modifiers::SHIFT,
+            )),
+            point,
+        );
+        board_event(
+            &mut ui,
+            &mut renderer,
+            wheel_event(iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }),
+            point,
+        );
+        assert_eq!(
+            scroll_offsets(&mut ui, &renderer),
+            (60.0, vertical.1),
+            "Shift must reach the board even during the lane's native wheel transaction"
+        );
+        board_event(
+            &mut ui,
+            &mut renderer,
+            iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(
+                iced::keyboard::Modifiers::empty(),
+            )),
+            point,
+        );
+        board_event(
+            &mut ui,
+            &mut renderer,
+            wheel_event(iced::mouse::ScrollDelta::Pixels { x: 0.0, y: -11.5 }),
+            point,
+        );
+        assert_eq!(
+            scroll_offsets(&mut ui, &renderer),
+            (60.0, vertical.1 + 11.5),
+            "return to vertical is immediate, without a transaction timeout"
+        );
+        assert!(Arc::ptr_eq(state.board.as_ref().unwrap(), &original));
+        assert_eq!(state.scope, None);
+        assert_eq!(state.layout, Layout::Board);
+    }
+
+    #[test]
+    fn board_wheel_requires_shift_for_native_x_and_preserves_pixel_motion_focus_and_cache() {
+        use iced::advanced::widget::{Id, operation};
+        let state = wheel_board_state();
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let size = iced::Size::new(800.0, 420.0);
+        let mut ui = Ui::build(
+            state.board_view(size.width),
+            size,
+            iced::runtime::user_interface::Cache::new(),
+            &mut renderer,
+        );
+        draw(&mut ui, &mut renderer);
+        let point = control_bounds(&ui, "Open task-00").center();
+        for delta in [
+            iced::mouse::ScrollDelta::Lines { x: -1.0, y: 0.0 },
+            iced::mouse::ScrollDelta::Pixels { x: -35.0, y: 0.0 },
+        ] {
+            board_event(&mut ui, &mut renderer, wheel_event(delta), point);
+            assert_eq!(scroll_offsets(&mut ui, &renderer), (0.0, 0.0));
+        }
+        board_event(
+            &mut ui,
+            &mut renderer,
+            wheel_event(iced::mouse::ScrollDelta::Pixels { x: -12.5, y: -7.5 }),
+            point,
+        );
+        assert_eq!(scroll_offsets(&mut ui, &renderer), (0.0, 7.5));
+        let focus = card_actions_id(&CardRef::of(&state.board.as_ref().unwrap().items[0]));
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(focus.clone()),
+        );
+        board_event(
+            &mut ui,
+            &mut renderer,
+            iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(
+                iced::keyboard::Modifiers::SHIFT,
+            )),
+            point,
+        );
+        board_event(
+            &mut ui,
+            &mut renderer,
+            wheel_event(iced::mouse::ScrollDelta::Pixels { x: -12.5, y: 12.5 }),
+            point,
+        );
+        assert_eq!(
+            scroll_offsets(&mut ui, &renderer),
+            (12.5, 7.5),
+            "real x wins rather than cancelling a diagonal trackpad gesture"
+        );
+        let cache = ui.into_cache();
+        let mut ui = Ui::build(state.board_view(size.width), size, cache, &mut renderer);
+        draw(&mut ui, &mut renderer);
+        board_event(
+            &mut ui,
+            &mut renderer,
+            wheel_event(iced::mouse::ScrollDelta::Lines { x: -1.0, y: 1.0 }),
+            point,
+        );
+        assert_eq!(
+            scroll_offsets(&mut ui, &renderer),
+            (72.5, 7.5),
+            "cached native Shift state and line scale survive rebuild"
+        );
+        board_event(
+            &mut ui,
+            &mut renderer,
+            iced::Event::Window(iced::window::Event::Unfocused),
+            point,
+        );
+        board_event(
+            &mut ui,
+            &mut renderer,
+            wheel_event(iced::mouse::ScrollDelta::Pixels { x: -3.0, y: -9.0 }),
+            point,
+        );
+        assert_eq!(
+            scroll_offsets(&mut ui, &renderer),
+            (72.5, 16.5),
+            "lost window focus cannot leave the board in Shift mode"
+        );
+        // Native widget operations remain available, independent of wheel policy.
+        ui.operate(
+            &renderer,
+            &mut operation::scrollable::scroll_by::<()>(
+                Id::new(board_scroll::ID),
+                operation::scrollable::AbsoluteOffset { x: 20.0, y: 0.0 },
+            ),
+        );
+        assert_eq!(scroll_offsets(&mut ui, &renderer), (92.5, 16.5));
+        let mut focused = BoardFocusProbe::default();
+        ui.operate(&renderer, &mut focused);
+        assert_eq!(focused.0, Some(focus));
+        board_event(
+            &mut ui,
+            &mut renderer,
+            iced::Event::Window(iced::window::Event::Focused),
+            point,
+        );
+        let mut actions = Vec::new();
+        let events = [
+            iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+                modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+                physical_key: iced::keyboard::key::Physical::Unidentified(
+                    iced::keyboard::key::NativeCode::Unidentified,
+                ),
+                location: iced::keyboard::Location::Standard,
+                modifiers: iced::keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            },
+            iced::keyboard::Event::KeyReleased {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+                modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+                physical_key: iced::keyboard::key::Physical::Unidentified(
+                    iced::keyboard::key::NativeCode::Unidentified,
+                ),
+                location: iced::keyboard::Location::Standard,
+                modifiers: iced::keyboard::Modifiers::empty(),
+            },
+        ]
+        .map(iced::Event::Keyboard);
+        let _ = ui.update(
+            &events,
+            iced::mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut actions,
+        );
+        assert!(
+            matches!(actions.as_slice(), [Action::Menu(Some(card))] if card == &CardRef::of(&state.board.as_ref().unwrap().items[0]))
+        );
+    }
+
+    #[test]
+    fn board_shift_wheel_ignores_captured_input_and_clipped_or_outside_hits() {
+        use iced::advanced::{Layout as NativeLayout, Shell, Widget, layout, widget::Tree};
+        let state = wheel_board_state();
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut element = state.board_view(800.0);
+        let mut tree = Tree::new(&element);
+        let bounds = iced::Rectangle::with_size(iced::Size::new(800.0, 420.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, bounds.size()),
+        );
+        let mut actions = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(
+                iced::keyboard::Modifiers::SHIFT,
+            )),
+            NativeLayout::new(&node),
+            iced::mouse::Cursor::Unavailable,
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut actions),
+            &bounds,
+        );
+        for (point, viewport, captured) in [
+            (bounds.center(), bounds, true),
+            (iced::Point::new(900.0, 300.0), bounds, false),
+            (
+                bounds.center(),
+                iced::Rectangle::new(iced::Point::new(0.0, 0.0), iced::Size::new(100.0, 100.0)),
+                false,
+            ),
+        ] {
+            let mut shell = Shell::new(&mut actions);
+            if captured {
+                shell.capture_event();
+            }
+            element.as_widget_mut().update(
+                &mut tree,
+                &wheel_event(iced::mouse::ScrollDelta::Pixels { x: -40.0, y: -20.0 }),
+                NativeLayout::new(&node),
+                iced::mouse::Cursor::Available(point),
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut shell,
+                &viewport,
+            );
+            let mut probe = BoardScrollProbe::default();
+            element.as_widget_mut().operate(
+                &mut tree,
+                NativeLayout::new(&node),
+                &renderer,
+                &mut probe,
+            );
+            assert!(
+                probe
+                    .entries
+                    .iter()
+                    .all(|(_, _, _, translation)| *translation == iced::Vector::ZERO),
+                "captured or invisible input must not move the board or its columns: {:?}",
+                probe.entries
+            );
+        }
+        assert!(actions.is_empty());
     }
 
     #[test]
