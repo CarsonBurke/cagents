@@ -60,6 +60,7 @@ fn gallery_and_the_existing_composer_keep_separate_keyboard_focus_and_geometry()
             None,
             vec![],
             Some(&gallery),
+            None,
         );
         let mut tree = Tree::new(element.as_widget());
         let node = element.as_widget_mut().layout(
