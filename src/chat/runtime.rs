@@ -421,14 +421,24 @@ impl LocalHandle {
             }
             _ => None,
         };
-        let goal_directory = match &mut ownership {
+        let mut goal_directory = match &mut ownership {
             Some(NativeOwnership::Adopted(holder, _, _)) => holder.pinned_launch_directory().ok(),
             _ => spec
                 .execution
                 .as_ref()
                 .and_then(|context| context.pinned_launch_directory().ok()),
         };
-        let native_holder = match ownership {
+        // Freshness comes from the once-claimed accepted launch, not from a
+        // newly spawned holder or a missing old descriptor. Claim on every
+        // marked entry, including contexts whose original FD is already set.
+        let fresh_goal_source = match &ownership {
+            Some(NativeOwnership::New(source, _)) => match &spec.execution {
+                Some(context) if context.claim_fresh_native_spawn(source)? => Some(source.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let mut native_holder = match ownership {
             Some(NativeOwnership::New(source, _))
                 if matches!(spec.transport, TransportSpec::OwnedUnixWebSocket { .. }) =>
             {
@@ -441,6 +451,26 @@ impl LocalHandle {
             Some(NativeOwnership::Adopted(holder, _, _)) => Some(holder),
             _ => None,
         };
+        if let Some(source) = fresh_goal_source {
+            // Retrieve the holder's actual inherited spawn FD. Neither a
+            // current pathname nor a replacement execution context is proof.
+            let (identity, directory) = native_holder
+                .as_mut()
+                .ok_or("Fresh native goal scope has no holder")?
+                .pinned_launch_directory()?;
+            let context = spec
+                .execution
+                .as_ref()
+                .ok_or("Fresh native goal scope has no admitted context")?;
+            if let Some(expected) = context.directory_identity()? {
+                if expected != identity {
+                    return Err("Native holder directory differs from its fresh admission".into());
+                }
+            } else {
+                context.retain_fresh_spawn_directory(&source, directory.clone())?;
+            }
+            goal_directory = Some((identity, directory));
+        }
         let (wake, reader) = UnixStream::pair().map_err(|e| e.to_string())?;
         nonblocking(&wake)?;
         nonblocking(&reader)?;
