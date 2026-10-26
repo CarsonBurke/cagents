@@ -1353,6 +1353,422 @@ fn historical_auth_diagnostics_survive_without_reactivating_recovery_after_new_w
 }
 
 #[test]
+fn selected_waiting_child_limit_is_compact_in_full_view_and_preserves_diagnostics_and_draft() {
+    use iced::advanced::{clipboard, widget::operation};
+    use iced::futures::StreamExt;
+    use iced::runtime::{UserInterface, user_interface::Cache};
+    type Ui<'a> = UserInterface<'a, Message, cosmic::Theme, cosmic::Renderer>;
+    fn mount<'a>(
+        live: &'a Runtime,
+        shortcuts: &'a crate::settings::KeyboardShortcuts,
+        width: f32,
+        cache: Cache,
+        renderer: &mut cosmic::Renderer,
+    ) -> Ui<'a> {
+        let mut ui = UserInterface::build(
+            live.view(
+                None,
+                false,
+                true,
+                shortcuts,
+                width,
+                Place {
+                    name: "selected-child-fixture".into(),
+                    branch: None,
+                    channel: None,
+                },
+                true,
+                None,
+                Vec::new(),
+            ),
+            iced::Size::new(width, 1200.0),
+            cache,
+            renderer,
+        );
+        ui.draw(
+            renderer,
+            &cosmic::theme::active(),
+            &iced::advanced::renderer::Style::default(),
+            iced::mouse::Cursor::Unavailable,
+        );
+        ui
+    }
+    fn surface(ui: &mut Ui<'_>, renderer: &cosmic::Renderer) -> FailureSurface {
+        let mut result = FailureSurface::default();
+        ui.operate(renderer, &mut result);
+        let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+        result.buttons = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter(|node| node.node().role() == iced_accessibility::accesskit::Role::Button)
+            .filter_map(|node| Some((node.node().label()?.to_owned(), node.node().bounds()?)))
+            .collect();
+        result
+    }
+    fn activate(
+        ui: &mut Ui<'_>,
+        renderer: &mut cosmic::Renderer,
+        target: Target,
+        key: &str,
+        label: &str,
+        copy: bool,
+    ) -> Vec<Action> {
+        let bounds = surface(ui, renderer)
+            .buttons
+            .into_iter()
+            .find(|(name, _)| name == label)
+            .expect("real full-view diagnostic action")
+            .1;
+        let point = iced::Point::new(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        let mut result = Vec::new();
+        let mut activated = false;
+        for (phase, event) in [
+            ("move", iced::mouse::Event::CursorMoved { position: point }),
+            (
+                "down",
+                iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left),
+            ),
+            (
+                "up",
+                iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+            ),
+        ] {
+            let mut messages = Vec::new();
+            ui.update(
+                &[iced::Event::Mouse(event)],
+                iced::mouse::Cursor::Available(point),
+                renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            let mut blurred = false;
+            for message in messages {
+                let Message::ChatUi(action) = message else {
+                    panic!("only chat UI callbacks")
+                };
+                match &action {
+                    Action::Composer(owner, text_editor::Action::ClearSelection) => {
+                        assert_eq!(*owner, target);
+                        assert!(!blurred, "at most one exact native blur per event");
+                        blurred = true;
+                    }
+                    Action::ToggleFailure(owner, actual)
+                        if !copy && *owner == target && actual == key =>
+                    {
+                        assert_eq!(phase, "up");
+                        assert!(!activated);
+                        activated = true;
+                    }
+                    Action::CopyFailure(owner, actual)
+                        if copy && *owner == target && actual == key =>
+                    {
+                        assert_eq!(phase, "up");
+                        assert!(!activated);
+                        activated = true;
+                    }
+                    _ => panic!("unexpected full-view diagnostic callback"),
+                }
+                result.push(action);
+            }
+        }
+        assert!(activated, "actual button release must activate");
+        result
+    }
+    for width in [260.0, 720.0] {
+        for diagnostics in [false, true] {
+            let (mut live, handle) = frame_cost::live_runtime(&[]);
+            let raw = if diagnostics {
+                format!(
+                    "{}\nrequest-id: selected-child-A\nOriginal exchange must remain readable to its last line.",
+                    session_limit("3:40pm")
+                )
+            } else {
+                session_limit("3:40pm")
+            };
+            let connection = "Connection reset by peer\nrequest-id: selected-distinct-connection";
+            let mut selected = child("selected-child", ToolStatus::Running, true);
+            selected.detail = raw.clone();
+            selected.items.push(Arc::new(provider_error(
+                "selected-connection",
+                Provider::Claude,
+                connection,
+            )));
+            selected.items.push(Arc::new(provider_error(
+                "selected-limit-history",
+                Provider::Claude,
+                &raw,
+            )));
+            let mut other = child("failed-other", ToolStatus::Failed, false);
+            other.detail = "Connection reset by peer\nrequest-id: unrelated-child-error".into();
+            let mut snapshot = live.snapshot.as_ref().clone();
+            snapshot.generation += 1;
+            snapshot.error =
+                Some("Connection reset by peer\nrequest-id: independent-parent-error".into());
+            snapshot.subagents = vec![
+                selected,
+                child("active-other", ToolStatus::Running, false),
+                other,
+            ];
+            handle.publish_snapshot_for_test(snapshot);
+            live.refresh();
+            live.selected_subagent = Some("selected-child".into());
+            live.replace_draft(text_editor::Content::with_text("keep beta [Image 17] tail"));
+            attachment_draft::move_to(
+                &mut live.composer,
+                text_editor::Cursor {
+                    position: text_editor::Position { line: 0, column: 9 },
+                    selection: Some(text_editor::Position { line: 0, column: 5 }),
+                },
+            );
+            live.attachments.push(Attachment {
+                path: "/fixture/composer-image.png".into(),
+                reference: Some(chat::ImageReference {
+                    id: uuid::Uuid::new_v4(),
+                    number: 17,
+                    device: uuid::Uuid::new_v4(),
+                    name: "Original composer image".into(),
+                    sha256: "a".repeat(64),
+                    extension: "png".into(),
+                }),
+            });
+            let incident = live
+                .failure_ui
+                .incidents
+                .iter()
+                .find(|incident| live.incident_has_child_detail(incident, "selected-child"))
+                .unwrap();
+            let key = incident.key.clone();
+            let summary = incident.summary.clone();
+            assert_eq!(live.failure_details(&key).as_deref(), Some(raw.as_str()));
+            assert!(
+                live.failure_ui
+                    .child_item("selected-child", "selected-connection")
+                    .is_some()
+            );
+            assert!(
+                live.failure_ui
+                    .incidents
+                    .iter()
+                    .any(|incident| live.incident_has_child_detail(incident, "failed-other"))
+            );
+            assert_eq!(
+                live.timeline_activity(false),
+                Some((Some(Icon::AgentWaiting), "Waiting".into()))
+            );
+            let before = (
+                live.composer.text(),
+                live.composer.cursor(),
+                live.attachments.clone(),
+                live.revision,
+                live.next_command,
+            );
+            let preserve = |live: &Runtime| {
+                assert_eq!(
+                    (
+                        live.composer.text(),
+                        live.composer.cursor(),
+                        live.attachments.clone(),
+                        live.revision,
+                        live.next_command
+                    ),
+                    before
+                );
+                assert!(live.pending.is_none() && live.queued.is_none());
+                assert_eq!(live.selected_subagent.as_deref(), Some("selected-child"));
+            };
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.context_inspector_open = false;
+            let mut target = live.target;
+            target.card = app.workspace.focused().unwrap();
+            live.target = target;
+            app.card_state_mut(target.card).unwrap().kind = CardKind::Chat(live.session.clone());
+            app.cards
+                .insert(target.card, CardRuntime::Chat(Box::new(live)));
+            let shortcuts = crate::settings::KeyboardShortcuts::default();
+            let mut renderer = crate::app::tests::headless_renderer();
+            let (mut cache, actions) = {
+                let live = app.chat_runtime_mut(target).unwrap();
+                let mut ui = mount(live, &shortcuts, width, Cache::new(), &mut renderer);
+                let full = surface(&mut ui, &renderer);
+                let text = full.text.join("\n");
+                assert_eq!(
+                    text.matches("resets 3:40pm (America/Vancouver)").count(),
+                    1,
+                    "full selected view at{width}px: {text}"
+                );
+                assert!(
+                    !text.contains("request-id:"),
+                    "raw originals stay behind deliberate disclosure: {text}"
+                );
+                assert!(
+                    text.contains("Waiting")
+                        && text.contains("Connection interrupted")
+                        && text.contains("1 working")
+                        && text.contains("1 waiting"),
+                    "selected status, independent parent/child activity remain truthful: {text}"
+                );
+                assert!(
+                    text.contains("Image 17"),
+                    "actual composer attachment chip remains mounted"
+                );
+                let label = format!("Show technical details for {summary}");
+                assert_eq!(
+                    full.buttons
+                        .iter()
+                        .filter(|(name, _)| name == &label)
+                        .count(),
+                    usize::from(diagnostics)
+                );
+                assert_eq!(
+                    full.buttons
+                        .iter()
+                        .filter(
+                            |(name, _)| name == &format!("Copy original diagnostics for {summary}")
+                        )
+                        .count(),
+                    usize::from(diagnostics)
+                );
+                preserve(live);
+                let actions = if diagnostics {
+                    ui.operate(
+                        &renderer,
+                        &mut operation::focusable::focus::<()>(card_control_id(
+                            target.card,
+                            "chat-composer",
+                        )),
+                    );
+                    activate(&mut ui, &mut renderer, target, &key, &label, false)
+                } else {
+                    Vec::new()
+                };
+                (ui.into_cache(), actions)
+            };
+            for action in actions {
+                assert_eq!(app.handle_chat_ui(action).units(), 0);
+                preserve(app.chat_runtime_mut(target).unwrap());
+            }
+            if diagnostics {
+                let actions = {
+                    let live = app.chat_runtime_mut(target).unwrap();
+                    assert!(live.failure_ui.expanded.contains(&key));
+                    assert_eq!(live.failure_preview(&key), Some((raw.as_str(), false)));
+                    let mut ui = mount(live, &shortcuts, width, cache, &mut renderer);
+                    let full = surface(&mut ui, &renderer);
+                    let text = full.text.join("\n");
+                    assert!(
+                        text.contains(&raw),
+                        "full native selected view includes complete expanded original"
+                    );
+                    let label = format!("Copy original diagnostics for {summary}");
+                    let bounds = full
+                        .buttons
+                        .iter()
+                        .find(|(name, _)| name == &label)
+                        .unwrap()
+                        .1;
+                    assert!(
+                        bounds.x0 >= 0.0
+                            && bounds.x1 <= f64::from(width)
+                            && bounds.y1 > bounds.y0
+                            && bounds.y1 <= 1200.0
+                    );
+                    let actions = activate(&mut ui, &mut renderer, target, &key, &label, true);
+                    cache = ui.into_cache();
+                    actions
+                };
+                for action in actions {
+                    let copy = matches!(action, Action::CopyFailure(..));
+                    let task = app.handle_chat_ui(action);
+                    if copy {
+                        let copied = tokio::runtime::Builder::new_current_thread()
+                            .enable_time()
+                            .build()
+                            .unwrap()
+                            .block_on(async {
+                                let mut stream = iced::runtime::task::into_stream(task)
+                                    .expect("actual Copy effect");
+                                tokio::time::timeout(Duration::from_secs(1), async {
+                                    while let Some(effect) = stream.next().await {
+                                        if let iced::runtime::Action::Clipboard(
+                                            iced::runtime::clipboard::Action::Write {
+                                                contents,
+                                                ..
+                                            },
+                                        ) = effect
+                                        {
+                                            return contents;
+                                        }
+                                    }
+                                    panic!("Copy must retain the exact original");
+                                })
+                                .await
+                                .expect("bounded Copy effect")
+                            });
+                        assert_eq!(copied, raw);
+                    } else {
+                        assert_eq!(task.units(), 0);
+                    }
+                    preserve(app.chat_runtime_mut(target).unwrap());
+                }
+            }
+            let mut snapshot = app
+                .chat_runtime_mut(target)
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .clone();
+            snapshot.generation += 1;
+            snapshot.subagents[0].waiting = false;
+            snapshot.subagents[0].detail =
+                "Reading the selected patch without losing progress".into();
+            handle.publish_snapshot_for_test(snapshot);
+            let live = app.chat_runtime_mut(target).unwrap();
+            live.refresh();
+            assert_eq!(
+                live.timeline_activity(false),
+                Some((
+                    Some(Icon::AgentWorking),
+                    "Reading the selected patch without losing progress".into()
+                ))
+            );
+            let mut ui = mount(live, &shortcuts, width, cache, &mut renderer);
+            let text = surface(&mut ui, &renderer).text.join("\n");
+            assert!(text.contains("Reading the selected patch without losing progress"));
+            assert!(
+                text.contains("resets 3:40pm"),
+                "authentic prior limit history remains readable"
+            );
+            assert!(
+                live.failure_ui
+                    .incidents
+                    .iter()
+                    .all(|incident| !live.incident_has_child_detail(incident, "selected-child")),
+                "current ordinary progress is not a historical ChildDetail source"
+            );
+            assert_eq!(live.failure_details(&key).as_deref(), Some(raw.as_str()));
+            assert!(
+                live.failure_ui
+                    .child_item("selected-child", "selected-limit-history")
+                    .is_some()
+            );
+            assert!(
+                live.failure_ui
+                    .child_item("selected-child", "selected-connection")
+                    .is_some()
+            );
+            assert_eq!(live.composer.text(), before.0);
+            assert_eq!(live.composer.cursor(), before.1);
+            assert_eq!(live.attachments, before.2);
+            assert!(live.pending.is_none() && live.queued.is_none());
+        }
+    }
+}
+
+#[test]
 fn waiting_child_quota_detail_without_items_is_projected_and_does_not_hide_other_work() {
     let (mut runtime, handle) = frame_cost::live_runtime(&[]);
     let raw = quota("1:30pm", "waiting-child-only");
