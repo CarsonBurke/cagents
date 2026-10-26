@@ -2705,9 +2705,9 @@ impl StateStore {
         prune_transcript_directory(directory, &live, retention)
     }
 
-    /// Every terminal id storage still knows about, from both tables that can
-    /// name one: a recipe row can outlive its transcript metadata and vice
-    /// versa, and either is reason enough to keep the file.
+    /// Every terminal id storage still knows about. A recipe, transcript row,
+    /// or retained descriptor (including compacted history) is reason enough
+    /// to keep the file.
     pub fn live_terminal_ids(&self) -> Result<HashSet<String>> {
         let inner = self.lock_inner()?;
         ensure_open(&inner)?;
@@ -3251,6 +3251,22 @@ fn collect_live_terminal_ids(connection: &Connection, live: &mut HashSet<String>
     for row in statement.query_map([], |row| row.get::<_, String>(0))? {
         let terminal: TerminalSession = from_json("archived terminal", &row?)?;
         live.insert(terminal.id.to_string());
+    }
+    // Compaction moves the original terminal identity out of the live tables.
+    // Read archives last so an atomic compaction between these queries cannot
+    // make a retained transcript look orphaned. Older windows have no archive.
+    if connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'closed_card_archives')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )? {
+        let mut statement = connection.prepare(
+            "SELECT terminal_id FROM closed_card_archives WHERE kind_tag = 'terminal'",
+        )?;
+        for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+            let terminal: TerminalId = parse_id("archived terminal", &row?)?;
+            live.insert(terminal.to_string());
+        }
     }
     Ok(())
 }
@@ -12628,6 +12644,115 @@ mod tests {
                 .cards
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn compacted_terminal_transcripts_survive_reopen_and_pruning() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("archived-terminal.sqlite3");
+        let transcripts = directory.path().join("transcripts");
+        fs::create_dir(&transcripts).unwrap();
+        let boot_id = boot("archived-transcript");
+        let store = StateStore::open(&path, boot_id.clone()).unwrap();
+        let mut workspace = workspace_with_terminal(&boot_id);
+        let card = workspace.cards[0].id;
+        let CardKind::Terminal(terminal) = &mut workspace.cards[0].kind else {
+            unreachable!();
+        };
+        let id = terminal.id;
+        let transcript = transcripts.join(format!("{id}.log"));
+        terminal.transcript_path = Some(transcript.clone());
+        let bytes = b"original closed terminal output\n";
+        fs::write(&transcript, bytes).unwrap();
+        let original = fs::metadata(&transcript).unwrap();
+        let orphan = transcripts.join(format!("{}.log", TerminalId::new()));
+        fs::write(&orphan, b"unrelated orphan").unwrap();
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        workspace.cards[0].existence = closed_by_user();
+        workspace.focused = None;
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(store.compact_closed_cards(i64::MAX).unwrap(), 1);
+        {
+            let inner = store.lock_inner().unwrap();
+            for table in ["cards", "terminal_recipes", "transcript_metadata"] {
+                assert_eq!(
+                    inner
+                        .connection
+                        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                            .get::<_, i64>(0),)
+                        .unwrap(),
+                    0,
+                    "the transcript must be claimed by its archive alone"
+                );
+            }
+        }
+        drop(store);
+        let store = StateStore::open(&path, boot_id).unwrap();
+        let saved = store.load_card(card, None).unwrap().unwrap();
+        assert!(matches!(&saved.kind, CardKind::Terminal(terminal)
+            if terminal.id == id && terminal.transcript_path.as_ref() == Some(&transcript)));
+        let local_ids = store.live_terminal_ids().unwrap();
+        let other_window_ids = read_live_terminal_ids(&path).unwrap();
+        let report = store
+            .prune_transcripts(&transcripts, HashSet::new(), TranscriptRetention::default())
+            .unwrap();
+        assert_eq!(report.removed_orphaned, 1);
+        assert_eq!(report.removed_oversized, 0);
+        assert_eq!(report.removed_for_budget, 0);
+        assert_eq!(report.retained, 1);
+        assert!(
+            !orphan.exists(),
+            "real unrelated orphans are still reclaimed"
+        );
+        assert_eq!(fs::read(&transcript).unwrap(), bytes);
+        let after = fs::metadata(&transcript).unwrap();
+        assert_eq!((after.dev(), after.ino()), (original.dev(), original.ino()));
+        assert!(local_ids.contains(&id.to_string()));
+        assert_eq!(other_window_ids, local_ids);
+
+        // A reader of an actual pre-archive schema must not migrate it merely
+        // to collect liveness. Build that schema from its original migration.
+        let legacy_path = directory.path().join("legacy-window.sqlite3");
+        let mut legacy = Connection::open(&legacy_path).unwrap();
+        let transaction = legacy.transaction().unwrap();
+        migrate_to_v1(&transaction).unwrap();
+        transaction.pragma_update(None, "user_version", 1).unwrap();
+        transaction.commit().unwrap();
+        drop(legacy);
+        assert!(read_live_terminal_ids(&legacy_path).unwrap().is_empty());
+        let legacy =
+            Connection::open_with_flags(&legacy_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(
+            legacy
+                .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            1
+        );
+        assert!(!legacy.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'closed_card_archives')",
+            [], |row| row.get::<_, bool>(0),
+        ).unwrap());
+
+        // Damaged attribution must stop pruning before any files are removed.
+        // The compacted archive is still a claim, even without live-table rows.
+        fs::write(&orphan, b"keep when attribution is unavailable").unwrap();
+        store.lock_inner().unwrap().connection.execute(
+            "UPDATE closed_card_archives SET terminal_id = 'invalid-terminal-id' WHERE card_id = ?1",
+            [card.to_string()],
+        ).unwrap();
+        assert!(read_live_terminal_ids(&path).is_err());
+        assert!(
+            store
+                .prune_transcripts(&transcripts, HashSet::new(), TranscriptRetention::default(),)
+                .is_err()
+        );
+        assert!(orphan.exists());
+        assert_eq!(fs::read(&transcript).unwrap(), bytes);
+        let after = fs::metadata(&transcript).unwrap();
+        assert_eq!((after.dev(), after.ino()), (original.dev(), original.ino()));
     }
 
     #[test]
