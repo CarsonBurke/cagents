@@ -8160,7 +8160,10 @@ impl Cagents {
             None
         };
         let action = self.handle_chat_action(action);
-        Task::batch(focus.into_iter().chain(std::iter::once(action)))
+        match focus {
+            Some(focus) => Task::batch([focus, action]),
+            None => action,
+        }
     }
     fn handle_chat_action(&mut self, action: Action) -> Task<Message> {
         if let Some(target) = action.mutation_target()
@@ -12050,6 +12053,64 @@ mod tests {
 
     #[test]
     fn image_gallery_keeps_chat_nonmodal_and_reuses_the_transcript_handle() {
+        fn focused_after(
+            app: &Cagents,
+            card: CardId,
+            task: Task<Message>,
+            initial: widget::Id,
+        ) -> Option<widget::Id> {
+            use iced::advanced::widget::{Operation, operation};
+            use iced::futures::StreamExt;
+            use iced::runtime::{UserInterface, user_interface::Cache};
+            let mut renderer = crate::app::tests::headless_renderer();
+            let mut ui = UserInterface::build(
+                app.chat_view(card),
+                iced::Size::new(640.0, 800.0),
+                Cache::new(),
+                &mut renderer,
+            );
+            ui.operate(&renderer, &mut operation::focusable::focus::<()>(initial));
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            executor.block_on(async {
+                if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                    while let Ok(Some(action)) =
+                        tokio::time::timeout(Duration::from_millis(250), stream.next()).await
+                    {
+                        match action {
+                            iced::runtime::Action::Widget(mut operation) => {
+                                ui.operate(&renderer, operation.as_mut());
+                            }
+                            _ => panic!("gallery focus must not launch another effect"),
+                        }
+                    }
+                }
+            });
+            executor.shutdown_background();
+            #[derive(Default)]
+            struct Focus(Option<widget::Id>);
+            impl Operation for Focus {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn focusable(
+                    &mut self,
+                    id: Option<&widget::Id>,
+                    _: iced::Rectangle,
+                    state: &mut dyn operation::Focusable,
+                ) {
+                    if state.is_focused() {
+                        assert!(self.0.is_none(), "only one native control owns focus");
+                        self.0 = id.cloned();
+                    }
+                }
+            }
+            let mut focused = Focus::default();
+            ui.operate(&renderer, &mut focused);
+            focused.0
+        }
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
         let runtime = match app.cards.get_mut(&card).unwrap() {
@@ -12079,7 +12140,12 @@ mod tests {
             .into(),
         ];
         let target = runtime.target;
-        drop(app.handle_chat_ui(Action::OpenImage(target, "image".into())));
+        let opened = app.handle_chat_ui(Action::OpenImage(target, "image".into()));
+        assert_eq!(
+            focused_after(&app, card, opened, card_control_id(card, "chat-composer")),
+            Some(images::canvas_focus_id()),
+            "opening the gallery focuses its canvas through a real widget operation"
+        );
         assert!(app.chat_ui.image_viewer.is_some());
         assert!(!app.modal_is_open());
         assert!(app.dialog().is_none());
@@ -12115,6 +12181,23 @@ mod tests {
             assert!(iced::runtime::task::into_stream(task).is_none());
             assert_eq!(app.chat_ui.image_viewer.as_ref().unwrap().reset, 0);
         }
+        let stale_close = app
+            .chat_ui
+            .image_viewer
+            .as_ref()
+            .unwrap()
+            .callback(images::ViewerCommand::Close);
+        let task = app.handle_chat_ui(Action::OpenImage(target, "image".into()));
+        assert_eq!(
+            focused_after(&app, card, task, card_control_id(card, "chat-composer")),
+            Some(images::canvas_focus_id())
+        );
+        let ignored = app.handle_chat_ui(stale_close);
+        assert_eq!(
+            focused_after(&app, card, ignored, images::canvas_focus_id()),
+            Some(images::canvas_focus_id()),
+            "a stale close leaves the active keyboard holder and composer unchanged"
+        );
         let stale_selection = app
             .chat_ui
             .image_viewer
