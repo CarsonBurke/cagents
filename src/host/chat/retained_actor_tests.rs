@@ -813,6 +813,14 @@ fn retained_turn_final_action(action: &str) {
     let next = proof("second");
     lease = Some(crate::daemon::HostLease::acquire(&paths, &next).unwrap());
     *active_proof.lock().unwrap() = next.clone();
+    // Inspect the actual orphan under the successor's lease before adoption;
+    // its issued source, not a private Host alias list, witnesses cleanup custody.
+    let (inspected_console, _) = crate::terminal::inspect_holder(
+        &crate::terminal::holder::socket(&crate::terminal::holder::directory().unwrap(), id),
+        &pair,
+        &next,
+    )
+    .unwrap();
     let mut state = HostState::new(next);
     state.enable_holder_recovery();
     state.install_model(super::super::model::Registry::at(&path).unwrap());
@@ -827,9 +835,9 @@ fn retained_turn_final_action(action: &str) {
     let restored_console = {
         let state = successor.lock().unwrap();
         let terminal = &state.terminals[&id];
-        // Orphan discovery appends the actual inspected holder source to these
-        // issued aliases. Keep that proof for cleanup, independently of UI state.
-        assert_eq!(Some(&terminal.session), terminal.upgrade_sources.last());
+        // Keep the actual holder's issued source for cleanup, independently
+        // of the public current-daemon presentation or later native binding.
+        assert_eq!(terminal.session, inspected_console.source);
         assert_eq!(
             terminal.session.continuity.live_proof(),
             Some(first.clone())
