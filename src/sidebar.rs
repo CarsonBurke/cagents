@@ -17479,8 +17479,7 @@ pub(crate) mod tests {
             .as_widget_mut()
             .operate(&mut tree, Layout::new(&node), &renderer, &mut focus);
         assert_eq!(
-            focus.0,
-            after_press_focus.0,
+            focus.0, after_press_focus.0,
             "the post-press native focus survives the cache hit"
         );
         assert_eq!(
