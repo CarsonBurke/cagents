@@ -6101,6 +6101,7 @@ impl RepositoryRuntime {
                 if background {
                     // Restoring the caret is not a foreground navigation.
                     self.pending_editor_focus = None;
+                    self.refresh_find_matches();
                     let diff = if self.source_surface == SourceSurface::Diff {
                         self.ensure_current_diff(card)
                     } else {
@@ -12603,9 +12604,11 @@ mod tests {
             card,
             watch: old_watch,
         });
-        assert!(iced::runtime::task::into_stream(departed_wake).is_none());
+        // An empty batched Task can still expose an empty stream. Judge the
+        // preserved document/read state rather than that container detail.
         assert!(!runtime.document_reading);
         assert!(!runtime.document_reload_pending);
+        finish_navigation_task(&mut runtime, departed_wake).await;
         assert_eq!(runtime.descriptor, target);
         assert_eq!(runtime.selected_path(), Some(Path::new("image.png")));
         let DocumentState::Failed { path, message } = &runtime.document else {

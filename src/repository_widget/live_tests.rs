@@ -109,7 +109,10 @@ async fn native_background_tabs_symlink_target_and_close_reopen() {
         card: a,
         watch: departed,
     });
-    assert!(iced::runtime::task::into_stream(ignored).is_none());
+    assert!(!first.document_reading);
+    assert!(!first.document_reload_pending);
+    settle(&mut first, ignored).await;
+    assert_eq!(first.editor_text().as_deref(), Some("AA"));
     std::fs::write(root.path().join("target/a.txt"), "AAA").unwrap();
     text(a, &mut first, "AAA").await;
 }
@@ -280,9 +283,12 @@ async fn clean_reload_invalidates_revision_zero_find_cache() {
     let path = root.path().join("live.txt");
     std::fs::write(&path, "needle needle").unwrap();
     let (card, mut runtime) = opened(root.path(), "live.txt").await;
-    runtime.find_open = true;
-    runtime.find_query = "needle".into();
-    let task = runtime.find_task(card);
+    let task = runtime.update(RepositoryAction::OpenFind { card });
+    settle(&mut runtime, task).await;
+    let task = runtime.update(RepositoryAction::FindQueryChanged {
+        card,
+        query: "needle".into(),
+    });
     settle(&mut runtime, task).await;
     assert_eq!(runtime.find_total, 2);
     let old_key = runtime.find_cache.clone();
