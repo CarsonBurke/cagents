@@ -45,7 +45,7 @@ pub(super) struct State {
     selected_by_reader: bool,
     /// Native geometry before indexing can shorten the list and clamp its
     /// offset. Shared with keyboard reveals so they do not wait for a redraw.
-    viewport: Arc<Mutex<Option<ReaderViewport>>>,
+    reader: Arc<Mutex<Reader>>,
     /// What earlier openings read, so reopening reads only what changed.
     cache: Arc<catalog::Cache>,
     indexer: Option<iced::task::Handle>,
@@ -62,6 +62,38 @@ impl State {
             .and_then(|&index| self.rows.get(index))
             .map(|row| row.card)
     }
+
+    fn reset_reader(&mut self) {
+        if let Ok(mut reader) = self.reader.lock() {
+            reader.active = false;
+            reader.pending = None;
+        }
+        self.reader = Arc::default();
+    }
+}
+
+struct Reader {
+    active: bool,
+    viewport: Option<ReaderViewport>,
+    pending: Option<PendingReveal>,
+}
+
+impl Default for Reader {
+    fn default() -> Self {
+        Self {
+            active: true,
+            viewport: None,
+            pending: None,
+        }
+    }
+}
+
+struct PendingReveal {
+    card: CardId,
+    previous: usize,
+    selected: usize,
+    viewport: Option<ReaderViewport>,
+    force: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -331,11 +363,9 @@ fn index(
 
 /// Reveal against the scrollable's current layout, including short or scaled windows.
 struct RevealSelection {
-    selected: usize,
-    /// Indexing follows a moved selection only while its old row was visible.
-    /// A reader who scrolled elsewhere keeps their own viewport.
-    previous: Option<(usize, Option<ReaderViewport>)>,
-    viewport: Arc<Mutex<Option<ReaderViewport>>>,
+    /// Every queued operation consumes the latest intent. A keyboard reveal
+    /// can be followed by more indexing before any native operation runs.
+    reader: Arc<Mutex<Reader>>,
 }
 impl iced::advanced::widget::Operation<Message> for RevealSelection {
     fn traverse(
@@ -355,29 +385,42 @@ impl iced::advanced::widget::Operation<Message> for RevealSelection {
         if id != Some(&widget::Id::new("conversation-resume.results")) {
             return;
         }
+        let Ok(mut reader) = self.reader.lock() else {
+            return;
+        };
+        if !reader.active {
+            return;
+        }
+        let Some(pending) = reader.pending.take() else {
+            return;
+        };
         let current = ReaderViewport {
             top: translation.y,
             height: bounds.height,
         };
-        if let Ok(mut viewport) = self.viewport.lock() {
-            *viewport = Some(current);
-        }
-        if let Some((previous, viewport)) = self.previous {
-            if !viewport.unwrap_or(current).contains(previous) {
+        reader.viewport = Some(current);
+        if !pending.force {
+            if !pending
+                .viewport
+                .unwrap_or(current)
+                .contains(pending.previous)
+            {
                 return;
             }
         }
-        let y =
-            resume_selection_offset(self.selected, bounds.height, content.height, translation.y);
+        let y = resume_selection_offset(
+            pending.selected,
+            bounds.height,
+            content.height,
+            translation.y,
+        );
         state.scroll_to(
             iced::advanced::widget::operation::scrollable::AbsoluteOffset {
                 x: None,
                 y: Some(y),
             },
         );
-        if let Ok(mut viewport) = self.viewport.lock() {
-            *viewport = Some(ReaderViewport { top: y, ..current });
-        }
+        reader.viewport = Some(ReaderViewport { top: y, ..current });
     }
 }
 fn resume_selection_offset(selected: usize, viewport: f32, content: f32, current: f32) -> f32 {
@@ -416,6 +459,9 @@ impl Cagents {
         }
         match key {
             keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
+                if let Ok(mut reader) = self.resume_ui.reader.lock() {
+                    reader.pending = None;
+                }
                 let count = self.resume_ui.visible.len().min(self.resume_ui.limit);
                 self.resume_ui.selected_by_reader = count > 0;
                 self.resume_ui.selected =
@@ -423,6 +469,9 @@ impl Cagents {
                 Some(self.reveal_resume_selection())
             }
             keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
+                if let Ok(mut reader) = self.resume_ui.reader.lock() {
+                    reader.pending = None;
+                }
                 self.resume_ui.selected_by_reader = !self.resume_ui.visible.is_empty();
                 self.resume_ui.selected = self.resume_ui.selected.saturating_sub(1);
                 Some(self.reveal_resume_selection())
@@ -432,10 +481,27 @@ impl Cagents {
     }
 
     fn reveal_resume_selection(&self) -> Task<Message> {
+        let selected = self.resume_ui.selected;
+        let card = self
+            .resume_ui
+            .visible
+            .get(selected)
+            .and_then(|&index| self.resume_ui.rows.get(index))
+            .map(|row| row.card);
+        if let Ok(mut reader) = self.resume_ui.reader.lock() {
+            reader.pending = card.map(|card| PendingReveal {
+                card,
+                previous: selected,
+                selected,
+                viewport: None,
+                force: true,
+            });
+        }
+        if card.is_none() {
+            return Task::none();
+        }
         iced::advanced::widget::operate(RevealSelection {
-            selected: self.resume_ui.selected,
-            previous: None,
-            viewport: self.resume_ui.viewport.clone(),
+            reader: self.resume_ui.reader.clone(),
         })
         .map(cosmic::Action::App)
     }
@@ -511,7 +577,7 @@ impl Cagents {
         state.limit = PAGE;
         state.selected = 0;
         state.selected_by_reader = false;
-        state.viewport = Arc::default();
+        state.reset_reader();
         let generation = state.generation;
         let cache = state.cache.clone();
         state.cancel = Arc::default();
@@ -623,20 +689,40 @@ impl Cagents {
                     return Task::none();
                 }
                 let previous = self.resume_ui.selected;
-                let viewport = self.resume_ui.viewport.lock().ok().and_then(|value| *value);
                 let selected = self.resume_ui.reader_selection();
                 self.resume_indexed(progress);
                 if selected.is_some()
                     && selected == self.resume_ui.reader_selection()
                     && previous != self.resume_ui.selected
                 {
+                    if let Ok(mut reader) = self.resume_ui.reader.lock() {
+                        let card = selected.unwrap();
+                        if let Some(pending) = reader
+                            .pending
+                            .as_mut()
+                            .filter(|pending| pending.card == card)
+                        {
+                            pending.selected = self.resume_ui.selected;
+                        } else {
+                            reader.pending = Some(PendingReveal {
+                                card,
+                                previous,
+                                selected: self.resume_ui.selected,
+                                viewport: reader.viewport,
+                                force: false,
+                            });
+                        }
+                    }
                     iced::advanced::widget::operate(RevealSelection {
-                        selected: self.resume_ui.selected,
-                        previous: Some((previous, viewport)),
-                        viewport: self.resume_ui.viewport.clone(),
+                        reader: self.resume_ui.reader.clone(),
                     })
                     .map(cosmic::Action::App)
                 } else {
+                    if selected != self.resume_ui.reader_selection() {
+                        if let Ok(mut reader) = self.resume_ui.reader.lock() {
+                            reader.pending = None;
+                        }
+                    }
                     Task::none()
                 }
             }
@@ -789,6 +875,7 @@ impl Cagents {
         state.limit = PAGE;
         state.selected = 0;
         state.selected_by_reader = false;
+        state.reset_reader();
         state.visible = resume_matches(&state.rows, &state.query, state.scope.as_ref());
     }
 
@@ -908,6 +995,7 @@ impl Cagents {
         let state = &mut self.resume_ui;
         state.open = false;
         state.selected_by_reader = false;
+        state.reset_reader();
         state.indexing = None;
         state.replace = None;
         state.cancel.store(true, Ordering::Relaxed);
@@ -1063,13 +1151,15 @@ impl Cagents {
             widget::scrollable(widget::column::with_children(rows).spacing(ROW_SPACING))
                 .id(widget::Id::new("conversation-resume.results"))
                 .on_scroll({
-                    let observed = state.viewport.clone();
+                    let observed = state.reader.clone();
                     move |viewport| {
                         if let Ok(mut observed) = observed.lock() {
-                            *observed = Some(ReaderViewport {
-                                top: viewport.absolute_offset().y,
-                                height: viewport.bounds().height,
-                            });
+                            if observed.active {
+                                observed.viewport = Some(ReaderViewport {
+                                    top: viewport.absolute_offset().y,
+                                    height: viewport.bounds().height,
+                                });
+                            }
                         }
                         Message::ResumeConversation(Action::ViewportObserved)
                     }
@@ -1284,7 +1374,7 @@ mod tests {
     }
 
     #[test]
-    fn indexed_arrivals_reveal_a_moved_selection_only_while_its_old_row_is_visible() {
+    fn batched_indexing_and_keyboard_intent_reveal_only_the_final_selected_conversation() {
         use iced::advanced::{
             Layout, layout,
             widget::{Operation, Tree, operation},
@@ -1319,154 +1409,223 @@ mod tests {
             iced::Size::new(880.0, 480.0),
         ] {
             for shrinking in [false, true] {
-                for manually_scrolled in [false, true] {
-                    let mut app = crate::app::tests::context_inspector_test_app(false);
-                    app.resume_ui.open = true;
-                    app.resume_ui.limit = PAGE;
-                    let generation = app.resume_ui.generation;
-                    list(
-                        &mut app,
-                        generation,
-                        (0..if shrinking { 100 } else { 24 })
-                            .map(|_| saved(directory.path()))
-                            .collect(),
-                    );
-                    if shrinking {
-                        drop(app.update_resume(Action::Query("peripheral".into())));
-                    }
-                    for _ in 0..if shrinking { 70 } else { 1 } {
-                        drop(arrow(&mut app, keyboard::key::Named::ArrowDown));
-                    }
-                    let selected = app.resume_ui.reader_selection().unwrap();
-                    let mut before = app.resume_dialog().unwrap();
-                    let mut tree = Tree::new(before.as_widget());
-                    let limits = layout::Limits::new(iced::Size::ZERO, size);
-                    let node = before.as_widget_mut().layout(&mut tree, &renderer, &limits);
-                    let mut scroll = operation::scrollable::scroll_to::<()>(
-                        widget::Id::new("conversation-resume.results"),
-                        iced::widget::scrollable::AbsoluteOffset {
-                            x: None,
-                            y: Some(match (shrinking, manually_scrolled) {
-                                (true, false) => 70.0 * (ROW_HEIGHT + ROW_SPACING),
-                                (true, true) => 85.0 * (ROW_HEIGHT + ROW_SPACING),
-                                (false, true) => 1500.0,
-                                (false, false) => 0.0,
-                            }),
-                        },
-                    );
-                    before.as_widget_mut().operate(
-                        &mut tree,
-                        Layout::new(&node),
-                        &renderer,
-                        &mut scroll,
-                    );
-                    let mut old = Viewport::default();
-                    before.as_widget_mut().operate(
-                        &mut tree,
-                        Layout::new(&node),
-                        &renderer,
-                        &mut old,
-                    );
-                    // Let the actual native scroll callback observe geometry
-                    // before indexing shortens and clamps the scrollable.
-                    let mut messages = Vec::new();
-                    before.as_widget_mut().update(
-                        &mut tree,
-                        &iced::Event::Window(iced::window::Event::RedrawRequested(
-                            iced::time::Instant::now(),
-                        )),
-                        Layout::new(&node),
-                        iced::mouse::Cursor::Unavailable,
-                        &renderer,
-                        &mut iced::advanced::clipboard::Null,
-                        &mut iced::advanced::Shell::new(&mut messages),
-                        &iced::Rectangle::with_size(size),
-                    );
-                    assert_eq!(app.resume_ui.viewport.lock().unwrap().unwrap().top, old.top);
-                    drop(before);
-
-                    let progress = if shrinking {
-                        Progress::Found {
-                            conversations: Vec::new(),
-                            titles: app.resume_ui.rows[..70]
-                                .iter()
-                                .map(|row| (row.card, "An unrelated conversation".into()))
+                for navigation_between_batches in [false, true] {
+                    for manually_scrolled in [false, true] {
+                        let mut app = crate::app::tests::context_inspector_test_app(false);
+                        app.resume_ui.open = true;
+                        app.resume_ui.limit = PAGE;
+                        let generation = app.resume_ui.generation;
+                        list(
+                            &mut app,
+                            generation,
+                            (0..if shrinking { 100 } else { 24 })
+                                .map(|_| saved(directory.path()))
                                 .collect(),
-                            read: 70,
-                        }
-                    } else {
-                        Progress::Saved {
-                            entries: (0..PAGE)
-                                .map(|_| {
-                                    let mut entry = saved(directory.path());
-                                    entry.updated_at_unix_ms = 2;
-                                    entry
-                                })
-                                .collect(),
-                            seeds: Arc::from([]),
-                            error: None,
-                        }
-                    };
-                    let task = app.update_resume(Action::Indexed(generation, progress));
-                    assert_eq!(app.resume_ui.reader_selection(), Some(selected));
-                    assert_eq!(app.resume_ui.selected, if shrinking { 0 } else { PAGE + 1 });
-                    let mut after = app.resume_dialog().unwrap();
-                    tree.diff(after.as_widget_mut());
-                    let node = after.as_widget_mut().layout(&mut tree, &renderer, &limits);
-                    let mut clamped = Viewport::default();
-                    after.as_widget_mut().operate(
-                        &mut tree,
-                        Layout::new(&node),
-                        &renderer,
-                        &mut clamped,
-                    );
-                    if shrinking {
-                        assert!(
-                            clamped.top < old.top,
-                            "the shortened native list must reproduce offset clamping"
                         );
-                    }
-                    iced::futures::executor::block_on(async {
-                        let mut effects = iced::runtime::task::into_stream(task)
-                            .expect("a moved reader selection returns its reveal operation");
-                        let Some(iced::runtime::Action::Widget(mut operation)) =
-                            effects.next().await
-                        else {
-                            panic!(
-                                "indexing must reveal through the actual native widget operation"
+                        if shrinking {
+                            drop(app.update_resume(Action::Query("peripheral".into())));
+                        }
+                        let mut key_reveal = Task::none();
+                        for _ in 0..if shrinking { 70 } else { 1 } {
+                            key_reveal = arrow(&mut app, keyboard::key::Named::ArrowDown);
+                        }
+                        let mut selected = app.resume_ui.reader_selection().unwrap();
+                        let mut before = app.resume_dialog().unwrap();
+                        let mut tree = Tree::new(before.as_widget());
+                        let limits = layout::Limits::new(iced::Size::ZERO, size);
+                        let node = before.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                        iced::futures::executor::block_on(async {
+                            let mut effects = iced::runtime::task::into_stream(key_reveal).unwrap();
+                            let Some(iced::runtime::Action::Widget(mut operation)) =
+                                effects.next().await
+                            else {
+                                panic!(
+                                    "the initial keyboard reveal must run before manual scrolling"
+                                );
+                            };
+                            before.as_widget_mut().operate(
+                                &mut tree,
+                                Layout::new(&node),
+                                &renderer,
+                                operation.as_mut(),
                             );
+                        });
+                        let mut scroll = operation::scrollable::scroll_to::<()>(
+                            widget::Id::new("conversation-resume.results"),
+                            iced::widget::scrollable::AbsoluteOffset {
+                                x: None,
+                                y: Some(match (shrinking, manually_scrolled) {
+                                    (true, false) => 70.0 * (ROW_HEIGHT + ROW_SPACING),
+                                    (true, true) => 85.0 * (ROW_HEIGHT + ROW_SPACING),
+                                    (false, true) => 1500.0,
+                                    (false, false) => 0.0,
+                                }),
+                            },
+                        );
+                        before.as_widget_mut().operate(
+                            &mut tree,
+                            Layout::new(&node),
+                            &renderer,
+                            &mut scroll,
+                        );
+                        let mut old = Viewport::default();
+                        before.as_widget_mut().operate(
+                            &mut tree,
+                            Layout::new(&node),
+                            &renderer,
+                            &mut old,
+                        );
+                        // Let the actual native scroll callback observe geometry
+                        // before indexing shortens and clamps the scrollable.
+                        let mut messages = Vec::new();
+                        before.as_widget_mut().update(
+                            &mut tree,
+                            &iced::Event::Window(iced::window::Event::RedrawRequested(
+                                iced::time::Instant::now(),
+                            )),
+                            Layout::new(&node),
+                            iced::mouse::Cursor::Unavailable,
+                            &renderer,
+                            &mut iced::advanced::clipboard::Null,
+                            &mut iced::advanced::Shell::new(&mut messages),
+                            &iced::Rectangle::with_size(size),
+                        );
+                        assert_eq!(
+                            app.resume_ui.reader.lock().unwrap().viewport.unwrap().top,
+                            old.top
+                        );
+                        drop(before);
+
+                        let progress = if shrinking {
+                            Progress::Found {
+                                conversations: Vec::new(),
+                                titles: app.resume_ui.rows[..35]
+                                    .iter()
+                                    .map(|row| (row.card, "An unrelated conversation".into()))
+                                    .collect(),
+                                read: 35,
+                            }
+                        } else {
+                            Progress::Saved {
+                                entries: (0..PAGE)
+                                    .map(|_| {
+                                        let mut entry = saved(directory.path());
+                                        entry.updated_at_unix_ms = 2;
+                                        entry
+                                    })
+                                    .collect(),
+                                seeds: Arc::from([]),
+                                error: None,
+                            }
                         };
+                        let first = app.update_resume(Action::Indexed(generation, progress));
+                        let key = if navigation_between_batches {
+                            let task = arrow(&mut app, keyboard::key::Named::ArrowDown);
+                            selected = app.resume_ui.reader_selection().unwrap();
+                            Some(task)
+                        } else {
+                            None
+                        };
+                        // The pinned native runtime drains several model messages
+                        // before executing their widget effects. Preserve the
+                        // original visibility intent and reveal the final index.
+                        let progress = if shrinking {
+                            Progress::Found {
+                                conversations: Vec::new(),
+                                titles: app.resume_ui.rows[35..70]
+                                    .iter()
+                                    .map(|row| (row.card, "An unrelated conversation".into()))
+                                    .collect(),
+                                read: 70,
+                            }
+                        } else {
+                            Progress::Saved {
+                                entries: (0..PAGE)
+                                    .map(|_| {
+                                        let mut entry = saved(directory.path());
+                                        entry.updated_at_unix_ms = 3;
+                                        entry
+                                    })
+                                    .collect(),
+                                seeds: Arc::from([]),
+                                error: None,
+                            }
+                        };
+                        let second = app.update_resume(Action::Indexed(generation, progress));
+                        assert_eq!(app.resume_ui.reader_selection(), Some(selected));
+                        assert_eq!(
+                            app.resume_ui.selected,
+                            if shrinking {
+                                usize::from(navigation_between_batches)
+                            } else {
+                                2 * PAGE + 1 + usize::from(navigation_between_batches)
+                            }
+                        );
+                        let mut after = app.resume_dialog().unwrap();
+                        tree.diff(after.as_widget_mut());
+                        let node = after.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                        let mut clamped = Viewport::default();
                         after.as_widget_mut().operate(
                             &mut tree,
                             Layout::new(&node),
                             &renderer,
-                            operation.as_mut(),
+                            &mut clamped,
                         );
-                    });
-                    let mut current = Viewport::default();
-                    after.as_widget_mut().operate(
-                        &mut tree,
-                        Layout::new(&node),
-                        &renderer,
-                        &mut current,
-                    );
-                    if manually_scrolled {
-                        assert_eq!(
-                            current.top, clamped.top,
-                            "indexing respects manual scrolling"
+                        if shrinking {
+                            assert!(
+                                clamped.top < old.top,
+                                "the shortened native list must reproduce offset clamping"
+                            );
+                        }
+                        iced::futures::executor::block_on(async {
+                            for task in std::iter::once(first)
+                                .chain(key)
+                                .chain(std::iter::once(second))
+                            {
+                                let mut effects = iced::runtime::task::into_stream(task).expect(
+                                    "a moved reader selection returns its reveal operation",
+                                );
+                                let Some(iced::runtime::Action::Widget(mut operation)) =
+                                    effects.next().await
+                                else {
+                                    panic!(
+                                        "indexing must reveal through the actual native widget operation"
+                                    );
+                                };
+                                after.as_widget_mut().operate(
+                                    &mut tree,
+                                    Layout::new(&node),
+                                    &renderer,
+                                    operation.as_mut(),
+                                );
+                            }
+                        });
+                        let mut current = Viewport::default();
+                        after.as_widget_mut().operate(
+                            &mut tree,
+                            Layout::new(&node),
+                            &renderer,
+                            &mut current,
                         );
-                    } else {
-                        let row_top = app.resume_ui.selected as f32 * (ROW_HEIGHT + ROW_SPACING);
-                        assert!(row_top >= current.top);
-                        assert!(row_top + ROW_HEIGHT <= current.top + current.height + 0.1);
+                        if manually_scrolled && !navigation_between_batches {
+                            assert_eq!(
+                                current.top, clamped.top,
+                                "indexing respects manual scrolling"
+                            );
+                        } else {
+                            let row_top =
+                                app.resume_ui.selected as f32 * (ROW_HEIGHT + ROW_SPACING);
+                            assert!(row_top >= current.top);
+                            assert!(row_top + ROW_HEIGHT <= current.top + current.height + 0.1);
+                        }
+                        drop(after);
+                        let unchanged =
+                            app.update_resume(Action::Indexed(generation, Progress::Counted(512)));
+                        assert!(
+                            iced::runtime::task::into_stream(unchanged).is_none(),
+                            "indexing progress without row movement must not scroll"
+                        );
                     }
-                    drop(after);
-                    let unchanged =
-                        app.update_resume(Action::Indexed(generation, Progress::Counted(512)));
-                    assert!(
-                        iced::runtime::task::into_stream(unchanged).is_none(),
-                        "indexing progress without row movement must not scroll"
-                    );
                 }
             }
         }
@@ -1583,6 +1742,92 @@ mod tests {
         assert_eq!(app.workspace.focused(), Some(original));
         assert_eq!(app.durable.cards.len(), 1);
         assert!(!app.resume_ui.open);
+    }
+
+    #[test]
+    fn queued_indexed_reveals_cannot_override_a_later_query_or_picker_scope() {
+        use iced::advanced::widget::operation::scrollable::{
+            AbsoluteOffset, RelativeOffset, Scrollable,
+        };
+        #[derive(Default)]
+        struct ScrollRequests(Vec<f32>);
+        impl Scrollable for ScrollRequests {
+            fn snap_to(&mut self, _: RelativeOffset<Option<f32>>) {}
+            fn scroll_to(&mut self, offset: AbsoluteOffset<Option<f32>>) {
+                if let Some(y) = offset.y {
+                    self.0.push(y);
+                }
+            }
+            fn scroll_by(&mut self, _: AbsoluteOffset, _: iced::Rectangle, _: iced::Rectangle) {}
+        }
+        let directory = tempfile::tempdir().unwrap();
+        for later in ["query", "unscope", "close", "filtered title"] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.resume_ui.open = true;
+            app.resume_ui.limit = PAGE;
+            let generation = app.resume_ui.generation;
+            list(
+                &mut app,
+                generation,
+                (0..24).map(|_| saved(directory.path())).collect(),
+            );
+            drop(app.update_resume(Action::Query("peripheral".into())));
+            drop(arrow(&mut app, keyboard::key::Named::ArrowDown));
+            let chosen = app.resume_ui.reader_selection().unwrap();
+            let mut newer = saved(directory.path());
+            newer.updated_at_unix_ms = 2;
+            let queued = app.update_resume(Action::Indexed(
+                generation,
+                Progress::Saved {
+                    entries: vec![newer],
+                    seeds: Arc::from([]),
+                    error: None,
+                },
+            ));
+            assert_eq!(app.resume_ui.reader_selection(), Some(chosen));
+            match later {
+                "query" => drop(app.update_resume(Action::Query("rust".into()))),
+                "unscope" => drop(app.update_resume(Action::Unscope)),
+                "close" => {
+                    drop(app.update_resume(Action::Close));
+                    app.resume_ui.open = true;
+                    app.resume_ui.generation += 1;
+                }
+                "filtered title" => drop(app.update_resume(Action::Indexed(
+                    generation,
+                    Progress::Found {
+                        conversations: Vec::new(),
+                        titles: vec![(chosen, "An unrelated conversation".into())],
+                        read: 1,
+                    },
+                ))),
+                _ => unreachable!(),
+            }
+            let mut requests = ScrollRequests::default();
+            iced::futures::executor::block_on(async {
+                let mut effects = iced::runtime::task::into_stream(queued).unwrap();
+                let Some(iced::runtime::Action::Widget(mut operation)) = effects.next().await
+                else {
+                    panic!("the queued indexing action must be a real widget operation");
+                };
+                operation.scrollable(
+                    Some(&widget::Id::new("conversation-resume.results")),
+                    iced::Rectangle::with_size(iced::Size::new(500.0, 200.0)),
+                    iced::Rectangle::with_size(iced::Size::new(500.0, 2600.0)),
+                    iced::Vector::new(0.0, 0.0),
+                    &mut requests,
+                );
+            });
+            assert!(
+                requests.0.is_empty(),
+                "{later} must retire the old indexed reveal"
+            );
+            let stale = app.update_resume(Action::Indexed(
+                generation.wrapping_sub(1),
+                Progress::Finished,
+            ));
+            assert!(iced::runtime::task::into_stream(stale).is_none());
+        }
     }
 
     #[test]
