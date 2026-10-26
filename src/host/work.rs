@@ -1580,7 +1580,7 @@ mod tests {
     }
 
     #[test]
-    fn watchers_are_sent_each_new_board_once_in_revision_order() {
+    fn watchers_keep_only_the_latest_pending_board_revision() {
         let host = super::super::service::test_host();
         let board = |generated_at_unix_ms, stale_after_days| Board {
             generated_at_unix_ms,
@@ -1618,7 +1618,7 @@ mod tests {
         publication.offer(&host, &board(3, 14), Some(1));
         assert_eq!(publication.revision, 2);
         assert_eq!(received(&first), [(1, 7)]);
-        assert_eq!(received(&second), [(1, 7), (2, 14)]);
+        assert_eq!(received(&second), [(2, 14)]);
     }
 
     #[test]
