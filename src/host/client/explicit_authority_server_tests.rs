@@ -543,14 +543,65 @@ fn actual_server_reauthenticates_the_issued_caller_and_never_replays_accepted_pt
     });
     handle.shutdown().unwrap();
     wait_until("original child worker cleanup", || original.is_completed());
-    assert!(
-        !server
+    // Shutdown deliberately retains this exact completed worker for history;
+    // it is not a request to retire its descriptor. The ordinary daemon poll
+    // does not remove these records either (close_terminal_attention contract).
+    wait_until("actual completion delivery", || {
+        server
             .host
             .lock()
             .unwrap()
-            .terminals
-            .contains_key(&child.id)
+            .replay_events(child.id, 0)
+            .unwrap()
+            .iter()
+            .any(|(_, event)| matches!(event, WireTerminalEvent::Completed { .. }))
+    });
+    {
+        let state = server.host.lock().unwrap();
+        assert!(state.terminals[&child.id].handle.same_worker(&original));
+        let ended = state.descriptor(reconnect, child.id).unwrap();
+        assert_eq!(ended.session.id, child.id);
+        assert_eq!(ended.session.launch, child.launch);
+        assert!(matches!(ended.session.continuity,
+            TerminalContinuity::RelaunchAvailable { ref recipe, .. } if recipe == &child.launch));
+        assert!(
+            state
+                .history_handle(reconnect, child.id)
+                .unwrap()
+                .same_worker(&original)
+        );
+        assert!(matches!(
+            state.surface_handle(reconnect, child.id),
+            Err(ProtocolError {
+                code: ProtocolErrorCode::TerminalUnavailable,
+                retryable: false,
+                ..
+            })
+        ));
+    }
+    // The public framed path must also refuse later input before any effect,
+    // while leaving the ended original available for read-only history.
+    handle
+        .input(b"MUST_NOT_REACH_CLOSED_PTY\n".to_vec())
+        .unwrap();
+    let events = handle.events();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let event = events
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("closed PTY input refusal");
+        if let TerminalEvent::InputRejected { operation, message } = event {
+            assert_eq!(operation, "write terminal input");
+            assert!(message.contains("this input was not sent"));
+            break;
+        }
+        assert!(Instant::now() < deadline, "missing closed PTY refusal");
+    }
+    assert_eq!(
+        fs::read(child.launch.working_directory.join("input")).unwrap(),
+        expected
     );
+    assert!(server.worker(child.id).same_worker(&original));
     handle.stop_for_test();
     drop(handle);
     drop(bootstrap);
