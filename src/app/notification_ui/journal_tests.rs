@@ -1065,7 +1065,7 @@ fn locally_read_session_stays_out_of_new_attention_after_stale_snapshot_without_
         id: uuid::Uuid::new_v4(),
         event: crate::notifications::Event::session(
             session,
-            Provider::Claude,
+            crate::agent::Provider::Claude,
             "/tmp".into(),
             crate::notifications::Evidence {
                 key: "read-before-broker-ack".into(),
