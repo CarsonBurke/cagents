@@ -50,9 +50,11 @@ fn enter(
     renderer: &mut cosmic::Renderer,
     target: Target,
     expected: Activation,
+    width: f32,
 ) -> (Action, Vec<Action>) {
     let mut activated = None;
     let mut cleanup = Vec::new();
+    let mut diagnostics = Vec::new();
     // Focusable::unfocus leaves a native ClearSelection pending. Keep each
     // event's cleanup separate from the one actual button/search activation.
     for (phase, event) in [
@@ -79,23 +81,39 @@ fn enter(
             },
         ),
     ] {
+        let mut before = Probe::default();
+        ui.operate(renderer, &mut before);
         let mut messages = Vec::new();
-        ui.update(
+        let (_, statuses) = ui.update(
             &[iced::Event::Keyboard(event)],
             iced::mouse::Cursor::Unavailable,
             renderer,
             &mut clipboard::Null,
             &mut messages,
         );
+        let mut after = Probe::default();
+        ui.operate(renderer, &mut after);
+        diagnostics.push(format!(
+            "{phase}: focus {:?} -> {:?}, status {statuses:?}, {} callbacks",
+            before.focused,
+            after.focused,
+            messages.len()
+        ));
         let mut blurred = false;
         for message in messages {
             let Message::ChatUi(action) = message else {
-                panic!("{expected:?} {phase}: unexpected message {message:?}")
+                panic!("{width}px {expected:?} {phase}: unexpected message {message:?}")
             };
             let owner = match (&action, expected) {
                 (Action::Composer(owner, text_editor::Action::ClearSelection), _) => {
-                    assert_eq!(*owner, target, "{expected:?} {phase}: exact blur owner");
-                    assert!(!blurred, "{expected:?} {phase}: one native blur per event");
+                    assert_eq!(
+                        *owner, target,
+                        "{width}px {expected:?} {phase}: exact blur owner"
+                    );
+                    assert!(
+                        !blurred,
+                        "{width}px {expected:?} {phase}: one native blur per event"
+                    );
                     blurred = true;
                     cleanup.push(action);
                     continue;
@@ -106,23 +124,117 @@ fn enter(
                     *owner
                 }
                 (Action::Composer(_, event), _) => panic!(
-                    "{expected:?} {phase}: only native blur is allowed, received {}",
+                    "{width}px {expected:?} {phase}: only native blur is allowed, received {}",
                     composer_event_name(event)
                 ),
-                _ => panic!("{expected:?} {phase}: unexpected activation {action:?}"),
+                _ => panic!("{width}px {expected:?} {phase}: unexpected activation {action:?}"),
             };
             assert_eq!(
                 owner, target,
-                "{expected:?} {phase}: exact activation owner"
+                "{width}px {expected:?} {phase}: exact activation owner"
             );
             assert!(
                 activated.replace(action).is_none(),
-                "{expected:?}: exactly one activation"
+                "{width}px {expected:?}: exactly one activation"
             );
         }
     }
     (
-        activated.expect("native Enter emits exactly one expected activation"),
+        activated.unwrap_or_else(|| panic!(
+            "{width}px {expected:?}: native Enter emits exactly one expected activation; {diagnostics:?}"
+        )),
+        cleanup,
+    )
+}
+
+fn type_model_character(
+    ui: &mut Ui<'_>,
+    renderer: &mut cosmic::Renderer,
+    target: Target,
+    width: f32,
+    character: &'static str,
+    physical: keyboard::key::Code,
+    expected_query: &str,
+) -> (Action, Vec<Action>) {
+    let key = keyboard::Key::Character(character.into());
+    let mut query = None;
+    let mut cleanup = Vec::new();
+    // Exercise the focused native field, then rebuild from the actual emitted
+    // query before the next character. No reducer action is reconstructed.
+    for (phase, event) in [
+        (
+            "character down",
+            keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key.clone(),
+                physical_key: keyboard::key::Physical::Code(physical),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: Some(character.into()),
+                repeat: false,
+            },
+        ),
+        (
+            "character release",
+            keyboard::Event::KeyReleased {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Code(physical),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+            },
+        ),
+    ] {
+        let mut messages = Vec::new();
+        let (_, statuses) = ui.update(
+            &[iced::Event::Keyboard(event)],
+            iced::mouse::Cursor::Unavailable,
+            renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        let mut blurred = false;
+        for message in messages {
+            if let Message::ChatUi(Action::Composer(owner, text_editor::Action::ClearSelection)) =
+                &message
+            {
+                assert_eq!(
+                    *owner, target,
+                    "{width}px model search {phase}: exact blur owner"
+                );
+                assert!(
+                    !blurred,
+                    "{width}px model search {phase}: one native blur per event"
+                );
+                blurred = true;
+                let Message::ChatUi(action) = message else {
+                    unreachable!()
+                };
+                cleanup.push(action);
+                continue;
+            }
+            let Message::ChatUi(action @ Action::ModelQuery(_, _)) = message else {
+                panic!("{width}px model search {phase}: unexpected callback {message:?}")
+            };
+            let Action::ModelQuery(owner, value) = &action else {
+                unreachable!()
+            };
+            assert_eq!(*owner, target, "{width}px model search: exact query owner");
+            assert_eq!(value, expected_query, "{width}px native model search query");
+            assert!(
+                query.replace(action).is_none(),
+                "{width}px model search: one query per character"
+            );
+        }
+        if phase == "character down" {
+            assert!(
+                query.is_some(),
+                "{width}px native model search character emits a query: {statuses:?}"
+            );
+        }
+    }
+    (
+        query.expect("native character emits exactly one model query"),
         cleanup,
     )
 }
@@ -173,6 +285,10 @@ fn settle_blur(app: &mut Cagents, target: Target, cleanup: Vec<Action>) {
 
 fn focus(ui: &mut Ui<'_>, renderer: &cosmic::Renderer, id: widget::Id) {
     ui.operate(renderer, &mut operation::focusable::focus::<()>(id.clone()));
+    assert_focus(ui, renderer, id);
+}
+
+fn assert_focus(ui: &mut Ui<'_>, renderer: &cosmic::Renderer, id: widget::Id) {
     let mut focused = Probe::default();
     ui.operate(renderer, &mut focused);
     assert_eq!(
@@ -281,6 +397,7 @@ fn real_chat_footer_keeps_right_group_visible_and_narrow_model_selection_keyboar
             runtime.composer.text(),
             runtime.composer.cursor(),
             runtime.attachments.clone(),
+            runtime.revision,
             runtime.next_command,
         );
         let viewport = iced::Size::new(width, 760.0);
@@ -363,7 +480,8 @@ fn real_chat_footer_keeps_right_group_visible_and_narrow_model_selection_keyboar
                 &renderer,
                 card_control_id(card, "chat-footer-details"),
             );
-            let (activation, cleanup) = enter(&mut ui, &mut renderer, target, Activation::Footer);
+            let (activation, cleanup) =
+                enter(&mut ui, &mut renderer, target, Activation::Footer, width);
             let cache = ui.into_cache();
             settle_blur(&mut app, target, cleanup);
             drop(app.handle_chat_ui(activation));
@@ -397,7 +515,7 @@ fn real_chat_footer_keeps_right_group_visible_and_narrow_model_selection_keyboar
             &renderer,
             card_control_id(card, "chat-model-picker"),
         );
-        let (activation, cleanup) = enter(&mut ui, &mut renderer, target, Activation::Model);
+        let (activation, cleanup) = enter(&mut ui, &mut renderer, target, Activation::Model, width);
         let cache = ui.into_cache();
         settle_blur(&mut app, target, cleanup);
         let task = app.handle_chat_ui(activation);
@@ -409,7 +527,45 @@ fn real_chat_footer_keeps_right_group_visible_and_narrow_model_selection_keyboar
             focused.focused,
             Some(card_control_id(card, "chat-model-search"))
         );
-        let (choice, cleanup) = enter(&mut ui, &mut renderer, target, Activation::DefaultModel);
+        // An empty search intentionally has no implicit first choice. Name
+        // Codex through native typing so Enter chooses its offered default.
+        // Each real query callback is reduced before the next frame; retaining
+        // native focus across those rebuilds is part of the keyboard contract.
+        for (character, physical, query) in [
+            ("c", keyboard::key::Code::KeyC, "c"),
+            ("o", keyboard::key::Code::KeyO, "co"),
+            ("d", keyboard::key::Code::KeyD, "cod"),
+            ("e", keyboard::key::Code::KeyE, "code"),
+            ("x", keyboard::key::Code::KeyX, "codex"),
+        ] {
+            let (query_action, cleanup) = type_model_character(
+                &mut ui,
+                &mut renderer,
+                target,
+                width,
+                character,
+                physical,
+                query,
+            );
+            let cache = ui.into_cache();
+            settle_blur(&mut app, target, cleanup);
+            let task = app.handle_chat_ui(query_action);
+            assert_eq!(task.units(), 0, "native model query schedules no effects");
+            drop(task);
+            ui = UserInterface::build(app.chat_view(card), viewport, cache, &mut renderer);
+            assert_focus(
+                &mut ui,
+                &renderer,
+                card_control_id(card, "chat-model-search"),
+            );
+        }
+        let (choice, cleanup) = enter(
+            &mut ui,
+            &mut renderer,
+            target,
+            Activation::DefaultModel,
+            width,
+        );
         drop(ui);
         settle_blur(&mut app, target, cleanup);
         drop(app.handle_chat_ui(choice));
@@ -422,6 +578,7 @@ fn real_chat_footer_keeps_right_group_visible_and_narrow_model_selection_keyboar
                 runtime.composer.text(),
                 runtime.composer.cursor(),
                 runtime.attachments.clone(),
+                runtime.revision,
                 runtime.next_command
             ),
             before
