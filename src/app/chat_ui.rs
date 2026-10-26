@@ -10933,7 +10933,7 @@ impl Cagents {
                             }
                             _ => None,
                         });
-                if gallery.accepts(identity, runtime) {
+                if gallery.accepts(identity, runtime, command) {
                     return self.handle_chat_ui(command.action());
                 }
             }
@@ -12340,7 +12340,7 @@ mod tests {
             images::ViewerCommand::Fit,
             images::ViewerCommand::ActualSize,
             images::ViewerCommand::Select(0),
-            images::ViewerCommand::External,
+            images::ViewerCommand::External(0),
             images::ViewerCommand::Close,
         ]
         .into_iter()
@@ -12454,7 +12454,7 @@ mod tests {
                 images::ViewerCommand::Fit,
                 images::ViewerCommand::ActualSize,
                 images::ViewerCommand::Select(0),
-                images::ViewerCommand::External,
+                images::ViewerCommand::External(0),
             ]
             .into_iter()
             .map(|command| app.chat_ui.image_viewer.as_ref().unwrap().callback(command))

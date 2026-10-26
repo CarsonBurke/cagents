@@ -2,6 +2,8 @@
 //! does not decode base64, read a file, or copy a pixel buffer.
 use super::*;
 mod canvas;
+#[cfg(test)]
+mod gesture_tests;
 pub(super) fn canvas_focus_id() -> widget::Id {
     widget::Id::new("chat.image-viewer.canvas")
 }
@@ -920,14 +922,14 @@ struct Entry {
     // and managed path hints are never retained or parsed by the gallery.
     external: Option<Url>,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::app) enum ViewerCommand {
     Close,
     Next(bool),
     Fit,
     ActualSize,
     Select(usize),
-    External,
+    External(usize),
 }
 impl ViewerCommand {
     pub(super) fn action(self) -> Action {
@@ -937,7 +939,7 @@ impl ViewerCommand {
             Self::Fit => Action::ImageFit,
             Self::ActualSize => Action::ImageActualSize,
             Self::Select(index) => Action::ImageSelect(index),
-            Self::External => Action::ImageExternal,
+            Self::External(_) => Action::ImageExternal,
         }
     }
 }
@@ -1043,8 +1045,15 @@ impl Gallery {
     fn message(&self, command: ViewerCommand) -> Message {
         action(self.callback(command))
     }
-    pub(super) fn accepts(&self, identity: u64, runtime: Option<&Runtime>) -> bool {
+    pub(super) fn accepts(
+        &self,
+        identity: u64,
+        runtime: Option<&Runtime>,
+        command: ViewerCommand,
+    ) -> bool {
         self.identity == identity
+            // External opens the clicked source, never a later selection.
+            && !matches!(command, ViewerCommand::External(index) if index != self.selected)
             && (self.is_modal()
                 || runtime.is_some_and(|runtime| {
                     self.belongs_to(runtime) && runtime.visible.load(Ordering::Relaxed)
@@ -1080,52 +1089,74 @@ impl Gallery {
     pub(super) fn url(&self) -> Option<Url> {
         self.entries[self.selected].external.clone()
     }
+    // Native press/focus state belongs to this exact command. Generated IDs
+    // otherwise let COSMIC reuse a held press after gallery/strip replacement.
+    fn control_id(&self, command: ViewerCommand) -> widget::Id {
+        let role = match command {
+            ViewerCommand::Close => "close".into(),
+            ViewerCommand::Next(true) => "next".into(),
+            ViewerCommand::Next(false) => "previous".into(),
+            ViewerCommand::Fit => "fit".into(),
+            ViewerCommand::ActualSize => "actual-size".into(),
+            ViewerCommand::Select(index) => format!("select.{index}"),
+            ViewerCommand::External(index) => format!("external.{index}"),
+        };
+        widget::Id::new(format!("chat.image-viewer.{}.{}", self.identity, role))
+    }
+    fn control_icon<'a>(
+        &'a self,
+        icon: Icon,
+        label: &'static str,
+        command: ViewerCommand,
+    ) -> Element<'a, Message> {
+        crate::ui_controls::icon_button(icon, label)
+            .id(self.control_id(command))
+            .on_press(self.message(command))
+            .into()
+    }
     pub(in crate::app) fn view(&self) -> Element<'_, Message> {
         let entry = &self.entries[self.selected];
         let mut controls = Vec::new();
         if self.entries.len() > 1 {
             controls.extend([
-                icon(
+                self.control_icon(
                     Icon::ChevronLeft,
                     "Previous image (Left)",
-                    true,
-                    self.callback(ViewerCommand::Next(false)),
+                    ViewerCommand::Next(false),
                 ),
                 design::caption(format!("{} / {}", self.selected + 1, self.entries.len())).into(),
-                icon(
+                self.control_icon(
                     Icon::ChevronRight,
                     "Next image (Right)",
-                    true,
-                    self.callback(ViewerCommand::Next(true)),
+                    ViewerCommand::Next(true),
                 ),
             ]);
         }
         controls.extend([
             crate::ui_controls::button::secondary("Fit")
+                .id(self.control_id(ViewerCommand::Fit))
                 .on_press(self.message(ViewerCommand::Fit))
                 .into(),
             crate::ui_controls::button::secondary("100%")
+                .id(self.control_id(ViewerCommand::ActualSize))
                 .on_press(self.message(ViewerCommand::ActualSize))
                 .into(),
             crate::interaction::tooltip(
-                crate::ui_controls::button::secondary("Open externally").on_press_maybe(
-                    entry
-                        .external
-                        .as_ref()
-                        .map(|_| self.message(ViewerCommand::External)),
-                ),
+                crate::ui_controls::button::secondary("Open externally")
+                    .id(self.control_id(ViewerCommand::External(self.selected)))
+                    .on_press_maybe(
+                        entry
+                            .external
+                            .as_ref()
+                            .map(|_| self.message(ViewerCommand::External(self.selected))),
+                    ),
                 if entry.external.is_some() {
                     "Open the original image in another application"
                 } else {
                     "The original image is unavailable to external applications on this device"
                 },
             ),
-            icon(
-                Icon::Close,
-                "Close image (Esc)",
-                true,
-                self.callback(ViewerCommand::Close),
-            ),
+            self.control_icon(Icon::Close, "Close image (Esc)", ViewerCommand::Close),
         ]);
         let toolbar = widget::flex_row(controls)
             .spacing(step::GAP_XS as u16)
@@ -1166,6 +1197,7 @@ impl Gallery {
                             .height(40)
                             .content_fit(iced::ContentFit::Contain),
                     )
+                    .id(self.control_id(ViewerCommand::Select(index)))
                     .class(crate::ui_controls::control_style(
                         index == self.selected,
                         None,
