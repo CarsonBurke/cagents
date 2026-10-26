@@ -1496,7 +1496,7 @@ impl Cagents {
             let (pending, saved_copy) = self.preserve_pending_shared_upgrade(id);
             tasks.push(pending);
             retained_upgrades.extend(saved_copy);
-            if matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty() || runtime.is_saving())
+            if matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
                 || self.shared_chat_has_local_work(id)
             {
                 self.retain_local_pane(id);
@@ -1623,7 +1623,7 @@ impl Cagents {
             match existing {
                 Some(card) if card.existence.is_open() => {
                     if card.kind != pane.kind
-                        && matches!(self.cards.get(&pane.id), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty() || runtime.is_saving())
+                        && matches!(self.cards.get(&pane.id), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
                     {
                         self.status = Some(TransientNotice::warning(
                             "Another client changed this pane. Save or discard its unsaved edits before adopting that change.",
@@ -4062,6 +4062,140 @@ mod tests {
         };
         assert!(runtime.is_dirty());
         assert_eq!(runtime.descriptor, original);
+    }
+
+    fn repository_retention_fixture(state: &str) -> (Cagents, ChannelId, Pane) {
+        let (mut app, channel, _, mut pane) = fixture();
+        let runtime = match state {
+            "dirty" => RepositoryRuntime::dirty_fixture(pane.id),
+            "saving" => RepositoryRuntime::post_persist_failure_fixture(pane.id).0,
+            "warning" => RepositoryRuntime::post_persist_warning_fixture(pane.id),
+            "recovery" => {
+                let (mut runtime, mut identity) =
+                    RepositoryRuntime::open_fixture(pane.id, "notes.txt", "saved\n");
+                let authority = crate::recovery_authority::RecoverySlot::reserve()
+                    .unwrap()
+                    .retain("pending editor cleanup".into(), || {
+                        Err("cleanup still pending".into())
+                    });
+                // A delayed completion must retain its cleanup authority even
+                // after its document generation has become obsolete. Drive
+                // that real receipt path without starting filesystem work.
+                identity.generation = identity.generation.wrapping_add(1);
+                drop(runtime.update(RepositoryAction::RetainedSaveFinished {
+                    identity,
+                    ticket: u64::MAX,
+                    revision: 0,
+                    saved_text: "saved\n".into(),
+                    result: Err(crate::editor::retained_save::RetainedSaveError::Recovery {
+                        message: "pending editor cleanup".into(),
+                        authority,
+                    }),
+                }));
+                assert!(runtime.has_editor_recovery());
+                runtime
+            }
+            "clean" => RepositoryRuntime::open_fixture(pane.id, "notes.txt", "saved\n").0,
+            _ => unreachable!(),
+        };
+        assert_eq!(runtime.is_dirty(), state == "dirty");
+        assert_eq!(runtime.is_saving(), state == "saving");
+        assert_eq!(runtime.has_durability_warning(), state == "warning");
+        assert_eq!(runtime.has_editor_recovery(), state == "recovery");
+        assert_eq!(runtime.blocks_navigation(), state != "clean");
+        pane.kind = CardKind::Repository(runtime.descriptor.clone());
+        let mut view = View::empty(channel);
+        view.panes.push(pane.clone());
+        app.workspace_model.views = vec![view];
+        drop(app.reconcile_shared_views());
+        app.cards
+            .insert(pane.id, CardRuntime::Repository(Box::new(runtime)));
+        (app, channel, pane)
+    }
+
+    #[test]
+    fn shared_repository_removal_preserves_navigation_fences_and_exact_runtime() {
+        for state in ["dirty", "saving", "warning", "recovery"] {
+            let (mut app, channel, pane) = repository_retention_fixture(state);
+            let Some(CardRuntime::Repository(before)) = app.cards.get(&pane.id) else {
+                unreachable!()
+            };
+            let identity = &**before as *const RepositoryRuntime;
+            let text = before.editor_text();
+            let error = before.save_error().map(str::to_owned);
+            app.workspace_model.views[0].panes.clear();
+            for _ in 0..2 {
+                drop(app.reconcile_shared_views());
+                let Some(CardRuntime::Repository(current)) = app.cards.get(&pane.id) else {
+                    panic!("{state}: passive removal must retain the fenced editor");
+                };
+                assert_eq!(&**current as *const RepositoryRuntime, identity, "{state}");
+                assert_eq!(current.editor_text(), text, "{state}");
+                assert_eq!(current.save_error().map(str::to_owned), error, "{state}");
+                assert!(current.blocks_navigation(), "{state}");
+                assert_eq!(current.has_editor_recovery(), state == "recovery");
+                assert_eq!(current.has_durability_warning(), state == "warning");
+                assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+                assert!(app.card_state(pane.id).unwrap().existence.is_open());
+                assert!(app.shared_views.retained.contains(&pane.id));
+                assert!(app.durable.local_only_cards.contains(&pane.id));
+                assert!(
+                    app.durable.channels.iter().any(|current| {
+                        current.id == channel && current.cards.contains(&pane.id)
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_repository_replacement_preserves_navigation_fences_and_exact_runtime() {
+        for state in ["dirty", "saving", "warning", "recovery"] {
+            let (mut app, _, pane) = repository_retention_fixture(state);
+            let Some(CardRuntime::Repository(before)) = app.cards.get(&pane.id) else {
+                unreachable!()
+            };
+            let identity = &**before as *const RepositoryRuntime;
+            let descriptor = before.descriptor.clone();
+            let text = before.editor_text();
+            let error = before.save_error().map(str::to_owned);
+            let CardKind::Repository(replacement) = &mut app.workspace_model.views[0].panes[0].kind
+            else {
+                unreachable!()
+            };
+            replacement.selected_file = Some("other.txt".into());
+            for _ in 0..2 {
+                drop(app.reconcile_shared_views());
+                let Some(CardRuntime::Repository(current)) = app.cards.get(&pane.id) else {
+                    panic!("{state}: replacement must retain the fenced editor");
+                };
+                assert_eq!(&**current as *const RepositoryRuntime, identity, "{state}");
+                assert_eq!(current.descriptor, descriptor, "{state}");
+                assert_eq!(current.editor_text(), text, "{state}");
+                assert_eq!(current.save_error().map(str::to_owned), error, "{state}");
+                assert!(current.blocks_navigation(), "{state}");
+                assert_eq!(current.has_editor_recovery(), state == "recovery");
+                assert_eq!(current.has_durability_warning(), state == "warning");
+                assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+                assert!(app.card_state(pane.id).unwrap().existence.is_open());
+            }
+        }
+    }
+
+    #[test]
+    fn shared_repository_removal_still_closes_a_clean_editor() {
+        let (mut app, channel, pane) = repository_retention_fixture("clean");
+        app.workspace_model.views[0].panes.clear();
+        drop(app.reconcile_shared_views());
+        assert!(!app.cards.contains_key(&pane.id));
+        assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+        assert!(!app.shared_views.retained.contains(&pane.id));
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .any(|current| { current.id == channel && !current.cards.contains(&pane.id) })
+        );
     }
 
     #[cfg(not(feature = "integrated-browser"))]
