@@ -77,14 +77,29 @@ pub(in crate::host) struct Broker {
     thread: Option<JoinHandle<()>>,
 }
 
+fn warn_history_maintenance(error: &str) {
+    let diagnostic: String = error
+        .chars()
+        .flat_map(char::escape_default)
+        .take(512)
+        .collect();
+    tracing::warn!(error = %diagnostic, "automation history maintenance is temporarily unavailable");
+}
+
 impl Broker {
     pub(super) fn start(host: &SharedHost, root: PathBuf) -> Result<Self, String> {
         let cleanup = std::fs::read_dir(&root).map_err(|error| error.to_string())?;
         let registry = agent_execution::registry(host)?;
-        registry
+        // Registry admission already succeeded. Optional history housekeeping
+        // must not prevent durable delivery or normal coordinator startup.
+        let now = service::now()?;
+        if let Err(error) = registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .maintain_automation_history(service::now()?)?;
+            .maintain_automation_history(now)
+        {
+            warn_history_maintenance(&error);
+        }
         let handle = Handle(Arc::new(Inner {
             host: Arc::downgrade(host),
             registry,
@@ -322,14 +337,30 @@ impl Handle {
 
     fn run(&self) {
         let mut maintained = Instant::now();
-        self.run_with(|host| {
-            if maintained.elapsed() >= Duration::from_secs(60)
-                && self.maintain_history_under_control(host)?
-            {
-                maintained = Instant::now();
+        self.run_with(|host| self.tick_with_history_maintenance(host, &mut maintained));
+    }
+
+    fn tick_with_history_maintenance(
+        &self,
+        host: &SharedHost,
+        maintained: &mut Instant,
+    ) -> Result<Duration, String> {
+        if maintained.elapsed() >= Duration::from_secs(60) {
+            match self.maintain_history_under_control(host) {
+                Ok(false) => {} // No attempt while the control writer owns admission.
+                result => {
+                    // Failure is an attempted pass too. Preserve the finite
+                    // retry interval instead of warning on every fast tick.
+                    *maintained = Instant::now();
+                    if let Err(error) = result {
+                        warn_history_maintenance(&error);
+                    }
+                }
             }
-            self.tick(host)
-        });
+        }
+        // Optional maintenance cannot gate either transfer or actual work.
+        // Errors from those real-work paths retain their existing handling.
+        self.tick(host)
     }
 
     fn maintain_history_under_control(&self, host: &SharedHost) -> Result<bool, String> {

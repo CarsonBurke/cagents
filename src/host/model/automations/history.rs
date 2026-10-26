@@ -419,3 +419,26 @@ impl Registry {
         }).map_err(|error| error.to_string())
     }
 }
+
+#[cfg(test)]
+impl Registry {
+    /// Fault the actual DELETE on this execution connection without changing
+    /// the published main-schema layout or bypassing strict admission.
+    pub(in crate::host) fn set_automation_history_prune_failure_for_test(
+        &self,
+        firing: Option<Uuid>,
+    ) -> Result<(), String> {
+        let sql = if let Some(firing) = firing {
+            // Uuid Display is canonical; this fault cannot hit another owner's
+            // required lifecycle transaction or alter the main-schema layout.
+            format!(
+                "CREATE TEMP TRIGGER refuse_history_prune BEFORE DELETE ON main.automation_firings WHEN OLD.id='{firing}' BEGIN SELECT RAISE(ABORT,'fixture history DELETE failure'); END;"
+            )
+        } else {
+            "DROP TRIGGER temp.refuse_history_prune".to_owned()
+        };
+        self.db
+            .execute_batch(&sql)
+            .map_err(|error| error.to_string())
+    }
+}
