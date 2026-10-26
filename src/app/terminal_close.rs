@@ -3,6 +3,7 @@ use crate::{control::ControlClient, terminal::ipc::TerminalCloseResult};
 
 #[derive(Debug, Clone)]
 pub(super) struct CloseIntent {
+    focus_instance: uuid::Uuid,
     pub card: CardId,
     pub terminal: TerminalId,
     pub proof: HostSessionProof,
@@ -241,6 +242,7 @@ impl Cagents {
                 .or_else(|| self.uncertain_terminal_proofs.get(&card).cloned())
         {
             self.terminal_close = Some(CloseIntent {
+                focus_instance: uuid::Uuid::new_v4(),
                 card,
                 terminal: session.id,
                 proof,
@@ -292,6 +294,7 @@ impl Cagents {
                     return Task::none();
                 }
                 self.terminal_close = Some(CloseIntent {
+                    focus_instance: uuid::Uuid::new_v4(),
                     card,
                     terminal: session.id,
                     proof,
@@ -668,10 +671,20 @@ impl Cagents {
     }
 
     pub(super) fn focus_terminal_close_after_cover(&mut self) -> Task<Message> {
-        if let Some(intent) = &mut self.terminal_close {
-            intent.focus = 0;
-        }
-        close_focus(0)
+        let Some(intent) = &mut self.terminal_close else {
+            return Task::none();
+        };
+        intent.focus = 0;
+        let marker = terminal_close_focus_marker(intent);
+        crate::interaction::guarded_focus(
+            widget::Id::new("dialog.terminal-close.cancel"),
+            vec![
+                widget::Id::new("dialog.terminal-close.confirm"),
+                widget::Id::new("dialog.terminal-close.dont-ask"),
+            ],
+            Some(marker),
+        )
+        .map(cosmic::Action::App)
     }
 
     pub(super) fn cycle_terminal_close_focus(&mut self, backwards: bool) -> Task<Message> {
@@ -752,10 +765,18 @@ impl Cagents {
         };
         rows.push(widget::row::with_children(buttons).spacing(space::S).into());
         Some(super::dialog_ui::surface(
-            widget::column::with_children(rows).spacing(space::M),
+            widget::container(widget::column::with_children(rows).spacing(space::M))
+                .id(terminal_close_focus_marker(intent)),
             560.0,
         ))
     }
+}
+
+fn terminal_close_focus_marker(intent: &CloseIntent) -> widget::Id {
+    widget::Id::new(format!(
+        "dialog.terminal-close.phase.{}.{}.{}.{}",
+        intent.focus_instance, intent.generation, intent.focus, intent.pending,
+    ))
 }
 
 fn close_focus(index: usize) -> Task<Message> {
@@ -902,11 +923,11 @@ mod tests {
         session.clone()
     }
 
-    #[test]
-    fn device_files_return_terminal_close_to_cancel_before_native_enter() {
+    fn active_close_after_cover_fixture() -> (Cagents, CardId, TerminalSession) {
         let (mut app, card) = retry_close_fixture();
         let source = terminal_source(&app, card);
         app.terminal_close = Some(CloseIntent {
+            focus_instance: uuid::Uuid::new_v4(),
             card,
             terminal: source.id,
             proof: source.continuity.live_proof().unwrap(),
@@ -921,6 +942,12 @@ mod tests {
             restore_keyboard_nav: true,
         });
         app.core.set_keyboard_nav(false);
+        (app, card, source)
+    }
+
+    #[test]
+    fn device_files_return_terminal_close_to_cancel_before_native_enter() {
+        let (mut app, card, source) = active_close_after_cover_fixture();
         app.device_ui.open = true;
         let task = app.update(Message::KeyEvent {
             event: super::super::dialog_ui::tests::key_press(keyboard::key::Named::Escape),
@@ -929,8 +956,12 @@ mod tests {
         assert!(!app.device_ui.open);
         assert_eq!(app.terminal_close.as_ref().unwrap().focus, 0);
         let cancel = widget::Id::new("dialog.terminal-close.cancel");
+        let effects =
+            iced::widget::operation::focus(widget::Id::new("dialog.terminal-close.confirm"))
+                .map(cosmic::Action::App)
+                .chain(task);
         assert_eq!(
-            super::super::tests::focused_element(app.terminal_close_dialog().unwrap(), task),
+            super::super::tests::focused_element(app.terminal_close_dialog().unwrap(), effects),
             Some(cancel.clone()),
         );
         let action = super::super::dialog_ui::tests::enter_control(
@@ -942,6 +973,79 @@ mod tests {
         assert!(app.terminal_close.is_none());
         assert!(app.card_state(card).unwrap().existence.is_open());
         assert_eq!(terminal_source(&app, card), source);
+    }
+
+    #[test]
+    fn delayed_terminal_after_cover_focus_preserves_a_reopened_device_field() {
+        for retain_dialog in [false, true] {
+            let (mut app, card, source) = active_close_after_cover_fixture();
+            app.device_ui.open = true;
+            let delayed = app.update_device(device_ui::Action::Close);
+            assert_eq!(app.terminal_close.as_ref().unwrap().focus, 0);
+            app.device_ui.open = true;
+            let owner = widget::Id::new("device-tools.directory");
+            let mut children = vec![app.device_dialog()];
+            if retain_dialog {
+                children.push(app.terminal_close_dialog().unwrap());
+            }
+            let effects = iced::widget::operation::focus(owner.clone())
+                .map(cosmic::Action::App)
+                .chain(delayed);
+            assert_eq!(
+                super::super::tests::focused_element(
+                    widget::column::with_children(children).into(),
+                    effects
+                ),
+                Some(owner),
+                "new Device field owns focus even with retained terminal controls",
+            );
+            assert_eq!(terminal_source(&app, card), source);
+            assert!(app.card_state(card).unwrap().existence.is_open());
+        }
+    }
+
+    #[test]
+    fn delayed_terminal_cancel_yields_to_newer_tab_and_generation_zero_reopen() {
+        for reopen in [false, true] {
+            let (mut app, card, source) = active_close_after_cover_fixture();
+            let old_instance = app.terminal_close.as_ref().unwrap().focus_instance;
+            app.device_ui.open = true;
+            let delayed = app.update_device(device_ui::Action::Close);
+            let newer = if reopen {
+                drop(app.cancel_terminal_close());
+                drop(app.completed_terminal_closed(
+                    card,
+                    source.clone(),
+                    Ok(CompletedCloseOutcome::Active(
+                        source.continuity.live_proof().unwrap(),
+                    )),
+                ));
+                let current = app.terminal_close.as_ref().unwrap();
+                assert_eq!(current.generation, 0);
+                assert_ne!(current.focus_instance, old_instance);
+                iced::widget::operation::focus(widget::Id::new("dialog.terminal-close.confirm"))
+                    .map(cosmic::Action::App)
+            } else {
+                app.update(Message::KeyEvent {
+                    event: super::super::dialog_ui::tests::key_press(keyboard::key::Named::Tab),
+                    captured: false,
+                })
+            };
+            assert_eq!(
+                app.terminal_close.as_ref().unwrap().focus,
+                usize::from(!reopen)
+            );
+            assert_eq!(
+                super::super::tests::focused_element(
+                    app.terminal_close_dialog().unwrap(),
+                    newer.chain(delayed),
+                ),
+                Some(widget::Id::new("dialog.terminal-close.confirm")),
+                "old Cancel restore cannot override the newer terminal owner: reopen={reopen}",
+            );
+            assert_eq!(terminal_source(&app, card), source);
+            assert!(app.card_state(card).unwrap().existence.is_open());
+        }
     }
 
     #[test]

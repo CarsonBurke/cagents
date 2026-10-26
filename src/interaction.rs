@@ -60,6 +60,58 @@ pub fn focused_key<'a, Message: 'a>(
     .into()
 }
 
+/// Apply queued focus only while its target is still mounted and a newer
+/// native owner has not taken focus. Listed controls belong to the same
+/// surface and may yield focus only while its exact mounted phase remains.
+pub fn guarded_focus<Message>(
+    target: Id,
+    same_owner: Vec<Id>,
+    marker: Option<Id>,
+) -> cosmic::iced::Task<Message> {
+    cosmic::iced::runtime::task::effect(cosmic::iced::runtime::Action::widget(GuardedFocus {
+        target,
+        same_owner,
+        marker,
+        mounted: false,
+        present: false,
+        foreign_focus: false,
+    }))
+}
+
+struct GuardedFocus {
+    target: Id,
+    same_owner: Vec<Id>,
+    marker: Option<Id>,
+    mounted: bool,
+    present: bool,
+    foreign_focus: bool,
+}
+
+impl Operation for GuardedFocus {
+    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+        visit(self);
+    }
+    fn container(&mut self, id: Option<&Id>, _: Rectangle) {
+        self.mounted |= self
+            .marker
+            .as_ref()
+            .is_some_and(|marker| id == Some(marker));
+    }
+    fn focusable(&mut self, id: Option<&Id>, _: Rectangle, state: &mut dyn operation::Focusable) {
+        self.present |= id == Some(&self.target);
+        self.foreign_focus |= state.is_focused()
+            && id != Some(&self.target)
+            && !(self.marker.is_some() && id.is_some_and(|id| self.same_owner.contains(id)));
+    }
+    fn finish(&self) -> operation::Outcome<()> {
+        if self.present && !self.foreign_focus && (self.marker.is_none() || self.mounted) {
+            operation::Outcome::Chain(Box::new(operation::focusable::focus(self.target.clone())))
+        } else {
+            operation::Outcome::None
+        }
+    }
+}
+
 /// Capture selected keys at a native surface boundary, including before any
 /// descendant has focus. Keys the callback declines retain native handling.
 pub fn key_listener<'a, Message: 'a>(
