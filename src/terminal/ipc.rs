@@ -2082,6 +2082,89 @@ mod tests {
     use super::*;
 
     #[test]
+    fn goal_controls_and_native_results_keep_their_original_wire_binding() {
+        use crate::chat::{Command, goal};
+        let chat_id = TerminalId::new();
+        let revision = u64::MAX - 1;
+        for operation in [
+            goal::Operation::Get,
+            goal::Operation::SetObjective("Preserve 🦀 and\noriginal scope".into()),
+            goal::Operation::Pause,
+            goal::Operation::Resume,
+            goal::Operation::Clear,
+        ] {
+            let request = ClientEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: 29,
+                proof: Some(proof("original-session", "original-boot", "original-host")),
+                request: ClientRequest::ChatCommand {
+                    chat_id,
+                    command: Command::Goal {
+                        thread_id: "original-thread".into(),
+                        revision,
+                        operation,
+                    },
+                },
+            };
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &request).unwrap();
+            assert_eq!(
+                read_frame::<ClientEnvelope>(&mut Cursor::new(bytes))
+                    .unwrap()
+                    .unwrap(),
+                request
+            );
+        }
+        for outcome in [
+            goal::Outcome::Confirmed,
+            goal::Outcome::Uncertain,
+            goal::Outcome::Unsupported,
+        ] {
+            let response = ServerResponse::ChatSnapshot {
+                chat_id,
+                snapshot: Some(crate::chat::Snapshot {
+                    session_id: Some("original-thread".into()),
+                    goal: Some(goal::Snapshot {
+                        thread_id: "original-thread".into(),
+                        revision: u64::MAX,
+                        support: goal::Support::Supported,
+                        read: goal::ReadState::Known(None),
+                        pending: false,
+                        uncertain: outcome != goal::Outcome::Confirmed,
+                        last_result: Some(goal::Completion { revision, outcome }),
+                    }),
+                    ..Default::default()
+                }),
+            };
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &response).unwrap();
+            assert_eq!(
+                read_frame::<ServerResponse>(&mut Cursor::new(bytes))
+                    .unwrap()
+                    .unwrap(),
+                response
+            );
+        }
+        // The existing dispatch acknowledgement carries no native goal result.
+        assert_ne!(
+            serde_json::to_value(ServerResponse::Accepted).unwrap(),
+            serde_json::to_value(goal::Completion {
+                revision,
+                outcome: goal::Outcome::Confirmed,
+            })
+            .unwrap()
+        );
+        let mut legacy = serde_json::to_value(crate::chat::Snapshot::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("goal");
+        assert!(
+            serde_json::from_value::<crate::chat::Snapshot>(legacy)
+                .unwrap()
+                .goal
+                .is_none()
+        );
+    }
+
+    #[test]
     fn retained_claude_snapshot_continuity_uses_the_matched_public_wire() {
         let response = ServerResponse::ChatSnapshot {
             chat_id: TerminalId::new(),
