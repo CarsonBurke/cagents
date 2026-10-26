@@ -375,9 +375,7 @@ impl Cagents {
                     state.generation,
                     matches!(available_action, Some(Action::CheckAgain { .. })),
                 ),
-                widget::container(overlay)
-                    .id(health_marker(state.generation))
-                    .into(),
+                widget::container(overlay).id(health_marker(state)).into(),
             )])
             .width(Length::Fill)
             .height(Length::Fill)
@@ -403,13 +401,24 @@ fn health_action_id(state: &State) -> widget::Id {
     widget::Id::new(format!("daemon-health.{}.{role}", state.generation))
 }
 
-fn health_marker(generation: u64) -> widget::Id {
-    widget::Id::new(format!("daemon-health.{generation}.dialog"))
+fn health_marker(state: &State) -> widget::Id {
+    // A newer keyboard choice or review phase withdraws earlier focus effects
+    // even when it belongs to the same ownership verification generation.
+    widget::Id::new(format!(
+        "daemon-health.{}.dialog.{}.{}.{}.{}.{}.{}",
+        state.generation,
+        state.focus,
+        state.preparing,
+        state.restarting,
+        state.target.is_some(),
+        state.error.is_some(),
+        state.health.unavailable(),
+    ))
 }
 
 fn health_focus(state: &State, index: usize) -> Task<Message> {
     iced::runtime::task::effect(iced::runtime::Action::widget(HealthFocus {
-        marker: Some(health_marker(state.generation)),
+        marker: Some(health_marker(state)),
         target: if index == 1 {
             health_action_id(state)
         } else {
@@ -800,6 +809,33 @@ mod tests {
                 Some(owner)
             );
         }
+    }
+
+    #[test]
+    fn delayed_daemon_preparation_focus_cannot_override_a_newer_tab_choice() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.daemon_health_ui.health = daemon_health::State::Unreachable {
+            since: std::time::SystemTime::UNIX_EPOCH,
+        };
+        drop(app.update_daemon_health_ui(Action::Open));
+        let older = app.update_daemon_health_ui(Action::Prepared {
+            generation: app.daemon_health_ui.generation,
+            target: Err("verification refused".into()),
+        });
+        assert_eq!(app.daemon_health_ui.focus, 0);
+        let newer = app
+            .daemon_health_key_event(&key(keyboard::key::Named::Tab), false)
+            .expect("the visible daemon dialog owns Tab");
+        assert_eq!(app.daemon_health_ui.focus, 1);
+        let current_action = health_action_id(&app.daemon_health_ui);
+        assert_eq!(
+            super::super::tests::focused_element(
+                app.daemon_health_dialog().unwrap(),
+                newer.chain(older),
+            ),
+            Some(current_action),
+            "the current Tab effect must focus Check again; older Cancel must have no effect",
+        );
     }
 
     #[test]
