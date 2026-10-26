@@ -1614,6 +1614,186 @@ mod tests {
     }
 
     #[test]
+    fn idle_reaping_preserves_a_live_provider_and_its_live_adopted_tool() {
+        const STAGE: &str = "CAGENTS_NATIVE_HOLDER_LIVE_REAPER_TEST";
+        if std::env::var_os(STAGE).is_none() {
+            let mut fixture = Command::new(std::env::current_exe().unwrap());
+            fixture
+                .args([
+                    "--exact",
+                    "chat::native_holder::transport::tests::idle_reaping_preserves_a_live_provider_and_its_live_adopted_tool",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(STAGE, "1");
+            // Isolate subreaper/wait ownership and block SIGCHLD in every
+            // libtest thread, as in the existing idle-reaper fixture.
+            unsafe {
+                fixture.pre_exec(|| {
+                    let mut mask = std::mem::zeroed();
+                    libc::sigemptyset(&mut mask);
+                    libc::sigaddset(&mut mask, libc::SIGCHLD);
+                    if libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let output = fixture.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let child_events = ChildEvents::new().unwrap();
+        for orphan in [false, true] {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            // The intermediate shell exits, adopting both tools into this
+            // holder. The actual provider leader stays alive. Only the short
+            // tool reads the test-owned pipe; no duration determines its exit.
+            let script = r#"
+while IFS=: read -r field value; do
+    if [ "$field" = SigBlk ]; then printf '%s\n' "$value" > "$1/provider-mask"; fi
+done < "/proc/$$/status"
+/bin/sh -c '
+    /bin/sleep 60 </dev/null &
+    echo $! > "$1/live"
+    /bin/sh -c "read -r token" <&0 &
+    echo $! > "$1/tool"
+' fixture "$1"
+echo ready > "$1/ready"
+exec /bin/sleep 60
+"#;
+            // Exercise the production pre-exec mask restoration, not a second
+            // test-only unblocking implementation. Other Spawn fields are not
+            // consulted by command(); no native registry/provider is opened.
+            let spawn = Spawn {
+                program: "/bin/sh".into(),
+                arguments: vec![
+                    "-c".into(),
+                    script.into(),
+                    "fixture".into(),
+                    directory.path().to_str().unwrap().into(),
+                ],
+                directory: directory.path().to_owned(),
+                environment: BTreeMap::new(),
+                recovery: super::super::tests::recovery(),
+                directory_fd: None,
+            };
+            let mut child = spawn.command().stdin(Stdio::piped()).spawn().unwrap();
+            let mut tool_gate = child.stdin.take().unwrap();
+            let mut server = Server(crate::daemon::owned_children::OwnedChildren::new(child));
+            let provider = Process::read(server.id()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !directory.path().join("ready").exists() {
+                assert!(!server.exited(), "provider exited during fixture startup");
+                assert!(Instant::now() < deadline, "provider fixture did not start");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let read_pid = |name| {
+                std::fs::read_to_string(directory.path().join(name))
+                    .unwrap()
+                    .trim()
+                    .parse::<i32>()
+                    .unwrap()
+            };
+            let tool = Process::read(read_pid("tool")).unwrap();
+            let live = Process::read(read_pid("live")).unwrap();
+            for process in [&tool, &live] {
+                let stat = std::fs::read_to_string(format!("/proc/{}/stat", process.pid)).unwrap();
+                let parent = stat
+                    .rsplit_once(')')
+                    .unwrap()
+                    .1
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap();
+                assert_eq!(parent.parse::<u32>().unwrap(), std::process::id());
+            }
+            let mask = std::fs::read_to_string(directory.path().join("provider-mask")).unwrap();
+            let mask = u64::from_str_radix(mask.trim(), 16).unwrap();
+            assert_eq!(mask & (1_u64 << (libc::SIGCHLD - 1)), 0);
+            assert!(!server.exited(), "provider must be live before idle wait");
+
+            let observed_tool = tool.clone();
+            let release_and_observe = move || {
+                let released = tool_gate.write_all(b"exit\n").is_ok();
+                drop(tool_gate);
+                if !released {
+                    return false;
+                }
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while observed_tool.is_current() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                !observed_tool.is_current()
+            };
+            let reaped = if orphan {
+                let path = directory.path().join("control.sock");
+                let listener = UnixListener::bind(&path).unwrap();
+                let connector = std::thread::spawn(move || {
+                    let reaped = release_and_observe();
+                    // Always wake the real wait path, even on a failed oracle.
+                    let stream = UnixStream::connect(path).unwrap();
+                    (stream, reaped)
+                });
+                wait_for_control(listener.as_raw_fd(), &server, &child_events).unwrap();
+                let (_peer, reaped) = connector.join().unwrap();
+                let _accepted = listener.accept().unwrap();
+                reaped
+            } else {
+                let (reader, mut writer) = UnixStream::pair().unwrap();
+                let sender = std::thread::spawn(move || {
+                    let reaped = release_and_observe();
+                    writer.write_all(b"x").unwrap();
+                    reaped
+                });
+                wait_for_control(reader.as_raw_fd(), &server, &child_events).unwrap();
+                sender.join().unwrap()
+            };
+            assert!(
+                reaped,
+                "adopted tool was not reaped before control activity"
+            );
+            assert!(!server.exited(), "idle wait consumed the live provider");
+            for process in [&provider, &live] {
+                assert!(process.is_current(), "idle reaping changed a live process");
+                let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                assert_eq!(
+                    unsafe {
+                        libc::waitid(
+                            libc::P_PID,
+                            process.pid as u32,
+                            &mut status,
+                            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                        )
+                    },
+                    0
+                );
+                assert_eq!(unsafe { status.si_pid() }, 0, "live process exited");
+            }
+            assert_eq!(
+                unsafe { libc::waitpid(tool.pid, std::ptr::null_mut(), libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+            assert!(server.terminate(Duration::from_secs(2)).unwrap());
+            assert!(!provider.is_current());
+            assert!(!live.is_current());
+            assert_eq!(
+                unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+        }
+    }
+
+    #[test]
     fn spawned_owner_keeps_exact_server_on_failed_adoption_then_acknowledges_close() {
         const STAGE: &str = "CAGENTS_NATIVE_HOLDER_TRANSPORT_TEST";
         if std::env::var_os(STAGE).is_none() {
