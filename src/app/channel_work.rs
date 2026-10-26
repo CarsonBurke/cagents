@@ -763,14 +763,16 @@ impl Cagents {
                     return Task::none();
                 }
                 self.channel_work.dispatches.remove(&operation);
-                confirmed_membership = result
-                    .as_ref()
-                    .is_ok_and(|reply| valid_saved_reply(&record, reply));
-                if settled
-                    && result
-                        .as_ref()
-                        .is_ok_and(|reply| valid_saved_reply(&record, reply))
-                {
+                confirmed_membership = result.as_ref().is_ok_and(|reply| {
+                    valid_saved_reply(&record, reply)
+                        && self.channel_work.view.accepts_receipt(
+                            record.mutation().home,
+                            operation,
+                            &reply.receipt,
+                        )
+                });
+                let valid_settlement = settled && confirmed_membership;
+                if valid_settlement {
                     self.channel_work.saved.remove(&operation);
                     self.channel_work.recovery_only.remove(&operation);
                     self.channel_work.operation_routes.remove(&operation);
@@ -781,7 +783,7 @@ impl Cagents {
                 ui::Action::AppliedWithSettlement {
                     ticket,
                     result,
-                    settled,
+                    settled: valid_settlement,
                 }
             }
             Completion::LookedUp {
@@ -805,6 +807,10 @@ impl Cagents {
                             .is_some_and(|intent| {
                                 journal::mutation_confirms_receipt(intent, receipt)
                             })
+                            && self
+                                .channel_work
+                                .view
+                                .accepts_receipt(home, operation, receipt)
                             && self
                                 .channel_work
                                 .saved
@@ -1211,9 +1217,18 @@ impl Cagents {
                     .view
                     .original_mutation(home, operation)
                     .cloned();
+                let confirmed = self
+                    .channel_work
+                    .view
+                    .confirmed_receipt(home, operation)
+                    .cloned();
                 let route = self.channel_work.operation_routes.get(&operation).cloned();
                 completed_task(
-                    move || lookup_saved(ticket, home, operation, original, resident, route),
+                    move || {
+                        lookup_saved(
+                            ticket, home, operation, original, resident, confirmed, route,
+                        )
+                    },
                     Completion::LookedUp {
                         ticket,
                         home,
@@ -1498,6 +1513,7 @@ fn lookup_saved(
     operation: uuid::Uuid,
     original: Option<Record>,
     resident: Option<crate::channel_work::Mutation>,
+    confirmed: Option<crate::channel_work::Receipt>,
     route: Option<Route>,
 ) -> Completion {
     let mut verified_route = None;
@@ -1564,17 +1580,27 @@ fn lookup_saved(
             _ => Err(Failure::Unavailable),
         }
     })();
-    let settled = match (&original, &result) {
-        (Some(record), Ok(Some(receipt))) => {
-            journal().is_ok_and(|journal| journal.settle(record, receipt).is_ok())
+    // A known positive is immutable even if a malformed response repeats its
+    // Home/op/CAS with a different sequence. Reject it before any journal I/O.
+    let result = result.and_then(|receipt| match &receipt {
+        Some(receipt) if confirmed.as_ref().is_some_and(|known| known != receipt) => {
+            Err(Failure::Unavailable)
         }
-        // A cooperating window may already have settled the same published
-        // operation. Prove positive outcome and locked absence, never reseed.
-        (None, Ok(Some(receipt))) => resident.as_ref().is_some_and(|intent| {
-            journal().is_ok_and(|journal| journal.settle_absent(intent, receipt).is_ok())
-        }),
-        _ => false,
-    };
+        _ => Ok(receipt),
+    });
+    let settled = result.as_ref().is_ok_and(|receipt| {
+        receipt.as_ref().is_some_and(|receipt| {
+            journal().is_ok_and(|journal| {
+                settle_saved_receipt(
+                    &journal,
+                    original.as_ref(),
+                    resident.as_ref(),
+                    confirmed.as_ref(),
+                    receipt,
+                )
+            })
+        })
+    });
     Completion::LookedUp {
         ticket,
         home,
@@ -1582,6 +1608,24 @@ fn lookup_saved(
         route: verified_route,
         result,
         settled,
+    }
+}
+
+/// Apply the same immutable known-positive fence at the filesystem boundary.
+/// This is also used for the recordless, positive-only absence reconciliation.
+fn settle_saved_receipt(
+    journal: &journal::Journal,
+    original: Option<&Record>,
+    resident: Option<&crate::channel_work::Mutation>,
+    confirmed: Option<&crate::channel_work::Receipt>,
+    receipt: &crate::channel_work::Receipt,
+) -> bool {
+    if confirmed.is_some_and(|known| known != receipt) {
+        return false;
+    }
+    match original {
+        Some(record) => journal.settle(record, receipt).is_ok(),
+        None => resident.is_some_and(|intent| journal.settle_absent(intent, receipt).is_ok()),
     }
 }
 

@@ -751,6 +751,24 @@ impl State {
             })
             .map(|pending| &pending.mutation)
     }
+    pub fn confirmed_receipt(&self, home: Home, operation: Uuid) -> Option<&Receipt> {
+        self.pending
+            .iter()
+            .find(|pending| {
+                pending.mutation.home == home && pending.mutation.operation == operation
+            })
+            .and_then(|pending| pending.confirmed.as_ref())
+    }
+    /// The adapter must use the reducer's complete original/known-positive
+    /// predicate before settling its parallel record and route custody.
+    pub fn accepts_receipt(&self, home: Home, operation: Uuid, receipt: &Receipt) -> bool {
+        self.pending
+            .iter()
+            .find(|pending| {
+                pending.mutation.home == home && pending.mutation.operation == operation
+            })
+            .is_some_and(|pending| Self::valid_receipt(pending, receipt))
+    }
     fn pending_for(&self, home: Home) -> Option<&Pending> {
         self.pending
             .iter()

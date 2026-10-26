@@ -293,6 +293,16 @@ mod pending_adapter {
         let (mut app, _) = main_fixture();
         let record = record(captured());
         let operation = record.operation();
+        let private = tempfile::tempdir().unwrap();
+        let storage = journal::Journal::at(private.path().join("pending")).unwrap();
+        storage.reserve(&record).unwrap();
+        let original_bytes = std::fs::read(
+            private
+                .path()
+                .join("pending")
+                .join(format!("{operation}.json")),
+        )
+        .unwrap();
         hydrate(&mut app, vec![record.clone()]);
         drop(app.open_saved_channel_work(operation));
         let owner = app.channel_work.view.owner().unwrap();
@@ -344,6 +354,64 @@ mod pending_adapter {
             checked.socket
         );
 
+        // Same Home/op/revision is insufficient once exact positive A is
+        // known: contradictory sequence B cannot delete disk or adapter custody.
+        let known = receipt(&record);
+        let mut contradictory = known.clone();
+        contradictory.sequence += 1;
+        assert!(!settle_saved_receipt(
+            &storage,
+            Some(&record),
+            Some(record.mutation()),
+            Some(&known),
+            &contradictory
+        ));
+        assert_eq!(
+            std::fs::read(
+                private
+                    .path()
+                    .join("pending")
+                    .join(format!("{operation}.json"))
+            )
+            .unwrap(),
+            original_bytes
+        );
+        drop(app.update_channel_work(ui::Action::Check(owner, operation)));
+        let bad = app.channel_work.lookups[&operation];
+        drop(app.complete_channel_work(Completion::LookedUp {
+            ticket: bad,
+            home: record.mutation().home,
+            operation,
+            route: Some(checked.clone()),
+            result: Ok(Some(contradictory)),
+            settled: true,
+        }));
+        assert_eq!(app.channel_work.saved.get(&operation), Some(&record));
+        assert_eq!(
+            app.channel_work.operation_routes[&operation].socket,
+            checked.socket
+        );
+        assert_eq!(
+            app.channel_work
+                .view
+                .confirmed_receipt(record.mutation().home, operation),
+            Some(&known)
+        );
+        assert!(
+            app.channel_work
+                .view
+                .update(ui::Action::Retry(owner, operation))
+                .is_none()
+        );
+        assert_eq!(storage.load().unwrap().records, [record.clone()]);
+        assert!(settle_saved_receipt(
+            &storage,
+            Some(&record),
+            Some(record.mutation()),
+            Some(&known),
+            &known
+        ));
+        assert!(storage.load().unwrap().records.is_empty());
         drop(app.update_channel_work(ui::Action::Check(owner, operation)));
         let next = app.channel_work.lookups[&operation];
         drop(app.complete_channel_work(Completion::LookedUp {
