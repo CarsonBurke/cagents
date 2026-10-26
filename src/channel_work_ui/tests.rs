@@ -2302,24 +2302,9 @@ fn local_native_input_inspects_before_explicit_tracking_and_uses_selected_point_
         &renderer,
         &mut operation::focusable::focus::<()>(local_path_id(owner)),
     );
-    let key = iced::keyboard::Key::Character("/".into());
-    let input = iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-        key: key.clone(),
-        modified_key: key,
-        physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Slash),
-        location: iced::keyboard::Location::Standard,
-        modifiers: iced::keyboard::Modifiers::default(),
-        text: Some("/repo/local".into()),
-        repeat: false,
-    });
-    let mut messages = Vec::new();
-    let _ = ui.update(
-        &[input],
-        mouse::Cursor::Unavailable,
-        &mut renderer,
-        &mut iced::advanced::clipboard::Null,
-        &mut messages,
-    );
+    // A normal key event inserts one character; paste the complete path through
+    // the actual focused widget rather than packing it into one key event.
+    let mut messages = repository_paste(&mut ui, &mut renderer, "/repo/local");
     let cache = ui.into_cache();
     assert!(
         matches!(messages.as_slice(), [Action::LocalPath(actual, value)] if *actual == owner && value == "/repo/local")
@@ -3493,14 +3478,58 @@ fn recovery_discovery_failure_blocks_only_selected_local_submit_and_preserves_me
     assert!(state.writable(state.owner().unwrap()));
     assert!(!state.local_writable(state.owner().unwrap()));
     state.update(Action::Dismiss(owner));
+    let view = state.view.as_ref().unwrap();
+    let local_form = view.form.as_ref().unwrap();
+    assert_eq!(local_form.owner, owner);
+    assert_eq!(local_form.local.as_ref().unwrap().directory, "/repo/local");
+    let confirmation = view.confirmation.as_ref().unwrap().id;
+    assert_eq!(
+        state.saved.error.as_deref(),
+        Some("Private recovery unavailable")
+    );
+    let view_owner = view.owner;
+    let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+    let mut ui = cached(&state, Cache::new(), &mut renderer, 500.0, 1800.0);
+    let point = bounds(&ui, "Discard draft").center();
+    let mut messages = click(&mut ui, &mut renderer, point);
+    let cache = ui.into_cache();
+    assert!(
+        matches!(messages.as_slice(), [Action::Discard(actual, id)] if *actual == view_owner && *id == confirmation)
+    );
+    state.update(messages.remove(0));
+    assert!(state.view.as_ref().unwrap().form.is_none());
+    assert!(state.view.as_ref().unwrap().confirmation.is_none());
     let form = filled_form(&mut state);
+    assert!(
+        state
+            .view
+            .as_ref()
+            .unwrap()
+            .form
+            .as_ref()
+            .unwrap()
+            .local
+            .is_none()
+    );
+    assert_eq!(
+        state.saved.error.as_deref(),
+        Some("Private recovery unavailable")
+    );
+    let mut ui = cached(&state, cache, &mut renderer, 500.0, 1800.0);
+    let point = bounds(&ui, "Track PR").center();
+    let mut messages = click(&mut ui, &mut renderer, point);
+    let _ = ui.into_cache();
     assert!(matches!(
-        state.update(Action::Submit {
-            owner: form,
-            target: target(7),
+        messages.as_slice(),
+        [Action::Submit {
+            owner: actual_owner,
+            target: actual,
             role: Role::Contribute,
             revision: 0
-        }),
+        }] if *actual_owner == form && *actual == target(7)
+    ));
+    assert!(matches!(
+        state.update(messages.remove(0)),
         Some(Effect::Mutate {
             selection: None,
             ..
