@@ -7378,6 +7378,12 @@ impl Cagents {
     }
 
     fn persist(&mut self) {
+        self.persist_with_view_publication(Self::publish_view_changes);
+    }
+
+    /// Snapshot the active strip before publishing its exact pane projection.
+    /// Shared reconciliation supplies an already projected publication pass.
+    fn persist_with_view_publication(&mut self, publish: impl FnOnce(&mut Self)) {
         self.shared_views.prune_restoration_requests(&self.durable);
         if !self.durable.pending_terminal_creations.is_empty() {
             let open = self
@@ -7395,7 +7401,7 @@ impl Cagents {
         }
         self.focus_save_pending = false;
         self.snapshot_workspace_scope();
-        self.publish_view_changes();
+        publish(self);
         let saved = self.persistent_workspace();
         if let Some(session) = &self.session {
             let adoptions = std::mem::take(&mut self.shared_views.adoptions);

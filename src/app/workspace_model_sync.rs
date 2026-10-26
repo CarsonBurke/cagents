@@ -109,6 +109,13 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
     // model to mirror, and the window starts one itself as soon as it publishes.
     let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
     let mut client = ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+    observe_with_client(sender, &mut client)
+}
+
+fn observe_with_client(
+    sender: &async_channel::Sender<ModelUpdate>,
+    client: &mut ControlClient,
+) -> Result<(), String> {
     // One request subscribes and reads, so an edit applied between the two
     // cannot fall into a gap - the hazard `watch_terminals` then `list` has to
     // order around with two requests.
@@ -133,6 +140,7 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
                 | ModelEdit::ReorderNavigation { .. }
                 | ModelEdit::ResetNavigation { .. }
                 | ModelEdit::RetireEmptyChannel { .. }
+                | ModelEdit::AgentsChanged
         ) {
             let model = client
                 .read_workspace_model()
@@ -142,13 +150,7 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
                 .map_err(|error| error.to_string())?;
             continue;
         }
-        let ranked = matches!(
-            edit,
-            ModelEdit::CreateChannel { .. }
-                | ModelEdit::AgentsChanged
-                | ModelEdit::SeedView { .. }
-                | ModelEdit::ChangeView { .. }
-        );
+        let ranked = matches!(edit, ModelEdit::CreateChannel { .. });
         sender
             .send_blocking(ModelUpdate::Edited { sequence, edit })
             .map_err(|error| error.to_string())?;
@@ -1549,6 +1551,135 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_invalidation_reads_once_without_reconciling_a_stale_inventory_edge() {
+        use crate::terminal::ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+            ServerResponse, read_frame, write_frame,
+        };
+        let channel = ChannelId::new();
+        let title = ModelEdit::RetitleChannel {
+            id: channel,
+            title: "Manual title".into(),
+        };
+        let create = ModelEdit::CreateChannel {
+            id: ChannelId::new(),
+            repository: "/repo/.git".into(),
+            title: "Other channel".into(),
+            title_source: Default::default(),
+        };
+        let expected_title = title.clone();
+        let expected_create = create.clone();
+        let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let server = std::thread::spawn(move || {
+            let proof = crate::model::HostSessionProof {
+                host_session_id: "observer".into(),
+                boot_id: "boot".into(),
+                host_incarnation: "owner".into(),
+            };
+            let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            write_frame(
+                &mut peer,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(hello.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof: proof.clone(),
+                            resumed: vec![],
+                        },
+                    },
+                },
+            )
+            .unwrap();
+            let watch: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            assert_eq!(watch.request, ClientRequest::WatchWorkspaceModel);
+            let mut model = WorkspaceModel {
+                identity: uuid::Uuid::new_v4(),
+                ..Default::default()
+            };
+            write_frame(
+                &mut peer,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(watch.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::WorkspaceModel {
+                            model: model.clone(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+            for (sequence, edit) in [(1, title), (2, ModelEdit::AgentsChanged), (3, create)] {
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: None,
+                        proof: proof.clone(),
+                        message: ServerMessage::WorkspaceModelEdited {
+                            sequence,
+                            edit: edit.clone(),
+                        },
+                    },
+                )
+                .unwrap();
+                model.fold(sequence, &edit);
+                if sequence != 1 {
+                    let read: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                    assert_eq!(read.request, ClientRequest::ReadWorkspaceModel);
+                    write_frame(
+                        &mut peer,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(read.request_id),
+                            proof: proof.clone(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::WorkspaceModel {
+                                    model: model.clone(),
+                                },
+                            },
+                        },
+                    )
+                    .unwrap();
+                }
+            }
+            write_frame(
+                &mut peer,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: None,
+                    proof,
+                    message: ServerMessage::HostShuttingDown,
+                },
+            )
+            .unwrap();
+        });
+        let mut client = ControlClient::from_stream(stream).unwrap();
+        let (tx, rx) = async_channel::unbounded();
+        assert!(observe_with_client(&tx, &mut client).is_err());
+        server.join().unwrap();
+        let updates = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            updates.len(),
+            5,
+            "one full Read for AgentsChanged, never a stale Edited first"
+        );
+        assert!(matches!(&updates[0], ModelUpdate::Connected(model) if model.sequence == 0));
+        assert!(
+            matches!(&updates[1], ModelUpdate::Edited { sequence: 1, edit } if edit == &expected_title)
+        );
+        assert!(matches!(&updates[2], ModelUpdate::Read(model) if model.sequence == 2));
+        assert!(
+            matches!(&updates[3], ModelUpdate::Edited { sequence: 3, edit } if edit == &expected_create)
+        );
+        assert!(matches!(&updates[4], ModelUpdate::Read(model) if model.sequence == 3));
+    }
 
     #[test]
     fn busy_title_publication_yields_after_three_original_attempts_to_the_next_edit() {
