@@ -5844,7 +5844,7 @@ pub(super) fn prepared_runtime_for_test(items: &[chat::Item]) -> (Runtime, Arc<C
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iced::advanced::{layout, widget::Tree, Layout};
+    use iced::advanced::{Layout, layout, widget::Tree};
 
     #[test]
     fn review_artifact_button_retains_exact_uri_and_rendered_origin_without_answering() {
@@ -13603,6 +13603,23 @@ mod tests {
             widget::{Operation, operation},
         };
         use iced::runtime::{UserInterface, user_interface::Cache};
+        #[derive(Default)]
+        struct Focus(Option<widget::Id>);
+        impl Operation for Focus {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if state.is_focused() {
+                    self.0 = id.cloned();
+                }
+            }
+        }
         fn menu(runtime: &Runtime) -> Element<'_, Message> {
             widget::container(runtime.composer_actions(true, 620.0))
                 .height(Length::Fill)
@@ -13638,7 +13655,10 @@ mod tests {
             .root()
             .iter()
             .chain(accessible.children())
-            .find(|node| node.node().label() == Some("Skill · beta"))
+            .find(|node| {
+                node.node().role() == iced_accessibility::accesskit::Role::Button
+                    && node.node().label() == Some("Skill · beta")
+            })
             .expect("the real action row is accessible")
             .id()
             .clone();
@@ -13649,6 +13669,15 @@ mod tests {
             &renderer,
             &mut operation::focusable::focus::<()>(beta_id.clone()),
         );
+        // Scrollable accessibility includes the label's text node before
+        // its button root. Only the interactive Button ID can own focus.
+        let mut initially_focused = Focus::default();
+        ui.operate(&renderer, &mut initially_focused);
+        assert_eq!(
+            initially_focused.0,
+            Some(beta_id.clone()),
+            "the actual native button must own focus before testing reorder"
+        );
         let cache = ui.into_cache();
         Arc::make_mut(&mut runtime.snapshot).skills.swap(0, 1);
         let mut ui = UserInterface::build(menu(&runtime), viewport, cache, &mut renderer);
@@ -13658,29 +13687,15 @@ mod tests {
                 .root()
                 .iter()
                 .chain(accessible.children())
-                .find(|node| node.node().label() == Some("Skill · beta"))
+                .find(|node| {
+                    node.node().role() == iced_accessibility::accesskit::Role::Button
+                        && node.node().label() == Some("Skill · beta")
+                })
                 .unwrap()
                 .id(),
             &beta,
             "native accessibility identity follows the exact invocation"
         );
-        #[derive(Default)]
-        struct Focus(Option<widget::Id>);
-        impl Operation for Focus {
-            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
-                operate(self);
-            }
-            fn focusable(
-                &mut self,
-                id: Option<&widget::Id>,
-                _: iced::Rectangle,
-                state: &mut dyn operation::Focusable,
-            ) {
-                if state.is_focused() {
-                    self.0 = id.cloned();
-                }
-            }
-        }
         let mut focused = Focus::default();
         ui.operate(&renderer, &mut focused);
         assert_eq!(focused.0, Some(beta_id));
