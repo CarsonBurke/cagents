@@ -292,6 +292,8 @@ enum NoticeKey {
     AccountLink,
     /// Telling panes whether they are on screen.
     SurfaceVisibility,
+    /// Saving the final state of this exact window before closing it.
+    WindowClose(window::Id),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12683,18 +12685,20 @@ impl Cagents {
             }
             return Task::none();
         };
-        // Fold pending settings without dispatching new effects. Capture the
-        // latest composer/editor state before putting the writer barrier behind it.
-        self.fold_settings_drafts();
+        // Apply pending settings through their ordinary live-effects path: a
+        // refused/cancelled close must leave a usable, synchronized window.
+        // Capture the latest composer/editor state before the writer barrier.
+        let drafts = self.flush_settings_drafts();
         self.persist();
         let snapshot = self.persistent_workspace();
         let writer = self.session.as_ref().map(SessionRuntime::operation_store);
         let save = self.capture_workspace_save();
         self.window_close_generation = self.window_close_generation.wrapping_add(1);
         let generation = self.window_close_generation;
-        self.status = Some(TransientNotice::warning(
-            "Saving this window before closing…",
-        ));
+        self.status = Some(
+            TransientNotice::warning("Saving this window before closing…")
+                .with_key(NoticeKey::WindowClose(window)),
+        );
         self.pending_window_close = Some(PendingWindowClose {
             generation,
             window,
@@ -12706,15 +12710,18 @@ impl Cagents {
                 .map_err(|error| error.to_string()),
             updater,
         });
-        cosmic::task::future(async move {
-            let (saved, result) = flush_workspace(save).await;
-            Message::WindowCloseFlushed {
-                generation,
-                window,
-                saved,
-                result,
-            }
-        })
+        Task::batch([
+            drafts,
+            cosmic::task::future(async move {
+                let (saved, result) = flush_workspace(save).await;
+                Message::WindowCloseFlushed {
+                    generation,
+                    window,
+                    saved,
+                    result,
+                }
+            }),
+        ])
     }
 
     fn finish_window_close(
@@ -12766,14 +12773,15 @@ impl Cagents {
                 self.update_committed = false;
                 let _ = response.try_send(format!("error: {error}").replace('\n', " "));
             }
-            self.status = Some(TransientNotice::error(format!(
-                "Could not save this window; it remains open. Copy unsent drafts before retrying close. {error}"
-            )));
+            self.status = Some(TransientNotice::error(
+                "Could not save this window. It remains open; copy unsent drafts before resolving the save error.",
+            ).with_details(error).with_key(NoticeKey::WindowClose(window)));
             return Task::none();
         }
         if let Ok(saved) = saved {
             self.acknowledge_settings_save(saved);
         }
+        self.resolve_notice(NoticeKey::WindowClose(window));
         if let Some((_, response)) = pending.updater {
             if response.try_send("ok".into()).is_err() {
                 self.update_prepared = false;
@@ -16136,6 +16144,7 @@ impl Application for Cagents {
                     }
                     if self.pending_window_close.as_ref().is_some_and(|pending| pending.updater.is_some()) {
                         let pending = self.pending_window_close.take().expect("updater close");
+                        self.resolve_notice(NoticeKey::WindowClose(pending.window));
                         if let Some((_, response)) = pending.updater {
                             let _ = response.try_send("error: window update preparation was cancelled".into());
                         }
@@ -20230,12 +20239,31 @@ mod tests {
         app.settings_write_blocked = false;
     }
 
+    fn window_close_test_message(app: &mut Cagents, task: Task<Message>) -> Message {
+        let mut stream = iced::runtime::task::into_stream(task).expect("close task");
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                        if matches!(message, Message::WindowCloseFlushed { .. }) {
+                            return message;
+                        }
+                        drop(app.update(message));
+                    }
+                }
+                panic!("close task did not acknowledge final save");
+            })
+    }
+
     fn acknowledge_test_window_close(app: &mut Cagents, window: window::Id) {
         let task = app.update(Message::WindowCloseRequested(window));
         assert!(app.pending_window_close.is_some());
         assert!(app.exit.is_none());
         assert_eq!(app.core.main_window_id(), Some(window));
-        let completed = task_app_message(task);
+        let completed = window_close_test_message(app, task);
         assert!(matches!(
             &completed,
             Message::WindowCloseFlushed { result: Ok(()), .. }
@@ -20287,7 +20315,7 @@ mod tests {
             generation
         );
         type_window_close_draft(&mut app, card, "must not be accepted during flush");
-        let completed = task_app_message(task);
+        let completed = window_close_test_message(&mut app, task);
         assert!(matches!(
             &completed,
             Message::WindowCloseFlushed { result: Ok(()), .. }
@@ -20329,7 +20357,7 @@ mod tests {
         let (activations, receiver) = async_channel::unbounded();
         app.activation_rx = receiver;
         let task = app.update(Message::WindowCloseRequested(window));
-        let completed = task_app_message(task);
+        let completed = window_close_test_message(&mut app, task);
         assert!(matches!(
             &completed,
             Message::WindowCloseFlushed { result: Err(_), .. }
@@ -20340,10 +20368,11 @@ mod tests {
         assert_eq!(app.core.main_window_id(), Some(window));
         assert!(!activations.is_closed());
         assert!(
-            app.notices
-                .entries
-                .iter()
-                .any(|entry| entry.notice.message.contains("Copy unsent drafts"))
+            app.notices.entries.iter().any(|entry| entry
+                .notice
+                .message
+                .contains("copy unsent drafts")
+                && entry.notice.details.is_some())
         );
         assert_eq!(
             app.persistent_workspace().chat_drafts[&card].trim_end(),
@@ -20370,7 +20399,8 @@ mod tests {
         // nor automatically retries a permanent storage quarantine.
         type_window_close_draft(&mut app, card, " still editable");
         assert!(app.persistent_workspace().chat_drafts[&card].contains("still editable"));
-        let retry = task_app_message(app.update(Message::WindowCloseRequested(window)));
+        let retry_task = app.update(Message::WindowCloseRequested(window));
+        let retry = window_close_test_message(&mut app, retry_task);
         assert!(matches!(
             &retry,
             Message::WindowCloseFlushed { result: Err(_), .. }
@@ -20378,6 +20408,14 @@ mod tests {
         drop(app.update(retry));
         assert_eq!(app.core.main_window_id(), Some(window));
         assert!(!activations.is_closed());
+        assert_eq!(
+            app.notices
+                .entries
+                .iter()
+                .filter(|entry| entry.notice.key == Some(NoticeKey::WindowClose(window)))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -20385,7 +20423,8 @@ mod tests {
         for changed in ["snapshot", "writer", "window", "settings", "view"] {
             let directory = tempfile::tempdir().unwrap();
             let (mut app, card, window) = window_close_draft_app(directory.path());
-            let completed = task_app_message(app.update(Message::WindowCloseRequested(window)));
+            let task = app.update(Message::WindowCloseRequested(window));
+            let completed = window_close_test_message(&mut app, task);
             assert!(matches!(
                 &completed,
                 Message::WindowCloseFlushed { result: Ok(()), .. }
@@ -20417,7 +20456,7 @@ mod tests {
                 app.pending_window_close.as_ref().unwrap().generation,
                 generation
             );
-            let completed = task_app_message(task);
+            let completed = window_close_test_message(&mut app, task);
             assert!(matches!(
                 &completed,
                 Message::WindowCloseFlushed { result: Ok(()), .. }
@@ -20432,13 +20471,25 @@ mod tests {
         for missing in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let (mut app, card, window) = window_close_draft_app(directory.path());
+            let previous = app.settings.chat_expand_tool_groups;
+            drop(app.update(Message::SettingsDraftChanged {
+                field: SettingsField::ChatExpandToolGroups,
+                value: (!previous).to_string(),
+            }));
+            assert!(
+                app.settings_pending
+                    .contains_key(&SettingsField::ChatExpandToolGroups)
+            );
+            assert!(matches!(&app.cards[&card], CardRuntime::Chat(runtime)
+                if runtime.tool_groups_expanded == previous));
             if missing {
                 app.session = None;
             } else {
                 // An actual settings write failure also vetoes the final barrier.
                 app.settings_path = Some(directory.path().to_path_buf());
             }
-            let completed = task_app_message(app.update(Message::WindowCloseRequested(window)));
+            let task = app.update(Message::WindowCloseRequested(window));
+            let completed = window_close_test_message(&mut app, task);
             assert!(matches!(
                 &completed,
                 Message::WindowCloseFlushed { result: Err(_), .. }
@@ -20446,6 +20497,10 @@ mod tests {
             drop(app.update(completed));
             assert!(app.exit.is_none());
             assert_eq!(app.core.main_window_id(), Some(window));
+            assert_eq!(app.settings.chat_expand_tool_groups, !previous);
+            assert!(app.settings_pending.is_empty());
+            assert!(matches!(&app.cards[&card], CardRuntime::Chat(runtime)
+                if runtime.tool_groups_expanded == !previous));
             assert_eq!(
                 app.persistent_workspace().chat_drafts[&card].trim_end(),
                 "UNSENT before close"
