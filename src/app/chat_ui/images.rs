@@ -2,6 +2,9 @@
 //! does not decode base64, read a file, or copy a pixel buffer.
 use super::*;
 mod canvas;
+pub(super) fn canvas_focus_id() -> widget::Id {
+    widget::Id::new("chat.image-viewer.canvas")
+}
 
 // Keep the pixel lease in the decoded buffer itself: cached turns, galleries,
 // detached widget trees and renderer host buffers all clone it. Counting cache
@@ -812,6 +815,87 @@ pub(super) fn subscriptions(runtime: &Runtime) -> Vec<Subscription<Message>> {
         .collect()
 }
 
+const IMAGE_LABEL_CHARS: usize = 120;
+const IMAGE_DETAIL_CHARS: usize = 160;
+
+// Bound the input before trimming, splitting or shaping it: provider metadata
+// can itself be a whole prompt or a data URL. Never clone its complete source.
+fn bounded_image_metadata(raw: &str, limit: usize) -> String {
+    let prefix: String = raw
+        .chars()
+        .take(limit + 1)
+        .take_while(|character| !matches!(character, '\n' | '\r'))
+        .filter(|character| !character.is_control())
+        .collect();
+    Runtime::short_description(prefix.trim(), limit)
+}
+fn inline_image_label(item: &chat::Item) -> String {
+    let ItemContent::Image {
+        description,
+        reference,
+        ..
+    } = &item.content
+    else {
+        return "Image".into();
+    };
+    let label = bounded_image_metadata(description, IMAGE_LABEL_CHARS);
+    if !label.is_empty()
+        && !label.starts_with("data:")
+        && !label.starts_with('/')
+        && !label.starts_with("file:")
+        && !label.starts_with("http:")
+        && !label.starts_with("https:")
+    {
+        label
+    } else {
+        reference
+            .as_ref()
+            .map(chat::ImageReference::label)
+            .unwrap_or_else(|| "Image".into())
+    }
+}
+fn inline_image_detail(raw: &str) -> String {
+    let prefix = bounded_image_metadata(raw, IMAGE_DETAIL_CHARS * 2);
+    // Diagnostics may carry absolute local/remote paths or an inline payload.
+    // Retain the useful reason while replacing path-like tokens before display.
+    let detail = prefix
+        .split_whitespace()
+        .map(|word| {
+            if word.contains('/') || word.contains('\\') || word.starts_with("data:") {
+                "[image]"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    bounded_image_metadata(&detail, IMAGE_DETAIL_CHARS)
+}
+
+// Paths and provider descriptions are untrusted metadata. In particular a
+// data URL is image content, never a filename to shape in a toolbar.
+fn gallery_label(
+    path: &str,
+    description: &str,
+    reference: Option<&chat::ImageReference>,
+) -> String {
+    let filename = (!path.starts_with("data:"))
+        .then(|| Path::new(path).file_name().and_then(|name| name.to_str()))
+        .flatten();
+    let label = reference
+        .map(|reference| reference.name.as_str())
+        .filter(|name| !name.trim().is_empty())
+        .or(filename.filter(|name| !name.trim().is_empty()))
+        .or_else(|| {
+            description
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+        })
+        .unwrap_or("Image");
+    bounded_image_metadata(label, IMAGE_LABEL_CHARS)
+}
+
 struct Entry {
     id: String,
     managed: bool,
@@ -819,11 +903,41 @@ struct Entry {
     label: String,
     handle: iced::widget::image::Handle,
 }
+#[derive(Clone, Copy)]
+pub(in crate::app) enum ViewerCommand {
+    Close,
+    Next(bool),
+    Fit,
+    ActualSize,
+    Select(usize),
+    External,
+}
+impl ViewerCommand {
+    pub(super) fn action(self) -> Action {
+        match self {
+            Self::Close => Action::CloseImage,
+            Self::Next(forward) => Action::ImageNext(forward),
+            Self::Fit => Action::ImageFit,
+            Self::ActualSize => Action::ImageActualSize,
+            Self::Select(index) => Action::ImageSelect(index),
+            Self::External => Action::ImageExternal,
+        }
+    }
+}
+fn next_gallery_identity() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 pub(in crate::app) struct Gallery {
+    identity: u64,
     entries: Vec<Entry>,
     selected: usize,
     remote: bool,
     pub(super) reset: u64,
+    pub(super) actual_size: bool,
+    target: Option<Target>,
+    agent: Option<String>,
 }
 impl Gallery {
     pub(in crate::app) fn file(
@@ -832,6 +946,7 @@ impl Gallery {
         handle: iced::widget::image::Handle,
     ) -> Self {
         Self {
+            identity: next_gallery_identity(),
             entries: vec![Entry {
                 id: "file".into(),
                 managed: false,
@@ -839,12 +954,19 @@ impl Gallery {
                 path: Url::from_file_path(&path)
                     .map(|url| url.to_string())
                     .unwrap_or_default(),
-                label: format!("{} · {}", device.unwrap_or("This device"), path.display()),
+                label: format!(
+                    "{} · {}",
+                    device.unwrap_or("This device"),
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ),
                 handle,
             }],
             selected: 0,
             remote: device.is_some(),
             reset: 0,
+            actual_size: false,
+            target: None,
+            agent: None,
         }
     }
     pub(super) fn new(runtime: &Runtime, id: &str) -> Option<Self> {
@@ -885,22 +1007,56 @@ impl Gallery {
                             .to_string_lossy()
                             .into_owned()
                     },
-                    label: if description.is_empty() {
-                        "Image".into()
-                    } else {
-                        description.clone()
-                    },
+                    label: gallery_label(path, description, reference.as_ref()),
                     handle: runtime.presentation_cache().get(&item.id)?.image.clone()?,
                 })
             })
             .collect();
         let selected = entries.iter().position(|entry| entry.id == id)?;
         Some(Self {
+            identity: next_gallery_identity(),
             entries,
             selected,
             remote: crate::device::is_remote(),
             reset: 0,
+            actual_size: false,
+            target: Some(runtime.target),
+            agent: runtime.selected_subagent.clone(),
         })
+    }
+    /// Device-file previews retain their dialog; transcript previews belong to
+    /// the exact runtime generation and agent that supplied the clicked image.
+    pub(super) fn callback(&self, command: ViewerCommand) -> Action {
+        Action::ImageViewer(self.identity, command)
+    }
+    fn message(&self, command: ViewerCommand) -> Message {
+        action(self.callback(command))
+    }
+    pub(super) fn accepts(&self, identity: u64, runtime: Option<&Runtime>) -> bool {
+        self.identity == identity
+            && (self.is_modal()
+                || runtime.is_some_and(|runtime| {
+                    self.belongs_to(runtime) && runtime.visible.load(Ordering::Relaxed)
+                }))
+    }
+    pub(in crate::app) fn is_modal(&self) -> bool {
+        self.target.is_none()
+    }
+    #[cfg(test)]
+    pub(super) fn selected_handle_id(&self) -> iced::advanced::image::Id {
+        self.entries[self.selected].handle.id()
+    }
+    pub(in crate::app) fn target(&self) -> Option<Target> {
+        self.target
+    }
+    pub(super) fn belongs_to(&self, runtime: &Runtime) -> bool {
+        self.target == Some(runtime.target) && self.agent == runtime.selected_subagent
+    }
+    pub(super) fn select(&mut self, index: usize) {
+        if index < self.entries.len() && index != self.selected {
+            self.selected = index;
+            self.reset = self.reset.wrapping_add(1);
+        }
     }
     pub(in crate::app) fn next(&mut self, forward: bool) {
         self.selected = if forward {
@@ -930,55 +1086,160 @@ impl Gallery {
     }
     pub(in crate::app) fn view(&self) -> Element<'_, Message> {
         let entry = &self.entries[self.selected];
-        let navigation = self.entries.len() > 1;
-        let toolbar = widget::row::with_children(vec![
-            icon(
-                Icon::ChevronLeft,
-                "Previous image (Left)",
-                navigation,
-                Action::ImageNext(false),
-            ),
-            design::caption(format!("{} / {}", self.selected + 1, self.entries.len())).into(),
-            icon(
-                Icon::ChevronRight,
-                "Next image (Right)",
-                navigation,
-                Action::ImageNext(true),
-            ),
-            iced::widget::Space::new().width(Length::Fill).into(),
+        let mut controls = Vec::new();
+        if self.entries.len() > 1 {
+            controls.extend([
+                icon(
+                    Icon::ChevronLeft,
+                    "Previous image (Left)",
+                    true,
+                    self.callback(ViewerCommand::Next(false)),
+                ),
+                design::caption(format!("{} / {}", self.selected + 1, self.entries.len())).into(),
+                icon(
+                    Icon::ChevronRight,
+                    "Next image (Right)",
+                    true,
+                    self.callback(ViewerCommand::Next(true)),
+                ),
+            ]);
+        }
+        controls.extend([
             crate::ui_controls::button::secondary("Fit")
-                .on_press(action(Action::ImageFit))
+                .on_press(self.message(ViewerCommand::Fit))
                 .into(),
-            crate::ui_controls::button::secondary("Open externally")
-                .on_press_maybe(self.url().map(|_| action(Action::ImageExternal)))
+            crate::ui_controls::button::secondary("100%")
+                .on_press(self.message(ViewerCommand::ActualSize))
                 .into(),
-            icon(Icon::Close, "Close image (Esc)", true, Action::CloseImage),
-        ])
-        .spacing(step::GAP_S)
-        .align_y(iced::Alignment::Center);
+            crate::interaction::tooltip(
+                crate::ui_controls::button::secondary("Open externally")
+                    .on_press_maybe(self.url().map(|_| self.message(ViewerCommand::External))),
+                if self.url().is_some() {
+                    "Open the original image in another application"
+                } else {
+                    "The original image is unavailable to external applications on this device"
+                },
+            ),
+            icon(
+                Icon::Close,
+                "Close image (Esc)",
+                true,
+                self.callback(ViewerCommand::Close),
+            ),
+        ]);
+        let toolbar = widget::flex_row(controls)
+            .spacing(step::GAP_XS as u16)
+            .align_items(iced::Alignment::Center);
         let viewer: Element<'_, Message> = iced::widget::image::Viewer::new(entry.handle.clone())
             .width(Length::Fill)
             .height(Length::Fill)
-            .content_fit(iced::ContentFit::Contain)
+            .content_fit(if self.actual_size {
+                iced::ContentFit::None
+            } else {
+                iced::ContentFit::Contain
+            })
             .min_scale(0.1)
             .max_scale(20.0)
             .into();
-        let canvas = canvas::resettable(self.reset, viewer);
-        dialog_ui::overlay(
-            dialog_ui::surface(
-                widget::column::with_children(vec![
-                    toolbar.into(),
-                    design::caption(entry.label.as_str()).into(),
-                    canvas.into(),
-                    design::caption("Scroll to zoom · Drag to pan · Left / Right to browse").into(),
-                ])
-                .spacing(step::GAP_S)
-                .height(Length::Fill),
-                f32::MAX,
-            ),
-            Some(action(Action::CloseImage)),
-            1.0,
-        )
+        let mut content = vec![
+            design::caption(entry.label.as_str()).into(),
+            toolbar.into(),
+            canvas::identified(self.identity, self.reset, &entry.label, viewer),
+        ];
+        if self.entries.len() > 1 {
+            // Reuse already admitted handles. Keep the strip small even if a
+            // conversation has many images; opening it never starts a decode.
+            let start = self
+                .selected
+                .saturating_sub(3)
+                .min(self.entries.len().saturating_sub(7));
+            let thumbs = self
+                .entries
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(7)
+                .map(|(index, entry)| {
+                    widget::button::custom(
+                        iced::widget::image(entry.handle.clone())
+                            .width(56)
+                            .height(40)
+                            .content_fit(iced::ContentFit::Contain),
+                    )
+                    .class(crate::ui_controls::control_style(
+                        index == self.selected,
+                        None,
+                    ))
+                    .padding(2)
+                    .name(format!(
+                        "View {} · image {} of {}",
+                        entry.label,
+                        index + 1,
+                        self.entries.len()
+                    ))
+                    .selected(index == self.selected)
+                    .on_press(self.message(ViewerCommand::Select(index)))
+                    .into()
+                })
+                .collect::<Vec<Element<'_, Message>>>();
+            content.push(widget::flex_row(thumbs).spacing(step::GAP_XS as u16).into());
+        }
+        let dimensions = match &entry.handle {
+            iced::widget::image::Handle::Rgba { width, height, .. } => {
+                format!("{width} × {height} · ")
+            }
+            _ => String::new(),
+        };
+        content.push(
+            design::caption(format!("{dimensions}Scroll or + / − to zoom · Drag to pan")).into(),
+        );
+        let surface = crate::interaction::focused_key(
+            widget::container(
+                widget::column::with_children(content)
+                    .spacing(step::GAP_XS)
+                    .height(Length::Fill),
+            )
+            .padding(step::GAP_S)
+            .class(design::surface(
+                Some(design::raised),
+                [design::RADIUS_M; 4],
+                true,
+            ))
+            .width(Length::Fill)
+            .height(Length::Fill),
+            |event| {
+                let iced::keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
+                    return None;
+                };
+                if !modifiers.is_empty() {
+                    return None;
+                }
+                let command = match key {
+                    iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) => {
+                        ViewerCommand::Close
+                    }
+                    iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowLeft) => {
+                        ViewerCommand::Next(false)
+                    }
+                    iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowRight) => {
+                        ViewerCommand::Next(true)
+                    }
+                    iced::keyboard::Key::Character(key) if key == "0" => ViewerCommand::Fit,
+                    iced::keyboard::Key::Character(key) if key == "1" => ViewerCommand::ActualSize,
+                    _ => return None,
+                };
+                Some(self.message(command))
+            },
+        );
+        if self.is_modal() {
+            dialog_ui::overlay(
+                dialog_ui::surface(surface, f32::MAX),
+                Some(self.message(ViewerCommand::Close)),
+                1.0,
+            )
+        } else {
+            surface
+        }
     }
 }
 impl Runtime {
@@ -987,54 +1248,93 @@ impl Runtime {
         item: &chat::Item,
         cached: &CachedItem,
     ) -> Element<'static, Message> {
-        let label = match &item.content {
-            ItemContent::Image { description, .. } if !description.is_empty() => {
-                description.clone()
-            }
-            _ => "Image".into(),
-        };
+        let label = inline_image_label(item);
         let Some(handle) = &cached.image else {
-            return if cached.image_unavailable {
-                design::caption(
-                    cached
-                        .image_error
-                        .clone()
-                        .unwrap_or_else(|| format!("{label} · Preview unavailable")),
-                )
+            let placeholder: Element<'static, Message> = if cached.image_unavailable {
+                let detail = cached
+                    .image_error
+                    .as_deref()
+                    .map(inline_image_detail)
+                    .filter(|detail| !detail.is_empty());
+                let mut notices = vec![design::caption("Preview unavailable").into()];
+                if let Some(detail) = detail {
+                    notices.push(design::caption(detail).into());
+                }
+                let can_retry =
+                    matches!(&item.content, ItemContent::Image { path, .. } if !path.is_empty());
+                widget::column::with_children(notices.into_iter().chain(can_retry.then(|| {
+                    crate::ui_controls::button::secondary("Retry preview")
+                        .name(format!("Retry preview for {label}"))
+                        .on_press(action(Action::LoadImage(self.target, item.id.clone())))
+                        .into()
+                })))
+                .spacing(step::GAP_XS)
                 .into()
             } else if cached.image_wait.is_some() {
-                design::caption(format!("{label} · Waiting for preview memory…")).into()
+                design::caption("Waiting for preview memory…").into()
             } else if cached.image_source.is_some()
                 && interest(self)
                     .iter()
                     .any(|candidate| candidate.id == item.id)
             {
-                design::caption(format!("{label} · Loading preview…")).into()
+                design::caption("Loading preview…").into()
             } else {
                 widget::column::with_children(vec![
-                    design::caption(label).into(),
                     crate::ui_controls::button::secondary("Load preview")
+                        .name(format!("Load preview for {label}"))
                         .on_press(action(Action::LoadImage(self.target, item.id.clone())))
                         .into(),
                 ])
                 .spacing(step::GAP_XS)
                 .into()
             };
+            return widget::container(
+                widget::column::with_children(vec![
+                    widget::container(placeholder)
+                        .height(216)
+                        .width(Length::Fill)
+                        .center_y(Length::Fill)
+                        .padding(step::GAP_S)
+                        .class(design::surface(
+                            Some(design::raised),
+                            [design::RADIUS_M; 4],
+                            true,
+                        ))
+                        .into(),
+                    design::caption(label).into(),
+                ])
+                .spacing(step::GAP_XS)
+                .width(Length::Fill),
+            )
+            .width(Length::Fill)
+            .max_width(480)
+            .into();
         };
         let preview = iced::widget::image(handle.clone())
             .width(Length::Fill)
-            .height(280)
+            .height(216)
             .content_fit(iced::ContentFit::Contain);
-        widget::column::with_children(vec![
-            widget::button::custom(preview)
-                .class(crate::ui_controls::control_style(false, None))
-                .padding(0)
-                .on_press(action(Action::OpenImage(self.target, item.id.clone())))
-                .width(Length::Fill)
-                .into(),
-            design::caption(format!("{label} · Click to enlarge")).into(),
-        ])
-        .spacing(step::GAP_XS)
+        widget::container(
+            widget::column::with_children(vec![
+                widget::button::custom(preview)
+                    .name(format!("Inspect {label}"))
+                    .class(crate::ui_controls::control_style(false, None))
+                    .padding(0)
+                    .on_press_maybe(self.active_item(&item.id).cloned().map(|source| {
+                        action(Action::OpenImageFrom(
+                            self.target,
+                            self.selected_subagent.clone(),
+                            source,
+                        ))
+                    }))
+                    .width(Length::Fill)
+                    .into(),
+                design::caption(format!("{label} · Click to enlarge")).into(),
+            ])
+            .spacing(step::GAP_XS)
+            .width(Length::Fill),
+        )
+        .max_width(480)
         .width(Length::Fill)
         .into()
     }
@@ -1052,6 +1352,48 @@ pub(super) fn deferred_for_test() -> Loaded {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gallery_labels_never_shape_inline_payloads_and_bound_provider_metadata() {
+        let inline = format!("data:image/png;base64,{}", "a".repeat(1024 * 1024));
+        assert_eq!(
+            gallery_label(&inline, "Generated image", None),
+            "Generated image"
+        );
+        assert_eq!(gallery_label(&inline, "", None), "Image");
+        let label = gallery_label(&format!("/fixture/{}", "x".repeat(4096)), "", None);
+        assert!(label.chars().count() <= 121);
+        assert!(!label.contains("data:"));
+    }
+
+    #[cfg(feature = "integrated-browser")]
+    #[test]
+    fn browser_import_is_above_conversation_images_and_below_device_file_dialogs() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        drop(app.update(Message::BrowserImport(
+            crate::app::browser_import_ui::Action::Open,
+        )));
+        let mut gallery = Gallery::file(
+            PathBuf::from("/fixture/image.png"),
+            None,
+            iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
+        );
+        app.chat_ui.image_viewer = Some(gallery);
+        assert!(
+            !app.browser_import_on_top(),
+            "device-file images remain above import"
+        );
+        gallery = app.chat_ui.image_viewer.take().unwrap();
+        gallery.target = Some(Target {
+            card: app.workspace.focused().unwrap(),
+            generation: 0,
+        });
+        app.chat_ui.image_viewer = Some(gallery);
+        assert!(
+            app.browser_import_on_top(),
+            "pane-local images do not cover import"
+        );
+    }
+
     #[test]
     fn image_headers_bound_pixel_memory_and_reject_invalid_data() {
         let mut bytes = Vec::new();
@@ -1684,10 +2026,14 @@ mod tests {
             handle: iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
         };
         let mut gallery = Gallery {
+            identity: next_gallery_identity(),
             entries: vec![entry("a"), entry("b")],
             selected: 0,
             remote: false,
             reset: 0,
+            actual_size: false,
+            target: None,
+            agent: None,
         };
         gallery.next(false);
         assert_eq!(gallery.selected, 1);

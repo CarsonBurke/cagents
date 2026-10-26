@@ -280,13 +280,17 @@ pub enum Action {
     OpenChangedFile(Target, PathBuf),
     ChangedFileResolved(Target, u64, PathBuf, Result<PathBuf, String>),
     OpenImage(Target, String),
+    OpenImageFrom(Target, Option<String>, Arc<chat::Item>),
     LoadImage(Target, String),
     ImageLoaded(Target, Arc<chat::Item>, u64, images::Loaded),
     ThumbnailLoaded(Target, Arc<PathBuf>, images::Loaded),
     RetryThumbnails(Target),
     CloseImage,
+    ImageViewer(u64, images::ViewerCommand),
     ImageNext(bool),
     ImageFit,
+    ImageActualSize,
+    ImageSelect(usize),
     ImageExternal,
     CopyLiteral(String),
     CopySharedCode(Target, Arc<str>),
@@ -297,6 +301,8 @@ pub enum Action {
     TakeBackQueued(Target, Option<QueueEntry>),
     RemoveQueued(Target, QueueEntry),
     ComposerActions(Target, bool),
+    ComposerActionsQuery(Target, String),
+    ComposerAction(Target, String),
     BranchPicker(Target, bool),
     ChangesPicker(Target, bool),
     ChangeFiles(Target, Option<chat::FileChangeKey>),
@@ -446,8 +452,11 @@ impl Action {
                 | Self::Tick
                 | Self::AccountPicker(_, false)
                 | Self::CloseImage
+                | Self::ImageViewer(..)
                 | Self::ImageNext(_)
                 | Self::ImageFit
+                | Self::ImageActualSize
+                | Self::ImageSelect(_)
                 | Self::ImageExternal
         )
     }
@@ -472,6 +481,7 @@ impl Action {
             | Self::Reconnect(target)
             | Self::SignIn(target, _)
             | Self::ResumeAfterSignIn(target)
+            | Self::ComposerAction(target, _)
             | Self::AcceptSuggestion(target, _)
             | Self::Submit(target, _)
             | Self::DiscardClosedDraft(target, _)
@@ -2037,6 +2047,7 @@ pub(super) struct Runtime {
     /// sending it again queues it unless the reader chooses otherwise.
     resend: Option<PromptMode>,
     composer_actions: bool,
+    composer_actions_query: String,
     branch_picker: bool,
     changes: changes::State,
     fork_requested: bool,
@@ -2066,6 +2077,7 @@ pub(super) struct Runtime {
     observed_scroll: scroll::Observations,
     scroll_memory: scroll::Memory,
     child_picker: Option<child_navigation::Picker>,
+    child_tab_focus: std::rc::Rc<std::cell::RefCell<Option<String>>>,
     /// The ids of items the reader was asked something after.
     ///
     /// A question or an approval request is the agent handing control back, so
@@ -2322,6 +2334,26 @@ impl Runtime {
         };
         token.fit(&rows);
         (!rows.is_empty()).then_some((token, rows))
+    }
+
+    /// Reuse slash completion's capability filtering and exact skill identity.
+    fn composer_action_candidates(&self) -> Vec<completion::Candidate<'_>> {
+        completion::candidates(
+            &self.snapshot,
+            &completion::Token {
+                line: 0,
+                start: 0,
+                end: 0,
+                sigil: '/',
+                query: self.composer_actions_query.clone(),
+                tail: String::new(),
+                leading: true,
+            },
+        )
+        .into_iter()
+        .filter(|row| row.name != COMPACT_COMMAND)
+        .take(100)
+        .collect()
     }
 
     /// Puts `insertion` over the word being completed when it is one of the
@@ -2954,6 +2986,7 @@ impl Runtime {
             taken_back: Vec::new(),
             resend: None,
             composer_actions: false,
+            composer_actions_query: String::new(),
             branch_picker: false,
             changes: changes::State::default(),
             fork_requested: false,
@@ -2982,6 +3015,7 @@ impl Runtime {
             observed_scroll: Default::default(),
             scroll_memory: Default::default(),
             child_picker: None,
+            child_tab_focus: Default::default(),
             asked_after: HashSet::new(),
             asked: HashSet::new(),
             opened: HashMap::new(),
@@ -3071,6 +3105,7 @@ impl Runtime {
         self.failures.clear();
         self.failure_ui = failure::State::default();
         self.child_picker = None;
+        self.child_tab_focus.borrow_mut().take();
         self.listed_models = 0;
         self.earlier_asked = None;
         self.later_asked = None;
@@ -7976,12 +8011,26 @@ impl Cagents {
         })
     }
     pub(super) fn handle_chat_ui(&mut self, action: Action) -> Task<Message> {
+        if matches!(
+            &action,
+            Action::ImageViewer(..)
+                | Action::CloseImage
+                | Action::ImageNext(_)
+                | Action::ImageFit
+                | Action::ImageActualSize
+                | Action::ImageSelect(_)
+                | Action::ImageExternal
+        ) && !self.image_viewer_owns_input()
+        {
+            return Task::none();
+        }
         let closed_refresh = match &action {
             Action::Ready(target, _) => Some(target.card),
             _ => None,
         };
         let restore = match &action {
             Action::AccountPicker(target, false)
+            | Action::ComposerActions(target, false)
             | Action::PermissionPicker(target, false)
             | Action::FooterPicker(target, false)
             | Action::ModelPicker(target, false)
@@ -10098,6 +10147,79 @@ impl Cagents {
                     .map(cosmic::Action::App);
                 }
             }
+            Action::ComposerActionsQuery(target, query) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.composer_actions_query = query;
+                }
+            }
+            Action::ComposerAction(target, insertion) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                let Some(kind) = runtime
+                    .composer_action_candidates()
+                    .into_iter()
+                    .find(|candidate| candidate.insertion == insertion)
+                    .map(|candidate| candidate.kind)
+                else {
+                    return Task::none();
+                };
+                if kind == completion::Kind::Command
+                    && (!runtime.snapshot.ready
+                        || runtime.snapshot.busy
+                        || runtime.snapshot.read_only_reason.is_some()
+                        || runtime.pending.is_some())
+                {
+                    return Task::none();
+                }
+                runtime.composer_actions = false;
+                runtime.branch_picker = false;
+                runtime.picker_keyboard = false;
+                if kind == completion::Kind::Skill {
+                    // The normal editor path maps pending image bookmarks and
+                    // leaves attachment identity and the rest of the draft intact.
+                    let cursor = runtime.composer.cursor().position;
+                    let prefix = runtime
+                        .composer
+                        .line(cursor.line)
+                        .and_then(|line| line.text.get(..cursor.column).map(str::to_owned))
+                        .is_some_and(|before| {
+                            before.chars().last().is_some_and(|c| !c.is_whitespace())
+                        });
+                    let insertion = format!("{}{} ", if prefix { " " } else { "" }, insertion);
+                    return Task::batch([
+                        self.handle_chat_ui(Action::Composer(
+                            target,
+                            text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(
+                                insertion,
+                            ))),
+                        )),
+                        iced::widget::operation::focus(card_control_id(
+                            target.card,
+                            "chat-composer",
+                        ))
+                        .map(cosmic::Action::App),
+                    ]);
+                }
+                if insertion == format!("/{PERMISSIONS_COMMAND}") {
+                    return self.handle_chat_ui(Action::PermissionPicker(target, true));
+                }
+                if insertion == format!("/{RESUME_COMMAND}") {
+                    return self
+                        .open_resume_from(target.card, String::new())
+                        .unwrap_or_else(Task::none);
+                }
+                // Dispatch the same provider command as a typed slash; drafts
+                // and their attachments remain available after a mode change.
+                return Task::batch([
+                    self.handle_chat_ui(Action::Command(
+                        target,
+                        Command::Slash { command: insertion },
+                    )),
+                    iced::widget::operation::focus(card_control_id(target.card, "chat-composer"))
+                        .map(cosmic::Action::App),
+                ]);
+            }
             Action::ComposerActions(target, open) => {
                 if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
                 {
@@ -10109,6 +10231,17 @@ impl Cagents {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.composer_actions = open;
                     runtime.branch_picker = false;
+                    runtime.picker_keyboard = open;
+                    if open {
+                        runtime.composer_actions_query.clear();
+                    }
+                }
+                if open {
+                    return widget::text_input::focus(card_control_id(
+                        target.card,
+                        "chat-actions-search",
+                    ))
+                    .map(cosmic::Action::App);
                 }
             }
             Action::BranchPicker(target, open) => {
@@ -10591,13 +10724,61 @@ impl Cagents {
                     }
                 }
             }
+            Action::OpenImageFrom(target, agent, source) => {
+                if self.chat_runtime_mut(target).is_some_and(|runtime| {
+                    runtime.selected_subagent == agent
+                        && runtime.visible.load(Ordering::Relaxed)
+                        && runtime
+                            .active_item(&source.id)
+                            .is_some_and(|current| Arc::ptr_eq(current, &source))
+                }) {
+                    return self.handle_chat_ui(Action::OpenImage(target, source.id.clone()));
+                }
+            }
             Action::OpenImage(target, id) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     let gallery = images::Gallery::new(runtime, &id);
                     self.chat_ui.image_viewer = gallery;
+                    if self.chat_ui.image_viewer.is_some() {
+                        return iced::widget::operation::focus(images::canvas_focus_id())
+                            .map(cosmic::Action::App);
+                    }
                 }
             }
-            Action::CloseImage => self.chat_ui.image_viewer = None,
+            Action::ImageViewer(identity, command) => {
+                let Some(gallery) = self.chat_ui.image_viewer.as_ref() else {
+                    return Task::none();
+                };
+                let runtime =
+                    gallery
+                        .target()
+                        .and_then(|target| match self.cards.get(&target.card) {
+                            Some(CardRuntime::Chat(runtime)) if runtime.target == target => {
+                                Some(runtime.as_ref())
+                            }
+                            _ => None,
+                        });
+                if gallery.accepts(identity, runtime) {
+                    return self.handle_chat_ui(command.action());
+                }
+            }
+            Action::CloseImage => {
+                let target = self
+                    .chat_ui
+                    .image_viewer
+                    .take()
+                    .and_then(|gallery| gallery.target());
+                if let Some(target) = target
+                    && self.workspace.focused() == Some(target.card)
+                    && self.chat_runtime_mut(target).is_some()
+                {
+                    return iced::widget::operation::focus(card_control_id(
+                        target.card,
+                        "chat-composer",
+                    ))
+                    .map(cosmic::Action::App);
+                }
+            }
             Action::ImageNext(forward) => {
                 if let Some(gallery) = &mut self.chat_ui.image_viewer {
                     gallery.next(forward);
@@ -10605,7 +10786,19 @@ impl Cagents {
             }
             Action::ImageFit => {
                 if let Some(gallery) = &mut self.chat_ui.image_viewer {
+                    gallery.actual_size = false;
                     gallery.reset = gallery.reset.wrapping_add(1);
+                }
+            }
+            Action::ImageActualSize => {
+                if let Some(gallery) = &mut self.chat_ui.image_viewer {
+                    gallery.actual_size = true;
+                    gallery.reset = gallery.reset.wrapping_add(1);
+                }
+            }
+            Action::ImageSelect(index) => {
+                if let Some(gallery) = &mut self.chat_ui.image_viewer {
+                    gallery.select(index);
                 }
             }
             Action::ImageExternal => {
@@ -10764,6 +10957,7 @@ impl Cagents {
                     return Task::none();
                 };
                 runtime.attachment_chooser_pending = Some(id.id);
+                runtime.composer_actions = false;
                 let directory = runtime.session.launch.recipe.working_directory.clone();
                 return cosmic::task::future(async move {
                     let result = match file_chooser::open::Dialog::new()
@@ -11855,7 +12049,7 @@ mod tests {
     }
 
     #[test]
-    fn image_gallery_is_modal_and_reuses_the_transcript_handle() {
+    fn image_gallery_keeps_chat_nonmodal_and_reuses_the_transcript_handle() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
         let runtime = match app.cards.get_mut(&card).unwrap() {
@@ -11887,16 +12081,241 @@ mod tests {
         let target = runtime.target;
         drop(app.handle_chat_ui(Action::OpenImage(target, "image".into())));
         assert!(app.chat_ui.image_viewer.is_some());
-        assert!(app.modal_is_open());
-        assert!(app.dialog().is_some());
-        let before = app.context_inspector_open;
-        drop(app.update(Message::ToggleContextInspector));
-        assert_eq!(app.context_inspector_open, before);
+        assert!(!app.modal_is_open());
+        assert!(app.dialog().is_none());
+        let handle_id = app.chat_runtime_mut(target).unwrap().cache["image"]
+            .image
+            .as_ref()
+            .unwrap()
+            .id();
+        assert_eq!(
+            handle_id,
+            app.chat_ui
+                .image_viewer
+                .as_ref()
+                .unwrap()
+                .selected_handle_id()
+        );
+        let stale: Vec<_> = [
+            images::ViewerCommand::Next(true),
+            images::ViewerCommand::Fit,
+            images::ViewerCommand::ActualSize,
+            images::ViewerCommand::Select(0),
+            images::ViewerCommand::External,
+            images::ViewerCommand::Close,
+        ]
+        .into_iter()
+        .map(|command| app.chat_ui.image_viewer.as_ref().unwrap().callback(command))
+        .collect();
+        // A redraw can install a replacement before callbacks from the old
+        // widget tree arrive. None may navigate, close, or externally open it.
+        drop(app.handle_chat_ui(Action::OpenImage(target, "image".into())));
+        for callback in stale {
+            let task = app.handle_chat_ui(callback);
+            assert!(iced::runtime::task::into_stream(task).is_none());
+            assert_eq!(app.chat_ui.image_viewer.as_ref().unwrap().reset, 0);
+        }
+        let stale_selection = app
+            .chat_ui
+            .image_viewer
+            .as_ref()
+            .unwrap()
+            .callback(images::ViewerCommand::Close);
+        app.chat_runtime_mut(target).unwrap().selected_subagent = Some("another-agent".into());
+        drop(app.handle_chat_ui(stale_selection));
+        assert!(
+            app.chat_ui.image_viewer.is_some(),
+            "another agent cannot close the hidden gallery"
+        );
+        app.chat_runtime_mut(target).unwrap().selected_subagent = None;
+        let stale_generation = app
+            .chat_ui
+            .image_viewer
+            .as_ref()
+            .unwrap()
+            .callback(images::ViewerCommand::Close);
+        app.chat_runtime_mut(target).unwrap().target.generation += 1;
+        drop(app.handle_chat_ui(stale_generation));
+        assert!(
+            app.chat_ui.image_viewer.is_some(),
+            "another runtime generation cannot close the old gallery"
+        );
+        if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&target.card) {
+            runtime.target = target;
+        }
         assert!(Action::ImageNext(true).allowed_while_modal());
         assert!(!Action::OpenImage(target, "image".into()).allowed_while_modal());
         drop(app.update(Message::ChatUi(Action::CloseImage)));
         assert!(!app.modal_is_open());
     }
+    fn image_callback_test_app() -> (Cagents, Target) {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+            unreachable!()
+        };
+        runtime.composer = text_editor::Content::with_text("Keep this feedback draft");
+        let content = ItemContent::Image {
+            path: "/fixture/missing-image-context-regression.png".into(),
+            description: "Context regression image".into(),
+            reference: None,
+        };
+        let mut cached = CachedItem::new(&content, runtime.syntax_theme);
+        cached.image = Some(iced::widget::image::Handle::from_rgba(
+            1,
+            1,
+            vec![0, 0, 0, 255],
+        ));
+        runtime.cache.insert("image".into(), cached);
+        Arc::make_mut(&mut runtime.snapshot).items = vec![
+            chat::Item {
+                id: "image".into(),
+                role: chat::Role::Assistant,
+                content,
+                started_at: None,
+                at: None,
+            }
+            .into(),
+        ];
+        let target = runtime.target;
+        drop(app.handle_chat_ui(Action::OpenImage(target, "image".into())));
+        assert!(app.image_viewer_owns_input());
+        (app, target)
+    }
+
+    #[test]
+    fn queued_conversation_image_callbacks_cannot_cross_update_freeze_or_another_modal() {
+        for owner in [
+            "update",
+            "transient-close",
+            "device-files",
+            "daemon-recovery",
+        ] {
+            let (mut app, target) = image_callback_test_app();
+            let callbacks: Vec<_> = [
+                images::ViewerCommand::Close,
+                images::ViewerCommand::Next(true),
+                images::ViewerCommand::Fit,
+                images::ViewerCommand::ActualSize,
+                images::ViewerCommand::Select(0),
+                images::ViewerCommand::External,
+            ]
+            .into_iter()
+            .map(|command| app.chat_ui.image_viewer.as_ref().unwrap().callback(command))
+            .collect();
+            match owner {
+                "update" => app.update_prepared = true,
+                "transient-close" => app.transient_work_close = Some(window::Id::unique()),
+                "device-files" => app.device_ui.open = true,
+                "daemon-recovery" => app.daemon_health_ui.confirmation = true,
+                _ => unreachable!(),
+            }
+            assert!(!app.image_viewer_owns_input(), "{owner}");
+            if owner != "update" {
+                assert!(app.dialog().is_some());
+            }
+            for callback in callbacks
+                .into_iter()
+                .chain([Action::CloseImage, Action::ImageFit])
+            {
+                let task = app.update(Message::ChatUi(callback));
+                assert_eq!(
+                    task_focuses(task, &card_control_id(target.card, "chat-composer")),
+                    (false, true),
+                    "{owner}: a retired callback must not focus the composer"
+                );
+                let gallery = app
+                    .chat_ui
+                    .image_viewer
+                    .as_ref()
+                    .expect("obscured source gallery is retained");
+                assert_eq!(
+                    gallery.reset, 0,
+                    "{owner}: hidden gallery cannot navigate or zoom"
+                );
+                assert!(!gallery.actual_size);
+                assert_eq!(
+                    app.chat_runtime_mut(target).unwrap().composer.text(),
+                    "Keep this feedback draft"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn device_file_image_actions_follow_actual_dialog_priority_and_keep_foreground_escape() {
+        let (mut app, target) = image_callback_test_app();
+        let file_gallery = || {
+            images::Gallery::file(
+                PathBuf::from("/fixture/device-image.png"),
+                None,
+                iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
+            )
+        };
+        app.chat_ui.image_viewer = Some(file_gallery());
+        // Recovery is below device-file images in the real dialog stack.
+        app.daemon_health_ui.confirmation = true;
+        assert!(app.image_viewer_owns_input());
+        let fit = app
+            .chat_ui
+            .image_viewer
+            .as_ref()
+            .unwrap()
+            .callback(images::ViewerCommand::Fit);
+        drop(app.update(Message::ChatUi(fit)));
+        assert_eq!(app.chat_ui.image_viewer.as_ref().unwrap().reset, 1);
+        let escape = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        };
+        drop(app.update(Message::KeyEvent {
+            event: escape,
+            captured: false,
+        }));
+        assert!(
+            app.chat_ui.image_viewer.is_none(),
+            "Escape closes the actual foreground image"
+        );
+        assert!(
+            app.daemon_health_ui.confirmation,
+            "Escape cannot dismiss recovery behind the image"
+        );
+        app.chat_ui.image_viewer = Some(file_gallery());
+        // Device files are above the image; its stale callback cannot close it.
+        let close = app
+            .chat_ui
+            .image_viewer
+            .as_ref()
+            .unwrap()
+            .callback(images::ViewerCommand::Close);
+        app.device_ui.open = true;
+        assert!(!app.image_viewer_owns_input());
+        let task = app.update(Message::ChatUi(close));
+        assert_eq!(
+            task_focuses(task, &card_control_id(target.card, "chat-composer")),
+            (false, true)
+        );
+        assert!(app.chat_ui.image_viewer.is_some());
+        app.device_ui.open = false;
+        app.update_prepared = true;
+        let close = app
+            .chat_ui
+            .image_viewer
+            .as_ref()
+            .unwrap()
+            .callback(images::ViewerCommand::Close);
+        drop(app.update(Message::ChatUi(close)));
+        assert!(
+            app.chat_ui.image_viewer.is_some(),
+            "the update freeze rejects file-image callbacks too"
+        );
+    }
+
     #[test]
     fn image_loads_ignore_replaced_items_and_retired_runtime_generations() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -17989,7 +18408,10 @@ mod tests {
             generation: app.workspace_view_generation,
             event: WorkspaceViewportEvent::Resized(1_600.0),
         }));
-        assert_eq!(app.workspace.visibility(card), Some(VisibilityClass::Visible));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
         let target = chat_runtime(&app, card).target;
         let handle = chat_runtime(&app, card).handle().unwrap().clone();
         write(&mut app, card, "accepted ");
@@ -18035,7 +18457,10 @@ mod tests {
         // Hidden transcript-derived history is disposable. The daemon hydrates
         // it again only after the reader returns to the actual visible pane.
         return_to_chat(&mut app);
-        assert_eq!(app.workspace.visibility(card), Some(VisibilityClass::Visible));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
         let runtime = chat_runtime(&app, card);
         assert!(runtime.visible.load(Ordering::Relaxed));
         assert_eq!(runtime.target, target);
@@ -20900,11 +21325,11 @@ mod tests {
     /// either order, including when its chat never got as far as starting.
     #[test]
     fn a_channel_closes_when_its_last_pane_does() {
+        use super::super::workspace_model_sync::ModelUpdate;
         use crate::workspace_model::{
             ModelChannel, ModelEdit, ModelProject,
             views::{Pane, Scope, View},
         };
-        use super::super::workspace_model_sync::ModelUpdate;
 
         for (chat_first, chat_state) in [(true, 0), (true, 1), (true, 2), (false, 0), (false, 2)] {
             let mut app = crate::app::tests::context_inspector_test_app(true);
@@ -21014,13 +21439,19 @@ mod tests {
                 before_ack.push(edit);
             }
             assert!(
-                !before_ack.iter().any(|edit| matches!(edit, ModelEdit::RetireEmptyChannel { .. })),
+                !before_ack
+                    .iter()
+                    .any(|edit| matches!(edit, ModelEdit::RetireEmptyChannel { .. })),
                 "the occupied canonical view cannot authorize retirement: {before_ack:?}"
             );
 
             let mut settled = app.workspace_model.clone();
             settled.sequence = 11;
-            let view = settled.views.iter_mut().find(|view| view.scope == scope).unwrap();
+            let view = settled
+                .views
+                .iter_mut()
+                .find(|view| view.scope == scope)
+                .unwrap();
             view.panes.clear();
             view.retired = vec![terminal, chat];
             view.revision = 8;
@@ -21033,12 +21464,16 @@ mod tests {
             while let Ok(edit) = published.try_recv() {
                 after_ack.push(edit);
             }
-            let retire_requests = after_ack.iter().filter_map(|edit| match edit {
-                ModelEdit::RetireEmptyChannel { home, expected_view_revision } => {
-                    Some((*home, *expected_view_revision))
-                }
-                _ => None,
-            }).collect::<Vec<_>>();
+            let retire_requests = after_ack
+                .iter()
+                .filter_map(|edit| match edit {
+                    ModelEdit::RetireEmptyChannel {
+                        home,
+                        expected_view_revision,
+                    } => Some((*home, *expected_view_revision)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
             assert_eq!(retire_requests, vec![(home, 8)], "{after_ack:?}");
 
             // These are explicit App model-reply fixtures, not an executed
@@ -21052,7 +21487,9 @@ mod tests {
             // An authoritative no-work retirement reply removes that same Home.
             settled.sequence = 13;
             settled.channels.retain(|entry| entry.id != channel);
-            settled.views.retain(|view| view.scope != Scope::Channel(channel));
+            settled
+                .views
+                .retain(|view| view.scope != Scope::Channel(channel));
             drop(app.apply_workspace_model_update(ModelUpdate::Read(settled)));
             assert!(!channel_exists(&app));
             assert!(app.channel_ui.was_deleted(channel));
@@ -23895,6 +24332,91 @@ mod tests {
         );
         assert!(!Action::OpenChangedFile(target, "/reported".into()).allowed_while_modal());
     }
+    #[test]
+    fn plus_skill_insertion_preserves_unicode_draft_and_pending_image_identity() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("plus-skills"));
+        app.workspace.focus(card).unwrap();
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        Arc::make_mut(&mut runtime.snapshot).skills = vec![chat::Skill {
+            name: "review".into(),
+            description: "Review changes".into(),
+            invocation: "$review".into(),
+        }];
+        runtime.replace_draft(text_editor::Content::with_text("Review 🦀 changes"));
+        runtime.composer.move_to(text_editor::Cursor {
+            position: text_editor::Position {
+                line: 0,
+                column: "Review 🦀".len(),
+            },
+            selection: None,
+        });
+        let pending = runtime
+            .try_attachment_insert()
+            .expect("pending pasted image");
+        let reference = Attachment::file(PathBuf::from("/tmp/reference.txt"));
+        runtime.merge_attachments([reference.clone()]);
+        drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
+        drop(app.handle_chat_ui(Action::ComposerActionsQuery(target, "review".into())));
+        drop(app.handle_chat_ui(Action::ComposerAction(target, "$review".into())));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text(), "Review 🦀 $review  changes");
+        assert_eq!(runtime.attachments, vec![reference]);
+        assert!(
+            runtime.attachment_ticket(pending.id).is_some(),
+            "normal text insertion must map the image bookmark"
+        );
+        assert!(!runtime.composer_actions);
+        assert_eq!(
+            runtime.composer.cursor().position.column,
+            "Review 🦀 $review ".len()
+        );
+    }
+
+    #[test]
+    fn plus_actions_revalidate_catalog_target_and_working_state() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("plus-actions"));
+        app.workspace.focus(card).unwrap();
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.ready = true;
+        snapshot.commands = vec![chat::SlashCommand {
+            name: "plan".into(),
+            description: "Plan mode".into(),
+        }];
+        runtime.replace_draft(text_editor::Content::with_text("Keep this unsent draft"));
+        drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
+        let before = chat_runtime(&app, card).next_command;
+        for action in [
+            Action::ComposerAction(
+                Target {
+                    generation: target.generation + 1,
+                    ..target
+                },
+                "/plan".into(),
+            ),
+            Action::ComposerAction(target, "/unsupported".into()),
+        ] {
+            drop(app.handle_chat_ui(action));
+        }
+        assert_eq!(chat_runtime(&app, card).next_command, before);
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).busy = true;
+        drop(app.handle_chat_ui(Action::ComposerAction(target, "/plan".into())));
+        assert_eq!(chat_runtime(&app, card).next_command, before);
+        assert!(chat_runtime(&app, card).composer_actions);
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).busy = false;
+        drop(app.handle_chat_ui(Action::ComposerAction(target, "/plan".into())));
+        assert_eq!(chat_runtime(&app, card).next_command, before + 1);
+        assert_eq!(
+            chat_runtime(&app, card).composer.text(),
+            "Keep this unsent draft"
+        );
+        assert!(!chat_runtime(&app, card).composer_actions);
+    }
+
     #[test]
     fn composer_actions_navigate_dismiss_and_ignore_stale_targets() {
         let mut app = crate::app::tests::context_inspector_test_app(false);

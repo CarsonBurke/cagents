@@ -2949,7 +2949,7 @@ pub enum SettingsField {
     BrowserSearchUrl,
     EditorFontFamily,
     EditorFontSize,
-    TerminalScrollbackLines,
+    TerminalScrollbackMib,
     ManagedWorktreeDirectory,
     AutoDeleteMergedWorktrees,
     WorktreeSort,
@@ -3081,7 +3081,7 @@ impl SettingsField {
             Self::WorkStaleAfterDays => "Stale after (days)",
             Self::TerminalFontSize => "Font size",
             Self::TerminalFontFamily => "Font family",
-            Self::TerminalScrollbackLines => "Scrollback lines",
+            Self::TerminalScrollbackMib => "Scrollback (MiB)",
             Self::ManagedWorktreeDirectory => "Managed worktree directory",
             Self::WorktreeSort => "Worktree order",
             Self::DefaultWorktreePane => "Default worktree pane",
@@ -3168,7 +3168,7 @@ impl SettingsField {
             | Self::TerminalTheme
             | Self::TerminalFontSize
             | Self::TerminalFontFamily
-            | Self::TerminalScrollbackLines
+            | Self::TerminalScrollbackMib
             | Self::ConfirmTerminalClose
             | Self::ConfirmMultilinePaste
             | Self::RelaunchAgentsOnUpgrade => SettingsCategory::Terminal,
@@ -3360,7 +3360,7 @@ struct SettingsDraft {
     editor_font_size: String,
     confirm_multiline_paste: bool,
     browser_search_url: String,
-    terminal_scrollback_lines: String,
+    terminal_scrollback_mib: String,
     managed_worktree_directory: String,
     auto_delete_merged_worktrees: bool,
     worktree_sort: String,
@@ -3416,7 +3416,7 @@ impl SettingsDraft {
                 .editor_font_size
                 .map(|size| size.to_string())
                 .unwrap_or_default(),
-            terminal_scrollback_lines: settings.terminal_scrollback_lines.to_string(),
+            terminal_scrollback_mib: settings.terminal_scrollback_mib.to_string(),
             managed_worktree_directory: settings.managed_worktree_directory.clone(),
             auto_delete_merged_worktrees: settings.auto_delete_merged_worktrees,
             worktree_sort: match settings.worktree_sort {
@@ -3471,7 +3471,7 @@ impl SettingsDraft {
             SettingsField::BrowserSearchUrl => self.browser_search_url = value,
             SettingsField::EditorFontFamily => self.editor_font_family = value,
             SettingsField::EditorFontSize => self.editor_font_size = value,
-            SettingsField::TerminalScrollbackLines => self.terminal_scrollback_lines = value,
+            SettingsField::TerminalScrollbackMib => self.terminal_scrollback_mib = value,
             SettingsField::ManagedWorktreeDirectory => self.managed_worktree_directory = value,
             SettingsField::AutoDeleteMergedWorktrees => {
                 self.auto_delete_merged_worktrees = value == "true"
@@ -3893,9 +3893,9 @@ fn settings_update(
             next.terminal_font_family = value.to_owned();
             Ok(())
         }
-        SettingsField::TerminalScrollbackLines => value
+        SettingsField::TerminalScrollbackMib => value
             .parse::<usize>()
-            .map(|value| next.terminal_scrollback_lines = value)
+            .map(|value| next.terminal_scrollback_mib = value)
             .map_err(|_| "Terminal scrollback must be a whole number.".to_owned()),
         SettingsField::ManagedWorktreeDirectory => {
             next.managed_worktree_directory = value.to_owned();
@@ -4046,9 +4046,9 @@ fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
             "{label} must be 1–{} lines.",
             settings::MAX_TERMINAL_SCROLL_SIZE
         ),
-        SettingsField::TerminalScrollbackLines => format!(
-            "Scrollback must be 0–{} lines.",
-            grouped_digits(settings::MAX_TERMINAL_SCROLLBACK_LINES)
+        SettingsField::TerminalScrollbackMib => format!(
+            "Scrollback must be 0–{} MiB.",
+            grouped_digits(settings::MAX_TERMINAL_SCROLLBACK_MIB)
         ),
         SettingsField::MaxHotCards => format!("{label} must be a whole number, at least 1."),
         SettingsField::HibernationDelayMs => {
@@ -6050,7 +6050,7 @@ impl Cagents {
     fn terminal_config(&self, visible: bool) -> TerminalConfig {
         TerminalConfig {
             initially_visible: visible,
-            max_scrollback: self.settings.terminal_scrollback_lines,
+            max_scrollback_bytes: self.settings.terminal_scrollback_mib * 1024 * 1024,
             theme: self.effective_terminal_theme(),
             ..TerminalConfig::default()
         }
@@ -6060,10 +6060,8 @@ impl Cagents {
         let width = if self.workspace.cards().is_empty() {
             // The welcome view has no WorkspaceSurface to replace the startup
             // width estimate. Use the window's current bounds until one mounts.
-            let sidebar = sidebar::effective_width(
-                self.projects_sidebar_mode(),
-                self.settings.sidebar_width,
-            );
+            let sidebar =
+                sidebar::effective_width(self.projects_sidebar_mode(), self.settings.sidebar_width);
             let inspector = if matches!(
                 self.context_inspector_mount(),
                 Some(InspectorLayout::Docked)
@@ -12074,6 +12072,27 @@ impl Cagents {
         self.update_ui.confirmation.is_some() || self.other_modal_is_open()
     }
 
+    /// Image callbacks belong to the surface that is currently accepting
+    /// input, not just the gallery generation that produced them.
+    fn image_viewer_owns_input(&self) -> bool {
+        if self.update_prepared {
+            return false;
+        }
+        let Some(gallery) = &self.chat_ui.image_viewer else {
+            return false;
+        };
+        if !gallery.is_modal() {
+            return !self.workspace_inputs_blocked();
+        }
+        // These are precisely the owners mounted before the device-file
+        // gallery in dialog(). Recovery/import/forms below it do not take its
+        // foreground keyboard or pointer actions.
+        !self.automation_approval_open()
+            && self.transient_work_close.is_none()
+            && !self.automation_ui.draft_dialog_open()
+            && !self.device_ui.open
+    }
+
     fn other_modal_is_open(&self) -> bool {
         self.form_dialog_is_open() || self.modal_over_form_dialogs()
     }
@@ -12142,7 +12161,7 @@ impl Cagents {
             || self.dirty_repository_close.is_some()
             || self.transient_work_close.is_some()
             || self.automation_ui.draft_dialog_open()
-            || self.chat_ui.image_viewer.is_some()
+            || self.chat_ui.image_viewer.as_ref().is_some_and(chat_ui::images::Gallery::is_modal)
             || self.terminal_paste.is_some()
             || self.terminal_close_dialog_visible()
             || self.settings_reset_confirm
@@ -13633,7 +13652,11 @@ impl Cagents {
             && self.transient_work_close.is_none()
             && !self.automation_ui.draft_dialog_open()
             && !self.device_ui.open
-            && self.chat_ui.image_viewer.is_none()
+            && !self
+                .chat_ui
+                .image_viewer
+                .as_ref()
+                .is_some_and(chat_ui::images::Gallery::is_modal)
             && self.terminal_paste.is_none()
             && !self.session_recovery.open()
             && !self.daemon_health_ui.confirmation
@@ -14181,6 +14204,12 @@ impl Application for Cagents {
                 _ => {}
             }
         }
+        if self.chat_ui.image_viewer.as_ref().and_then(chat_ui::images::Gallery::target)
+            .is_some_and(|target| !matches!(self.cards.get(&target.card),
+                Some(CardRuntime::Chat(runtime)) if runtime.target == target))
+        {
+            self.chat_ui.image_viewer = None;
+        }
         self.tab_history.observe(self.workspace.focused());
         // A workspace opened some other way while the switcher is held, by a
         // click on one of its rows or in the sidebar, is the choice. Anything
@@ -14190,7 +14219,7 @@ impl Application for Cagents {
             && (matches!(&message, Message::Sidebar(action) if WorkspaceDestination::from_action(action).is_some())
                 || self.update_prepared
                 || self.workspace_inputs_blocked()
-                || self.chat_ui.image_viewer.is_some())
+                || self.chat_ui.image_viewer.as_ref().is_some_and(chat_ui::images::Gallery::is_modal))
         {
             self.cancel_workspace_preview();
         }
@@ -16812,6 +16841,31 @@ impl Application for Cagents {
                 if let Some(task) = self.automation_approval_key(&event, captured) {
                     return task;
                 }
+                if let keyboard::Event::ModifiersChanged(modifiers) = &event {
+                    self.keyboard_modifiers = *modifiers;
+                }
+                // Device-file images remain a dialog and do not start with
+                // a focused chat canvas. Keep their original modal keyboard
+                // contract without intercepting a conversation's composer.
+                if self.image_viewer_owns_input()
+                    && self.chat_ui.image_viewer.as_ref().is_some_and(chat_ui::images::Gallery::is_modal)
+                {
+                    if let keyboard::Event::KeyPressed { key, .. } = &event {
+                        match key {
+                            keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                                self.chat_ui.image_viewer = None;
+                            }
+                            keyboard::Key::Named(keyboard::key::Named::ArrowLeft) if !captured => {
+                                self.chat_ui.image_viewer.as_mut().unwrap().next(false);
+                            }
+                            keyboard::Key::Named(keyboard::key::Named::ArrowRight) if !captured => {
+                                self.chat_ui.image_viewer.as_mut().unwrap().next(true);
+                            }
+                            _ => {}
+                        }
+                    }
+                    return Task::none();
+                }
                 #[cfg(feature = "integrated-browser")]
                 if is_escape_press(&event) && self.browser_import_on_top() {
                     return self.update_browser_import(self.browser_import.escape_action());
@@ -16821,26 +16875,6 @@ impl Application for Cagents {
                 }
                 if let Some(task) = self.daemon_health_key_event(&event, captured) {
                     return task;
-                }
-                if let keyboard::Event::ModifiersChanged(modifiers) = &event {
-                    self.keyboard_modifiers = *modifiers;
-                }
-                if self.chat_ui.image_viewer.is_some() {
-                    if let keyboard::Event::KeyPressed { key, .. } = &event {
-                        match key {
-                            keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                                self.chat_ui.image_viewer = None
-                            }
-                            keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
-                                self.chat_ui.image_viewer.as_mut().unwrap().next(false);
-                            }
-                            keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
-                                self.chat_ui.image_viewer.as_mut().unwrap().next(true);
-                            }
-                            _ => {}
-                        }
-                    }
-                    return Task::none();
                 }
                 if !captured
                     && !self.workspace_inputs_blocked()
@@ -17877,7 +17911,9 @@ impl Application for Cagents {
                 1.0,
             ));
         }
-        if let Some(gallery) = &self.chat_ui.image_viewer {
+        if let Some(gallery) = &self.chat_ui.image_viewer
+            && gallery.is_modal()
+        {
             return Some(gallery.view());
         }
         if let Some(dialog) = self.terminal_paste_dialog() {
@@ -18996,6 +19032,37 @@ fn unix_millis() -> i64 {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_scrollback_settings_draft_reaches_runtime_as_bytes() {
+        let mut app = context_inspector_test_app(false);
+        assert_eq!(app.settings.terminal_scrollback_mib, 16);
+        for mib in [0, 16, 32, settings::MAX_TERMINAL_SCROLLBACK_MIB] {
+            let SettingsDecision::Persist(next) = settings_update(
+                &app.settings,
+                SettingsField::TerminalScrollbackMib,
+                &mib.to_string(),
+            ) else {
+                panic!("valid MiB setting must persist")
+            };
+            let draft = SettingsDraft::from_settings(&next);
+            assert_eq!(draft.terminal_scrollback_mib, mib.to_string());
+            app.settings = next;
+            let config = app.terminal_config(false);
+            assert!(!config.initially_visible);
+            assert_eq!(config.max_scrollback_bytes, mib * 1024 * 1024);
+            assert_eq!(
+                crate::terminal::TerminalSpawnOptions::from(config).max_scrollback_bytes,
+                mib * 1024 * 1024
+            );
+        }
+        for invalid in ["-1", "1025", "18446744073709551615"] {
+            assert!(matches!(
+                settings_update(&app.settings, SettingsField::TerminalScrollbackMib, invalid),
+                SettingsDecision::Invalid(_)
+            ));
+        }
+    }
+
     #[test]
     fn completed_push_observation_warning_preserves_known_completion() {
         let notice = super::push_report(Ok(crate::repository::PushOutcome::OutcomeUnknown {
@@ -30289,8 +30356,8 @@ mod tests {
             "Scroll size must be 1–10 lines."
         );
         assert_eq!(
-            refusal(SettingsField::TerminalScrollbackLines, "1000001"),
-            "Scrollback must be 0–1,000,000 lines."
+            refusal(SettingsField::TerminalScrollbackMib, "1025"),
+            "Scrollback must be 0–1,024 MiB."
         );
         assert_eq!(
             refusal(SettingsField::TerminalFontFamily, "F".repeat(129).as_str()),

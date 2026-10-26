@@ -8,28 +8,64 @@ use iced::advanced::{
 };
 use iced::{Event, Rectangle, Size, mouse};
 
+#[cfg(test)]
 pub(super) fn resettable<'a>(revision: u64, content: Element<'a, Message>) -> Element<'a, Message> {
-    Element::new(Canvas { revision, content })
+    identified(0, revision, "Image viewer", content)
+}
+pub(super) fn identified<'a>(
+    identity: u64,
+    revision: u64,
+    label: &str,
+    content: Element<'a, Message>,
+) -> Element<'a, Message> {
+    Element::new(Canvas {
+        identity,
+        revision,
+        label: label.to_owned(),
+        content,
+    })
 }
 struct Canvas<'a> {
+    identity: u64,
+    label: String,
     revision: u64,
     content: Element<'a, Message>,
 }
-struct Revision(u64);
+struct Revision {
+    identity: u64,
+    revision: u64,
+    focused: bool,
+}
+impl iced::advanced::widget::operation::Focusable for Revision {
+    fn is_focused(&self) -> bool {
+        self.focused
+    }
+    fn focus(&mut self) {
+        self.focused = true;
+    }
+    fn unfocus(&mut self) {
+        self.focused = false;
+    }
+}
 impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Canvas<'_> {
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<Revision>()
     }
     fn state(&self) -> tree::State {
-        tree::State::new(Revision(self.revision))
+        tree::State::new(Revision {
+            identity: self.identity,
+            revision: self.revision,
+            focused: false,
+        })
     }
     fn children(&self) -> Vec<Tree> {
         vec![Tree::new(self.content.as_widget())]
     }
     fn diff(&mut self, tree: &mut Tree) {
         let revision = tree.state.downcast_mut::<Revision>();
-        if revision.0 != self.revision {
-            revision.0 = self.revision;
+        if revision.identity != self.identity || revision.revision != self.revision {
+            revision.identity = self.identity;
+            revision.revision = self.revision;
             tree.children = self.children();
         } else {
             tree.children[0].diff(self.content.as_widget_mut());
@@ -55,6 +91,11 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Canvas<'_> {
         renderer: &cosmic::Renderer,
         operation: &mut dyn Operation,
     ) {
+        operation.focusable(
+            Some(&canvas_focus_id()),
+            layout.bounds(),
+            tree.state.downcast_mut::<Revision>(),
+        );
         self.content
             .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation);
@@ -70,16 +111,73 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Canvas<'_> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        let state = tree.state.downcast_mut::<Revision>();
+        if matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_))) {
+            state.focused = cursor.is_over(layout.bounds());
+        }
+        let zoom = if state.focused {
+            match event {
+                Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Character(key),
+                    modifiers,
+                    ..
+                }) if !modifiers.command() && !modifiers.control() && !modifiers.alt() => {
+                    match key.as_str() {
+                        "+" | "=" => Some(1.0),
+                        "-" | "−" => Some(-1.0),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let zoom_event = zoom.map(|y| {
+            Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { x: 0.0, y },
+            })
+        });
         self.content.as_widget_mut().update(
             &mut tree.children[0],
-            event,
+            zoom_event.as_ref().unwrap_or(event),
             layout,
-            cursor,
+            if zoom.is_some() {
+                mouse::Cursor::Available(layout.bounds().center())
+            } else {
+                cursor
+            },
             renderer,
             clipboard,
             shell,
             viewport,
         );
+        if zoom.is_some() {
+            shell.capture_event();
+        }
+    }
+    fn id(&self) -> Option<widget::Id> {
+        Some(canvas_focus_id())
+    }
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        _tree: &Tree,
+        _cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        use iced_accessibility::accesskit::{Action, Node, Rect, Role};
+        let bounds = layout.bounds();
+        let mut node = Node::new(Role::Image);
+        node.set_label(format!("Image viewer: {}", self.label));
+        node.set_description("Left and Right browse images. Plus and minus zoom. 0 fits the image, 1 shows actual size, and Escape closes the viewer.");
+        node.add_action(Action::Focus);
+        node.set_bounds(Rect::new(
+            f64::from(bounds.x),
+            f64::from(bounds.y),
+            f64::from(bounds.x + bounds.width),
+            f64::from(bounds.y + bounds.height),
+        ));
+        iced_accessibility::A11yTree::leaf(node, canvas_focus_id())
     }
     fn mouse_interaction(
         &self,
@@ -193,6 +291,32 @@ mod tests {
                 .state
                 .downcast_ref::<viewer::State>()
                 .is_cursor_grabbed()
+        );
+        // A new gallery can start at the same Fit revision. Its independent
+        // identity must still discard the previous image's pan and zoom.
+        let mut replacement = identified(
+            99,
+            0,
+            "Replacement image",
+            Viewer::new(handle.clone())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .content_fit(iced::ContentFit::Contain)
+                .into(),
+        );
+        tree.diff(replacement.as_widget_mut());
+        assert_eq!(scale(&tree), Size::new(200.0, 200.0));
+        let accessible = replacement.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            mouse::Cursor::Unavailable,
+        );
+        assert!(
+            accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .any(|node| node.node().label() == Some("Image viewer: Replacement image"))
         );
         let mut reset = element(1);
         tree.diff(reset.as_widget_mut());

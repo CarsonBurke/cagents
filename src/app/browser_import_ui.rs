@@ -556,7 +556,11 @@ impl Cagents {
             && self.transient_work_close.is_none()
             && !self.automation_ui.draft_dialog_open()
             && !self.device_ui.open
-            && self.chat_ui.image_viewer.is_none()
+            && !self
+                .chat_ui
+                .image_viewer
+                .as_ref()
+                .is_some_and(chat_ui::images::Gallery::is_modal)
             && self.terminal_paste.is_none()
     }
 

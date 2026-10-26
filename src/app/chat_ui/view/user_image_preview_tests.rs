@@ -112,8 +112,8 @@ fn click_prompt(
     let actions: Vec<_> = messages
         .iter()
         .map(|message| match message {
-            Message::ChatUi(Action::OpenImage(target, id)) => {
-                format!("OpenImage({target:?}, {id})")
+            Message::ChatUi(Action::OpenImageFrom(target, _, item)) => {
+                format!("OpenImageFrom({target:?}, {})", item.id)
             }
             Message::ChatUi(Action::LoadImage(target, id)) => {
                 format!("LoadImage({target:?}, {id})")
@@ -146,8 +146,8 @@ fn restored_user_image_opens_viewer_from_its_rendered_preview() {
             .any(|text| text.contains("image-internal-digest"))
     );
     assert!(matches!(messages.as_slice(),
-        [Message::ChatUi(Action::OpenImage(target, id))]
-            if *target == runtime.target && id == &item.id));
+        [Message::ChatUi(Action::OpenImageFrom(target, _, source))]
+            if *target == runtime.target && source.id == item.id));
     let Message::ChatUi(open) = messages.into_iter().next().unwrap() else {
         unreachable!()
     };
@@ -198,7 +198,7 @@ fn unavailable_user_image_preserves_its_error_without_a_viewer_action() {
     );
     assert!(!messages.iter().any(|message| matches!(
         message,
-        Message::ChatUi(Action::OpenImage(..) | Action::LoadImage(..))
+        Message::ChatUi(Action::OpenImageFrom(..) | Action::LoadImage(..))
     )));
     assert!(
         !texts
@@ -244,7 +244,7 @@ fn claude_document_placeholder_keeps_its_title_without_image_actions() {
     assert!(!texts.iter().any(|text| text == "Load preview"));
     assert!(!messages.iter().any(|message| matches!(
         message,
-        Message::ChatUi(Action::OpenImage(..) | Action::LoadImage(..))
+        Message::ChatUi(Action::OpenImageFrom(..) | Action::LoadImage(..))
     )));
 }
 
@@ -276,6 +276,13 @@ fn selected_child_user_image_uses_its_own_preview_despite_parent_id_collision() 
     let mut app = crate::app::tests::context_inspector_test_app(false);
     app.cards
         .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+    {
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.composer = text_editor::Content::with_text("Feedback on this exact image");
+        runtime
+            .attachments
+            .push(chat::Attachment::file("/fixture/keep-this-attachment.txt"));
+    }
     drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("native-child".into()))));
     let renderer = crate::app::tests::headless_renderer();
     let runtime = app.chat_runtime_mut(target).unwrap();
@@ -287,20 +294,73 @@ fn selected_child_user_image_uses_its_own_preview_despite_parent_id_collision() 
             .any(|text| text == "Image 47 · Click to enlarge")
     );
     assert!(matches!(messages.as_slice(),
-        [Message::ChatUi(Action::OpenImage(found, id))] if *found == target && id == &child.id));
+        [Message::ChatUi(Action::OpenImageFrom(found, agent, source))] if *found == target && agent.as_deref() == Some("native-child") && source.id == child.id));
     let Message::ChatUi(open) = messages.into_iter().next().unwrap() else {
         unreachable!()
     };
+    // A callback retired by a tab switch must never resolve the parent's
+    // coincident item ID, even when that parent image is already decoded.
+    drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+    ready(
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .cache
+            .get_mut(&parent.id)
+            .unwrap(),
+    );
+    drop(app.handle_chat_ui(open.clone()));
+    assert!(app.chat_ui.image_viewer.is_none());
+    app.chat_runtime_mut(target)
+        .unwrap()
+        .cache
+        .get_mut(&parent.id)
+        .unwrap()
+        .image = None;
+    drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("native-child".into()))));
+    ready(
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .child_cache
+            .get_mut(&child.id)
+            .unwrap(),
+    );
+    // A same-ID replacement in the same agent is a different source too.
+    let original = app
+        .chat_runtime_mut(target)
+        .unwrap()
+        .active_item(&child.id)
+        .unwrap()
+        .clone();
+    Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).subagents[0].items[0] =
+        Arc::new(image(&child.id, 48));
+    drop(app.handle_chat_ui(open.clone()));
+    assert!(app.chat_ui.image_viewer.is_none());
+    Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).subagents[0].items[0] =
+        original;
     drop(app.handle_chat_ui(open));
     assert!(app.chat_ui.image_viewer.is_some());
-    drop(app.handle_chat_ui(Action::CloseImage));
+    for action in [
+        Action::ImageNext(true),
+        Action::ImageActualSize,
+        Action::ImageFit,
+        Action::CloseImage,
+    ] {
+        drop(app.handle_chat_ui(action));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert_eq!(runtime.composer.text(), "Feedback on this exact image");
+        assert_eq!(
+            runtime.attachments,
+            [chat::Attachment::file("/fixture/keep-this-attachment.txt")]
+        );
+        assert_eq!(runtime.selected_subagent.as_deref(), Some("native-child"));
+    }
     drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
     let runtime = app.chat_runtime_mut(target).unwrap();
     let (_, messages) = click_prompt(&renderer, runtime, &parent);
     assert!(
         !messages
             .iter()
-            .any(|message| matches!(message, Message::ChatUi(Action::OpenImage(..)))),
+            .any(|message| matches!(message, Message::ChatUi(Action::OpenImageFrom(..)))),
         "child pixels never make the parent clickable"
     );
 }
@@ -321,6 +381,102 @@ fn uncached_managed_user_image_keeps_its_stable_label() {
     assert!(
         !messages
             .iter()
-            .any(|message| matches!(message, Message::ChatUi(Action::OpenImage(..))))
+            .any(|message| matches!(message, Message::ChatUi(Action::OpenImageFrom(..))))
     );
+}
+
+#[test]
+fn inline_metadata_and_failure_paths_remain_bounded_in_every_preview_state() {
+    let mut item = image("bounded-inline-metadata", 61);
+    let ItemContent::Image {
+        path, description, ..
+    } = &mut item.content
+    else {
+        unreachable!()
+    };
+    *path = format!(
+        "/private/never-display-this-path/{}",
+        "p".repeat(1024 * 1024)
+    );
+    *description = "caption".repeat(180_000);
+    let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+    let renderer = crate::app::tests::headless_renderer();
+    let source = runtime.active_item(&item.id).unwrap().clone();
+    for state in ["ready", "loading", "waiting", "unavailable"] {
+        let cached = runtime.cache.get_mut(&item.id).unwrap();
+        ready(cached);
+        if state != "ready" {
+            cached.image = None;
+        }
+        if state == "loading" {
+            cached.image_source = Some(source.clone());
+        }
+        if state == "waiting" {
+            let images::Loaded::Deferred(pressure) = images::deferred_for_test() else {
+                unreachable!()
+            };
+            cached.image_wait = Some(pressure);
+        }
+        if state == "unavailable" {
+            cached.image_unavailable = true;
+            let ItemContent::Image { path, .. } = &item.content else {
+                unreachable!()
+            };
+            cached.image_error = Some(format!("Cannot read {path}: No such file or directory"));
+        }
+        let cached = &runtime.cache[&item.id];
+        let mut element = runtime.image_preview(&item, cached);
+        let mut tree = Tree::new(element.as_widget());
+        let bounds = Rectangle::with_size(Size::new(360.0, 600.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, bounds.size()),
+        );
+        #[derive(Default)]
+        struct Text(Vec<String>);
+        impl Operation for Text {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: Rectangle, text: &str) {
+                self.0.push(text.to_owned());
+            }
+        }
+        let mut visible = Text::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut visible);
+        let accessible =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        visible.0.extend(
+            accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .filter_map(|node| node.node().label().map(str::to_owned)),
+        );
+        assert!(!visible.0.is_empty());
+        for text in &visible.0 {
+            assert!(
+                text.chars().count() <= 180,
+                "{state} metadata exceeds its display bound"
+            );
+            assert!(
+                !text.contains("/private") && !text.contains("never-display-this-path"),
+                "{state} diagnostics must not dump image paths"
+            );
+        }
+        if state == "ready" {
+            let (_, messages) = click_prompt(&renderer, &runtime, &item);
+            assert!(
+                matches!(messages.as_slice(),
+                [Message::ChatUi(Action::OpenImageFrom(target, _, clicked))]
+                    if *target == runtime.target && Arc::ptr_eq(clicked, &source)),
+                "bounded metadata must preserve the exact clicked source"
+            );
+        }
+    }
 }
