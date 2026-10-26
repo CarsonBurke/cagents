@@ -3308,6 +3308,333 @@ mod tests {
             })
     }
 
+    #[test]
+    fn shared_folder_reopen_loads_new_rows_and_preserves_acknowledged_terminal_membership() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        use crate::workspace_model::views::{Change, Scope, View};
+
+        fn sidebar_frame(
+            app: &Cagents,
+            renderer: &mut cosmic::Renderer,
+            navigation: &crate::sidebar::NavigationCache,
+            cache: cosmic::iced::runtime::user_interface::Cache,
+        ) -> (
+            cosmic::iced::runtime::user_interface::Cache,
+            Vec<(String, [f64; 4])>,
+        ) {
+            use cosmic::iced::{
+                Size,
+                advanced::{clipboard, mouse},
+            };
+            let shortcuts = crate::settings::KeyboardShortcuts::default();
+            let mut ui = cosmic::iced::runtime::UserInterface::build(
+                crate::sidebar::view_cached(
+                    &app.sidebar_model,
+                    &app.sidebar_state,
+                    crate::sidebar::SidebarMode::Expanded,
+                    280.0,
+                    false,
+                    navigation,
+                    &shortcuts,
+                ),
+                Size::new(280.0, 900.0),
+                cache,
+                renderer,
+            );
+            let mut messages = Vec::new();
+            ui.update(
+                &[],
+                mouse::Cursor::Unavailable,
+                renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert!(messages.is_empty());
+            ui.draw(
+                renderer,
+                &cosmic::theme::active(),
+                &cosmic::iced::advanced::renderer::Style::default(),
+                mouse::Cursor::Unavailable,
+            );
+            let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+            let rows = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .filter_map(|node| {
+                    let label = node.node().label()?;
+                    let bounds = node.node().bounds()?;
+                    (node.node().role() == iced_accessibility::accesskit::Role::Button
+                        && !node.node().is_hidden()
+                        && !node.node().is_disabled()
+                        && label.starts_with("Open project "))
+                    .then(|| {
+                        (
+                            label.to_owned(),
+                            [bounds.x0, bounds.y0, bounds.x1, bounds.y1],
+                        )
+                    })
+                })
+                .collect();
+            (ui.into_cache(), rows)
+        }
+
+        fn reopen(app: &mut Cagents, path: &Path, sequence: u64) {
+            let task = app.update(Message::WorkspaceModelObserved(ModelUpdate::Edited {
+                sequence,
+                edit: ModelEdit::ReopenProject {
+                    repository: path.to_path_buf(),
+                    name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                    kind: ProjectKind::Folder,
+                },
+            }));
+            let loaded = first_message(task).expect("the actual model edit schedules its loader");
+            assert!(matches!(&loaded, Message::RepositoryLoaded {
+                open_cards: false,
+                result: Ok(loaded),
+                ..
+            } if loaded.project.repository == path && loaded.project.kind == ProjectKind::Folder));
+            drop(app.update(loaded));
+        }
+
+        for explicitly_filed in [false, true] {
+            let mut renderer = super::super::tests::headless_renderer();
+            let navigation = crate::sidebar::NavigationCache::default();
+            let directory = tempfile::tempdir().unwrap();
+            let parent = directory.path().canonicalize().unwrap().join("parent");
+            let nested = parent.join("nested");
+            let control = directory.path().join("control");
+            std::fs::create_dir_all(&nested).unwrap();
+            std::fs::create_dir(&control).unwrap();
+            let mut app = super::super::tests::context_inspector_test_app(true);
+            let control_card = app.workspace.focused().unwrap();
+            let CardKind::Terminal(mut session) =
+                app.card_state(control_card).unwrap().kind.clone()
+            else {
+                panic!("the original control pane is a terminal")
+            };
+            if let CardKind::Terminal(control_session) =
+                &mut app.card_state_mut(control_card).unwrap().kind
+            {
+                control_session.launch.working_directory = control.clone();
+            }
+            drop(app.select_worktree(control.clone(), false));
+            app.refresh_ui.focused = false;
+            let focused = app.workspace.focused();
+            let strip = app.workspace.order().collect::<Vec<_>>();
+            let published = intercept_publishes(&mut app);
+            drop(
+                app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+                    registry(Vec::new()),
+                ))),
+            );
+            reopen(&mut app, &parent, 1);
+            assert!(app.known_worktree_roots.contains(&parent));
+            assert_eq!(app.worktree_scope_for(&nested), Some(parent.clone()));
+            let parent_key = app.sidebar_model.worktree_at(&parent).unwrap();
+            let scope = app.worktree_view_scope(&parent).unwrap();
+            assert!(matches!(&scope, Scope::Worktree { path, .. } if *path == parent));
+
+            // A real seed acknowledgment precedes the newly observed session.
+            // Unlike the old NO_REGISTRY fixture, subsequent publication and
+            // canonical projection therefore both run through the App reducer.
+            let mut model = app.workspace_model.clone();
+            model.sequence = 2;
+            model.views.push(View::empty(scope.clone()));
+            drop(
+                app.update(Message::WorkspaceModelObserved(ModelUpdate::ViewApplied {
+                    scope: scope.clone(),
+                    operation: None,
+                    model,
+                })),
+            );
+            drain(&published);
+            session.id = TerminalId::new();
+            session.launch.working_directory = nested.clone();
+            session.continuity = TerminalContinuity::Live {
+                host_session_id: crate::model::HostSessionId::new("shared-folder-test"),
+                boot_id: crate::model::BootId::new("shared-folder-test"),
+                host_incarnation: crate::model::HostIncarnation::new("shared-folder-test"),
+            };
+            let terminal = session.id;
+            let mut descriptor = crate::terminal::ipc::TerminalDescriptor::relaunchable(
+                terminal,
+                session.launch.clone(),
+                None,
+            );
+            descriptor.session = session.clone();
+            assert!(!app.durable.cards.iter().any(|card| {
+                matches!(&card.kind, CardKind::Terminal(current) if current.id == terminal)
+            }));
+            drop(app.update(Message::HostedTerminalsObserved(vec![descriptor])));
+            let cards = app.durable.cards.iter().filter(|card| {
+                matches!(&card.kind, CardKind::Terminal(current) if current.id == terminal)
+            }).map(|card| card.id).collect::<Vec<_>>();
+            assert_eq!(cards.len(), 1);
+            let card = cards[0];
+            assert!(
+                !app.durable.card_scopes.contains_key(&card),
+                "the known Folder boundary must prevent active-control fallback filing"
+            );
+            if explicitly_filed {
+                Arc::make_mut(&mut app.durable)
+                    .card_scopes
+                    .insert(card, parent.clone());
+            }
+            let working = Activity {
+                provider: Provider::Omp,
+                state: ActivityState::Working,
+            };
+            app.sidebar_state.set_agent_activity(
+                card,
+                parent_key.project_id,
+                parent_key.worktree_id,
+                working,
+            );
+            app.sidebar_state.observe_agent_update(
+                card,
+                parent_key.project_id,
+                parent_key.worktree_id,
+            );
+            app.publish_view_changes();
+            let inserts = drain(&published)
+                .into_iter()
+                .filter_map(|edit| match edit {
+                    ModelEdit::ChangeView {
+                        scope: actual,
+                        operation,
+                        expected_revision,
+                        change: change @ Change::Insert { .. },
+                        ..
+                    } if actual == scope => Some((operation, expected_revision, change)),
+                    _ => None,
+                })
+                .filter(
+                    |(_, _, change)| matches!(change, Change::Insert { pane, .. } if pane.id == card),
+                )
+                .collect::<Vec<_>>();
+            assert_eq!(
+                inserts.len(),
+                1,
+                "the real publish queue must contain the exact new pane"
+            );
+            let (operation, expected_revision, change) = inserts.into_iter().next().unwrap();
+            let mut acknowledged = app.workspace_model.clone();
+            acknowledged.sequence = 3;
+            let view = acknowledged
+                .views
+                .iter_mut()
+                .find(|view| view.scope == scope)
+                .unwrap();
+            assert_eq!(
+                expected_revision, view.revision,
+                "the captured real request must target this exact simulated CAS basis"
+            );
+            assert!(view.apply(&change).unwrap());
+            view.revision += 1;
+            drop(
+                app.update(Message::WorkspaceModelObserved(ModelUpdate::ViewApplied {
+                    scope,
+                    operation: Some(operation),
+                    model: acknowledged,
+                })),
+            );
+            assert_eq!(
+                app.durable.card_scopes.get(&card),
+                Some(&parent),
+                "daemon-accepted membership is authoritative in both pre-ACK cases"
+            );
+            let (retained_cache, before_rows) = sidebar_frame(
+                &app,
+                &mut renderer,
+                &navigation,
+                cosmic::iced::runtime::user_interface::Cache::default(),
+            );
+            assert!(
+                before_rows
+                    .iter()
+                    .any(|(label, _)| label == "Open project parent, agent working")
+            );
+            assert!(
+                !before_rows
+                    .iter()
+                    .any(|(label, _)| label == "Open project nested")
+            );
+            reopen(&mut app, &nested, 4);
+            let nested_key = app
+                .sidebar_model
+                .worktree_at(&nested)
+                .expect("the model-driven nested Folder must have its own row");
+            assert_ne!(nested_key.project_id, parent_key.project_id);
+            assert_eq!(
+                app.sidebar_model
+                    .projects
+                    .iter()
+                    .filter(|project| project.repository == parent)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                app.sidebar_model
+                    .projects
+                    .iter()
+                    .filter(|project| project.repository == nested)
+                    .count(),
+                1
+            );
+            let (_, after_rows) = sidebar_frame(&app, &mut renderer, &navigation, retained_cache);
+            for expected in ["Open project parent, agent working", "Open project nested"] {
+                let matches = after_rows
+                    .iter()
+                    .filter(|(label, _)| label == expected)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    matches.len(),
+                    1,
+                    "the retained real sidebar must expose {expected}"
+                );
+                let bounds = matches[0].1;
+                assert!(
+                    bounds[0] >= 0.0
+                        && bounds[1] >= 0.0
+                        && bounds[2] > bounds[0]
+                        && bounds[3] > bounds[1]
+                        && bounds[2] <= 280.0
+                        && bounds[3] <= 900.0
+                );
+            }
+            assert_eq!(
+                app.card_worktree(app.card_state(card).unwrap()),
+                Some(parent.as_path())
+            );
+            assert_eq!(
+                app.sidebar_state
+                    .agent_activity(parent_key.project_id, parent_key.worktree_id),
+                Some(ActivityState::Working)
+            );
+            assert!(
+                app.sidebar_state
+                    .has_agent_update(parent_key.project_id, parent_key.worktree_id)
+            );
+            assert_eq!(
+                app.sidebar_state
+                    .agent_activity(nested_key.project_id, nested_key.worktree_id),
+                None
+            );
+            assert!(
+                !app.sidebar_state
+                    .has_agent_update(nested_key.project_id, nested_key.worktree_id)
+            );
+            assert_eq!(app.durable.card_scopes.get(&card), Some(&parent));
+            assert_eq!(app.active_workspace.as_ref(), Some(&control));
+            assert_eq!(app.workspace.focused(), focused);
+            assert_eq!(app.workspace.order().collect::<Vec<_>>(), strip);
+            assert!(
+                matches!(&app.card_state(card).unwrap().kind, CardKind::Terminal(current) if *current == session)
+            );
+        }
+    }
+
     /// A project this window has never seen - opened from a shell with
     /// `cagents project open`, or in another window - arrives as a sidebar row
     /// and nothing else.
