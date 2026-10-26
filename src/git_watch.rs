@@ -497,7 +497,7 @@ impl Registrations {
                 registrations.failures.insert(id, reason.clone());
             }
             for (path, mode) in project.metadata_paths() {
-                registrations.claim(id, path, mode, limit, &mut checks, &mut inspect);
+                let _ = registrations.claim(id, path, mode, limit, &mut checks, &mut inspect);
             }
         }
         let mut candidates = limit;
