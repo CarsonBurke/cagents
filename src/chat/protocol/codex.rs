@@ -765,9 +765,18 @@ impl Codex {
             self.call(step, "thread/resume", json!({"threadId":self.thread,"excludeTurns":true,"initialTurnsPage":{"limit":20,"sortDirection":"desc","itemsView":"full"}}), Pending::Attach)?;
             self.goal_resume_pending = false;
         } else {
+            let detail = if self
+                .goal
+                .as_ref()
+                .is_some_and(|state| state.support() == chat::goal::Support::Unsupported)
+            {
+                "This Codex server does not support native Goal controls; restore still needs original scope or a confirmed inactive goal"
+            } else {
+                "Codex restore needs original scope or a confirmed inactive goal; Goal status, Pause and Clear remain available"
+            };
             step.events.push(Event::Status {
                 busy: false,
-                detail: "Codex restore needs original scope or a confirmed inactive goal; Goal status, Pause and Clear remain available".into(),
+                detail: detail.into(),
             });
         }
         Ok(())
