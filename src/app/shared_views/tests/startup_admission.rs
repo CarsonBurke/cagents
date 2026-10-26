@@ -881,6 +881,10 @@ fn startup_gate_waits_for_shared_authority_and_requires_offscreen_attachment() {
     use crate::app::workspace_model_sync::ModelUpdate;
     let daemon = ScriptedDaemon::start();
     let (mut app, active, hidden, pane, identity) = cached_chat();
+    // This parent exercises a live publisher waiting for its seed ACK. The
+    // default headless sender has no receiver and correctly means Closed.
+    let (publisher, _requests) = async_channel::unbounded();
+    app.workspace_model_tx = publisher;
     let startup = app.initialize_runtimes();
     settle(&mut app, startup);
     assert_eq!(app.startup_pane_check(), Ok(false));
@@ -1496,3 +1500,620 @@ fn an_upgraded_visibility_reply_allows_peer_read_close_without_stopping_admissio
     // Drop must join both actual server connections without masking a panic.
     drop(daemon);
 }
+
+/// A real framed publisher exchange, separate from the chat fixture. The
+/// refusal read is on the same pinned connection as the rejected SeedView.
+fn framed_seed(
+    edit: ModelEdit,
+    model: crate::workspace_model::WorkspaceModel,
+    refuse: bool,
+) -> Vec<crate::app::workspace_model_sync::ModelUpdate> {
+    let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    peer.set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let expected = edit.clone();
+    let server = std::thread::spawn(move || {
+        let proof = HostSessionProof {
+            host_session_id: "publisher-host".into(),
+            boot_id: "boot".into(),
+            host_incarnation: "publisher-incarnation".into(),
+        };
+        let connected: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+        assert!(matches!(connected.request, ClientRequest::Connect { .. }));
+        let reply = |peer: &mut std::os::unix::net::UnixStream, request_id, message| {
+            write_frame(
+                peer,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request_id),
+                    proof: proof.clone(),
+                    message,
+                },
+            )
+            .unwrap();
+        };
+        reply(
+            &mut peer,
+            connected.request_id,
+            ServerMessage::Response {
+                response: ServerResponse::Connected {
+                    proof: proof.clone(),
+                    resumed: vec![],
+                },
+            },
+        );
+        let request: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+        assert_eq!(request.proof, Some(proof.clone()));
+        assert_eq!(
+            request.request,
+            ClientRequest::EditWorkspaceModel { edit: expected }
+        );
+        if refuse {
+            reply(
+                &mut peer,
+                request.request_id,
+                ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::PermissionDenied,
+                    "private-server-detail-must-not-be-rendered",
+                    false,
+                )),
+            );
+            let read: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            assert_eq!(read.proof, Some(proof.clone()));
+            assert_eq!(read.request, ClientRequest::ReadWorkspaceModel);
+            reply(
+                &mut peer,
+                read.request_id,
+                ServerMessage::Response {
+                    response: ServerResponse::WorkspaceModel { model },
+                },
+            );
+        } else {
+            reply(
+                &mut peer,
+                request.request_id,
+                ServerMessage::Response {
+                    response: ServerResponse::WorkspaceModel { model },
+                },
+            );
+        }
+    });
+    let mut client = crate::control::ControlClient::from_stream(stream).unwrap();
+    let (tx, rx) = async_channel::unbounded();
+    let result = crate::app::workspace_model_sync::send_seed_for_test(&mut client, edit, &tx);
+    assert_eq!(result.is_err(), refuse);
+    server.join().unwrap();
+    let mut updates = Vec::new();
+    while let Ok(update) = rx.try_recv() {
+        updates.push(update);
+    }
+    assert_eq!(updates.len(), 2, "Started plus exactly one final outcome");
+    updates
+}
+
+fn queued_seed(rx: &async_channel::Receiver<ModelEdit>, scope: &Scope) -> ModelEdit {
+    let mut found = None;
+    while let Ok(edit) = rx.try_recv() {
+        if matches!(&edit, ModelEdit::SeedView { scope: queued, .. } if queued == scope) {
+            assert!(
+                found.replace(edit).is_none(),
+                "one seed per admission attempt"
+            );
+        }
+    }
+    found.expect("the real Connected/publication path queued this scope")
+}
+
+fn apply_seed_updates(
+    app: &mut Cagents,
+    updates: Vec<crate::app::workspace_model_sync::ModelUpdate>,
+) {
+    for update in updates {
+        let task = app.apply_workspace_model_update(update);
+        settle(app, task);
+    }
+}
+
+#[test]
+fn refused_seed_has_finite_failure_and_exact_retry_reopens_saved_chat_without_starting_provider() {
+    if isolated(
+        "refused_seed_has_finite_failure_and_exact_retry_reopens_saved_chat_without_starting_provider",
+    ) {
+        return;
+    }
+    use crate::app::workspace_model_sync::ModelUpdate;
+    crate::chat::attachment_assets::with_test_image(|image| {
+        let (mut app, active, hidden, mut pane, identity) = cached_chat();
+        let CardKind::Chat(source) = &mut pane.kind else {
+            unreachable!()
+        };
+        source.proof = Some(HostSessionProof {
+            host_session_id: "live-host".into(),
+            boot_id: "boot".into(),
+            host_incarnation: "live-incarnation".into(),
+        });
+        let source = source.clone();
+        app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+        let daemon = ScriptedDaemon::with_upgrade(Some(UpgradeScript {
+            source: source.clone(),
+            canonical: source.clone(),
+            refuse_lineage: false,
+        }));
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        let draft = "Unsent source text  ";
+        app.chat_ui = chat_ui::State::with_draft_attachments(
+            HashMap::from([(pane.id, draft.into())]),
+            HashMap::from([(pane.id, vec![image.clone()])]),
+        );
+        let task = app.initialize_runtimes();
+        settle(&mut app, task);
+        let CardRuntime::Chat(runtime) = app.cards.get(&pane.id).unwrap() else {
+            unreachable!()
+        };
+        let allocation = &**runtime as *const chat_ui::Runtime as usize;
+        let target = runtime.target;
+        let cursor = app.handle_chat_ui(chat_ui::Action::ComposerCursor(
+            target,
+            cosmic::iced::widget::text_editor::Cursor {
+                position: cosmic::iced::widget::text_editor::Position { line: 0, column: 4 },
+                selection: None,
+            },
+        ));
+        settle(&mut app, cursor);
+        assert_eq!(app.startup_pane_check(), Ok(false));
+        let mut view = View::empty(hidden);
+        view.panes.push(pane.clone());
+        let canonical = model(identity, active, hidden, view);
+        let connected = app.apply_workspace_model_update(ModelUpdate::Connected(canonical.clone()));
+        settle(&mut app, connected);
+        let scope = Scope::Channel(hidden);
+        let seed = queued_seed(&rx, &scope);
+        let active_ack = app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+            scope: Scope::Channel(active),
+            operation: None,
+            model: canonical.clone(),
+        });
+        settle(&mut app, active_ack);
+        let failed = framed_seed(seed, canonical.clone(), true);
+        let old_started = failed[0].clone();
+        let old_refused = failed[1].clone();
+        apply_seed_updates(&mut app, failed);
+        let failure = app
+            .shared_chat_admission_failure(pane.id)
+            .expect("finite failure, not indefinite reconnect");
+        assert!(!failure.message().contains("private-server-detail"));
+        assert!(
+            app.startup_pane_check()
+                .unwrap_err()
+                .contains("Saved workspace recovery failed")
+        );
+        let retry = failure.retry().unwrap();
+        assert_eq!(retry, retry.clone());
+        assert!(!format!("{retry:?}").contains(&source.id.to_string()));
+        for _ in 0..3 {
+            let read = app.apply_workspace_model_update(ModelUpdate::Read(canonical.clone()));
+            settle(&mut app, read);
+            app.publish_view_changes();
+            app.persist();
+        }
+        let connected_again =
+            app.apply_workspace_model_update(ModelUpdate::Connected(canonical.clone()));
+        settle(&mut app, connected_again);
+        assert!(
+            rx.is_empty(),
+            "read/persist/reconnect cannot replay permanent refusal"
+        );
+        assert!(daemon.requests().is_empty());
+        assert!(app.chat_awaiting_admission(pane.id));
+        assert_eq!(
+            app.durable.pending_chat_admissions.get(&pane.id),
+            Some(&source)
+        );
+        let task = app.retry_shared_chat_admission(retry.clone());
+        settle(&mut app, task);
+        assert!(app.shared_chat_admission_failure(pane.id).is_none());
+        assert!(
+            app.chat_awaiting_admission(pane.id),
+            "retry is not admission"
+        );
+        let next = queued_seed(&rx, &scope);
+        let task = app.retry_shared_chat_admission(retry.clone());
+        settle(&mut app, task);
+        assert!(
+            rx.is_empty(),
+            "a queued old retry cannot duplicate the new attempt"
+        );
+        apply_seed_updates(&mut app, vec![old_refused.clone()]);
+        assert!(
+            app.shared_chat_admission_failure(pane.id).is_none(),
+            "old refusal cannot poison a fresh queued attempt"
+        );
+        let accepted = framed_seed(next, canonical.clone(), false);
+        apply_seed_updates(&mut app, accepted);
+        assert_eq!(
+            daemon.requests(),
+            vec![source.clone()],
+            "exact ChatAttach only; ChatStart panics in this fixture"
+        );
+        assert!(
+            daemon.resolutions().is_empty(),
+            "no history substitution or lineage rewrite"
+        );
+        assert!(!app.chat_awaiting_admission(pane.id));
+        assert!(!app.durable.pending_chat_admissions.contains_key(&pane.id));
+        assert_eq!(app.startup_pane_check(), Ok(true));
+        let CardRuntime::Chat(runtime) = app.cards.get(&pane.id).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(
+            &**runtime as *const chat_ui::Runtime as usize, allocation,
+            "retain the Content owner and its caret"
+        );
+        let current_target = runtime.target;
+        assert_eq!(current_target.card, target.card);
+        assert!(
+            current_target.generation > target.generation,
+            "canonical reattachment must fence callbacks issued to the inert runtime"
+        );
+        assert_eq!(runtime.session, source);
+        let saved = app.persistent_workspace();
+        assert_eq!(
+            saved.chat_drafts.get(&pane.id).map(String::as_str),
+            Some(draft)
+        );
+        assert_eq!(saved.chat_draft_attachments[&pane.id], [image.clone()]);
+        assert!(
+            saved
+                .channels
+                .iter()
+                .find(|channel| channel.id == hidden)
+                .unwrap()
+                .cards
+                .contains(&pane.id)
+        );
+        assert_eq!(
+            saved.active_channel,
+            Some(active),
+            "offscreen recovery does not steal selection"
+        );
+        let stale_cursor = app.handle_chat_ui(chat_ui::Action::ComposerCursor(
+            target,
+            cosmic::iced::widget::text_editor::Cursor {
+                position: cosmic::iced::widget::text_editor::Position { line: 0, column: 0 },
+                selection: None,
+            },
+        ));
+        settle(&mut app, stale_cursor);
+        let stale_edit = app.handle_chat_ui(chat_ui::Action::Composer(
+            target,
+            cosmic::iced::widget::text_editor::Action::Edit(
+                cosmic::iced::widget::text_editor::Edit::Paste(Arc::new("OLD".into())),
+            ),
+        ));
+        settle(&mut app, stale_edit);
+        assert_eq!(
+            app.persistent_workspace()
+                .chat_drafts
+                .get(&pane.id)
+                .map(String::as_str),
+            Some(draft),
+            "an old UI callback cannot edit the recovered conversation"
+        );
+        let current_edit = app.handle_chat_ui(chat_ui::Action::Composer(
+            current_target,
+            cosmic::iced::widget::text_editor::Action::Edit(
+                cosmic::iced::widget::text_editor::Edit::Paste(Arc::new("X".into())),
+            ),
+        ));
+        settle(&mut app, current_edit);
+        assert_eq!(
+            app.persistent_workspace()
+                .chat_drafts
+                .get(&pane.id)
+                .map(String::as_str),
+            Some("UnseXnt source text  "),
+            "the current callback must use the preserved pre-admission caret; stale cursor movement is ignored"
+        );
+        apply_seed_updates(&mut app, vec![old_started, old_refused]);
+        let stale = app.retry_shared_chat_admission(retry);
+        settle(&mut app, stale);
+        assert!(app.shared_chat_admission_failure(pane.id).is_none());
+        assert_eq!(daemon.requests().len(), 1);
+        assert!(rx.is_empty());
+    });
+}
+
+#[test]
+fn failed_seed_retry_rejects_stale_owner_source_registry_and_attempt() {
+    if isolated("failed_seed_retry_rejects_stale_owner_source_registry_and_attempt") {
+        return;
+    }
+    use crate::app::workspace_model_sync::ModelUpdate;
+    let daemon = ScriptedDaemon::start();
+    let (mut app, active, hidden, pane, identity) = cached_chat();
+    let (tx, rx) = async_channel::unbounded();
+    app.workspace_model_tx = tx;
+    let startup = app.initialize_runtimes();
+    settle(&mut app, startup);
+    let mut view = View::empty(hidden);
+    view.panes.push(pane.clone());
+    let canonical = model(identity, active, hidden, view);
+    let connected = app.apply_workspace_model_update(ModelUpdate::Connected(canonical.clone()));
+    settle(&mut app, connected);
+    let scope = Scope::Channel(hidden);
+    let failed = framed_seed(queued_seed(&rx, &scope), canonical, true);
+    // Local presentation edits during the request must not make its Started
+    // basis disappear: it is the immutable queued panes, not current panes.
+    let title = app.card_state(pane.id).unwrap().title.clone();
+    app.card_state_mut(pane.id).unwrap().title = "Renamed while the seed was in flight".into();
+    apply_seed_updates(&mut app, vec![failed[0].clone()]);
+    let ModelUpdate::ViewSeedRefused {
+        scope: failed_scope,
+        attempt,
+        ..
+    } = &failed[1]
+    else {
+        unreachable!()
+    };
+    apply_seed_updates(
+        &mut app,
+        vec![
+            ModelUpdate::ViewSeedRefused {
+                scope: failed_scope.clone(),
+                attempt: *attempt,
+                registry: Some(uuid::Uuid::new_v4()),
+                error: "foreign registry".into(),
+            },
+            ModelUpdate::ViewSeedRefused {
+                scope: failed_scope.clone(),
+                attempt: uuid::Uuid::new_v4(),
+                registry: Some(identity),
+                error: "stale attempt".into(),
+            },
+        ],
+    );
+    assert!(app.shared_chat_admission_failure(pane.id).is_none());
+    assert_eq!(app.startup_pane_check(), Ok(false));
+    apply_seed_updates(&mut app, vec![failed[1].clone()]);
+    let retry = app
+        .shared_chat_admission_failure(pane.id)
+        .unwrap()
+        .retry()
+        .unwrap();
+    app.card_state_mut(pane.id).unwrap().title = title;
+    // Every mutation is an actual owning source field, not a replacement token
+    // fabricated from the current pane. Restore it only for the next control.
+    app.workspace_model.identity = uuid::Uuid::new_v4();
+    drop(app.retry_shared_chat_admission(retry.clone()));
+    assert!(rx.is_empty());
+    app.workspace_model.identity = identity;
+    app.resume_ui.open = true;
+    drop(app.retry_shared_chat_admission(retry.clone()));
+    assert!(rx.is_empty(), "retry cannot bypass another modal");
+    app.resume_ui.open = false;
+    let existence = app.card_state(pane.id).unwrap().existence.clone();
+    app.card_state_mut(pane.id).unwrap().existence = Existence::Closing {
+        operation_id: crate::model::OperationId::new(),
+    };
+    drop(app.retry_shared_chat_admission(retry.clone()));
+    assert!(rx.is_empty());
+    app.card_state_mut(pane.id).unwrap().existence = existence;
+    let original = app.card_state(pane.id).unwrap().kind.clone();
+    let CardKind::Chat(mut replaced) = original.clone() else {
+        unreachable!()
+    };
+    replaced
+        .launch
+        .recipe
+        .arguments
+        .push("changed-source".into());
+    app.card_state_mut(pane.id).unwrap().kind = CardKind::Chat(replaced);
+    drop(app.retry_shared_chat_admission(retry.clone()));
+    assert!(rx.is_empty());
+    app.card_state_mut(pane.id).unwrap().kind = original;
+    assert!(app.shared_chat_admission_failure(pane.id).is_some());
+    {
+        let durable = Arc::make_mut(&mut app.durable);
+        durable
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == hidden)
+            .unwrap()
+            .cards
+            .retain(|id| *id != pane.id);
+        durable
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == active)
+            .unwrap()
+            .cards
+            .push(pane.id);
+    }
+    drop(app.retry_shared_chat_admission(retry.clone()));
+    assert!(
+        rx.is_empty(),
+        "a same-card/same-session scope move invalidates old action"
+    );
+    {
+        let durable = Arc::make_mut(&mut app.durable);
+        durable
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == active)
+            .unwrap()
+            .cards
+            .retain(|id| *id != pane.id);
+        durable
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == hidden)
+            .unwrap()
+            .cards
+            .push(pane.id);
+        durable.local_only_cards.insert(pane.id);
+    }
+    drop(app.retry_shared_chat_admission(retry.clone()));
+    assert!(rx.is_empty());
+    Arc::make_mut(&mut app.durable)
+        .local_only_cards
+        .remove(&pane.id);
+    assert!(app.shared_chat_admission_failure(pane.id).is_some());
+    app.workspace_model
+        .views
+        .iter_mut()
+        .find(|view| view.scope == scope)
+        .unwrap()
+        .panes
+        .clear();
+    app.workspace_model
+        .views
+        .iter_mut()
+        .find(|view| view.scope == Scope::Channel(active))
+        .unwrap()
+        .panes
+        .push(pane.clone());
+    drop(app.retry_shared_chat_admission(retry.clone()));
+    assert!(
+        rx.is_empty(),
+        "canonical foreign ownership cannot be seeded over"
+    );
+    app.workspace_model
+        .views
+        .iter_mut()
+        .find(|view| view.scope == Scope::Channel(active))
+        .unwrap()
+        .panes
+        .clear();
+    app.shared_views
+        .seed_admissions
+        .get_mut(&scope)
+        .unwrap()
+        .attempt = Some(uuid::Uuid::new_v4());
+    drop(app.retry_shared_chat_admission(retry.clone()));
+    assert!(
+        rx.is_empty(),
+        "older failure cannot retry a newer operation"
+    );
+    app.shared_views
+        .seed_admissions
+        .get_mut(&scope)
+        .unwrap()
+        .attempt = Some(retry.0.attempt);
+    assert!(app.shared_chat_admission_failure(pane.id).is_some());
+    {
+        let durable = Arc::make_mut(&mut app.durable);
+        durable
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == hidden)
+            .unwrap()
+            .cards
+            .retain(|id| *id != pane.id);
+        durable
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == active)
+            .unwrap()
+            .cards
+            .push(pane.id);
+    }
+    app.publish_view_changes();
+    assert!(
+        app.shared_chat_admission_failure(pane.id).is_none(),
+        "the normal projection boundary removes the previous scope's error too"
+    );
+    {
+        let durable = Arc::make_mut(&mut app.durable);
+        durable
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == active)
+            .unwrap()
+            .cards
+            .retain(|id| *id != pane.id);
+        durable
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == hidden)
+            .unwrap()
+            .cards
+            .push(pane.id);
+    }
+    drop(app.retry_shared_chat_admission(retry));
+    assert!(
+        rx.is_empty(),
+        "returning to the same scope cannot revive an invalidated action"
+    );
+    assert!(daemon.requests().is_empty());
+    assert!(app.chat_awaiting_admission(pane.id));
+}
+
+#[test]
+fn closed_or_full_publisher_reports_seed_failure_without_admitting_cached_chat() {
+    if isolated("closed_or_full_publisher_reports_seed_failure_without_admitting_cached_chat") {
+        return;
+    }
+    use crate::app::workspace_model_sync::ModelUpdate;
+    let daemon = ScriptedDaemon::start();
+    for closed in [false, true] {
+        let (mut app, active, hidden, pane, identity) = cached_chat();
+        let (tx, rx) = async_channel::bounded(1);
+        // Full and Closed both fail actual try_send, without an observer thread.
+        tx.try_send(ModelEdit::SeedView {
+            scope: Scope::Channel(active),
+            panes: vec![],
+            closed: vec![],
+        })
+        .unwrap();
+        if closed {
+            rx.close();
+        }
+        app.workspace_model_tx = tx;
+        let startup = app.initialize_runtimes();
+        settle(&mut app, startup);
+        let mut view = View::empty(hidden);
+        view.panes.push(pane.clone());
+        let connected = app.apply_workspace_model_update(ModelUpdate::Connected(model(
+            identity, active, hidden, view,
+        )));
+        settle(&mut app, connected);
+        let failure = app.shared_chat_admission_failure(pane.id).unwrap();
+        assert!(
+            failure
+                .message()
+                .contains(if closed { "stopped" } else { "full" })
+        );
+        assert!(app.startup_pane_check().is_err());
+        if closed {
+            assert!(failure.message().contains("close and reopen this window"));
+            assert!(
+                failure.retry().is_none(),
+                "a stopped publisher must not offer a dead-end retry"
+            );
+        } else {
+            let old = failure.retry().unwrap();
+            drop(app.retry_shared_chat_admission(old.clone()));
+            let new = app
+                .shared_chat_admission_failure(pane.id)
+                .unwrap()
+                .retry()
+                .unwrap();
+            assert_ne!(
+                old, new,
+                "a refused queue retry remains a new finite failure"
+            );
+            drop(app.retry_shared_chat_admission(old));
+            assert_eq!(
+                app.shared_chat_admission_failure(pane.id).unwrap().retry(),
+                Some(new)
+            );
+        }
+        assert!(app.chat_awaiting_admission(pane.id));
+        assert_eq!(rx.len(), 1, "no duplicate provider or hidden queue growth");
+    }
+    assert!(daemon.requests().is_empty());
+}
+#[path = "../../chat_ui/pending_admission_retry_view_tests.rs"]
+mod retry_view;

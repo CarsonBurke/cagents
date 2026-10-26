@@ -2693,6 +2693,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::OpenTerminalOutput(_)
         | Message::NewBrowser
         | Message::RetryCard(_)
+        | Message::RetrySharedChatAdmission(_)
         | Message::FocusAdjacent(_)
         | Message::FocusProjectSearch
         | Message::ToggleContextInspector
@@ -4571,6 +4572,7 @@ pub enum Message {
     },
     NativeWindowAction(cosmic::app::Action),
     ChatUi(chat_ui::Action),
+    RetrySharedChatAdmission(shared_views::SharedChatAdmissionRetry),
     UpdateUi(update_ui::Action),
     ChromeUi(chrome_ui::Action),
     ChannelUi(channel_ui::Action),
@@ -14180,6 +14182,7 @@ impl Application for Cagents {
         }
         if crate::device::is_remote() {
             match &message {
+                Message::RetrySharedChatAdmission(_) => return Task::none(),
                 Message::GitUi(_)
                 | Message::ProjectUi(
                     project_ui::Action::EditorsLoaded(_) | project_ui::Action::AvatarLoaded { .. },
@@ -17375,6 +17378,7 @@ impl Application for Cagents {
             }
             Message::NativeWindowAction(action) => Task::done(cosmic::Action::Cosmic(action)),
             Message::ChatUi(action) => self.handle_chat_ui(action),
+            Message::RetrySharedChatAdmission(retry) => self.retry_shared_chat_admission(retry),
             Message::ResetSettings => {
                 if self.settings_reset_confirm {
                     return Task::none();

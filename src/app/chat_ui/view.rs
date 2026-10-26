@@ -992,6 +992,16 @@ impl Cagents {
     pub(in crate::app) fn chat_view(&self, card: CardId) -> Element<'_, Message> {
         match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => {
+                if runtime.awaiting_admission() {
+                    return runtime.pending_admission_view_with_failure(
+                        self.shared_chat_admission_failure(card),
+                        !crate::device::is_remote()
+                            && !self.update_prepared
+                            && !self.workspace_inputs_blocked()
+                            && !self.focused_repository_is_saving()
+                            && !self.pane_close_owned(card),
+                    );
+                }
                 let place = self.chat_place(&runtime.session.launch.recipe.working_directory, card);
                 let accounts = self.chat_accounts(
                     runtime.session.launch.provider,

@@ -7,6 +7,14 @@ impl Runtime {
     }
 
     pub(super) fn pending_admission_view(&self) -> Element<'_, Message> {
+        self.pending_admission_view_with_failure(None, false)
+    }
+
+    pub(super) fn pending_admission_view_with_failure(
+        &self,
+        failure: Option<&crate::app::shared_views::SharedChatAdmissionFailure>,
+        retry_enabled: bool,
+    ) -> Element<'_, Message> {
         let text = self.unsent_text();
         let attachments = self.unsent_attachments();
         let mut rows: Vec<Element<'_, Message>> = vec![
@@ -21,6 +29,29 @@ impl Runtime {
             .width(Length::Fill)
             .into(),
         ];
+        if let Some(failure) = failure {
+            // Admission owns the sanitized public message and opaque authority.
+            // Presentation never inspects a session proof or creates a retry.
+            rows.push(
+                design::body(failure.message().to_owned())
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                    .width(Length::Fill)
+                    .into(),
+            );
+            if let Some(retry) = failure.retry() {
+                rows.push(crate::ui_controls::owned(
+                    (retry.clone(), retry_enabled),
+                    widget::button::custom(design::body("Retry workspace connection"))
+                        .name("Retry workspace connection")
+                        .id(card_control_id(self.target.card, "saved.admission.retry"))
+                        .class(crate::ui_controls::control_style(false, None))
+                        .padding([space::S as u16, space::M as u16])
+                        .on_press_maybe(
+                            retry_enabled.then_some(Message::RetrySharedChatAdmission(retry)),
+                        ),
+                ));
+            }
+        }
         if text.is_empty() && attachments.is_empty() {
             rows.push(design::body("No unsent draft.").into());
         } else {
@@ -88,7 +119,6 @@ impl Runtime {
             .into()
     }
 }
-
 #[cfg(test)]
 #[path = "pending_admission_view_tests.rs"]
 mod view_tests;
