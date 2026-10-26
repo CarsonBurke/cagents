@@ -18,6 +18,7 @@ pub(super) struct Picker {
 }
 
 const PAGE_SIZE: usize = 24;
+const MAX_DIRECT_TABS: usize = 24;
 
 // Presentation key only. Selection commands retain and validate the exact ID.
 fn child_key(id: &str) -> [u8; 32] {
@@ -50,6 +51,31 @@ fn child_icon(child: &chat::Subagent) -> Icon {
         chat::ToolStatus::Succeeded => Icon::Check,
         chat::ToolStatus::Stopped => Icon::Cancel,
     }
+}
+
+/// Keep metadata scanning cheap and mounted controls bounded. The chooser is
+/// the complete catalog; its selected child always keeps a direct tab.
+fn direct_tabs<'a>(
+    children: &'a [chat::Subagent],
+    selected: Option<&str>,
+) -> Vec<&'a chat::Subagent> {
+    let mut rows: Vec<_> = children.iter().collect();
+    rows.sort_by_key(|child| rank(child));
+    if rows.len() > MAX_DIRECT_TABS {
+        let retained_selection = selected.and_then(|id| {
+            rows.iter()
+                .position(|child| child.id == id)
+                .filter(|index| *index >= MAX_DIRECT_TABS)
+                .map(|index| rows[index])
+        });
+        rows.truncate(MAX_DIRECT_TABS);
+        if let Some(child) = retained_selection {
+            rows.pop();
+            rows.push(child);
+            rows.sort_by_key(|child| rank(child));
+        }
+    }
+    rows
 }
 
 impl Picker {
@@ -106,10 +132,7 @@ impl Runtime {
     pub(super) fn child_navigation(&self, _width: f32) -> Element<'_, Message> {
         let target = self.target;
         let selected = self.selected_subagent.as_ref();
-        let mut children: Vec<_> = self.snapshot.subagents.iter().collect();
-        // Stable sorting preserves provider order within each live status group.
-        children.sort_by_key(|child| rank(child));
-        let tabs = children
+        let tabs = direct_tabs(&self.snapshot.subagents, selected.map(String::as_str))
             .into_iter()
             .map(|child| {
                 let chosen = selected == Some(&child.id);
@@ -377,6 +400,40 @@ mod tests {
             background: true,
             items: Vec::new(),
         }
+    }
+
+    #[test]
+    fn direct_tabs_bound_large_catalog_while_retaining_selected_identity_and_working_prefix() {
+        let children: Vec<_> = (0..1000)
+            .map(|index| {
+                child(
+                    &index.to_string(),
+                    if index < 30 {
+                        chat::ToolStatus::Running
+                    } else {
+                        chat::ToolStatus::Succeeded
+                    },
+                    false,
+                )
+            })
+            .collect();
+        let visible = direct_tabs(&children, Some("999"));
+        assert_eq!(visible.len(), MAX_DIRECT_TABS);
+        assert_eq!(visible.first().unwrap().id, "0");
+        assert_eq!(visible.last().unwrap().id, "999");
+        assert_eq!(
+            visible
+                .iter()
+                .filter(|child| child.status == chat::ToolStatus::Running)
+                .count(),
+            MAX_DIRECT_TABS - 1
+        );
+        let picker = Picker::new(&children);
+        assert_eq!(
+            picker.rows(&children).len(),
+            1000,
+            "the chooser keeps every child reachable"
+        );
     }
 
     #[test]

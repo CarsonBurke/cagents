@@ -2102,7 +2102,7 @@ impl Runtime {
                 activity.push(if glyph == Icon::AgentWorking {
                     crate::ui_controls::activity_spinner(
                         f32::from(design::COMPACT_ICON_SIZE),
-                        design::muted_text,
+                        design::muted_icon_color,
                     )
                 } else {
                     crate::ui_controls::passive_icon(glyph, design::COMPACT_ICON_SIZE)
@@ -6496,6 +6496,54 @@ mod tests {
             background: true,
             items: Vec::new(),
         }
+    }
+
+    #[test]
+    fn native_child_strip_mounts_bounded_controls_for_large_catalog_and_preserves_selection() {
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        Arc::make_mut(&mut runtime.snapshot).subagents = (0..1000)
+            .map(|index| chat::Subagent {
+                id: format!("child-{index}"),
+                kind: format!("Agent {index}"),
+                status: if index < 30 {
+                    chat::ToolStatus::Running
+                } else {
+                    chat::ToolStatus::Succeeded
+                },
+                ..native_child_fixture()
+            })
+            .collect();
+        runtime.selected_subagent = Some("child-999".into());
+        let renderer = crate::app::tests::headless_renderer();
+        let mut element = runtime.child_navigation(360.0);
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(360.0, 100.0)),
+        );
+        assert!(node.bounds().width <= 360.0);
+        let accessible = element.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            iced::mouse::Cursor::Unavailable,
+        );
+        let labels: Vec<_> = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .filter(|node| node.node().role() == iced_accessibility::accesskit::Role::Button)
+            .filter_map(|node| node.node().label())
+            .filter(|label| label.contains("native subagent"))
+            .collect();
+        assert_eq!(labels.len(), 24, "only direct tabs mount native buttons");
+        assert!(labels[0].contains("Agent 0 ·"));
+        assert!(labels.last().unwrap().contains("Agent 999 ·"));
+        assert_eq!(runtime.selected_subagent.as_deref(), Some("child-999"));
+        assert!(
+            runtime.child_cache.is_empty(),
+            "tab metadata never prepares hidden transcripts"
+        );
     }
 
     #[test]
