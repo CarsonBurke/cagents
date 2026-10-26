@@ -2,28 +2,28 @@
 //! Rows carry existing UI actions; capability dispatch remains in chat_ui.
 use super::*;
 
-pub(super) struct Row {
+pub(super) struct Row<'a> {
     pub key: [u8; 32],
     pub label: String,
-    pub description: String,
+    pub description: &'a str,
     pub icon: Option<Icon>,
     pub id: Option<widget::Id>,
     pub accessible_name: Option<&'static str>,
     pub action: Option<Action>,
 }
 
-impl Row {
+impl<'a> Row<'a> {
     fn native(
         identity: &str,
         label: &str,
-        description: &str,
+        description: &'a str,
         icon: Icon,
         action: Option<Action>,
     ) -> Self {
         Self {
             key: composer_action_key("native", identity),
             label: label.into(),
-            description: description.into(),
+            description,
             icon: Some(icon),
             id: None,
             accessible_name: None,
@@ -32,7 +32,7 @@ impl Row {
     }
 }
 
-pub(super) fn offered(runtime: &Runtime, available: bool, command_enabled: bool) -> Vec<Row> {
+pub(super) fn offered(runtime: &Runtime, available: bool, command_enabled: bool) -> Vec<Row<'_>> {
     let target = runtime.target;
     let snapshot = &runtime.snapshot;
     let query = runtime.composer_actions_query.trim().to_lowercase();
@@ -68,7 +68,7 @@ pub(super) fn offered(runtime: &Runtime, available: bool, command_enabled: bool)
                 &candidate.insertion,
             ),
             label,
-            description: candidate.description.into(),
+            description: candidate.description,
             icon: None,
             id: None,
             accessible_name: None,
