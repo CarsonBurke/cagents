@@ -110,8 +110,8 @@ struct Model {
     goal_response_gate: Arc<Mutex<Option<Arc<GoalResponseGate>>>>,
 }
 
-/// SDK2 alone paces completed Responses, not native Goal commands or turns.
-/// Other SDK/Continuity cases and the external GUI endpoint stay unpaced.
+/// SDK2 and SDK3 opt into pacing completed Responses, not native Goal commands
+/// or turns. Other Continuity cases and the external GUI endpoint stay unpaced.
 struct GoalResponseGate {
     state: Mutex<GoalResponseState>,
     changed: std::sync::Condvar,
@@ -227,6 +227,15 @@ impl GoalResponsePacing {
             self.0.release_after_confirmed_pause(),
             "invalid paused response allowance"
         );
+    }
+
+    fn has_held_response(&self) -> bool {
+        let state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.held == 1 && !state.cancelled && !state.timed_out
     }
 
     fn assert_healthy(&self) {
