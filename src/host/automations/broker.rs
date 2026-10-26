@@ -1748,7 +1748,7 @@ mod tests {
             "journal progress uses the existing finite wait, not read-triggered wakes"
         );
         assert!(
-            handle.0.attention.lock().unwrap().is_empty(),
+            handle.0.attention.lock().unwrap().in_flight.is_empty(),
             "a no-run event cannot invent AgentRun attention"
         );
     }
