@@ -415,26 +415,23 @@ pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
     let mut installation = running_installation()?;
     let layout = locate(&std::env::current_exe()?)?;
     let served = served_version_root(&layout)?;
-    if served == layout.version_root && !daemon_protocol_mismatch() {
-        return Err(invalid("the installed application is already running"));
-    }
     if executable.canonicalize()? != served.join("bin/cagents-ui").canonicalize()? {
         return Err(invalid(
             "the installed candidate changed; inspect the installation again",
         ));
     }
     // A newly opened UI may already be current while an older daemon still
-    // owns the sessions. Its own CLI must perform the preview and checkpoint.
-    installation.version =
-        installation_worker_version(&layout, &served, installed_daemon_owner(&layout)?.as_ref());
-    if served
-        == installation
-            .prefix
-            .join("versions")
-            .join(&installation.version)
-    {
-        return Err(invalid("the installed application is already running"));
-    }
+    // owns the sessions. Ordinary skew uses that owner's CLI; the qualified
+    // protocol-77 adapter keeps the new matched coordinator in control.
+    let (source_protocol, source_proof) = source::inspect_identity(None)?;
+    let source_owner = installed_daemon_owner(&layout)?;
+    installation.version = installed_update_worker(
+        &layout,
+        &served,
+        source_owner.as_ref(),
+        source_protocol,
+        source_proof.as_ref(),
+    )?;
     let version = served
         .file_name()
         .and_then(|name| name.to_str())
@@ -447,11 +444,40 @@ pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
     )
 }
 
+/// This entry decision consumes an authenticated source observation. A failed
+/// ordinary-client decode is neither proof of compatibility nor permission to
+/// route around a source owner. Header discovery alone never reaches here.
+fn installed_update_worker(
+    window: &InstallLayout,
+    served: &Path,
+    daemon: Option<&InstallLayout>,
+    source_protocol: u16,
+    source_proof: Option<&crate::model::HostSessionProof>,
+) -> Result<String, UpdateError> {
+    let replaces_daemon =
+        source_proof.is_some() && source_protocol != crate::terminal_ipc::PROTOCOL_VERSION;
+    if served == window.version_root && !replaces_daemon {
+        return Err(invalid("the installed application is already running"));
+    }
+    let legacy_source = source_proof.is_some()
+        && source_protocol == 77
+        && crate::terminal_ipc::PROTOCOL_VERSION > 77;
+    let worker = installation_worker_version(window, served, daemon, legacy_source);
+    if !legacy_source && served == window.prefix.join("versions").join(&worker) {
+        return Err(invalid("the installed application is already running"));
+    }
+    Ok(worker)
+}
+
 fn installation_worker_version(
     window: &InstallLayout,
     served: &Path,
     daemon: Option<&InstallLayout>,
+    legacy_source: bool,
 ) -> String {
+    if legacy_source {
+        return window.version.clone();
+    }
     // Once the candidate already owns the daemon, the old window's worker
     // must perform the remaining UI-only replacement. A current worker would
     // correctly reject replacing its own installation with itself.
@@ -992,7 +1018,8 @@ fn perform_update(
     )?;
     verify_digest(&mut archive, &archive_hash)?;
     let staged = candidate::Staged::from_archive(&release, &archive, &archive_hash, &cancellation)?;
-    if staged.identity.protocol == crate::terminal_ipc::PROTOCOL_VERSION {
+    let (source_protocol, _) = source::inspect_identity(None)?;
+    if staged.identity.protocol == source_protocol {
         staged.verify_compatible_handshake(&cancellation)?;
     }
     let confirmed = confirmation::wait(state, job, |policy| {
@@ -1033,8 +1060,8 @@ fn perform_update(
         }
         if let Some(daemon) = current.daemon {
             let socket = crate::terminal_ipc::daemon_socket_path()?;
-            let mut client = crate::control::ControlClient::connect(&socket)
-                .map_err(|error| invalid(error.to_string()))?;
+            let mut client =
+                source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
             client
                 .prepare_confirmed_upgrade(daemon, false)
                 .map_err(|error| invalid(error.to_string()))?;
@@ -1207,7 +1234,7 @@ fn observe_impact(
     policy: impact::Policy,
 ) -> Result<impact::Preview, UpdateError> {
     let socket = crate::terminal_ipc::daemon_socket_path()?;
-    let mut client = match crate::control::ControlClient::connect(&socket) {
+    let mut client = match source::Client::connect(&socket) {
         Ok(client) => Some(client),
         Err(crate::control::ControlError::Connect(error))
             if matches!(
@@ -1228,8 +1255,9 @@ fn observe_impact(
         }
         Err(error) => return Err(invalid(error.to_string())),
     };
-    let replaces_daemon =
-        client.is_some() && candidate.protocol != crate::terminal_ipc::PROTOCOL_VERSION;
+    let replaces_daemon = client
+        .as_ref()
+        .is_some_and(|client| candidate.protocol != client.protocol());
     let daemon = if replaces_daemon {
         Some(
             client
@@ -2247,24 +2275,63 @@ sys.exit(7)
         let new = layout("new");
         // A newer UI cannot speak the old service's protocol.
         assert_eq!(
-            installation_worker_version(&new, &new.version_root, Some(&old)),
+            installation_worker_version(&new, &new.version_root, Some(&old), false),
             "old"
         );
         // Once that service is already new, the old UI still needs replacement:
         // selecting the new worker would reject its candidate as itself.
         assert_eq!(
-            installation_worker_version(&old, &new.version_root, Some(&new)),
+            installation_worker_version(&old, &new.version_root, Some(&new), false),
             "old"
         );
         // Repeated staging must use the actual owner, not the window or current.
         let staged = layout("third");
         assert_eq!(
-            installation_worker_version(&old, &staged.version_root, Some(&new)),
+            installation_worker_version(&old, &staged.version_root, Some(&new), false),
             "new"
+        );
+        // An authenticated legacy source must be migrated by the new matched
+        // coordinator, even when that coordinator is already the served build.
+        assert_eq!(
+            installation_worker_version(&new, &new.version_root, Some(&old), true),
+            "new"
+        );
+        // The real entry decision must not mistake an already-served window
+        // for a completed daemon migration. No-daemon/current observations keep
+        // the old already-running refusal instead of granting a legacy route.
+        for source_proof in [
+            None,
+            Some(crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("current"),
+                boot_id: crate::model::BootId::new("current"),
+                host_incarnation: crate::model::HostIncarnation::new("current"),
+            }),
+        ] {
+            assert!(
+                installed_update_worker(
+                    &new,
+                    &new.version_root,
+                    Some(&new),
+                    crate::terminal_ipc::PROTOCOL_VERSION,
+                    source_proof.as_ref()
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            installed_update_worker(
+                &old,
+                &new.version_root,
+                None,
+                crate::terminal_ipc::PROTOCOL_VERSION,
+                None
+            )
+            .unwrap(),
+            "old"
         );
         // Without a service, the old window's worker can start the candidate.
         assert_eq!(
-            installation_worker_version(&old, &new.version_root, None),
+            installation_worker_version(&old, &new.version_root, None, false),
             "old"
         );
     }
