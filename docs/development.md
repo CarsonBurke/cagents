@@ -396,7 +396,18 @@ cargo test --locked --no-default-features --features host --test repository_scal
 The fixture retains its disk-backed private namespace, subprocess deadline and
 process-family cleanup checks. Its test count and workload are unchanged.
 
-Run `cargo fmt --check` after Rust edits. For UI changes, launch the real UI with
+Run `scripts/check-format` after Rust edits. It runs `cargo fmt --check` for
+Cargo roots and directly checks `src/modules.rs` and nested Rust-source
+`include!` fragments, which rustfmt does not discover through macro expansion.
+Both stages report their diagnostics and any failure makes the command fail;
+the check never rewrites source or formats vendored packages. When adding a
+Rust-source `include!`, update the explicit list in the script. Its lightweight
+regression is `python3 tests/check_format.py` (mocked command routing and bounded
+real-rustfmt fixtures, with no Cargo/application build). Set
+`CHECK_FORMAT_CARGO_FIXTURE=1` for the additional dependency-free temporary Cargo
+fixture; this still runs only `cargo fmt`, with no application build.
+
+For UI changes, launch the real UI with
 the runner and exercise the changed path. For browser or feature-boundary
 changes, verify both the browserless and integrated lanes. Performance
 workloads are described in [Performance](performance.md).
