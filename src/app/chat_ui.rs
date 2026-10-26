@@ -23,6 +23,7 @@ mod clipboard_image;
 mod closed_draft;
 mod completion;
 mod coordination;
+mod dictation;
 mod failure;
 mod find;
 mod find_navigation;
@@ -161,6 +162,7 @@ pub enum ReturnRefused {
 
 #[derive(Clone)]
 pub enum Action {
+    Dictation(Target, dictation::Action),
     PreparationAvailable,
     FlowAvailable,
     FlowRequest(Target, flow_layout::Request),
@@ -405,6 +407,9 @@ impl std::fmt::Debug for Action {
 
 impl Action {
     pub(super) fn allowed_while_modal(&self) -> bool {
+        if let Self::Dictation(_, action) = self {
+            return action.asynchronous();
+        }
         matches!(
             self,
             Self::Ready(..)
@@ -474,6 +479,7 @@ impl Action {
 
     fn mutation_target(&self) -> Option<Target> {
         match self {
+            Self::Dictation(target, action) if !action.asynchronous() => Some(*target),
             Self::Composer(target, action) if action.is_edit() => Some(*target),
             Self::DraftModel(target, _, _)
             | Self::ChooseAccount(target, _)
@@ -573,6 +579,7 @@ impl Phase {
 }
 
 pub(super) struct State {
+    dictation_setup: dictation::Setup,
     channel_names: HashMap<Target, ChannelNameObservation>,
     pub(super) image_viewer: Option<images::Gallery>,
     files: HashMap<PathBuf, Arc<Vec<String>>>,
@@ -618,6 +625,7 @@ impl Default for State {
     fn default() -> Self {
         let (sender, receiver) = async_channel::unbounded();
         Self {
+            dictation_setup: dictation::Setup::default(),
             image_viewer: None,
             channel_names: HashMap::new(),
             files: HashMap::new(),
@@ -2102,6 +2110,7 @@ pub(super) struct Runtime {
     opened: HashMap<String, bool>,
     pub(super) tool_groups_expanded: bool,
     composer: text_editor::Content<cosmic::Renderer>,
+    dictation: dictation::State,
     revision: u64,
     attachments: Vec<Attachment>,
     thumbnails: thumbnails::Cache,
@@ -2181,6 +2190,7 @@ pub(super) struct Runtime {
 }
 impl Drop for Runtime {
     fn drop(&mut self) {
+        self.dictation.retire();
         tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_runtime", chat_id = %self.session.id,
             released = true, resident_bytes = 0usize, cache_entries = 0usize, exposed_presentation_bytes = 0usize);
     }
@@ -2380,6 +2390,7 @@ impl Runtime {
             bookmark.valid = false;
         }
         self.attachment_jobs.clear();
+        self.dictation.unmeasured_edit();
         completion::apply(&mut self.composer, &token, insertion);
         self.completion = completion::State::default();
         self.revision = self.revision.wrapping_add(1);
@@ -2448,16 +2459,18 @@ impl Runtime {
     fn composer_action(&mut self, action: text_editor::Action) {
         match action {
             text_editor::Action::Edit(edit) => {
-                if self.attachment_bookmarks.is_empty() {
+                if self.attachment_bookmarks.is_empty() && !self.dictation.has_bookmark() {
                     self.composer.perform(text_editor::Action::Edit(edit));
                 } else {
                     match attachment_draft::edit(&mut self.composer, edit) {
                         Ok(Some(change)) => {
+                            self.dictation.changed(&change);
                             for bookmark in self.attachment_bookmarks.values_mut() {
                                 bookmark.changed(&change);
                             }
                         }
                         Err(()) => {
+                            self.dictation.unmeasured_edit();
                             for bookmark in self.attachment_bookmarks.values_mut() {
                                 bookmark.valid = false;
                             }
@@ -2541,10 +2554,15 @@ impl Runtime {
             }
         }
         if !insertion.is_empty() {
-            if let Ok(Some(change)) = attachment_draft::edit(
+            let effect = attachment_draft::edit(
                 &mut self.composer,
                 text_editor::Edit::Paste(Arc::new(insertion)),
-            ) {
+            );
+            if effect.is_err() {
+                self.dictation.unmeasured_edit();
+            }
+            if let Ok(Some(change)) = effect {
+                self.dictation.changed(&change);
                 for (other_id, other) in &mut self.attachment_bookmarks {
                     // Equal collapsed anchors follow paste initiation order,
                     // independent of worker completion order. User caret
@@ -2612,10 +2630,15 @@ impl Runtime {
                     selection: Some(excerpt.position(offset)),
                 },
             );
-            if let Ok(Some(change)) = attachment_draft::edit(
+            let effect = attachment_draft::edit(
                 &mut self.composer,
                 text_editor::Edit::Paste(Arc::new(String::new())),
-            ) {
+            );
+            if effect.is_err() {
+                self.dictation.unmeasured_edit();
+            }
+            if let Ok(Some(change)) = effect {
+                self.dictation.changed(&change);
                 for bookmark in self.attachment_bookmarks.values_mut() {
                     bookmark.changed(&change);
                 }
@@ -2941,6 +2964,7 @@ impl Runtime {
     /// retire old insert ownership before those callbacks become unreachable.
     fn retarget(&mut self, target: Target) {
         if self.target != target {
+            self.dictation.retire();
             self.cancel_attachment_jobs();
             self.attachment_chooser_pending = None;
             self.target = target;
@@ -2950,6 +2974,7 @@ impl Runtime {
     /// Puts a whole new draft in the composer. Whatever the completion list
     /// was doing belonged to the old one.
     fn replace_draft(&mut self, composer: text_editor::Content<cosmic::Renderer>) {
+        self.dictation.retire();
         self.cancel_attachment_jobs();
         self.composer = composer;
         self.completion = completion::State::default();
@@ -3021,6 +3046,7 @@ impl Runtime {
             opened: HashMap::new(),
             tool_groups_expanded: false,
             composer: text_editor::Content::new(),
+            dictation: dictation::State::default(),
             revision: 0,
             attachments: Vec::new(),
             thumbnails: thumbnails::Cache::default(),
@@ -4376,6 +4402,7 @@ impl Runtime {
     }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         if !visible {
+            self.dictation.cancel(self.target);
             self.find_navigation.cancel_all();
             self.preparation.clear_local();
             if let Some(queued) = &mut self.queued {
@@ -6497,7 +6524,7 @@ impl Cagents {
         }
         if self.cards.values().any(|card| {
             matches!(card, CardRuntime::Chat(runtime)
-            if runtime.snapshot.busy && runtime.visible.load(Ordering::Relaxed))
+            if (runtime.snapshot.busy || runtime.dictation.phase().is_some()) && runtime.visible.load(Ordering::Relaxed))
         }) {
             subscriptions.push(
                 iced::time::every(Duration::from_secs(1)).map(|_| Message::ChatUi(Action::Tick)),
@@ -7988,6 +8015,9 @@ impl Cagents {
             Command::SetModel { model, reasoning } => Some((model.clone(), reasoning.clone())),
             _ => None,
         };
+        if clear_draft {
+            runtime.dictation.retire();
+        }
         runtime.pending = Some(PendingCommand {
             followup: false,
             take_back: None,
@@ -8183,6 +8213,7 @@ impl Cagents {
             return Task::none();
         }
         match action {
+            Action::Dictation(target, action) => return self.handle_dictation(target, action),
             Action::CopyClosedDraft(target, revision) => {
                 return self.copy_closed_chat_draft(target, revision);
             }
@@ -11687,6 +11718,7 @@ pub(super) fn show_chat_snapshot_for_test(
 
 #[cfg(test)]
 mod tests {
+    mod dictation_tests;
     #[test]
     fn remote_resume_command_preserves_draft_without_opening_desktop_history() {
         const CHILD: &str = "CAGENTS_TEST_REMOTE_RESUME_COMMAND";

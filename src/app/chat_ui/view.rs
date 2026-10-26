@@ -1022,6 +1022,7 @@ impl Cagents {
                         .image_viewer
                         .as_ref()
                         .filter(|gallery| gallery.belongs_to(runtime)),
+                    Some(&self.chat_ui.dictation_setup),
                 );
                 if !runtime.closed_elsewhere
                     && let Some(recovery) = self.account_recovery_controls(card)
@@ -1757,6 +1758,7 @@ impl Runtime {
             accounts,
             offers,
             None,
+            None,
         )
     }
 
@@ -1772,6 +1774,7 @@ impl Runtime {
         accounts: Option<ChatAccounts>,
         offers: Vec<Offer<'a>>,
         gallery: Option<&'a images::Gallery>,
+        dictation_setup: Option<&'a dictation::Setup>,
     ) -> Element<'a, Message> {
         if self.awaiting_admission() {
             return self.pending_admission_view();
@@ -2812,6 +2815,14 @@ impl Runtime {
                             Action::AcceptSuggestion(target, suggestion.clone()),
                         )));
                     }
+                    if self.dictation.phase().is_some()
+                        && matches!(completion_key(&press), Some(CompletionKey::Dismiss))
+                    {
+                        return Some(text_editor::Binding::Custom(action(Action::Dictation(
+                            target,
+                            dictation::Action::Cancel,
+                        ))));
+                    }
                     if snapshot.busy
                         && available
                         && self.model_picker.is_none()
@@ -2916,6 +2927,7 @@ impl Runtime {
             );
         }
         let mut inline = vec![self.composer_actions(available, content_width), editor];
+        inline.extend(self.dictation_controls(available, dictation_setup));
         inline.extend(submissions);
         let composer_row = widget::row::with_children(inline)
             .spacing(step::GAP_XS)
@@ -2935,6 +2947,7 @@ impl Runtime {
                     .spacing(step::GAP_XS)
                     .into(),
                     composer_row.into(),
+                    self.dictation_notice(available, dictation_setup),
                     suggestion_hint,
                 ])
                 .width(Length::Fill),
@@ -5844,7 +5857,7 @@ pub(super) fn prepared_runtime_for_test(items: &[chat::Item]) -> (Runtime, Arc<C
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iced::advanced::{layout, widget::Tree, Layout};
+    use iced::advanced::{Layout, layout, widget::Tree};
 
     #[test]
     fn review_artifact_button_retains_exact_uri_and_rendered_origin_without_answering() {
