@@ -667,6 +667,13 @@ impl Cagents {
         }
     }
 
+    pub(super) fn focus_terminal_close_after_cover(&mut self) -> Task<Message> {
+        if let Some(intent) = &mut self.terminal_close {
+            intent.focus = 0;
+        }
+        close_focus(0)
+    }
+
     pub(super) fn cycle_terminal_close_focus(&mut self, backwards: bool) -> Task<Message> {
         let Some(intent) = self.terminal_close.as_mut() else {
             return Task::none();
@@ -893,6 +900,48 @@ mod tests {
             unreachable!();
         };
         session.clone()
+    }
+
+    #[test]
+    fn device_files_return_terminal_close_to_cancel_before_native_enter() {
+        let (mut app, card) = retry_close_fixture();
+        let source = terminal_source(&app, card);
+        app.terminal_close = Some(CloseIntent {
+            card,
+            terminal: source.id,
+            proof: source.continuity.live_proof().unwrap(),
+            completed_source: None,
+            generation: 0,
+            restore_card: Some(card),
+            pending: false,
+            active: true,
+            dont_ask_again: false,
+            detail: None,
+            focus: 1,
+            restore_keyboard_nav: true,
+        });
+        app.core.set_keyboard_nav(false);
+        app.device_ui.open = true;
+        let task = app.update(Message::KeyEvent {
+            event: super::super::dialog_ui::tests::key_press(keyboard::key::Named::Escape),
+            captured: false,
+        });
+        assert!(!app.device_ui.open);
+        assert_eq!(app.terminal_close.as_ref().unwrap().focus, 0);
+        let cancel = widget::Id::new("dialog.terminal-close.cancel");
+        assert_eq!(
+            super::super::tests::focused_element(app.terminal_close_dialog().unwrap(), task),
+            Some(cancel.clone()),
+        );
+        let action = super::super::dialog_ui::tests::enter_control(
+            app.terminal_close_dialog().unwrap(),
+            cancel,
+        );
+        assert!(matches!(action, Message::CancelTerminalClose));
+        drop(app.update(action));
+        assert!(app.terminal_close.is_none());
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert_eq!(terminal_source(&app, card), source);
     }
 
     #[test]
