@@ -345,7 +345,7 @@ mod tests {
                 widget::column::with_children(vec![
                     keyboard_list_entry(
                         crate::ui_controls::field::search("Search actions", "")
-                            .id("test-actions-search")
+                            .id("test-actions-search".into())
                             .on_input(Action::Query),
                     ),
                     keyboard_list_row(
