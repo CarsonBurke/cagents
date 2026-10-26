@@ -16,12 +16,33 @@ pub(super) fn discover_protocol(
     socket: &Path,
     deadline: Instant,
 ) -> Result<u16, crate::control::ControlError> {
+    let (bytes, _) = discover_reply(socket, deadline)?;
+    discovered_version(&bytes).map_err(discovery_error)
+}
+
+/// Entry routing may recognize another protocol without decoding its DTOs.
+/// The caller must authenticate the returned peer's original lease and route
+/// only to its matched installed CLI; this is never a wire client admission.
+pub(super) fn discover_installed_protocol(
+    socket: &Path,
+    deadline: Instant,
+) -> Result<(u16, Peer), crate::control::ControlError> {
+    let (bytes, peer) = discover_reply(socket, deadline)?;
+    let (version, _) = postcard::take_from_bytes::<u16>(&bytes)
+        .map_err(|_| discovery_error(invalid("Malformed source version header")))?;
+    Ok((version, peer))
+}
+
+fn discover_reply(
+    socket: &Path,
+    deadline: Instant,
+) -> Result<(Vec<u8>, Peer), crate::control::ControlError> {
     let mut stream = crate::control::connect_control_socket(
         socket,
         deadline.saturating_duration_since(Instant::now()),
     )
     .map_err(crate::control::ControlError::Connect)?;
-    Peer::observe(&stream, socket).map_err(discovery_error)?;
+    let peer = Peer::observe(&stream, socket).map_err(discovery_error)?;
     let bytes = postcard::to_stdvec(&(
         crate::terminal_ipc::PROTOCOL_VERSION,
         1u64,
@@ -33,7 +54,7 @@ pub(super) fn discover_protocol(
     .map_err(|_| discovery_error(invalid("Cannot encode source version discovery")))?;
     write(&mut stream, &bytes, deadline).map_err(discovery_error)?;
     let bytes = read(&mut stream, deadline).map_err(discovery_error)?;
-    discovered_version(&bytes).map_err(discovery_error)
+    Ok((bytes, peer))
 }
 
 fn discovery_error(error: UpdateError) -> crate::control::ControlError {
