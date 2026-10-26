@@ -271,7 +271,8 @@ pub(crate) fn remove_fenced(
     // Busy applications skip before the independent-editor process census.
     // Admission remains fenced while directory leases are then acquired.
     admit(&windows)?;
-    let _editors = crate::instance::verified_running_editors().map_err(|error| error.to_string())?;
+    let _editors =
+        crate::instance::verified_running_editors().map_err(|error| error.to_string())?;
     let _directory = acquire(
         &crate::instance::runtime_directory().map_err(|error| error.to_string())?,
         &target.path,
@@ -291,7 +292,10 @@ pub(crate) fn remove_fenced(
             // A packed branch below a directory of refs may have no loose
             // directory to lock in; Git creates leading directories alike.
             let loose = target.common_dir.join("refs/heads").join(branch);
-            if Path::new(branch).components().any(|part| !matches!(part, std::path::Component::Normal(_))) {
+            if Path::new(branch)
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            {
                 return Err(format!("Branch {branch} is not a valid branch name"));
             }
             if let Some(parent) = loose.parent() {
@@ -330,7 +334,9 @@ pub(crate) fn remove_fenced(
         crate::repository::GitFileLock::acquire(&target.common_dir.join(name))
             .and_then(|lock| lock.check())
             .map_err(|error| {
-                format!("Another Git operation in this repository is running ({error}); retry shortly")
+                format!(
+                    "Another Git operation in this repository is running ({error}); retry shortly"
+                )
             })?;
     }
     let mut command = crate::process::CommandSpec::new("git")
