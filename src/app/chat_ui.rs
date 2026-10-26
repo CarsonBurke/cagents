@@ -8011,6 +8011,19 @@ impl Cagents {
         })
     }
     pub(super) fn handle_chat_ui(&mut self, action: Action) -> Task<Message> {
+        if matches!(
+            &action,
+            Action::ImageViewer(..)
+                | Action::CloseImage
+                | Action::ImageNext(_)
+                | Action::ImageFit
+                | Action::ImageActualSize
+                | Action::ImageSelect(_)
+                | Action::ImageExternal
+        ) && !self.image_viewer_owns_input()
+        {
+            return Task::none();
+        }
         let closed_refresh = match &action {
             Action::Ready(target, _) => Some(target.card),
             _ => None,
@@ -12135,6 +12148,174 @@ mod tests {
         drop(app.update(Message::ChatUi(Action::CloseImage)));
         assert!(!app.modal_is_open());
     }
+    fn image_callback_test_app() -> (Cagents, Target) {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+            unreachable!()
+        };
+        runtime.composer = text_editor::Content::with_text("Keep this feedback draft");
+        let content = ItemContent::Image {
+            path: "/fixture/missing-image-context-regression.png".into(),
+            description: "Context regression image".into(),
+            reference: None,
+        };
+        let mut cached = CachedItem::new(&content, runtime.syntax_theme);
+        cached.image = Some(iced::widget::image::Handle::from_rgba(
+            1,
+            1,
+            vec![0, 0, 0, 255],
+        ));
+        runtime.cache.insert("image".into(), cached);
+        Arc::make_mut(&mut runtime.snapshot).items = vec![
+            chat::Item {
+                id: "image".into(),
+                role: chat::Role::Assistant,
+                content,
+                started_at: None,
+                at: None,
+            }
+            .into(),
+        ];
+        let target = runtime.target;
+        drop(app.handle_chat_ui(Action::OpenImage(target, "image".into())));
+        assert!(app.image_viewer_owns_input());
+        (app, target)
+    }
+
+    #[test]
+    fn queued_conversation_image_callbacks_cannot_cross_update_freeze_or_another_modal() {
+        for owner in [
+            "update",
+            "transient-close",
+            "device-files",
+            "daemon-recovery",
+        ] {
+            let (mut app, target) = image_callback_test_app();
+            let callbacks: Vec<_> = [
+                images::ViewerCommand::Close,
+                images::ViewerCommand::Next(true),
+                images::ViewerCommand::Fit,
+                images::ViewerCommand::ActualSize,
+                images::ViewerCommand::Select(0),
+                images::ViewerCommand::External,
+            ]
+            .into_iter()
+            .map(|command| app.chat_ui.image_viewer.as_ref().unwrap().callback(command))
+            .collect();
+            match owner {
+                "update" => app.update_prepared = true,
+                "transient-close" => app.transient_work_close = Some(window::Id::unique()),
+                "device-files" => app.device_ui.open = true,
+                "daemon-recovery" => app.daemon_health_ui.confirmation = true,
+                _ => unreachable!(),
+            }
+            assert!(!app.image_viewer_owns_input(), "{owner}");
+            if owner != "update" {
+                assert!(app.dialog().is_some());
+            }
+            for callback in callbacks
+                .into_iter()
+                .chain([Action::CloseImage, Action::ImageFit])
+            {
+                let task = app.update(Message::ChatUi(callback));
+                assert_eq!(
+                    task_focuses(task, &card_control_id(target.card, "chat-composer")),
+                    (false, true),
+                    "{owner}: a retired callback must not focus the composer"
+                );
+                let gallery = app
+                    .chat_ui
+                    .image_viewer
+                    .as_ref()
+                    .expect("obscured source gallery is retained");
+                assert_eq!(
+                    gallery.reset, 0,
+                    "{owner}: hidden gallery cannot navigate or zoom"
+                );
+                assert!(!gallery.actual_size);
+                assert_eq!(
+                    app.chat_runtime_mut(target).unwrap().composer.text(),
+                    "Keep this feedback draft"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn device_file_image_actions_follow_actual_dialog_priority_and_keep_foreground_escape() {
+        let (mut app, target) = image_callback_test_app();
+        let file_gallery = || {
+            images::Gallery::file(
+                PathBuf::from("/fixture/device-image.png"),
+                None,
+                iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
+            )
+        };
+        app.chat_ui.image_viewer = Some(file_gallery());
+        // Recovery is below device-file images in the real dialog stack.
+        app.daemon_health_ui.confirmation = true;
+        assert!(app.image_viewer_owns_input());
+        let fit = app
+            .chat_ui
+            .image_viewer
+            .as_ref()
+            .unwrap()
+            .callback(images::ViewerCommand::Fit);
+        drop(app.update(Message::ChatUi(fit)));
+        assert_eq!(app.chat_ui.image_viewer.as_ref().unwrap().reset, 1);
+        let escape = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        };
+        drop(app.update(Message::KeyEvent {
+            event: escape,
+            captured: false,
+        }));
+        assert!(
+            app.chat_ui.image_viewer.is_none(),
+            "Escape closes the actual foreground image"
+        );
+        assert!(
+            app.daemon_health_ui.confirmation,
+            "Escape cannot dismiss recovery behind the image"
+        );
+        app.chat_ui.image_viewer = Some(file_gallery());
+        // Device files are above the image; its stale callback cannot close it.
+        let close = app
+            .chat_ui
+            .image_viewer
+            .as_ref()
+            .unwrap()
+            .callback(images::ViewerCommand::Close);
+        app.device_ui.open = true;
+        assert!(!app.image_viewer_owns_input());
+        let task = app.update(Message::ChatUi(close));
+        assert_eq!(
+            task_focuses(task, &card_control_id(target.card, "chat-composer")),
+            (false, true)
+        );
+        assert!(app.chat_ui.image_viewer.is_some());
+        app.device_ui.open = false;
+        app.update_prepared = true;
+        let close = app
+            .chat_ui
+            .image_viewer
+            .as_ref()
+            .unwrap()
+            .callback(images::ViewerCommand::Close);
+        drop(app.update(Message::ChatUi(close)));
+        assert!(
+            app.chat_ui.image_viewer.is_some(),
+            "the update freeze rejects file-image callbacks too"
+        );
+    }
+
     #[test]
     fn image_loads_ignore_replaced_items_and_retired_runtime_generations() {
         let mut app = crate::app::tests::context_inspector_test_app(false);

@@ -12072,6 +12072,27 @@ impl Cagents {
         self.update_ui.confirmation.is_some() || self.other_modal_is_open()
     }
 
+    /// Image callbacks belong to the surface that is currently accepting
+    /// input, not just the gallery generation that produced them.
+    fn image_viewer_owns_input(&self) -> bool {
+        if self.update_prepared {
+            return false;
+        }
+        let Some(gallery) = &self.chat_ui.image_viewer else {
+            return false;
+        };
+        if !gallery.is_modal() {
+            return !self.workspace_inputs_blocked();
+        }
+        // These are precisely the owners mounted before the device-file
+        // gallery in dialog(). Recovery/import/forms below it do not take its
+        // foreground keyboard or pointer actions.
+        !self.automation_approval_open()
+            && self.transient_work_close.is_none()
+            && !self.automation_ui.draft_dialog_open()
+            && !self.device_ui.open
+    }
+
     fn other_modal_is_open(&self) -> bool {
         self.form_dialog_is_open() || self.modal_over_form_dialogs()
     }
@@ -16820,23 +16841,15 @@ impl Application for Cagents {
                 if let Some(task) = self.automation_approval_key(&event, captured) {
                     return task;
                 }
-                #[cfg(feature = "integrated-browser")]
-                if is_escape_press(&event) && self.browser_import_on_top() {
-                    return self.update_browser_import(self.browser_import.escape_action());
-                }
-                if let Some(task) = self.session_recovery_key_event(&event, captured) {
-                    return task;
-                }
-                if let Some(task) = self.daemon_health_key_event(&event, captured) {
-                    return task;
-                }
                 if let keyboard::Event::ModifiersChanged(modifiers) = &event {
                     self.keyboard_modifiers = *modifiers;
                 }
                 // Device-file images remain a dialog and do not start with
                 // a focused chat canvas. Keep their original modal keyboard
                 // contract without intercepting a conversation's composer.
-                if self.chat_ui.image_viewer.as_ref().is_some_and(chat_ui::images::Gallery::is_modal) {
+                if self.image_viewer_owns_input()
+                    && self.chat_ui.image_viewer.as_ref().is_some_and(chat_ui::images::Gallery::is_modal)
+                {
                     if let keyboard::Event::KeyPressed { key, .. } = &event {
                         match key {
                             keyboard::Key::Named(keyboard::key::Named::Escape) => {
@@ -16852,6 +16865,16 @@ impl Application for Cagents {
                         }
                     }
                     return Task::none();
+                }
+                #[cfg(feature = "integrated-browser")]
+                if is_escape_press(&event) && self.browser_import_on_top() {
+                    return self.update_browser_import(self.browser_import.escape_action());
+                }
+                if let Some(task) = self.session_recovery_key_event(&event, captured) {
+                    return task;
+                }
+                if let Some(task) = self.daemon_health_key_event(&event, captured) {
+                    return task;
                 }
                 if !captured
                     && !self.workspace_inputs_blocked()
