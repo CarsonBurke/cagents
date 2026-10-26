@@ -77,7 +77,7 @@ mod pending_adapter {
                 records,
                 problems: vec![],
                 occupied,
-                saturated: false,
+                saturated: occupied >= journal::MAX_RECORDS,
             }),
         }));
     }
