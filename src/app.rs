@@ -292,8 +292,8 @@ enum NoticeKey {
     AccountLink,
     /// Telling panes whether they are on screen.
     SurfaceVisibility,
-    /// The same Git action in this exact project/worktree/path identity.
-    GitMutation(ActiveWorktreeKey, MutationKind),
+    /// Committing this exact project/worktree/path identity.
+    GitCommit(ActiveWorktreeKey),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17549,7 +17549,8 @@ impl Application for Cagents {
                 else {
                     return Task::none();
                 };
-                let notice_key = NoticeKey::GitMutation(key.clone(), mutation.kind);
+                let notice_key = (mutation.kind == MutationKind::Commit)
+                    .then(|| NoticeKey::GitCommit(key.clone()));
                 self.source_control_mutations.remove(&key.canonical_path);
                 if committed && let Some(revision) = mutation.commit_revision {
                     self.sidebar_state.clear_submitted_commit(&key, revision);
@@ -17573,16 +17574,18 @@ impl Application for Cagents {
                         source.key.clone()
                     });
                 if let Some(report) = report {
-                    self.status = Some(
-                        TransientNotice::error(format!(
-                            "{}: {report}",
-                            display_path(&key.canonical_path)
-                        ))
-                        .with_key(notice_key),
-                    );
-                } else {
-                    // Only the admitted operation's complete success resolves
-                    // this action's report. Partial/unknown outcomes keep theirs.
+                    let notice = TransientNotice::error(format!(
+                        "{}: {report}",
+                        display_path(&key.canonical_path)
+                    ));
+                    self.status = Some(match notice_key {
+                        Some(key) => notice.with_key(key),
+                        None => notice,
+                    });
+                } else if let Some(notice_key) = notice_key {
+                    // Only an admitted Commit's complete success resolves its
+                    // report. Path selections and push targets are not captured
+                    // here, so other Git actions retain their unkeyed notices.
                     self.resolve_notice(notice_key);
                 }
                 // Navigation does not cancel Git. Only this exact completion
@@ -27504,7 +27507,7 @@ mod tests {
         app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
         let key = app.sidebar_state.active_worktree().unwrap().clone();
         app.active_workspace = Some(key.canonical_path.clone());
-        let notice_key = NoticeKey::GitMutation(key.clone(), MutationKind::Commit);
+        let notice_key = NoticeKey::GitCommit(key.clone());
         app.notices
             .record(TransientNotice::warning("Unrelated report"));
         let first = app
@@ -27577,8 +27580,8 @@ mod tests {
             .sidebar_model
             .worktree_at(Path::new("/repo/fix-sidebar"))
             .unwrap();
-        let primary_notice = NoticeKey::GitMutation(key.clone(), MutationKind::Commit);
-        let sibling_notice = NoticeKey::GitMutation(sibling.clone(), MutationKind::Commit);
+        let primary_notice = NoticeKey::GitCommit(key.clone());
+        let sibling_notice = NoticeKey::GitCommit(sibling.clone());
         for target in [&key, &sibling] {
             app.active_workspace = Some(target.canonical_path.clone());
             drop(app.rebind_source_control());
@@ -27641,7 +27644,7 @@ mod tests {
         app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
         let key = app.sidebar_state.active_worktree().unwrap().clone();
         app.active_workspace = Some(key.canonical_path.clone());
-        let notice_key = NoticeKey::GitMutation(key.clone(), MutationKind::Commit);
+        let notice_key = NoticeKey::GitCommit(key.clone());
         let first = app
             .begin_mutation(&key, MutationKind::Commit, None)
             .unwrap();
@@ -27709,50 +27712,115 @@ mod tests {
     }
 
     #[test]
-    fn partial_and_unknown_git_reports_keep_their_notice_until_full_success() {
-        let mut app = context_inspector_test_app(false);
-        app.sidebar_model = sidebar::tests::panel_model();
-        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
-        let key = app.sidebar_state.active_worktree().unwrap().clone();
-        app.active_workspace = Some(key.canonical_path.clone());
-        let notice_key = NoticeKey::GitMutation(key.clone(), MutationKind::Stage);
-        let path = crate::repository::RepoPath::parse("src/example.rs").unwrap();
+    fn successful_stage_of_another_selection_keeps_unkeyed_failure_partial_and_unknown_notices() {
+        use crate::repository::{MutationFailure, PathSelection, RepoPath};
+
+        let path_a = RepoPath::parse("src/a.rs").unwrap();
+        let path_b = RepoPath::parse("src/b.rs").unwrap();
+        let path_c = RepoPath::parse("src/c.rs").unwrap();
+        assert_ne!(path_a, path_b);
         for outcome in [
+            MutationOutcome::NotApplied {
+                failure: MutationFailure::Rejected {
+                    reason: "A was refused before execution".into(),
+                },
+            },
             MutationOutcome::PartiallyApplied {
-                paths: vec![path.clone()],
-                failures: vec![crate::repository::MutationFailure::Rejected {
-                    reason: "remaining path refused".into(),
+                paths: vec![path_a.clone()],
+                failures: vec![MutationFailure::Rejected {
+                    reason: "another selected path refused".into(),
                 }],
             },
             MutationOutcome::OutcomeUnknown {
-                failure: crate::repository::MutationFailure::Rejected {
-                    reason: "no completion proof".into(),
+                failure: MutationFailure::Rejected {
+                    reason: "A has no completion proof".into(),
                 },
             },
         ] {
-            let operation = app.begin_mutation(&key, MutationKind::Stage, None).unwrap();
+            let mut app = context_inspector_test_app(false);
+            app.sidebar_model = sidebar::tests::panel_model();
+            app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+            let key = app.sidebar_state.active_worktree().unwrap().clone();
+            app.active_workspace = Some(key.canonical_path.clone());
+
+            // Use the public reducer's selected-path action, not a synthetic
+            // begin_mutation which could conceal loss of the original subject.
+            // Worker tasks are not polled: these are callback custody oracles,
+            // not actual Git or filesystem qualification.
+            let selected_a = if matches!(&outcome, MutationOutcome::PartiallyApplied { .. }) {
+                vec![path_a.clone(), path_c.clone()]
+            } else {
+                vec![path_a.clone()]
+            };
+            drop(
+                app.update(Message::Sidebar(SidebarAction::Stage {
+                    key: key.clone(),
+                    selection: selected_a
+                        .into_iter()
+                        .map(|path| PathSelection {
+                            path,
+                            old_path: None,
+                        })
+                        .collect(),
+                })),
+            );
+            let first = app.source_control_mutations[&key.canonical_path];
+            assert_eq!(first.kind, MutationKind::Stage);
             let report = mutation_report("Stage", Ok(outcome));
             assert!(report.is_some());
             drop(app.update(Message::SourceControlMutated {
                 key: key.clone(),
-                operation,
+                operation: first.id,
                 report,
                 committed: false,
             }));
-            assert!(app.notices.has(notice_key.clone()));
             assert_eq!(app.notices.len(), 1);
-            assert_eq!(app.notices.recent().next().unwrap().expires_at, None);
+            let original = app.notices.recent().next().unwrap().clone();
+            assert_eq!(original.notice.key, None);
+            assert_eq!(original.expires_at, None);
+
+            drop(app.update(Message::Sidebar(SidebarAction::Stage {
+                key: key.clone(),
+                selection: vec![PathSelection {
+                    path: path_b.clone(),
+                    old_path: None,
+                }],
+            })));
+            let second = app.source_control_mutations[&key.canonical_path];
+            assert_eq!(second.kind, MutationKind::Stage);
+            assert_ne!(second.id, first.id);
+            let report = mutation_report(
+                "Stage",
+                Ok(MutationOutcome::Applied {
+                    paths: vec![path_b.clone()],
+                }),
+            );
+            assert!(report.is_none());
+            drop(app.update(Message::SourceControlMutated {
+                key: key.clone(),
+                operation: second.id,
+                report,
+                committed: false,
+            }));
+            assert!(
+                !app.source_control_mutations
+                    .contains_key(&key.canonical_path)
+            );
+            assert!(
+                app.sidebar_model
+                    .source_control
+                    .as_ref()
+                    .unwrap()
+                    .error
+                    .is_none()
+            );
+            assert_eq!(app.notices.len(), 1);
+            assert_eq!(
+                app.notices.recent().next().unwrap(),
+                &original,
+                "Stage(B) success does not resolve Stage(A)'s failure or uncertainty"
+            );
         }
-        let operation = app.begin_mutation(&key, MutationKind::Stage, None).unwrap();
-        let report = mutation_report("Stage", Ok(MutationOutcome::Applied { paths: vec![path] }));
-        assert!(report.is_none());
-        drop(app.update(Message::SourceControlMutated {
-            key,
-            operation,
-            report,
-            committed: false,
-        }));
-        assert!(!app.notices.has(notice_key));
     }
 
     #[test]
