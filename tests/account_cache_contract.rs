@@ -1,5 +1,7 @@
-#![cfg(target_os = "linux")]
+#![cfg(all(target_os = "linux", any(feature = "host", feature = "ui")))]
 //! Real cache writers in separate processes; no provider or daemon is started.
+//! The public cache API exists in both host and UI lanes; shared-only suites
+//! compile this target without the feature-specific contract.
 use cagents::{
     account::{
         UsageSnapshot, UsageStatus,
@@ -124,17 +126,30 @@ impl Drop for Writer {
     }
 }
 
+/// Read the kernel's identity from the descriptor that actually holds the lock.
+/// Btrfs can report a subvolume st_dev different from /proc/locks' superblock
+/// device, so formatting fstat's device number would miss genuine waiters.
+fn kernel_lock_identity(lock: &File) -> String {
+    let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", lock.as_raw_fd())).unwrap();
+    let metadata = lock.metadata().unwrap();
+    info.lines()
+        .filter_map(|line| line.strip_prefix("lock:"))
+        .find_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            (fields.len() == 8
+                && fields[1..4] == ["FLOCK", "ADVISORY", "WRITE"]
+                && fields[4].parse::<u32>().ok() == Some(std::process::id())
+                && fields[5].rsplit(':').next()?.parse::<u64>().ok() == Some(metadata.ino())
+                && fields[6..8] == ["0", "EOF"])
+            .then(|| fields[5].to_owned())
+        })
+        .expect("held cache descriptor must expose its exclusive kernel flock")
+}
+
 /// The kernel's waiting FLOCK records identify the process and exact inode.
 /// Inspecting them proves arrival at the real cache lock, without a timed
 /// assumption that a child has had enough CPU to attempt its write.
-fn blocked_writers(lock: &File) -> BTreeSet<u32> {
-    let metadata = lock.metadata().unwrap();
-    let identity = format!(
-        "{:02x}:{:02x}:{}",
-        libc::major(metadata.dev()),
-        libc::minor(metadata.dev()),
-        metadata.ino()
-    );
+fn blocked_writers(identity: &str) -> BTreeSet<u32> {
     fs::read_to_string("/proc/locks")
         .expect("Linux cache contract requires observable kernel lock waiters")
         .lines()
@@ -177,6 +192,10 @@ fn independent_account_and_catalog_writers_preserve_each_others_updates() {
         std::io::Error::last_os_error()
     );
 
+    let identity = kernel_lock_identity(&lock);
+    // Bound readiness and successful completion polling. Panic cleanup still
+    // kills and reaps each original child; wait() is not a hard wall-time bound
+    // if the kernel leaves a killed process in uninterruptible filesystem I/O.
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut writers: Vec<_> = WRITERS
         .iter()
@@ -190,7 +209,7 @@ fn independent_account_and_catalog_writers_preserve_each_others_updates() {
                 "writer completed while another process held the cache lock"
             );
         }
-        if expected.is_subset(&blocked_writers(&lock)) {
+        if expected.is_subset(&blocked_writers(&identity)) {
             break;
         }
         assert!(
