@@ -29,6 +29,8 @@ pub fn message(event: &super::Event, previews: bool) -> Message {
         },
         Kind::ReviewRequested => "Review requested",
         Kind::MessageReceived => "Messages waiting",
+        Kind::AutomationPaused => "Automation pause recorded",
+        Kind::AutomationBlocked => "Automation block recorded",
     };
     let inbox = matches!(event.target, Target::SessionInbox(_));
     let context = if inbox {
@@ -69,11 +71,16 @@ pub fn message(event: &super::Event, previews: bool) -> Message {
         action: match event.target {
             Target::PullRequest(_) => "Open review",
             Target::SessionInbox(_) => "Open terminal",
+            Target::Automation { .. } => "Open history",
             _ => "Open conversation",
         },
         needs_input: matches!(
             event.evidence.kind,
-            Kind::Waiting | Kind::ReviewRequested | Kind::MessageReceived
+            Kind::Waiting
+                | Kind::ReviewRequested
+                | Kind::MessageReceived
+                | Kind::AutomationPaused
+                | Kind::AutomationBlocked
         ),
     }
 }
@@ -370,5 +377,44 @@ mod tests {
         assert!(result.ends_with('…'));
         assert!(!result.contains('\n'));
         assert!(title(&"🦀".repeat(1000)).chars().count() <= TITLE_LIMIT);
+    }
+
+    #[test]
+    fn automation_captions_describe_recorded_history_and_never_offer_execution() {
+        use crate::notifications::{Content, Event, Evidence, Kind, Target};
+        let id = uuid::Uuid::new_v4();
+        for (kind, caption) in [
+            (Kind::AutomationPaused, "Automation pause recorded"),
+            (Kind::AutomationBlocked, "Automation block recorded"),
+        ] {
+            let event = Event {
+                target: Target::Automation { id, sequence: 17 },
+                source_session: None,
+                provider: None,
+                directory: None,
+                destination: None,
+                evidence: Evidence {
+                    key: format!("automation:{id}:lifecycle:17"),
+                    kind,
+                },
+                content: Some(Content {
+                    conversation: "PRIVATE_AUTOMATION".into(),
+                    preview: "Project closed".into(),
+                    request: None,
+                }),
+            };
+            event.validate().unwrap();
+            let private = message(&event, false);
+            assert_eq!(private.title, caption);
+            assert_eq!(private.body, caption);
+            assert_eq!(private.action, "Open history");
+            assert!(private.needs_input);
+            assert!(!private.title.contains("PRIVATE") && !private.body.contains("Project closed"));
+            let rich = message(&event, true);
+            assert_eq!(rich.title, "PRIVATE_AUTOMATION");
+            assert_eq!(rich.body, format!("{caption}: Project closed"));
+            assert_eq!(rich.action, "Open history");
+            assert_eq!(event.evidence.kind.label(), caption);
+        }
     }
 }
