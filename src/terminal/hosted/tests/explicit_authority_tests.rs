@@ -91,6 +91,7 @@ fn attach(
     proof: &HostSessionProof,
     session: &TerminalSession,
     spawned: bool,
+    restored_epoch: Option<u64>,
 ) {
     let operation = request(stream, proof);
     assert!(if spawned {
@@ -98,6 +99,11 @@ fn attach(
     } else {
         matches!(operation.request, ClientRequest::Attach { terminal_id, .. } if terminal_id == session.id)
     });
+    if restored_epoch.is_some() {
+        // Match real subscription timing: the server has received Attach,
+        // but its correlated descriptor response has not yet been queued.
+        send_provisional(stream, proof, session);
+    }
     reply(
         stream,
         proof,
@@ -122,6 +128,63 @@ fn attach(
         visibility.request_id,
         ServerResponse::Accepted,
     );
+    if let Some(expected) = restored_epoch {
+        let acknowledgement = request(stream, proof);
+        assert!(matches!(
+            acknowledgement.request,
+            ClientRequest::TerminalAcknowledge { terminal_id, epoch }
+                if terminal_id == session.id && epoch == expected
+        ));
+        reply(
+            stream,
+            proof,
+            acknowledgement.request_id,
+            ServerResponse::Accepted,
+        );
+    }
+}
+fn provisional_messages(terminal_id: TerminalId) -> Vec<ServerMessage> {
+    vec![
+        ServerMessage::TerminalObserved {
+            terminal_id,
+            epoch: 7,
+        },
+        ServerMessage::Snapshot {
+            terminal_id,
+            snapshot: TerminalSnapshot::full(&RenderSnapshot {
+                generation: 3,
+                ..RenderSnapshot::empty()
+            }),
+        },
+        ServerMessage::Event {
+            terminal_id,
+            sequence: 1,
+            event: crate::terminal_ipc::WireTerminalEvent::Bell,
+        },
+        ServerMessage::Redraw {
+            terminal_id,
+            generation: 3,
+        },
+        ServerMessage::Synchronized {
+            terminal_id,
+            generation: 3,
+            event_sequence: 1,
+        },
+    ]
+}
+fn send_provisional(stream: &mut UnixStream, proof: &HostSessionProof, session: &TerminalSession) {
+    for message in provisional_messages(session.id) {
+        write_frame(
+            stream,
+            &ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: None,
+                proof: proof.clone(),
+                message,
+            },
+        )
+        .unwrap();
+    }
 }
 fn await_stopped(handle: &HostedTerminalHandle) {
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -283,7 +346,7 @@ fn explicit_authority_precedes_spawn_input_paste_and_close_without_environment_f
     }
     reply(&mut stream, &proof, auth, ServerResponse::Accepted);
     inventory(&mut stream, &proof, Vec::new());
-    attach(&mut stream, &proof, &session, true);
+    attach(&mut stream, &proof, &session, true, None);
     for paste in [false, true] {
         let operation = request(&mut stream, &proof);
         assert!(if paste {
@@ -317,13 +380,91 @@ fn explicit_authority_precedes_spawn_input_paste_and_close_without_environment_f
 
 #[test]
 fn explicit_authority_reauthenticates_on_reconnect_without_replaying_started_input() {
+    // A lost Spawn acknowledgement must not bless its provisional broadcasts
+    // or spawn again. The next authenticated inventory selects the same actor.
+    {
+        let authority = Authority::session(TOKEN.into());
+        let (_directory, listener, handle, proof, session) = begin(authority.clone());
+        handle
+            .inner
+            .published
+            .output_observation
+            .lock()
+            .unwrap()
+            .epoch = 7;
+        handle.input(b"queued until exact source".to_vec()).unwrap();
+        let mut first = connect(&listener, &proof);
+        let auth = authenticate(&mut first, &proof, &authority);
+        reply(&mut first, &proof, auth, ServerResponse::Accepted);
+        inventory(&mut first, &proof, Vec::new());
+        let spawn = request(&mut first, &proof);
+        assert!(
+            matches!(spawn.request, ClientRequest::Spawn { session: actual, .. } if actual == session)
+        );
+        send_provisional(&mut first, &proof, &session);
+        drop(first); // Spawn may have happened; no descriptor was acknowledged.
+        let mut second = connect(&listener, &proof);
+        assert!(handle.wait_until_attached(Duration::ZERO).is_err());
+        assert_eq!(handle.snapshot().generation, 0);
+        assert_eq!(
+            handle
+                .inner
+                .published
+                .event_sequence
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(!handle.take_observed_output());
+        assert!(
+            !handle
+                .events()
+                .try_iter()
+                .any(|event| matches!(event, TerminalEvent::Bell))
+        );
+        let auth = authenticate(&mut second, &proof, &authority);
+        reply(&mut second, &proof, auth, ServerResponse::Accepted);
+        inventory(&mut second, &proof, vec![descriptor(&session)]);
+        attach(&mut second, &proof, &session, false, Some(7));
+        let input = request(&mut second, &proof);
+        assert!(
+            matches!(input.request, ClientRequest::Input { terminal_id, bytes }
+            if terminal_id == session.id && bytes == b"queued until exact source")
+        );
+        // Receiving input is a barrier: every provisional frame was drained
+        // after the exact descriptor, before any queued user command.
+        assert_eq!(handle.snapshot().generation, 3);
+        assert_eq!(
+            handle
+                .inner
+                .published
+                .event_sequence
+                .load(Ordering::Acquire),
+            1
+        );
+        assert!(handle.take_observed_output());
+        assert_eq!(
+            handle
+                .events()
+                .try_iter()
+                .filter(|event| matches!(event, TerminalEvent::Bell))
+                .count(),
+            1
+        );
+        reply(
+            &mut second,
+            &proof,
+            input.request_id,
+            ServerResponse::Accepted,
+        );
+        stop(&handle);
+    }
     let authority = Authority::session(TOKEN.into());
     let (_directory, listener, handle, proof, session) = begin(authority.clone());
     let mut first = connect(&listener, &proof);
     let auth = authenticate(&mut first, &proof, &authority);
     reply(&mut first, &proof, auth, ServerResponse::Accepted);
     inventory(&mut first, &proof, Vec::new());
-    attach(&mut first, &proof, &session, true);
+    attach(&mut first, &proof, &session, true, None);
     handle.wait_until_attached(Duration::from_secs(2)).unwrap();
     handle.input(b"already started input".to_vec()).unwrap();
     let input = request(&mut first, &proof);
@@ -336,7 +477,7 @@ fn explicit_authority_reauthenticates_on_reconnect_without_replaying_started_inp
     let auth = authenticate(&mut second, &proof, &authority);
     reply(&mut second, &proof, auth, ServerResponse::Accepted);
     inventory(&mut second, &proof, vec![descriptor(&session)]);
-    attach(&mut second, &proof, &session, false);
+    attach(&mut second, &proof, &session, false, None);
     handle.wait_until_attached(Duration::from_secs(2)).unwrap();
     handle.input(b"fresh input".to_vec()).unwrap();
     let fresh = request(&mut second, &proof);
@@ -377,6 +518,164 @@ fn explicit_authority_reauthenticates_on_reconnect_without_replaying_started_inp
 
 #[test]
 fn explicit_authority_rejects_changed_source_and_uncorrelated_or_stale_proof_before_restore() {
+    let frame = ServerEnvelope {
+        version: PROTOCOL_VERSION,
+        request_id: None,
+        proof: proof("capacity-only"),
+        message: ServerMessage::TerminalObserved {
+            terminal_id: session().id,
+            epoch: 7,
+        },
+    };
+    let exact_bytes = serde_json::to_vec(&frame).unwrap().len();
+    assert_eq!(
+        provisional_frame_bytes(&frame, exact_bytes),
+        Some(exact_bytes)
+    );
+    assert_eq!(provisional_frame_bytes(&frame, exact_bytes - 1), None);
+    {
+        // A real framed overflow must reconnect without accepting provisional
+        // publication or advancing either replay cursor. Tiny frames exercise
+        // the count limit without constructing a large snapshot allocation.
+        let authority = Authority::session(TOKEN.into());
+        let (_directory, listener, handle, proof, session) = begin(authority.clone());
+        handle
+            .inner
+            .published
+            .output_observation
+            .lock()
+            .unwrap()
+            .epoch = 7;
+        handle
+            .input(b"queued across capacity retry".to_vec())
+            .unwrap();
+        let mut first = connect(&listener, &proof);
+        let auth = authenticate(&mut first, &proof, &authority);
+        reply(&mut first, &proof, auth, ServerResponse::Accepted);
+        inventory(&mut first, &proof, Vec::new());
+        let spawn = request(&mut first, &proof);
+        assert!(matches!(spawn.request,
+            ClientRequest::Spawn { session: actual, .. } if actual == session));
+        for index in 0..=EVENT_CAPACITY {
+            let message = match index {
+                0 => ServerMessage::Snapshot {
+                    terminal_id: session.id,
+                    snapshot: TerminalSnapshot::full(&RenderSnapshot {
+                        generation: 3,
+                        ..RenderSnapshot::empty()
+                    }),
+                },
+                1 => ServerMessage::Event {
+                    terminal_id: session.id,
+                    sequence: 1,
+                    event: crate::terminal_ipc::WireTerminalEvent::Bell,
+                },
+                _ => ServerMessage::TerminalObserved {
+                    terminal_id: session.id,
+                    epoch: 7,
+                },
+            };
+            write_frame(
+                &mut first,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: None,
+                    proof: proof.clone(),
+                    message,
+                },
+            )
+            .unwrap();
+        }
+        assert!(
+            read_frame::<ClientEnvelope>(&mut first).unwrap().is_none(),
+            "overflow must close without presentation, output ACK, snapshot or input requests"
+        );
+        drop(first);
+        // This is the actual worker's bounded retry, not a new test handle.
+        // connect checks the original host proof and an empty resume list.
+        let mut second = connect(&listener, &proof);
+        assert!(handle.wait_until_attached(Duration::ZERO).is_err());
+        assert_eq!(handle.snapshot().generation, 0);
+        assert_eq!(
+            handle
+                .inner
+                .published
+                .event_sequence
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(!handle.take_observed_output());
+        assert!(
+            !handle
+                .events()
+                .try_iter()
+                .any(|event| matches!(event, TerminalEvent::Bell))
+        );
+        let auth = authenticate(&mut second, &proof, &authority);
+        reply(&mut second, &proof, auth, ServerResponse::Accepted);
+        inventory(&mut second, &proof, vec![descriptor(&session)]);
+        let attach = request(&mut second, &proof);
+        assert!(matches!(attach.request, ClientRequest::Attach {
+            terminal_id, after_generation: 0, after_event_sequence: 0
+        } if terminal_id == session.id));
+        reply(
+            &mut second,
+            &proof,
+            attach.request_id,
+            ServerResponse::Attached {
+                terminal: descriptor(&session),
+            },
+        );
+        let visibility = request(&mut second, &proof);
+        assert!(matches!(visibility.request,
+            ClientRequest::SetVisibility { terminal_id, .. } if terminal_id == session.id));
+        reply(
+            &mut second,
+            &proof,
+            visibility.request_id,
+            ServerResponse::Accepted,
+        );
+        let acknowledgement = request(&mut second, &proof);
+        assert!(matches!(acknowledgement.request,
+            ClientRequest::TerminalAcknowledge { terminal_id, epoch: 7 }
+            if terminal_id == session.id));
+        reply(
+            &mut second,
+            &proof,
+            acknowledgement.request_id,
+            ServerResponse::Accepted,
+        );
+        let input = request(&mut second, &proof);
+        assert!(
+            matches!(input.request, ClientRequest::Input { terminal_id, bytes }
+            if terminal_id == session.id && bytes == b"queued across capacity retry")
+        );
+        // Consuming the queued input is a barrier after restoration: none of
+        // the discarded connection's provisional frames may leak through.
+        assert_eq!(handle.snapshot().generation, 0);
+        assert_eq!(
+            handle
+                .inner
+                .published
+                .event_sequence
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(!handle.take_observed_output());
+        assert!(
+            !handle
+                .events()
+                .try_iter()
+                .any(|event| matches!(event, TerminalEvent::Bell))
+        );
+        reply(
+            &mut second,
+            &proof,
+            input.request_id,
+            ServerResponse::Accepted,
+        );
+        stop(&handle);
+    }
     for case in [
         "source",
         "proof",
@@ -385,6 +684,7 @@ fn explicit_authority_rejects_changed_source_and_uncorrelated_or_stale_proof_bef
         "list-proof",
         "list-request-id",
         "attached-source",
+        "spawned-source",
     ] {
         let authority = Authority::session(TOKEN.into());
         let (_directory, listener, handle, proof, session) = begin(authority.clone());
@@ -410,25 +710,37 @@ fn explicit_authority_rejects_changed_source_and_uncorrelated_or_stale_proof_bef
                 response.request_id = Some(list.request_id + 1);
             }
             write_frame(&mut stream, &response).unwrap();
-        } else if case == "attached-source" {
+        } else if matches!(case, "attached-source" | "spawned-source") {
+            handle
+                .inner
+                .published
+                .output_observation
+                .lock()
+                .unwrap()
+                .epoch = 7;
             handle
                 .input(b"must wait for exact source".to_vec())
                 .unwrap();
             reply(&mut stream, &proof, auth, ServerResponse::Accepted);
-            inventory(&mut stream, &proof, vec![descriptor(&session)]);
-            let attach = request(&mut stream, &proof);
-            assert!(matches!(attach.request, ClientRequest::Attach { .. }));
-            let visibility = request(&mut stream, &proof);
-            assert!(matches!(
-                visibility.request,
-                ClientRequest::SetVisibility { .. }
-            ));
-            reply(
+            let spawned = case == "spawned-source";
+            inventory(
                 &mut stream,
                 &proof,
-                visibility.request_id,
-                ServerResponse::Accepted,
+                if spawned {
+                    Vec::new()
+                } else {
+                    vec![descriptor(&session)]
+                },
             );
+            let operation = request(&mut stream, &proof);
+            assert!(if spawned {
+                matches!(operation.request, ClientRequest::Spawn { .. })
+            } else {
+                matches!(operation.request, ClientRequest::Attach { .. })
+            });
+            // Genuine broadcasts may precede a descriptor. Even their output
+            // acknowledgement and redraw requests must wait for its identity.
+            send_provisional(&mut stream, &proof, &session);
             let mut changed = descriptor(&session);
             changed
                 .session
@@ -438,8 +750,12 @@ fn explicit_authority_rejects_changed_source_and_uncorrelated_or_stale_proof_bef
             reply(
                 &mut stream,
                 &proof,
-                attach.request_id,
-                ServerResponse::Attached { terminal: changed },
+                operation.request_id,
+                if spawned {
+                    ServerResponse::Spawned { terminal: changed }
+                } else {
+                    ServerResponse::Attached { terminal: changed }
+                },
             );
         } else if case == "source" {
             reply(&mut stream, &proof, auth, ServerResponse::Accepted);
@@ -474,7 +790,29 @@ fn explicit_authority_rejects_changed_source_and_uncorrelated_or_stale_proof_bef
             write_frame(&mut stream, &response).unwrap();
         }
         assert!(handle.wait_until_attached(Duration::from_secs(2)).is_err());
-        assert!(read_frame::<ClientEnvelope>(&mut stream).unwrap().is_none());
+        assert!(
+            read_frame::<ClientEnvelope>(&mut stream).unwrap().is_none(),
+            "no visibility, acknowledgement, snapshot or queued input may precede a valid descriptor"
+        );
+        await_stopped(&handle);
+        if matches!(case, "attached-source" | "spawned-source") {
+            assert_eq!(handle.snapshot().generation, 0);
+            assert_eq!(
+                handle
+                    .inner
+                    .published
+                    .event_sequence
+                    .load(Ordering::Acquire),
+                0
+            );
+            assert!(!handle.take_observed_output());
+            assert!(
+                !handle
+                    .events()
+                    .try_iter()
+                    .any(|event| matches!(event, TerminalEvent::Bell))
+            );
+        }
         stop(&handle);
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)

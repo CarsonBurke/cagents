@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     io,
     net::Shutdown,
     os::unix::{net::UnixStream, process::CommandExt},
@@ -1840,6 +1840,29 @@ fn coalesce_client_scroll_command(
     ClientCommand::Scroll(TerminalScroll::Lines(delta))
 }
 
+// Measure provisional wire payload without allocating a second serialized
+// frame. Even a sparse decoded snapshot must fit the remaining aggregate cap.
+fn provisional_frame_bytes(envelope: &ServerEnvelope, limit: usize) -> Option<usize> {
+    struct Budget(usize);
+    impl io::Write for Budget {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > self.0 {
+                return Err(io::Error::other(
+                    "provisional source frame capacity exhausted",
+                ));
+            }
+            self.0 -= bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut budget = Budget(limit);
+    serde_json::to_writer(&mut budget, envelope).ok()?;
+    Some(limit - budget.0)
+}
+
 fn serve_connection(
     context: &ConnectionContext<'_>,
     carried: &mut Option<ClientCommand>,
@@ -2222,47 +2245,67 @@ fn serve_connection(
         return ConnectionEnd::Stop;
     }
 
-    if send_request(
-        connection.writer(),
-        &proof,
-        &mut next_request_id,
-        &mut pending,
-        PendingRequest::Command("restore hosted terminal visibility"),
-        ClientRequest::SetVisibility {
-            terminal_id,
-            visibility: published.desired_visibility(),
-        },
-    )
-    .is_err()
-    {
-        return ConnectionEnd::Retry;
-    }
-    let epoch = published
-        .output_observation
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .epoch;
-    if epoch != 0
-        && send_request(
-            connection.writer(),
-            &proof,
-            &mut next_request_id,
-            &mut pending,
-            PendingRequest::Command("restore terminal output observation"),
-            ClientRequest::TerminalAcknowledge { terminal_id, epoch },
-        )
-        .is_err()
-    {
-        return ConnectionEnd::Retry;
-    }
-
+    // Explicit callers must validate the actual Attach/Spawn descriptor before
+    // restoring presentation or acknowledging a former output scope. Trusted
+    // GUI callers retain their existing pre-reply restoration order.
+    let mut presentation_restore_pending = true;
+    let mut provisional_frames = VecDeque::new();
+    let mut provisional_bytes = 0_usize;
     loop {
+        // Exact attachment wakes its waiter, which may immediately stop this
+        // explicit caller. Do not restore presentation after that stop.
+        if presentation_restore_pending
+            && matches!(intent, ConnectionIntent::AuthorizedSpawn { .. })
+            && stop.is_requested()
+        {
+            connection.close();
+            return ConnectionEnd::Stop;
+        }
+        if presentation_restore_pending
+            && (!matches!(intent, ConnectionIntent::AuthorizedSpawn { .. }) || attached)
+        {
+            if send_request(
+                connection.writer(),
+                &proof,
+                &mut next_request_id,
+                &mut pending,
+                PendingRequest::Command("restore hosted terminal visibility"),
+                ClientRequest::SetVisibility {
+                    terminal_id,
+                    visibility: published.desired_visibility(),
+                },
+            )
+            .is_err()
+            {
+                return ConnectionEnd::Retry;
+            }
+            let epoch = published
+                .output_observation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .epoch;
+            if epoch != 0
+                && send_request(
+                    connection.writer(),
+                    &proof,
+                    &mut next_request_id,
+                    &mut pending,
+                    PendingRequest::Command("restore terminal output observation"),
+                    ClientRequest::TerminalAcknowledge { terminal_id, epoch },
+                )
+                .is_err()
+            {
+                return ConnectionEnd::Retry;
+            }
+
+            presentation_restore_pending = false;
+        }
         published.expire_retained(Instant::now());
         if stop.is_requested() {
             connection.close();
             return ConnectionEnd::Stop;
         }
-        while pending.len() < MAX_IN_FLIGHT_REQUESTS {
+        while pending.len() < MAX_IN_FLIGHT_REQUESTS && provisional_frames.is_empty() {
             // An explicit caller also waits for the exact source reply before
             // consuming queued input: inventory may change before Attach.
             if matches!(intent, ConnectionIntent::AuthorizedSpawn { .. }) && !attached {
@@ -2339,7 +2382,9 @@ fn serve_connection(
             }
         }
 
-        let work = if pending.len() < MAX_IN_FLIGHT_REQUESTS
+        let work = if attached && !provisional_frames.is_empty() {
+            ClientWork::Server(provisional_frames.pop_front().unwrap())
+        } else if pending.len() < MAX_IN_FLIGHT_REQUESTS
             && !(matches!(intent, ConnectionIntent::AuthorizedSpawn { .. }) && !attached)
         {
             wait_for_client_work(stop, commands, connection.incoming(), published)
@@ -2374,6 +2419,36 @@ fn serve_connection(
         }
         if envelope.proof != proof {
             return ConnectionEnd::Retry;
+        }
+        if matches!(intent, ConnectionIntent::AuthorizedSpawn { .. })
+            && !attached
+            && envelope.request_id.is_none()
+            && matches!(
+                &envelope.message,
+                ServerMessage::TerminalObserved { terminal_id: id, .. }
+                    | ServerMessage::Redraw { terminal_id: id, .. }
+                    | ServerMessage::Snapshot { terminal_id: id, .. }
+                    | ServerMessage::Event { terminal_id: id, .. }
+                    | ServerMessage::Synchronized { terminal_id: id, .. }
+                    if *id == terminal_id
+            )
+        {
+            // Host subscriptions are installed before their response is queued,
+            // so genuine broadcasts can precede the exact source descriptor.
+            // Hold them without publication, requests or cursor advancement;
+            // preserve their order only after that descriptor is authenticated.
+            let encoded_bytes = provisional_frame_bytes(
+                &envelope,
+                MAX_FRAME_BYTES.saturating_sub(provisional_bytes),
+            );
+            if provisional_frames.len() == EVENT_CAPACITY || encoded_bytes.is_none() {
+                // The old replay cursor is unchanged. Reconnect can ask the
+                // authenticated original for its replay instead of dropping data.
+                return ConnectionEnd::Retry;
+            }
+            provisional_bytes += encoded_bytes.unwrap();
+            provisional_frames.push_back(envelope);
+            continue;
         }
 
         match envelope.message {
