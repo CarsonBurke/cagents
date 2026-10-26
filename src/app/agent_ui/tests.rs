@@ -25,11 +25,21 @@ fn restored_omp_attaches_for_background_metadata_without_opening_or_replaying() 
     let CardKind::Terminal(session) = &original.kind else {
         unreachable!()
     };
+    // A real restored control stays selected while the Omp owner is offscreen.
+    // Rebuilding a one-card workspace selects its first card before any
+    // attachment, so an empty-focus oracle would not test this contract.
+    let mut control = super::super::tests::terminal_card_state();
+    control.kind = CardKind::Settings;
+    control.exposure = Exposure::Visible;
+    control.residency = Residency::Hot;
     app.durable = Arc::new(WorkspaceState {
-        cards: vec![original.clone()],
+        cards: vec![control.clone(), original.clone()],
+        focused: Some(control.id),
         ..Default::default()
     });
     app.workspace = Cagents::rebuild_workspace(&app.durable);
+    assert_eq!(app.workspace.focused(), Some(control.id));
+    let strip = app.workspace.order().collect::<Vec<_>>();
     drop(app.initialize_runtimes());
     assert_eq!(app.terminal_starts_in_flight(), 1);
     assert!(app.terminal_start_in_flight(original.id));
@@ -41,7 +51,8 @@ fn restored_omp_attaches_for_background_metadata_without_opening_or_replaying() 
         app.cards.get(&original.id),
         Some(CardRuntime::Loading)
     ));
-    assert_eq!(app.workspace.focused(), None);
+    assert_eq!(app.workspace.focused(), Some(control.id));
+    assert_eq!(app.workspace.order().collect::<Vec<_>>(), strip);
     assert_eq!(app.card_state(original.id).unwrap().kind, original.kind);
 
     // The existing attach-only reducer must not relaunch a session that no
@@ -55,7 +66,8 @@ fn restored_omp_attaches_for_background_metadata_without_opening_or_replaying() 
     assert_eq!(app.terminal_starts_in_flight(), 0);
     assert!(app.restored_agent_attaches.is_empty());
     assert_eq!(app.card_state(original.id).unwrap().kind, original.kind);
-    assert_eq!(app.workspace.focused(), None);
+    assert_eq!(app.workspace.focused(), Some(control.id));
+    assert_eq!(app.workspace.order().collect::<Vec<_>>(), strip);
     assert_eq!(app.notices.entries.len(), notices);
 }
 
