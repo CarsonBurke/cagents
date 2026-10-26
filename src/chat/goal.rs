@@ -354,15 +354,21 @@ impl State {
         if self.pending.as_ref() != Some(request) {
             return Ok(false);
         }
+        let current =
+            request.thread_id == self.thread_id && request.observation == self.observation;
         self.pending = None;
-        if request.thread_id != self.thread_id || request.observation != self.observation {
-            return Ok(false);
-        }
         // A response or refusal changes the publication too. A queued control
         // from before this request must not act on the newly observed goal,
         // even when no provider notification accompanied the response.
+        let Some(next) = self.observation.checked_add(1) else {
+            self.uncertain = true;
+            return Err(Error::Exhausted);
+        };
+        self.observation = next;
+        if !current {
+            return Ok(false);
+        }
         self.uncertain = true;
-        self.observation = self.observation.checked_add(1).ok_or(Error::Exhausted)?;
         let reply = match result {
             Err(Failure::Unsupported) => {
                 self.support = Support::Unsupported;
@@ -491,6 +497,40 @@ mod tests {
             state.begin_for(&pending.thread_id, pending.revision, Operation::Resume),
             Err(Error::StaleObservation)
         );
+    }
+
+    #[test]
+    fn stale_physical_completion_retires_its_publication_without_replacing_newer_goal() {
+        let mut state = State::new("original-thread".into()).unwrap();
+        let request = state.begin(Operation::Get).unwrap();
+        let newest = goal("original-thread", "newer notification", Status::Active);
+        state
+            .observe("original-thread", Some(newest.clone()))
+            .unwrap();
+        let held = state.snapshot();
+        assert!(held.pending);
+        assert!(!state.complete(&request, Ok(Reply::Read(None))).unwrap());
+        let settled = state.snapshot();
+        assert!(!settled.pending && settled.revision > held.revision);
+        assert_eq!(settled.read, ReadState::Known(Some(newest)));
+        assert!(!settled.uncertain);
+        assert_eq!(
+            state.begin_for(&held.thread_id, held.revision, Operation::Clear),
+            Err(Error::StaleObservation)
+        );
+        let before_duplicate = state.snapshot();
+        assert!(!state.complete(&request, Ok(Reply::Read(None))).unwrap());
+        assert_eq!(state.snapshot(), before_duplicate);
+
+        let mut exhausted = State::new("original-thread".into()).unwrap();
+        exhausted.observation = u64::MAX - 1;
+        let final_request = exhausted.begin(Operation::Get).unwrap();
+        assert_eq!(
+            exhausted.complete(&final_request, Ok(Reply::Read(None))),
+            Err(Error::Exhausted)
+        );
+        assert!(exhausted.pending().is_none() && exhausted.uncertain());
+        assert_eq!(exhausted.begin(Operation::Get), Err(Error::Exhausted));
     }
 
     #[test]
