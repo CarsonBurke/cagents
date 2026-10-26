@@ -16,6 +16,23 @@ use iced_accessibility::{
 
 type Message = (u8, bool);
 
+#[test]
+fn disabled_switch_style_preserves_the_stored_on_and_off_colors() {
+    use cosmic::widget::toggler::{Catalog, Status};
+
+    for theme in [cosmic::Theme::light(), cosmic::Theme::dark()] {
+        for is_toggled in [false, true] {
+            let active = Catalog::style(&theme, &(), Status::Active { is_toggled });
+            let disabled = Catalog::style(&theme, &(), Status::Disabled { is_toggled });
+            assert_eq!(disabled.background, active.background.scale_alpha(0.5));
+            assert_eq!(disabled.foreground, active.foreground.scale_alpha(0.5));
+        }
+        let on = Catalog::style(&theme, &(), Status::Disabled { is_toggled: true });
+        let off = Catalog::style(&theme, &(), Status::Disabled { is_toggled: false });
+        assert_ne!(on.background, off.background);
+    }
+}
+
 fn switches(first_on: bool, first_enabled: bool) -> Element<'static, Message> {
     widget::column::with_children(vec![
         widget::toggler(first_on)
