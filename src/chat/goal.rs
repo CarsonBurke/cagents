@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const MAX_OBJECTIVE_CHARS: usize = 4_000;
-pub const MAX_THREAD_ID_BYTES: usize = 512;
+pub const MAX_THREAD_ID_BYTES: usize = 1_024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -120,8 +120,9 @@ fn validate_thread(thread: &str) -> Result<(), Error> {
 /// must be shown as an error, never retried as a generic provider prompt.
 /// `set` disambiguates objectives equal to a command such as `pause`.
 pub fn parse(input: &str) -> Option<Result<Operation, Error>> {
-    let rest = input.trim_start().strip_prefix("/goal")?;
-    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+    let input = input.trim_start();
+    let (command, rest) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
+    if !command.eq_ignore_ascii_case("/goal") {
         return None;
     }
     let rest = rest.trim();
@@ -132,11 +133,13 @@ pub fn parse(input: &str) -> Option<Result<Operation, Error>> {
         .split_once(char::is_whitespace)
         .map_or((rest, ""), |(word, arguments)| (word, arguments.trim()));
     let command = match word {
-        "view" | "status" => Some(Operation::Get),
-        "pause" => Some(Operation::Pause),
-        "resume" => Some(Operation::Resume),
-        "clear" => Some(Operation::Clear),
-        "set" => {
+        word if word.eq_ignore_ascii_case("view") || word.eq_ignore_ascii_case("status") => {
+            Some(Operation::Get)
+        }
+        word if word.eq_ignore_ascii_case("pause") => Some(Operation::Pause),
+        word if word.eq_ignore_ascii_case("resume") => Some(Operation::Resume),
+        word if word.eq_ignore_ascii_case("clear") => Some(Operation::Clear),
+        word if word.eq_ignore_ascii_case("set") => {
             return Some(
                 validated_objective(arguments).map(|text| Operation::SetObjective(text.into())),
             );
@@ -297,6 +300,8 @@ impl State {
 
     /// True means a current completion was handled, not that a goal or its
     /// objective succeeded. Lost/invalid replies never cause an automatic retry.
+    /// Call only after the physical RPC resolves or its connection is proved
+    /// closed. A presentation/acknowledgement timeout alone cannot release it.
     pub fn complete(
         &mut self,
         request: &Request,
@@ -324,19 +329,10 @@ impl State {
         };
         let goal = match (&request.operation, reply) {
             (Operation::Get, Reply::Read(goal)) => goal,
-            (operation, Reply::Updated(goal)) => {
-                let matches = match operation {
-                    Operation::SetObjective(objective) => goal.objective == *objective,
-                    Operation::Pause => goal.status == Status::Paused,
-                    Operation::Resume => goal.status == Status::Active,
-                    _ => false,
-                };
-                if !matches {
-                    self.uncertain = true;
-                    return Err(Error::InvalidReply);
-                }
-                Some(goal)
-            }
+            (
+                Operation::SetObjective(_) | Operation::Pause | Operation::Resume,
+                Reply::Updated(goal),
+            ) => Some(goal),
             (Operation::Clear, Reply::Cleared(true)) => None,
             (Operation::Clear, Reply::Cleared(false)) => {
                 // A refusal to clear is not an observation of absence.
@@ -384,6 +380,13 @@ mod tests {
         for input in ["/goal", " /goal \n", "/goal view", "/goal status"] {
             assert_eq!(parse(input), Some(Ok(Operation::Get)));
         }
+        assert_eq!(parse("/GOAL PaUsE"), Some(Ok(Operation::Pause)));
+        assert_eq!(parse("/GoAl RESUME"), Some(Ok(Operation::Resume)));
+        assert_eq!(parse("/GOAL VIEW"), Some(Ok(Operation::Get)));
+        assert_eq!(
+            parse("/GoAl SeT PaUsE"),
+            Some(Ok(Operation::SetObjective("PaUsE".into())))
+        );
         for (word, command) in [
             ("pause", Operation::Pause),
             ("resume", Operation::Resume),
@@ -405,7 +408,13 @@ mod tests {
                 Some(Ok(Operation::SetObjective(word.into())))
             );
         }
-        for input in ["/goals", "/goalkeeper", "ordinary text", "/goal/path"] {
+        for input in [
+            "/goals",
+            "/GOALS",
+            "/goalkeeper",
+            "ordinary text",
+            "/goal/path",
+        ] {
             assert_eq!(parse(input), None);
         }
         assert_eq!(parse("/goal set \t"), Some(Err(Error::InvalidObjective)));
@@ -546,7 +555,6 @@ mod tests {
     fn incompatible_or_unbound_replies_cannot_publish_a_goal() {
         for reply in [
             Reply::Updated(goal("thread-b", "wanted", Status::Active)),
-            Reply::Updated(goal("thread-a", "different", Status::Active)),
             Reply::Read(None),
             Reply::Cleared(true),
         ] {
@@ -571,6 +579,38 @@ mod tests {
     }
 
     #[test]
+    fn mutation_replies_preserve_provider_truth_without_claiming_the_requested_action() {
+        let mut state = State::new("thread-a".into()).unwrap();
+        state
+            .observe("thread-a", Some(goal("thread-a", "finish", Status::Paused)))
+            .unwrap();
+        let request = state.begin(Operation::Resume).unwrap();
+        // Native progress can finish before the response, without an earlier
+        // notification. An Active-only acknowledgement test would lose truth.
+        let completed = goal("thread-a", "finish", Status::Complete);
+        assert!(
+            state
+                .complete(&request, Ok(Reply::Updated(completed.clone())))
+                .unwrap()
+        );
+        assert_eq!(state.read(), &ReadState::Known(Some(completed)));
+        assert!(!state.uncertain());
+        let request = state
+            .begin(Operation::SetObjective("new objective".into()))
+            .unwrap();
+        // Another native client can replace the objective. This exact-thread
+        // observation is not proof our requested objective won that race.
+        let current = goal("thread-a", "other native objective", Status::Blocked);
+        assert!(
+            state
+                .complete(&request, Ok(Reply::Updated(current.clone())))
+                .unwrap()
+        );
+        assert_eq!(state.read(), &ReadState::Known(Some(current)));
+        assert!(state.pending().is_none() && !state.uncertain());
+    }
+
+    #[test]
     fn direct_wire_construction_cannot_bypass_bounds_or_wrap_request_identity() {
         for thread in ["", " ", "latest", "thread\0other"] {
             assert!(matches!(
@@ -578,6 +618,11 @@ mod tests {
                 Err(Error::InvalidThread)
             ));
         }
+        assert!(State::new("a".repeat(MAX_THREAD_ID_BYTES)).is_ok());
+        assert!(matches!(
+            State::new("a".repeat(MAX_THREAD_ID_BYTES + 1)),
+            Err(Error::InvalidThread)
+        ));
         let mut state = State::new("thread-a".into()).unwrap();
         let oversized = "🦀".repeat(MAX_OBJECTIVE_CHARS + 1);
         let direct: Operation = serde_json::from_value(serde_json::json!({
