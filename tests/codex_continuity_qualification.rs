@@ -20,9 +20,21 @@
 //! locally, then run
 //!
 //! ```sh
+//! Run each of the three continuity scenarios explicitly; the separate GUI
+//! model-only ignored parent requires an owned stdin pipe, not Cargo stdin.
+//!
 //! CAGENTS_QUALIFY_CODEX=/path/to/native/codex cargo test --locked \
 //!     --no-default-features --features host \
-//!     --test codex_continuity_qualification -- --ignored --test-threads=1
+//!     --test codex_continuity_qualification a_running_command_survives_a_killed_daemon \
+//!     -- --exact --ignored --test-threads=1
+//! CAGENTS_QUALIFY_CODEX=/path/to/native/codex cargo test --locked \
+//!     --no-default-features --features host \
+//!     --test codex_continuity_qualification a_yielded_command_poll_survives_a_killed_daemon \
+//!     -- --exact --ignored --test-threads=1
+//! CAGENTS_QUALIFY_CODEX=/path/to/native/codex cargo test --locked \
+//!     --no-default-features --features host \
+//!     --test codex_continuity_qualification a_pending_approval_survives_a_killed_daemon_unanswered \
+//!     -- --exact --ignored --test-threads=1
 //! ```
 //!
 //! and keep the allowlist entry only if all three pass. The path must name the
