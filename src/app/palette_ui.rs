@@ -1052,13 +1052,15 @@ impl Cagents {
                                 modifiers,
                                 repeat,
                                 ..
-                            } if modifiers.is_empty()
+                            } if matches!(
+                                key.as_ref(),
+                                keyboard::Key::Named(keyboard::key::Named::Enter)
+                            ) || (modifiers.is_empty()
                                 && matches!(
                                     key.as_ref(),
-                                    keyboard::Key::Named(
-                                        keyboard::key::Named::Enter | keyboard::key::Named::Space
-                                    ) | keyboard::Key::Character(" ")
-                                ) =>
+                                    keyboard::Key::Named(keyboard::key::Named::Space)
+                                        | keyboard::Key::Character(" ")
+                                )) =>
                             {
                                 if *repeat {
                                     return Some(Message::Palette(Action::ConsumedActivation));
@@ -1991,13 +1993,30 @@ mod tests {
         for row_focus in [false, true] {
             let keys = if row_focus {
                 vec![
-                    (keyboard::key::Named::Enter, keyboard::key::Code::Enter),
-                    (keyboard::key::Named::Space, keyboard::key::Code::Space),
+                    (
+                        keyboard::key::Named::Enter,
+                        keyboard::key::Code::Enter,
+                        keyboard::Modifiers::empty(),
+                    ),
+                    (
+                        keyboard::key::Named::Enter,
+                        keyboard::key::Code::NumpadEnter,
+                        keyboard::Modifiers::CTRL,
+                    ),
+                    (
+                        keyboard::key::Named::Space,
+                        keyboard::key::Code::Space,
+                        keyboard::Modifiers::empty(),
+                    ),
                 ]
             } else {
-                vec![(keyboard::key::Named::Enter, keyboard::key::Code::Enter)]
+                vec![(
+                    keyboard::key::Named::Enter,
+                    keyboard::key::Code::Enter,
+                    keyboard::Modifiers::empty(),
+                )]
             };
-            for (key, physical) in keys {
+            for (key, physical, modifiers) in keys {
                 let (mut app, card, _directory) = terminal_palette_fixture();
                 app.set_terminal_review_owner(Some(card));
                 drop(app.update_palette(Action::Query(">return to terminal input".into())));
@@ -2027,7 +2046,7 @@ mod tests {
                     modified_key: keyboard::Key::Named(key),
                     physical_key: keyboard::key::Physical::Code(physical),
                     location: keyboard::Location::Standard,
-                    modifiers: keyboard::Modifiers::empty(),
+                    modifiers,
                     text: None,
                     repeat: false,
                 };
@@ -2089,7 +2108,7 @@ mod tests {
                     modified_key: keyboard::Key::Named(key),
                     physical_key: keyboard::key::Physical::Code(physical),
                     location: keyboard::Location::Standard,
-                    modifiers: keyboard::Modifiers::empty(),
+                    modifiers,
                 };
                 assert!(app.terminal_review_input.consume_keyboard(&release));
                 assert!(
