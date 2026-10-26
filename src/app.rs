@@ -29752,6 +29752,7 @@ mod tests {
     pub(super) fn task_app_message(task: Task<Message>) -> Message {
         let mut stream = iced::runtime::task::into_stream(task).expect("task has an output");
         let action = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
             .build()
             .unwrap()
             .block_on(stream.next())
