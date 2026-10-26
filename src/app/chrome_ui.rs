@@ -2327,15 +2327,21 @@ impl Cagents {
                 &notice.event,
                 self.settings.notifications.message_previews,
             );
-            let body = widget::column::with_children(vec![
+            let mut paragraphs = vec![
                 design::heading(message.title.clone())
                     .width(Length::Fill)
                     .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                     .into(),
-                design::body(message.body)
-                    .width(Length::Fill)
-                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-                    .into(),
+            ];
+            if !message.body.is_empty() && message.body != message.title {
+                paragraphs.push(
+                    design::body(message.body)
+                        .width(Length::Fill)
+                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                        .into(),
+                );
+            }
+            paragraphs.push(
                 crate::ui_controls::button::quiet(message.action)
                     .id(widget::Id::new(format!("attention.open.{}", notice.id)))
                     .name(format!(
@@ -2346,9 +2352,10 @@ impl Cagents {
                     ))
                     .on_press(self.attention_notice_action(notice))
                     .into(),
-            ])
-            .spacing(space::XS)
-            .width(Length::Fill);
+            );
+            let body = widget::column::with_children(paragraphs)
+                .spacing(space::XS)
+                .width(Length::Fill);
             entries.push(crate::ui_controls::owned(
                 self.attention_notice_owner(notice),
                 widget::container(body)

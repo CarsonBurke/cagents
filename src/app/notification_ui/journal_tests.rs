@@ -1132,3 +1132,39 @@ fn locally_read_session_stays_out_of_new_attention_after_stale_snapshot_without_
         "opening/reading/closing Attention must not ACK Automation",
     );
 }
+
+#[test]
+fn journal_renders_one_generic_paragraph_and_preserves_distinct_opted_in_preview() {
+    let mut renderer = super::super::tests::headless_renderer();
+    let mut app = fixture(1);
+    open(&mut app);
+    for previews in [false, true] {
+        app.settings.notifications.message_previews = previews;
+        let expected = crate::notifications::presentation::message(&notice(0).event, previews);
+        assert_eq!(expected.title == expected.body, !previews);
+        let action_label = format!("{} — {} — entry 1", expected.action, expected.title);
+        let (nodes, messages) = frame(&app, &mut renderer, 420.0, false, Some(&action_label));
+        let text = labels(&nodes);
+        assert_eq!(
+            text.iter().filter(|text| **text == expected.title).count(),
+            1
+        );
+        if previews {
+            assert_eq!(
+                text.iter().filter(|text| **text == expected.body).count(),
+                1
+            );
+            assert!(expected.body.contains("PRIVATE_PREVIEW_SENTINEL"));
+            assert_eq!(expected.title, "PRIVATE_CONVERSATION_SENTINEL");
+        } else {
+            assert!(!text.iter().any(|text| text.contains("PRIVATE_")));
+        }
+        assert_eq!(messages.len(), 1, "the real action remains accessible");
+        assert!(matches!(
+            &messages[0],
+            Message::NotificationUi(Action::OpenNotice(_))
+        ));
+        assert!(app.notification_ui.lifecycle_read.is_none());
+        no_ack(&app, notice(0).id);
+    }
+}
