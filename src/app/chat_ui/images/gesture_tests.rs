@@ -224,11 +224,19 @@ fn queued_external_callback_cannot_open_a_newly_selected_image() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
     drop(app.new_native_chat(Provider::Codex, Some(PathBuf::from("/fixture"))));
     let card = app.workspace.focused().unwrap();
+    drop(app.update(Message::Viewport {
+        generation: app.workspace_view_generation,
+        event: WorkspaceViewportEvent::Resized(800.0),
+    }));
+    assert_eq!(
+        app.workspace.visibility(card),
+        Some(VisibilityClass::Visible)
+    );
     let CardRuntime::Chat(runtime) = app.cards.get_mut(&card).unwrap() else {
         panic!("draft chat")
     };
     let target = runtime.target;
-    runtime.visible.store(true, Ordering::Relaxed);
+    assert!(runtime.visible.load(Ordering::Relaxed));
     runtime.composer = text_editor::Content::with_text("Keep this gallery feedback");
     runtime.attachments = vec![Attachment {
         path: PathBuf::from("/fixture/attached.png"),
@@ -252,12 +260,32 @@ fn queued_external_callback_cannot_open_a_newly_selected_image() {
         PathBuf::from("/fixture/image-1.png")
     );
     app.chat_ui.image_viewer = Some(source);
+    assert!(
+        app.image_viewer_owns_input(),
+        "global input ownership admits the actual gallery"
+    );
     let task = app.update(Message::ChatUi(queued));
     assert_eq!(
         task.units(),
         0,
         "a stale source must not schedule an OS external-open future or focus operation"
     );
+    drop(task);
+    assert!(app.image_viewer_owns_input());
+    let current = app
+        .chat_ui
+        .image_viewer
+        .as_ref()
+        .unwrap()
+        .callback(ViewerCommand::External(1));
+    let task = app.update(Message::ChatUi(current));
+    assert_eq!(
+        task.units(),
+        1,
+        "the actual current source schedules exactly its external-open future"
+    );
+    // Never poll this future: no OS/file action belongs in this regression.
+    drop(task);
     let source = app.chat_ui.image_viewer.as_ref().unwrap();
     assert_eq!(source.selected_handle_id(), selected);
     assert_eq!(source.reset, 1);
