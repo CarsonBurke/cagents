@@ -473,6 +473,21 @@ impl Cagents {
     }
 
     pub(super) fn dispatch_goal(&mut self, target: Target) -> Task<Message> {
+        let was_pending = self
+            .chat_card_runtime_mut(target)
+            .is_some_and(|runtime| runtime.goal_pending.is_some());
+        let task = self.dispatch_goal_inner(target);
+        if was_pending {
+            if let Some(runtime) = self.chat_card_runtime_mut(target) {
+                if runtime.goal_pending.is_none() {
+                    let _ = runtime.present();
+                }
+            }
+        }
+        task
+    }
+
+    fn dispatch_goal_inner(&mut self, target: Target) -> Task<Message> {
         if self.chat_start_pending(target.card)
             || self.chat_closed_elsewhere(target.card)
             || self
@@ -634,6 +649,7 @@ impl Cagents {
         }
         if let Err(error) = result {
             runtime.goal_pending = None;
+            let _ = runtime.present();
             runtime.error = Some(format!(
                 "Native goal dispatch was not confirmed: {error}. Your input is kept; check the current goal."
             ));
