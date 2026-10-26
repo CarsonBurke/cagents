@@ -4278,6 +4278,151 @@ mod tests {
         assert!(!app.shared_views.retained.contains(&pane.id));
     }
 
+    fn repository_peer_channel_deletion_fixture(state: &str) -> (Cagents, ChannelId, Pane, Scope) {
+        let (mut app, channel, pane) = repository_retention_fixture(state);
+        let CardKind::Repository(descriptor) = &pane.kind else {
+            unreachable!()
+        };
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.channels.retain(|current| current.id == channel);
+        durable.channels[0].project_id = descriptor.project;
+        app.sidebar_model.projects.push(SidebarProject::new(
+            descriptor.project,
+            RepositoryId::new(),
+            "repo".into(),
+            descriptor.repository.clone(),
+            vec![crate::sidebar::SidebarWorktree::from_durable(
+                crate::model::WorktreeId::new(),
+                descriptor.worktree.clone(),
+                Some("main".into()),
+            )],
+            Vec::new(),
+        ));
+        app.workspace_model.projects = vec![crate::workspace_model::ModelProject {
+            repository: descriptor.repository.clone(),
+            name: "repo".into(),
+            kind: Default::default(),
+            ordinal: 1,
+        }];
+        app.workspace_model.channels = vec![crate::workspace_model::ModelChannel {
+            id: channel,
+            repository: descriptor.repository.clone(),
+            title: "view".into(),
+            title_source: Default::default(),
+            ordinal: 1,
+        }];
+        let fallback = Scope::Worktree {
+            repository: descriptor.repository.clone(),
+            path: descriptor.worktree.clone(),
+        };
+        app.workspace_model
+            .views
+            .push(View::empty(fallback.clone()));
+        app.shared_views.initialized.insert(fallback.clone());
+        app.known_worktree_roots.insert(descriptor.worktree.clone());
+        drop(app.select_channel(channel));
+        assert_eq!(app.durable.active_channel, Some(channel));
+        assert!(app.workspace.card(pane.id).is_some());
+        (app, channel, pane, fallback)
+    }
+
+    #[test]
+    fn peer_channel_model_deletion_preserves_clean_warning_and_recovery_through_fallback_projection()
+     {
+        use super::super::workspace_model_sync::ModelUpdate;
+        for state in ["warning", "recovery"] {
+            let (mut app, channel, pane, fallback) =
+                repository_peer_channel_deletion_fixture(state);
+            let Some(CardRuntime::Repository(before)) = app.cards.get(&pane.id) else {
+                unreachable!()
+            };
+            let identity = &**before as *const RepositoryRuntime;
+            let descriptor = before.descriptor.clone();
+            let text = before.editor_text();
+            let error = before.save_error().map(str::to_owned);
+            assert!(!before.is_dirty() && !before.is_saving());
+            let sequence = app.workspace_model.sequence + 1;
+            drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+                sequence,
+                edit: ModelEdit::DeleteChannel { id: channel },
+            }));
+            assert!(app.channel_ui.was_deleted(channel));
+            assert!(
+                !app.durable
+                    .channels
+                    .iter()
+                    .any(|current| current.id == channel)
+            );
+            assert!(
+                app.status
+                    .as_ref()
+                    .unwrap()
+                    .message
+                    .contains("file recovery or durability warning")
+            );
+            // The explicit edit retires the channel before projection. The
+            // following canonical read also removes its stale source view,
+            // so the initialized fallback must preserve this local editor.
+            let mut canonical = app.workspace_model.clone();
+            canonical.sequence += 1;
+            canonical
+                .views
+                .retain(|view| view.scope != Scope::Channel(channel));
+            for _ in 0..2 {
+                drop(app.apply_workspace_model_update(ModelUpdate::Read(canonical.clone())));
+                let Some(CardRuntime::Repository(current)) = app.cards.get(&pane.id) else {
+                    panic!(
+                        "{state}: peer deletion must retain recovery through fallback projection"
+                    );
+                };
+                assert_eq!(&**current as *const RepositoryRuntime, identity, "{state}");
+                assert_eq!(current.descriptor, descriptor, "{state}");
+                assert_eq!(current.editor_text(), text, "{state}");
+                assert_eq!(current.save_error().map(str::to_owned), error, "{state}");
+                assert_eq!(current.has_editor_recovery(), state == "recovery");
+                assert_eq!(current.has_durability_warning(), state == "warning");
+                assert!(current.blocks_navigation());
+                assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+                assert!(app.card_state(pane.id).unwrap().existence.is_open());
+                assert!(app.shared_views.retained.contains(&pane.id));
+                assert!(app.durable.local_only_cards.contains(&pane.id));
+                assert!(
+                    !app.durable
+                        .channels
+                        .iter()
+                        .any(|current| current.cards.contains(&pane.id))
+                );
+                assert_eq!(app.durable.active_channel, None);
+                assert_eq!(
+                    app.durable.card_scopes.get(&pane.id),
+                    Some(&descriptor.worktree)
+                );
+                assert_eq!(app.active_workspace.as_ref(), Some(&descriptor.worktree));
+                assert!(app.workspace.card(pane.id).is_some());
+                assert!(app.shared_views.initialized.contains(&fallback));
+                let notice = app.status.as_ref().unwrap().message.as_str();
+                assert!(notice.contains("file recovery or durability warning"));
+                assert!(!notice.contains("save or discard"));
+            }
+        }
+    }
+
+    #[test]
+    fn peer_channel_model_deletion_still_retires_a_clean_editor() {
+        let (mut app, channel, pane, _) = repository_peer_channel_deletion_fixture("clean");
+        let sequence = app.workspace_model.sequence + 1;
+        drop(app.apply_workspace_model_update(
+            super::super::workspace_model_sync::ModelUpdate::Edited {
+                sequence,
+                edit: ModelEdit::DeleteChannel { id: channel },
+            },
+        ));
+        assert!(app.channel_ui.was_deleted(channel));
+        assert!(!app.cards.contains_key(&pane.id));
+        assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+        assert!(!app.shared_views.retained.contains(&pane.id));
+    }
+
     #[cfg(not(feature = "integrated-browser"))]
     #[test]
     fn browserless_shared_browser_keeps_saved_descriptor_and_external_open_state() {
