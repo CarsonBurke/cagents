@@ -282,7 +282,7 @@ impl NoticeSeverity {
 /// raised: a retry that fails again does not stack a second report, and one
 /// that succeeds replaces the failure with its confirmation. Resolving a key
 /// withdraws its notice without announcing anything.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum NoticeKey {
     /// Opening the conversation in this card, or switching its terminal to one.
     ChatAttach(CardId),
@@ -292,6 +292,8 @@ enum NoticeKey {
     AccountLink,
     /// Telling panes whether they are on screen.
     SurfaceVisibility,
+    /// The same Git action in this exact project/worktree/path identity.
+    GitMutation(ActiveWorktreeKey, MutationKind),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,10 +360,13 @@ impl NoticeLog {
         // failures in turn would otherwise alternate them forever and fill the
         // log with copies. The repeat moves to the back because the user cares
         // that it is happening now, and `recent` reads newest first.
-        let previous = self.entries.iter().position(|entry| match notice.key {
-            Some(key) => entry.notice.key == Some(key),
-            None => entry.notice == notice,
-        });
+        let previous = self
+            .entries
+            .iter()
+            .position(|entry| match notice.key.as_ref() {
+                Some(key) => entry.notice.key.as_ref() == Some(key),
+                None => entry.notice == notice,
+            });
         if let Some(index) = previous {
             let mut entry = self.entries.remove(index).expect("index came from the log");
             if entry.notice == notice {
@@ -422,13 +427,14 @@ impl NoticeLog {
     fn has(&self, key: NoticeKey) -> bool {
         self.entries
             .iter()
-            .any(|entry| entry.notice.key == Some(key))
+            .any(|entry| entry.notice.key.as_ref() == Some(&key))
     }
 
     /// Withdraws whatever `key` last reported, because its condition no
     /// longer holds.
     fn resolve(&mut self, key: NoticeKey) {
-        self.entries.retain(|entry| entry.notice.key != Some(key));
+        self.entries
+            .retain(|entry| entry.notice.key.as_ref() != Some(&key));
     }
 
     /// Retires every confirmation due by `now`. Nothing is due while paused,
@@ -11913,13 +11919,13 @@ impl Cagents {
             .notices
             .entries
             .iter()
-            .filter_map(|entry| match entry.notice.key {
+            .filter_map(|entry| match entry.notice.key.as_ref() {
                 Some(key @ NoticeKey::ChatAttach(card))
                     if self
-                        .card_state(card)
+                        .card_state(*card)
                         .is_none_or(|state| !state.existence.is_open()) =>
                 {
-                    Some(key)
+                    Some(key.clone())
                 }
                 _ => None,
             })
@@ -11934,7 +11940,7 @@ impl Cagents {
     fn notice_stands(&self, key: NoticeKey) -> bool {
         self.status
             .as_ref()
-            .is_some_and(|notice| notice.key == Some(key))
+            .is_some_and(|notice| notice.key.as_ref() == Some(&key))
             || self.notices.has(key)
     }
 
@@ -11945,7 +11951,7 @@ impl Cagents {
         if self
             .status
             .as_ref()
-            .is_some_and(|notice| notice.key == Some(key))
+            .is_some_and(|notice| notice.key.as_ref() == Some(&key))
         {
             self.status = None;
         }
@@ -17543,6 +17549,7 @@ impl Application for Cagents {
                 else {
                     return Task::none();
                 };
+                let notice_key = NoticeKey::GitMutation(key.clone(), mutation.kind);
                 self.source_control_mutations.remove(&key.canonical_path);
                 if committed && let Some(revision) = mutation.commit_revision {
                     self.sidebar_state.clear_submitted_commit(&key, revision);
@@ -17566,10 +17573,17 @@ impl Application for Cagents {
                         source.key.clone()
                     });
                 if let Some(report) = report {
-                    self.status = Some(TransientNotice::error(format!(
-                        "{}: {report}",
-                        display_path(&key.canonical_path)
-                    )));
+                    self.status = Some(
+                        TransientNotice::error(format!(
+                            "{}: {report}",
+                            display_path(&key.canonical_path)
+                        ))
+                        .with_key(notice_key),
+                    );
+                } else {
+                    // Only the admitted operation's complete success resolves
+                    // this action's report. Partial/unknown outcomes keep theirs.
+                    self.resolve_notice(notice_key);
                 }
                 // Navigation does not cancel Git. Only this exact completion
                 // releases the worktree, then the index is read afresh.
@@ -21378,13 +21392,13 @@ mod tests {
         log.record(
             TransientNotice::error("Could not reopen “Fix parser”.")
                 .with_details("Exact native chat not found")
-                .with_key(key),
+                .with_key(key.clone()),
         );
         let first = log.recent().next().unwrap().id;
         log.record(
             TransientNotice::error("Could not reopen “Fix parser”.")
                 .with_details("daemon refused")
-                .with_key(key),
+                .with_key(key.clone()),
         );
         assert_eq!(log.len(), 2, "re-raising a key replaces its report");
         let replaced = log.recent().next().unwrap();
@@ -21394,20 +21408,20 @@ mod tests {
         log.record(
             TransientNotice::error("Could not reopen “Fix parser”.")
                 .with_details("daemon refused")
-                .with_key(key),
+                .with_key(key.clone()),
         );
         assert_eq!(log.recent().next().unwrap().repeats, 2);
 
         // Another object's report under the same operation is its own.
         let other = NoticeKey::ChatAttach(CardId::new());
-        log.record(TransientNotice::error("Could not reopen “Other”.").with_key(other));
+        log.record(TransientNotice::error("Could not reopen “Other”.").with_key(other.clone()));
         assert_eq!(log.len(), 3);
 
-        log.record(TransientNotice::success("Reopened.").with_key(key));
+        log.record(TransientNotice::success("Reopened.").with_key(key.clone()));
         assert_eq!(log.len(), 3, "the success takes the failure's place");
         assert!(
             log.recent()
-                .filter(|entry| entry.notice.key == Some(key))
+                .filter(|entry| entry.notice.key.as_ref() == Some(&key))
                 .all(|entry| entry.notice.severity == NoticeSeverity::Success)
         );
 
@@ -27481,6 +27495,264 @@ mod tests {
         assert_eq!(parked.at, LspPosition::new(4, 2));
         assert_eq!(parked.coordinates, LspCoordinates::Utf16);
         assert_eq!(notice(&app), None);
+    }
+
+    #[test]
+    fn a_confirmed_git_retry_resolves_its_failed_commit_notice() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        app.active_workspace = Some(key.canonical_path.clone());
+        let notice_key = NoticeKey::GitMutation(key.clone(), MutationKind::Commit);
+        app.notices
+            .record(TransientNotice::warning("Unrelated report"));
+        let first = app
+            .begin_mutation(&key, MutationKind::Commit, None)
+            .unwrap();
+        let (report, committed) = commit_report(Ok(CommitOutcome::NotCreated {
+            failure: crate::repository::MutationFailure::Rejected {
+                reason: "fixture pre-commit refusal".into(),
+            },
+        }));
+        assert!(report.is_some() && !committed);
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation: first,
+            report,
+            committed,
+        }));
+        assert!(app.notices.has(notice_key.clone()));
+        assert!(
+            app.sidebar_model
+                .source_control
+                .as_ref()
+                .unwrap()
+                .error
+                .is_some()
+        );
+        let original_notice = app.notices.recent().next().unwrap().notice.clone();
+        let retry = app
+            .begin_mutation(&key, MutationKind::Commit, None)
+            .unwrap();
+        assert!(
+            app.notices.has(notice_key.clone()),
+            "admission is not success"
+        );
+        assert_eq!(app.notices.recent().next().unwrap().notice, original_notice);
+        let (report, committed) = commit_report(Ok(CommitOutcome::Created {
+            oid: crate::repository::Oid::parse_object("a".repeat(40)).unwrap(),
+            warnings: Vec::new(),
+        }));
+        assert!(report.is_none() && committed);
+        drop(app.update(Message::SourceControlMutated {
+            key,
+            operation: retry,
+            report,
+            committed,
+        }));
+        assert!(!app.notices.has(notice_key));
+        assert!(
+            app.sidebar_model
+                .source_control
+                .as_ref()
+                .unwrap()
+                .error
+                .is_none()
+        );
+        assert_eq!(app.notices.len(), 1);
+        assert_eq!(
+            app.notices.recent().next().unwrap().notice.message,
+            "Unrelated report"
+        );
+    }
+
+    #[test]
+    fn git_notice_resolution_keeps_other_worktrees_and_mutation_kinds() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        let sibling = app
+            .sidebar_model
+            .worktree_at(Path::new("/repo/fix-sidebar"))
+            .unwrap();
+        let primary_notice = NoticeKey::GitMutation(key.clone(), MutationKind::Commit);
+        let sibling_notice = NoticeKey::GitMutation(sibling.clone(), MutationKind::Commit);
+        for target in [&key, &sibling] {
+            app.active_workspace = Some(target.canonical_path.clone());
+            drop(app.rebind_source_control());
+            let operation = app
+                .begin_mutation(target, MutationKind::Commit, None)
+                .unwrap();
+            let (report, committed) = commit_report(Ok(CommitOutcome::NotCreated {
+                failure: crate::repository::MutationFailure::Rejected {
+                    reason: "fixture refusal".into(),
+                },
+            }));
+            drop(app.update(Message::SourceControlMutated {
+                key: target.clone(),
+                operation,
+                report,
+                committed,
+            }));
+        }
+        assert!(app.notices.has(primary_notice.clone()));
+        assert!(app.notices.has(sibling_notice.clone()));
+        app.active_workspace = Some(key.canonical_path.clone());
+        drop(app.rebind_source_control());
+        let operation = app.begin_mutation(&key, MutationKind::Stage, None).unwrap();
+        let report = mutation_report("Stage", Ok(MutationOutcome::Applied { paths: Vec::new() }));
+        assert!(report.is_none());
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation,
+            report,
+            committed: false,
+        }));
+        assert!(
+            app.notices.has(primary_notice.clone()),
+            "Stage cannot resolve Commit"
+        );
+        assert!(app.notices.has(sibling_notice.clone()));
+        app.active_workspace = Some(sibling.canonical_path.clone());
+        drop(app.rebind_source_control());
+        let operation = app
+            .begin_mutation(&sibling, MutationKind::Commit, None)
+            .unwrap();
+        let (report, committed) = commit_report(Ok(CommitOutcome::Created {
+            oid: crate::repository::Oid::parse_object("b".repeat(40)).unwrap(),
+            warnings: Vec::new(),
+        }));
+        drop(app.update(Message::SourceControlMutated {
+            key: sibling,
+            operation,
+            report,
+            committed,
+        }));
+        assert!(!app.notices.has(sibling_notice));
+        assert!(app.notices.has(primary_notice));
+    }
+
+    #[test]
+    fn a_stale_git_completion_cannot_clear_or_replace_a_newer_owners_notice() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        app.active_workspace = Some(key.canonical_path.clone());
+        let notice_key = NoticeKey::GitMutation(key.clone(), MutationKind::Commit);
+        let first = app
+            .begin_mutation(&key, MutationKind::Commit, None)
+            .unwrap();
+        let (report, committed) = commit_report(Ok(CommitOutcome::NotCreated {
+            failure: crate::repository::MutationFailure::Rejected {
+                reason: "first refusal".into(),
+            },
+        }));
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation: first,
+            report,
+            committed,
+        }));
+        let first_notice = app.notices.recent().next().unwrap().clone();
+        let retry = app
+            .begin_mutation(&key, MutationKind::Commit, None)
+            .unwrap();
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation: first,
+            report: None,
+            committed: true,
+        }));
+        assert_eq!(app.source_control_mutations[&key.canonical_path].id, retry);
+        assert_eq!(app.notices.recent().next().unwrap(), &first_notice);
+        let (report, committed) = commit_report(Ok(CommitOutcome::NotCreated {
+            failure: crate::repository::MutationFailure::Rejected {
+                reason: "newer refusal".into(),
+            },
+        }));
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation: retry,
+            report,
+            committed,
+        }));
+        let replacement = app.notices.recent().next().unwrap().clone();
+        assert_ne!(replacement.id, first_notice.id);
+        assert_eq!(app.notices.len(), 1, "same-key retry replaces its report");
+        let newest = app
+            .begin_mutation(&key, MutationKind::Commit, None)
+            .unwrap();
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation: retry,
+            report: Some("stale other failure".into()),
+            committed: false,
+        }));
+        drop(app.update(Message::DismissNotice(first_notice.id)));
+        assert_eq!(app.source_control_mutations[&key.canonical_path].id, newest);
+        assert_eq!(app.notices.recent().next().unwrap(), &replacement);
+        assert!(app.notices.has(notice_key.clone()));
+        let (report, committed) = commit_report(Ok(CommitOutcome::Created {
+            oid: crate::repository::Oid::parse_object("c".repeat(40)).unwrap(),
+            warnings: Vec::new(),
+        }));
+        drop(app.update(Message::SourceControlMutated {
+            key,
+            operation: newest,
+            report,
+            committed,
+        }));
+        assert!(!app.notices.has(notice_key));
+    }
+
+    #[test]
+    fn partial_and_unknown_git_reports_keep_their_notice_until_full_success() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        app.active_workspace = Some(key.canonical_path.clone());
+        let notice_key = NoticeKey::GitMutation(key.clone(), MutationKind::Stage);
+        let path = crate::repository::RepoPath::parse("src/example.rs").unwrap();
+        for outcome in [
+            MutationOutcome::PartiallyApplied {
+                paths: vec![path.clone()],
+                failures: vec![crate::repository::MutationFailure::Rejected {
+                    reason: "remaining path refused".into(),
+                }],
+            },
+            MutationOutcome::OutcomeUnknown {
+                failure: crate::repository::MutationFailure::Rejected {
+                    reason: "no completion proof".into(),
+                },
+            },
+        ] {
+            let operation = app.begin_mutation(&key, MutationKind::Stage, None).unwrap();
+            let report = mutation_report("Stage", Ok(outcome));
+            assert!(report.is_some());
+            drop(app.update(Message::SourceControlMutated {
+                key: key.clone(),
+                operation,
+                report,
+                committed: false,
+            }));
+            assert!(app.notices.has(notice_key.clone()));
+            assert_eq!(app.notices.len(), 1);
+            assert_eq!(app.notices.recent().next().unwrap().expires_at, None);
+        }
+        let operation = app.begin_mutation(&key, MutationKind::Stage, None).unwrap();
+        let report = mutation_report("Stage", Ok(MutationOutcome::Applied { paths: vec![path] }));
+        assert!(report.is_none());
+        drop(app.update(Message::SourceControlMutated {
+            key,
+            operation,
+            report,
+            committed: false,
+        }));
+        assert!(!app.notices.has(notice_key));
     }
 
     #[test]
