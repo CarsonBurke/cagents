@@ -3,7 +3,7 @@
 //! https://github.com/openai/codex/tree/rust-v0.153.4/codex-rs/app-server-protocol
 //! Pending requests are replayed to joining connections with the original ID;
 //! the first answer wins (app-server/src/outgoing_message.rs). Never auto-answer.
-use super::{Adapter, ProcessSpec, ServerIdentity, Step, TransportSpec};
+use super::{Adapter, GoalResumeAdmission, ProcessSpec, ServerIdentity, Step, TransportSpec};
 use crate::account::{self, LiveReport};
 use crate::chat::{
     self, Answer, Attachment, Capabilities, ChangeKind, Choice, Command, CommandAction, Event,
@@ -427,6 +427,8 @@ fn create_inner(
             retained_identity,
             thread: launch.session_id.clone(),
             goal: None,
+            goal_resume_admission: GoalResumeAdmission::Unavailable,
+            goal_resume_pending: false,
             start,
             alias,
             cwd: launch.recipe.working_directory.clone(),
@@ -576,6 +578,9 @@ struct Codex {
     retained_identity: Option<ServerIdentity>,
     thread: Option<String>,
     goal: Option<chat::goal::State>,
+    goal_resume_admission: GoalResumeAdmission,
+    /// Keep metadata/stop controls usable while legacy restore lacks authority.
+    goal_resume_pending: bool,
     start: Value,
     alias: Option<PathBuf>,
     cwd: PathBuf,
@@ -730,6 +735,42 @@ impl Codex {
             snapshot.revision,
             chat::goal::Operation::Get,
         )
+    }
+
+    /// Preparing an attach is not authority: the runtime rechecks the exact
+    /// physical scope and this step's observation immediately before writing.
+    fn resume_after_goal_read(&mut self, step: &mut Step) -> Result<(), String> {
+        if !self.goal_resume_pending {
+            return Ok(());
+        }
+        let admitted = match self.goal_resume_admission {
+            GoalResumeAdmission::OriginalScope => true,
+            GoalResumeAdmission::InactiveOnly => self.goal.as_ref().is_some_and(|state| {
+                let observation = state.snapshot();
+                observation.support == chat::goal::Support::Supported
+                    && !observation.pending
+                    && !observation.uncertain
+                    && matches!(
+                        observation.read,
+                        chat::goal::ReadState::Known(None)
+                            | chat::goal::ReadState::Known(Some(chat::goal::Goal {
+                                status: chat::goal::Status::Paused | chat::goal::Status::Complete,
+                                ..
+                            }))
+                    )
+            }),
+            GoalResumeAdmission::Unavailable => false,
+        };
+        if admitted {
+            self.call(step, "thread/resume", json!({"threadId":self.thread,"excludeTurns":true,"initialTurnsPage":{"limit":20,"sortDirection":"desc","itemsView":"full"}}), Pending::Attach)?;
+            self.goal_resume_pending = false;
+        } else {
+            step.events.push(Event::Status {
+                busy: false,
+                detail: "Codex restore needs original scope or a confirmed inactive goal; Goal status, Pause and Clear remain available".into(),
+            });
+        }
+        Ok(())
     }
 
     fn discover_child(
@@ -1739,6 +1780,10 @@ impl Adapter for Codex {
         }
     }
 
+    fn set_goal_resume_admission(&mut self, admission: GoalResumeAdmission) {
+        self.goal_resume_admission = admission;
+    }
+
     fn server_identity(&self) -> Option<&ServerIdentity> {
         self.server_identity.as_ref()
     }
@@ -1788,6 +1833,7 @@ impl Adapter for Codex {
         let mut step = Step::default();
         self.ready = false;
         self.attached = false;
+        self.goal_resume_pending = false;
         if let Some(state) = &mut self.goal {
             let thread = self
                 .thread
@@ -1801,7 +1847,18 @@ impl Adapter for Codex {
     }
     fn command(&mut self, command: Command) -> Result<Step, String> {
         let mut step = Step::default();
-        if !self.ready {
+        let blocked_restore_control = self.goal_resume_pending
+            && self.server_identity.is_some()
+            && matches!(
+                &command,
+                Command::Goal {
+                    operation: chat::goal::Operation::Get
+                        | chat::goal::Operation::Pause
+                        | chat::goal::Operation::Clear,
+                    ..
+                }
+            );
+        if !self.ready && !blocked_restore_control {
             return Err("Codex native connection is not ready".into());
         }
         match command {
@@ -2016,6 +2073,7 @@ impl Adapter for Codex {
                         .map_err(|error| error.to_string())?;
                 }
                 self.publish_goal(&mut step);
+                self.resume_after_goal_read(&mut step)?;
                 return Ok(step);
             }
             if matches!(pending, Pending::History { .. }) {
@@ -2215,7 +2273,15 @@ impl Adapter for Codex {
                     step.writes
                         .push(json!({"method":"initialized","params":{}}));
                     if self.thread.is_some() {
-                        self.call(&mut step, "thread/resume", json!({"threadId":self.thread,"excludeTurns":true,"initialTurnsPage":{"limit":20,"sortDirection":"desc","itemsView":"full"}}), Pending::Attach)?;
+                        self.goal_resume_pending = true;
+                        if self.goal_resume_admission == GoalResumeAdmission::OriginalScope {
+                            self.resume_after_goal_read(&mut step)?;
+                        } else {
+                            // Get does not load or resume an existing thread. A
+                            // missing legacy tuple must never discover its goal
+                            // by starting it first.
+                            self.read_goal(&mut step)?;
+                        }
                     } else {
                         self.call(
                             &mut step,
@@ -5966,6 +6032,8 @@ mod tests {
             retained_identity: None,
             thread: Some("thread-exact".into()),
             goal: None,
+            goal_resume_admission: GoalResumeAdmission::OriginalScope,
+            goal_resume_pending: false,
             start: json!({}),
             alias: None,
             cwd: PathBuf::from("/tmp"),
@@ -7304,6 +7372,7 @@ mod tests {
             spec.transport,
             TransportSpec::UnixWebSocket { .. }
         ));
+        adapter.set_goal_resume_admission(GoalResumeAdmission::OriginalScope);
         let initialize = adapter.initialize().unwrap();
         let step = adapter.receive(json!({"id":initialize.writes[0]["id"],"result":{"userAgent":"codex","codexHome":directory.path()}})).unwrap();
         let resume = step

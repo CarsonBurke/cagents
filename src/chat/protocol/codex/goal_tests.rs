@@ -10,6 +10,7 @@ fn adapter() -> Codex {
         ready: true,
         attached: true,
         direct_input: true,
+        goal_resume_admission: GoalResumeAdmission::OriginalScope,
         ..Codex::default()
     }
 }
@@ -431,4 +432,179 @@ fn failed_request_admission_and_invalid_direct_objective_do_not_reserve_a_slot()
             .is_err()
     );
     assert_eq!(snapshot(&mut adapter), before);
+}
+
+/// The runtime cannot authenticate initialize's server identity until the
+/// initialize response is decoded. Unknown advisory must still allow this
+/// metadata request, without loading or resuming the retained thread.
+fn begin_legacy_restore(adapter: &mut Codex) -> Step {
+    adapter.set_goal_resume_admission(GoalResumeAdmission::Unavailable);
+    let initialize = adapter.initialize().unwrap();
+    let step = adapter
+        .receive(json!({"id":initialize.writes[0]["id"],"result":{
+            "codexHome":adapter.expected_home,"userAgent":"fixture"}}))
+        .unwrap();
+    assert!(adapter.server_identity().is_some());
+    assert!(!adapter.ready);
+    assert!(step.writes.iter().all(|frame| !matches!(
+        frame["method"].as_str(),
+        Some("thread/resume" | "thread/start" | "turn/start")
+    )));
+    assert_eq!(
+        step.writes
+            .iter()
+            .filter(|frame| frame["method"] == "thread/goal/get")
+            .count(),
+        1
+    );
+    step
+}
+
+#[test]
+fn legacy_restore_reads_before_resume_and_requires_positive_inactive_native_truth() {
+    for status in [
+        None,
+        Some("paused"),
+        Some("complete"),
+        Some("active"),
+        Some("blocked"),
+        Some("usageLimited"),
+        Some("budgetLimited"),
+    ] {
+        let mut adapter = adapter();
+        let initialized = begin_legacy_restore(&mut adapter);
+        let get = initialized
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "thread/goal/get")
+            .unwrap();
+        // Real runtime refresh occurs before this receive, after identity was
+        // established by the preceding initialize response.
+        adapter.set_goal_resume_admission(GoalResumeAdmission::InactiveOnly);
+        let result = adapter
+            .receive(json!({"id":get["id"],"result":{
+            "goal":status.map(|status| raw_goal("thread-exact", "Original goal", status))}}))
+            .unwrap();
+        let inactive = matches!(status, None | Some("paused" | "complete"));
+        assert_eq!(
+            result
+                .writes
+                .iter()
+                .any(|frame| frame["method"] == "thread/resume"),
+            inactive,
+            "{status:?}"
+        );
+        assert_eq!(adapter.goal_resume_pending, !inactive);
+        assert!(!adapter.ready, "metadata is not an attached native session");
+        assert!(result.writes.iter().all(|frame| !matches!(
+            frame["method"].as_str(),
+            Some("turn/start" | "thread/goal/set")
+        )));
+        assert!(
+            adapter
+                .command(Command::Prompt {
+                    text: "retain ordinary input".into(),
+                    attachments: vec![],
+                    mode: PromptMode::Send
+                })
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn blocked_legacy_restore_keeps_native_pause_and_clear_without_claiming_ready() {
+    for clear in [false, true] {
+        let mut adapter = adapter();
+        let initialized = begin_legacy_restore(&mut adapter);
+        let get = initialized
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "thread/goal/get")
+            .unwrap();
+        adapter.set_goal_resume_admission(GoalResumeAdmission::InactiveOnly);
+        let active = adapter
+            .receive(json!({"id":get["id"],"result":{
+            "goal":raw_goal("thread-exact", "Original goal", "active")}}))
+            .unwrap();
+        assert!(active.writes.is_empty());
+        assert!(adapter.goal_resume_pending && !adapter.ready);
+        let before = snapshot(&mut adapter);
+        assert!(
+            adapter
+                .command(Command::Goal {
+                    thread_id: before.thread_id,
+                    revision: before.revision,
+                    operation: Operation::Resume
+                })
+                .is_err()
+        );
+        let stop = command(
+            &mut adapter,
+            if clear {
+                Operation::Clear
+            } else {
+                Operation::Pause
+            },
+        );
+        assert_eq!(
+            stop.writes[0]["method"],
+            if clear {
+                "thread/goal/clear"
+            } else {
+                "thread/goal/set"
+            }
+        );
+        assert!(stop.writes[0]["params"].get("objective").is_none());
+        let reply = if clear {
+            json!({"cleared":true})
+        } else {
+            json!({"goal":raw_goal("thread-exact", "Original goal", "paused")})
+        };
+        let stopped = adapter
+            .receive(json!({"id":stop.writes[0]["id"],"result":reply}))
+            .unwrap();
+        assert_eq!(stopped.writes.len(), 1);
+        assert_eq!(stopped.writes[0]["method"], "thread/resume");
+        assert_eq!(stopped.writes[0]["params"]["threadId"], "thread-exact");
+        assert!(!adapter.ready);
+    }
+}
+
+#[test]
+fn unavailable_scope_unknown_or_unsupported_goal_never_falls_back_to_legacy_resume() {
+    for reply in [
+        json!({"result":{"goal":null}}),
+        json!({"error":{"code":-32601,"message":"not implemented"}}),
+        json!({"error":{"code":-32000,"message":"temporarily unavailable"}}),
+        json!({"result":{"goal":raw_goal("foreign-thread", "Wrong source", "paused")}}),
+    ] {
+        let mut adapter = adapter();
+        let initialized = begin_legacy_restore(&mut adapter);
+        let get = initialized
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "thread/goal/get")
+            .unwrap();
+        // Even a positive None cannot restore failed physical authority.
+        adapter.set_goal_resume_admission(
+            if reply["result"]["goal"].is_null() && reply.get("result").is_some() {
+                GoalResumeAdmission::Unavailable
+            } else {
+                GoalResumeAdmission::InactiveOnly
+            },
+        );
+        let mut frame = reply;
+        frame["id"] = get["id"].clone();
+        let blocked = adapter.receive(frame).unwrap();
+        assert!(blocked.writes.is_empty());
+        assert!(adapter.goal_resume_pending && !adapter.ready);
+        assert!(!published(&blocked).pending);
+        assert!(
+            blocked.events.iter().all(|event| !matches!(
+                event,
+                Event::Error { fatal: true, .. } | Event::Ready(true)
+            ))
+        );
+    }
 }
