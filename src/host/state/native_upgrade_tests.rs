@@ -1508,7 +1508,7 @@ fn provider() {
             }
             let result = match frame["method"].as_str().unwrap() {
                 "initialize" => {
-                    json!({"userAgent": if goals { "cagents/0.160.0 (Linux)" } else { "cagents/0.157.1 (Linux)" }, "codexHome":std::env::var("CODEX_HOME").unwrap()})
+                    json!({"userAgent": if goals { "cagents/0.162.0 (Linux)" } else { "cagents/0.157.1 (Linux)" }, "codexHome":std::env::var("CODEX_HOME").unwrap()})
                 }
                 "thread/start" | "thread/resume" => {
                     json!({"thread":{"id":THREAD,"canAcceptDirectInput":true,"status":{"type":"idle"}},"model":"fixture-model"})
