@@ -45,6 +45,10 @@
 #[path = "support/hosted_agent_cleanup.rs"]
 mod hosted_agent_cleanup;
 
+// Reviewed private pipe-capture dependency, imported unchanged from PR1695.
+#[path = "support/private_cli_capture.rs"]
+mod private_cli_capture;
+
 #[path = "codex_continuity_qualification/goal.rs"]
 mod goal;
 #[path = "support/codex_goal_model.rs"]
@@ -867,7 +871,7 @@ unified_exec = true
     fn await_daemon(&self) {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let output = self.output(&["daemon", "status"]);
+            let output = self.output_until(&["daemon", "status"], deadline);
             if output.status.success()
                 && serde_json::from_slice::<Value>(&output.stdout).unwrap()["data"]["running"]
                     == true
@@ -880,23 +884,15 @@ unified_exec = true
     }
 
     fn output(&self, arguments: &[&str]) -> Output {
-        let mut child = Self::command(self.root.path(), Path::new(env!("CARGO_BIN_EXE_cagents")))
-            .arg("--json")
-            .args(arguments)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(90);
-        while child.try_wait().unwrap().is_none() {
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let output = child.wait_with_output().unwrap();
-                panic!("CLI timed out: {arguments:?}: {output:?}");
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        let output = child.wait_with_output().unwrap();
+        self.output_until(arguments, Instant::now() + Duration::from_secs(90))
+    }
+
+    fn output_until(&self, arguments: &[&str], deadline: Instant) -> Output {
+        let spec = private_cli_capture::private_cli(self.root.path())
+            .env("TERM", "xterm-256color")
+            .args(arguments.iter().copied());
+        let output = private_cli_capture::capture(spec, deadline)
+            .unwrap_or_else(|failure| panic!("CLI failed: {arguments:?}: {failure:?}"));
         self.agents.observe(&output);
         output
     }
