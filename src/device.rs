@@ -1556,7 +1556,10 @@ mod tests {
             scoped_window_slot("a-b", "c"),
             scoped_window_slot("a", "b-c")
         );
-        assert_ne!(scoped_window_slot("build-host", "primary"), "build-host-primary");
+        assert_ne!(
+            scoped_window_slot("build-host", "primary"),
+            "build-host-primary"
+        );
         assert_eq!(
             scoped_window_slot("build-host", "primary"),
             scoped_window_slot("build-host", "primary")
