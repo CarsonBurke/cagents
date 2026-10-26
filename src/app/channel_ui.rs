@@ -688,7 +688,7 @@ impl Cagents {
         if self.channel_ui.closing.contains_key(&id) {
             return Task::none();
         }
-        let Some(target) = self
+        let Some(mut target) = self
             .channel_ui
             .approved
             .get(&id)
@@ -726,6 +726,12 @@ impl Cagents {
         // meanwhile. The workspace leaves the channel now, so
         // nothing the user does in the meantime lands in a channel whose
         // sessions are being closed.
+        let removable = target
+            .members
+            .iter()
+            .copied()
+            .filter(|card| target.inactive.contains(card) || self.chat_is_unused_default(*card))
+            .collect::<HashSet<_>>();
         let leave = if self.durable.active_channel == Some(id)
             && let Some(index) = self
                 .durable
@@ -738,6 +744,27 @@ impl Cagents {
         } else {
             Task::none()
         };
+        // Leaving the scope synchronously prunes closed descriptors and
+        // unused automatic drafts. Retire only those known harmless members
+        // from consent; never recapture newly arrived panes or identities.
+        let members = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .map(|channel| &channel.cards);
+        let removed = removable
+            .into_iter()
+            .filter(|card| members.is_some_and(|members| !members.contains(card)))
+            .collect::<HashSet<_>>();
+        target.members.retain(|card| !removed.contains(card));
+        target.inactive.retain(|card| !removed.contains(card));
+        target.panes.retain(|(card, _, _)| !removed.contains(card));
+        if !self.channel_deletion_target_current(id, &target) {
+            return Task::batch([leave, self.refuse_channel_deletion(id,
+                "The channel's panes changed. Review the channel and choose Delete channel again.".into())]);
+        }
+        self.channel_ui.approved.insert(id, target.clone());
         let sessions: Vec<_> = self
             .durable
             .cards
@@ -855,7 +882,11 @@ impl Cagents {
         };
         if self.workspace_model.identity != attempt.registry
             || channel.project_id != attempt.project
-            || channel.cards != attempt.members
+            || channel.cards.len() != attempt.members.len()
+            || attempt
+                .members
+                .iter()
+                .any(|card| !channel.cards.contains(card))
             || attempt.inactive.iter().any(|card| {
                 self.card_state(*card)
                     .is_some_and(|state| state.existence.is_open())
@@ -1766,6 +1797,57 @@ mod tests {
         drop(app.delete_channels(vec![channel]));
         assert!(app.channel_ui.is_deleting(channel));
         assert_ne!(app.channel_ui.close_operation(channel), operation);
+    }
+
+    #[test]
+    fn channel_delete_own_navigation_can_discard_an_unused_automatic_draft() {
+        let (mut app, channel, _, conversation) = channel_with_a_conversation();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|row| row.id == channel)
+            .unwrap()
+            .cards
+            .clear();
+        drop(app.select_channel(channel));
+        assert!(app.active_workspace.is_some());
+        drop(app.add_default_pane(PathBuf::from("/repo"), settings::DefaultPane::NativeChat));
+        let draft = app.workspace.focused().unwrap();
+        assert!(app.chat_is_unused_default(draft));
+        assert_ne!(draft, conversation);
+        drop(app.handle_channel_ui(Action::RequestDelete(channel)));
+        assert!(app.channel_ui.modal_open());
+        drop(app.handle_channel_ui(Action::ConfirmDelete));
+        assert!(
+            app.channel_ui.was_deleted(channel),
+            "own draft cleanup must not invalidate consent"
+        );
+        assert!(app.card_state(draft).is_none());
+        assert!(!app.channel_ui.failed.contains_key(&channel));
+    }
+
+    #[test]
+    fn channel_delete_own_navigation_can_prune_an_already_closed_member() {
+        let (mut app, channel, _, conversation) = channel_with_a_conversation();
+        drop(app.select_channel(channel));
+        let mut closed = app.card_state(conversation).unwrap().clone();
+        closed.id = CardId::new();
+        closed.existence = super::super::project_ui::removed_existence("closed before deletion");
+        let durable = Arc::make_mut(&mut app.durable);
+        durable
+            .channels
+            .iter_mut()
+            .find(|row| row.id == channel)
+            .unwrap()
+            .cards
+            .push(closed.id);
+        durable.cards.push(closed);
+        drop(app.handle_channel_ui(Action::RequestDelete(channel)));
+        drop(app.handle_channel_ui(Action::ConfirmDelete));
+        let operation = app.channel_ui.close_operation(channel);
+        drop(app.handle_channel_ui(Action::SessionsClosed(channel, operation, Ok(()))));
+        assert!(app.channel_ui.was_deleted(channel));
+        assert!(!app.channel_ui.failed.contains_key(&channel));
     }
 
     #[test]
