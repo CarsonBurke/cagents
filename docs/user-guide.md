@@ -444,8 +444,9 @@ request privately. If that save cannot finish safely, the declaration is not
 sent and the draft remains available. **Saved channel changes**, available in
 channel Work and from a new tab, lists retained requests after reopening the
 app. Open the original request and choose **Check result** on its original
-device profile. This recovery view never resends a request or restores its
-checkout selection; a missing receipt remains unknown. Closing the view does
+device profile. Requests restored after reopening the app are result-check
+only: their checkout selection is not restored and they cannot be resent.
+A missing receipt remains unknown. Closing the view does
 not discard the request. There are sixteen disk recovery slots, with no
 expiry or automatic eviction; unresolved requests can keep those slots occupied.
 Ordinary PR and known-row changes keep their existing in-window recovery and
