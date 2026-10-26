@@ -3,16 +3,17 @@ use super::*;
 use crate::chat::goal::{Operation, ReadState, Snapshot, Status, Support};
 
 fn adapter() -> Codex {
-    Codex {
-        thread: Some("thread-exact".into()),
-        cwd: PathBuf::from("/tmp"),
-        expected_home: std::fs::canonicalize("/tmp").unwrap(),
-        ready: true,
-        attached: true,
-        direct_input: true,
-        goal_resume_admission: GoalResumeAdmission::OriginalScope,
-        ..Codex::default()
-    }
+    // Codex owns alias cleanup through Drop; struct update cannot move its
+    // non-Copy fields out of a temporary default value.
+    let mut adapter = Codex::default();
+    adapter.thread = Some("thread-exact".into());
+    adapter.cwd = PathBuf::from("/tmp");
+    adapter.expected_home = std::fs::canonicalize("/tmp").unwrap();
+    adapter.ready = true;
+    adapter.attached = true;
+    adapter.direct_input = true;
+    adapter.goal_resume_admission = GoalResumeAdmission::OriginalScope;
+    adapter
 }
 
 fn raw_goal(thread: &str, objective: &str, status: &str) -> Value {
