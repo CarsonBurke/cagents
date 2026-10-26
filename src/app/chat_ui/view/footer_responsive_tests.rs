@@ -191,7 +191,18 @@ fn real_chat_footer_keeps_right_group_visible_and_narrow_model_selection_keyboar
             (footer.width - width.min(design::READABLE_MEASURE + 2.0 * step::GAP_M)).abs() <= 1.0,
             "the real chat_view uses the capped reading width: {width}: {footer:?}"
         );
+        let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+        let more = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| {
+                node.node().role() == Role::Button
+                    && node.node().label() == Some("Conversation details and settings")
+            })
+            .and_then(|node| node.node().bounds());
         if width >= 640.0 {
+            assert!(more.is_none(), "wide details are visible without More");
             let group = group_bounds(&mut ui)
                 .expect("model, effort, usage and cost are visible in the real app footer");
             for bounds in group {
@@ -224,6 +235,15 @@ fn real_chat_footer_keeps_right_group_visible_and_narrow_model_selection_keyboar
                 "cost anchors the right edge"
             );
         } else {
+            let more = more.expect("narrow footer exposes its actual More trigger");
+            assert!(more.x1 > more.x0 && more.y1 > more.y0);
+            assert!(
+                more.x0 >= f64::from(footer.x)
+                    && more.x1 <= f64::from(footer.x + footer.width)
+                    && more.y0 >= f64::from(footer.y)
+                    && more.y1 <= f64::from(footer.y + footer.height),
+                "{width}: the real More trigger stays inside the footer: {more:?} in {footer:?}"
+            );
             assert!(
                 group_bounds(&mut ui).is_none(),
                 "narrow details are initially folded"
