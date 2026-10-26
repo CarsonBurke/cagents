@@ -320,6 +320,7 @@ mod tests {
         Cagents,
         chat_ui::{self, Action, Runtime, Target, card_control_id},
     };
+    use cosmic::Application as _;
     use cosmic::iced::{
         advanced::clipboard,
         keyboard,
