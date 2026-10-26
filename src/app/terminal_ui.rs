@@ -10,11 +10,13 @@ pub enum Action {
     Focus(CardId, bool),
     Context(
         CardId,
+        crate::model::TerminalId,
         iced::Point,
         Option<crate::terminal::SearchMatch>,
         Option<Url>,
     ),
     DismissContext(CardId),
+    Review(CardId, crate::model::TerminalId, bool),
     Copy(CardId, String),
     CopySelection(CardId, crate::terminal::SearchMatch),
     PasteClipboard(CardId),
@@ -28,6 +30,78 @@ pub enum Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn review_context_captures_origin_and_rejects_queued_successor_actions() {
+        let (mut app, card, directory) = super::super::tests::live_agent_app("review-menu-fixture");
+        let terminal = match app.cards.get(&card).unwrap() {
+            CardRuntime::Terminal(handle) => handle.terminal_id(),
+            _ => unreachable!(),
+        };
+        drop(app.handle_terminal_find(Action::Context(
+            card,
+            terminal,
+            iced::Point::ORIGIN,
+            None,
+            None,
+        )));
+        assert_eq!(app.terminal_context.as_ref().unwrap().terminal, terminal);
+        let message = super::super::dialog_ui::tests::enter_control(
+            app.terminal_menu(card).unwrap(),
+            review_id(card),
+        );
+        let Message::TerminalFind(Action::Review(target, origin, true)) = message else {
+            panic!("the actual menu control must retain its exact review target");
+        };
+        assert_eq!((target, origin), (card, terminal));
+        drop(app.handle_terminal_find(Action::Review(target, origin, true)));
+        assert_eq!(app.terminal_review_card, Some(card));
+        assert!(app.terminal_context.is_none());
+        drop(app.handle_terminal_find(Action::Review(card, terminal, false)));
+        assert_eq!(app.terminal_review_card, None);
+        drop(app.handle_terminal_find(Action::Context(
+            card,
+            terminal,
+            iced::Point::ORIGIN,
+            None,
+            None,
+        )));
+        let replacement = crate::model::TerminalId::new();
+        app.cards.insert(
+            card,
+            CardRuntime::Terminal(super::super::tests::unconnected_surface(
+                directory.path(),
+                replacement,
+            )),
+        );
+        drop(app.handle_terminal_find(Action::Review(card, terminal, true)));
+        assert_eq!(app.terminal_review_card, None);
+        assert!(
+            app.terminal_context.is_none(),
+            "a stale menu closes without affecting the successor"
+        );
+        drop(app.handle_terminal_find(Action::Context(
+            card,
+            terminal,
+            iced::Point::ORIGIN,
+            None,
+            None,
+        )));
+        assert!(
+            app.terminal_context.is_none(),
+            "a queued old-widget gesture cannot create a successor menu"
+        );
+        drop(app.handle_terminal_find(Action::Context(
+            card,
+            replacement,
+            iced::Point::ORIGIN,
+            None,
+            None,
+        )));
+        assert_eq!(app.terminal_context.as_ref().unwrap().terminal, replacement);
+        drop(app.handle_terminal_find(Action::Review(card, replacement, true)));
+        assert_eq!(app.terminal_review_card, Some(card));
+    }
+
     #[test]
     fn closed_find_rejects_delayed_results_for_its_current_request() {
         let mut app = super::super::tests::context_inspector_test_app(false);
@@ -504,6 +578,7 @@ impl Find {
 
 pub(super) struct Context {
     pub card: CardId,
+    terminal: crate::model::TerminalId,
     pub selection: Option<crate::terminal::SearchMatch>,
     pub link: Option<Url>,
     pub point: iced::Point,
@@ -511,6 +586,10 @@ pub(super) struct Context {
 
 fn input_id(card: CardId) -> iced::widget::Id {
     iced::widget::Id::from(format!("terminal-find-{card}"))
+}
+
+fn review_id(card: CardId) -> iced::widget::Id {
+    iced::widget::Id::new(format!("terminal-review-{card}"))
 }
 
 impl Cagents {
@@ -547,6 +626,7 @@ impl Cagents {
             | Action::Focus(card, _)
             | Action::Context(card, ..)
             | Action::DismissContext(card)
+            | Action::Review(card, ..)
             | Action::Copy(card, _)
             | Action::CopySelection(card, _)
             | Action::PasteClipboard(card)
@@ -581,9 +661,13 @@ impl Cagents {
                 }
                 return Task::none();
             }
-            Action::Context(_, point, selection, link) => {
+            Action::Context(_, terminal, point, selection, link) => {
+                if handle.terminal_id() != terminal {
+                    return Task::none();
+                }
                 self.terminal_context = Some(Context {
                     card,
+                    terminal,
                     selection,
                     link,
                     point,
@@ -593,6 +677,24 @@ impl Cagents {
             Action::DismissContext(_) => {
                 self.terminal_context = None;
                 return Task::none();
+            }
+            Action::Review(_, terminal, active) => {
+                if handle.terminal_id() != terminal {
+                    if self
+                        .terminal_context
+                        .as_ref()
+                        .is_some_and(|context| context.card == card && context.terminal == terminal)
+                    {
+                        self.terminal_context = None;
+                    }
+                    return Task::none();
+                }
+                self.terminal_context = None;
+                return self.update(Message::TerminalReviewMode {
+                    card,
+                    terminal,
+                    active,
+                });
             }
             Action::Copy(_, text) => {
                 self.terminal_context = None;
@@ -877,6 +979,21 @@ impl Cagents {
         items.push(command("Select all", Action::SelectAll(card)));
         items.push(command("Clear scrollback", Action::Clear(card)));
         items.push(command("Find…", Action::Open(card)));
+        items.push(
+            widget::button::text(if self.terminal_review_card == Some(card) {
+                "Return to terminal input"
+            } else {
+                "Review visible text"
+            })
+            .id(review_id(card))
+            .width(Length::Fill)
+            .on_press(Message::TerminalFind(Action::Review(
+                card,
+                context.terminal,
+                self.terminal_review_card != Some(card),
+            )))
+            .into(),
+        );
         if let Some(link) = &context.link {
             items.push(
                 widget::button::text(if link.scheme() == "file" {

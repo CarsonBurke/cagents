@@ -9812,7 +9812,7 @@ impl Cagents {
                         .width_settled(self.workspace.width_is_settled(id))
                         .on_context(move |point, selection, link| {
                             Message::TerminalFind(terminal_ui::Action::Context(
-                                id, point, selection, link,
+                                id, terminal, point, selection, link,
                             ))
                         })
                         .on_paste(move |text| {
