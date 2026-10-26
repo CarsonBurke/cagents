@@ -815,6 +815,30 @@ pub(super) fn subscriptions(runtime: &Runtime) -> Vec<Subscription<Message>> {
         .collect()
 }
 
+// Paths and provider descriptions are untrusted metadata. In particular a
+// data URL is image content, never a filename to shape in a toolbar.
+fn gallery_label(
+    path: &str,
+    description: &str,
+    reference: Option<&chat::ImageReference>,
+) -> String {
+    let filename = (!path.starts_with("data:"))
+        .then(|| Path::new(path).file_name().and_then(|name| name.to_str()))
+        .flatten();
+    let label = reference
+        .map(|reference| reference.name.as_str())
+        .filter(|name| !name.trim().is_empty())
+        .or(filename.filter(|name| !name.trim().is_empty()))
+        .or_else(|| {
+            description
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+        })
+        .unwrap_or("Image");
+    Runtime::short_description(label, 120)
+}
+
 struct Entry {
     id: String,
     managed: bool,
@@ -898,24 +922,7 @@ impl Gallery {
                             .to_string_lossy()
                             .into_owned()
                     },
-                    label: reference
-                        .as_ref()
-                        .map(|reference| reference.name.clone())
-                        .filter(|name| !name.is_empty())
-                        .or_else(|| {
-                            Path::new(path)
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                .map(str::to_owned)
-                        })
-                        .filter(|name| !name.is_empty())
-                        .unwrap_or_else(|| {
-                            if description.is_empty() {
-                                "Image".into()
-                            } else {
-                                description.clone()
-                            }
-                        }),
+                    label: gallery_label(path, description, reference.as_ref()),
                     handle: runtime.presentation_cache().get(&item.id)?.image.clone()?,
                 })
             })
@@ -1237,6 +1244,48 @@ pub(super) fn deferred_for_test() -> Loaded {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gallery_labels_never_shape_inline_payloads_and_bound_provider_metadata() {
+        let inline = format!("data:image/png;base64,{}", "a".repeat(1024 * 1024));
+        assert_eq!(
+            gallery_label(&inline, "Generated image", None),
+            "Generated image"
+        );
+        assert_eq!(gallery_label(&inline, "", None), "Image");
+        let label = gallery_label(&format!("/fixture/{}", "x".repeat(4096)), "", None);
+        assert!(label.chars().count() <= 121);
+        assert!(!label.contains("data:"));
+    }
+
+    #[cfg(feature = "integrated-browser")]
+    #[test]
+    fn browser_import_is_above_conversation_images_and_below_device_file_dialogs() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        drop(app.update(Message::BrowserImport(
+            crate::app::browser_import_ui::Action::Open,
+        )));
+        let mut gallery = Gallery::file(
+            PathBuf::from("/fixture/image.png"),
+            None,
+            iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
+        );
+        app.chat_ui.image_viewer = Some(gallery);
+        assert!(
+            !app.browser_import_on_top(),
+            "device-file images remain above import"
+        );
+        gallery = app.chat_ui.image_viewer.take().unwrap();
+        gallery.target = Some(Target {
+            card: app.workspace.focused().unwrap(),
+            generation: 0,
+        });
+        app.chat_ui.image_viewer = Some(gallery);
+        assert!(
+            app.browser_import_on_top(),
+            "pane-local images do not cover import"
+        );
+    }
+
     #[test]
     fn image_headers_bound_pixel_memory_and_reject_invalid_data() {
         let mut bytes = Vec::new();
