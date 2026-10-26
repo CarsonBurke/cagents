@@ -1,6 +1,8 @@
 //! Bounded synchronous process execution shared by UI services and daemon workers.
 
 mod poll;
+#[cfg(feature = "ui")]
+pub(crate) mod speech_local;
 
 use serde::{Deserialize, Serialize};
 use std::{
