@@ -7536,6 +7536,12 @@ impl RepositoryRuntime {
         if self.blocks_navigation() {
             return;
         }
+        // A refused destination owns no document watch. A queued event from
+        // the departed buffer must not reopen it without the protection that
+        // just failed (nor reuse its cleared original-root attestation).
+        self.document_watch = None;
+        self.document_reading = false;
+        self.document_reload_pending = false;
         self.push_lsp_close();
         self.pending_fragment = None;
         self.pending_editor_navigation = None;
@@ -12559,6 +12565,7 @@ mod tests {
             runtime.worktree_protection.as_ref().unwrap().directory(),
             root
         );
+        let old_watch = runtime.document_watch.as_ref().unwrap().id();
         let old_identity = runtime.current_identity(card, "old.png".into());
         let old_read = crate::editor::read_file_at(
             &root,
@@ -12591,6 +12598,14 @@ mod tests {
         };
         let task = runtime.retarget_file(card, target.clone());
         assert!(iced::runtime::task::into_stream(task).is_none());
+        assert!(runtime.document_watch.is_none());
+        let departed_wake = runtime.update(RepositoryAction::DocumentChanged {
+            card,
+            watch: old_watch,
+        });
+        assert!(iced::runtime::task::into_stream(departed_wake).is_none());
+        assert!(!runtime.document_reading);
+        assert!(!runtime.document_reload_pending);
         assert_eq!(runtime.descriptor, target);
         assert_eq!(runtime.selected_path(), Some(Path::new("image.png")));
         let DocumentState::Failed { path, message } = &runtime.document else {
