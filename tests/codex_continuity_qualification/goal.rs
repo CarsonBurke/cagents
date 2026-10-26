@@ -173,6 +173,7 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
     // metadata-only implementation pass. The model counter alone also cannot
     // pass (e.g. a prediction request is not a new original-thread response).
     // Do not require a sampled idle gap while the goal may continue again.
+    let observation_started = Instant::now();
     let (continued_turn, continued_requests) = until(
         Duration::from_secs(30),
         "Goal Set alone to produce a model response in a new native turn",
@@ -205,13 +206,16 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
                 .then_some((snapshot.turn_generation, requests))
         },
     );
+    // Share the original 30-second work-observation budget with settlement;
+    // the existing Pause retains its own unchanged RPC observation bound.
+    let settlement_budget = Duration::from_secs(30).saturating_sub(observation_started.elapsed());
     // This is the existing first Pause, moved directly after positive work:
     // Pause prevents further Goal continuation but does not stop a live turn.
     let paused = pause(&mut window, &chat);
     assert_eq!(paused.objective, active.objective);
     assert_eq!(paused.token_budget, active.token_budget);
     let settled_turn = until(
-        Duration::from_secs(30),
+        settlement_budget,
         "the autonomous native turn to settle after explicit Goal Pause",
         || {
             let snapshot = window.read(chat.id);
