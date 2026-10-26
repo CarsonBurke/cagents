@@ -266,6 +266,207 @@ fn terminal(root: &Path) -> TerminalSession {
 }
 
 #[test]
+fn listener_failure_precedes_real_holder_adoption_and_preserves_the_checkpoint() {
+    use crate::upgrade::handoff::{Carried, Checkpoint, Phase, Store};
+    use std::{
+        cell::Cell,
+        os::unix::fs::{FileTypeExt, MetadataExt},
+    };
+
+    const EXACT: &str = "host::provider_shutdown_tests::listener_failure_precedes_real_holder_adoption_and_preserves_the_checkpoint";
+    let Some(root) = private_runtime(EXACT, false) else {
+        return;
+    };
+    let proof = |incarnation: &str| HostSessionProof {
+        host_session_id: HostSessionId::new("listener-startup"),
+        boot_id: daemon::read_boot_id().unwrap(),
+        host_incarnation: HostIncarnation::new(incarnation),
+    };
+    let old_proof = proof("before-listener");
+    let paths = RuntimePaths::discover().unwrap();
+    let old_lease = HostLease::acquire(&paths, &old_proof).unwrap();
+    let mut source = terminal(&root);
+    source.id = TerminalId::new();
+    source.launch.arguments = vec![
+        "-c".into(),
+        "printf 'launched\\n' >> launches; printf 'listener-ready\\n'; \
+         IFS= read -r line; printf 'continued:%s\\n' \"$line\"; IFS= read -r line"
+            .into(),
+    ];
+    source.continuity = TerminalContinuity::DetachedSameBoot {
+        host_session_id: old_proof.host_session_id.clone(),
+        boot_id: old_proof.boot_id.clone(),
+        host_incarnation: old_proof.host_incarnation.clone(),
+    };
+    let first = TerminalHandle::spawn(
+        source.clone(),
+        TerminalConfig {
+            holder_recovery: Some(crate::terminal::holder::Recovery {
+                source: source.clone(),
+                previous_sources: Vec::new(),
+                relaunches: Vec::new(),
+                options: Default::default(),
+                execution_environment: None,
+                execution_recipe: None,
+            }),
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .unwrap();
+    let visible_text = |handle: &TerminalHandle, expected: &str| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = handle.snapshot();
+            handle.acknowledge_redraw(snapshot.generation);
+            let text: String = snapshot
+                .lines
+                .iter()
+                .flat_map(|line| line.cells.iter().map(|cell| cell.text.as_str()))
+                .collect();
+            if text.contains(expected) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "missing {expected:?}: {text:?}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    visible_text(&first, "listener-ready");
+    let original = first.holder_identity().unwrap().clone();
+    let original_root = ProcessPin::capture(original.root.clone());
+    let original_holder = ProcessPin::capture(original.holder.clone());
+    let holders = crate::terminal::holder::directory().unwrap();
+    let holder_socket = crate::terminal::holder::socket(&holders, source.id);
+    first.carry(holder_socket.clone()).unwrap();
+    assert!(first.is_completed());
+    drop(first);
+
+    let store = Store::discover().unwrap();
+    let mut checkpoint = Checkpoint::new(
+        old_proof,
+        Vec::new(),
+        vec![Carried {
+            source: source.clone(),
+            previous_sources: Vec::new(),
+            relaunches: Vec::new(),
+            options: Default::default(),
+        }],
+        Vec::new(),
+    );
+    checkpoint.phase = Phase::Ready;
+    checkpoint.preserve_carried = true;
+    store.save(&checkpoint).unwrap();
+    let checkpoint_bytes = fs::read(&store.path).unwrap();
+    let checkpoint_stat = fs::metadata(&store.path).unwrap();
+    drop(old_lease);
+
+    let lease = HostLease::acquire(&paths, &proof("after-listener")).unwrap();
+    let host = Arc::new(state::HostLock::new(HostState::new(proof(
+        "after-listener",
+    ))));
+    // Production opens the durable execution registry before recovering an
+    // original holder; a bare HostState deliberately has no such connection.
+    host.lock()
+        .unwrap()
+        .install_model(model::Registry::at(&root.join("registry.sqlite3")).unwrap());
+    assert!(host.lock().unwrap().execution_registry.is_some());
+    host.lock().unwrap().enable_holder_recovery();
+    // Inject a real bind failure after acquiring the actual lease. This socket
+    // is only this fixture's blocker; it never accepts or serves a client.
+    let blocker = UnixListener::bind(&paths.socket).unwrap();
+    let blocker_stat = fs::symlink_metadata(&paths.socket).unwrap();
+    let restored = Cell::new(false);
+    let restore = || {
+        state::restore_upgrade(&host).map_err(io::Error::other)?;
+        restored.set(true);
+        Ok(())
+    };
+    let error = listener_before_restore(&paths, &restore).unwrap_err();
+    assert!(matches!(error, HostError::Io(ref error) if error.kind() == io::ErrorKind::AddrInUse));
+    assert!(!restored.get());
+    assert!(HostLease::is_held(&paths).unwrap());
+    assert!(host.lock().unwrap().terminals.is_empty());
+    assert_eq!(fs::read(&store.path).unwrap(), checkpoint_bytes);
+    let unchanged = fs::metadata(&store.path).unwrap();
+    assert_eq!(
+        (unchanged.dev(), unchanged.ino()),
+        (checkpoint_stat.dev(), checkpoint_stat.ino())
+    );
+    assert_eq!(store.load().unwrap().unwrap().phase, Phase::Ready);
+    assert_eq!(
+        crate::terminal::holder::evidence(&holder_socket).unwrap(),
+        Some(original.clone())
+    );
+    assert!(original_root.live() && original_holder.live());
+    assert_eq!(fs::read(root.join("launches")).unwrap(), b"launched\n");
+
+    // The positive control invokes the SAME real restore through the gate.
+    // Only remove the exact private blocker inode this test just created.
+    drop(blocker);
+    let named = fs::symlink_metadata(&paths.socket).unwrap();
+    assert_eq!(
+        (named.dev(), named.ino()),
+        (blocker_stat.dev(), blocker_stat.ino())
+    );
+    assert!(named.file_type().is_socket());
+    fs::remove_file(&paths.socket).unwrap();
+    let listener = listener_before_restore(&paths, &restore).unwrap();
+    assert!(restored.get());
+    assert!(store.load().unwrap().is_none());
+    assert_eq!(fs::metadata(&paths.socket).unwrap().mode() & 0o777, 0o600);
+    // SAFETY: fcntl observes this test's still-owned listener descriptor.
+    let flags = unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0, "{}", io::Error::last_os_error());
+    assert_ne!(flags & libc::O_NONBLOCK, 0);
+    let successor = host.lock().unwrap().terminals[&source.id].handle.clone();
+    assert_eq!(successor.holder_identity(), Some(&original));
+    assert!(original_root.live() && original_holder.live());
+    // Adoption restores the cached screen with a hidden worker. Follow the
+    // public Attach + Visible host path before requiring fresh PTY snapshots.
+    {
+        let mut state = host.lock().unwrap();
+        state.register_client(1);
+        state.attach(1, source.id).unwrap();
+        state
+            .set_visibility(
+                1,
+                source.id,
+                crate::terminal_ipc::TerminalVisibility::Visible,
+            )
+            .unwrap();
+    }
+    visible_text(&successor, "listener-ready");
+    successor.input(b"after-bind\n".to_vec()).unwrap();
+    visible_text(&successor, "continued:after-bind");
+    assert_eq!(fs::read(root.join("launches")).unwrap(), b"launched\n");
+    assert!(
+        finish_terminal_shutdown(&[successor])
+            .into_iter()
+            .all(|result| result.is_ok())
+    );
+    original_root.assert_reaped();
+    // The first worker handed its actual Child to the existing reaper when
+    // carried. Joining the adopted worker proves its holder exited, but the
+    // original parent's wait may still be completing for that same process.
+    let reaped_by = Instant::now() + Duration::from_secs(5);
+    while Process::read(original_holder.process.pid)
+        .is_ok_and(|current| current == original_holder.process)
+    {
+        assert!(
+            Instant::now() < reaped_by,
+            "original carried holder was not reaped"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    original_holder.assert_reaped();
+    assert!(HostLease::is_held(&paths).unwrap());
+    drop(listener);
+    drop(lease);
+    assert!(!paths.socket.exists());
+    assert!(!HostLease::is_held(&paths).unwrap());
+}
+
+#[test]
 fn cleanup_refusal_is_reported_and_healthy_owners_still_stop() {
     let Some(root) = private_runtime(TEST, false) else {
         return;

@@ -182,6 +182,25 @@ struct RetainedFrame {
     expires: Instant,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputRejectionReason {
+    QueueFull,
+    WorkerClosed,
+    Coalesced,
+}
+
+impl InputRejectionReason {
+    fn message(self) -> &'static str {
+        match self {
+            Self::QueueFull => {
+                "The terminal input queue is full; input was not accepted. Retry when output drains."
+            }
+            Self::WorkerClosed => "The terminal is not accepting input; this input was not sent.",
+            Self::Coalesced => "Terminal input was refused before it was sent.",
+        }
+    }
+}
+
 struct HostedPublishedState {
     snapshot: ArcSwap<RenderSnapshot>,
     /// The last grid a hibernated view showed.
@@ -214,6 +233,9 @@ struct HostedPublishedState {
     /// unrelated pointer event repainted the widget from this snapshot.
     announced_generation: AtomicU64,
     semantic_wake_pending: AtomicBool,
+    // At most one coalesced local refusal outlives a full semantic inbox. No
+    // input bytes, daemon error payload or unbounded per-request list is kept.
+    input_rejection: Mutex<Option<(Sender<TerminalEvent>, &'static str, InputRejectionReason)>>,
     output_observation: Mutex<OutputObservation>,
     visibility: AtomicU8,
     proof: Mutex<Option<HostSessionProof>>,
@@ -242,6 +264,7 @@ impl HostedPublishedState {
             acknowledgement_rx,
             announced_generation: AtomicU64::new(0),
             semantic_wake_pending: AtomicBool::new(false),
+            input_rejection: Mutex::new(None),
             output_observation: Mutex::new(OutputObservation::default()),
             visibility: AtomicU8::new(Self::visibility_code(if visible {
                 TerminalVisibility::Visible
@@ -464,6 +487,66 @@ impl HostedPublishedState {
 
     fn begin_event_drain(&self) {
         self.semantic_wake_pending.store(false, Ordering::Release);
+        let mut pending = self
+            .input_rejection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let full = if let Some((events, operation, reason)) = pending.take() {
+            match events.try_send(Self::input_rejected(operation, reason)) {
+                Ok(()) | Err(TrySendError::Disconnected(_)) => false,
+                Err(TrySendError::Full(_)) => {
+                    *pending = Some((events, operation, reason));
+                    true
+                }
+            }
+        } else {
+            false
+        };
+        drop(pending);
+        if full {
+            // This drain frees inbox capacity. A second semantic turn must
+            // retry the retained notice even if no further server data arrives.
+            self.request_semantic_wake();
+        }
+    }
+
+    fn input_rejected(operation: &'static str, reason: InputRejectionReason) -> TerminalEvent {
+        TerminalEvent::InputRejected {
+            operation,
+            message: reason.message().into(),
+        }
+    }
+
+    fn reject_input(
+        &self,
+        events: &Sender<TerminalEvent>,
+        operation: &'static str,
+        reason: InputRejectionReason,
+    ) {
+        let mut pending = self
+            .input_rejection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let (operation, reason) = if let Some((_, _, previous)) = pending.as_ref() {
+            (
+                "send terminal input",
+                if *previous == reason {
+                    reason
+                } else {
+                    InputRejectionReason::Coalesced
+                },
+            )
+        } else {
+            (operation, reason)
+        };
+        match events.try_send(Self::input_rejected(operation, reason)) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => *pending = None,
+            Err(TrySendError::Full(_)) => *pending = Some((events.clone(), operation, reason)),
+        }
+        drop(pending);
+        // Never wait on the UI here: Stop and queued ShutdownTerminal must
+        // remain serviceable while its bounded event channel is full.
+        self.request_semantic_wake();
     }
 
     fn hibernate(&self) {
@@ -1024,10 +1107,26 @@ impl HostedTerminalHandle {
         origin: PasteOrigin,
     ) -> Result<(), TerminalSendError> {
         let text = text.into();
+        let bytes = text.len();
+        let origin_name = match origin {
+            PasteOrigin::Clipboard => "clipboard",
+            PasteOrigin::Drop => "drop",
+        };
         if text.len() > MAX_INPUT_BYTES {
+            tracing::debug!(target: "cagents::terminal_input", terminal_id = %self.terminal_id(),
+                stage = "hosted_enqueue", origin = origin_name, bytes, outcome = "too_large");
             return Err(TerminalSendError::PasteTooLarge(text.len()));
         }
-        self.try_command(ClientCommand::Paste(text, origin))
+        let result = self.try_command(ClientCommand::Paste(text, origin));
+        tracing::debug!(target: "cagents::terminal_input", terminal_id = %self.terminal_id(),
+        stage = "hosted_enqueue", origin = origin_name, bytes,
+        outcome = match &result {
+            Ok(()) => "queued",
+            Err(TerminalSendError::Full) => "full",
+            Err(TerminalSendError::Closed) => "closed",
+            Err(TerminalSendError::PasteTooLarge(_)) => "too_large",
+        });
+        result
     }
 
     pub fn key(&self, key: KeyInput) -> Result<(), TerminalSendError> {
@@ -1181,6 +1280,9 @@ enum PendingRequest {
     Snapshot,
     Acknowledge,
     Command(&'static str),
+    // QueueFull for these commands proves no PTY input was admitted. Keep the
+    // type of the original request, rather than classifying an operation label.
+    Input(&'static str),
     Hibernate,
     Shutdown(Sender<()>),
 }
@@ -1977,6 +2079,10 @@ fn serve_connection(
             }
             let operation = command.operation();
             let pending_kind = match &command {
+                ClientCommand::Input(_)
+                | ClientCommand::Paste(..)
+                | ClientCommand::Key(_)
+                | ClientCommand::Mouse(_) => PendingRequest::Input(operation),
                 ClientCommand::Hibernate => PendingRequest::Hibernate,
                 ClientCommand::ShutdownTerminal(completed) => {
                     PendingRequest::Shutdown(completed.clone())
@@ -2062,6 +2168,15 @@ fn serve_connection(
                 let Some(kind) = pending.remove(&request_id) else {
                     return ConnectionEnd::Retry;
                 };
+                // Diagnostic correlation only; IDs are scoped to this connection.
+                if matches!(&kind, PendingRequest::Input("paste into terminal")) {
+                    tracing::debug!(target: "cagents::terminal_input", %terminal_id, request_id,
+                    stage = "rpc_result", outcome = if matches!(&response, ServerResponse::Accepted) {
+                        "accepted"
+                    } else {
+                        "unexpected_response"
+                    });
+                }
                 match (kind, response) {
                     (PendingRequest::Attach, ServerResponse::Attached { terminal })
                         if terminal.session.id == terminal_id =>
@@ -2141,12 +2256,16 @@ fn serve_connection(
                         }
                     }
                     (PendingRequest::Acknowledge, ServerResponse::Accepted)
-                    | (PendingRequest::Command(_), ServerResponse::Accepted) => {}
+                    | (PendingRequest::Command(_), ServerResponse::Accepted)
+                    | (PendingRequest::Input(_), ServerResponse::Accepted) => {}
                     (PendingRequest::Hibernate, ServerResponse::Accepted) => {}
                     (PendingRequest::Shutdown(completed), ServerResponse::Accepted) => {
                         let _ = completed.try_send(());
                     }
-                    (PendingRequest::Command(operation), unexpected) => {
+                    (
+                        PendingRequest::Command(operation) | PendingRequest::Input(operation),
+                        unexpected,
+                    ) => {
                         publish_event(
                             events,
                             published,
@@ -2162,6 +2281,21 @@ fn serve_connection(
                 }
             }
             ServerMessage::Error(error) => {
+                // Keep refusal diagnostics behind the same version/proof fence
+                // and an existing pending request, without retaining paste data.
+                if let Some(request_id) = envelope.request_id
+                    && matches!(
+                        pending.get(&request_id),
+                        Some(PendingRequest::Input("paste into terminal"))
+                    )
+                {
+                    tracing::debug!(target: "cagents::terminal_input", %terminal_id, request_id,
+                    stage = "rpc_result", outcome = if error.code == ProtocolErrorCode::QueueFull {
+                        "queue_full"
+                    } else {
+                        "refused"
+                    });
+                }
                 if is_committed_daemon_shutdown(&error) {
                     // In-flight controls can reach the old daemon after its
                     // checkpoint commits. Keep the runtime alive until the
@@ -2185,8 +2319,36 @@ fn serve_connection(
                         ConnectionEnd::Stop
                     };
                 };
+                let request = pending.remove(&request_id);
+                if let Some(PendingRequest::Input(operation)) = &request {
+                    let refusal = match (error.code, error.retryable, error.message.as_str()) {
+                        (ProtocolErrorCode::QueueFull, true, _) => {
+                            Some(InputRejectionReason::QueueFull)
+                        }
+                        // These exact host admission errors precede any input
+                        // effect. Completion can race its response; keep the
+                        // attachment to receive the actual Completed event.
+                        (
+                            ProtocolErrorCode::TerminalUnavailable,
+                            true,
+                            "the terminal worker has closed",
+                        )
+                        | (
+                            ProtocolErrorCode::TerminalUnavailable,
+                            false,
+                            "terminal output has completed",
+                        ) => Some(InputRejectionReason::WorkerClosed),
+                        _ => None,
+                    };
+                    if let Some(reason) = refusal {
+                        // Version, proof and exact request correlation have
+                        // passed. Never replay this refused command.
+                        published.reject_input(events, *operation, reason);
+                        continue;
+                    }
+                }
                 let mut attachment_failed = false;
-                let operation = match pending.remove(&request_id) {
+                let operation = match request {
                     Some(PendingRequest::Attach) => {
                         attachment_failed = true;
                         published.mark_detached();
@@ -2204,7 +2366,9 @@ fn serve_connection(
                     Some(PendingRequest::Acknowledge) => "acknowledge hosted terminal redraw",
                     Some(PendingRequest::Hibernate) => "hibernate terminal",
                     Some(PendingRequest::Shutdown(_)) => "shutdown terminal",
-                    Some(PendingRequest::Command(operation)) => operation,
+                    Some(PendingRequest::Command(operation) | PendingRequest::Input(operation)) => {
+                        operation
+                    }
                     None => return ConnectionEnd::Retry,
                 };
                 let retry = error.retryable && error.code != ProtocolErrorCode::ProofMismatch;
@@ -2335,7 +2499,26 @@ fn send_request(
 ) -> Result<(), FrameError> {
     let request_id = *next_request_id;
     *next_request_id = (*next_request_id).wrapping_add(1).max(2);
-    codec.write(
+    let paste = match &request {
+        ClientRequest::Paste {
+            terminal_id,
+            text,
+            origin,
+        } => Some((
+            *terminal_id,
+            text.len(),
+            match origin {
+                PasteOrigin::Clipboard => "clipboard",
+                PasteOrigin::Drop => "drop",
+            },
+        )),
+        _ => None,
+    };
+    if let Some((terminal_id, bytes, origin)) = paste {
+        tracing::debug!(target: "cagents::terminal_input", %terminal_id, request_id,
+            stage = "rpc_write", origin, bytes, outcome = "started");
+    }
+    let result = codec.write(
         stream,
         &ClientEnvelope {
             version: PROTOCOL_VERSION,
@@ -2343,7 +2526,12 @@ fn send_request(
             proof: Some(proof.clone()),
             request,
         },
-    )?;
+    );
+    if let Some((terminal_id, bytes, origin)) = paste {
+        tracing::debug!(target: "cagents::terminal_input", %terminal_id, request_id,
+            stage = "rpc_write", origin, bytes, outcome = if result.is_ok() { "written" } else { "failed" });
+    }
+    result?;
     pending.insert(request_id, kind);
     Ok(())
 }
@@ -2467,6 +2655,8 @@ fn publish_event(
 
 #[cfg(test)]
 mod tests {
+    mod input_rejection_tests;
+
     use std::{os::unix::net::UnixListener, sync::atomic::AtomicUsize};
 
     use crate::{
@@ -2645,11 +2835,38 @@ mod tests {
 
     #[test]
     fn systemd_scope_preserves_environment_arguments_and_isolates_cgroup() {
+        use std::io::{Read, Seek};
+
         if !systemd_user_manager_available() {
             return;
         }
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("scope-evidence");
+        // Regular files avoid waiting for the background holder to close a pipe.
+        let mut stdout = tempfile::tempfile().unwrap();
+        let mut stderr = tempfile::tempfile().unwrap();
+        let diagnostic = |file: &mut std::fs::File| {
+            const LIMIT: u64 = 4096;
+            let mut bytes = Vec::new();
+            if file
+                .rewind()
+                .and_then(|_| file.take(LIMIT + 1).read_to_end(&mut bytes))
+                .is_err()
+            {
+                return "[fixture output could not be read]".to_owned();
+            }
+            let truncated = bytes.len() as u64 > LIMIT;
+            bytes.truncate(LIMIT as usize);
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&bytes),
+                if truncated {
+                    "\n[truncated after 4096 bytes]"
+                } else {
+                    ""
+                }
+            )
+        };
         let mut command = daemon_launch_command(
             Path::new("/bin/sh"),
             crate::notifications::Application::Cagents,
@@ -2662,8 +2879,16 @@ mod tests {
             .args(["-c", "cat /proc/self/cgroup > \"$1\"; printf '%s\\n%s\\n' \"$2\" \"$CAGENTS_SCOPE_TEST\" >> \"$1\"; sleep 30 & echo $! >> \"$1\"", "fixture"])
             .arg(&output)
             .arg("$HOME");
+        command
+            .stdout(stdout.try_clone().unwrap())
+            .stderr(stderr.try_clone().unwrap());
         let status = command.status().unwrap();
-        assert!(status.success(), "scope launch failed: {status}");
+        assert!(
+            status.success(),
+            "scope launch failed: {status}; fixed fixture stdout prefix: {:?}; stderr prefix: {:?}",
+            diagnostic(&mut stdout),
+            diagnostic(&mut stderr)
+        );
         let evidence = std::fs::read_to_string(output).unwrap();
         // A detached holder must survive a daemon handoff. Scope launchers
         // return when the main process exits and leave its children in place.

@@ -33,6 +33,14 @@ fn reset() {
     PROTECTIONS.set(0);
 }
 
+#[derive(Debug)]
+enum ObservedInput {
+    Connect,
+    Paste(String),
+    Input(Vec<u8>),
+    Key(crate::terminal::KeyInput),
+}
+
 struct Peer {
     _directory: tempfile::TempDir,
     handle: HostedTerminalHandle,
@@ -40,6 +48,9 @@ struct Peer {
     stop: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
     sequence: u64,
+    reject_next_paste: Arc<AtomicBool>,
+    reject_next_key: Arc<std::sync::Mutex<Option<ProtocolError>>>,
+    observed: crossbeam_channel::Receiver<ObservedInput>,
 }
 impl Peer {
     fn new(session: TerminalSession, proof: HostSessionProof) -> Self {
@@ -55,6 +66,11 @@ impl Peer {
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
         let expected_proof = proof.clone();
+        let reject_next_paste = Arc::new(AtomicBool::new(false));
+        let reject_paste = Arc::clone(&reject_next_paste);
+        let reject_next_key = Arc::new(std::sync::Mutex::new(None));
+        let reject_key = Arc::clone(&reject_next_key);
+        let (observe, observed) = crossbeam_channel::unbounded();
         let worker = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(3);
             let mut stream = loop {
@@ -107,6 +123,15 @@ impl Peer {
                     }
                     Err(error) => panic!("private decode: {error}"),
                 };
+                // Observe only fixture input/connection kinds, never copy an
+                // Authenticate request or its inherited opaque authority.
+                let observed_request = match &request.request {
+                    ClientRequest::Connect { .. } => Some(ObservedInput::Connect),
+                    ClientRequest::Paste { text, .. } => Some(ObservedInput::Paste(text.clone())),
+                    ClientRequest::Input { bytes, .. } => Some(ObservedInput::Input(bytes.clone())),
+                    ClientRequest::Key { input, .. } => Some(ObservedInput::Key(input.clone())),
+                    _ => None,
+                };
                 let message = if !connected {
                     assert!(matches!(request.request, ClientRequest::Connect { .. }));
                     connected = true;
@@ -116,6 +141,18 @@ impl Peer {
                             resumed: vec![descriptor.clone()],
                         },
                     }
+                } else if matches!(request.request, ClientRequest::Paste { .. })
+                    && reject_paste.swap(false, Ordering::Relaxed)
+                {
+                    ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::QueueFull,
+                        "the terminal command queue is full",
+                        true,
+                    ))
+                } else if matches!(request.request, ClientRequest::Key { .. })
+                    && let Some(error) = reject_key.lock().unwrap().take()
+                {
+                    ServerMessage::Error(error)
                 } else if matches!(request.request, ClientRequest::CopyTerminalSelection { .. }) {
                     // Control errors carry the request ID. The hosted client
                     // restores the exact pending operation before UI delivery.
@@ -142,6 +179,9 @@ impl Peer {
                 {
                     return;
                 }
+                if let Some(request) = observed_request {
+                    observe.send(request).unwrap();
+                }
             }
         });
         let handle =
@@ -153,6 +193,9 @@ impl Peer {
             stop,
             worker: Some(worker),
             sequence: 0,
+            reject_next_paste,
+            reject_next_key,
+            observed,
         };
         peer.handle
             .wait_until_attached(Duration::from_secs(3))
@@ -440,4 +483,471 @@ fn confirmed_host_proof_refreshes_uncertain_terminal_metadata() {
     reset();
     apply(&mut app, card, &mut peer, None);
     assert_eq!(counts(), (0, 0));
+}
+
+#[test]
+fn rejected_paste_keeps_the_actual_app_surface_proof_output_and_next_control() {
+    let (mut app, card, mut peer) = fixture();
+    let proof = peer.handle.proof().unwrap();
+    let continuity = terminal_continuity(app.card_state(card)).unwrap().clone();
+    let recovery_attempts = app.terminal_recovery_attempts.clone();
+    let uncertain = app.uncertain_terminal_proofs.clone();
+    let mut requests = peer.observed.try_iter().collect::<Vec<_>>();
+    peer.reject_next_paste.store(true, Ordering::Relaxed);
+    app.settings.confirm_multiline_paste = false;
+    drop(app.update(Message::TerminalFind(terminal_ui::Action::Paste(
+        card,
+        "refused original input".into(),
+    ))));
+    // The normal user Paste update performs its existing projection. Measure
+    // only the following typed rejection wake, not that setup work.
+    let durable = Arc::clone(&app.durable);
+    reset();
+    let events = peer.handle.events();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while events.is_empty() {
+        assert!(Instant::now() < deadline, "actual correlated paste refusal");
+        thread::sleep(Duration::from_millis(1));
+    }
+    drop(app.update(Message::TerminalWake {
+        card,
+        generation: peer.handle.generation(),
+    }));
+    assert_eq!(counts(), (0, 0), "rejection changes only a notice");
+    assert!(Arc::ptr_eq(&durable, &app.durable));
+    assert_eq!(terminal_continuity(app.card_state(card)), Some(&continuity));
+    assert_eq!(app.terminal_recovery_attempts, recovery_attempts);
+    assert_eq!(app.uncertain_terminal_proofs, uncertain);
+    assert!(
+        matches!(app.cards.get(&card), Some(CardRuntime::Terminal(surface))
+        if surface.terminal_id() == peer.handle.terminal_id() && surface.host_proof() == Some(proof.clone()))
+    );
+    assert!(ended_terminal(app.card_state(card)).is_none());
+    assert!(app.notices.entries.iter().any(|entry| {
+        entry.notice.severity == NoticeSeverity::Warning
+            && entry.notice.message.contains("input queue is full")
+            && entry.notice.message.contains("try again")
+    }));
+    // New output is delivered by this same open socket after the refused
+    // command, and a distinct user command still reaches that exact peer.
+    let generation = peer.publish(None);
+    drop(app.update(Message::TerminalWake { card, generation }));
+    assert_eq!(peer.handle.snapshot().generation, generation);
+    peer.handle.input(b"after refusal".to_vec()).unwrap();
+    loop {
+        let request = peer.observed.recv_timeout(Duration::from_secs(3)).unwrap();
+        let done = matches!(&request, ObservedInput::Input(bytes) if bytes == b"after refusal");
+        requests.push(request);
+        if done {
+            break;
+        }
+    }
+    requests.extend(peer.observed.try_iter());
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| matches!(r, ObservedInput::Connect))
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| matches!(r, ObservedInput::Paste(text)
+        if text == "refused original input"))
+            .count(),
+        1,
+        "never automatically replay refused input"
+    );
+    assert!(
+        !peer.worker.as_ref().unwrap().is_finished(),
+        "the same connection survives"
+    );
+    assert_eq!(peer.handle.proof(), Some(proof));
+    assert!(matches!(
+        app.cards.get(&card),
+        Some(CardRuntime::Terminal(_))
+    ));
+}
+
+#[test]
+fn delayed_input_rejection_cannot_replace_a_newer_fatal_or_completed_terminal_outcome() {
+    for completed in [false, true] {
+        let (mut app, card, mut peer) = fixture();
+        peer.reject_next_paste.store(true, Ordering::Relaxed);
+        // A real server event precedes the correlated rejection on this same
+        // framed connection. This also models a coalesced rejection released
+        // after an already queued, newer terminal outcome.
+        let outcome = if completed {
+            WireTerminalEvent::Completed {
+                exit_code: 7,
+                signal: None,
+                intentional: false,
+            }
+        } else {
+            WireTerminalEvent::Error {
+                operation: "read PTY".into(),
+                message: "fixture fatal outcome".into(),
+            }
+        };
+        let generation = peer.publish(Some(outcome));
+        peer.handle
+            .paste("stale input", crate::terminal::PasteOrigin::Clipboard)
+            .unwrap();
+        loop {
+            let request = peer.observed.recv_timeout(Duration::from_secs(3)).unwrap();
+            if matches!(request, ObservedInput::Paste(ref text) if text == "stale input") {
+                break;
+            }
+        }
+        let events = peer.handle.events();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while events.len() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "both actual terminal events must arrive"
+            );
+            thread::yield_now();
+        }
+        app.status = Some(TransientNotice::warning("preserve existing notice"));
+        drop(app.update(Message::TerminalWake { card, generation }));
+        if completed {
+            assert!(ended_terminal(app.card_state(card)).is_some());
+            assert!(
+                app.notices
+                    .entries
+                    .iter()
+                    .any(|entry| entry.notice.severity == NoticeSeverity::Error
+                        && entry.notice.message == "terminal exited with status 7")
+            );
+        } else {
+            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+            assert!(
+                app.notices
+                    .entries
+                    .iter()
+                    .any(|entry| entry.notice.severity == NoticeSeverity::Error
+                        && entry.notice.message.contains("fixture fatal outcome"))
+            );
+        }
+        assert!(
+            !app.notices
+                .entries
+                .iter()
+                .any(|entry| entry.notice.message.starts_with("Terminal input rejected"))
+        );
+    }
+}
+
+#[test]
+fn input_notice_preserves_the_actual_live_app_original_and_next_input() {
+    let (mut app, card, mut peer) = fixture();
+    let proof = peer.handle.proof().unwrap();
+    let continuity = terminal_continuity(app.card_state(card)).unwrap().clone();
+    let recovery_attempts = app.terminal_recovery_attempts.clone();
+    let uncertain = app.uncertain_terminal_proofs.clone();
+    let mut requests = peer.observed.try_iter().collect::<Vec<_>>();
+    peer.handle.input(b"accepted prefix".to_vec()).unwrap();
+    loop {
+        let request = peer.observed.recv_timeout(Duration::from_secs(3)).unwrap();
+        let accepted =
+            matches!(&request, ObservedInput::Input(bytes) if bytes == b"accepted prefix");
+        requests.push(request);
+        if accepted {
+            break;
+        }
+    }
+    let durable = Arc::clone(&app.durable);
+    reset();
+    const MESSAGE: &str = "Unsent input was canceled. Previously sent input was preserved.";
+    apply(
+        &mut app,
+        card,
+        &mut peer,
+        Some(WireTerminalEvent::InputNotice {
+            operation: "cancel terminal input".into(),
+            message: MESSAGE.into(),
+        }),
+    );
+    assert_eq!(counts(), (0, 0), "input notice changes only presentation");
+    assert!(Arc::ptr_eq(&durable, &app.durable));
+    assert_eq!(terminal_continuity(app.card_state(card)), Some(&continuity));
+    assert_eq!(app.terminal_recovery_attempts, recovery_attempts);
+    assert_eq!(app.uncertain_terminal_proofs, uncertain);
+    assert!(matches!(
+        app.cards.get(&card),
+        Some(CardRuntime::Terminal(surface))
+            if surface.terminal_id() == peer.handle.terminal_id()
+                && surface.host_proof() == Some(proof.clone())
+    ));
+    assert!(ended_terminal(app.card_state(card)).is_none());
+    assert!(app.notices.entries.iter().any(|entry| {
+        entry.notice.severity == NoticeSeverity::Warning && entry.notice.message == MESSAGE
+    }));
+    // A different output generation and a new user interrupt still use the
+    // original open connection; the accepted prefix must never be replayed.
+    peer.sequence += 1;
+    let generation = peer.sequence;
+    let mut output = RenderSnapshot::empty();
+    output.generation = generation;
+    output.columns = 1;
+    output.rows = 1;
+    output.scroll.total = 1;
+    output.scroll.len = 1;
+    output.lines = vec![Arc::new(crate::terminal::RowSnapshot {
+        cells: vec![crate::terminal::CellSnapshot {
+            text: crate::terminal::CellText::new("Z"),
+            ..Default::default()
+        }],
+        ..Default::default()
+    })]
+    .into();
+    peer.send
+        .send(ServerMessage::Snapshot {
+            terminal_id: peer.handle.terminal_id(),
+            snapshot: TerminalSnapshot::full(&output),
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while peer.handle.generation() < generation {
+        assert!(
+            Instant::now() < deadline,
+            "output after the nonfatal notice"
+        );
+        thread::yield_now();
+    }
+    drop(app.update(Message::TerminalWake { card, generation }));
+    assert_eq!(peer.handle.snapshot().generation, generation);
+    assert_eq!(peer.handle.snapshot().lines[0].cells[0].text.as_str(), "Z");
+    peer.handle.input(vec![3]).unwrap();
+    loop {
+        let request = peer.observed.recv_timeout(Duration::from_secs(3)).unwrap();
+        let interrupt = matches!(&request, ObservedInput::Input(bytes) if bytes == &[3]);
+        requests.push(request);
+        if interrupt {
+            break;
+        }
+    }
+    requests.extend(peer.observed.try_iter());
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| matches!(request, ObservedInput::Connect))
+            .count(),
+        1,
+        "the nonfatal notice must not reconnect the original attachment"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| matches!(request,
+            ObservedInput::Input(bytes) if bytes == b"accepted prefix"))
+            .count(),
+        1,
+        "never replay previously delivered input"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| matches!(request,
+            ObservedInput::Input(bytes) if bytes == &[3]))
+            .count(),
+        1,
+        "one new user interrupt, no automatic retry"
+    );
+    assert!(!peer.worker.as_ref().unwrap().is_finished());
+    assert_eq!(peer.handle.proof(), Some(proof));
+}
+
+#[test]
+fn late_input_notice_cannot_replace_a_fatal_or_completed_original() {
+    for completed in [false, true] {
+        let (mut app, card, mut peer) = fixture();
+        let outcome = if completed {
+            WireTerminalEvent::Completed {
+                exit_code: 7,
+                signal: None,
+                intentional: false,
+            }
+        } else {
+            // Even identical recovery wording is fatal when the trusted
+            // producer classified it as Error. App never matches error text.
+            WireTerminalEvent::Error {
+                operation: "cancel terminal input".into(),
+                message: "Unsent input was canceled. Previously sent input was preserved.".into(),
+            }
+        };
+        peer.publish(Some(outcome));
+        let generation = peer.publish(Some(WireTerminalEvent::InputNotice {
+            operation: "cancel terminal input".into(),
+            message: "late notice must not replace the original outcome".into(),
+        }));
+        drop(app.update(Message::TerminalWake { card, generation }));
+        if completed {
+            assert!(ended_terminal(app.card_state(card)).is_some());
+            assert!(app.notices.entries.iter().any(|entry| {
+                entry.notice.severity == NoticeSeverity::Error
+                    && entry.notice.message == "terminal exited with status 7"
+            }));
+        } else {
+            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+            assert!(app.notices.entries.iter().any(|entry| {
+                entry.notice.severity == NoticeSeverity::Error
+                    && entry
+                        .notice
+                        .message
+                        .contains("Previously sent input was preserved")
+            }));
+        }
+        assert!(!app.notices.entries.iter().any(|entry| {
+            entry
+                .notice
+                .message
+                .contains("late notice must not replace")
+        }));
+    }
+}
+
+#[test]
+fn refused_key_before_completion_keeps_the_actual_app_surface_and_exit_status() {
+    for (message, retryable) in [
+        ("the terminal worker has closed", true),
+        ("terminal output has completed", false),
+    ] {
+        let (mut app, card, mut peer) = fixture();
+        let proof = peer.handle.proof().unwrap();
+        let continuity = terminal_continuity(app.card_state(card)).unwrap().clone();
+        let uncertain = app.uncertain_terminal_proofs.clone();
+        let recovery_attempts = app.terminal_recovery_attempts.clone();
+        let mut observed = peer.observed.try_iter().collect::<Vec<_>>();
+        *peer.reject_next_key.lock().unwrap() = Some(ProtocolError::new(
+            ProtocolErrorCode::TerminalUnavailable,
+            message,
+            retryable,
+        ));
+        let key = crate::terminal::KeyInput {
+            action: crate::terminal::KeyAction::Release,
+            key: crate::terminal::TerminalKey::Enter,
+            modifiers: crate::terminal::KeyModifiers::default(),
+            text: None,
+            unshifted_codepoint: None,
+        };
+        peer.handle.key(key.clone()).unwrap();
+        loop {
+            let request = peer.observed.recv_timeout(Duration::from_secs(3)).unwrap();
+            let done = matches!(&request, ObservedInput::Key(actual) if *actual == key);
+            observed.push(request);
+            if done {
+                break;
+            }
+        }
+        let events = peer.handle.events();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while events.is_empty() {
+            assert!(Instant::now() < deadline, "actual correlated key refusal");
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Force the refusal through App before any completion exists. A
+        // generic Error here used to replace the retained terminal surface.
+        let durable = Arc::clone(&app.durable);
+        drop(app.update(Message::TerminalWake {
+            card,
+            generation: peer.handle.generation(),
+        }));
+        assert!(Arc::ptr_eq(&durable, &app.durable));
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Terminal(surface))
+            if surface.terminal_id() == peer.handle.terminal_id() && surface.host_proof() == Some(proof.clone()))
+        );
+        assert_eq!(terminal_continuity(app.card_state(card)), Some(&continuity));
+        assert!(
+            ended_terminal(app.card_state(card)).is_none(),
+            "a refusal is not an exit receipt"
+        );
+        assert_eq!(app.terminal_recovery_attempts, recovery_attempts);
+        assert_eq!(app.uncertain_terminal_proofs, uncertain);
+        assert!(
+            app.notices
+                .entries
+                .iter()
+                .any(|entry| entry.notice.severity == NoticeSeverity::Warning
+                    && entry.notice.message.contains("this input was not sent"))
+        );
+        apply(
+            &mut app,
+            card,
+            &mut peer,
+            Some(WireTerminalEvent::Completed {
+                exit_code: 23,
+                signal: None,
+                intentional: false,
+            }),
+        );
+        assert!(matches!(
+            &ended_terminal(app.card_state(card)).unwrap().continuity,
+            TerminalContinuity::RelaunchAvailable { last_exit: Some(exit), .. }
+                if exit.code == Some(23) && exit.signal.is_none()
+        ));
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Terminal(surface))
+            if surface.terminal_id() == peer.handle.terminal_id() && surface.host_proof() == Some(proof.clone()))
+        );
+        assert_eq!(
+            app.card_state(card).unwrap().residency,
+            Residency::Hibernated
+        );
+        assert!(
+            app.notices
+                .entries
+                .iter()
+                .any(|entry| entry.notice.severity == NoticeSeverity::Error
+                    && entry.notice.message == "terminal exited with status 23")
+        );
+        observed.extend(peer.observed.try_iter());
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|r| matches!(r, ObservedInput::Connect))
+                .count(),
+            1
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|r| matches!(r, ObservedInput::Key(actual) if *actual == key))
+                .count(),
+            1,
+            "no reconnect or automatic replay of the refused physical key"
+        );
+        assert!(!peer.worker.as_ref().unwrap().is_finished());
+    }
+}
+
+#[test]
+fn worker_closed_wording_in_a_real_wire_error_remains_fatal() {
+    let (mut app, card, mut peer) = fixture();
+    apply(
+        &mut app,
+        card,
+        &mut peer,
+        Some(WireTerminalEvent::Error {
+            operation: "send terminal key".into(),
+            message: "the terminal worker has closed".into(),
+        }),
+    );
+    assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+    assert!(ended_terminal(app.card_state(card)).is_none());
+    assert!(app.notices.entries.iter().any(|entry| {
+        entry.notice.severity == NoticeSeverity::Error
+            && entry
+                .notice
+                .message
+                .contains("the terminal worker has closed")
+    }));
+    assert!(
+        !app.notices
+            .entries
+            .iter()
+            .any(|entry| entry.notice.message.contains("Terminal input rejected"))
+    );
 }

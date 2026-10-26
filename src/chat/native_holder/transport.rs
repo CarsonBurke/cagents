@@ -15,7 +15,7 @@ use std::{
     collections::BTreeMap,
     io::{self, Read, Write},
     os::{
-        fd::{AsRawFd, FromRawFd, RawFd},
+        fd::{AsFd, AsRawFd, FromRawFd, RawFd},
         unix::{
             fs::MetadataExt,
             net::{UnixListener, UnixStream},
@@ -155,6 +155,7 @@ enum Request {
         #[serde(default)]
         application: Option<String>,
     },
+    PinnedLaunchDirectory,
     Release,
 }
 
@@ -163,6 +164,8 @@ enum Report {
     Started {
         protocol: u32,
         record: Record,
+        #[serde(default)]
+        directory_pin: bool,
     },
     Confirmed,
     SourceUpdated,
@@ -172,6 +175,8 @@ enum Report {
         record: Record,
         recovery: Recovery,
         exited: bool,
+        #[serde(default)]
+        directory_pin: bool,
     },
     Adopted(Recovery),
     Failed(String),
@@ -183,10 +188,85 @@ pub(crate) struct Holder {
     control: Option<UnixStream>,
     release_on_drop: bool,
     durable: bool,
+    directory_pin: bool,
+    control_peer: Process,
+    control_poisoned: bool,
     identity: super::Detached,
 }
 
 impl Holder {
+    pub(crate) fn pinned_launch_directory(
+        &mut self,
+    ) -> Result<
+        (
+            crate::agent_execution::DirectoryIdentity,
+            std::sync::Arc<std::fs::File>,
+        ),
+        String,
+    > {
+        if self.control_poisoned {
+            return Err(
+                "Native holder control framing is uncertain; only exact cleanup is available"
+                    .into(),
+            );
+        }
+        if !self.directory_pin {
+            return Err(
+                "This native holder does not support original launch-directory descriptors".into(),
+            );
+        }
+        if !self.identity.record.holder.is_current() {
+            return Err("Original native holder is no longer live".into());
+        }
+        let control = self.control.as_ref().ok_or("Native holder is detached")?;
+        let credentials = peer(control)?;
+        if credentials.uid != crate::daemon::current_uid()
+            || credentials.pid != self.control_peer.pid
+            || !self.control_peer.is_current()
+        {
+            return Err("Native holder directory endpoint belongs to another process".into());
+        }
+        let deadline = Instant::now() + TIMEOUT;
+        let exchange = (|| {
+            crate::descriptor_frame::send_json_with_fds_until(
+                control,
+                &Request::PinnedLaunchDirectory,
+                &[],
+                deadline,
+                MAX_FRAME,
+                0,
+                crate::descriptor_frame::FrameByteOrder::BigEndian,
+            )?;
+            crate::descriptor_frame::receive_json_with_fds_until::<
+                Result<crate::agent_execution::DirectoryIdentity, String>,
+            >(
+                control,
+                deadline,
+                MAX_FRAME,
+                1,
+                crate::descriptor_frame::FrameByteOrder::BigEndian,
+            )
+        })();
+        let (response, mut descriptors) = match exchange {
+            Ok(response) => response,
+            Err(error) => {
+                // Keep the original provider owned. A partial frame cannot be
+                // reused for another lifecycle acknowledgement; explicit Close
+                // reconciles through the existing exact detached-owner path.
+                self.control_poisoned = true;
+                return Err(error);
+            }
+        };
+        let identity = response?;
+        if descriptors.len() != 1 || !self.identity.record.holder.is_current() {
+            return Err(
+                "Native holder did not transfer one live original directory descriptor".into(),
+            );
+        }
+        let directory = std::sync::Arc::new(std::fs::File::from(descriptors.remove(0)));
+        crate::chat::protocol::validate_launch_directory(&directory, identity)?;
+        Ok((identity, directory))
+    }
     pub fn is_durable(&self) -> bool {
         self.durable
     }
@@ -196,6 +276,12 @@ impl Holder {
         identity: crate::chat::protocol::ServerIdentity,
         process: Process,
     ) -> Result<(), String> {
+        if self.control_poisoned {
+            return Err(
+                "Native holder control framing is uncertain; only exact cleanup is available"
+                    .into(),
+            );
+        }
         let control = self.control.as_ref().ok_or("Native holder is detached")?;
         send(
             control,
@@ -228,6 +314,12 @@ impl Holder {
         execution_console: Option<crate::model::LaunchRecipe>,
         paired_holder: Option<crate::terminal::holder::Record>,
     ) -> Result<(), String> {
+        if self.control_poisoned {
+            return Err(
+                "Native holder control framing is uncertain; only exact cleanup is available"
+                    .into(),
+            );
+        }
         let control = self.control.as_ref().ok_or("Native holder is detached")?;
         send(
             control,
@@ -254,6 +346,9 @@ impl Holder {
             self.control.take();
             self.release_on_drop = false;
             return Ok(());
+        }
+        if self.control_poisoned {
+            self.control.take();
         }
         let Some(control) = self.control.as_ref() else {
             return if retain {
@@ -325,10 +420,33 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
         .clone()
         .ok_or("Native holder source has no daemon proof")?;
     let execution = spec.execution.clone();
-    let directory = execution
+    let original = execution
         .as_ref()
-        .and_then(|context| context.directory.clone());
-    let directory_fd = directory.as_ref().map(|file| file.as_raw_fd());
+        .map(|context| {
+            let descriptor = context.directory_descriptor();
+            if descriptor.is_none() && context.directory_identity()?.is_some() {
+                return Err(
+                    "Admitted native context has no original directory descriptor".to_owned(),
+                );
+            }
+            Ok(descriptor)
+        })
+        .transpose()?
+        .flatten();
+    let directory = match original {
+        Some(directory) => directory,
+        None => {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::sync::Arc::new(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+                    .open(&spec.working_directory)
+                    .map_err(|error| error.to_string())?,
+            )
+        }
+    };
+    let directory_fd = Some(directory.as_raw_fd());
     let request = Spawn {
         directory_fd,
         program: spec.program,
@@ -343,6 +461,9 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
     let _account =
         crate::account::registry::authorize_command(&command).map_err(|error| error.to_string())?;
     let (control, remote) = UnixStream::pair().map_err(|error| error.to_string())?;
+    // SO_PEERCRED on a socketpair remains its creator, including after exec.
+    let control_peer =
+        Process::read(std::process::id() as i32).map_err(|error| error.to_string())?;
     let fd = remote.as_raw_fd();
     let mut holder = Command::new("/proc/self/exe");
     holder
@@ -436,26 +557,32 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
             START_TIMEOUT,
         )?;
         match receive(&control, START_TIMEOUT)? {
-            Some(Report::Started { protocol, record })
-                if protocol == PROTOCOL
-                    && record.holder.pid == pid
-                    && record.holder.is_current() =>
+            Some(Report::Started {
+                protocol,
+                record,
+                directory_pin,
+            }) if protocol == PROTOCOL
+                && record.holder.pid == pid
+                && record.holder.is_current() =>
             {
                 crate::daemon::process_scope::warn_if_shared(
                     record.holder.pid as u32,
                     record.root.pid as u32,
                 );
-                Ok(record)
+                Ok((record, directory_pin))
             }
             Some(Report::Failed(error)) => Err(error),
             _ => Err("Native holder did not acknowledge its server".into()),
         }
     })();
     match result {
-        Ok(record) => Ok(Holder {
+        Ok((record, directory_pin)) => Ok(Holder {
             control: Some(control),
             release_on_drop: true,
             durable: false,
+            directory_pin,
+            control_peer,
+            control_poisoned: false,
             identity: super::Detached {
                 record,
                 proof: source_proof.clone(),
@@ -498,6 +625,13 @@ pub(crate) fn inspect(
     record: &Record,
     proof: &HostSessionProof,
 ) -> Result<(Recovery, bool), String> {
+    inspect_with_directory_pin(record, proof).map(|(recovery, exited, _)| (recovery, exited))
+}
+
+fn inspect_with_directory_pin(
+    record: &Record,
+    proof: &HostSessionProof,
+) -> Result<(Recovery, bool, bool), String> {
     let control = connect(record)?;
     send(
         &control,
@@ -512,9 +646,10 @@ pub(crate) fn inspect(
             record: actual,
             recovery,
             exited,
+            directory_pin,
         }) if matches!(protocol, 2 | PROTOCOL) && actual == *record => {
             recovery.validate_original_role(&record.boot, &record.application)?;
-            Ok((recovery, exited))
+            Ok((recovery, exited, directory_pin))
         }
         Some(Report::Failed(error)) => Err(error),
         _ => Err("Native holder did not return its exact discovery evidence".into()),
@@ -529,7 +664,7 @@ pub(crate) fn adopt(
     // Inspect is read-only. A candidate role does not authorize Adopt: first
     // authenticate this live holder's complete issued source on its own lease-
     // checked channel, and retain the exact original Record through cleanup.
-    let (original, _) = inspect(record, proof)?;
+    let (original, _, directory_pin) = inspect_with_directory_pin(record, proof)?;
     if &original.source != source && !original.previous_sources.contains(source) {
         return Err("Native role transition does not recognize the exact issued source".into());
     }
@@ -569,6 +704,9 @@ pub(crate) fn adopt(
                     control: Some(control),
                     release_on_drop: false,
                     durable: true,
+                    directory_pin,
+                    control_peer: record.holder.clone(),
+                    control_poisoned: false,
                     identity: super::Detached {
                         record: record.clone(),
                         source: recovery.source.clone(),
@@ -585,6 +723,43 @@ pub(crate) fn adopt(
     }
 }
 
+/// Bind the exact already-validated provider incarnation, never its cwd path.
+/// An exited zombie can still pass Process::is_current; only the owned pidfd
+/// establishes the kernel-live observation used by a directory-pin reply.
+fn pin_provider_process(process: &Process) -> Result<std::fs::File, String> {
+    if !process.is_current() {
+        return Err("Original native provider identity changed".into());
+    }
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, process.pid, 0) };
+    if descriptor < 0 {
+        return Err(format!(
+            "Pin original native provider: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let descriptor = unsafe { std::fs::File::from_raw_fd(descriptor as RawFd) };
+    if !process.is_current() {
+        return Err("Original native provider identity changed during pinning".into());
+    }
+    Ok(descriptor)
+}
+
+fn ensure_provider_live(pidfd: &std::fs::File) -> Result<(), String> {
+    let mut event = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    match unsafe { libc::poll(&mut event, 1, 0) } {
+        0 if event.revents == 0 => Ok(()),
+        result if result < 0 => Err(format!(
+            "Observe original native provider: {}",
+            io::Error::last_os_error()
+        )),
+        _ => Err("Original native provider has exited or its observation is unavailable".into()),
+    }
+}
+
 struct Residence {
     directory: PathBuf,
     listener: Listener,
@@ -594,6 +769,7 @@ struct Residence {
     child_events: ChildEvents,
     released: bool,
     _working_directory: Option<std::fs::File>,
+    provider_pidfd: std::fs::File,
     owner_application: String,
 }
 
@@ -643,7 +819,9 @@ impl Residence {
             holder: Process::read(std::process::id() as i32).map_err(|error| error.to_string())?,
             root: Process::read(child.id()).map_err(|error| error.to_string())?,
         };
+        let provider_pidfd = pin_provider_process(&record.root)?;
         let residence = Self {
+            provider_pidfd,
             owner_application: crate::instance::APPLICATION_ID.into(),
             directory,
             listener,
@@ -705,6 +883,23 @@ impl Residence {
         Ok(())
     }
 
+    fn pinned_launch_directory(
+        &self,
+    ) -> Result<(crate::agent_execution::DirectoryIdentity, &std::fs::File), String> {
+        if self.released {
+            return Err("Original native provider was released".into());
+        }
+        ensure_provider_live(&self.provider_pidfd)?;
+        let directory = self
+            ._working_directory
+            .as_ref()
+            .ok_or("Native provider has no original launch-directory descriptor")?;
+        let identity = crate::agent_execution::DirectoryIdentity::from_metadata(
+            &directory.metadata().map_err(|error| error.to_string())?,
+        );
+        crate::chat::protocol::validate_launch_directory(directory, identity)?;
+        Ok((identity, directory))
+    }
     fn attend(&mut self, control: UnixStream) -> bool {
         loop {
             if wait_for_control(control.as_raw_fd(), &self.child, &self.child_events).is_err() {
@@ -714,6 +909,32 @@ impl Residence {
                 Ok(Some(request)) => request,
                 _ => return self.recovery.is_durable(),
             };
+            if matches!(&request, Request::PinnedLaunchDirectory) {
+                let pin = self.pinned_launch_directory();
+                let response = pin
+                    .as_ref()
+                    .map(|(identity, _)| *identity)
+                    .map_err(Clone::clone);
+                let descriptors: Vec<_> = pin
+                    .as_ref()
+                    .ok()
+                    .map(|(_, file)| vec![file.as_fd()])
+                    .unwrap_or_default();
+                if crate::descriptor_frame::send_json_with_fds_until(
+                    &control,
+                    &response,
+                    &descriptors,
+                    Instant::now() + TIMEOUT,
+                    MAX_FRAME,
+                    1,
+                    crate::descriptor_frame::FrameByteOrder::BigEndian,
+                )
+                .is_err()
+                {
+                    return self.recovery.is_durable();
+                }
+                continue;
+            }
             let response = match request {
                 Request::Release => match self.release() {
                     Ok(()) => {
@@ -729,8 +950,12 @@ impl Residence {
                 } => {
                     match self
                         .verify_server(&process)
-                        .and_then(|()| self.recovery.confirm(thread, identity, process))
-                    {
+                        .and_then(|()| pin_provider_process(&process))
+                        .and_then(|pidfd| {
+                            self.recovery.confirm(thread, identity, process)?;
+                            self.provider_pidfd = pidfd;
+                            Ok(())
+                        }) {
                         Ok(()) => Report::Confirmed,
                         Err(error) => Report::Failed(error),
                     }
@@ -832,6 +1057,7 @@ impl Residence {
                             record: self.record.clone(),
                             recovery: self.recovery.clone(),
                             exited: self.exited(),
+                            directory_pin: true,
                         },
                         TIMEOUT,
                     );
@@ -1207,6 +1433,7 @@ extern "C" fn serve_if_requested() {
             &Report::Started {
                 protocol: PROTOCOL,
                 record: residence.record.clone(),
+                directory_pin: true,
             },
             START_TIMEOUT,
         )?;
@@ -1550,6 +1777,340 @@ mod tests {
                     .extension()
                     .is_none_or(|extension| extension != "closed"))
         );
+    }
+
+    #[test]
+    fn original_directory_pin_survives_native_adoption_and_path_replacement() {
+        const STAGE: &str = "CAGENTS_NATIVE_DIRECTORY_PIN_TEST";
+        if std::env::var_os(STAGE).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let name = std::thread::current().name().unwrap().to_owned();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env(STAGE, "1")
+                .env("XDG_RUNTIME_DIR", root.path())
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("cwd");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::write(cwd.join("marker"), "original").unwrap();
+        std::fs::write(
+            cwd.join("provider"),
+            "#!/bin/sh\n/bin/cat marker > observed\nexec /bin/sleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(cwd.join("provider"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        struct RestorePermissions([PathBuf; 2]);
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+                }
+            }
+        }
+        let _permissions = RestorePermissions([cwd.clone(), root.path().join("moved")]);
+        // Existing executable/file access needs traversal, not list permission.
+        std::fs::write(cwd.join("observed"), "").unwrap();
+        std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let expected = crate::agent_execution::DirectoryIdentity::from_metadata(
+            &std::fs::metadata(&cwd).unwrap(),
+        );
+        let mut source = super::super::tests::recovery().source;
+        let boot = crate::daemon::read_boot_id().unwrap();
+        source.proof.as_mut().unwrap().boot_id = boot.clone();
+        source
+            .owned_codex_listener
+            .as_mut()
+            .unwrap()
+            .allocator
+            .boot_id = boot;
+        source.launch.recipe.program = "./provider".into();
+        source.launch.recipe.working_directory = cwd.clone();
+        // The published source keeps its exact issued --remote ownership;
+        // only the executable ProcessSpec below is the local test fixture.
+        assert!(source.owns_codex_listener());
+        let mut stripped = source.clone();
+        stripped.launch.recipe.arguments.clear();
+        assert!(!stripped.owns_codex_listener());
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            transport: TransportSpec::OwnedUnixWebSocket {
+                socket: source.owned_codex_listener.as_ref().unwrap().socket.clone(),
+            },
+            program: "./provider".into(),
+            arguments: Vec::new(),
+            working_directory: cwd.clone(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let proof = source.proof.clone().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        assert_eq!(
+            spawn(spec.clone(), stripped).err().as_deref(),
+            Some("Native holder has inconsistent ownership evidence"),
+            "a source without the issued listener must still fail before provider creation"
+        );
+        let mut holder = spawn(spec, source.clone()).unwrap();
+        let record = holder.identity.record.clone();
+        let deadline = Instant::now() + TIMEOUT;
+        while std::fs::read_to_string(cwd.join("observed"))
+            .ok()
+            .as_deref()
+            != Some("original")
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::rename(&cwd, root.path().join("moved")).unwrap();
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::write(cwd.join("marker"), "replacement").unwrap();
+        // Missing additive capability fields decode as unsupported for old peers.
+        let mut legacy = serde_json::to_value(Report::Started {
+            protocol: PROTOCOL,
+            record: record.clone(),
+            directory_pin: true,
+        })
+        .unwrap();
+        legacy["Started"]
+            .as_object_mut()
+            .unwrap()
+            .remove("directory_pin");
+        assert!(matches!(
+            serde_json::from_value::<Report>(legacy).unwrap(),
+            Report::Started {
+                directory_pin: false,
+                ..
+            }
+        ));
+        // A legacy capability refuses locally; the original control remains usable.
+        holder.directory_pin = false;
+        assert!(holder.pinned_launch_directory().is_err());
+        holder.directory_pin = true;
+        assert_eq!(holder.pinned_launch_directory().unwrap().0, expected);
+        let thread = uuid::Uuid::new_v4().to_string();
+        holder
+            .confirm(
+                thread.clone(),
+                super::super::tests::server_identity(),
+                record.root.clone(),
+            )
+            .unwrap();
+        let detached = holder.preserve();
+        struct Cleanup(super::super::Detached);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = self.0.close();
+            }
+        }
+        let _cleanup = Cleanup(detached);
+        let (mut adopted, _) = adopt(&record, &source, &proof).unwrap();
+        let (identity, pin) = adopted.pinned_launch_directory().unwrap();
+        assert_eq!(identity, expected);
+        assert_ne!(
+            unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_GETFL) } & libc::O_PATH,
+            0
+        );
+        let fd = unsafe {
+            libc::openat(
+                pin.as_raw_fd(),
+                c"marker".as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
+        assert!(fd >= 0);
+        let mut text = String::new();
+        unsafe { std::fs::File::from_raw_fd(fd) }
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "original");
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("marker")).unwrap(),
+            "replacement"
+        );
+        // Relay one real holder pin reply, then deliberately expose only a
+        // partial header to the client. Timeout must poison this stream without
+        // sending Release or losing the real provider's original owner.
+        let (control, mut partial) = UnixStream::pair().unwrap();
+        let original = adopted.control.replace(control).unwrap();
+        adopted.control_peer = Process::read(std::process::id() as i32).unwrap();
+        let (finish, release) = std::sync::mpsc::sync_channel(1);
+        let relay = std::thread::spawn(move || {
+            assert!(matches!(
+                receive::<Request>(&partial, TIMEOUT).unwrap(),
+                Some(Request::PinnedLaunchDirectory)
+            ));
+            send(&original, &Request::PinnedLaunchDirectory, TIMEOUT).unwrap();
+            let (reply, rights) = crate::descriptor_frame::receive_json_with_fds_until::<
+                Result<crate::agent_execution::DirectoryIdentity, String>,
+            >(
+                &original,
+                Instant::now() + TIMEOUT,
+                MAX_FRAME,
+                1,
+                crate::descriptor_frame::FrameByteOrder::BigEndian,
+            )
+            .unwrap();
+            assert_eq!(reply.unwrap(), expected);
+            assert_eq!(rights.len(), 1);
+            partial.write_all(&20_u32.to_be_bytes()[..2]).unwrap();
+            release
+                .recv_timeout(TIMEOUT + Duration::from_secs(5))
+                .unwrap();
+            let mut byte = 0_u8;
+            assert_eq!(
+                unsafe {
+                    libc::recv(
+                        partial.as_raw_fd(),
+                        (&raw mut byte).cast(),
+                        1,
+                        libc::MSG_DONTWAIT,
+                    )
+                },
+                -1
+            );
+            assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+            // Dropping the original control preserves the confirmed holder.
+        });
+        assert!(adopted.pinned_launch_directory().is_err());
+        assert!(adopted.control_poisoned);
+        assert!(record.root.is_current());
+        assert!(
+            adopted
+                .confirm(
+                    thread,
+                    super::super::tests::server_identity(),
+                    record.root.clone()
+                )
+                .unwrap_err()
+                .contains("framing")
+        );
+        assert!(
+            adopted
+                .update_source(source, None, None)
+                .unwrap_err()
+                .contains("framing")
+        );
+        finish.send(()).unwrap();
+        relay.join().unwrap();
+        assert!(record.root.is_current());
+        adopted.close().unwrap();
+        assert!(adopted.pinned_launch_directory().is_err());
+        assert!(!record.root.is_current());
+    }
+
+    #[test]
+    fn native_directory_pin_refuses_an_exited_original_before_reap() {
+        const STAGE: &str = "CAGENTS_NATIVE_DIRECTORY_EXIT_TEST";
+        if std::env::var_os(STAGE).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let name = std::thread::current().name().unwrap().to_owned();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env(STAGE, "1")
+                .env("XDG_RUNTIME_DIR", root.path())
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("finish");
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let mut source = super::super::tests::recovery().source;
+        let boot = crate::daemon::read_boot_id().unwrap();
+        source.proof.as_mut().unwrap().boot_id = boot.clone();
+        source
+            .owned_codex_listener
+            .as_mut()
+            .unwrap()
+            .allocator
+            .boot_id = boot;
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            transport: TransportSpec::OwnedUnixWebSocket {
+                socket: source.owned_codex_listener.as_ref().unwrap().socket.clone(),
+            },
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "read line < finish".into()],
+            working_directory: directory.path().into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease =
+            crate::daemon::HostLease::acquire(&paths, source.proof.as_ref().unwrap()).unwrap();
+        let mut holder = spawn(spec, source).unwrap();
+        let root = holder.identity.record.root.clone();
+        holder
+            .confirm(
+                uuid::Uuid::new_v4().to_string(),
+                super::super::tests::server_identity(),
+                root.clone(),
+            )
+            .unwrap();
+        assert!(holder.pinned_launch_directory().is_ok());
+        let original = pin_provider_process(&root).unwrap();
+        ensure_provider_live(&original).unwrap();
+        // Nonblocking opens only once the actual original shell is reading.
+        use std::os::unix::fs::OpenOptionsExt;
+        let deadline = Instant::now() + TIMEOUT;
+        let mut writer = loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(&fifo)
+            {
+                Ok(writer) => break writer,
+                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        };
+        writer.write_all(b"finish\n").unwrap();
+        drop(writer);
+        while ensure_provider_live(&original).is_ok() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            root.is_current(),
+            "the original zombie is retained by its sole holder"
+        );
+        assert!(
+            holder.pinned_launch_directory().is_err(),
+            "process identity alone must not pass a kernel-exited root"
+        );
+        assert!(
+            !holder.control_poisoned,
+            "fully consumed semantic refusal is not a framing failure"
+        );
+        holder.close().unwrap();
+        assert!(!root.is_current());
     }
 
     #[test]

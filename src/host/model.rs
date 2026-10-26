@@ -27,6 +27,9 @@ use crate::{
 mod automation_audit;
 mod automation_proposals;
 mod automations;
+pub(super) mod channel_work;
+#[cfg(test)]
+mod channel_work_integration_tests;
 pub(super) use automations::Claimed;
 mod execution;
 pub(super) use execution::ResidentRelease;
@@ -41,7 +44,7 @@ mod schema;
 mod terminal_owners;
 mod views;
 
-const SCHEMA_VERSION: u32 = 16;
+const SCHEMA_VERSION: u32 = 18;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -215,7 +218,7 @@ impl Registry {
         let changed = match edit {
             ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply(&transaction, edit)?,
             ModelEdit::ResetNavigation { .. } | ModelEdit::ReorderNavigation { .. } => navigation::apply(&transaction, edit)?,
-            ModelEdit::AgentsChanged => {
+            ModelEdit::AgentsChanged | ModelEdit::ChannelWorkChanged { .. } => {
                 return Err("Agent model changes are committed by the execution service".into());
             }
             ModelEdit::OpenProject {
@@ -297,6 +300,15 @@ impl Registry {
             // nobody has open is reachable from no window's sidebar.
             ModelEdit::CloseProject { repository } => {
                 let key = repository_key(repository)?;
+                let channels = {
+                    let mut statement = transaction.prepare("SELECT id FROM channels WHERE repository=?1").map_err(|e| e.to_string())?;
+                    statement.query_map(params![key], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?
+                        .collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
+                };
+                views::retire_project_placements(&transaction, repository)?;
+                for channel in channels {
+                    channel_work::deleted_in(&transaction, channel.parse().map_err(|_| "The channel identity is unreadable")?)?;
+                }
                 let removed = transaction
                     .execute("DELETE FROM projects WHERE repository = ?1", params![key])
                     .map_err(|error| error.to_string())?
@@ -355,6 +367,7 @@ impl Registry {
                             params![id.to_string(), key, title, ordinal, *title_source as i64],
                         )
                         .map_err(|error| error.to_string())?;
+                    channel_work::created_in(&transaction, *id)?;
                     true
                 }
             }
@@ -393,7 +406,16 @@ impl Registry {
                     params![id.to_string(), title, *source as i64],
                 ).map_err(|error| error.to_string())? > 0
             }
+            ModelEdit::RetireEmptyChannel { home, expected_view_revision } => {
+                if channel_work::may_auto_retire_in(&transaction, home, *expected_view_revision)? {
+                    views::retire_channel_placements(&transaction, home.channel)?;
+                    channel_work::deleted_in(&transaction, home.channel)?;
+                    transaction.execute("DELETE FROM channels WHERE id=?1", params![home.channel.to_string()]).map_err(|e| e.to_string())? > 0
+                } else { false }
+            }
             ModelEdit::DeleteChannel { id } => {
+                views::retire_channel_placements(&transaction, *id)?;
+                channel_work::deleted_in(&transaction, *id)?;
                 transaction
                     .execute(
                         "DELETE FROM channels WHERE id = ?1",
@@ -404,6 +426,14 @@ impl Registry {
             }
         };
         if changed {
+            match edit {
+                ModelEdit::RetitleChannel { id, .. }
+                | ModelEdit::SuggestChannelTitle { id, .. }
+                | ModelEdit::SuggestConversationTitle { id, .. } => {
+                    channel_work::renamed_in(&transaction, *id)?
+                }
+                _ => {}
+            }
             transaction
                 .execute(
                     "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
@@ -592,6 +622,14 @@ fn migrate_through(
     if version < 16 && target >= 16 {
         automation_audit::migrate(tx)?;
         schema::migration_checkpoint(16)?;
+    }
+    if version < 17 && target >= 17 {
+        channel_work::migrate(tx)?;
+        schema::migration_checkpoint(17)?;
+    }
+    if version < 18 && target >= 18 {
+        channel_work::placement::migrate(tx)?;
+        schema::migration_checkpoint(18)?;
     }
     Ok(())
 }
@@ -1042,7 +1080,12 @@ mod tests {
         registry
             .db
             .execute_batch(
-                "DROP TABLE automation_lifecycle;
+                "DROP TABLE channel_work_placement_epochs;
+                 DROP TABLE channel_work_placement_clock;
+                 DROP TABLE channel_work_operations;
+                 DROP TABLE channel_work_entries;
+                 DROP TABLE channel_work_homes;
+                 DROP TABLE automation_lifecycle;
                  ALTER TABLE channels DROP COLUMN title_source; PRAGMA user_version = 2;",
             )
             .unwrap();

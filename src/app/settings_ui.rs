@@ -1275,10 +1275,11 @@ pub(super) fn settings_pane<'a>(
     query: &'a str,
     context: SettingsContext<'a>,
 ) -> Element<'a, Message> {
-    crate::ui_controls::responsive(move |size| {
+    let pane: Element<'a, Message> = crate::ui_controls::responsive(move |size| {
         settings_layout(category, draft, query, &context, size.width)
     })
-    .into()
+    .into();
+    pane.map(account_ui::pane_message)
 }
 
 fn settings_layout<'a>(
