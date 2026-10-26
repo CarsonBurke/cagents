@@ -1,6 +1,8 @@
 use super::coordination::Coordinated;
 use super::*;
 
+mod composer_menu;
+
 /// Bind a link to the surface that rendered it, before another pane, project,
 /// or child conversation can become selected.
 pub(super) fn capture_document_link(
@@ -3383,16 +3385,8 @@ impl Runtime {
                     .spacing(step::GAP_S)
                     .into()
             } else {
-                let candidates = self.composer_action_candidates();
-                let first = candidates
-                    .iter()
-                    .find(|candidate| {
-                        available
-                            && (candidate.kind == completion::Kind::Skill
-                                || candidate.insertion == "/goal"
-                                || enabled)
-                    })
-                    .map(|candidate| candidate.insertion.clone().into_owned());
+                let rows = composer_menu::offered(self, available, enabled);
+                let first = rows.iter().find_map(|row| row.action.clone());
                 let search = crate::interaction::keyboard_list_entry(
                     crate::ui_controls::field::search(
                         "Search skills and actions",
@@ -3400,111 +3394,29 @@ impl Runtime {
                     )
                     .id(card_control_id(target.card, "chat-actions-search"))
                     .on_input(move |query| action(Action::ComposerActionsQuery(target, query)))
-                    .on_submit_maybe(first.map(|insertion| {
-                        move |_| action(Action::ComposerAction(target, insertion.clone()))
-                    })),
+                    .on_submit_maybe(first.map(|first| move |_| action(first.clone()))),
                 );
-                let mut choices: Vec<([u8; 32], Element<'_, Message>)> = Vec::new();
-                if snapshot.capabilities.attachments && self.composer_actions_query.is_empty() {
-                    choices.push((
-                        composer_action_key("native", "attachments"),
-                        crate::ui_controls::button::secondary("Attach files or images…")
-                            .icon(Icon::Attachment)
+                let choices: Vec<([u8; 32], Element<'_, Message>)> = rows
+                    .into_iter()
+                    .map(|row| {
+                        let mut button = crate::ui_controls::button::secondary(row.label)
                             .width(Length::Fill)
-                            .on_press_maybe(
-                                (available && self.attachment_chooser_pending.is_none())
-                                    .then(|| action(Action::Attach(target))),
-                            )
-                            .into(),
-                    ));
-                }
-                for candidate in candidates {
-                    let is_skill = candidate.kind == completion::Kind::Skill;
-                    let label = if is_skill {
-                        format!("Skill · {}", candidate.name)
-                    } else {
-                        match candidate.name {
-                            "plan" => "Plan mode".into(),
-                            "goal" => "Goal…".into(),
-                            _ => candidate.label().into_owned(),
+                            .on_press_maybe(row.action.map(action));
+                        if let Some(icon) = row.icon {
+                            button = button.icon(icon);
                         }
-                    };
-                    let key = composer_action_key(
-                        if is_skill { "skill" } else { "command" },
-                        &candidate.insertion,
-                    );
-                    choices.push((
-                        key,
-                        crate::interaction::tooltip(
-                            crate::ui_controls::button::secondary(label)
-                                .width(Length::Fill)
-                                .on_press_maybe(
-                                    (available
-                                        && (is_skill || candidate.insertion == "/goal" || enabled))
-                                        .then(|| {
-                                            action(Action::ComposerAction(
-                                                target,
-                                                candidate.insertion.into_owned(),
-                                            ))
-                                        }),
-                                ),
-                            candidate.description,
-                        ),
-                    ));
-                }
-                if !snapshot.capabilities.interrupt_modes.is_empty()
-                    && (self.composer_actions_query.is_empty()
-                        || "steering timing".contains(&self.composer_actions_query.to_lowercase()))
-                {
-                    let mode = snapshot.interrupt_mode.as_deref().unwrap_or("immediate");
-                    let next = if mode == "wait" { "immediate" } else { "wait" };
-                    choices.push((
-                        composer_action_key("native", "steering"),
-                        crate::ui_controls::button::secondary(if mode == "wait" {
-                            "Steering: after turn"
-                        } else {
-                            "Steering: after tools"
-                        })
-                        .icon(Icon::Jump)
-                        .width(Length::Fill)
-                        .on_press_maybe(available.then(|| {
-                            action(Action::Command(
-                                target,
-                                Command::SetInterruptMode { mode: next.into() },
-                            ))
-                        }))
-                        .into(),
-                    ));
-                }
-                if snapshot.capabilities.branch {
-                    choices.push((
-                        composer_action_key("native", "fork"),
-                        crate::ui_controls::button::secondary("Fork conversation…")
-                            .icon(Icon::Branch)
-                            .id(card_control_id(target.card, "chat-actions-fork"))
-                            .width(Length::Fill)
-                            .on_press_maybe(
-                                enabled.then(|| action(Action::BranchPicker(target, true))),
-                            )
-                            .into(),
-                    ));
-                }
-                if snapshot.capabilities.compact {
-                    choices.push((
-                        composer_action_key("native", "compact"),
-                        crate::ui_controls::button::secondary("Compact conversation")
-                            .icon(Icon::Compress)
-                            .id(card_control_id(target.card, "chat-actions-compact"))
-                            .name(
-                                "Compact the conversation: summarize earlier turns to free context",
-                            )
-                            .width(Length::Fill)
-                            .on_press_maybe(
-                                enabled.then(|| action(Action::Command(target, Command::Compact))),
-                            )
-                            .into(),
-                    ));
-                }
+                        if let Some(id) = row.id {
+                            button = button.id(id);
+                        }
+                        if let Some(name) = row.accessible_name {
+                            button = button.name(name);
+                        }
+                        (
+                            row.key,
+                            crate::interaction::tooltip(button, row.description),
+                        )
+                    })
+                    .collect();
                 widget::column::with_children(vec![
                     search,
                     crate::interaction::keyed_list_rows(
@@ -5876,6 +5788,8 @@ fn model_list<'a>(
     .into()
 }
 
+#[cfg(test)]
+mod composer_menu_tests;
 #[cfg(test)]
 mod footer_responsive_tests;
 #[cfg(test)]
