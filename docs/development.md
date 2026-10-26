@@ -11,8 +11,9 @@
 
 The README's [Run from source](../README.md#run-from-source) section is the
 quick start; this page is the full reference. Repository tooling is shell
-(POSIX `sh`, plus Bash for the release and benchmark scripts) and Rust; Python
-is only a native build prerequisite of the full Servo dependency graph.
+(POSIX `sh`, plus Bash for the release and benchmark scripts) and Rust. Python 3
+is also required by the ceditor development/installation scripts, experimental
+hot runner, and the full Servo dependency graph.
 
 ## Prerequisites
 
@@ -459,8 +460,9 @@ source visible alongside an error. Rendering is debounced, uses at most two
 workers, and retains at most 24 diagrams / 32 MiB of pixels per document.
 
 The development runner uses an isolated application and settings identity.
-The editor runner and installer honor `CARGO_BUILD_TARGET` when locating the
-built executable.
+The editor runner and installer require Python 3 to read executable paths from
+Cargo's build output. This honors configured targets and output directories,
+including `build.target` in Cargo configuration and `CARGO_BUILD_TARGET`.
 
 Desktop alerts are sent through the notification portal under the daemon's
 application ID. When the portal accepts that ID, the daemon owns it on the session
