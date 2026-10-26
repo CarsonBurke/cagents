@@ -167,7 +167,10 @@ pub enum Response {
     Board(Board),
     Pinned(Box<Item>),
     /// The answer to a subscription: the board as of `revision`.
-    Watching { revision: u64, board: Box<Board> },
+    Watching {
+        revision: u64,
+        board: Box<Board>,
+    },
     RemovalPlan(Box<RemovalPlan>),
     Removed(Box<Removed>),
     Snapshots(Vec<SavedSnapshot>),
@@ -215,7 +218,10 @@ impl RemovalPlan {
         match &self.inspection.verdict {
             Verdict::Landed => format!(
                 "Everything landed in {}: removing the worktree loses nothing, and its branch may go too.",
-                self.inspection.landed_in.as_deref().unwrap_or("the default branch")
+                self.inspection
+                    .landed_in
+                    .as_deref()
+                    .unwrap_or("the default branch")
             ),
             Verdict::CommitsKept => {
                 "Nothing uncommitted would be lost, and the branch keeps its commits.".into()
@@ -380,9 +386,12 @@ impl Item {
     }
 
     pub fn has_live_agent(&self) -> bool {
-        self.sessions
-            .iter()
-            .any(|session| matches!(session.state, ActivityState::Working | ActivityState::Waiting))
+        self.sessions.iter().any(|session| {
+            matches!(
+                session.state,
+                ActivityState::Working | ActivityState::Waiting
+            )
+        })
     }
 }
 
@@ -847,7 +856,13 @@ mod tests {
             behind: 3,
         };
         assert_eq!(
-            last_activity(Some(&head), Some(&at_base), None, None, Some(NOW - 2 * HOUR)),
+            last_activity(
+                Some(&head),
+                Some(&at_base),
+                None,
+                None,
+                Some(NOW - 2 * HOUR)
+            ),
             activity(2 * HOUR, ActivitySource::Created)
         );
         let ahead = Comparison {
@@ -864,11 +879,23 @@ mod tests {
             newest_modified_at_unix_ms: Some(NOW - 60_000),
         };
         assert_eq!(
-            last_activity(Some(&head), Some(&ahead), Some(&dirty), Some(NOW - 120_000), None),
+            last_activity(
+                Some(&head),
+                Some(&ahead),
+                Some(&dirty),
+                Some(NOW - 120_000),
+                None
+            ),
             activity(60_000, ActivitySource::Files)
         );
         assert_eq!(
-            last_activity(Some(&head), Some(&ahead), Some(&dirty), Some(NOW - 1_000), None),
+            last_activity(
+                Some(&head),
+                Some(&ahead),
+                Some(&dirty),
+                Some(NOW - 1_000),
+                None
+            ),
             activity(1_000, ActivitySource::Session)
         );
         assert_eq!(last_activity(None, None, None, None, None), None);
