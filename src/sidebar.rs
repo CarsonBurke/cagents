@@ -17496,7 +17496,8 @@ pub(crate) mod tests {
                 &viewport,
                 &renderer
             ),
-            mouse::Interaction::Pointer
+            mouse::Interaction::Grab,
+            "the cached project header keeps its existing reorder gesture"
         );
         element.as_widget_mut().update(
             &mut tree,
