@@ -1299,7 +1299,7 @@ mod tests {
             .id(search_id.clone())
             .on_input(move |query| Message::ChatUi(Action::ModelQuery(target, query)));
         let mut ui = iced::runtime::UserInterface::build(
-            search.into(),
+            search,
             iced::Size::new(360.0, 120.0),
             iced::runtime::user_interface::Cache::new(),
             &mut renderer,
