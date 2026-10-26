@@ -58,23 +58,19 @@ fn child_icon(child: &chat::Subagent) -> Icon {
 fn direct_tabs<'a>(
     children: &'a [chat::Subagent],
     selected: Option<&str>,
+    focused: Option<&str>,
 ) -> Vec<&'a chat::Subagent> {
     let mut rows: Vec<_> = children.iter().collect();
     rows.sort_by_key(|child| rank(child));
-    if rows.len() > MAX_DIRECT_TABS {
-        let retained_selection = selected.and_then(|id| {
-            rows.iter()
-                .position(|child| child.id == id)
-                .filter(|index| *index >= MAX_DIRECT_TABS)
-                .map(|index| rows[index])
-        });
-        rows.truncate(MAX_DIRECT_TABS);
-        if let Some(child) = retained_selection {
-            rows.pop();
-            rows.push(child);
-            rows.sort_by_key(|child| rank(child));
-        }
-    }
+    let pins: Vec<_> = rows
+        .iter()
+        .skip(MAX_DIRECT_TABS)
+        .copied()
+        .filter(|child| selected == Some(child.id.as_str()) || focused == Some(child.id.as_str()))
+        .collect();
+    rows.truncate(MAX_DIRECT_TABS);
+    rows.extend(pins);
+    rows.sort_by_key(|child| rank(child));
     rows
 }
 
@@ -132,7 +128,18 @@ impl Runtime {
     pub(super) fn child_navigation(&self, _width: f32) -> Element<'_, Message> {
         let target = self.target;
         let selected = self.selected_subagent.as_ref();
-        let tabs = direct_tabs(&self.snapshot.subagents, selected.map(String::as_str))
+        let focused = self.child_tab_focus.borrow().clone();
+        let children = direct_tabs(
+            &self.snapshot.subagents,
+            selected.map(String::as_str),
+            focused.as_deref(),
+        );
+        let identities: HashMap<_, _> = children
+            .iter()
+            .map(|child| (child_key(&child.id), child.id.clone()))
+            .collect();
+        let focus = self.child_tab_focus.clone();
+        let tabs = children
             .into_iter()
             .map(|child| {
                 let chosen = selected == Some(&child.id);
@@ -177,12 +184,18 @@ impl Runtime {
                 )
             })
             .collect();
-        let tabs = widget::scrollable(crate::interaction::keyed_control_row(tabs, space::XS))
-            .id(card_control_id(target.card, "chat-subagent-tabs"))
-            .direction(iced::widget::scrollable::Direction::Horizontal(
-                iced::widget::scrollable::Scrollbar::hidden(),
-            ))
-            .width(Length::Fill);
+        let tabs = widget::scrollable(crate::interaction::keyed_control_row(
+            tabs,
+            space::XS,
+            move |key| {
+                *focus.borrow_mut() = key.and_then(|key| identities.get(&key).cloned());
+            },
+        ))
+        .id(card_control_id(target.card, "chat-subagent-tabs"))
+        .direction(iced::widget::scrollable::Direction::Horizontal(
+            iced::widget::scrollable::Scrollbar::hidden(),
+        ))
+        .width(Length::Fill);
         let trigger = widget::button::custom(crate::ui_controls::passive_icon(
             Icon::PanDown,
             design::COMPACT_ICON_SIZE,
@@ -417,8 +430,8 @@ mod tests {
                 )
             })
             .collect();
-        let visible = direct_tabs(&children, Some("999"));
-        assert_eq!(visible.len(), MAX_DIRECT_TABS);
+        let visible = direct_tabs(&children, Some("999"), None);
+        assert_eq!(visible.len(), MAX_DIRECT_TABS + 1);
         assert_eq!(visible.first().unwrap().id, "0");
         assert_eq!(visible.last().unwrap().id, "999");
         assert_eq!(
@@ -426,7 +439,7 @@ mod tests {
                 .iter()
                 .filter(|child| child.status == chat::ToolStatus::Running)
                 .count(),
-            MAX_DIRECT_TABS - 1
+            MAX_DIRECT_TABS
         );
         let picker = Picker::new(&children);
         assert_eq!(

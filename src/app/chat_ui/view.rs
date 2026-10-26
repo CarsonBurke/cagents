@@ -6538,7 +6538,11 @@ mod tests {
             .filter_map(|node| node.node().label())
             .filter(|label| label.contains("native subagent"))
             .collect();
-        assert_eq!(labels.len(), 24, "only direct tabs mount native buttons");
+        assert_eq!(
+            labels.len(),
+            25,
+            "only prefix and selected tab mount native buttons"
+        );
         assert!(labels[0].contains("Agent 0 ·"));
         assert!(labels.last().unwrap().contains("Agent 999 ·"));
         assert_eq!(runtime.selected_subagent.as_deref(), Some("child-999"));
@@ -6546,6 +6550,103 @@ mod tests {
             runtime.child_cache.is_empty(),
             "tab metadata never prepares hidden transcripts"
         );
+    }
+
+    #[test]
+    fn native_child_strip_pins_focused_unselected_child_when_status_moves_beyond_prefix() {
+        use iced::advanced::{
+            clipboard,
+            widget::{Operation, operation},
+        };
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        Arc::make_mut(&mut runtime.snapshot).subagents = (0..1000)
+            .map(|index| chat::Subagent {
+                id: format!("child-{index}"),
+                kind: format!("Agent {index}"),
+                status: if index < 30 {
+                    chat::ToolStatus::Running
+                } else {
+                    chat::ToolStatus::Succeeded
+                },
+                ..native_child_fixture()
+            })
+            .collect();
+        runtime.selected_subagent = Some("child-999".into());
+        let focused_id = card_control_id(runtime.target.card, "chat-subagent-tab-child-20");
+        let renderer = crate::app::tests::headless_renderer();
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(360.0, 100.0));
+        let mut element = runtime.child_navigation(360.0);
+        let mut tree = Tree::new(element.as_widget());
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(focused_id.clone()),
+        );
+        assert_eq!(
+            runtime.child_tab_focus.borrow().as_deref(),
+            Some("child-20")
+        );
+        drop(element);
+        Arc::make_mut(&mut runtime.snapshot).subagents[20].status = chat::ToolStatus::Succeeded;
+        let mut updated = runtime.child_navigation(360.0);
+        tree.diff(updated.as_widget_mut());
+        let node = updated
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        #[derive(Default)]
+        struct Focus(Option<widget::Id>);
+        impl Operation for Focus {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if state.is_focused() {
+                    self.0 = id.cloned();
+                }
+            }
+        }
+        let mut focused = Focus::default();
+        updated
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut focused);
+        assert_eq!(focused.0, Some(focused_id));
+        let key = iced::keyboard::key::Named::Enter;
+        let event = iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(key),
+            modified_key: iced::keyboard::Key::Named(key),
+            physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Enter),
+            location: iced::keyboard::Location::Standard,
+            modifiers: iced::keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        });
+        let mut messages = Vec::new();
+        updated.as_widget_mut().update(
+            &mut tree,
+            &event,
+            Layout::new(&node),
+            iced::mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut iced::advanced::Shell::new(&mut messages),
+            &iced::Rectangle::with_size(iced::Size::new(360.0, 100.0)),
+        );
+        assert!(
+            messages.iter().any(|message| matches!(message,
+            Message::ChatUi(Action::SelectSubagent(_, Some(id))) if id == "child-20")),
+            "activation must address the exact focused child after reorder"
+        );
+        assert_eq!(runtime.selected_subagent.as_deref(), Some("child-999"));
+        assert!(runtime.child_cache.is_empty());
     }
 
     #[test]

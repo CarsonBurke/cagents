@@ -7,19 +7,30 @@ pub(super) fn view<'a, Message: 'a>(
     let (keys, children): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
     Element::new(KeyedList {
         keys,
+        on_focus: None,
         content: widget::column::with_children(children)
             .width(Length::Fill)
             .into(),
     })
 }
 
+#[cfg(test)]
 pub(super) fn horizontal<'a, Message: 'a>(
     rows: Vec<([u8; 32], Element<'a, Message>)>,
     spacing: f32,
 ) -> Element<'a, Message> {
+    horizontal_observed(rows, spacing, None)
+}
+
+pub(super) fn horizontal_observed<'a, Message: 'a>(
+    rows: Vec<([u8; 32], Element<'a, Message>)>,
+    spacing: f32,
+    on_focus: Option<Box<dyn Fn(Option<[u8; 32]>) + 'a>>,
+) -> Element<'a, Message> {
     let (keys, children): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
     Element::new(KeyedList {
         keys,
+        on_focus,
         content: widget::row::with_children(children)
             .spacing(spacing)
             .align_y(cosmic::iced::Alignment::Center)
@@ -31,7 +42,49 @@ struct Keys(Vec<[u8; 32]>);
 
 struct KeyedList<'a, Message> {
     keys: Vec<[u8; 32]>,
+    on_focus: Option<Box<dyn Fn(Option<[u8; 32]>) + 'a>>,
     content: Element<'a, Message>,
+}
+
+#[derive(Default)]
+struct FocusedId(Option<Id>);
+impl Operation for FocusedId {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+    fn focusable(&mut self, id: Option<&Id>, _: Rectangle, state: &mut dyn operation::Focusable) {
+        if state.is_focused() {
+            self.0 = id.cloned();
+        }
+    }
+}
+
+impl<Message> KeyedList<'_, Message> {
+    fn observe_focus(&mut self, tree: &mut Tree, layout: Layout<'_>, renderer: &Renderer) {
+        if self.on_focus.is_none() {
+            return;
+        }
+        let mut focused = FocusedId::default();
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, &mut focused);
+        fn contains(tree: &Tree, id: &Id) -> bool {
+            tree.id.as_ref() == Some(id) || tree.children.iter().any(|child| contains(child, id))
+        }
+        let key = focused
+            .0
+            .as_ref()
+            .and_then(|id| {
+                tree.children[0]
+                    .children
+                    .iter()
+                    .position(|child| contains(child, id))
+            })
+            .and_then(|index| self.keys.get(index).copied());
+        if let Some(on_focus) = &self.on_focus {
+            on_focus(key);
+        }
+    }
 }
 
 impl<Message> Widget<Message, Theme, Renderer> for KeyedList<'_, Message> {
@@ -99,6 +152,7 @@ impl<Message> Widget<Message, Theme, Renderer> for KeyedList<'_, Message> {
             renderer,
             operation,
         );
+        self.observe_focus(tree, layout, renderer);
     }
     fn update(
         &mut self,
@@ -121,6 +175,7 @@ impl<Message> Widget<Message, Theme, Renderer> for KeyedList<'_, Message> {
             shell,
             viewport,
         );
+        self.observe_focus(tree, layout, renderer);
     }
     fn mouse_interaction(
         &self,

@@ -116,8 +116,9 @@ pub fn keyed_list_rows<'a, Message: 'a>(
 pub fn keyed_control_row<'a, Message: 'a>(
     controls: Vec<([u8; 32], Element<'a, Message>)>,
     spacing: f32,
+    on_focus: impl Fn(Option<[u8; 32]>) + 'a,
 ) -> Element<'a, Message> {
-    keyed_list::horizontal(controls, spacing)
+    keyed_list::horizontal_observed(controls, spacing, Some(Box::new(on_focus)))
 }
 
 /// A filter field at the head of a keyboard list. Down enters its first
