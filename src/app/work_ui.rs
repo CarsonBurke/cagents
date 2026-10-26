@@ -12,6 +12,7 @@ impl Cagents {
         let visible = self.workspace_surfaces_visible()
             && self.workspace.mounted_visibility().any(|(id, visibility)| {
                 visibility == VisibilityClass::Visible
+                    && matches!(self.cards.get(&id), Some(CardRuntime::Work))
                     && self
                         .card_state(id)
                         .is_some_and(|card| card.kind == CardKind::Work && card.existence.is_open())
@@ -307,5 +308,50 @@ mod tests {
         app.context_inspector_open = false;
         app.sync_work_watch_visibility();
         assert!(app.work_ui.listening_epoch().unwrap() > revealed);
+    }
+
+    #[test]
+    fn a_visible_failed_work_placeholder_has_no_listener_until_its_runtime_is_work() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        app.window_width = 1_800.0;
+        app.workspace.resize_viewport(1_400.0);
+        drop(app.add_utility_card(CardKind::Work));
+        let work = app.workspace.focused().unwrap();
+        app.workspace.native_scroll(0.0, 1_400.0);
+        assert_eq!(
+            app.workspace.visibility(work),
+            Some(VisibilityClass::Visible)
+        );
+        assert!(app.card_state(work).unwrap().existence.is_open());
+        assert!(matches!(app.cards.get(&work), Some(CardRuntime::Work)));
+
+        // The synthetic latency constructor makes this exact replacement:
+        // durable kind and on-screen geometry alone do not render the board.
+        app.cards.insert(
+            work,
+            CardRuntime::Failed("Synthetic failure placeholder".into()),
+        );
+        app.sync_work_watch_visibility();
+        assert_eq!(app.work_ui.listening_epoch(), None);
+        assert_eq!(
+            app.workspace.visibility(work),
+            Some(VisibilityClass::Visible)
+        );
+        assert!(app.card_state(work).unwrap().existence.is_open());
+
+        app.cards.insert(work, CardRuntime::Work);
+        app.sync_work_watch_visibility();
+        let original = app.work_ui.listening_epoch().unwrap();
+        app.cards
+            .insert(work, CardRuntime::Failed("Runtime replaced".into()));
+        app.sync_work_watch_visibility();
+        assert_eq!(app.work_ui.listening_epoch(), None);
+        app.cards.insert(work, CardRuntime::Work);
+        app.sync_work_watch_visibility();
+        assert!(app.work_ui.listening_epoch().unwrap() > original);
+        app.refresh_ui.focused = false;
+        app.sync_work_watch_visibility();
+        assert!(app.work_ui.listening_epoch().is_some());
     }
 }
