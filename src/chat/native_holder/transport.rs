@@ -1680,9 +1680,9 @@ exec /bin/sleep 60
                 directory_fd: None,
             };
             let mut child = spawn.command().stdin(Stdio::piped()).spawn().unwrap();
-            let provider = Process::read(child.id() as i32).unwrap();
             let mut tool_gate = child.stdin.take().unwrap();
             let mut server = Server(crate::daemon::owned_children::OwnedChildren::new(child));
+            let provider = Process::read(server.id()).unwrap();
             let deadline = Instant::now() + Duration::from_secs(3);
             while !directory.path().join("ready").exists() {
                 assert!(!server.exited(), "provider exited during fixture startup");
@@ -1716,8 +1716,11 @@ exec /bin/sleep 60
 
             let observed_tool = tool.clone();
             let release_and_observe = move || {
-                tool_gate.write_all(b"exit\n").unwrap();
+                let released = tool_gate.write_all(b"exit\n").is_ok();
                 drop(tool_gate);
+                if !released {
+                    return false;
+                }
                 let deadline = Instant::now() + Duration::from_secs(3);
                 while observed_tool.is_current() && Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(5));
