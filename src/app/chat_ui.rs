@@ -287,6 +287,8 @@ pub enum Action {
     CloseImage,
     ImageNext(bool),
     ImageFit,
+    ImageActualSize,
+    ImageSelect(usize),
     ImageExternal,
     CopyLiteral(String),
     CopySharedCode(Target, Arc<str>),
@@ -450,6 +452,8 @@ impl Action {
                 | Self::CloseImage
                 | Self::ImageNext(_)
                 | Self::ImageFit
+                | Self::ImageActualSize
+                | Self::ImageSelect(_)
                 | Self::ImageExternal
         )
     }
@@ -10705,9 +10709,29 @@ impl Cagents {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     let gallery = images::Gallery::new(runtime, &id);
                     self.chat_ui.image_viewer = gallery;
+                    if self.chat_ui.image_viewer.is_some() {
+                        return iced::widget::operation::focus(images::canvas_focus_id())
+                            .map(cosmic::Action::App);
+                    }
                 }
             }
-            Action::CloseImage => self.chat_ui.image_viewer = None,
+            Action::CloseImage => {
+                let target = self
+                    .chat_ui
+                    .image_viewer
+                    .take()
+                    .and_then(|gallery| gallery.target());
+                if let Some(target) = target
+                    && self.workspace.focused() == Some(target.card)
+                    && self.chat_runtime_mut(target).is_some()
+                {
+                    return iced::widget::operation::focus(card_control_id(
+                        target.card,
+                        "chat-composer",
+                    ))
+                    .map(cosmic::Action::App);
+                }
+            }
             Action::ImageNext(forward) => {
                 if let Some(gallery) = &mut self.chat_ui.image_viewer {
                     gallery.next(forward);
@@ -10715,7 +10739,19 @@ impl Cagents {
             }
             Action::ImageFit => {
                 if let Some(gallery) = &mut self.chat_ui.image_viewer {
+                    gallery.actual_size = false;
                     gallery.reset = gallery.reset.wrapping_add(1);
+                }
+            }
+            Action::ImageActualSize => {
+                if let Some(gallery) = &mut self.chat_ui.image_viewer {
+                    gallery.actual_size = true;
+                    gallery.reset = gallery.reset.wrapping_add(1);
+                }
+            }
+            Action::ImageSelect(index) => {
+                if let Some(gallery) = &mut self.chat_ui.image_viewer {
+                    gallery.select(index);
                 }
             }
             Action::ImageExternal => {
@@ -11966,7 +12002,7 @@ mod tests {
     }
 
     #[test]
-    fn image_gallery_is_modal_and_reuses_the_transcript_handle() {
+    fn image_gallery_keeps_chat_nonmodal_and_reuses_the_transcript_handle() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
         let runtime = match app.cards.get_mut(&card).unwrap() {
@@ -11998,11 +12034,17 @@ mod tests {
         let target = runtime.target;
         drop(app.handle_chat_ui(Action::OpenImage(target, "image".into())));
         assert!(app.chat_ui.image_viewer.is_some());
-        assert!(app.modal_is_open());
-        assert!(app.dialog().is_some());
-        let before = app.context_inspector_open;
-        drop(app.update(Message::ToggleContextInspector));
-        assert_eq!(app.context_inspector_open, before);
+        assert!(!app.modal_is_open());
+        assert!(app.dialog().is_none());
+        let handle_id = app.chat_runtime_mut(target).unwrap().cache["image"].image.as_ref().unwrap().id();
+        assert_eq!(
+            handle_id,
+            app.chat_ui
+                .image_viewer
+                .as_ref()
+                .unwrap()
+                .selected_handle_id()
+        );
         assert!(Action::ImageNext(true).allowed_while_modal());
         assert!(!Action::OpenImage(target, "image".into()).allowed_while_modal());
         drop(app.update(Message::ChatUi(Action::CloseImage)));

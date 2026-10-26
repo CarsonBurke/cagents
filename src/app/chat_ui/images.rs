@@ -2,6 +2,9 @@
 //! does not decode base64, read a file, or copy a pixel buffer.
 use super::*;
 mod canvas;
+pub(super) fn canvas_focus_id() -> widget::Id {
+    widget::Id::new("chat.image-viewer.canvas")
+}
 
 // Keep the pixel lease in the decoded buffer itself: cached turns, galleries,
 // detached widget trees and renderer host buffers all clone it. Counting cache
@@ -824,6 +827,9 @@ pub(in crate::app) struct Gallery {
     selected: usize,
     remote: bool,
     pub(super) reset: u64,
+    pub(super) actual_size: bool,
+    target: Option<Target>,
+    agent: Option<String>,
 }
 impl Gallery {
     pub(in crate::app) fn file(
@@ -839,12 +845,19 @@ impl Gallery {
                 path: Url::from_file_path(&path)
                     .map(|url| url.to_string())
                     .unwrap_or_default(),
-                label: format!("{} · {}", device.unwrap_or("This device"), path.display()),
+                label: format!(
+                    "{} · {}",
+                    device.unwrap_or("This device"),
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ),
                 handle,
             }],
             selected: 0,
             remote: device.is_some(),
             reset: 0,
+            actual_size: false,
+            target: None,
+            agent: None,
         }
     }
     pub(super) fn new(runtime: &Runtime, id: &str) -> Option<Self> {
@@ -885,11 +898,24 @@ impl Gallery {
                             .to_string_lossy()
                             .into_owned()
                     },
-                    label: if description.is_empty() {
-                        "Image".into()
-                    } else {
-                        description.clone()
-                    },
+                    label: reference
+                        .as_ref()
+                        .map(|reference| reference.name.clone())
+                        .filter(|name| !name.is_empty())
+                        .or_else(|| {
+                            Path::new(path)
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .map(str::to_owned)
+                        })
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or_else(|| {
+                            if description.is_empty() {
+                                "Image".into()
+                            } else {
+                                description.clone()
+                            }
+                        }),
                     handle: runtime.presentation_cache().get(&item.id)?.image.clone()?,
                 })
             })
@@ -900,7 +926,31 @@ impl Gallery {
             selected,
             remote: crate::device::is_remote(),
             reset: 0,
+            actual_size: false,
+            target: Some(runtime.target),
+            agent: runtime.selected_subagent.clone(),
         })
+    }
+    /// Device-file previews retain their dialog; transcript previews belong to
+    /// the exact runtime generation and agent that supplied the clicked image.
+    pub(in crate::app) fn is_modal(&self) -> bool {
+        self.target.is_none()
+    }
+    #[cfg(test)]
+    pub(super) fn selected_handle_id(&self) -> iced::advanced::image::Id {
+        self.entries[self.selected].handle.id()
+    }
+    pub(in crate::app) fn target(&self) -> Option<Target> {
+        self.target
+    }
+    pub(super) fn belongs_to(&self, runtime: &Runtime) -> bool {
+        self.target == Some(runtime.target) && self.agent == runtime.selected_subagent
+    }
+    pub(super) fn select(&mut self, index: usize) {
+        if index < self.entries.len() && index != self.selected {
+            self.selected = index;
+            self.reset = self.reset.wrapping_add(1);
+        }
     }
     pub(in crate::app) fn next(&mut self, forward: bool) {
         self.selected = if forward {
@@ -930,55 +980,148 @@ impl Gallery {
     }
     pub(in crate::app) fn view(&self) -> Element<'_, Message> {
         let entry = &self.entries[self.selected];
-        let navigation = self.entries.len() > 1;
-        let toolbar = widget::row::with_children(vec![
-            icon(
-                Icon::ChevronLeft,
-                "Previous image (Left)",
-                navigation,
-                Action::ImageNext(false),
-            ),
-            design::caption(format!("{} / {}", self.selected + 1, self.entries.len())).into(),
-            icon(
-                Icon::ChevronRight,
-                "Next image (Right)",
-                navigation,
-                Action::ImageNext(true),
-            ),
-            iced::widget::Space::new().width(Length::Fill).into(),
+        let mut controls = Vec::new();
+        if self.entries.len() > 1 {
+            controls.extend([
+                icon(
+                    Icon::ChevronLeft,
+                    "Previous image (Left)",
+                    true,
+                    Action::ImageNext(false),
+                ),
+                design::caption(format!("{} / {}", self.selected + 1, self.entries.len())).into(),
+                icon(
+                    Icon::ChevronRight,
+                    "Next image (Right)",
+                    true,
+                    Action::ImageNext(true),
+                ),
+            ]);
+        }
+        controls.extend([
             crate::ui_controls::button::secondary("Fit")
                 .on_press(action(Action::ImageFit))
                 .into(),
-            crate::ui_controls::button::secondary("Open externally")
-                .on_press_maybe(self.url().map(|_| action(Action::ImageExternal)))
+            crate::ui_controls::button::secondary("100%")
+                .on_press(action(Action::ImageActualSize))
                 .into(),
+            crate::interaction::tooltip(
+                crate::ui_controls::button::secondary("Open externally")
+                    .on_press_maybe(self.url().map(|_| action(Action::ImageExternal))),
+                if self.url().is_some() {
+                    "Open the original image in another application"
+                } else {
+                    "The original image is unavailable to external applications on this device"
+                },
+            ),
             icon(Icon::Close, "Close image (Esc)", true, Action::CloseImage),
-        ])
-        .spacing(step::GAP_S)
-        .align_y(iced::Alignment::Center);
+        ]);
+        let toolbar = widget::flex_row(controls)
+            .spacing(step::GAP_XS as u16)
+            .align_items(iced::Alignment::Center);
         let viewer: Element<'_, Message> = iced::widget::image::Viewer::new(entry.handle.clone())
             .width(Length::Fill)
             .height(Length::Fill)
-            .content_fit(iced::ContentFit::Contain)
+            .content_fit(if self.actual_size {
+                iced::ContentFit::None
+            } else {
+                iced::ContentFit::Contain
+            })
             .min_scale(0.1)
             .max_scale(20.0)
             .into();
-        let canvas = canvas::resettable(self.reset, viewer);
-        dialog_ui::overlay(
-            dialog_ui::surface(
-                widget::column::with_children(vec![
-                    toolbar.into(),
-                    design::caption(entry.label.as_str()).into(),
-                    canvas.into(),
-                    design::caption("Scroll to zoom · Drag to pan · Left / Right to browse").into(),
-                ])
-                .spacing(step::GAP_S)
-                .height(Length::Fill),
-                f32::MAX,
-            ),
-            Some(action(Action::CloseImage)),
-            1.0,
-        )
+        let mut content = vec![
+            design::caption(entry.label.as_str()).into(),
+            toolbar.into(),
+            canvas::resettable(self.reset, viewer),
+        ];
+        if self.entries.len() > 1 {
+            // Reuse already admitted handles. Keep the strip small even if a
+            // conversation has many images; opening it never starts a decode.
+            let start = self
+                .selected
+                .saturating_sub(3)
+                .min(self.entries.len().saturating_sub(7));
+            let thumbs = self
+                .entries
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(7)
+                .map(|(index, entry)| {
+                    widget::button::custom(
+                        iced::widget::image(entry.handle.clone())
+                            .width(56)
+                            .height(40)
+                            .content_fit(iced::ContentFit::Contain),
+                    )
+                    .class(crate::ui_controls::control_style(
+                        index == self.selected,
+                        None,
+                    ))
+                    .padding(2)
+                    .on_press(action(Action::ImageSelect(index)))
+                    .into()
+                })
+                .collect::<Vec<Element<'_, Message>>>();
+            content.push(widget::flex_row(thumbs).spacing(step::GAP_XS as u16).into());
+        }
+        let dimensions = match &entry.handle {
+            iced::widget::image::Handle::Rgba { width, height, .. } => {
+                format!("{width} × {height} · ")
+            }
+            _ => String::new(),
+        };
+        content.push(
+            design::caption(format!("{dimensions}Scroll or + / − to zoom · Drag to pan")).into(),
+        );
+        let surface = crate::interaction::focused_key(
+            widget::container(
+                widget::column::with_children(content)
+                    .spacing(step::GAP_XS)
+                    .height(Length::Fill),
+            )
+            .padding(step::GAP_S)
+            .class(design::surface(
+                Some(design::raised),
+                [design::RADIUS_M; 4],
+                true,
+            ))
+            .width(Length::Fill)
+            .height(Length::Fill),
+            |event| {
+                let iced::keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
+                    return None;
+                };
+                if !modifiers.is_empty() {
+                    return None;
+                }
+                let command = match key {
+                    iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) => {
+                        Action::CloseImage
+                    }
+                    iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowLeft) => {
+                        Action::ImageNext(false)
+                    }
+                    iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowRight) => {
+                        Action::ImageNext(true)
+                    }
+                    iced::keyboard::Key::Character(key) if key == "0" => Action::ImageFit,
+                    iced::keyboard::Key::Character(key) if key == "1" => Action::ImageActualSize,
+                    _ => return None,
+                };
+                Some(action(command))
+            },
+        );
+        if self.is_modal() {
+            dialog_ui::overlay(
+                dialog_ui::surface(surface, f32::MAX),
+                Some(action(Action::CloseImage)),
+                1.0,
+            )
+        } else {
+            surface
+        }
     }
 }
 impl Runtime {
@@ -994,13 +1137,23 @@ impl Runtime {
             _ => "Image".into(),
         };
         let Some(handle) = &cached.image else {
-            return if cached.image_unavailable {
-                design::caption(
+            let placeholder: Element<'static, Message> = if cached.image_unavailable {
+                let notice = design::caption(
                     cached
                         .image_error
                         .clone()
                         .unwrap_or_else(|| format!("{label} · Preview unavailable")),
-                )
+                );
+                let can_retry =
+                    matches!(&item.content, ItemContent::Image { path, .. } if !path.is_empty());
+                widget::column::with_children(std::iter::once(notice.into()).chain(can_retry.then(
+                    || {
+                        crate::ui_controls::button::secondary("Retry preview")
+                            .on_press(action(Action::LoadImage(self.target, item.id.clone())))
+                            .into()
+                    },
+                )))
+                .spacing(step::GAP_XS)
                 .into()
             } else if cached.image_wait.is_some() {
                 design::caption(format!("{label} · Waiting for preview memory…")).into()
@@ -1012,7 +1165,7 @@ impl Runtime {
                 design::caption(format!("{label} · Loading preview…")).into()
             } else {
                 widget::column::with_children(vec![
-                    design::caption(label).into(),
+                    design::caption(label.clone()).into(),
                     crate::ui_controls::button::secondary("Load preview")
                         .on_press(action(Action::LoadImage(self.target, item.id.clone())))
                         .into(),
@@ -1020,21 +1173,46 @@ impl Runtime {
                 .spacing(step::GAP_XS)
                 .into()
             };
+            return widget::container(
+                widget::column::with_children(vec![
+                    widget::container(placeholder)
+                        .height(216)
+                        .width(Length::Fill)
+                        .center_y(Length::Fill)
+                        .padding(step::GAP_S)
+                        .class(design::surface(
+                            Some(design::raised),
+                            [design::RADIUS_M; 4],
+                            true,
+                        ))
+                        .into(),
+                    design::caption(label).into(),
+                ])
+                .spacing(step::GAP_XS)
+                .width(Length::Fill),
+            )
+            .width(Length::Fill)
+            .max_width(480)
+            .into();
         };
         let preview = iced::widget::image(handle.clone())
             .width(Length::Fill)
-            .height(280)
+            .height(216)
             .content_fit(iced::ContentFit::Contain);
-        widget::column::with_children(vec![
-            widget::button::custom(preview)
-                .class(crate::ui_controls::control_style(false, None))
-                .padding(0)
-                .on_press(action(Action::OpenImage(self.target, item.id.clone())))
-                .width(Length::Fill)
-                .into(),
-            design::caption(format!("{label} · Click to enlarge")).into(),
-        ])
-        .spacing(step::GAP_XS)
+        widget::container(
+            widget::column::with_children(vec![
+                widget::button::custom(preview)
+                    .class(crate::ui_controls::control_style(false, None))
+                    .padding(0)
+                    .on_press(action(Action::OpenImage(self.target, item.id.clone())))
+                    .width(Length::Fill)
+                    .into(),
+                design::caption(format!("{label} · Click to enlarge")).into(),
+            ])
+            .spacing(step::GAP_XS)
+            .width(Length::Fill),
+        )
+        .max_width(480)
         .width(Length::Fill)
         .into()
     }
@@ -1688,6 +1866,9 @@ mod tests {
             selected: 0,
             remote: false,
             reset: 0,
+            actual_size: false,
+            target: None,
+            agent: None,
         };
         gallery.next(false);
         assert_eq!(gallery.selected, 1);

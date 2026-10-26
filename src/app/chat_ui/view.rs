@@ -993,7 +993,7 @@ impl Cagents {
                 } else {
                     Vec::new()
                 };
-                let view = runtime.view(
+                let view = runtime.view_with_gallery(
                     self.chat_auth_recovery(runtime),
                     self.chat_start_pending(card),
                     self.settings.chat_enter_sends,
@@ -1007,6 +1007,10 @@ impl Cagents {
                     !self.workspace_inputs_blocked(),
                     accounts,
                     offers,
+                    self.chat_ui
+                        .image_viewer
+                        .as_ref()
+                        .filter(|gallery| gallery.belongs_to(runtime)),
                 );
                 if !runtime.closed_elsewhere
                     && let Some(recovery) = self.account_recovery_controls(card)
@@ -1730,6 +1734,33 @@ impl Runtime {
         accounts: Option<ChatAccounts>,
         offers: Vec<Offer<'a>>,
     ) -> Element<'a, Message> {
+        self.view_with_gallery(
+            recovery,
+            transitioning,
+            enter_sends,
+            shortcuts,
+            content_width,
+            place,
+            accepting_drops,
+            accounts,
+            offers,
+            None,
+        )
+    }
+
+    fn view_with_gallery<'a>(
+        &'a self,
+        recovery: Option<auth_recovery::Recovery>,
+        transitioning: bool,
+        enter_sends: bool,
+        shortcuts: &crate::settings::KeyboardShortcuts,
+        content_width: f32,
+        place: Place,
+        accepting_drops: bool,
+        accounts: Option<ChatAccounts>,
+        offers: Vec<Offer<'a>>,
+        gallery: Option<&'a images::Gallery>,
+    ) -> Element<'a, Message> {
         if self.awaiting_admission() {
             return self.pending_admission_view();
         }
@@ -2291,7 +2322,9 @@ impl Runtime {
         // chooser is open, preserving its native scroll and selection state.
         content.push(crate::interaction::exclusive_layer(
             transcript_layer,
-            self.child_picker_view(),
+            gallery
+                .map(images::Gallery::view)
+                .or_else(|| self.child_picker_view()),
         ));
         if selected.is_none() && self.unseen_activity && !self.active_scroll().at_bottom() {
             content.push(

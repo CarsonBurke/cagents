@@ -6060,10 +6060,8 @@ impl Cagents {
         let width = if self.workspace.cards().is_empty() {
             // The welcome view has no WorkspaceSurface to replace the startup
             // width estimate. Use the window's current bounds until one mounts.
-            let sidebar = sidebar::effective_width(
-                self.projects_sidebar_mode(),
-                self.settings.sidebar_width,
-            );
+            let sidebar =
+                sidebar::effective_width(self.projects_sidebar_mode(), self.settings.sidebar_width);
             let inspector = if matches!(
                 self.context_inspector_mount(),
                 Some(InspectorLayout::Docked)
@@ -12142,7 +12140,7 @@ impl Cagents {
             || self.dirty_repository_close.is_some()
             || self.transient_work_close.is_some()
             || self.automation_ui.draft_dialog_open()
-            || self.chat_ui.image_viewer.is_some()
+            || self.chat_ui.image_viewer.as_ref().is_some_and(chat_ui::images::Gallery::is_modal)
             || self.terminal_paste.is_some()
             || self.terminal_close_dialog_visible()
             || self.settings_reset_confirm
@@ -13633,7 +13631,11 @@ impl Cagents {
             && self.transient_work_close.is_none()
             && !self.automation_ui.draft_dialog_open()
             && !self.device_ui.open
-            && self.chat_ui.image_viewer.is_none()
+            && !self
+                .chat_ui
+                .image_viewer
+                .as_ref()
+                .is_some_and(chat_ui::images::Gallery::is_modal)
             && self.terminal_paste.is_none()
             && !self.session_recovery.open()
             && !self.daemon_health_ui.confirmation
@@ -14181,6 +14183,12 @@ impl Application for Cagents {
                 _ => {}
             }
         }
+        if self.chat_ui.image_viewer.as_ref().and_then(chat_ui::images::Gallery::target)
+            .is_some_and(|target| !matches!(self.cards.get(&target.card),
+                Some(CardRuntime::Chat(runtime)) if runtime.target == target))
+        {
+            self.chat_ui.image_viewer = None;
+        }
         self.tab_history.observe(self.workspace.focused());
         // A workspace opened some other way while the switcher is held, by a
         // click on one of its rows or in the sidebar, is the choice. Anything
@@ -14190,7 +14198,7 @@ impl Application for Cagents {
             && (matches!(&message, Message::Sidebar(action) if WorkspaceDestination::from_action(action).is_some())
                 || self.update_prepared
                 || self.workspace_inputs_blocked()
-                || self.chat_ui.image_viewer.is_some())
+                || self.chat_ui.image_viewer.as_ref().is_some_and(chat_ui::images::Gallery::is_modal))
         {
             self.cancel_workspace_preview();
         }
@@ -16825,23 +16833,6 @@ impl Application for Cagents {
                 if let keyboard::Event::ModifiersChanged(modifiers) = &event {
                     self.keyboard_modifiers = *modifiers;
                 }
-                if self.chat_ui.image_viewer.is_some() {
-                    if let keyboard::Event::KeyPressed { key, .. } = &event {
-                        match key {
-                            keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                                self.chat_ui.image_viewer = None
-                            }
-                            keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
-                                self.chat_ui.image_viewer.as_mut().unwrap().next(false);
-                            }
-                            keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
-                                self.chat_ui.image_viewer.as_mut().unwrap().next(true);
-                            }
-                            _ => {}
-                        }
-                    }
-                    return Task::none();
-                }
                 if !captured
                     && !self.workspace_inputs_blocked()
                     && workspace_widget::global_shortcut(
@@ -17877,7 +17868,9 @@ impl Application for Cagents {
                 1.0,
             ));
         }
-        if let Some(gallery) = &self.chat_ui.image_viewer {
+        if let Some(gallery) = &self.chat_ui.image_viewer
+            && gallery.is_modal()
+        {
             return Some(gallery.view());
         }
         if let Some(dialog) = self.terminal_paste_dialog() {

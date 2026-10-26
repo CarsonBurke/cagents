@@ -15,21 +15,38 @@ struct Canvas<'a> {
     revision: u64,
     content: Element<'a, Message>,
 }
-struct Revision(u64);
+struct Revision {
+    revision: u64,
+    focused: bool,
+}
+impl iced::advanced::widget::operation::Focusable for Revision {
+    fn is_focused(&self) -> bool {
+        self.focused
+    }
+    fn focus(&mut self) {
+        self.focused = true;
+    }
+    fn unfocus(&mut self) {
+        self.focused = false;
+    }
+}
 impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Canvas<'_> {
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<Revision>()
     }
     fn state(&self) -> tree::State {
-        tree::State::new(Revision(self.revision))
+        tree::State::new(Revision {
+            revision: self.revision,
+            focused: false,
+        })
     }
     fn children(&self) -> Vec<Tree> {
         vec![Tree::new(self.content.as_widget())]
     }
     fn diff(&mut self, tree: &mut Tree) {
         let revision = tree.state.downcast_mut::<Revision>();
-        if revision.0 != self.revision {
-            revision.0 = self.revision;
+        if revision.revision != self.revision {
+            revision.revision = self.revision;
             tree.children = self.children();
         } else {
             tree.children[0].diff(self.content.as_widget_mut());
@@ -55,6 +72,11 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Canvas<'_> {
         renderer: &cosmic::Renderer,
         operation: &mut dyn Operation,
     ) {
+        operation.focusable(
+            Some(&canvas_focus_id()),
+            layout.bounds(),
+            tree.state.downcast_mut::<Revision>(),
+        );
         self.content
             .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation);
@@ -70,16 +92,50 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Canvas<'_> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        let state = tree.state.downcast_mut::<Revision>();
+        if matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_))) {
+            state.focused = cursor.is_over(layout.bounds());
+        }
+        let zoom = if state.focused {
+            match event {
+                Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Character(key),
+                    modifiers,
+                    ..
+                }) if !modifiers.command() && !modifiers.control() && !modifiers.alt() => {
+                    match key.as_str() {
+                        "+" | "=" => Some(1.0),
+                        "-" | "−" => Some(-1.0),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let zoom_event = zoom.map(|y| {
+            Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { x: 0.0, y },
+            })
+        });
         self.content.as_widget_mut().update(
             &mut tree.children[0],
-            event,
+            zoom_event.as_ref().unwrap_or(event),
             layout,
-            cursor,
+            if zoom.is_some() {
+                mouse::Cursor::Available(layout.bounds().center())
+            } else {
+                cursor
+            },
             renderer,
             clipboard,
             shell,
             viewport,
         );
+        if zoom.is_some() {
+            shell.capture_event();
+        }
     }
     fn mouse_interaction(
         &self,
