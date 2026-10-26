@@ -5822,8 +5822,8 @@ impl RepositoryRuntime {
         struct Source(CardId, DocumentWatch);
         impl std::hash::Hash for Source {
             fn hash<H: std::hash::Hasher>(&self, hasher: &mut H) {
-                self.0.hash(hasher);
-                self.1.id().hash(hasher);
+                std::hash::Hash::hash(&self.0, hasher);
+                std::hash::Hash::hash(&self.1.id(), hasher);
             }
         }
         iced::Subscription::run_with(Source(card, watch.clone()), |source| {
@@ -6095,9 +6095,21 @@ impl RepositoryRuntime {
                     self.dismiss_editor_results();
                     self.diffs.retain(|(basis, _)| basis.is_immutable());
                 }
+                let card = identity.card;
                 let task = self.update_inner(RepositoryAction::FileLoaded { identity, result });
                 self.original_read_attested = attested;
-                task
+                if background {
+                    // Restoring the caret is not a foreground navigation.
+                    self.pending_editor_focus = None;
+                    let diff = if self.source_surface == SourceSurface::Diff {
+                        self.ensure_current_diff(card)
+                    } else {
+                        Task::none()
+                    };
+                    Task::batch([task, self.diagram_task(card), diff])
+                } else {
+                    task
+                }
             }
             RepositoryAction::FileLoaded { identity, result } => {
                 if !self.accepts_selected(&identity) {

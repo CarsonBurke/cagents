@@ -197,7 +197,16 @@ async fn clean_reload_retains_caret_scroll_and_preview_mode() {
     std::fs::write(&path, "ONE\nTWO\nTHREE\nFOUR\n").unwrap();
     text(card, &mut runtime, "ONE\nTWO\nTHREE\nFOUR\n").await;
     assert_eq!(runtime.markdown_mode, MarkdownMode::Preview);
+    assert!(
+        runtime.take_restored_editor_focus(card).is_none(),
+        "external changes must not steal keyboard focus"
+    );
     if let DocumentState::Editable(document) = &runtime.document {
+        assert!(
+            !document.markdown_items.is_empty(),
+            "selected preview must be reparsed"
+        );
+        assert!(document.preview_text.contains("THREE"));
         assert_eq!(
             document.content.cursor().position,
             text_editor::Position { line: 2, column: 3 }
