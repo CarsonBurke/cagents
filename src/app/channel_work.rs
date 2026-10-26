@@ -798,6 +798,18 @@ mod tests {
             cosmic::Renderer,
         >;
 
+        fn key(key: keyboard::Key, code: keyboard::key::Code, text: Option<&str>) -> iced::Event {
+            iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                modified_key: key.clone(),
+                key,
+                physical_key: keyboard::key::Physical::Code(code),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: text.map(Into::into),
+                repeat: false,
+            })
+        }
+
         #[derive(Debug)]
         struct FocusNode {
             id: Option<widget::Id>,

@@ -167,7 +167,7 @@ fn labels(ui: &mut Ui) -> Vec<(Role, String, iced::Rectangle)> {
 }
 
 fn enter(ui: &mut Ui, renderer: &mut cosmic::Renderer, id: widget::Id) -> Action {
-    ui.operate(renderer, &mut operation::focus(id.clone()));
+    ui.operate(renderer, &mut operation::focusable::focus(id.clone()));
     let mut probe = Mounted::default();
     ui.operate(renderer, &mut probe);
     assert_eq!(probe.focused, [id.clone()], "real native button focus");
@@ -576,7 +576,7 @@ fn presentation_controls_keep_native_focus_and_held_presses_with_the_exact_runti
                 messages.is_empty(),
                 "a physical Down must not activate {role}"
             );
-            ui.operate(&renderer, &mut operation::focus(control(target)));
+            ui.operate(&renderer, &mut operation::focusable::focus(control(target)));
             let mut focused = Mounted::default();
             ui.operate(&renderer, &mut focused);
             assert_eq!(focused.focused, [control(target)]);

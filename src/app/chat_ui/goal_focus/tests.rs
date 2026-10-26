@@ -437,7 +437,7 @@ fn restoration_preserves_named_and_anonymous_foreign_native_focus_and_requires_a
         let cache = ui.into_cache();
         let task = publish(&mut app, target, accounting);
         let foreign = text_editor::Content::with_text("Foreign native editor");
-        let field = widget::text_editor(&foreign);
+        let field = widget::text_editor::text_editor(&foreign);
         let field: Element<'_, Message> = if anonymous {
             field.into()
         } else {
