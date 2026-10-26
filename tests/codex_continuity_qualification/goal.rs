@@ -8,18 +8,61 @@ use std::os::fd::AsRawFd;
 const OBJECTIVE: &str = "SCENARIO goal: observe the private fixture; never call a tool";
 
 fn start(fixture: &Fixture) -> (Window, Session) {
-    fixture.start("goal", "never");
+    let accepted_agent: cagents::model::AgentId = fixture.start("goal", "never").parse().unwrap();
     let mut window = fixture.window();
+    let discovery_started = Instant::now();
+    let mut last_startup = None;
     let chat = until(
         Duration::from_secs(30),
         "the exact Goal conversation",
         || {
             let chats = window.chats();
             assert!(chats.len() <= 1);
-            chats
+            let chat_count = chats.len();
+            let thread_present = chats.iter().any(|chat| chat.launch.session_id.is_some());
+            let chat = chats
                 .into_iter()
                 .next()
-                .filter(|chat| chat.launch.session_id.is_some())
+                .filter(|chat| chat.launch.session_id.is_some());
+            if chat.is_none() {
+                // Read only the originally accepted agent, through this window's
+                // existing fixture-daemon connection. Never resubmit on failure.
+                let remaining = Duration::from_secs(30).saturating_sub(discovery_started.elapsed());
+                if remaining.is_zero() {
+                    return None;
+                }
+                let previous_timeout = window.stream.read_timeout().unwrap();
+                window.stream.set_read_timeout(Some(remaining)).unwrap();
+                let response = window.request(ClientRequest::Agent {
+                    authority: cagents::agent_execution::Authority::default(),
+                    operation: cagents::agent_execution::Operation::Status(accepted_agent),
+                });
+                window.stream.set_read_timeout(previous_timeout).unwrap();
+                let ServerResponse::Agent(cagents::agent_execution::Reply::Status { agent, run }) =
+                    response
+                else {
+                    panic!("expected the accepted Goal agent's public status");
+                };
+                assert_eq!(agent.id, accepted_agent);
+                assert_eq!(run.agent, accepted_agent);
+                // Bound and escape only the diagnostic: no Agent, launch recipe,
+                // authority or provider result text is written to the test log.
+                let diagnostic = run.result.diagnostic.as_deref().map(|text| {
+                    text.chars()
+                        .flat_map(char::escape_default)
+                        .take(512)
+                        .collect::<String>()
+                });
+                let startup = (run.id, run.state, diagnostic, chat_count, thread_present);
+                if last_startup.as_ref() != Some(&startup) {
+                    eprintln!(
+                        "Goal startup: accepted_agent={accepted_agent} run={} state={:?} diagnostic={:?} chats={} thread_present={}",
+                        startup.0, startup.1, startup.2, startup.3, startup.4
+                    );
+                    last_startup = Some(startup);
+                }
+            }
+            chat
         },
     );
     window.attach(chat.clone());
