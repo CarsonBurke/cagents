@@ -2,9 +2,48 @@ use super::*;
 use crate::{
     channel_work::Home,
     channel_work_api as api,
-    channel_work_ui::{self as ui, Effect, Failure},
+    channel_work_ui::{
+        self as ui, Effect, Failure,
+        journal::{self, Destination, Record},
+    },
     model::WorktreeId,
 };
+
+mod recovery;
+
+#[derive(Clone, Debug)]
+pub(super) enum Completion {
+    Loaded {
+        generation: uuid::Uuid,
+        result: Result<journal::Loaded, String>,
+    },
+    Applied {
+        ticket: ui::Ticket,
+        record: Record,
+        route: Route,
+        result: Result<crate::channel_work::Reply, Failure>,
+        settled: bool,
+    },
+    LookedUp {
+        ticket: ui::Ticket,
+        home: Home,
+        operation: uuid::Uuid,
+        route: Option<Route>,
+        result: Result<Option<crate::channel_work::Receipt>, Failure>,
+        settled: bool,
+    },
+    BeforeSendFailed {
+        ticket: ui::Ticket,
+        operation: uuid::Uuid,
+        record: Option<Record>,
+        reason: String,
+        retained: bool,
+    },
+    Interrupted {
+        ticket: ui::Ticket,
+        operation: uuid::Uuid,
+    },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum Surface {
@@ -30,6 +69,18 @@ pub(super) struct State {
     restore_card: Option<CardId>,
     deferred: Option<Deferred>,
     navigation_view: Option<ui::ViewOwner>,
+    saved_view: Option<ui::ViewOwner>,
+    saved: HashMap<uuid::Uuid, Record>,
+    recovery_only: HashSet<uuid::Uuid>,
+    operation_routes: HashMap<uuid::Uuid, Route>,
+    loading_saved: Option<uuid::Uuid>,
+    desired_saved: Option<uuid::Uuid>,
+    #[cfg(test)]
+    saved_loader: Option<Arc<dyn Fn() -> Result<journal::Loaded, String> + Send + Sync>>,
+    saved_ready: bool,
+    dispatches: HashMap<uuid::Uuid, ui::Ticket>,
+    lookups: HashMap<uuid::Uuid, ui::Ticket>,
+    normal_navigation: Option<(Home, Option<ui::ViewOwner>, Option<journal::Profile>)>,
 }
 
 impl Default for State {
@@ -44,6 +95,18 @@ impl Default for State {
             restore_card: None,
             deferred: None,
             navigation_view: None,
+            saved_view: None,
+            saved: HashMap::new(),
+            recovery_only: HashSet::new(),
+            operation_routes: HashMap::new(),
+            loading_saved: None,
+            desired_saved: None,
+            #[cfg(test)]
+            saved_loader: None,
+            saved_ready: false,
+            dispatches: HashMap::new(),
+            lookups: HashMap::new(),
+            normal_navigation: None,
         }
     }
 }
@@ -86,9 +149,11 @@ impl PaneDestination {
     }
 }
 
-#[derive(Clone)]
-struct Route {
+#[derive(Clone, Debug)]
+pub(super) struct Route {
     socket: PathBuf,
+    profile: Option<journal::Profile>,
+    recovery_verified: bool,
     proof: Arc<Mutex<Option<crate::model::HostSessionProof>>>,
 }
 
@@ -98,6 +163,9 @@ impl Cagents {
     }
 
     pub(super) fn channel_home(&self) -> Option<(Home, String)> {
+        if self.channel_work.view.saved_is_shown() {
+            return None;
+        }
         if self.channel_work_is_main() {
             return Some((
                 self.channel_work.view.home()?,
@@ -154,7 +222,16 @@ impl Cagents {
         };
         let title = channel.title.clone();
         let was_main = self.channel_work_is_main();
+        let previous_owner = self.channel_work.view.owner();
+        let profile = recovery::capture_profile();
+        let saved = self.channel_work.view.load_saved();
         let effect = self.channel_work.view.open(home, title);
+        if matches!(&effect, Some(Effect::Read { home: accepted, .. }) if *accepted == home) {
+            self.install_normal_channel_route(home, profile);
+            self.channel_work.saved_view = None;
+        } else if self.channel_work.view.has_confirmation() {
+            self.channel_work.normal_navigation = Some((home, previous_owner, profile));
+        }
         if matches!(&effect, Some(Effect::Read { home: accepted, .. }) if *accepted == home) {
             // An explicit accepted open selects its destination even when the
             // existing view owner is unchanged. Coalesced reads and draft
@@ -178,7 +255,9 @@ impl Cagents {
                 self.set_workspace_surfaces_visible(false);
             }
         }
-        effect.map_or_else(Task::none, |effect| self.channel_work_effect(effect))
+        let load = self.channel_work_effect(saved);
+        let open = effect.map_or_else(Task::none, |effect| self.channel_work_effect(effect));
+        Task::batch([load, open])
     }
 
     /// Only stable navigation is deferred through the Work draft guard. Pane
@@ -268,6 +347,9 @@ impl Cagents {
                 // accepted Work leave below may perform that navigation.
                 drop(self.update_palette(palette_ui::Action::Close));
                 self.channel_work.deferred = Some(Deferred::Pane(destination));
+                if self.channel_work.view.saved_is_shown() {
+                    return Some(self.escape_channel_work());
+                }
                 let owner = self.channel_work.view.owner()?;
                 return Some(self.update_channel_work(ui::Action::Close(owner)));
             }
@@ -336,6 +418,9 @@ impl Cagents {
             repository,
             message: Box::new(message.clone()),
         });
+        if self.channel_work.view.saved_is_shown() {
+            return Some(self.escape_channel_work());
+        }
         let owner = self.channel_work.view.owner()?;
         Some(self.update_channel_work(ui::Action::Close(owner)))
     }
@@ -572,20 +657,366 @@ impl Cagents {
         let effect = self.channel_work.view.escape();
         if was_confirming && !self.channel_work.view.has_confirmation() {
             self.channel_work.deferred = None;
+            self.channel_work.normal_navigation = None;
         }
         effect.map_or_else(Task::none, |effect| self.channel_work_effect(effect))
     }
 
     pub(super) fn update_channel_work(&mut self, action: ui::Action) -> Task<Message> {
+        let show_saved = matches!(&action, ui::Action::ShowSaved);
         let keep = matches!(&action, ui::Action::Keep(..));
         let effect = self.channel_work.view.update(action);
+        if self.channel_work.view.is_open()
+            && (show_saved || self.channel_work.view.saved_is_shown())
+        {
+            self.mount_channel_work_main();
+        }
         if keep && !self.channel_work.view.has_confirmation() {
+            self.channel_work.normal_navigation = None;
             self.channel_work.deferred = None;
         }
         effect.map_or_else(Task::none, |effect| self.channel_work_effect(effect))
     }
 
+    pub(super) fn load_saved_channel_work(&mut self) -> Task<Message> {
+        let effect = self.channel_work.view.load_saved();
+        self.channel_work_effect(effect)
+    }
+
+    fn mount_channel_work_main(&mut self) {
+        if !self.channel_work_is_main() {
+            self.channel_work.restore_card = self.workspace.focused();
+            self.channel_work.generation = uuid::Uuid::new_v4();
+        }
+        self.channel_work.main = true;
+        self.set_workspace_surfaces_visible(false);
+    }
+
+    pub(super) fn complete_channel_work(&mut self, completion: Completion) -> Task<Message> {
+        let mut confirmed_membership = false;
+        let action = match completion {
+            Completion::Loaded { generation, result } => {
+                if self.channel_work.loading_saved != Some(generation) {
+                    return Task::none();
+                }
+                // Release only the actual completed scan, before checking its
+                // presentation generation. Closing/reopening does not cancel I/O.
+                self.channel_work.loading_saved = None;
+                let desired = self.channel_work.desired_saved.take();
+                if desired != Some(generation)
+                    || !self.channel_work.view.saved_load_is_current(generation)
+                {
+                    return desired
+                        .filter(|next| self.channel_work.view.saved_load_is_current(*next))
+                        .map_or_else(Task::none, |generation| {
+                            self.channel_work_effect(Effect::LoadSaved { generation })
+                        });
+                }
+                let mut problems = Vec::new();
+                let mut occupied = 0;
+                let mut saturated = false;
+                self.channel_work.saved_ready = false;
+                let result = result.and_then(|loaded| {
+                    occupied = loaded.occupied;
+                    saturated = loaded.saturated;
+                    problems = loaded.problems.iter().map(|problem| match problem.operation {
+                        Some(operation) => format!("Saved change {operation} could not be read ({:?}). It has been kept.", problem.kind),
+                        None => format!("Some saved changes could not be read ({:?}). They have been kept.", problem.kind),
+                    }).collect();
+                    let info = loaded.records.iter().map(saved_info).collect::<Vec<_>>();
+                    let union = self.channel_work.saved.keys().copied()
+                        .chain(loaded.records.iter().map(Record::operation)).collect::<HashSet<_>>();
+                    if union.len() > 32 || !self.channel_work.view.can_restore_saved(&info)
+                        || loaded.records.iter().any(|record| self.channel_work.saved.get(&record.operation()).is_some_and(|old| old != record))
+                    {
+                        return Err("Saved changes could not be combined safely. Check existing original results, then reload saved changes.".into());
+                    }
+                    self.channel_work.saved_ready = loaded.problems.is_empty();
+                    for record in loaded.records {
+                        if !self.channel_work.saved.contains_key(&record.operation())
+                            && !self.channel_work.operation_routes.contains_key(&record.operation())
+                        {
+                            self.channel_work.recovery_only.insert(record.operation());
+                        }
+                        self.channel_work.operation_routes.entry(record.operation()).or_insert_with(|| Route::saved(&record));
+                        self.channel_work.saved.insert(record.operation(), record);
+                    }
+                    Ok(info)
+                });
+                ui::Action::SavedLoaded {
+                    generation,
+                    result,
+                    problems,
+                    occupied,
+                    saturated,
+                }
+            }
+            Completion::Applied {
+                ticket,
+                record,
+                route,
+                result,
+                settled,
+            } => {
+                let operation = record.operation();
+                if self.channel_work.dispatches.get(&operation) != Some(&ticket) {
+                    return Task::none();
+                }
+                self.channel_work.dispatches.remove(&operation);
+                confirmed_membership = result
+                    .as_ref()
+                    .is_ok_and(|reply| valid_saved_reply(&record, reply));
+                if settled
+                    && result
+                        .as_ref()
+                        .is_ok_and(|reply| valid_saved_reply(&record, reply))
+                {
+                    self.channel_work.saved.remove(&operation);
+                    self.channel_work.recovery_only.remove(&operation);
+                    self.channel_work.operation_routes.remove(&operation);
+                } else {
+                    self.channel_work.operation_routes.insert(operation, route);
+                    self.channel_work.saved.insert(operation, record);
+                }
+                ui::Action::AppliedWithSettlement {
+                    ticket,
+                    result,
+                    settled,
+                }
+            }
+            Completion::LookedUp {
+                ticket,
+                home,
+                operation,
+                route,
+                result,
+                settled,
+            } => {
+                if home != ticket.home || self.channel_work.lookups.get(&operation) != Some(&ticket)
+                {
+                    return Task::none();
+                }
+                self.channel_work.lookups.remove(&operation);
+                let matches_original = result.as_ref().is_ok_and(|receipt| {
+                    receipt.as_ref().is_some_and(|receipt| {
+                        self.channel_work
+                            .view
+                            .original_mutation(home, operation)
+                            .is_some_and(|intent| {
+                                journal::mutation_confirms_receipt(intent, receipt)
+                            })
+                            && self
+                                .channel_work
+                                .saved
+                                .get(&operation)
+                                .is_none_or(|record| record.confirms_receipt(receipt))
+                    })
+                });
+                let valid_settlement = settled && matches_original;
+                confirmed_membership = matches_original;
+                if valid_settlement {
+                    self.channel_work.saved.remove(&operation);
+                    self.channel_work.recovery_only.remove(&operation);
+                    self.channel_work.operation_routes.remove(&operation);
+                } else if let Some(route) = route {
+                    self.channel_work.operation_routes.insert(operation, route);
+                }
+                ui::Action::LookedUpWithSettlement {
+                    ticket,
+                    operation,
+                    result,
+                    settled: valid_settlement,
+                }
+            }
+            Completion::BeforeSendFailed {
+                ticket,
+                operation,
+                record,
+                reason,
+                retained,
+            } => {
+                if self.channel_work.dispatches.get(&operation) != Some(&ticket) {
+                    return Task::none();
+                }
+                self.channel_work.dispatches.remove(&operation);
+                if !retained {
+                    self.channel_work.operation_routes.remove(&operation);
+                }
+                if let Some(record) = record {
+                    self.channel_work
+                        .operation_routes
+                        .entry(record.operation())
+                        .or_insert_with(|| Route::saved(&record));
+                    self.channel_work.saved.insert(record.operation(), record);
+                }
+                ui::Action::BeforeSendFailed {
+                    ticket,
+                    reason,
+                    retained,
+                }
+            }
+            Completion::Interrupted { ticket, operation } => {
+                if self.channel_work.dispatches.get(&operation) != Some(&ticket) {
+                    return Task::none();
+                }
+                self.channel_work.dispatches.remove(&operation);
+                let applied = self.update_channel_work(ui::Action::Applied {
+                    ticket,
+                    result: Err(Failure::Unavailable),
+                });
+                let effect = self.channel_work.view.load_saved();
+                return Task::batch([applied, self.channel_work_effect(effect)]);
+            }
+        };
+        let result = self.update_channel_work(action);
+        self.prune_channel_work_routes();
+        if confirmed_membership {
+            // A snapshot captured before receipt settlement must not reinsert
+            // its old record. Retire that load and start a fresh disk-only read.
+            let saved = self.channel_work.view.load_saved();
+            return Task::batch([result, self.channel_work_effect(saved)]);
+        }
+        self.retire_settled_empty_channels();
+        result
+    }
+
+    fn prune_channel_work_routes(&mut self) {
+        let keep = self
+            .channel_work
+            .view
+            .pending_homes()
+            .chain(self.channel_work.view.home())
+            .collect::<HashSet<_>>();
+        self.channel_work
+            .routes
+            .retain(|home, _| keep.contains(home));
+    }
+
+    fn install_normal_channel_route(&mut self, home: Home, profile: Option<journal::Profile>) {
+        self.install_normal_channel_route_with(
+            home,
+            profile,
+            crate::terminal::ipc::daemon_socket_path,
+        );
+    }
+
+    fn install_normal_channel_route_with(
+        &mut self,
+        home: Home,
+        profile: Option<journal::Profile>,
+        socket: impl FnOnce() -> std::io::Result<PathBuf>,
+    ) {
+        self.channel_work.normal_navigation = None;
+        // Ordinary entry always establishes the currently selected transport;
+        // a saved destination can never be upgraded into fresh write routing.
+        self.channel_work.routes.remove(&home);
+        if recovery::capture_profile() == profile
+            && let Ok(socket) = socket()
+        {
+            self.channel_work.routes.insert(
+                home,
+                Route {
+                    socket,
+                    profile,
+                    recovery_verified: false,
+                    proof: Arc::new(Mutex::new(None)),
+                },
+            );
+        }
+    }
+
+    fn admit_deferred_normal_route(
+        &mut self,
+        home: Home,
+        socket: impl FnOnce() -> std::io::Result<PathBuf>,
+    ) -> bool {
+        if let Some((destination, previous, profile)) = self.channel_work.normal_navigation.clone()
+            && destination == home
+            && self.channel_work.view.owner() != previous
+        {
+            self.install_normal_channel_route_with(home, profile, socket);
+            self.prune_channel_work_routes();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn open_saved_channel_work(&mut self, operation: uuid::Uuid) -> Task<Message> {
+        let Some(record) = self.channel_work.saved.get(&operation).cloned() else {
+            return Task::none();
+        };
+        let home = record.mutation().home;
+        let route = self
+            .channel_work
+            .operation_routes
+            .entry(operation)
+            .or_insert_with(|| Route::saved(&record))
+            .clone();
+        if self.channel_work.view.has_confirmation() {
+            return Task::none();
+        }
+        self.channel_work.normal_navigation = None;
+        let effect = self
+            .channel_work
+            .view
+            .open_saved_home(home, record.title().to_owned());
+        if matches!(&effect, Some(Effect::Read { home: accepted, .. }) if *accepted == home) {
+            self.channel_work.routes.insert(home, route);
+            self.channel_work.saved_view = self.channel_work.view.owner();
+            self.channel_work.title = record.title().to_owned();
+            self.mount_channel_work_main();
+        }
+        self.prune_channel_work_routes();
+        effect.map_or_else(Task::none, |effect| self.channel_work_effect(effect))
+    }
+
     pub(super) fn channel_work_effect(&mut self, effect: Effect) -> Task<Message> {
+        let effect = match effect {
+            Effect::LoadSaved { generation } => {
+                self.channel_work.desired_saved = Some(generation);
+                self.channel_work.saved_ready = false;
+                if self.channel_work.view.saved_is_shown() {
+                    self.mount_channel_work_main();
+                }
+                if self.channel_work.loading_saved.is_some() {
+                    return Task::none();
+                }
+                self.channel_work.loading_saved = Some(generation);
+                #[cfg(test)]
+                let loader = self.channel_work.saved_loader.clone();
+                return completed_task(
+                    move || Completion::Loaded {
+                        generation,
+                        result: {
+                            #[cfg(test)]
+                            if let Some(loader) = loader {
+                                return Completion::Loaded {
+                                    generation,
+                                    result: loader(),
+                                };
+                            }
+                            journal().and_then(|journal| {
+                                journal.load().map_err(|error| error.to_string())
+                            })
+                        },
+                    },
+                    Completion::Loaded {
+                        generation,
+                        result: Err("Saved changes could not be loaded".into()),
+                    },
+                );
+            }
+            Effect::OpenSaved { operation } => return self.open_saved_channel_work(operation),
+            Effect::CloseSaved => return self.finish_channel_conversations(),
+            effect => effect,
+        };
+        if let Effect::Read { home, .. } = &effect {
+            if self.admit_deferred_normal_route(*home, crate::terminal::ipc::daemon_socket_path) {
+                self.channel_work.saved_view = None;
+            }
+        }
+
         let home = match &effect {
             Effect::Read { home, .. }
             | Effect::Refresh { home, .. }
@@ -595,6 +1026,9 @@ impl Cagents {
             | Effect::Close { home } => *home,
             Effect::Mutate { mutation, .. } => mutation.home,
             Effect::Focus { owner, .. } => owner.home,
+            Effect::LoadSaved { .. } | Effect::OpenSaved { .. } | Effect::CloseSaved => {
+                unreachable!("saved effect handled")
+            }
         };
         let changed_view = self.channel_work_is_main()
             && self.channel_work.navigation_view != self.channel_work.view.owner();
@@ -605,6 +1039,7 @@ impl Cagents {
         let selection = if matches!(&effect, Effect::Read { .. })
             && self.channel_work_is_main()
             && self.channel_work.view.home() == Some(home)
+            && self.channel_work.saved_view != self.channel_work.view.owner()
         {
             // Only a newly accepted open (including Discard's destination)
             // selects scope. Polls, invalidations and page reads do not revisit
@@ -633,26 +1068,7 @@ impl Cagents {
         } else {
             Task::none()
         };
-        if !self.channel_work.routes.contains_key(&home)
-            && let Ok(socket) = crate::terminal::ipc::daemon_socket_path()
-        {
-            self.channel_work.routes.insert(
-                home,
-                Route {
-                    socket,
-                    proof: Arc::new(Mutex::new(None)),
-                },
-            );
-        }
-        let keep = self
-            .channel_work
-            .view
-            .pending_homes()
-            .chain(self.channel_work.view.home())
-            .collect::<HashSet<_>>();
-        self.channel_work
-            .routes
-            .retain(|home, _| keep.contains(home));
+        self.prune_channel_work_routes();
         let route = self.channel_work.routes.get(&home).cloned();
         let task = match effect {
             Effect::Read { ticket, home, page } => request(
@@ -696,48 +1112,118 @@ impl Cagents {
                 ticket,
                 mutation,
                 selection,
-            } => request(
-                route,
-                home,
-                match selection {
-                    Some(selection) => api::Request::ApplySelection {
-                        selection,
-                        mutation,
-                        caller: None,
+            } => {
+                let operation = mutation.operation;
+                if self.channel_work.recovery_only.contains(&operation) {
+                    return self.update_channel_work(ui::Action::BeforeSendFailed {
+                        ticket,
+                        reason: "Restored requests can only check their original result".into(),
+                        retained: true,
+                    });
+                }
+                if selection.is_none() {
+                    // Ordinary PR/known-row changes keep the existing memory-only
+                    // path. Journal capacity and discovery do not gate this send.
+                    return request(
+                        route,
+                        home,
+                        api::Request::Mutate {
+                            mutation,
+                            caller: None,
+                        },
+                        move |result| ui::Action::Applied {
+                            ticket,
+                            result: result.and_then(|response| match response {
+                                api::Response::Applied(reply) => Ok(reply),
+                                _ => Err(Failure::Unavailable),
+                            }),
+                        },
+                    );
+                }
+                if self.channel_work.dispatches.contains_key(&operation) {
+                    return Task::none();
+                }
+                self.channel_work.dispatches.insert(operation, ticket);
+                let original = self.channel_work.saved.get(&operation).cloned();
+                let captured = self.channel_work.operation_routes.get(&operation).cloned();
+                let retry = original.is_some() || captured.is_some();
+                // Capture before the worker runs: an interruption must not let
+                // Check/Retry borrow a later ordinary navigation transport.
+                let route = captured.or_else(|| if original.is_none() { route } else { None });
+                if let Some(route) = &route {
+                    self.channel_work
+                        .operation_routes
+                        .entry(operation)
+                        .or_insert_with(|| route.clone());
+                }
+                let title = self
+                    .channel_work
+                    .view
+                    .home()
+                    .filter(|current| *current == home)
+                    .map(|_| self.channel_work.title.clone())
+                    .unwrap_or_else(|| "Channel work".into())
+                    .chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .take(256)
+                    .collect();
+                completed_task(
+                    move || {
+                        dispatch_saved(ticket, mutation, selection, original, route, title, retry)
                     },
-                    None => api::Request::Mutate {
-                        mutation,
-                        caller: None,
-                    },
-                },
-                move |result| ui::Action::Applied {
-                    ticket,
-                    result: result.and_then(|response| match response {
-                        api::Response::Applied(reply) => Ok(reply),
-                        _ => Err(Failure::Unavailable),
-                    }),
-                },
-            ),
+                    Completion::Interrupted { ticket, operation },
+                )
+            }
             Effect::Lookup {
                 ticket,
                 home,
                 operation,
-            } => cosmic::task::future(async move {
-                let result = tokio::task::spawn_blocking(move || {
-                    let mut client = connect(route.as_ref(), home, true)?;
-                    match send(&mut client, api::Request::Receipt { home, operation })? {
-                        api::Response::Receipt(receipt) => Ok(receipt),
-                        _ => Err(Failure::Unavailable),
-                    }
-                })
-                .await
-                .unwrap_or(Err(Failure::Unavailable));
-                Message::ChannelWork(ui::Action::LookedUp {
-                    ticket,
-                    operation,
-                    result,
-                })
-            }),
+            } => {
+                if !self.channel_work.saved.contains_key(&operation)
+                    && !self.channel_work.operation_routes.contains_key(&operation)
+                {
+                    // Preserve the original memory-only Check: it always
+                    // reconciles the exact Registry/Home across daemon restart.
+                    return cosmic::task::future(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            let mut client = connect(route.as_ref(), home, true)?;
+                            match send(&mut client, api::Request::Receipt { home, operation })? {
+                                api::Response::Receipt(receipt) => Ok(receipt),
+                                _ => Err(Failure::Unavailable),
+                            }
+                        })
+                        .await
+                        .unwrap_or(Err(Failure::Unavailable));
+                        Message::ChannelWork(ui::Action::LookedUp {
+                            ticket,
+                            operation,
+                            result,
+                        })
+                    });
+                }
+                if self.channel_work.lookups.contains_key(&operation) {
+                    return Task::none();
+                }
+                self.channel_work.lookups.insert(operation, ticket);
+                let original = self.channel_work.saved.get(&operation).cloned();
+                let resident = self
+                    .channel_work
+                    .view
+                    .original_mutation(home, operation)
+                    .cloned();
+                let route = self.channel_work.operation_routes.get(&operation).cloned();
+                completed_task(
+                    move || lookup_saved(ticket, home, operation, original, resident, route),
+                    Completion::LookedUp {
+                        ticket,
+                        home,
+                        operation,
+                        route: None,
+                        result: Err(Failure::Unavailable),
+                        settled: false,
+                    },
+                )
+            }
             Effect::OpenPullRequest {
                 home: _,
                 key: _,
@@ -768,6 +1254,9 @@ impl Cagents {
                     self.open_link_in(url, destination)
                 }
             }
+            Effect::LoadSaved { .. } | Effect::OpenSaved { .. } | Effect::CloseSaved => {
+                unreachable!("saved effect handled")
+            }
             Effect::Close { .. } if self.channel_work.main => self.finish_channel_conversations(),
             Effect::Close { .. } => self.set_context_inspector_open(false),
             Effect::Focus { owner, id } => {
@@ -784,6 +1273,16 @@ impl Cagents {
     /// View publication supplies the settled revision. The daemon checks that
     /// exact revision and durable work/history together before retiring a home.
     pub(super) fn retire_settled_empty_channels(&mut self) {
+        // Discovery must be complete and safe before a local unsent request
+        // can be mistaken for an empty Home. Keep candidates for resumption.
+        if !self.channel_work.saved_ready || !self.channel_work.view.saved_discovery_ready() {
+            return;
+        }
+        let pending = self
+            .channel_work
+            .view
+            .pending_homes()
+            .collect::<HashSet<_>>();
         let candidates = self
             .channel_work
             .retire_candidates
@@ -791,6 +1290,9 @@ impl Cagents {
             .copied()
             .collect::<Vec<_>>();
         for captured in candidates {
+            if pending.contains(&captured) {
+                continue;
+            }
             let channel = captured.channel;
             let Some(metadata) = self.workspace_model.channel(channel) else {
                 self.channel_work.retire_candidates.remove(&captured);
@@ -823,6 +1325,266 @@ impl Cagents {
     }
 }
 
+impl Route {
+    fn saved(record: &Record) -> Self {
+        let destination = record.destination();
+        Self {
+            socket: destination.socket.clone(),
+            profile: destination.profile.clone(),
+            recovery_verified: false,
+            proof: Arc::new(Mutex::new(Some(destination.proof.clone()))),
+        }
+    }
+}
+
+fn saved_info(record: &Record) -> ui::SavedOperation {
+    ui::SavedOperation {
+        mutation: record.mutation().clone(),
+        selection: record.selection(),
+        title: record.title().to_owned(),
+        device_label: record
+            .destination()
+            .profile
+            .as_ref()
+            .map_or_else(|| "Local backend".into(), |profile| profile.name.clone()),
+        confirmed: None,
+    }
+}
+
+fn journal() -> Result<journal::Journal, String> {
+    let directories = crate::instance::project_dirs()
+        .ok_or("The application recovery directory is unavailable")?;
+    journal::Journal::at(directories.data_dir().join("channel-work-pending"))
+        .map_err(|error| error.to_string())
+}
+
+fn completed_task(
+    work: impl FnOnce() -> Completion + Send + 'static,
+    fallback: Completion,
+) -> Task<Message> {
+    cosmic::task::future(async move {
+        let completion = tokio::task::spawn_blocking(work).await.unwrap_or(fallback);
+        Message::ChannelWorkCompleted(Box::new(completion))
+    })
+}
+
+fn valid_saved_reply(record: &Record, reply: &crate::channel_work::Reply) -> bool {
+    record.confirms_receipt(&reply.receipt)
+        && reply.snapshot.validate().is_ok()
+        && reply.snapshot.home == record.mutation().home
+        && reply.receipt.revision <= reply.snapshot.revision
+}
+
+fn dispatch_saved(
+    ticket: ui::Ticket,
+    mutation: crate::channel_work::Mutation,
+    selection: Option<uuid::Uuid>,
+    original: Option<Record>,
+    route: Option<Route>,
+    title: String,
+    retry: bool,
+) -> Completion {
+    let operation = mutation.operation;
+    let retained = original.is_some() || retry;
+    let original_record = original.clone();
+    let record = original;
+    let prepared = (|| -> Result<(Record, Route, crate::control::ControlClient, journal::Journal), String> {
+        // A checked endpoint cannot reconstruct the immutable record that may
+        // already have been published before an interrupted worker.
+        if retry && record.is_none() {
+            return Err("Reload saved changes before retrying the original request".into());
+        }
+        if let Some(original) = &record {
+            if original.mutation() != &mutation || original.selection() != selection { return Err("The original saved change does not match this request".into()); }
+            recovery::require_current_profile(original.destination()).map_err(str::to_owned)?;
+        }
+        let route = route.ok_or("The original channel destination is unavailable")?;
+        if (record.is_some() || retry) && !route.recovery_verified {
+            return Err("Check the original result before retrying this saved change".into());
+        }
+        let client = connect(Some(&route), mutation.home, false).map_err(|_| "The original channel destination could not be confirmed")?;
+        let saved = match record.clone() {
+            Some(record) => record,
+            None => {
+                let now = std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH).map_err(|_| "The current time could not be recorded")?.as_millis();
+                let created_ms = i64::try_from(now).map_err(|_| "The current time is unsupported")?;
+                Record::new(mutation, selection, Destination { profile: route.profile.clone(), socket: route.socket.clone(), proof: client.proof().clone() }, title, created_ms).map_err(|error| error.to_string())?
+            }
+        };
+        let journal = journal()?;
+        Ok((saved, route, client, journal))
+    })();
+    let (record, route, mut client, journal) = match prepared {
+        Ok(prepared) => prepared,
+        Err(reason) => {
+            return Completion::BeforeSendFailed {
+                ticket,
+                operation,
+                record: original_record,
+                reason,
+                retained,
+            };
+        }
+    };
+    let (result, settled) =
+        match reserve_then_send(&journal, &record, |request| send(&mut client, request)) {
+            Ok(result) => result,
+            Err(error) => {
+                return failed_reservation(ticket, operation, original_record, retry, error);
+            }
+        };
+    Completion::Applied {
+        ticket,
+        record,
+        route,
+        result,
+        settled,
+    }
+}
+
+fn failed_reservation(
+    ticket: ui::Ticket,
+    operation: uuid::Uuid,
+    original: Option<Record>,
+    retry: bool,
+    error: journal::Error,
+) -> Completion {
+    // The journal maps every post-publication failure to PublicationUncertain.
+    // Conflict may mean an existing original belongs to this UUID. Other
+    // reserve failures precede publication, so genuinely fresh intent keeps its
+    // editable draft rather than becoming an unrecoverable record-less retry.
+    let retained = original.is_some()
+        || retry
+        || matches!(
+            error,
+            journal::Error::Conflict
+                | journal::Error::PublicationUncertain
+                | journal::Error::SettlementUncertain
+        );
+    Completion::BeforeSendFailed {
+        ticket,
+        operation,
+        // A failed reservation never proves a newly constructed candidate is
+        // the immutable original. Only successful hydration can adopt it.
+        record: original,
+        reason: error.to_string(),
+        retained,
+    }
+}
+
+/// The sole mutation-send boundary: exact publication and directory sync
+/// precede even invoking the sender. Receipt validation and cleanup are separate.
+fn reserve_then_send(
+    journal: &journal::Journal,
+    record: &Record,
+    sender: impl FnOnce(api::Request) -> Result<api::Response, Failure>,
+) -> Result<(Result<crate::channel_work::Reply, Failure>, bool), journal::Error> {
+    let request = record.wire_request()?;
+    journal.reserve(record)?;
+    let result = match sender(request) {
+        Ok(api::Response::Applied(reply)) if valid_saved_reply(record, &reply) => Ok(reply),
+        // A refusal describes this attempt, not a shared original's outcome.
+        _ => Err(Failure::Unavailable),
+    };
+    let settled = result
+        .as_ref()
+        .is_ok_and(|reply| journal.settle(record, &reply.receipt).is_ok());
+    Ok((result, settled))
+}
+
+fn lookup_saved(
+    ticket: ui::Ticket,
+    home: Home,
+    operation: uuid::Uuid,
+    original: Option<Record>,
+    resident: Option<crate::channel_work::Mutation>,
+    route: Option<Route>,
+) -> Completion {
+    let mut verified_route = None;
+    let result = (|| -> Result<Option<crate::channel_work::Receipt>, Failure> {
+        let route = if let Some(record) = &original {
+            if record.mutation().home != home || record.operation() != operation {
+                return Err(Failure::Unavailable);
+            }
+            let socket = recovery::explicit_check_socket(record.destination())
+                .map_err(|_| Failure::Unavailable)?;
+            let mut candidate = Route {
+                socket,
+                profile: record.destination().profile.clone(),
+                recovery_verified: false,
+                proof: Arc::new(Mutex::new(None)),
+            };
+            let mut client = connect(Some(&candidate), home, true)?;
+            candidate.recovery_verified = true;
+            verified_route = Some(candidate);
+            return match send(&mut client, api::Request::Receipt { home, operation })? {
+                api::Response::Receipt(receipt)
+                    if receipt
+                        .as_ref()
+                        .is_none_or(|receipt| record.confirms_receipt(receipt)) =>
+                {
+                    Ok(receipt)
+                }
+                _ => Err(Failure::Unavailable),
+            };
+        } else {
+            if resident
+                .as_ref()
+                .is_none_or(|intent| intent.home != home || intent.operation != operation)
+            {
+                return Err(Failure::Unavailable);
+            }
+            route.ok_or(Failure::Unavailable)?
+        };
+        if route.profile != recovery::capture_profile() {
+            return Err(Failure::Unavailable);
+        }
+        // No immutable record hydrated yet, but the original operation route
+        // still binds its logical profile. Only this explicit Check resolves
+        // a replacement proxy, and it proves Registry+Home before installation.
+        let mut route = Route {
+            socket: crate::terminal::ipc::daemon_socket_path().map_err(|_| Failure::Unavailable)?,
+            profile: route.profile,
+            recovery_verified: false,
+            proof: Arc::new(Mutex::new(None)),
+        };
+        let mut client = connect(Some(&route), home, true)?;
+        route.recovery_verified = true;
+        verified_route = Some(route);
+        match send(&mut client, api::Request::Receipt { home, operation })? {
+            api::Response::Receipt(receipt)
+                if receipt.as_ref().is_none_or(|receipt| {
+                    resident
+                        .as_ref()
+                        .is_some_and(|intent| journal::mutation_confirms_receipt(intent, receipt))
+                }) =>
+            {
+                Ok(receipt)
+            }
+            _ => Err(Failure::Unavailable),
+        }
+    })();
+    let settled = match (&original, &result) {
+        (Some(record), Ok(Some(receipt))) => {
+            journal().is_ok_and(|journal| journal.settle(record, receipt).is_ok())
+        }
+        // A cooperating window may already have settled the same published
+        // operation. Prove positive outcome and locked absence, never reseed.
+        (None, Ok(Some(receipt))) => resident.as_ref().is_some_and(|intent| {
+            journal().is_ok_and(|journal| journal.settle_absent(intent, receipt).is_ok())
+        }),
+        _ => false,
+    };
+    Completion::LookedUp {
+        ticket,
+        home,
+        operation,
+        route: verified_route,
+        result,
+        settled,
+    }
+}
+
 fn snapshot(response: api::Response) -> Result<crate::channel_work::Snapshot, Failure> {
     match response {
         api::Response::Snapshot(snapshot) => Ok(snapshot),
@@ -836,33 +1598,30 @@ fn connect(
     reconcile: bool,
 ) -> Result<crate::control::ControlClient, Failure> {
     let route = route.ok_or(Failure::Unavailable)?;
+    if route.profile != recovery::capture_profile() {
+        return Err(Failure::Unavailable);
+    }
     let mut client =
         crate::control::ControlClient::connect(&route.socket).map_err(|_| Failure::Unavailable)?;
     let mut proof = route.proof.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(expected) = proof.as_ref() {
+    if reconcile {
+        // Every explicit Check proves the original logical profile, handshake,
+        // Registry and exact Home; unchanged host proof is not an exemption.
+        let model = client
+            .read_workspace_model()
+            .map_err(|_| Failure::Unavailable)?;
+        if model.identity != home.registry {
+            return Err(Failure::Unavailable);
+        }
+        match send(&mut client, api::Request::ReadHome { home })? {
+            api::Response::Home { home: current, .. }
+                if current == home && current.validate().is_ok() => {}
+            _ => return Err(Failure::Unavailable),
+        }
+        *proof = Some(client.proof().clone());
+    } else if let Some(expected) = proof.as_ref() {
         if client.proof() != expected {
-            if !reconcile {
-                return Err(Failure::Unavailable);
-            }
-            // Only the user's explicit Check result can reconcile a restarted
-            // endpoint. Prove the original durable home using read-only calls
-            // before updating its transport proof; never resend a mutation.
-            let model = client
-                .read_workspace_model()
-                .map_err(|_| Failure::Unavailable)?;
-            if model.identity != home.registry {
-                return Err(Failure::Unavailable);
-            }
-            let api::Response::Home { home: current, .. } =
-                send(&mut client, api::Request::ReadHome { home })?
-            else {
-                return Err(Failure::Unavailable);
-            };
-            current.validate().map_err(|_| Failure::Unavailable)?;
-            if current != home {
-                return Err(Failure::Unavailable);
-            }
-            *proof = Some(client.proof().clone());
+            return Err(Failure::Unavailable);
         }
     } else {
         let model = client
@@ -915,11 +1674,28 @@ fn request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("channel_work/pending_tests.rs");
     use crate::workspace_model::{
         ModelChannel, ModelEdit, WorkspaceModel,
         views::{Scope, View},
     };
     use cosmic::iced::futures::StreamExt;
+
+    /// Complete the startup discovery demanded by an explicit normal open.
+    /// The original navigation/native assertions below remain unchanged.
+    fn complete_saved_discovery(app: &mut Cagents) {
+        if let Some(generation) = app.channel_work.loading_saved {
+            drop(app.complete_channel_work(Completion::Loaded {
+                generation,
+                result: Ok(journal::Loaded {
+                    records: Vec::new(),
+                    problems: Vec::new(),
+                    occupied: 0,
+                    saturated: false,
+                }),
+            }));
+        }
+    }
 
     fn captured() -> Home {
         Home {
@@ -967,6 +1743,20 @@ mod tests {
             let (send, received) = async_channel::unbounded();
             app.workspace_model_tx = send;
             app.workspace_model = model(current);
+            let Effect::LoadSaved { generation } = app.channel_work.view.load_saved() else {
+                unreachable!()
+            };
+            app.channel_work.loading_saved = Some(generation);
+            app.channel_work.desired_saved = Some(generation);
+            drop(app.complete_channel_work(Completion::Loaded {
+                generation,
+                result: Ok(journal::Loaded {
+                    records: Vec::new(),
+                    problems: Vec::new(),
+                    occupied: 0,
+                    saturated: false,
+                }),
+            }));
             app.channel_work.retire_candidates.insert(original);
             app.retire_settled_empty_channels();
             if current == original {
@@ -2460,6 +3250,20 @@ mod tests {
     fn main_fixture() -> (Cagents, Home) {
         let mut app = super::super::tests::context_inspector_test_app(false);
         let home = captured();
+        let Effect::LoadSaved { generation } = app.channel_work.view.load_saved() else {
+            unreachable!()
+        };
+        app.channel_work.loading_saved = Some(generation);
+        app.channel_work.desired_saved = Some(generation);
+        drop(app.complete_channel_work(Completion::Loaded {
+            generation,
+            result: Ok(journal::Loaded {
+                records: Vec::new(),
+                problems: Vec::new(),
+                occupied: 0,
+                saturated: false,
+            }),
+        }));
         app.workspace_model = model(home);
         Arc::make_mut(&mut app.durable).active_channel = Some(home.channel);
         let Effect::Read { ticket, .. } =
@@ -2486,6 +3290,8 @@ mod tests {
             home,
             Route {
                 socket: "/fixture/never-connected.sock".into(),
+                profile: None,
+                recovery_verified: false,
                 proof: Arc::new(Mutex::new(None)),
             },
         );
@@ -2696,6 +3502,7 @@ mod tests {
                 dirty_native_form(&mut app, &mut renderer);
             }
             drop(app.open_channel_work(other));
+            complete_saved_discovery(&mut app);
             if dirty {
                 assert!(app.channel_work.view.has_confirmation());
                 assert_eq!(app.channel_work.view.owner(), Some(owner));
@@ -2713,6 +3520,7 @@ mod tests {
                 assert_eq!(app.durable.active_channel, Some(home.channel));
                 assert_eq!(app.workspace.focused(), Some(original));
                 drop(app.open_channel_work(other));
+                complete_saved_discovery(&mut app);
                 discard_native(&mut app, &mut renderer);
             }
             let accepted = app.channel_work.view.owner().unwrap();
@@ -2726,6 +3534,7 @@ mod tests {
             drop(app.select_channel(home.channel));
             assert_eq!(app.workspace.focused(), Some(original));
             drop(app.open_channel_work(other));
+            complete_saved_discovery(&mut app);
             assert_ne!(app.channel_work.view.owner(), Some(accepted));
             assert_eq!(app.durable.active_channel, Some(other));
             assert_eq!(app.workspace.focused(), Some(target));
@@ -2757,6 +3566,7 @@ mod tests {
             drop(app.select_channel(other));
             assert_eq!(app.workspace.focused(), Some(target));
             drop(app.open_channel_work(home.channel));
+            complete_saved_discovery(&mut app);
             assert_eq!(app.channel_work.view.owner(), Some(owner));
             assert_eq!(app.durable.active_channel, Some(home.channel));
             assert_eq!(app.workspace.focused(), Some(original));
@@ -2880,6 +3690,7 @@ mod tests {
         drop(app.update(messages.remove(0)));
         let queued = workboard_query_callback(&app, &mut renderer);
         drop(app.open_channel_work(home.channel));
+        complete_saved_discovery(&mut app);
         assert!(app.channel_work_is_main());
         let ui = native(&app, Cache::new(), &mut renderer, 1_400.0);
         assert!(
@@ -2956,6 +3767,7 @@ mod tests {
         let _ = ui.into_cache();
         let pin = workboard_pin_callback(&mut app, &mut renderer);
         drop(app.open_channel_work(home.channel));
+        complete_saved_discovery(&mut app);
         assert!(app.channel_work_is_main());
         drop(app.update(pin));
         let ui = workboard_native(&app, &mut renderer);
@@ -3059,6 +3871,7 @@ mod tests {
         assert_ne!(prompt_selection.0, prompt_selection.1);
         let _ = tree.into_cache();
         drop(app.open_channel_work(home.channel));
+        complete_saved_discovery(&mut app);
         let mut tree = native(&app, Cache::new(), &mut renderer, 1_400.0);
         assert!(
             !native_labels(&tree)
@@ -3135,6 +3948,7 @@ mod tests {
             panic!("accepted fixture read")
         };
         drop(app.open_channel_work(home.channel));
+        complete_saved_discovery(&mut app);
         drop(
             app.update(Message::AutomationUi(AutomationAction::Received {
                 sequence,
@@ -3176,6 +3990,7 @@ mod tests {
             if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "z"))
         );
         drop(app.open_channel_work(home.channel));
+        complete_saved_discovery(&mut app);
         let tree = native(&app, Cache::new(), &mut renderer, 1_400.0);
         assert!(
             !native_labels(&tree)
@@ -3467,6 +4282,7 @@ mod tests {
             drop(app.update(Message::AccountUi(AccountAction::Refresh(id.clone()))));
             let probe_owner = app.account_ui.probe_owner(&id).unwrap();
             drop(app.open_channel_work(home.channel));
+            complete_saved_discovery(&mut app);
             if modal {
                 drop(app.update(Message::DaemonHealth(
                     crate::daemon_health::State::Unreachable {
@@ -3576,6 +4392,7 @@ mod tests {
         let queued_open = messages.remove(0);
         let _ = tree.into_cache();
         drop(app.open_channel_work(home.channel));
+        complete_saved_discovery(&mut app);
         let owner = app.channel_work.view.owner().unwrap();
         drop(app.update(queued_choice));
         drop(app.update(queued_open));
@@ -3604,6 +4421,7 @@ mod tests {
         let queued_record = messages.remove(0);
         let _ = tree.into_cache();
         drop(app.open_channel_work(home.channel));
+        complete_saved_discovery(&mut app);
         drop(app.update(queued_record));
         assert!(!app.palette.is_open());
         let owner = app.channel_work.view.owner().unwrap();
@@ -4325,7 +5143,9 @@ mod tests {
             other.title = "Other".into();
             app.workspace_model.channels.push(other.clone());
             drop(app.open_channel_work(other.id));
+            complete_saved_discovery(&mut app);
             drop(app.open_channel_work(home.channel));
+            complete_saved_discovery(&mut app);
             let mut ui = native(&app, cache, &mut renderer, width);
             let current = bounds(&ui, "Conversations for channel Work");
             assert!(

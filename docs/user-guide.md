@@ -439,6 +439,18 @@ that explicit declaration. Inspection does not establish authorship, prove
 filesystem writes, associate a PR or run a task. **Working-tree changes not
 inspected** means unknown, not clean.
 
+Before the GUI sends a selected-checkout declaration, it saves the original
+request privately. If that save cannot finish safely, the declaration is not
+sent and the draft remains available. **Saved channel changes**, available in
+channel Work and from a new tab, lists retained requests after reopening the
+app. Open the original request and choose **Check result** on its original
+device profile. This recovery view never resends a request or restores its
+checkout selection; a missing receipt remains unknown. Closing the view does
+not discard the request. There are sixteen disk recovery slots, with no
+expiry or automatic eviction; unresolved requests can keep those slots occupied.
+Ordinary PR and known-row changes keep their existing in-window recovery and
+are not saved by this selected-checkout feature.
+
 An inspection expires after five minutes. Before a new submission, use
 **Inspect again** if it expires or the checkout changes. Directory selection
 supports the interactive User only; provider sessions and issued
@@ -482,8 +494,10 @@ pages; use the current-page and history controls to browse further.
 **Change role** corrects a relation, and **End tracking** moves it to history.
 Leaving an edited tracking form offers **Keep editing** or **Discard draft**.
 Submitted changes continue independently of the view. If a result is
-unconfirmed, use **Check result** or **Retry original change**; retry preserves
-the original target, role and operation. Do not inspect again and submit a new
+unconfirmed, use **Check result**. In the original window, **Retry original
+change**, when offered after checking, preserves the original target, role,
+selection and operation. Requests restored after restart offer only result
+checks. Do not inspect again and submit a new
 change to retry an uncertain one. A committed original receipt remains
 checkable after its inspection expires; a missing receipt does not prove that
 nothing happened. For a saved CLI request, use `cagents channel work apply

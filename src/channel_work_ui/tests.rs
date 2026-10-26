@@ -2234,6 +2234,9 @@ fn incomplete_url_edit_disables_submit_and_refuses_a_previously_captured_complet
 }
 
 fn local_draft(state: &mut State, directory: &str) -> FormOwner {
+    if !state.saved.ready && !state.saved.loading && state.saved.error.is_none() {
+        recovery_ready(state);
+    }
     state.update(Action::AttachLocal(state.owner().unwrap()));
     let owner = state.view.as_ref().unwrap().form.as_ref().unwrap().owner;
     state.update(Action::LocalPath(owner, directory.into()));
@@ -2714,6 +2717,7 @@ fn selected_local_unknown_retry_keeps_original_selection_and_receipt_settles_wit
     let read = state.open(home(10), "Original".into()).unwrap();
     load(&mut state, read, snapshot(home(10), Vec::new(), 8));
     let owner = state.owner().unwrap();
+    checked_missing(&mut state, mutation.operation);
     let Effect::Mutate {
         ticket,
         mutation: retried,
@@ -3056,4 +3060,830 @@ fn local_client_inspection_slot_survives_dismissal_home_changes_and_duplicate_re
         explicit, current,
         "only another explicit inspection starts after failure"
     );
+}
+
+fn saved_loaded(state: &mut State, effect: Effect, records: Vec<SavedOperation>) {
+    let Effect::LoadSaved { generation } = effect else {
+        panic!("saved load")
+    };
+    state.update(Action::SavedLoaded {
+        generation,
+        occupied: records.len(),
+        saturated: records.len() >= MAX_PENDING,
+        result: Ok(records),
+        problems: Vec::new(),
+    });
+}
+fn recovery_ready(state: &mut State) {
+    let effect = state.load_saved();
+    saved_loaded(state, effect, Vec::new());
+}
+fn saved_operation(number: u64, original: Home) -> SavedOperation {
+    SavedOperation {
+        mutation: Mutation {
+            home: original,
+            expected_revision: 0,
+            operation: Uuid::from_u128(5000 + u128::from(number)),
+            change: Change::Claim {
+                target: target(number),
+                role: Role::Review,
+            },
+        },
+        selection: None,
+        title: format!("Saved channel {number}"),
+        device_label: "Original fixture device".into(),
+        confirmed: None,
+    }
+}
+fn request_from_form(state: &mut State) -> (FormOwner, Ticket, Mutation) {
+    let owner = filled_form(state);
+    let Effect::Mutate {
+        ticket, mutation, ..
+    } = state
+        .update(Action::Submit {
+            owner,
+            target: target(7),
+            role: Role::Contribute,
+            revision: 0,
+        })
+        .unwrap()
+    else {
+        panic!()
+    };
+    (owner, ticket, mutation)
+}
+
+#[test]
+fn saved_changes_restore_unknown_multiple_operations_and_open_original_home_without_live_channel() {
+    let mut state = State::default();
+    let records = vec![
+        saved_operation(1, home(70)),
+        saved_operation(2, home(70)),
+        saved_operation(3, home(71)),
+    ];
+    let effect = state.update(Action::ShowSaved).unwrap();
+    saved_loaded(&mut state, effect, records.clone());
+    assert_eq!(state.pending.len(), 3);
+    assert!(
+        state
+            .pending
+            .iter()
+            .all(|pending| pending.delivery == Delivery::Unknown && pending.ambiguous)
+    );
+    assert!(state.view.is_none());
+    let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+    for width in [300.0, 900.0] {
+        let ui = cached(&state, Cache::new(), &mut renderer, width, 2600.0);
+        for record in &records {
+            let control = bounds(
+                &ui,
+                &format!("Open saved operation {}", record.mutation.operation),
+            );
+            assert!(control.x >= 0.0 && control.x + control.width <= width + 0.01);
+        }
+    }
+    let generation = state.saved.generation;
+    assert!(
+        matches!(state.update(Action::OpenSaved { generation, operation: records[1].mutation.operation }),
+        Some(Effect::OpenSaved { operation }) if operation == records[1].mutation.operation)
+    );
+    // The adapter can open a captured deleted Home that has no model/sidebar row.
+    let read = state
+        .open_saved_home(home(70), "Deleted original".into())
+        .unwrap();
+    let mut deleted = snapshot(home(70), Vec::new(), 1);
+    deleted.lifecycle = HomeLifecycle::Deleted;
+    load(&mut state, read, deleted);
+    assert!(!state.writable(state.owner().unwrap()));
+    let mut ui = cached(&state, Cache::new(), &mut renderer, 700.0, 2600.0);
+    let point = bounds(
+        &ui,
+        &format!("Check original operation {}", records[1].mutation.operation),
+    )
+    .center();
+    let mut messages = click(&mut ui, &mut renderer, point);
+    let _ = ui.into_cache();
+    assert!(
+        matches!(state.update(messages.remove(0)), Some(Effect::Lookup { home: actual, operation, .. })
+        if actual == home(70) && operation == records[1].mutation.operation)
+    );
+    assert_eq!(
+        state.pending.len(),
+        3,
+        "navigation/check sends no mutation or deletion"
+    );
+}
+
+#[test]
+fn saved_load_is_generation_owned_and_bounded_without_pruning_unresolved_originals() {
+    let mut state = State::default();
+    let first = state.load_saved();
+    let Effect::LoadSaved { generation: old } = first else {
+        panic!()
+    };
+    let current = state.load_saved();
+    state.update(Action::SavedLoaded {
+        generation: old,
+        result: Ok(vec![saved_operation(90, home(90))]),
+        problems: Vec::new(),
+        occupied: 1,
+        saturated: false,
+    });
+    assert!(state.pending.is_empty());
+    let first_records = (1..=16)
+        .map(|n| saved_operation(n, home(u128::from(n))))
+        .collect::<Vec<_>>();
+    assert!(state.can_restore_saved(&first_records));
+    saved_loaded(&mut state, current, first_records.clone());
+    assert!(state.saved.saturated);
+    assert!(
+        state.saved_discovery_ready(),
+        "all 16 records are known even at capacity"
+    );
+    let read = state
+        .open(home(99), "Unrelated readable Home".into())
+        .unwrap();
+    load(&mut state, read, snapshot(home(99), Vec::new(), 1));
+    assert!(
+        state.writable(state.owner().unwrap()),
+        "restored rows do not consume the resident request budget"
+    );
+    assert!(!state.local_writable(state.owner().unwrap()));
+    let next = (17..=32)
+        .map(|n| saved_operation(n, home(u128::from(n))))
+        .collect::<Vec<_>>();
+    assert!(
+        !state.can_restore_saved(&next),
+        "a second set cannot evict the original sixteen"
+    );
+    let effect = state.load_saved();
+    saved_loaded(&mut state, effect, next);
+    assert_eq!(state.pending.len(), MAX_PENDING);
+    let original = state
+        .pending
+        .iter()
+        .map(|pending| pending.mutation.clone())
+        .collect::<Vec<_>>();
+    let extra = saved_operation(33, home(33));
+    assert!(!state.can_restore_saved(&[extra.clone()]));
+    let effect = state.load_saved();
+    saved_loaded(&mut state, effect, vec![extra]);
+    assert!(!state.saved.ready && state.saved.error.is_some());
+    assert_eq!(
+        state
+            .pending
+            .iter()
+            .map(|pending| pending.mutation.clone())
+            .collect::<Vec<_>>(),
+        original
+    );
+    let effect = state.load_saved();
+    saved_loaded(&mut state, effect, Vec::new());
+    assert_eq!(
+        state.pending.len(),
+        MAX_PENDING,
+        "disk absence never settles an unknown operation"
+    );
+    let mut conflict = first_records[0].clone();
+    conflict.mutation.change = Change::End { target: target(1) };
+    assert!(!state.can_restore_saved(&[conflict]));
+}
+
+#[test]
+fn before_send_failure_preserves_draft_and_prior_unknown_request_without_false_refusal_settlement()
+{
+    let mut state = ready(home(10), Vec::new());
+    let (owner, ticket, _) = request_from_form(&mut state);
+    state.update(Action::BeforeSendFailed {
+        ticket,
+        reason: "Recovery storage unavailable".into(),
+        retained: false,
+    });
+    assert!(state.pending.is_empty());
+    assert_eq!(
+        state.view.as_ref().unwrap().form.as_ref().unwrap().owner,
+        owner
+    );
+    assert_eq!(
+        state
+            .view
+            .as_ref()
+            .unwrap()
+            .form
+            .as_ref()
+            .unwrap()
+            .repository,
+        "owner/repo"
+    );
+    let Effect::Mutate {
+        ticket, mutation, ..
+    } = state
+        .update(Action::Submit {
+            owner,
+            target: target(7),
+            role: Role::Contribute,
+            revision: 0,
+        })
+        .unwrap()
+    else {
+        panic!()
+    };
+    state.update(Action::AppliedWithSettlement {
+        ticket,
+        result: Err(Failure::Refused("This attempt made no change".into())),
+        settled: false,
+    });
+    assert_eq!(
+        state.pending[0].delivery,
+        Delivery::Unknown,
+        "published refusal cannot resolve the original request"
+    );
+    checked_missing(&mut state, mutation.operation);
+    let Effect::Mutate {
+        ticket: retry,
+        mutation: retried,
+        ..
+    } = state
+        .update(Action::Retry(state.owner().unwrap(), mutation.operation))
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(retried, mutation);
+    state.update(Action::BeforeSendFailed {
+        ticket: retry,
+        reason: "Original connection unavailable".into(),
+        retained: false,
+    });
+    assert_eq!(state.pending[0].mutation, mutation);
+    assert_eq!(state.pending[0].delivery, Delivery::Unknown);
+    assert!(state.pending[0].ambiguous);
+    checked_missing(&mut state, mutation.operation);
+    let effect = state
+        .update(Action::Retry(state.owner().unwrap(), mutation.operation))
+        .unwrap();
+    assert!(matches!(effect, Effect::Mutate { mutation: again, .. } if again == mutation));
+}
+
+#[test]
+fn confirmed_unsaved_change_disables_retry_and_only_exact_settlement_clears_it() {
+    let mut state = ready(home(10), Vec::new());
+    let (_, ticket, mutation) = request_from_form(&mut state);
+    let reply = completed(&mutation, 1, vec![entry(7, Role::Contribute)]);
+    state.update(Action::AppliedWithSettlement {
+        ticket,
+        result: Ok(reply.clone()),
+        settled: false,
+    });
+    assert_eq!(state.pending[0].confirmed, Some(reply.receipt.clone()));
+    assert!(state.view.as_ref().unwrap().form.is_none());
+    let owner = state.owner().unwrap();
+    assert!(
+        state
+            .update(Action::Retry(owner, mutation.operation))
+            .is_none()
+    );
+    let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+    let mut ui = cached(&state, Cache::new(), &mut renderer, 400.0, 2000.0);
+    let point = bounds(
+        &ui,
+        &format!("Check original operation {}", mutation.operation),
+    )
+    .center();
+    let mut messages = click(&mut ui, &mut renderer, point);
+    let _ = ui.into_cache();
+    let Effect::Lookup {
+        ticket, operation, ..
+    } = state.update(messages.remove(0)).unwrap()
+    else {
+        panic!()
+    };
+    let mut wrong = reply.receipt.clone();
+    wrong.operation = Uuid::new_v4();
+    assert!(
+        state
+            .update(Action::LookedUpWithSettlement {
+                ticket,
+                operation,
+                result: Ok(Some(wrong)),
+                settled: true
+            })
+            .is_none()
+    );
+    assert_eq!(state.pending.len(), 1);
+    assert!(state.pending[0].confirmed.is_some());
+    let mut contradictory = SavedOperation {
+        mutation: mutation.clone(),
+        selection: None,
+        title: "Original".into(),
+        device_label: "Original connection".into(),
+        confirmed: Some(reply.receipt.clone()),
+    };
+    contradictory.confirmed.as_mut().unwrap().sequence += 1;
+    assert!(
+        !state.can_restore_saved(&[contradictory]),
+        "a reload cannot replace an already confirmed immutable receipt"
+    );
+    let Effect::Lookup {
+        ticket, operation, ..
+    } = state
+        .update(Action::Check(owner, mutation.operation))
+        .unwrap()
+    else {
+        panic!()
+    };
+    let effect = state
+        .update(Action::LookedUpWithSettlement {
+            ticket,
+            operation,
+            result: Ok(Some(reply.receipt)),
+            settled: true,
+        })
+        .unwrap();
+    assert!(state.pending.is_empty());
+    let Effect::Read { ticket, .. } = effect else {
+        panic!()
+    };
+    state.update(Action::Loaded {
+        ticket,
+        result: Err(Failure::Unavailable),
+    });
+    assert!(
+        state.pending.is_empty(),
+        "failed current projection cannot unconfirm original receipt"
+    );
+}
+
+#[test]
+fn saved_list_native_open_and_close_callbacks_cannot_cross_reload_generation() {
+    let mut state = State::default();
+    let a = saved_operation(1, home(10));
+    let b = saved_operation(2, home(11));
+    let effect = state.update(Action::ShowSaved).unwrap();
+    saved_loaded(&mut state, effect, vec![a.clone(), b.clone()]);
+    let old_generation = state.saved.generation;
+    let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+    let mut ui = cached(&state, Cache::new(), &mut renderer, 700.0, 2200.0);
+    let point = bounds(
+        &ui,
+        &format!("Open saved operation {}", a.mutation.operation),
+    )
+    .center();
+    let old_action = click(&mut ui, &mut renderer, point).remove(0);
+    assert!(
+        events(
+            &mut ui,
+            &mut renderer,
+            point,
+            &[mouse::Event::ButtonPressed(mouse::Button::Left)]
+        )
+        .is_empty()
+    );
+    let cache = ui.into_cache();
+    let effect = state.update(Action::ShowSaved).unwrap();
+    saved_loaded(&mut state, effect, vec![b.clone(), a]);
+    let mut ui = cached(&state, cache, &mut renderer, 700.0, 2200.0);
+    assert!(
+        events(
+            &mut ui,
+            &mut renderer,
+            point,
+            &[mouse::Event::ButtonReleased(mouse::Button::Left)]
+        )
+        .is_empty()
+    );
+    let point = bounds(
+        &ui,
+        &format!("Open saved operation {}", b.mutation.operation),
+    )
+    .center();
+    let mut current = click(&mut ui, &mut renderer, point);
+    let _ = ui.into_cache();
+    assert!(state.update(old_action).is_none());
+    assert!(state.update(Action::CloseSaved(old_generation)).is_none());
+    assert!(state.saved.shown);
+    assert!(
+        matches!(state.update(current.remove(0)), Some(Effect::OpenSaved { operation }) if operation == b.mutation.operation)
+    );
+}
+
+#[test]
+fn recovery_discovery_failure_blocks_only_selected_local_submit_and_preserves_memory_pr_intent() {
+    let mut state = ready(home(10), Vec::new());
+    let generation = match state.load_saved() {
+        Effect::LoadSaved { generation } => generation,
+        _ => unreachable!(),
+    };
+    state.update(Action::SavedLoaded {
+        generation,
+        result: Err("Private recovery unavailable".into()),
+        problems: vec![],
+        occupied: 0,
+        saturated: false,
+    });
+    let owner = local_draft(&mut state, "/repo/local");
+    let ticket = inspect_local(&mut state);
+    let original = selected(home(10), 0);
+    state.update(Action::PreparedLocal {
+        ticket,
+        result: Ok(original),
+    });
+    assert!(state.update(local_submit(&state)).is_none());
+    assert!(state.pending.is_empty());
+    assert!(state.writable(state.owner().unwrap()));
+    assert!(!state.local_writable(state.owner().unwrap()));
+    state.update(Action::Dismiss(owner));
+    let form = filled_form(&mut state);
+    assert!(matches!(
+        state.update(Action::Submit {
+            owner: form,
+            target: target(7),
+            role: Role::Contribute,
+            revision: 0
+        }),
+        Some(Effect::Mutate {
+            selection: None,
+            ..
+        })
+    ));
+    assert!(!state.saved_discovery_ready());
+}
+
+#[test]
+fn saved_home_is_read_only_even_when_active_and_deferred_navigation_preserves_mode() {
+    let mut state = ready(home(10), vec![entry(1, Role::Contribute)]);
+    let old_form = filled_form(&mut state);
+    let record = saved_operation(2, home(11));
+    let effect = state.load_saved();
+    saved_loaded(&mut state, effect, vec![record.clone()]);
+    assert!(matches!(
+        state.open_saved_home(home(11), "Original saved home".into()),
+        Some(Effect::Focus { .. })
+    ));
+    let old_owner = state.owner().unwrap();
+    let confirmation = state
+        .view
+        .as_ref()
+        .unwrap()
+        .confirmation
+        .as_ref()
+        .unwrap()
+        .id;
+    assert_eq!(
+        state.view.as_ref().unwrap().form.as_ref().unwrap().owner,
+        old_form
+    );
+    let read = state
+        .update(Action::Discard(old_owner, confirmation))
+        .unwrap();
+    load(
+        &mut state,
+        read,
+        snapshot(home(11), vec![entry(1, Role::Contribute)], 1),
+    );
+    let owner = state.owner().unwrap();
+    assert!(state.view.as_ref().unwrap().read_only);
+    assert!(!state.writable(owner));
+    assert!(state.update(Action::Attach(owner)).is_none());
+    assert!(state.update(Action::Correct(row(&state, 1))).is_none());
+    assert!(state.update(Action::End(row(&state, 1))).is_none());
+    let Effect::Lookup {
+        ticket, operation, ..
+    } = state
+        .update(Action::Check(owner, record.mutation.operation))
+        .unwrap()
+    else {
+        panic!()
+    };
+    state.update(Action::LookedUpWithSettlement {
+        ticket,
+        operation,
+        result: Ok(None),
+        settled: false,
+    });
+    assert!(
+        state
+            .update(Action::Retry(owner, record.mutation.operation))
+            .is_none(),
+        "restored Home remains receipt-only even after Missing"
+    );
+    assert_eq!(state.pending[0].mutation, record.mutation);
+    let Effect::Lookup {
+        ticket, operation, ..
+    } = state
+        .update(Action::Check(owner, record.mutation.operation))
+        .unwrap()
+    else {
+        panic!()
+    };
+    let receipt = completed(&record.mutation, 1, vec![entry(2, Role::Review)]).receipt;
+    let read = state
+        .update(Action::LookedUpWithSettlement {
+            ticket,
+            operation,
+            result: Ok(Some(receipt)),
+            settled: true,
+        })
+        .unwrap();
+    load(
+        &mut state,
+        read,
+        snapshot(
+            home(11),
+            vec![entry(1, Role::Contribute), entry(2, Role::Review)],
+            2,
+        ),
+    );
+    assert!(state.pending.is_empty());
+    assert!(
+        !state.writable(owner),
+        "settling the saved operation never upgrades captured routing to new intent"
+    );
+    assert!(state.update(Action::Attach(owner)).is_none());
+    let read = state.open(home(11), "Current channel".into()).unwrap();
+    load(
+        &mut state,
+        read,
+        snapshot(
+            home(11),
+            vec![entry(1, Role::Contribute), entry(2, Role::Review)],
+            2,
+        ),
+    );
+    let current = state.owner().unwrap();
+    assert_ne!(current, owner);
+    assert!(!state.view.as_ref().unwrap().read_only);
+    assert!(state.writable(current));
+    assert!(state.update(Action::Attach(owner)).is_none());
+    assert!(matches!(
+        state.update(Action::Attach(current)),
+        Some(Effect::Focus { .. })
+    ));
+}
+
+#[test]
+fn showing_saved_changes_guards_dirty_draft_and_discard_never_dispatches_a_mutation() {
+    let mut state = ready(home(10), Vec::new());
+    let form = filled_form(&mut state);
+    let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+    let mut ui = cached(&state, Cache::new(), &mut renderer, 800.0, 1800.0);
+    let point = bounds(&ui, "Saved channel changes").center();
+    let mut actions = click(&mut ui, &mut renderer, point);
+    let _ = ui.into_cache();
+    assert!(matches!(actions.as_slice(), [Action::ShowSaved]));
+    assert!(matches!(
+        state.update(actions.remove(0)),
+        Some(Effect::Focus { .. })
+    ));
+    assert!(!state.saved_is_shown());
+    assert!(!state.saved.loading);
+    let owner = state.owner().unwrap();
+    let confirmation = state
+        .view
+        .as_ref()
+        .unwrap()
+        .confirmation
+        .as_ref()
+        .unwrap()
+        .id;
+    assert!(matches!(
+        state.update(Action::Keep(owner, confirmation)),
+        Some(Effect::Focus { .. })
+    ));
+    assert_eq!(
+        state.view.as_ref().unwrap().form.as_ref().unwrap().owner,
+        form
+    );
+    assert_eq!(
+        state
+            .view
+            .as_ref()
+            .unwrap()
+            .form
+            .as_ref()
+            .unwrap()
+            .target()
+            .unwrap(),
+        target(7)
+    );
+    assert!(matches!(
+        state.update(Action::ShowSaved),
+        Some(Effect::Focus { .. })
+    ));
+    let confirmation = state
+        .view
+        .as_ref()
+        .unwrap()
+        .confirmation
+        .as_ref()
+        .unwrap()
+        .id;
+    let effect = state.update(Action::Discard(owner, confirmation)).unwrap();
+    assert!(state.saved_is_shown());
+    assert!(state.view.as_ref().unwrap().form.is_none());
+    let record = saved_operation(2, home(77));
+    saved_loaded(&mut state, effect, vec![record.clone()]);
+    assert_eq!(state.pending.len(), 1);
+    assert_eq!(state.pending[0].delivery, Delivery::Unknown);
+    let generation = state.saved.generation;
+    assert!(
+        matches!(state.update(Action::OpenSaved { generation, operation: record.mutation.operation }),
+        Some(Effect::OpenSaved { operation }) if operation == record.mutation.operation)
+    );
+    assert_eq!(
+        state.home(),
+        Some(home(10)),
+        "only the adapter may open the original Home"
+    );
+}
+
+#[test]
+fn confirmed_settlement_retires_a_loading_generation_without_resurrecting_the_original() {
+    let mut state = ready(home(10), Vec::new());
+    let (_, ticket, mutation) = request_from_form(&mut state);
+    let Effect::LoadSaved { generation } = state.load_saved() else {
+        panic!()
+    };
+    assert!(state.saved_load_is_current(generation));
+    let original = SavedOperation {
+        mutation: mutation.clone(),
+        selection: None,
+        title: "Original".into(),
+        device_label: "Original connection".into(),
+        confirmed: None,
+    };
+    let reply = completed(&mutation, 1, vec![entry(7, Role::Contribute)]);
+    assert!(
+        state
+            .update(Action::AppliedWithSettlement {
+                ticket,
+                result: Ok(reply),
+                settled: true
+            })
+            .is_none()
+    );
+    assert!(state.pending.is_empty());
+    assert!(!state.saved_load_is_current(generation));
+    assert!(!state.saved_discovery_ready());
+    assert!(
+        state
+            .update(Action::SavedLoaded {
+                generation,
+                result: Ok(vec![original]),
+                problems: Vec::new(),
+                occupied: 1,
+                saturated: false
+            })
+            .is_none()
+    );
+    assert!(
+        state.pending.is_empty(),
+        "a load captured before settlement cannot restore the old request"
+    );
+    let effect = state.load_saved();
+    saved_loaded(&mut state, effect, Vec::new());
+    assert!(state.saved_discovery_ready());
+    assert!(state.writable(state.owner().unwrap()));
+}
+
+#[test]
+fn restored_receipt_does_not_discard_an_unsubmitted_form_on_the_same_home() {
+    let mut state = ready(home(10), vec![entry(1, Role::Contribute)]);
+    let form = filled_form(&mut state);
+    state.update(Action::Role(form, 3));
+    let record = saved_operation(2, home(10));
+    let effect = state.load_saved();
+    saved_loaded(&mut state, effect, vec![record.clone()]);
+    let owner = state.owner().unwrap();
+    let Effect::Lookup {
+        ticket, operation, ..
+    } = state
+        .update(Action::Check(owner, record.mutation.operation))
+        .unwrap()
+    else {
+        panic!()
+    };
+    let receipt = completed(&record.mutation, 1, vec![entry(2, Role::Review)]).receipt;
+    let effect = state
+        .update(Action::LookedUpWithSettlement {
+            ticket,
+            operation,
+            result: Ok(Some(receipt)),
+            settled: true,
+        })
+        .unwrap();
+    load(
+        &mut state,
+        effect,
+        snapshot(
+            home(10),
+            vec![entry(1, Role::Contribute), entry(2, Role::Review)],
+            2,
+        ),
+    );
+    let current = state.view.as_ref().unwrap().form.as_ref().unwrap();
+    assert_eq!(current.owner, form);
+    assert_eq!(current.target().unwrap(), target(7));
+    assert_eq!(current.role, Role::Reference);
+    let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+    let mut ui = cached(&state, Cache::new(), &mut renderer, 800.0, 2400.0);
+    let point = bounds(&ui, "Track PR").center();
+    let mut actions = click(&mut ui, &mut renderer, point);
+    let _ = ui.into_cache();
+    assert!(
+        matches!(actions.as_slice(), [Action::Submit { owner, target: actual, role: Role::Reference, revision: 0 }]
+        if *owner == form && *actual == target(7))
+    );
+    assert!(
+        matches!(state.update(actions.remove(0)), Some(Effect::Mutate { mutation, .. })
+        if mutation.home == home(10) && mutation.change == (Change::Claim { target: target(7), role: Role::Reference }))
+    );
+}
+
+fn checked_missing(state: &mut State, operation: Uuid) {
+    let Effect::Lookup {
+        ticket, operation, ..
+    } = state
+        .update(Action::Check(state.owner().unwrap(), operation))
+        .unwrap()
+    else {
+        panic!("explicit check")
+    };
+    assert!(
+        state
+            .update(Action::LookedUpWithSettlement {
+                ticket,
+                operation,
+                result: Ok(None),
+                settled: false
+            })
+            .is_none()
+    );
+}
+
+#[test]
+fn restored_selected_and_legacy_requests_remain_receipt_only_after_missing_and_foreign_receipts() {
+    for selected_request in [false, true] {
+        let mut state = State::default();
+        let mut original = saved_operation(7, home(70));
+        if selected_request {
+            original.selection = Some(Uuid::new_v4());
+            original.mutation.change = Change::Claim {
+                target: Target::Local(Uuid::new_v4()),
+                role: Role::Contribute,
+            };
+        }
+        let effect = state.load_saved();
+        saved_loaded(&mut state, effect, vec![original.clone()]);
+        let read = state.open_saved_home(home(70), "Original".into()).unwrap();
+        load(&mut state, read, snapshot(home(70), Vec::new(), 1));
+        let owner = state.owner().unwrap();
+        checked_missing(&mut state, original.mutation.operation);
+        assert!(
+            state
+                .update(Action::Retry(owner, original.mutation.operation))
+                .is_none()
+        );
+        let pending = state.pending_for(home(70)).unwrap();
+        assert_eq!(pending.selection, original.selection);
+        assert!(pending.receipt_only && !pending.retry_ready);
+        assert_eq!(pending.mutation, original.mutation);
+        let mut conflict = original.clone();
+        conflict.selection = Some(Uuid::new_v4());
+        assert!(!state.can_restore_saved(&[conflict]));
+        let Effect::Lookup {
+            ticket, operation, ..
+        } = state
+            .update(Action::Check(owner, original.mutation.operation))
+            .unwrap()
+        else {
+            panic!()
+        };
+        let mut receipt = completed(&original.mutation, 1, vec![]).receipt;
+        receipt.operation = Uuid::new_v4();
+        state.update(Action::LookedUpWithSettlement {
+            ticket,
+            operation,
+            result: Ok(Some(receipt)),
+            settled: true,
+        });
+        assert_eq!(state.pending.len(), 1);
+        assert!(state.pending[0].confirmed.is_none());
+        let Effect::Lookup {
+            ticket, operation, ..
+        } = state
+            .update(Action::Check(owner, original.mutation.operation))
+            .unwrap()
+        else {
+            panic!()
+        };
+        let receipt = completed(&original.mutation, 1, vec![]).receipt;
+        state.update(Action::LookedUpWithSettlement {
+            ticket,
+            operation,
+            result: Ok(Some(receipt)),
+            settled: true,
+        });
+        assert!(state.pending.is_empty());
+    }
 }

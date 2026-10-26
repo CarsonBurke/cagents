@@ -1,5 +1,7 @@
 //! A channel-owned view of durable work intent. Checkout facts remain context;
 //! queued messages and native child state retain the exact home and target.
+pub(crate) mod journal;
+
 use crate::{
     channel_work::{
         Bucket, Change, Entry, Freshness, Home, HomeLifecycle, Mutation, Page, PrState, Receipt,
@@ -15,12 +17,14 @@ use cosmic::{
     iced::{Alignment, Length},
     widget,
 };
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 use uuid::Uuid;
 
 const PAGE_SIZE: u16 = 50;
 const VISIBLE_ROWS: usize = 30;
 const MAX_PENDING: usize = 16;
+// Sixteen original resident requests plus sixteen recovered disk records.
+const MAX_RECOVERY: usize = 32;
 const ROLES: [&str; 4] = ["Contributing", "Stewarding", "Review only", "Reference"];
 const ROLE_VALUES: [Role; 4] = [
     Role::Contribute,
@@ -85,8 +89,63 @@ impl Failure {
     }
 }
 
+/// Safe presentation metadata. Routing and authority remain in the adapter.
+#[derive(Debug, Clone)]
+pub struct SavedOperation {
+    pub mutation: Mutation,
+    pub selection: Option<Uuid>,
+    pub title: String,
+    pub device_label: String,
+    pub confirmed: Option<Receipt>,
+}
+impl SavedOperation {
+    fn valid(&self) -> bool {
+        self.mutation
+            .canonicalized()
+            .is_ok_and(|value| value == self.mutation)
+            && self.selection.is_none_or(|selection| !selection.is_nil() && matches!(self.mutation.change, Change::Claim { target: Target::Local(id), .. } if !id.is_nil()))
+            && self.title.len() <= 1024
+            && !self.title.chars().any(char::is_control)
+            && self.device_label.len() <= 4096
+            && !self.device_label.chars().any(char::is_control)
+            && self
+                .confirmed
+                .as_ref()
+                .is_none_or(|receipt| State::receipt_matches(&self.mutation, receipt))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Action {
+    ShowSaved,
+    SavedLoaded {
+        generation: Uuid,
+        result: Result<Vec<SavedOperation>, String>,
+        problems: Vec<String>,
+        occupied: usize,
+        saturated: bool,
+    },
+    OpenSaved {
+        generation: Uuid,
+        operation: Uuid,
+    },
+    CloseSaved(Uuid),
+    BeforeSendFailed {
+        ticket: Ticket,
+        reason: String,
+        retained: bool,
+    },
+    AppliedWithSettlement {
+        ticket: Ticket,
+        result: Result<Reply, Failure>,
+        settled: bool,
+    },
+    LookedUpWithSettlement {
+        ticket: Ticket,
+        operation: Uuid,
+        result: Result<Option<Receipt>, Failure>,
+        settled: bool,
+    },
     Close(ViewOwner),
     Tab(ViewOwner, Bucket),
     Refresh(ViewOwner),
@@ -155,12 +214,23 @@ impl Action {
                 | Self::Applied { .. }
                 | Self::LookedUp { .. }
                 | Self::PreparedLocal { .. }
+                | Self::SavedLoaded { .. }
+                | Self::BeforeSendFailed { .. }
+                | Self::AppliedWithSettlement { .. }
+                | Self::LookedUpWithSettlement { .. }
         )
     }
 }
 
 #[derive(Debug, Clone)]
 pub enum Effect {
+    LoadSaved {
+        generation: Uuid,
+    },
+    OpenSaved {
+        operation: Uuid,
+    },
+    CloseSaved,
     Refresh {
         ticket: Ticket,
         home: Home,
@@ -335,7 +405,15 @@ impl Form {
 enum Leave {
     Close,
     Dismiss,
-    Open { home: Home, title: String },
+    Open {
+        home: Home,
+        title: String,
+        read_only: bool,
+    },
+    OpenSaved {
+        operation: Uuid,
+    },
+    ShowSaved,
 }
 #[derive(Debug)]
 struct Confirmation {
@@ -345,6 +423,7 @@ struct Confirmation {
 #[derive(Debug)]
 struct View {
     owner: ViewOwner,
+    read_only: bool,
     title: String,
     snapshot: Option<Snapshot>,
     page: Page,
@@ -372,11 +451,32 @@ struct Pending {
     lookup: Option<Ticket>,
     delivery: Delivery,
     ambiguous: bool,
+    // Presentation admission only; the adapter independently proves the route.
+    retry_ready: bool,
+    // Reloaded records are receipt-only; their old selection is never renewed.
+    receipt_only: bool,
+    saved_record: bool,
+    title: String,
+    device_label: String,
+    confirmed: Option<Receipt>,
+    submitted_form: Option<FormOwner>,
 }
 
 /// One bounded set of unresolved changes across channel navigation. Close never
 /// cancels a submitted change or evicts its immutable request. The limit refuses
 /// additional changes, not reads, navigation, or host operations.
+#[derive(Debug, Default)]
+struct SavedView {
+    generation: Uuid,
+    shown: bool,
+    loading: bool,
+    ready: bool,
+    occupied: usize,
+    saturated: bool,
+    problems: Vec<String>,
+    error: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct State {
     view: Option<View>,
@@ -384,17 +484,143 @@ pub struct State {
     // One actual client inspection survives view/form dismissal. A stale reply
     // releases only its own slot and cannot populate another draft.
     local_inspection: Option<Ticket>,
+    saved: SavedView,
 }
 
 impl State {
     pub fn is_open(&self) -> bool {
-        self.view.is_some()
+        self.saved.shown || self.view.is_some()
     }
     pub fn owner(&self) -> Option<ViewOwner> {
         self.view.as_ref().map(|view| view.owner)
     }
     pub fn refresh(&mut self) -> Option<Effect> {
+        if self.saved.shown {
+            return None;
+        }
         self.read(self.owner()?)
+    }
+    /// Must complete before a newly opened channel permits fresh mutations.
+    pub fn load_saved(&mut self) -> Effect {
+        self.saved.generation = Uuid::new_v4();
+        self.saved.loading = true;
+        self.saved.ready = false;
+        self.saved.error = None;
+        Effect::LoadSaved {
+            generation: self.saved.generation,
+        }
+    }
+    /// The adapter must check this before adopting loaded records or routes.
+    pub fn saved_load_is_current(&self, generation: Uuid) -> bool {
+        self.saved.loading && self.saved.generation == generation
+    }
+    /// The adapter checks this before adopting the corresponding route map.
+    pub fn can_restore_saved(&self, records: &[SavedOperation]) -> bool {
+        if records.len() > journal::MAX_RECORDS {
+            return false;
+        }
+        let mut ids = self
+            .pending
+            .iter()
+            .map(|pending| pending.mutation.operation)
+            .collect::<HashSet<_>>();
+        let mut incoming = HashSet::new();
+        for record in records {
+            if !record.valid() || !incoming.insert(record.mutation.operation) {
+                return false;
+            }
+            if self.pending.iter().any(|pending| {
+                pending.mutation.operation == record.mutation.operation
+                    && (pending.mutation != record.mutation
+                        || pending.selection != record.selection
+                        || matches!((&pending.confirmed, &record.confirmed), (Some(old), Some(new)) if old != new))
+            }) {
+                return false;
+            }
+            ids.insert(record.mutation.operation);
+        }
+        let recovered = self
+            .pending
+            .iter()
+            .filter(|pending| pending.receipt_only)
+            .map(|pending| pending.mutation.operation)
+            .chain(
+                records
+                    .iter()
+                    .filter(|record| {
+                        !self.pending.iter().any(|pending| {
+                            pending.mutation.operation == record.mutation.operation
+                                && !pending.receipt_only
+                        })
+                    })
+                    .map(|record| record.mutation.operation),
+            )
+            .collect::<HashSet<_>>();
+        ids.len() <= MAX_RECOVERY && recovered.len() <= journal::MAX_RECORDS
+    }
+    fn submitted_form(&self, owner: FormOwner) -> bool {
+        self.pending
+            .iter()
+            .any(|pending| pending.submitted_form == Some(owner))
+    }
+    fn unsent_draft(&self, view: &View) -> bool {
+        view.form
+            .as_ref()
+            .is_some_and(|form| form.dirty() && !self.submitted_form(form.owner))
+    }
+    /// Original saved routing can reconcile saved operations, never start fresh intent.
+    pub fn open_saved_home(&mut self, home: Home, title: String) -> Option<Effect> {
+        self.open_mode(home, title, true)
+    }
+    fn open_mode(&mut self, home: Home, title: String, read_only: bool) -> Option<Effect> {
+        self.saved.shown = false;
+        if self.home() == Some(home)
+            && self
+                .view
+                .as_ref()
+                .is_some_and(|view| view.read_only == read_only)
+        {
+            self.view.as_mut()?.title = title;
+            return self.read(self.owner()?);
+        }
+        if let Some(view) = &self.view {
+            if view.confirmation.is_some() {
+                return None;
+            }
+            if self.unsent_draft(view) {
+                return self.leave(
+                    view.owner,
+                    Leave::Open {
+                        home,
+                        title,
+                        read_only,
+                    },
+                );
+            }
+        }
+        self.open_direct(home, title, read_only)
+    }
+    pub fn saved_is_shown(&self) -> bool {
+        self.saved.shown
+    }
+    /// Complete, clean discovery is required before automatic Home retirement.
+    /// Capacity prevents new intent but does not make the known Home set incomplete.
+    pub fn saved_discovery_ready(&self) -> bool {
+        self.saved.ready
+            && !self.saved.loading
+            && self.saved.error.is_none()
+            && self.saved.problems.is_empty()
+    }
+    /// A pre-settlement load must not resurrect the operation it observed.
+    pub fn invalidate_saved_load(&mut self) {
+        if self.saved.loading {
+            self.saved.generation = Uuid::new_v4();
+            self.saved.loading = false;
+            self.saved.ready = false;
+            self.saved.error = Some(
+                "Saved changes changed while loading. Reload saved changes to continue.".into(),
+            );
+        }
     }
     pub fn home(&self) -> Option<Home> {
         self.view.as_ref().map(|view| view.owner.home)
@@ -415,29 +641,16 @@ impl State {
             .is_some_and(|view| view.confirmation.is_some())
     }
     pub fn open(&mut self, home: Home, title: String) -> Option<Effect> {
-        if self.home() == Some(home) {
-            self.view.as_mut()?.title = title;
-            return self.read(self.owner()?);
-        }
-        if let Some(view) = &self.view {
-            if view.confirmation.is_some() {
-                return None;
-            }
-            if view.form.as_ref().is_some_and(Form::dirty)
-                && self.pending_for(view.owner.home).is_none()
-            {
-                return self.leave(view.owner, Leave::Open { home, title });
-            }
-        }
-        self.open_direct(home, title)
+        self.open_mode(home, title, false)
     }
-    fn open_direct(&mut self, home: Home, title: String) -> Option<Effect> {
+    fn open_direct(&mut self, home: Home, title: String, read_only: bool) -> Option<Effect> {
         let owner = ViewOwner {
             home,
             generation: Uuid::new_v4(),
         };
         self.view = Some(View {
             owner,
+            read_only,
             title,
             snapshot: None,
             page: Page {
@@ -462,14 +675,15 @@ impl State {
         self.read(owner)
     }
     pub fn escape(&mut self) -> Option<Effect> {
+        if self.saved.shown {
+            return self.update(Action::CloseSaved(self.saved.generation));
+        }
         let view = self.view.as_ref()?;
         if let Some(confirmation) = &view.confirmation {
             return self.update(Action::Keep(view.owner, confirmation.id));
         }
         self.update(match view.form.as_ref() {
-            Some(form) if self.pending_for(view.owner.home).is_none() => {
-                Action::Dismiss(form.owner)
-            }
+            Some(form) if !self.submitted_form(form.owner) => Action::Dismiss(form.owner),
             _ => Action::Close(view.owner),
         })
     }
@@ -477,9 +691,7 @@ impl State {
         if !self.current(owner) || self.has_confirmation() {
             return None;
         }
-        if self.view.as_ref()?.form.as_ref().is_some_and(Form::dirty)
-            && self.pending_for(owner.home).is_none()
-        {
+        if self.unsent_draft(self.view.as_ref()?) {
             let id = Uuid::new_v4();
             self.view.as_mut()?.confirmation = Some(Confirmation { id, intent });
             return Some(Effect::Focus {
@@ -502,11 +714,42 @@ impl State {
                     id: attach_id(owner),
                 })
             }
-            Leave::Open { home, title } => self.open_direct(home, title),
+            Leave::Open {
+                home,
+                title,
+                read_only,
+            } => self.open_direct(home, title, read_only),
+            Leave::ShowSaved => {
+                self.saved.shown = true;
+                Some(self.load_saved())
+            }
+            Leave::OpenSaved { operation } => {
+                if !self
+                    .pending
+                    .iter()
+                    .any(|pending| pending.mutation.operation == operation)
+                {
+                    self.view.as_mut()?.error = Some(
+                        "The saved change is no longer pending. No connection was changed.".into(),
+                    );
+                    return None;
+                }
+                self.view.as_mut()?.form = None;
+                Some(Effect::OpenSaved { operation })
+            }
         }
     }
     fn current(&self, owner: ViewOwner) -> bool {
         self.view.as_ref().is_some_and(|view| view.owner == owner)
+    }
+    /// Immutable resident intent; this does not reconstruct a saved record.
+    pub fn original_mutation(&self, home: Home, operation: Uuid) -> Option<&Mutation> {
+        self.pending
+            .iter()
+            .find(|pending| {
+                pending.mutation.home == home && pending.mutation.operation == operation
+            })
+            .map(|pending| &pending.mutation)
     }
     fn pending_for(&self, home: Home) -> Option<&Pending> {
         self.pending
@@ -515,14 +758,30 @@ impl State {
     }
     fn writable(&self, owner: ViewOwner) -> bool {
         self.current(owner)
+            && self.view.as_ref().is_some_and(|view| !view.read_only)
+            && !self.saved.shown
             && !self.has_confirmation()
             && self.pending_for(owner.home).is_none()
-            && self.pending.len() < MAX_PENDING
+            && self
+                .pending
+                .iter()
+                .filter(|pending| !pending.receipt_only)
+                .count()
+                < MAX_PENDING
+            && self.pending.len() < MAX_RECOVERY
             && self
                 .view
                 .as_ref()
                 .and_then(|view| view.snapshot.as_ref())
                 .is_some_and(|snapshot| snapshot.lifecycle == HomeLifecycle::Active)
+    }
+    fn local_writable(&self, owner: ViewOwner) -> bool {
+        self.writable(owner)
+            && self.saved.ready
+            && !self.saved.loading
+            && !self.saved.saturated
+            && self.saved.problems.is_empty()
+            && self.saved.error.is_none()
     }
     fn row(&self, owner: &RowOwner, mutable: bool) -> Option<&Entry> {
         if !self.current(owner.view) || (mutable && !self.writable(owner.view)) {
@@ -573,7 +832,7 @@ impl State {
         change: Change,
         selection: Option<Uuid>,
     ) -> Option<Effect> {
-        if !self.writable(owner) {
+        if !self.writable(owner) || (selection.is_some() && !self.local_writable(owner)) {
             return None;
         }
         let mutation = Mutation {
@@ -592,6 +851,19 @@ impl State {
             lookup: None,
             delivery: Delivery::Sending,
             ambiguous: false,
+            retry_ready: false,
+            receipt_only: false,
+            saved_record: false,
+            title: self
+                .view
+                .as_ref()
+                .map_or_else(String::new, |view| view.title.clone()),
+            device_label: "Original connection".into(),
+            confirmed: None,
+            submitted_form: self
+                .view
+                .as_ref()
+                .and_then(|view| view.form.as_ref().map(|form| form.owner)),
         });
         if let Some(view) = &mut self.view {
             view.error = None;
@@ -615,14 +887,46 @@ impl State {
             }
         }
     }
-    fn valid_receipt(pending: &Pending, receipt: &Receipt) -> bool {
-        receipt.home == pending.mutation.home
-            && receipt.operation == pending.mutation.operation
-            && pending
-                .mutation
+    fn receipt_matches(mutation: &Mutation, receipt: &Receipt) -> bool {
+        receipt.home == mutation.home
+            && receipt.operation == mutation.operation
+            && mutation
                 .expected_revision
                 .checked_add(u64::from(receipt.changed))
                 == Some(receipt.revision)
+    }
+    fn valid_receipt(pending: &Pending, receipt: &Receipt) -> bool {
+        Self::receipt_matches(&pending.mutation, receipt)
+            && pending
+                .confirmed
+                .as_ref()
+                .is_none_or(|confirmed| confirmed == receipt)
+    }
+    fn dismiss_submitted(view: &mut View, pending: &Pending) {
+        if pending.submitted_form.is_some()
+            && view.form.as_ref().map(|form| form.owner) == pending.submitted_form
+        {
+            view.form = None;
+        }
+    }
+    fn confirmed_unsaved(&mut self, index: usize, receipt: Receipt) {
+        if !Self::valid_receipt(&self.pending[index], &receipt) {
+            return;
+        }
+        let pending = &mut self.pending[index];
+        pending.confirmed = Some(receipt);
+        pending.retry_ready = false;
+        pending.delivery = Delivery::Unknown;
+        pending.lookup = None;
+        pending.ambiguous = true;
+        if let Some(view) = self
+            .view
+            .as_mut()
+            .filter(|view| view.owner.home == pending.mutation.home)
+        {
+            Self::dismiss_submitted(view, pending);
+            view.notice = Some("The original change is confirmed. Its saved recovery record still needs to be updated.".into());
+        }
     }
     fn valid_reply(pending: &Pending, reply: &Reply) -> bool {
         Self::valid_receipt(pending, &reply.receipt)
@@ -653,7 +957,7 @@ impl State {
                         // launched for the old page must not replace it later.
                         view.loading = None;
                     }
-                    view.form = None;
+                    Self::dismiss_submitted(view, &pending);
                     view.notice = Some(
                         if reply.receipt.changed {
                             "Channel work updated."
@@ -684,6 +988,8 @@ impl State {
             }
             _ => {
                 self.pending[index].delivery = Delivery::Unknown;
+                self.pending[index].retry_ready =
+                    !self.pending[index].receipt_only && self.pending[index].selection.is_none();
                 self.pending[index].lookup = None;
                 self.pending[index].ambiguous = true;
             }
@@ -702,7 +1008,203 @@ impl State {
         {
             return None;
         }
+        if self.saved.shown
+            && !action.background()
+            && !matches!(
+                &action,
+                Action::ShowSaved | Action::OpenSaved { .. } | Action::CloseSaved(..)
+            )
+        {
+            return None;
+        }
         match action {
+            Action::ShowSaved => {
+                if !self.saved.shown
+                    && let Some(view) = &self.view
+                {
+                    if self.unsent_draft(view) {
+                        return self.leave(view.owner, Leave::ShowSaved);
+                    }
+                }
+                self.saved.shown = true;
+                return Some(self.load_saved());
+            }
+            Action::CloseSaved(generation)
+                if self.saved.shown && generation == self.saved.generation =>
+            {
+                self.saved.shown = false;
+                self.view = None;
+                return Some(Effect::CloseSaved);
+            }
+            Action::OpenSaved {
+                generation,
+                operation,
+            } if self.saved.shown && generation == self.saved.generation => {
+                if !self
+                    .pending
+                    .iter()
+                    .any(|pending| pending.mutation.operation == operation && pending.saved_record)
+                {
+                    return None;
+                }
+                self.saved.shown = false;
+                if let Some(owner) = self.owner() {
+                    return self.leave(owner, Leave::OpenSaved { operation });
+                }
+                return Some(Effect::OpenSaved { operation });
+            }
+            Action::SavedLoaded {
+                generation,
+                result,
+                problems,
+                occupied,
+                saturated,
+            } => {
+                if generation != self.saved.generation || !self.saved.loading {
+                    return None;
+                }
+                self.saved.loading = false;
+                self.saved.ready = false;
+                match result {
+                    Ok(records) if self.can_restore_saved(&records) => {
+                        for record in records {
+                            if let Some(pending) = self.pending.iter_mut().find(|pending| pending.mutation.operation == record.mutation.operation) {
+                                pending.retry_ready = false;
+                                pending.saved_record = true;
+                                pending.title = record.title;
+                                pending.device_label = record.device_label;
+                                if record.confirmed.is_some() {
+                                    pending.confirmed = record.confirmed;
+                                    pending.delivery = Delivery::Unknown;
+                                    pending.lookup = None;
+                                    pending.ambiguous = true;
+                                }
+                            } else {
+                                self.pending.push(Pending {
+                                    ticket: Ticket::new(record.mutation.home),
+                                    mutation: record.mutation,
+                                    selection: record.selection,
+                                    receipt_only: true,
+                                    saved_record: true,
+                                    lookup: None, delivery: Delivery::Unknown, ambiguous: true, retry_ready: false,
+                                    title: record.title, device_label: record.device_label,
+                                    confirmed: record.confirmed, submitted_form: None,
+                                });
+                            }
+                        }
+                        self.saved.problems = problems;
+                        self.saved.occupied = occupied;
+                        self.saved.saturated = saturated;
+                        self.saved.ready = true;
+                        self.saved.error = None;
+                    }
+                    Ok(_) => self.saved.error = Some("Saved changes could not be restored safely. Existing unconfirmed changes are preserved; check their results and reload.".into()),
+                    Err(reason) => self.saved.error = Some(format!("Could not load saved changes: {reason}")),
+                }
+            }
+            Action::BeforeSendFailed {
+                ticket,
+                reason,
+                retained,
+            } => {
+                let index = self
+                    .pending
+                    .iter()
+                    .position(|pending| pending.ticket == ticket)?;
+                let confirmed = self.pending[index].confirmed.is_some();
+                let keep = retained || self.pending[index].ambiguous || confirmed;
+                if keep {
+                    self.pending[index].retry_ready = false;
+                    self.pending[index].delivery = Delivery::Unknown;
+                    self.pending[index].ambiguous = true;
+                } else {
+                    self.pending.remove(index);
+                }
+                if let Some(view) = self
+                    .view
+                    .as_mut()
+                    .filter(|view| view.owner.home == ticket.home)
+                {
+                    view.error = Some(format!(
+                        "This attempt was not sent: {reason}{}",
+                        if confirmed {
+                            " The original change is confirmed; its recovery record still needs to be updated."
+                        } else if keep {
+                            " The original saved change remains unconfirmed."
+                        } else {
+                            " Your draft is preserved."
+                        }
+                    ));
+                }
+            }
+            Action::AppliedWithSettlement {
+                ticket,
+                result,
+                settled,
+            } => {
+                let index = self
+                    .pending
+                    .iter()
+                    .position(|pending| pending.ticket == ticket)?;
+                // A published request can have an earlier unconfirmed attempt.
+                self.pending[index].ambiguous = true;
+                self.pending[index].saved_record = true;
+                if let Ok(reply) = &result {
+                    if Self::valid_reply(&self.pending[index], reply) && !settled {
+                        self.invalidate_saved_load();
+                        self.confirmed_unsaved(index, reply.receipt.clone());
+                        return None;
+                    }
+                }
+                if result
+                    .as_ref()
+                    .is_ok_and(|reply| Self::valid_reply(&self.pending[index], reply))
+                {
+                    self.invalidate_saved_load();
+                }
+                self.applied(index, result);
+            }
+            Action::LookedUpWithSettlement {
+                ticket,
+                operation,
+                result,
+                settled,
+            } => {
+                let index = self.pending.iter().position(|pending| {
+                    pending.lookup == Some(ticket) && pending.mutation.operation == operation
+                })?;
+                if let Ok(Some(receipt)) = &result {
+                    if Self::valid_receipt(&self.pending[index], receipt) && !settled {
+                        self.invalidate_saved_load();
+                        self.confirmed_unsaved(index, receipt.clone());
+                        return None;
+                    }
+                }
+                if result.as_ref().is_ok_and(|receipt| {
+                    receipt
+                        .as_ref()
+                        .is_some_and(|receipt| Self::valid_receipt(&self.pending[index], receipt))
+                }) {
+                    self.invalidate_saved_load();
+                }
+                // Only the adapter's successfully verified explicit Check can
+                // make a missing receipt retry-ready. This is not route authority.
+                let verified_missing = matches!(&result, Ok(None));
+                let effect = self.update(Action::LookedUp {
+                    ticket,
+                    operation,
+                    result,
+                });
+                if verified_missing
+                    && let Some(pending) = self.pending.iter_mut().find(|pending| {
+                        pending.mutation.operation == operation
+                            && pending.ticket.home == ticket.home
+                    })
+                {
+                    pending.retry_ready = !pending.receipt_only && pending.confirmed.is_none();
+                }
+                return effect;
+            }
             Action::Keep(owner, id) if self.current(owner) => {
                 if self.view.as_ref()?.confirmation.as_ref()?.id != id {
                     return None;
@@ -788,7 +1290,7 @@ impl State {
                             .as_mut()
                             .filter(|view| view.owner.home == pending.mutation.home)
                         {
-                            view.form = None;
+                            Self::dismiss_submitted(view, &pending);
                             view.notice = Some("The original tracking change is confirmed. Refreshing the current view…".into());
                             // A receipt settles an operation, not its current state.
                             // Retire any older page read and request a separate latest
@@ -803,8 +1305,11 @@ impl State {
                             return self.read(owner);
                         }
                     }
-                    _ => {
+                    result => {
                         self.pending[index].lookup = None;
+                        self.pending[index].retry_ready = matches!(result, Ok(None))
+                            && !self.pending[index].receipt_only
+                            && self.pending[index].selection.is_none();
                         self.pending[index].delivery = Delivery::Unknown;
                     }
                 }
@@ -1104,9 +1609,7 @@ impl State {
                     form.role = role;
                 }
             }
-            Action::Dismiss(owner)
-                if self.current(owner.view) && self.pending_for(owner.view.home).is_none() =>
-            {
+            Action::Dismiss(owner) if self.current(owner.view) && !self.submitted_form(owner) => {
                 if self.view.as_ref()?.form.as_ref()?.owner == owner {
                     return self.leave(owner.view, Leave::Dismiss);
                 }
@@ -1222,6 +1725,7 @@ impl State {
                 }
                 let ticket = Ticket::new(owner.home);
                 pending.lookup = Some(ticket);
+                pending.retry_ready = false;
                 pending.delivery = Delivery::Checking;
                 return Some(Effect::Lookup {
                     ticket,
@@ -1233,12 +1737,17 @@ impl State {
                 let pending = self.pending.iter_mut().find(|pending| {
                     pending.mutation.home == owner.home && pending.mutation.operation == operation
                 })?;
-                if pending.delivery != Delivery::Unknown {
+                if pending.delivery != Delivery::Unknown
+                    || pending.confirmed.is_some()
+                    || !pending.retry_ready
+                    || pending.receipt_only
+                {
                     return None;
                 }
                 let ticket = Ticket::new(owner.home);
                 pending.ticket = ticket;
                 pending.lookup = None;
+                pending.retry_ready = false;
                 pending.delivery = Delivery::Sending;
                 return Some(Effect::Mutate {
                     ticket,
@@ -1254,6 +1763,9 @@ impl State {
 
 impl State {
     pub fn view(&self, width: f32, height: f32) -> Element<'_, Action> {
+        if self.saved.shown {
+            return self.saved_view(width, height);
+        }
         let Some(view) = &self.view else {
             return widget::Space::new().into();
         };
@@ -1280,6 +1792,11 @@ impl State {
             )
             .on_press_maybe(view.loading.is_none().then_some(Action::Refresh(owner))),
         );
+        let saved = ui_controls::owned(
+            (owner, "saved-changes"),
+            ui_controls::icon_button(Icon::History, "Saved channel changes")
+                .on_press(Action::ShowSaved),
+        );
         let title = widget::column::with_children(vec![
             design::caption("Channel work").into(),
             design::title(view.title.as_str()).into(),
@@ -1287,6 +1804,7 @@ impl State {
         .spacing(space::XXS);
         let header = widget::row::with_children(vec![
             widget::container(title).width(Length::Fill).into(),
+            saved,
             refresh,
             close,
         ])
@@ -1309,31 +1827,26 @@ impl State {
         if let Some(notice) = &view.notice {
             status.push(message(notice, false));
         }
-        if let Some(pending) = self.pending_for(owner.home) {
-            let text = match pending.delivery {
-                Delivery::Sending => {
-                    "Updating tracking… Closing this view does not cancel the change."
-                }
-                Delivery::Checking => {
-                    "Checking the original change. Tracking controls remain paused until its result is confirmed."
-                }
-                Delivery::Unknown => {
-                    "The change is not yet confirmed. A missing receipt does not mean it stopped."
-                }
-            };
-            let mut rows = vec![design::body(text).into()];
-            if pending.delivery == Delivery::Unknown {
-                rows.push(flow(vec![
-                    ui_controls::owned((owner, pending.mutation.operation, "lookup"), button::secondary("Check result")
-                        .on_press(Action::Check(owner, pending.mutation.operation))),
-                    ui_controls::owned((owner, pending.mutation.operation, "retry"), button::quiet("Retry original change")
-                        .name("Retry the exact original tracking change with its original operation identity")
-                        .on_press(Action::Retry(owner, pending.mutation.operation))),
-                ], narrow));
-                rows.push(design::caption("Retry sends the same target, role and operation. It does not apply a newly edited request.").into());
-            }
-            status.push(panel(rows));
-        } else if self.pending.len() >= MAX_PENDING {
+        self.saved_status(&mut status);
+        if view.read_only {
+            status.push(design::caption("Saved change recovery: check original results here. Restored requests are never resent. Open the channel normally to start a new change.").into());
+        }
+        for pending in self
+            .pending
+            .iter()
+            .filter(|pending| pending.mutation.home == owner.home)
+        {
+            status.push(self.pending_view(owner, pending, narrow));
+        }
+        if self.pending_for(owner.home).is_none()
+            && (self
+                .pending
+                .iter()
+                .filter(|pending| !pending.receipt_only)
+                .count()
+                >= MAX_PENDING
+                || self.pending.len() >= MAX_RECOVERY)
+        {
             status.push(message("Other channels still have unconfirmed changes. Reads and navigation remain available; confirm a pending change before starting another.", true));
         }
         let Some(snapshot) = &view.snapshot else {
@@ -1753,10 +2266,9 @@ impl State {
             controls.push(button::primary::<Action>("Track PR").into());
         }
         controls.push(ui_controls::owned(
-            (owner, "cancel", self.pending_for(view.owner.home).is_none()),
-            button::quiet("Cancel").on_press_maybe(
-                (self.pending_for(view.owner.home).is_none()).then_some(Action::Dismiss(owner)),
-            ),
+            (owner, "cancel", !self.submitted_form(owner)),
+            button::quiet("Cancel")
+                .on_press_maybe((!self.submitted_form(owner)).then_some(Action::Dismiss(owner))),
         ));
         rows.push(flow(controls, narrow));
         panel(rows)
@@ -1771,6 +2283,7 @@ impl State {
     ) -> Element<'a, Action> {
         let owner = form.owner;
         let enabled = self.writable(view.owner);
+        let can_submit = self.local_writable(view.owner);
         let inspect = Action::InspectLocal {
             owner,
             path_generation: local.path_generation,
@@ -1909,11 +2422,11 @@ impl State {
                     selected.context.id,
                     form.role,
                     selected.expected_revision,
-                    enabled,
+                    can_submit,
                 ),
                 button::primary("Track local work")
                     .name("Track selected local checkout")
-                    .on_press_maybe(enabled.then_some(Action::SubmitLocal {
+                    .on_press_maybe(can_submit.then_some(Action::SubmitLocal {
                         owner,
                         selection: selected.selection,
                         target: selected.context.id,
@@ -1936,6 +2449,186 @@ impl State {
         ));
         rows.push(flow(controls, narrow));
         panel(rows)
+    }
+    fn saved_status<'a>(&'a self, rows: &mut Vec<Element<'a, Action>>) {
+        if self.saved.loading {
+            rows.push(
+                design::caption(
+                    "Loading saved changes… New local tracking waits for recovery discovery.",
+                )
+                .into(),
+            );
+        }
+        if let Some(error) = &self.saved.error {
+            rows.push(message(error, true));
+        }
+        for problem in self.saved.problems.iter().take(MAX_PENDING + 1) {
+            rows.push(message(problem, true));
+        }
+        if self.saved.saturated {
+            rows.push(message("Saved local changes are at capacity. Check original results before starting another local change; ordinary PR tracking and reads remain available.", true));
+        }
+        if !self.saved.ready && !self.saved.loading && self.saved.error.is_none() {
+            rows.push(
+                design::caption(
+                    "Saved changes have not been loaded. New local tracking waits for recovery discovery.",
+                )
+                .into(),
+            );
+        }
+    }
+    fn pending_view<'a>(
+        &'a self,
+        owner: ViewOwner,
+        pending: &'a Pending,
+        narrow: bool,
+    ) -> Element<'a, Action> {
+        let text = if pending.confirmed.is_some() {
+            "The original change is confirmed. Its saved recovery record still needs to be updated."
+        } else {
+            match pending.delivery {
+                Delivery::Sending => {
+                    "Updating tracking… Closing this view does not cancel the change."
+                }
+                Delivery::Checking => {
+                    "Checking the original change. Tracking controls remain paused until its result is confirmed."
+                }
+                Delivery::Unknown => {
+                    "The change is not yet confirmed. A missing receipt does not mean it stopped."
+                }
+            }
+        };
+        let mut rows = vec![
+            design::heading(operation_label(&pending.mutation)).into(),
+            design::body(text).into(),
+            design::caption(format!(
+                "Original operation {} · {}",
+                pending.mutation.operation, pending.device_label
+            ))
+            .into(),
+        ];
+        if pending.delivery == Delivery::Unknown {
+            let mut actions = vec![ui_controls::owned(
+                (
+                    owner,
+                    pending.mutation.operation,
+                    pending.confirmed.is_some(),
+                    "lookup",
+                ),
+                button::secondary(if pending.confirmed.is_some() {
+                    "Save confirmation"
+                } else {
+                    "Check result"
+                })
+                .name(format!(
+                    "Check original operation {}",
+                    pending.mutation.operation
+                ))
+                .on_press(Action::Check(owner, pending.mutation.operation)),
+            )];
+            if pending.confirmed.is_none() && pending.retry_ready && !pending.receipt_only {
+                actions.push(ui_controls::owned(
+                    (owner, pending.mutation.operation, "retry"),
+                    button::quiet("Retry original change")
+                        .name(format!(
+                            "Retry original operation {}",
+                            pending.mutation.operation
+                        ))
+                        .on_press(Action::Retry(owner, pending.mutation.operation)),
+                ));
+            }
+            rows.push(flow(actions, narrow));
+            rows.push(design::caption(if pending.confirmed.is_some() {
+                "Retry is disabled because the original result is already confirmed."
+            } else if pending.receipt_only {
+                "This saved request is read-only. Its selection is not restored. Check result never resends it; a missing receipt remains unknown."
+            } else if !pending.retry_ready {
+                "Check result first to verify the original destination before retrying."
+            } else { "Retry sends the same target, role and operation. It does not apply a newly edited request." }).into());
+        }
+        panel(rows)
+    }
+    fn saved_view(&self, _width: f32, height: f32) -> Element<'_, Action> {
+        let generation = self.saved.generation;
+        let title = widget::column::with_children(vec![
+            design::heading("Saved channel changes").into(),
+            design::caption(format!("{} retained operations", self.pending.len())).into(),
+        ])
+        .spacing(space::XXS);
+        let reload = ui_controls::owned(
+            (generation, "saved-reload"),
+            ui_controls::icon_button(Icon::Refresh, "Reload saved changes")
+                .on_press_maybe((!self.saved.loading).then_some(Action::ShowSaved)),
+        );
+        let close = ui_controls::owned(
+            (generation, "saved-close"),
+            ui_controls::icon_button(Icon::Close, "Close saved changes")
+                .on_press(Action::CloseSaved(generation)),
+        );
+        let header = widget::row::with_children(vec![
+            widget::container(title).width(Length::Fill).into(),
+            reload,
+            close,
+        ])
+        .spacing(space::XS)
+        .align_y(Alignment::Center);
+        let mut rows: Vec<Element<'_, Action>> = Vec::new();
+        self.saved_status(&mut rows);
+        rows.push(design::body("These are the original tracking changes. Opening one does not resend it. A missing receipt never proves that it stopped.").into());
+        for pending in &self.pending {
+            let status = if pending.confirmed.is_some() {
+                "Confirmed · recovery save pending"
+            } else {
+                match pending.delivery {
+                    Delivery::Sending => "Sending",
+                    Delivery::Checking => "Checking result",
+                    Delivery::Unknown => "Result unknown",
+                }
+            };
+            let home = pending.mutation.home;
+            let content = vec![
+                design::heading(operation_label(&pending.mutation)).into(),
+                design::body(if pending.title.is_empty() {
+                    format!("Channel {}", home.channel)
+                } else {
+                    pending.title.clone()
+                })
+                .into(),
+                design::caption(format!("{} · {status}", pending.device_label)).into(),
+                design::caption(format!(
+                    "Original home {} / {} / {}",
+                    home.registry, home.channel, home.creation_ordinal
+                ))
+                .into(),
+                design::caption(format!("Operation {}", pending.mutation.operation)).into(),
+                ui_controls::owned(
+                    (generation, pending.mutation.operation, "open-saved"),
+                    button::secondary("Open original change")
+                        .name(format!(
+                            "Open saved operation {}",
+                            pending.mutation.operation
+                        ))
+                        .on_press_maybe(pending.saved_record.then_some(Action::OpenSaved {
+                            generation,
+                            operation: pending.mutation.operation,
+                        })),
+                )
+                .into(),
+            ];
+            let mut content = content;
+            if !pending.saved_record {
+                content.push(design::caption("The original request is retained in this window. Reopen its original channel to check it; saved metadata has not been recovered.").into());
+            }
+            rows.push(panel(content));
+        }
+        if self.pending.is_empty()
+            && self.saved.ready
+            && self.saved.problems.is_empty()
+            && !self.saved.loading
+        {
+            rows.push(design::body("No saved tracking changes need confirmation.").into());
+        }
+        mount(header, Vec::new(), rows, height)
     }
 
     fn entry_view<'a>(
@@ -2163,6 +2856,13 @@ fn ongoing_group(entry: &Entry) -> OngoingGroup {
     }
 }
 
+fn operation_label(mutation: &Mutation) -> String {
+    match &mutation.change {
+        Change::Claim { target, role } => format!("{} · {}", role.label(), target_label(target)),
+        Change::End { target } => format!("End tracking · {}", target_label(target)),
+        Change::Suppress { target } => format!("Not this channel · {}", target_label(target)),
+    }
+}
 fn target_label(target: &Target) -> String {
     match target {
         Target::PullRequest(key) => format!(
