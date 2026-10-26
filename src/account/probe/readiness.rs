@@ -1,6 +1,8 @@
 //! Model-free measurements through the official Codex app server. No command
 //! in this module requests a policy override, thread, turn, or unsandboxed API.
-use super::{Cache, Session, TIMEOUT, command_with_path, current_search_path, find_executable, now_ms};
+use super::{
+    Cache, Session, TIMEOUT, command_with_path, current_search_path, find_executable, now_ms,
+};
 use crate::{
     account::{Account, Identity, UsageStatus, readiness::*},
     agent::Provider,

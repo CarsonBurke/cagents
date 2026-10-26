@@ -1,6 +1,8 @@
 //! Explicit verification of one import-owned pending home. This never requests
 //! a thread, turn, model, quota, execution policy, or command execution.
-use super::{Cache, Session, SpawnOwner, TIMEOUT, command_with_path, current_search_path, find_executable};
+use super::{
+    Cache, Session, SpawnOwner, TIMEOUT, command_with_path, current_search_path, find_executable,
+};
 use crate::{
     account::{Account, AccountHome, Identity, import::PhysicalIdentity},
     agent::Provider,
