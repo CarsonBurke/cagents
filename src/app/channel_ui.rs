@@ -833,7 +833,7 @@ impl Cagents {
             }
             if passive
                 && (self.shared_chat_has_local_work(card)
-                    || matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty() || runtime.is_saving()))
+                    || matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation()))
             {
                 self.retain_local_pane(card);
                 let scope = self
@@ -875,7 +875,7 @@ impl Cagents {
         }
         if retained_scope.is_some() {
             self.status = Some(TransientNotice::warning(
-                "A channel was deleted in another client. Your unsaved work is retained in its worktree.",
+                "A channel was deleted in another client. Your open work is retained in its worktree. Resolve any unsaved edits, pending saves, file recovery or durability warnings before closing it.",
             ));
         }
         let select = if was_active {
