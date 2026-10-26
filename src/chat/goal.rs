@@ -187,6 +187,21 @@ pub enum Failure {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Outcome {
+    Confirmed,
+    Uncertain,
+    Unsupported,
+}
+
+/// Confirmation of a native RPC, separate from its dispatch acknowledgement.
+/// The revision identifies the publication from which the command originated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Completion {
+    pub revision: u64,
+    pub outcome: Outcome,
+}
+
 /// A bounded UI projection. Physical request IDs and admission tokens stay in
 /// the actor. The revision is local ordering, never a provider timestamp.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,6 +212,7 @@ pub struct Snapshot {
     pub read: ReadState,
     pub pending: bool,
     pub uncertain: bool,
+    pub last_result: Option<Completion>,
 }
 
 /// Opaque physical request identity. Only its matching completion releases the
@@ -206,6 +222,7 @@ pub struct Request {
     id: u64,
     thread_id: String,
     observation: u64,
+    input_revision: u64,
     operation: Operation,
 }
 
@@ -233,6 +250,7 @@ pub struct State {
     read: ReadState,
     uncertain: bool,
     pending: Option<Request>,
+    last_result: Option<Completion>,
 }
 
 impl State {
@@ -246,6 +264,7 @@ impl State {
             read: ReadState::Unknown,
             uncertain: false,
             pending: None,
+            last_result: None,
         })
     }
 
@@ -270,6 +289,7 @@ impl State {
             read: self.read.clone(),
             pending: self.pending.is_some(),
             uncertain: self.uncertain,
+            last_result: self.last_result,
         }
     }
 
@@ -300,6 +320,7 @@ impl State {
         self.support = Support::Unknown;
         self.read = ReadState::Unknown;
         self.uncertain = self.pending.is_some();
+        self.last_result = None;
         Ok(())
     }
 
@@ -317,11 +338,13 @@ impl State {
             id,
             thread_id: self.thread_id.clone(),
             observation,
+            input_revision: self.observation,
             operation,
         };
         self.next = id;
         self.observation = observation;
         self.pending = Some(request.clone());
+        self.last_result = None;
         Ok(request)
     }
 
@@ -362,13 +385,43 @@ impl State {
         // even when no provider notification accompanied the response.
         let Some(next) = self.observation.checked_add(1) else {
             self.uncertain = true;
+            self.last_result = Some(Completion {
+                revision: request.input_revision,
+                outcome: Outcome::Uncertain,
+            });
             return Err(Error::Exhausted);
         };
         self.observation = next;
+        let validated = match &result {
+            Err(Failure::Unsupported) => Ok(Outcome::Unsupported),
+            Err(Failure::Unavailable) => Ok(Outcome::Uncertain),
+            Ok(reply) => match (&request.operation, reply) {
+                (Operation::Get, Reply::Read(goal)) => goal
+                    .as_ref()
+                    .map_or(Ok(()), |goal| goal.validate(&request.thread_id))
+                    .map(|()| Outcome::Confirmed),
+                (
+                    Operation::SetObjective(_) | Operation::Pause | Operation::Resume,
+                    Reply::Updated(goal),
+                ) => goal
+                    .validate(&request.thread_id)
+                    .map(|()| Outcome::Confirmed),
+                (Operation::Clear, Reply::Cleared(true)) => Ok(Outcome::Confirmed),
+                (Operation::Clear, Reply::Cleared(false)) => Ok(Outcome::Uncertain),
+                _ => Err(Error::InvalidReply),
+            },
+        };
+        self.last_result = Some(Completion {
+            revision: request.input_revision,
+            outcome: validated.as_ref().copied().unwrap_or(Outcome::Uncertain),
+        });
         if !current {
+            // The outcome is correlated to its original command, while the
+            // current goal remains the newer authoritative observation.
             return Ok(false);
         }
         self.uncertain = true;
+        validated?;
         let reply = match result {
             Err(Failure::Unsupported) => {
                 self.support = Support::Unsupported;
@@ -484,7 +537,7 @@ mod tests {
         let pending = state.snapshot();
         assert!(pending.pending && pending.revision > before.revision);
         let json = serde_json::to_value(&pending).unwrap();
-        assert_eq!(json.as_object().unwrap().len(), 6);
+        assert_eq!(json.as_object().unwrap().len(), 7);
         assert!(json.get("operation").is_none() && json.get("request").is_none());
         assert_eq!(serde_json::from_value::<Snapshot>(json).unwrap(), pending);
         let bytes = postcard::to_allocvec(&pending).unwrap();
@@ -496,6 +549,72 @@ mod tests {
         assert_eq!(
             state.begin_for(&pending.thread_id, pending.revision, Operation::Resume),
             Err(Error::StaleObservation)
+        );
+    }
+
+    #[test]
+    fn only_a_native_result_confirms_the_exact_originating_command() {
+        let mut state = State::new("original-thread".into()).unwrap();
+        let source = state.snapshot();
+        let request = state
+            .begin_for(
+                &source.thread_id,
+                source.revision,
+                Operation::SetObjective("requested objective".into()),
+            )
+            .unwrap();
+        assert!(state.snapshot().pending);
+        assert_eq!(state.snapshot().last_result, None);
+        let newer = goal("original-thread", "newer objective", Status::Blocked);
+        state
+            .observe("original-thread", Some(newer.clone()))
+            .unwrap();
+        assert_eq!(state.snapshot().last_result, None);
+        assert!(state.snapshot().pending);
+        assert!(
+            !state
+                .complete(
+                    &request,
+                    Ok(Reply::Updated(goal(
+                        "original-thread",
+                        "requested objective",
+                        Status::Active,
+                    ))),
+                )
+                .unwrap()
+        );
+        let settled = state.snapshot();
+        assert_eq!(settled.read, ReadState::Known(Some(newer)));
+        assert_eq!(
+            settled.last_result,
+            Some(Completion {
+                revision: source.revision,
+                outcome: Outcome::Confirmed,
+            })
+        );
+        let clear = state
+            .begin_for(&settled.thread_id, settled.revision, Operation::Clear)
+            .unwrap();
+        assert_eq!(state.snapshot().last_result, None);
+        state.complete(&clear, Ok(Reply::Cleared(false))).unwrap();
+        assert_eq!(
+            state.snapshot().last_result,
+            Some(Completion {
+                revision: settled.revision,
+                outcome: Outcome::Uncertain,
+            })
+        );
+        let before = state.snapshot();
+        let read = state
+            .begin_for(&before.thread_id, before.revision, Operation::Get)
+            .unwrap();
+        state.complete(&read, Err(Failure::Unsupported)).unwrap();
+        assert_eq!(
+            state.snapshot().last_result,
+            Some(Completion {
+                revision: before.revision,
+                outcome: Outcome::Unsupported,
+            })
         );
     }
 
