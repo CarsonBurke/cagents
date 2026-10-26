@@ -204,31 +204,86 @@ fn checkout(directory: &Path) -> Option<(PathBuf, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(feature = "ui", feature = "host", target_os = "linux"))]
+    use crate::process::{
+        CancellationToken, CommandSpec, ProcessExecutor, ProcessOutput, SystemProcessExecutor,
+    };
 
-    fn git(directory: &Path, arguments: &[&std::ffi::OsStr]) {
-        let mut command = Command::new("git");
+    #[cfg(any(feature = "ui", feature = "host", target_os = "linux"))]
+    fn fixture_command(program: impl Into<PathBuf>) -> CommandSpec {
+        let mut command = CommandSpec::new(program);
         for (name, _) in std::env::vars_os() {
             if name.as_encoded_bytes().starts_with(b"GIT_") {
-                command.env_remove(name);
+                command = command.env_remove(name);
             }
         }
-        let output = command
-            .args(arguments)
-            .current_dir(directory)
+        command
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {arguments:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
+            .timeout(std::time::Duration::from_secs(30))
+            .output_limits(64 * 1024, 64 * 1024)
+    }
+
+    #[cfg(any(feature = "ui", feature = "host", target_os = "linux"))]
+    fn execute_fixture(command: CommandSpec) -> ProcessOutput {
+        SystemProcessExecutor
+            .execute(&command, &CancellationToken::new())
+            .and_then(|output| output.require_success(&command.program))
+            .unwrap_or_else(|error| panic!("{error}: {}", error.reported_detail()))
+    }
+
+    #[cfg(any(feature = "ui", feature = "host", target_os = "linux"))]
+    fn git(directory: &Path, arguments: &[&std::ffi::OsStr]) {
+        execute_fixture(
+            fixture_command("git")
+                .args(arguments.iter().copied())
+                .cwd(directory),
         );
     }
 
+    // discover intentionally honors the caller's Git environment. Run these
+    // fixtures in an isolated child so both setup and discovery see the same
+    // controlled configuration without mutating the parallel test parent.
+    #[cfg(any(feature = "ui", feature = "host", target_os = "linux"))]
+    fn isolated_git_case(qualified: &str) -> bool {
+        let case = qualified
+            .strip_prefix(concat!(env!("CARGO_CRATE_NAME"), "::"))
+            .unwrap_or(qualified);
+        if std::env::var("CAGENTS_PROJECT_LOCATION_CASE").as_deref() == Ok(case) {
+            return false;
+        }
+        let output = execute_fixture(
+            fixture_command(std::env::current_exe().unwrap())
+                .args([
+                    case,
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                    "--color=never",
+                ])
+                .env("CAGENTS_PROJECT_LOCATION_CASE", case)
+                .timeout(std::time::Duration::from_secs(90))
+                .output_limits(256 * 1024, 256 * 1024),
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!("test {case} ... ok"))
+                && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+            "exact child did not run the owning regression: {stdout}"
+        );
+        print!("{stdout}");
+        true
+    }
+
+    #[cfg(any(feature = "ui", feature = "host", target_os = "linux"))]
     #[test]
     fn discovery_preserves_trailing_git_directory_whitespace() {
+        if isolated_git_case(concat!(
+            module_path!(),
+            "::discovery_preserves_trailing_git_directory_whitespace"
+        )) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         for name in ["bare-space ", "bare-tab\t", "bare-newline\n"] {
             let directory = root.path().join(name);
@@ -258,6 +313,12 @@ mod tests {
     #[cfg(feature = "host")]
     #[test]
     fn placement_preserves_git_marker_and_common_directory_whitespace() {
+        if isolated_git_case(concat!(
+            module_path!(),
+            "::placement_preserves_git_marker_and_common_directory_whitespace"
+        )) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         for suffix in [" ", "\t"] {
             let repository = root.path().join(format!("repository{suffix}"));
@@ -289,6 +350,14 @@ mod tests {
                     project: Some(key.clone()),
                 }
             );
+            let marker_path = repository.join(".git");
+            let original_marker = fs::read(&marker_path).unwrap();
+            for prefix in ["gitdir:", "gitdir:\t", "gitdir:  "] {
+                fs::write(&marker_path, format!("{prefix}{}\n", key.display())).unwrap();
+                assert!(discover(&repository).is_err(), "Git rejects {prefix:?}");
+                assert_eq!(place(&repository, &model), Placement::default());
+            }
+            fs::write(&marker_path, original_marker).unwrap();
 
             git(
                 &repository,
