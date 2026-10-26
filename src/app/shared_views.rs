@@ -74,6 +74,9 @@ pub(super) struct State {
     requested_transfers: HashMap<uuid::Uuid, CardId>,
     pub attached: HashSet<CardId>,
     retained: HashSet<CardId>,
+    /// Last reported unresolved retention condition for each current local pane.
+    /// This gates notices only; every projection still rechecks the live fence.
+    retention_incidents: HashMap<CardId, RetentionIncident>,
     /// Exact chat identity retired by an authoritative view, never inferred from EOF.
     pub closed_chats: HashMap<CardId, crate::chat::Session>,
     /// Last actual canonical descriptors, before optimistic local edits.
@@ -87,6 +90,14 @@ pub(super) struct State {
     pub adoptions: Vec<crate::persistence::TerminalPaneAdoption>,
     pub restorations: Vec<crate::persistence::TerminalPaneRestoration>,
     restoration_requests: HashMap<CardId, TerminalId>,
+}
+
+#[derive(Debug, PartialEq)]
+struct RetentionIncident {
+    original: CardKind,
+    /// None means a remote removal; Some names the conflicting replacement.
+    incoming: Option<CardKind>,
+    reason: &'static str,
 }
 
 impl State {
@@ -300,7 +311,33 @@ impl Cagents {
 
     pub(super) fn retain_local_pane(&mut self, id: CardId) {
         self.shared_views.retained.insert(id);
-        Arc::make_mut(&mut self.durable).local_only_cards.insert(id);
+        if !self.durable.local_only_cards.contains(&id) {
+            Arc::make_mut(&mut self.durable).local_only_cards.insert(id);
+        }
+    }
+
+    fn report_retention_incident(
+        &mut self,
+        id: CardId,
+        incoming: Option<CardKind>,
+        reason: &'static str,
+    ) {
+        let Some(card) = self.card_state(id).filter(|card| card.existence.is_open()) else {
+            self.shared_views.retention_incidents.remove(&id);
+            return;
+        };
+        let incident = RetentionIncident {
+            original: card.kind.clone(),
+            incoming,
+            reason,
+        };
+        if self.shared_views.retention_incidents.get(&id) != Some(&incident) {
+            self.shared_views.retention_incidents.insert(id, incident);
+            // A single read can retain several panes. Record each transition
+            // directly rather than overwriting the shell's one pending status.
+            tracing::warn!(message = reason, "application notice");
+            self.notices.record(TransientNotice::warning(reason));
+        }
     }
 
     pub(super) fn reserve_terminal_creation(&mut self, id: CardId) {
@@ -1141,6 +1178,9 @@ impl Cagents {
         self.shared_views
             .closed_chats
             .retain(|id, _| local_cards.contains(id));
+        self.shared_views
+            .retention_incidents
+            .retain(|id, _| local_cards.contains(id));
         let mut seen = HashSet::new();
         let mut ambiguous = HashSet::new();
         for pane in self
@@ -1484,13 +1524,17 @@ impl Cagents {
         let mut retained_upgrades = Vec::new();
         for id in current.iter().copied() {
             if self.chat_is_unused_default(id) && view.panes.is_empty() {
+                self.shared_views.retention_incidents.remove(&id);
                 continue;
             }
-            if owned.contains(&id)
-                || self
-                    .card_state(id)
-                    .is_some_and(|card| card.kind.is_utility())
+            if self
+                .card_state(id)
+                .is_some_and(|card| card.kind.is_utility())
             {
+                self.shared_views.retention_incidents.remove(&id);
+                continue;
+            }
+            if owned.contains(&id) {
                 continue;
             }
             let (pending, saved_copy) = self.preserve_pending_shared_upgrade(id);
@@ -1523,7 +1567,7 @@ impl Cagents {
                         "A pane was closed in another client. Its unsaved edits are retained here; save or discard them before closing it."
                     }
                 };
-                self.status = Some(TransientNotice::warning(message));
+                self.report_retention_incident(id, None, message);
                 continue;
             }
             self.detach_shared_pane(id);
@@ -1643,7 +1687,7 @@ impl Cagents {
                         } else {
                             "Another client changed this pane. Resolve this editor's file recovery or durability warning before adopting that change."
                         };
-                        self.status = Some(TransientNotice::warning(message));
+                        self.report_retention_incident(pane.id, Some(pane.kind.clone()), message);
                         continue;
                     }
                     if card.kind != pane.kind {
@@ -1701,6 +1745,7 @@ impl Cagents {
                     tasks.push(self.attach_shared_pane(pane));
                 }
             }
+            self.shared_views.retention_incidents.remove(&pane.id);
             let durable = Arc::make_mut(&mut self.durable);
             match &pane.scope {
                 Some(scope) => {
@@ -1818,6 +1863,7 @@ impl Cagents {
 
     /// Passive removal detaches surfaces; it never calls a host close request.
     fn detach_shared_pane(&mut self, id: CardId) {
+        self.shared_views.retention_incidents.remove(&id);
         self.shared_views.defaults.remove(&id);
         Arc::make_mut(&mut self.durable)
             .pending_terminal_creations
@@ -4169,7 +4215,7 @@ mod tests {
                 assert!(app.card_state(pane.id).unwrap().existence.is_open());
                 assert!(app.shared_views.retained.contains(&pane.id));
                 assert!(app.durable.local_only_cards.contains(&pane.id));
-                let notice = app.status.as_ref().unwrap().message.as_str();
+                let notice = app.notices.recent().next().unwrap().notice.message.as_str();
                 match state {
                     "dirty" => assert!(notice.contains("save or discard them before closing")),
                     "saving" => assert!(notice.contains("wait for its save to finish")),
@@ -4218,7 +4264,7 @@ mod tests {
                 assert_eq!(current.has_durability_warning(), state == "warning");
                 assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
                 assert!(app.card_state(pane.id).unwrap().existence.is_open());
-                let notice = app.status.as_ref().unwrap().message.as_str();
+                let notice = app.notices.recent().next().unwrap().notice.message.as_str();
                 match state {
                     "dirty" => assert!(notice.contains("Save or discard its unsaved edits")),
                     "saving" => assert!(notice.contains("Wait for its save to finish")),
@@ -4326,6 +4372,336 @@ mod tests {
         (app, channel, pane, fallback)
     }
 
+    fn retention_full_read(app: &mut Cagents) {
+        let mut model = app.workspace_model.clone();
+        model.sequence += 1;
+        drop(app.update(Message::WorkspaceModelObserved(
+            super::super::workspace_model_sync::ModelUpdate::Read(model),
+        )));
+    }
+
+    #[test]
+    fn retention_notice_full_reads_preserve_dismissal_and_do_not_count_unchanged_incidents() {
+        for state in ["dirty", "saving", "warning", "recovery"] {
+            for replacement in [false, true] {
+                let (mut app, _, pane, _) = repository_peer_channel_deletion_fixture(state);
+                app.status = None;
+                app.notices.clear();
+                if replacement {
+                    let CardKind::Repository(incoming) =
+                        &mut app.workspace_model.views[0].panes[0].kind
+                    else {
+                        unreachable!()
+                    };
+                    incoming.selected_file = Some("another.txt".into());
+                } else {
+                    app.workspace_model.views[0].panes.clear();
+                }
+                let Some(CardRuntime::Repository(before)) = app.cards.get(&pane.id) else {
+                    unreachable!()
+                };
+                let identity = &**before as *const RepositoryRuntime;
+                let text = before.editor_text();
+                retention_full_read(&mut app);
+                assert_eq!(app.notices.entries.len(), 1, "{state}, {replacement}");
+                let notice_id = app.notices.entries[0].id;
+                retention_full_read(&mut app);
+                assert_eq!(app.notices.entries.len(), 1);
+                assert_eq!(app.notices.entries[0].id, notice_id);
+                assert_eq!(app.notices.entries[0].repeats, 1);
+                drop(app.update(Message::DismissNotice(notice_id)));
+                retention_full_read(&mut app);
+                assert!(app.notices.is_empty(), "dismissed incident stays quiet");
+                let Some(CardRuntime::Repository(current)) = app.cards.get(&pane.id) else {
+                    panic!("notification suppression must not bypass retention");
+                };
+                assert_eq!(&**current as *const RepositoryRuntime, identity);
+                assert_eq!(current.editor_text(), text);
+                assert!(current.blocks_navigation());
+                assert!(app.card_state(pane.id).unwrap().existence.is_open());
+                assert_eq!(app.shared_views.retention_incidents.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn retention_notice_reports_changed_reason_incoming_target_and_original_source_once() {
+        let (mut app, _, pane, _) = repository_peer_channel_deletion_fixture("dirty");
+        app.status = None;
+        app.notices.clear();
+        let original = pane.kind.clone();
+        app.workspace_model.views[0].panes.clear();
+        retention_full_read(&mut app);
+        drop(app.update(Message::DismissStatus));
+
+        let mut saving = RepositoryRuntime::post_persist_failure_fixture(pane.id).0;
+        let CardKind::Repository(descriptor) = &original else {
+            unreachable!()
+        };
+        saving.descriptor = descriptor.clone();
+        app.cards
+            .insert(pane.id, CardRuntime::Repository(Box::new(saving)));
+        retention_full_read(&mut app);
+        assert!(
+            app.notices.entries[0]
+                .notice
+                .message
+                .contains("save to finish")
+        );
+        retention_full_read(&mut app);
+        assert_eq!(app.notices.entries[0].repeats, 1);
+        drop(app.update(Message::DismissStatus));
+
+        let mut incoming = pane.clone();
+        let CardKind::Repository(target) = &mut incoming.kind else {
+            unreachable!()
+        };
+        target.selected_file = Some("replacement.txt".into());
+        app.workspace_model.views[0].panes.push(incoming);
+        retention_full_read(&mut app);
+        assert!(
+            app.notices.entries[0]
+                .notice
+                .message
+                .contains("changed this pane")
+        );
+        drop(app.update(Message::DismissStatus));
+        let CardKind::Repository(target) = &mut app.workspace_model.views[0].panes[0].kind else {
+            unreachable!()
+        };
+        target.selected_file = Some("different-replacement.txt".into());
+        retention_full_read(&mut app);
+        assert_eq!(app.notices.entries.len(), 1);
+        assert_eq!(app.notices.entries[0].repeats, 1);
+        drop(app.update(Message::DismissStatus));
+
+        let CardKind::Repository(local) = &mut app.card_state_mut(pane.id).unwrap().kind else {
+            unreachable!()
+        };
+        local.selected_file = Some("different-original.txt".into());
+        retention_full_read(&mut app);
+        assert_eq!(
+            app.notices.entries.len(),
+            1,
+            "same card, new original descriptor"
+        );
+        retention_full_read(&mut app);
+        assert_eq!(app.notices.entries[0].repeats, 1);
+    }
+
+    #[test]
+    fn retention_notice_full_read_reports_every_new_pane_incident_before_dismissal() {
+        let (mut app, channel, pane, _) = repository_peer_channel_deletion_fixture("dirty");
+        app.status = None;
+        app.notices.clear();
+        let second_id = CardId::new();
+        let mut saving = RepositoryRuntime::post_persist_failure_fixture(second_id).0;
+        let CardKind::Repository(original) = &pane.kind else {
+            unreachable!()
+        };
+        saving.descriptor = original.clone();
+        let mut second = app.card_state(pane.id).unwrap().clone();
+        second.id = second_id;
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.push(second);
+        durable
+            .channels
+            .iter_mut()
+            .find(|row| row.id == channel)
+            .unwrap()
+            .cards
+            .push(second_id);
+        app.cards
+            .insert(second_id, CardRuntime::Repository(Box::new(saving)));
+        app.workspace_model.views[0].panes.clear();
+        retention_full_read(&mut app);
+        assert_eq!(
+            app.notices.entries.len(),
+            2,
+            "one status slot cannot carry both transitions"
+        );
+        assert!(
+            app.notices
+                .entries
+                .iter()
+                .any(|entry| entry.notice.message.contains("save or discard"))
+        );
+        assert!(
+            app.notices
+                .entries
+                .iter()
+                .any(|entry| entry.notice.message.contains("save to finish"))
+        );
+        retention_full_read(&mut app);
+        assert!(app.notices.entries.iter().all(|entry| entry.repeats == 1));
+        drop(app.update(Message::DismissStatus));
+        retention_full_read(&mut app);
+        assert!(app.notices.is_empty());
+        assert_eq!(app.shared_views.retention_incidents.len(), 2);
+        assert!(app.cards.contains_key(&pane.id) && app.cards.contains_key(&second_id));
+    }
+
+    #[test]
+    fn retention_notice_same_conflict_reports_again_after_matching_descriptor_clears_it() {
+        let (mut app, _, pane, _) = repository_peer_channel_deletion_fixture("dirty");
+        app.status = None;
+        app.notices.clear();
+        let mut conflicting = pane.kind.clone();
+        let CardKind::Repository(incoming) = &mut conflicting else {
+            unreachable!()
+        };
+        incoming.selected_file = Some("conflicting.txt".into());
+        app.workspace_model.views[0].panes[0].kind = conflicting.clone();
+        retention_full_read(&mut app);
+        drop(app.update(Message::DismissStatus));
+        app.workspace_model.views[0].panes[0].kind = pane.kind.clone();
+        retention_full_read(&mut app);
+        assert!(app.shared_views.retention_incidents.is_empty());
+        app.workspace_model.views[0].panes[0].kind = conflicting;
+        retention_full_read(&mut app);
+        assert_eq!(app.notices.entries.len(), 1);
+        retention_full_read(&mut app);
+        assert_eq!(app.notices.entries[0].repeats, 1);
+    }
+
+    #[test]
+    fn retention_notice_rearms_after_valid_adoption_and_clean_removal() {
+        let (mut app, _, pane, _) = repository_peer_channel_deletion_fixture("dirty");
+        app.status = None;
+        app.notices.clear();
+        app.workspace_model.views[0].panes.clear();
+        retention_full_read(&mut app);
+        drop(app.update(Message::DismissStatus));
+        app.workspace_model.views[0].panes.push(pane.clone());
+        retention_full_read(&mut app);
+        assert!(app.shared_views.retention_incidents.is_empty());
+        app.workspace_model.views[0].panes.clear();
+        retention_full_read(&mut app);
+        assert_eq!(
+            app.notices.entries.len(),
+            1,
+            "a genuine new removal reports again"
+        );
+        let (mut clean, _) = RepositoryRuntime::open_fixture(pane.id, "notes.txt", "saved\n");
+        let CardKind::Repository(original) = &pane.kind else {
+            unreachable!()
+        };
+        clean.descriptor = original.clone();
+        app.cards
+            .insert(pane.id, CardRuntime::Repository(Box::new(clean)));
+        retention_full_read(&mut app);
+        assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+        assert!(!app.cards.contains_key(&pane.id));
+        assert!(app.shared_views.retention_incidents.is_empty());
+    }
+
+    #[test]
+    fn retention_notice_does_not_block_clean_conflicting_descriptor_adoption() {
+        let (mut app, _, pane, _) = repository_peer_channel_deletion_fixture("dirty");
+        let CardKind::Repository(incoming) = &mut app.workspace_model.views[0].panes[0].kind else {
+            unreachable!()
+        };
+        incoming.selected_file = Some("replacement.txt".into());
+        retention_full_read(&mut app);
+        assert!(app.shared_views.retention_incidents.contains_key(&pane.id));
+        let (mut clean, _) = RepositoryRuntime::open_fixture(pane.id, "notes.txt", "saved\n");
+        let CardKind::Repository(original) = &pane.kind else {
+            unreachable!()
+        };
+        clean.descriptor = original.clone();
+        app.cards
+            .insert(pane.id, CardRuntime::Repository(Box::new(clean)));
+        retention_full_read(&mut app);
+        assert!(app.shared_views.retention_incidents.is_empty());
+        let Some(CardRuntime::Repository(current)) = app.cards.get(&pane.id) else {
+            panic!("clean replacement is adopted");
+        };
+        assert_eq!(current.selected_path(), Some(Path::new("replacement.txt")));
+        assert!(!current.blocks_navigation());
+    }
+
+    #[test]
+    fn retention_notice_rechecks_closed_chat_authority_even_when_already_reported() {
+        let (mut app, _, pane, _) = repository_peer_channel_deletion_fixture("clean");
+        let CardKind::Terminal(terminal) = moving_terminal_kind() else {
+            unreachable!()
+        };
+        let source = crate::chat::Session {
+            id: TerminalId::new(),
+            proof: terminal.continuity.live_proof(),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Codex,
+                session_id: Some("retention-original".into()),
+                recipe: terminal.launch,
+            },
+        };
+        app.card_state_mut(pane.id).unwrap().kind = CardKind::Chat(source.clone());
+        app.workspace_model.views[0].panes[0].kind = CardKind::Chat(source.clone());
+        app.cards
+            .insert(pane.id, CardRuntime::Failed("fixture detached chat".into()));
+        app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(pane.id, "local draft".into())]));
+        retention_full_read(&mut app);
+        app.workspace_model.views[0].panes.clear();
+        app.workspace_model.views[0].retired.push(pane.id);
+        retention_full_read(&mut app);
+        assert!(app.chat_closed_elsewhere(pane.id));
+        drop(app.update(Message::DismissStatus));
+        // Reconstruct derived authority on the next identical read. An early
+        // retained-card skip would incorrectly leave this missing.
+        app.shared_views.closed_chats.remove(&pane.id);
+        retention_full_read(&mut app);
+        assert_eq!(app.shared_views.closed_chats.get(&pane.id), Some(&source));
+        assert!(app.chat_closed_elsewhere(pane.id));
+        assert!(app.notices.is_empty());
+        let mut successor = source;
+        successor.id = TerminalId::new();
+        successor.launch.session_id = Some("retention-successor".into());
+        app.card_state_mut(pane.id).unwrap().kind = CardKind::Chat(successor.clone());
+        retention_full_read(&mut app);
+        assert!(
+            !app.chat_closed_elsewhere(pane.id),
+            "old tombstone cannot close a new source"
+        );
+        assert_eq!(
+            app.card_state(pane.id).unwrap().kind,
+            CardKind::Chat(successor)
+        );
+        assert_eq!(
+            app.notices.entries.len(),
+            1,
+            "new local identity is a new incident"
+        );
+    }
+
+    #[test]
+    fn retention_notice_retires_with_card_and_retention_sets_repair_independently() {
+        let (mut app, _, pane, _) = repository_peer_channel_deletion_fixture("dirty");
+        app.workspace_model.views[0].panes.clear();
+        retention_full_read(&mut app);
+        app.card_state_mut(pane.id).unwrap().existence =
+            super::super::project_ui::removed_existence("local retirement");
+        retention_full_read(&mut app);
+        assert!(app.shared_views.retention_incidents.is_empty());
+
+        app.shared_views.retained.remove(&pane.id);
+        let durable = app.durable.clone();
+        assert!(durable.local_only_cards.contains(&pane.id));
+        app.retain_local_pane(pane.id);
+        assert!(app.shared_views.retained.contains(&pane.id));
+        assert!(
+            Arc::ptr_eq(&durable, &app.durable),
+            "already durable retention needs no mutation"
+        );
+        Arc::make_mut(&mut app.durable)
+            .local_only_cards
+            .remove(&pane.id);
+        app.retain_local_pane(pane.id);
+        assert!(app.durable.local_only_cards.contains(&pane.id));
+    }
+
     #[test]
     fn peer_channel_model_deletion_preserves_clean_warning_and_recovery_through_fallback_projection()
      {
@@ -4354,9 +4730,11 @@ mod tests {
                     .any(|current| current.id == channel)
             );
             assert!(
-                app.status
-                    .as_ref()
+                app.notices
+                    .recent()
+                    .next()
                     .unwrap()
+                    .notice
                     .message
                     .contains("file recovery or durability warning")
             );
@@ -4400,7 +4778,7 @@ mod tests {
                 assert_eq!(app.active_workspace.as_ref(), Some(&descriptor.worktree));
                 assert!(app.workspace.card(pane.id).is_some());
                 assert!(app.shared_views.initialized.contains(&fallback));
-                let notice = app.status.as_ref().unwrap().message.as_str();
+                let notice = app.notices.recent().next().unwrap().notice.message.as_str();
                 assert!(notice.contains("file recovery or durability warning"));
                 assert!(!notice.contains("save or discard"));
             }
