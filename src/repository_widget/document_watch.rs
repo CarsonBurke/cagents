@@ -200,7 +200,8 @@ fn run(commands: mpsc::Receiver<Command>, wake: mpsc::Sender<Command>) {
         let wake = wake.clone();
         notify::recommended_watcher(move |event: notify::Result<Event>| {
             if event.as_ref().is_ok_and(|event| {
-                matches!(event.kind,
+                !event.need_rescan()
+                    && matches!(event.kind,
                 EventKind::Access(kind) if !matches!(kind,
                     notify::event::AccessKind::Close(notify::event::AccessMode::Write)))
             }) {
@@ -266,6 +267,16 @@ fn run(commands: mpsc::Receiver<Command>, wake: mpsc::Sender<Command>) {
             })
             .map(|(&id, _)| id)
             .collect();
+        if changes.as_ref().is_some_and(|pending| {
+            !pending.overflow
+                && pending.fault.is_none()
+                && !pending.events.iter().any(Event::need_rescan)
+        }) && changed.is_empty()
+        {
+            // Ancestor watches also see siblings. Unrelated repository or
+            // temporary-file traffic must not cause path probes or reads.
+            continue;
+        }
         let fault = changes.as_ref().and_then(|pending| pending.fault.clone());
         let lost = changes.as_ref().is_some_and(|pending| {
             pending.overflow || pending.events.iter().any(Event::need_rescan)
@@ -287,6 +298,16 @@ fn run(commands: mpsc::Receiver<Command>, wake: mpsc::Sender<Command>) {
                         desired
                             .get(*key)
                             .is_none_or(|directory| directory.path != **path)
+                            || changes.as_ref().is_some_and(|pending| {
+                                pending.events.iter().any(|event| {
+                                    matches!(
+                                        event.kind,
+                                        EventKind::Create(_)
+                                            | EventKind::Remove(_)
+                                            | EventKind::Modify(notify::event::ModifyKind::Name(_))
+                                    ) && event.paths.iter().any(|changed| path.starts_with(changed))
+                                })
+                            })
                     })
                     .map(|(key, path)| (key.clone(), path.clone()))
                     .collect();
