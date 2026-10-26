@@ -950,7 +950,7 @@ mod tests {
         let (mut app, card, target) = live();
         // Mount the card through the same viewport event as the real UI before
         // asking its presentation which native Goal controls can take focus.
-        drop(app.update(Message::WorkspaceViewport {
+        drop(app.update(Message::Viewport {
             generation: app.workspace_view_generation,
             event: WorkspaceViewportEvent::Resized(1_600.0),
         }));
@@ -1564,7 +1564,7 @@ mod tests {
         // Ready behind an unmeasured workspace deliberately keeps its old
         // presentation. Real exposure must hydrate it before an idle routing
         // positive can distinguish Goal activity from ordinary loading.
-        drop(app.update(Message::WorkspaceViewport {
+        drop(app.update(Message::Viewport {
             generation: app.workspace_view_generation,
             event: WorkspaceViewportEvent::Resized(1_600.0),
         }));
