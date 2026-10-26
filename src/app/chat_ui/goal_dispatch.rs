@@ -127,37 +127,11 @@ impl Runtime {
             return None;
         }
         let binding = Binding::capture(self);
-        let live = self.handle().and_then(|handle| current_goal(self, handle));
         let observed = self.snapshot.goal.as_ref();
-        let current = live
-            .as_ref()
-            .zip(observed)
-            .is_some_and(|(live, observed)| live == observed)
-            && self.pending.is_none()
-            && self.goal_pending.is_none();
-        let support = observed.map_or(
-            if self.session.launch.provider == Provider::Codex {
-                Support::Unknown
-            } else {
-                Support::Unsupported
-            },
-            |goal| goal.support,
-        );
-        let presentation = goal::Presentation {
-            support,
-            read: observed.map_or(&ReadState::Unknown, |goal| &goal.read),
-            pending: observed.is_some_and(|goal| goal.pending) || self.goal_pending.is_some(),
-            uncertain: observed.is_some_and(|goal| goal.uncertain),
-            current,
-            work_ready: self.handle().is_some_and(|handle| {
-                let latest = handle.snapshot();
-                latest.ready && latest.read_only_reason.is_none()
-            }),
-            observation_revision: observed.map_or(0, |goal| goal.revision),
-        };
+        let presentation = self.goal_presentation();
         let target = self.target;
         let thread = observed.map_or_else(String::new, |goal| goal.thread_id.clone());
-        let panel = goal::panel(presentation, move |intent| {
+        let panel = goal::panel_with_ids(presentation, self.goal_control_ids(), move |intent| {
             // Disabled controls never call the reducer. Keep the callback pure
             // even for an unavailable observation; there is no I/O here.
             let binding = binding.clone().unwrap_or_else(|| Binding {
@@ -181,7 +155,8 @@ impl Runtime {
                     self.handle().map(|handle| Arc::as_ptr(handle) as usize),
                 ),
                 widget::column::with_children(vec![
-                    crate::ui_controls::button::quiet("Close goal")
+                    crate::ui_controls::button::quiet("Close goal panel")
+                        .id(card_control_id(target.card, "chat-goal-close"))
                         .on_press(Message::ChatUi(Action::GoalPanel(target, false)))
                         .into(),
                     panel,
@@ -191,6 +166,75 @@ impl Runtime {
             )
             .into(),
         )
+    }
+
+    fn goal_presentation(&self) -> goal::Presentation<'_> {
+        let live = self.handle().and_then(|handle| current_goal(self, handle));
+        let observed = self.snapshot.goal.as_ref();
+        let current = live
+            .as_ref()
+            .zip(observed)
+            .is_some_and(|(live, observed)| live == observed)
+            && self.pending.is_none()
+            && self.goal_pending.is_none();
+        let support = observed.map_or(
+            if self.session.launch.provider == Provider::Codex {
+                Support::Unknown
+            } else {
+                Support::Unsupported
+            },
+            |goal| goal.support,
+        );
+        goal::Presentation {
+            support,
+            read: observed.map_or(&ReadState::Unknown, |goal| &goal.read),
+            pending: observed.is_some_and(|goal| goal.pending) || self.goal_pending.is_some(),
+            uncertain: observed.is_some_and(|goal| goal.uncertain),
+            current,
+            work_ready: self.handle().is_some_and(|handle| {
+                let latest = handle.snapshot();
+                latest.ready && latest.read_only_reason.is_none()
+            }),
+            observation_revision: observed.map_or(0, |goal| goal.revision),
+        }
+    }
+
+    fn goal_control_ids(&self) -> [widget::Id; 4] {
+        ["check", "pause", "resume", "clear"]
+            .map(|control| card_control_id(self.target.card, &format!("chat-goal-{control}")))
+    }
+
+    pub(super) fn goal_controls(&self) -> Vec<widget::Id> {
+        let presentation = self.goal_presentation();
+        std::iter::once(card_control_id(self.target.card, "chat-goal-close"))
+            .chain(
+                self.goal_control_ids()
+                    .into_iter()
+                    .zip([
+                        Operation::Get,
+                        Operation::Pause,
+                        Operation::Resume,
+                        Operation::Clear,
+                    ])
+                    .filter_map(|(id, operation)| {
+                        presentation.control_enabled(&operation).then_some(id)
+                    }),
+            )
+            .collect()
+    }
+
+    pub(super) fn open_goal_panel(&mut self) {
+        self.model_picker = None;
+        self.reasoning_picker = false;
+        self.permission_picker = false;
+        self.footer_picker = false;
+        self.account_picker = false;
+        self.composer_actions = false;
+        self.branch_picker = false;
+        self.child_picker = None;
+        self.picker_keyboard = false;
+        self.picker_focus = 0;
+        self.goal_open = true;
     }
 
     pub(super) fn cancel_unsent_goal(&mut self) {
@@ -345,7 +389,7 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
-        runtime.goal_open = true;
+        runtime.open_goal_panel();
         let refusal = if mode != PromptMode::Send {
             Some(
                 "Native goals cannot be queued or steered. Use Send to request the goal change."
@@ -437,7 +481,7 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
-        runtime.goal_open = true;
+        runtime.open_goal_panel();
         if let Err(error) = control.intent.operation.validate() {
             runtime.error = Some(error.to_string());
             return Task::none();
@@ -797,6 +841,177 @@ mod tests {
                 operation,
                 observation_revision: goal.revision,
             },
+        }
+    }
+
+    #[test]
+    fn an_old_panel_close_preserves_a_newer_waiting_goal_and_all_composer_state() {
+        let (mut app, card, target) = live();
+        let mut probing = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+        probing.goal.as_mut().unwrap().pending = true;
+        publish(&mut app, card, probing);
+        write(&mut app, target, "/goal set Goal A");
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+        assert!(matches!(
+            runtime(&app, card).goal_pending.as_ref().unwrap().stage,
+            Stage::Waiting
+        ));
+        let old_close = Action::GoalPanel(target, false);
+
+        let mut observed = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+        observed.goal = Some(goal(9));
+        publish(&mut app, card, observed);
+        assert!(matches!(
+            runtime(&app, card).goal_pending.as_ref().unwrap().stage,
+            Stage::Native { revision: 9, .. }
+        ));
+        acknowledge(&mut app, card, Ok(()));
+        finish_native(&mut app, card, 9, Outcome::Confirmed);
+        assert!(runtime(&app, card).goal_pending.is_none());
+
+        let mut probing = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+        probing.goal.as_mut().unwrap().pending = true;
+        publish(&mut app, card, probing);
+        write(&mut app, target, "/goal set Goal B");
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+        let rt = app.chat_runtime_mut(target).unwrap();
+        rt.composer.perform(text_editor::Action::Move(
+            text_editor::Motion::DocumentStart,
+        ));
+        rt.attachments
+            .push(Attachment::file("keep-after-submit.txt"));
+        let before = (
+            rt.composer.text(),
+            rt.composer.cursor(),
+            rt.attachments.clone(),
+            rt.revision,
+        );
+        let request = rt.goal_pending.as_ref().unwrap().clone();
+        assert!(matches!(request.stage, Stage::Waiting));
+        assert_eq!(request.operation, Operation::SetObjective("Goal B".into()));
+        assert!(rt.goal_open);
+        drop(app.handle_chat_ui(old_close));
+        let rt = runtime(&app, card);
+        assert!(!rt.goal_open);
+        assert_eq!(
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision
+            ),
+            before
+        );
+        let retained = rt.goal_pending.as_ref().unwrap();
+        assert!(matches!(retained.stage, Stage::Waiting));
+        assert_eq!(retained.operation, request.operation);
+        assert_eq!(
+            retained.input.as_ref().unwrap().revision,
+            request.input.as_ref().unwrap().revision
+        );
+        assert_eq!(
+            retained.input.as_ref().unwrap().text,
+            request.input.as_ref().unwrap().text
+        );
+        assert!(retained.binding.as_ref().unwrap().matches(rt));
+        assert!(rt.pending.is_none());
+        assert!(rt.queued.is_none());
+        assert!(rt.followups.is_empty());
+        // Target retirement, rather than presentation dismissal, still owns
+        // cancellation of an intent that has not reached the provider.
+        app.chat_runtime_mut(target).unwrap().cancel_unsent_goal();
+        assert!(runtime(&app, card).goal_pending.is_none());
+        assert_eq!(runtime(&app, card).composer.text(), before.0);
+    }
+
+    #[test]
+    fn goal_keyboard_ring_focuses_real_enabled_card_controls_and_wraps_without_mutating_input() {
+        use iced::advanced::widget::{Operation as WidgetOperation, operation};
+        use iced::futures::StreamExt;
+
+        struct Focused(Option<widget::Id>);
+        impl WidgetOperation for Focused {
+            fn traverse(&mut self, children: &mut dyn FnMut(&mut dyn WidgetOperation)) {
+                children(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if state.is_focused() {
+                    self.0 = id.cloned();
+                }
+            }
+        }
+        let (mut app, card, target) = live();
+        write(&mut app, target, "ordinary unsent draft");
+        let before = runtime(&app, card).composer.text();
+        drop(app.handle_chat_ui(Action::GoalPanel(target, true)));
+        assert_eq!(
+            runtime(&app, card).goal_controls(),
+            vec![
+                card_control_id(card, "chat-goal-close"),
+                card_control_id(card, "chat-goal-check"),
+            ]
+        );
+        let mut tasks = Vec::new();
+        for backwards in [false, false, true] {
+            let key = keyboard::Key::Named(keyboard::key::Named::Tab);
+            let event = keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Tab),
+                location: keyboard::Location::Standard,
+                modifiers: if backwards {
+                    keyboard::Modifiers::SHIFT
+                } else {
+                    keyboard::Modifiers::empty()
+                },
+                text: None,
+                repeat: false,
+            };
+            tasks.push(
+                app.chat_picker_key(&event)
+                    .expect("goal owns its existing picker key path"),
+            );
+        }
+        assert_eq!(runtime(&app, card).composer.text(), before);
+        assert!(runtime(&app, card).pending.is_none());
+        assert!(runtime(&app, card).goal_pending.is_none());
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut ui = iced::runtime::UserInterface::build(
+            runtime(&app, card).goal_panel().unwrap(),
+            iced::Size::new(360.0, 650.0),
+            iced::runtime::user_interface::Cache::new(),
+            &mut renderer,
+        );
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus(card_control_id(card, "chat-goal-close")),
+        );
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for (task, expected) in tasks.into_iter().zip(["check", "close", "check"]) {
+            executor.block_on(async {
+                let mut stream = iced::runtime::task::into_stream(task).unwrap();
+                while let Some(action) = stream.next().await {
+                    match action {
+                        iced::runtime::Action::Widget(mut operation) => {
+                            ui.operate(&renderer, operation.as_mut())
+                        }
+                        _ => panic!("picker navigation must only issue a focus operation"),
+                    }
+                }
+            });
+            let mut focused = Focused(None);
+            ui.operate(&renderer, &mut focused);
+            assert_eq!(
+                focused.0,
+                Some(card_control_id(card, &format!("chat-goal-{expected}")))
+            );
         }
     }
 

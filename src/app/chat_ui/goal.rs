@@ -32,6 +32,36 @@ pub(super) struct Presentation<'a> {
     pub observation_revision: u64,
 }
 
+impl Presentation<'_> {
+    pub(super) fn control_enabled(self, operation: &Operation) -> bool {
+        let goal = match self.read {
+            ReadState::Known(Some(goal)) => Some(goal),
+            _ => None,
+        };
+        let free = self.current && !self.pending;
+        let confirmed = free && self.support == Support::Supported && !self.uncertain;
+        match operation {
+            Operation::Get => free && self.support != Support::Unsupported,
+            Operation::Pause => confirmed && goal.is_some_and(|goal| goal.status == Status::Active),
+            Operation::Resume => {
+                confirmed
+                    && self.work_ready
+                    && goal.is_some_and(|goal| {
+                        matches!(
+                            goal.status,
+                            Status::Paused
+                                | Status::Blocked
+                                | Status::UsageLimited
+                                | Status::BudgetLimited
+                        )
+                    })
+            }
+            Operation::Clear => confirmed && goal.is_some(),
+            Operation::SetObjective(_) => false,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct ControlsKey {
     subject: Option<(String, String, Status)>,
@@ -61,15 +91,26 @@ pub(super) fn panel<'a, Message: Clone + 'a>(
     state: Presentation<'a>,
     on_action: impl Fn(Intent) -> Message,
 ) -> Element<'a, Message> {
+    panel_with_ids(
+        state,
+        std::array::from_fn(|_| widget::Id::unique()),
+        on_action,
+    )
+}
+
+pub(super) fn panel_with_ids<'a, Message: Clone + 'a>(
+    state: Presentation<'a>,
+    ids: [widget::Id; 4],
+    on_action: impl Fn(Intent) -> Message,
+) -> Element<'a, Message> {
     let goal = match state.read {
         ReadState::Known(Some(goal)) => Some(goal),
         _ => None,
     };
     let confirmed =
         state.current && state.support == Support::Supported && !state.uncertain && !state.pending;
-    let free = state.current && !state.pending;
-    let check = free && state.support != Support::Unsupported;
-    let change = confirmed && goal.is_some();
+    let check = state.control_enabled(&Operation::Get);
+    let change = state.control_enabled(&Operation::Clear);
     let intent = |operation| Intent {
         operation,
         observation_revision: state.observation_revision,
@@ -171,23 +212,18 @@ pub(super) fn panel<'a, Message: Clone + 'a>(
                 .into(),
         );
     }
-    let pause = change && goal.is_some_and(|goal| goal.status == Status::Active);
-    let resume = change
-        && state.work_ready
-        && goal.is_some_and(|goal| {
-            matches!(
-                goal.status,
-                Status::Paused | Status::Blocked | Status::UsageLimited | Status::BudgetLimited
-            )
-        });
+    let pause = state.control_enabled(&Operation::Pause);
+    let resume = state.control_enabled(&Operation::Resume);
     let controls = widget::column::with_children(vec![
         widget::row::with_children(vec![
             button::secondary("Check")
+                .id(ids[0].clone())
                 .name("Check native goal")
                 .width(Length::Fill)
                 .on_press_maybe(check.then(|| on_action(intent(Operation::Get))))
                 .into(),
             button::secondary("Pause")
+                .id(ids[1].clone())
                 .name("Pause native goal")
                 .width(Length::Fill)
                 .on_press_maybe(pause.then(|| on_action(intent(Operation::Pause))))
@@ -198,11 +234,13 @@ pub(super) fn panel<'a, Message: Clone + 'a>(
         .into(),
         widget::row::with_children(vec![
             button::secondary("Resume")
+                .id(ids[2].clone())
                 .name("Resume native goal")
                 .width(Length::Fill)
                 .on_press_maybe(resume.then(|| on_action(intent(Operation::Resume))))
                 .into(),
             button::secondary("Clear")
+                .id(ids[3].clone())
                 .name("Clear native goal")
                 .width(Length::Fill)
                 .on_press_maybe(change.then(|| on_action(intent(Operation::Clear))))

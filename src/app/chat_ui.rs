@@ -4486,6 +4486,8 @@ impl Runtime {
             "chat-subagent-search"
         } else if self.model_picker.is_some() {
             "chat-model-search"
+        } else if self.goal_open {
+            "chat-goal-close"
         } else {
             "chat-composer"
         }
@@ -5222,9 +5224,9 @@ impl Cagents {
             .and_then(|card| self.cards.get(&card))
             .is_some_and(|card| {
                 matches!(card, CardRuntime::Chat(runtime)
-                if runtime.picker_keyboard
+                if runtime.goal_open || (runtime.picker_keyboard
                     && (runtime.account_picker || (runtime.permission_picker
-                        && runtime.permissions_form.page == permissions::Page::Blocked)))
+                        && runtime.permissions_form.page == permissions::Page::Blocked))))
             })
     }
 
@@ -5248,7 +5250,9 @@ impl Cagents {
             },
             _ => None,
         })?;
-        let ring: Vec<_> = if runtime.account_picker {
+        let ring: Vec<_> = if runtime.goal_open {
+            runtime.goal_controls()
+        } else if runtime.account_picker {
             let accounts = self.chat_accounts(
                 runtime.session.launch.provider,
                 &runtime.session.launch.recipe,
@@ -6213,7 +6217,9 @@ impl Cagents {
             || runtime.footer_picker
             || runtime.account_picker
             || runtime.composer_actions
-            || runtime.branch_picker;
+            || runtime.branch_picker
+            || runtime.goal_open;
+        runtime.goal_open = false;
         runtime.reasoning_picker = false;
         runtime.permission_picker = false;
         runtime.footer_picker = false;
@@ -8029,7 +8035,8 @@ impl Cagents {
             _ => None,
         };
         let restore = match &action {
-            Action::AccountPicker(target, false)
+            Action::GoalPanel(target, false)
+            | Action::AccountPicker(target, false)
             | Action::PermissionPicker(target, false)
             | Action::FooterPicker(target, false)
             | Action::ModelPicker(target, false)
@@ -8042,6 +8049,7 @@ impl Cagents {
                     CardRuntime::Chat(runtime)
                         if runtime.target == *target
                             && (runtime.picker_keyboard
+                                || runtime.goal_open
                                 || runtime.model_picker.is_some()
                                 || runtime.child_picker.is_some()) =>
                     {
@@ -8052,16 +8060,41 @@ impl Cagents {
             }
             _ => None,
         };
+        let goal_before = self
+            .workspace
+            .focused()
+            .and_then(|card| match self.cards.get(&card) {
+                Some(CardRuntime::Chat(runtime)) => Some((runtime.target, runtime.goal_open)),
+                _ => None,
+            });
+        let goal_close = matches!(&action, Action::GoalPanel(_, false));
         let task = self.handle_chat_ui_inner(action);
         self.reconcile_chat_failure_presentations();
         if let Some(card) = closed_refresh {
             self.sync_closed_chat_draft(card);
         }
+        if let Some((target, false)) = goal_before
+            && self.workspace.focused() == Some(target.card)
+            && !self.workspace_inputs_blocked()
+            && self
+                .chat_runtime_mut(target)
+                .is_some_and(|runtime| runtime.goal_open)
+        {
+            return Task::batch([
+                task,
+                iced::widget::operation::focus(card_control_id(target.card, "chat-goal-close"))
+                    .map(cosmic::Action::App),
+            ]);
+        }
         if let Some(target) = restore
+            && (!goal_close
+                || (self.workspace.focused() == Some(target.card)
+                    && !self.workspace_inputs_blocked()))
             && let Some(runtime) = self.chat_runtime_mut(target)
             && !runtime.account_picker
             && !runtime.permission_picker
             && runtime.model_picker.is_none()
+            && !runtime.goal_open
         {
             runtime.picker_keyboard = false;
             return Task::batch([
@@ -8180,6 +8213,16 @@ impl Cagents {
         }
         if matches!(&action, Action::Submit(target, _) if self.chat_closed_elsewhere(target.card)) {
             return Task::none();
+        }
+        if let Action::AccountPicker(target, true)
+        | Action::PermissionPicker(target, true)
+        | Action::FooterPicker(target, true)
+        | Action::ModelPicker(target, true)
+        | Action::ReasoningPicker(target, true)
+        | Action::SubagentPicker(target, true) = &action
+            && let Some(runtime) = self.chat_runtime_mut(*target)
+        {
+            runtime.goal_open = false;
         }
         match action {
             Action::CopyClosedDraft(target, revision) => {
@@ -9608,9 +9651,12 @@ impl Cagents {
             }
             Action::GoalPanel(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.goal_open = open;
-                    if !open {
-                        runtime.cancel_unsent_goal();
+                    if open {
+                        runtime.open_goal_panel();
+                    } else {
+                        // A queued close only hides presentation. It cannot
+                        // cancel an intent created after that button rendered.
+                        runtime.goal_open = false;
                     }
                 }
             }
@@ -23977,6 +24023,98 @@ mod tests {
         );
         assert!(!Action::OpenChangedFile(target, "/reported".into()).allowed_while_modal());
     }
+    #[test]
+    fn goal_panel_excludes_other_pickers_and_escape_restores_only_its_focused_composer() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("goal-picker-lifecycle"));
+        app.workspace.focus(card).unwrap();
+        let target = chat_runtime(&app, card).target;
+        write(&mut app, card, "draft kept while inspecting goal");
+        let rt = app.chat_runtime_mut(target).unwrap();
+        rt.attachments.push(Attachment::file("kept.txt"));
+        rt.composer.perform(text_editor::Action::Move(
+            text_editor::Motion::DocumentStart,
+        ));
+        let before = (
+            rt.composer.text(),
+            rt.composer.cursor(),
+            rt.attachments.clone(),
+            rt.revision,
+        );
+        let close = card_control_id(card, "chat-goal-close");
+        let composer = card_control_id(card, "chat-composer");
+
+        for picker in [
+            Action::ModelPicker(target, true),
+            Action::PermissionPicker(target, true),
+            Action::FooterPicker(target, true),
+            Action::ReasoningPicker(target, true),
+            Action::ComposerActions(target, true),
+            Action::SubagentPicker(target, true),
+        ] {
+            drop(app.handle_chat_ui(picker));
+            assert!(!chat_runtime(&app, card).goal_open);
+            let task = app.handle_chat_ui(Action::GoalPanel(target, true));
+            let rt = chat_runtime(&app, card);
+            assert!(rt.goal_open);
+            assert!(rt.model_picker.is_none());
+            assert!(rt.child_picker.is_none());
+            assert!(
+                !rt.permission_picker
+                    && !rt.account_picker
+                    && !rt.footer_picker
+                    && !rt.reasoning_picker
+                    && !rt.composer_actions
+            );
+            assert!(!rt.branch_picker);
+            assert_eq!(rt.focus_control(), "chat-goal-close");
+            assert!(app.chat_picker_owns_keyboard());
+            assert_eq!(task_focuses(task, &close), (true, false));
+        }
+        let stale = Target {
+            generation: target.generation + 1,
+            ..target
+        };
+        let task = app.handle_chat_ui(Action::GoalPanel(stale, false));
+        assert!(chat_runtime(&app, card).goal_open);
+        assert_eq!(task_focuses(task, &composer), (false, true));
+
+        let key = keyboard::Key::Named(keyboard::key::Named::Escape);
+        let task = app.update(Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            },
+            captured: true,
+        });
+        assert!(!chat_runtime(&app, card).goal_open);
+        assert!(!app.chat_picker_owns_keyboard());
+        assert_eq!(task_focuses(task, &composer), (true, false));
+        let rt = chat_runtime(&app, card);
+        assert_eq!(
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision
+            ),
+            before
+        );
+        assert!(!app.dismiss_chat_picker());
+
+        drop(app.handle_chat_ui(Action::GoalPanel(target, true)));
+        let other = draft_chat(&mut app);
+        assert_eq!(app.workspace.focused(), Some(other));
+        let task = app.handle_chat_ui(Action::GoalPanel(target, false));
+        assert!(!chat_runtime(&app, card).goal_open);
+        assert_eq!(task_focuses(task, &composer), (false, true));
+    }
+
     #[test]
     fn composer_actions_navigate_dismiss_and_ignore_stale_targets() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
