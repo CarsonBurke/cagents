@@ -265,8 +265,15 @@ fn resume_revalidates_original_scope_after_adapter_preparation_before_any_frame(
         old: std::path::PathBuf,
         frame: serde_json::Value,
         identity: super::super::protocol::ServerIdentity,
+        admission: Option<super::super::protocol::GoalResumeAdmission>,
     }
     impl Adapter for SwapBeforeResume {
+        fn set_goal_resume_admission(
+            &mut self,
+            admission: super::super::protocol::GoalResumeAdmission,
+        ) {
+            self.admission = Some(admission);
+        }
         fn server_identity(&self) -> Option<&super::super::protocol::ServerIdentity> {
             Some(&self.identity)
         }
@@ -274,6 +281,10 @@ fn resume_revalidates_original_scope_after_adapter_preparation_before_any_frame(
             Ok(Step::default())
         }
         fn command(&mut self, _: Command) -> Result<Step, String> {
+            assert_eq!(
+                self.admission,
+                Some(super::super::protocol::GoalResumeAdmission::OriginalScope)
+            );
             std::fs::rename(&self.home, &self.old).map_err(|e| e.to_string())?;
             std::fs::create_dir(&self.home).map_err(|e| e.to_string())?;
             Ok(Step {
@@ -305,6 +316,7 @@ fn resume_revalidates_original_scope_after_adapter_preparation_before_any_frame(
                 old: root.path().join("old-codex"),
                 frame,
                 identity: identity(&home),
+                admission: None,
             }),
         );
         let error = handle.command(Command::Compact).unwrap_err();
@@ -347,8 +359,8 @@ fn goal_observations_fence_thread_reset_and_never_make_unknown_or_limited_work_i
     unknown.support = Support::Unsupported;
     assert_eq!(
         goal_readiness(Some(&unknown)),
-        None,
-        "Unsupported optional goals leave ordinary chat usable"
+        Some(UpdateReadiness::Unready),
+        "Unsupported is not proof that a goal-capable actor is inactive"
     );
     unknown.pending = true;
     assert_eq!(
@@ -440,6 +452,198 @@ fn goal_work_binds_healthy_original_scope_to_the_initialized_server_across_alias
     assert_eq!(
         handle.check_update_readiness().unwrap(),
         UpdateReadiness::Busy
+    );
+    handle.close().unwrap();
+}
+
+#[test]
+fn legacy_inactive_admission_requires_original_directory_and_exact_retained_server() {
+    use super::super::protocol::GoalResumeAdmission as Admission;
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().join("work");
+    let home = root.path().join("codex");
+    std::fs::create_dir(&cwd).unwrap();
+    std::fs::create_dir(&home).unwrap();
+    let original = scope(&home);
+    let server = identity(&home);
+    let context = super::super::protocol::ExecutionContext::capture(&cwd).unwrap();
+    let pin = context.pinned_launch_directory().unwrap();
+    let restored = super::super::protocol::ExecutionContext::restored(pin.0);
+    let classify = |scope, current, legacy, directory| {
+        goal_resume_admission(scope, current, legacy, Some(&restored), directory, &cwd)
+    };
+    assert_eq!(
+        classify(Some(&original), Some(&server), None, Some(&pin)),
+        Admission::OriginalScope
+    );
+    assert_eq!(
+        classify(None, Some(&server), Some(&server), Some(&pin)),
+        Admission::InactiveOnly
+    );
+    assert_eq!(
+        classify(None, Some(&server), None, Some(&pin)),
+        Admission::Unavailable,
+        "A fresh missing tuple is never a legacy fallback"
+    );
+    assert_eq!(
+        classify(None, None, Some(&server), Some(&pin)),
+        Admission::Unavailable
+    );
+    assert_eq!(
+        classify(None, Some(&server), Some(&server), None),
+        Admission::Unavailable
+    );
+    let mut changed = server.clone();
+    changed.reported_home = "/another-original-report".into();
+    assert_eq!(
+        classify(None, Some(&changed), Some(&server), Some(&pin)),
+        Admission::Unavailable
+    );
+    std::fs::rename(&home, root.path().join("old-codex")).unwrap();
+    std::fs::create_dir(&home).unwrap();
+    assert_eq!(
+        classify(Some(&original), Some(&server), Some(&server), Some(&pin)),
+        Admission::Unavailable,
+        "A failed retained tuple cannot downgrade to inactive-only"
+    );
+    std::fs::rename(&cwd, root.path().join("old-work")).unwrap();
+    std::fs::create_dir(&cwd).unwrap();
+    assert_eq!(
+        classify(None, Some(&server), Some(&server), Some(&pin)),
+        Admission::Unavailable
+    );
+}
+
+#[test]
+fn legacy_resume_requires_latest_exact_positive_inactive_observation_not_unknown_or_old_active() {
+    use super::super::protocol::GoalResumeAdmission as Admission;
+    let mut state = Snapshot {
+        session_id: Some("original-thread".into()),
+        goal: Some(observation(Status::Active, 1)),
+        ..Snapshot::default()
+    };
+    let resume =
+        serde_json::json!({"method":"thread/resume","params":{"threadId":"original-thread"}});
+    let mut step = Step {
+        writes: vec![resume],
+        events: vec![Event::Goal(observation(Status::Paused, 2))],
+        ..Step::default()
+    };
+    assert!(
+        validate_goal_resume_step(Admission::InactiveOnly, &state, &step).is_ok(),
+        "The latest paused probe must override old Active"
+    );
+    for status in [Status::Paused, Status::Complete] {
+        step.events = vec![Event::Goal(observation(status, 3))];
+        assert!(validate_goal_resume_step(Admission::InactiveOnly, &state, &step).is_ok());
+    }
+    let mut absent = observation(Status::Paused, 4);
+    absent.read = ReadState::Known(None);
+    step.events = vec![Event::Goal(absent.clone())];
+    assert!(validate_goal_resume_step(Admission::InactiveOnly, &state, &step).is_ok());
+    for status in [
+        Status::Active,
+        Status::Blocked,
+        Status::UsageLimited,
+        Status::BudgetLimited,
+    ] {
+        step.events = vec![Event::Goal(observation(status, 5))];
+        assert!(validate_goal_resume_step(Admission::InactiveOnly, &state, &step).is_err());
+    }
+    state.goal = Some(observation(Status::Paused, 6));
+    let mut unknown = observation(Status::Paused, 7);
+    unknown.read = ReadState::Unknown;
+    for support in [Support::Unknown, Support::Unsupported, Support::Supported] {
+        unknown.support = support;
+        step.events = vec![Event::Goal(unknown.clone())];
+        assert!(
+            validate_goal_resume_step(Admission::InactiveOnly, &state, &step).is_err(),
+            "New unknown/unsupported cannot fall back to cached paused"
+        );
+        assert_eq!(
+            goal_readiness(Some(&unknown)),
+            Some(UpdateReadiness::Unready)
+        );
+        assert!(
+            validate_goal_resume_step(Admission::OriginalScope, &state, &step).is_ok(),
+            "The original physical proof authorizes restore independently of optional Goal API support"
+        );
+    }
+    for (pending, uncertain) in [(true, false), (false, true)] {
+        let mut unanswered = absent.clone();
+        unanswered.pending = pending;
+        unanswered.uncertain = uncertain;
+        step.events = vec![Event::Goal(unanswered)];
+        assert!(validate_goal_resume_step(Admission::InactiveOnly, &state, &step).is_err());
+    }
+    step.events = vec![Event::Goal(absent)];
+    assert!(validate_goal_resume_step(Admission::Unavailable, &state, &step).is_err());
+    assert!(validate_goal_resume_step(Admission::OriginalScope, &state, &step).is_ok());
+    step.writes[0]["params"]["threadId"] = serde_json::json!("another-thread");
+    assert!(validate_goal_resume_step(Admission::InactiveOnly, &state, &step).is_err());
+    assert!(
+        goal_readiness(None).is_none(),
+        "Ordinary no-Goal snapshots keep existing policy"
+    );
+}
+
+#[test]
+fn goal_resume_advisory_refreshes_on_real_actor_command_and_receive() {
+    use super::super::protocol::GoalResumeAdmission as Admission;
+    struct Advisory {
+        identity: super::super::protocol::ServerIdentity,
+        admission: Option<Admission>,
+        received: crossbeam_channel::Sender<Admission>,
+    }
+    impl Adapter for Advisory {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+        fn server_identity(&self) -> Option<&super::super::protocol::ServerIdentity> {
+            Some(&self.identity)
+        }
+        fn set_goal_resume_admission(&mut self, admission: Admission) {
+            self.admission = Some(admission);
+        }
+        fn command(&mut self, _: Command) -> Result<Step, String> {
+            assert!(self.admission.is_some(), "Refresh must precede the command");
+            Ok(Step {
+                writes: vec![serde_json::json!({"synthetic":"echo"})],
+                ..Step::default()
+            })
+        }
+        fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+            self.received
+                .send(self.admission.expect("Refresh before receive"))
+                .unwrap();
+            Ok(Step::default())
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("codex");
+    std::fs::create_dir(&home).unwrap();
+    let (send, receive) = crossbeam_channel::bounded(2);
+    let handle = start(
+        spec(root.path()),
+        Some(scope(&home)),
+        Box::new(Advisory {
+            identity: identity(&home),
+            admission: None,
+            received: send,
+        }),
+    );
+    handle.command(Command::Compact).unwrap();
+    assert_eq!(
+        receive.recv_timeout(Duration::from_secs(5)).unwrap(),
+        Admission::OriginalScope
+    );
+    std::fs::rename(&home, root.path().join("old-home")).unwrap();
+    std::fs::create_dir(&home).unwrap();
+    handle.command(Command::Interrupt).unwrap();
+    assert_eq!(
+        receive.recv_timeout(Duration::from_secs(5)).unwrap(),
+        Admission::Unavailable,
+        "The initialized actor must refresh authority after a physical home replacement"
     );
     handle.close().unwrap();
 }

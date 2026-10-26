@@ -229,6 +229,7 @@ enum NativeOwnership {
     Adopted(
         super::native_holder::Holder,
         crate::daemon::holder_registry::Process,
+        Option<super::protocol::ServerIdentity>,
     ),
 }
 impl LocalHandle {
@@ -313,7 +314,11 @@ impl LocalHandle {
             initial,
             store,
             recovery.confirmed_thread,
-            Some(NativeOwnership::Adopted(holder, server)),
+            Some(NativeOwnership::Adopted(
+                holder,
+                server,
+                recovery.server_identity,
+            )),
             recovery.goal_account_scope,
             notify,
         )
@@ -398,7 +403,7 @@ impl LocalHandle {
             }
         }
         let expected_native_peer = match &ownership {
-            Some(NativeOwnership::Adopted(_, server)) => Some(server.clone()),
+            Some(NativeOwnership::Adopted(_, server, _)) => Some(server.clone()),
             _ => None,
         };
         let adopted_native = expected_native_peer.is_some();
@@ -407,12 +412,17 @@ impl LocalHandle {
         // This is the original spawn FD (or the authenticated holder's FD),
         // never a new open of the current working-directory spelling. Keep it
         // separate from ExecutionContext: restored contexts retain run custody.
-        let goal_resume_requires_scope = matches!(&ownership, Some(NativeOwnership::New(..)))
-            || launch_account_scope
-                .as_ref()
-                .is_some_and(|scope| scope.provider == crate::agent::Provider::Codex);
+        // Only an actual old adopted holder can use inactive-only recovery.
+        // A fresh launch or a retained tuple that failed validation must never
+        // downgrade to this path.
+        let goal_legacy_server = match &ownership {
+            Some(NativeOwnership::Adopted(_, _, server)) if launch_account_scope.is_none() => {
+                server.clone()
+            }
+            _ => None,
+        };
         let goal_directory = match &mut ownership {
-            Some(NativeOwnership::Adopted(holder, _)) => holder.pinned_launch_directory().ok(),
+            Some(NativeOwnership::Adopted(holder, _, _)) => holder.pinned_launch_directory().ok(),
             _ => spec
                 .execution
                 .as_ref()
@@ -428,7 +438,7 @@ impl LocalHandle {
                     launch_account_scope.clone(),
                 )?)
             }
-            Some(NativeOwnership::Adopted(holder, _)) => Some(holder),
+            Some(NativeOwnership::Adopted(holder, _, _)) => Some(holder),
             _ => None,
         };
         let (wake, reader) = UnixStream::pair().map_err(|e| e.to_string())?;
@@ -494,7 +504,7 @@ impl LocalHandle {
                     launch_context: spec.execution.clone(),
                     launch_account_scope,
                     goal_directory,
-                    goal_resume_requires_scope,
+                    goal_legacy_server,
                     working_directory: spec.working_directory.clone(),
                     child: None,
                     native_holder,
@@ -1904,6 +1914,15 @@ fn validate_goal_work(
             "The original goal account scope does not match this initialized server".into(),
         );
     }
+    validate_goal_directory(context, directory, working_directory)?;
+    scope.revalidate()
+}
+
+fn validate_goal_directory(
+    context: Option<&super::protocol::ExecutionContext>,
+    directory: Option<&GoalDirectory>,
+    working_directory: &std::path::Path,
+) -> Result<(), String> {
     let context = context.ok_or("The original goal launch context is unavailable")?;
     let (identity, directory) =
         directory.ok_or("The original goal launch-directory descriptor is unavailable")?;
@@ -1911,15 +1930,93 @@ fn validate_goal_work(
     if context.directory_identity()? != Some(*identity) {
         return Err("The goal launch directory does not match its admitted context".into());
     }
-    context.verify_directory(working_directory)?;
-    scope.revalidate()
+    context.verify_directory(working_directory)
+}
+
+fn goal_resume_admission(
+    scope: Option<&crate::account::scope::LaunchAccountScope>,
+    server: Option<&super::protocol::ServerIdentity>,
+    legacy_server: Option<&super::protocol::ServerIdentity>,
+    context: Option<&super::protocol::ExecutionContext>,
+    directory: Option<&GoalDirectory>,
+    working_directory: &std::path::Path,
+) -> super::protocol::GoalResumeAdmission {
+    use super::protocol::GoalResumeAdmission;
+    if validate_goal_work(scope, server, context, directory, working_directory).is_ok() {
+        GoalResumeAdmission::OriginalScope
+    } else if scope.is_none()
+        && legacy_server.is_some()
+        && server == legacy_server
+        && validate_goal_directory(context, directory, working_directory).is_ok()
+    {
+        GoalResumeAdmission::InactiveOnly
+    } else {
+        GoalResumeAdmission::Unavailable
+    }
+}
+
+fn goal_is_confirmed_inactive(goal: Option<&super::goal::Snapshot>, thread: &str) -> bool {
+    use super::goal::{ReadState, Status, Support};
+    goal.is_some_and(|snapshot| {
+        snapshot.thread_id == thread
+            && snapshot.support == Support::Supported
+            && !snapshot.pending
+            && !snapshot.uncertain
+            && match &snapshot.read {
+                ReadState::Known(None) => true,
+                ReadState::Known(Some(goal)) => {
+                    goal.thread_id == thread
+                        && matches!(goal.status, Status::Paused | Status::Complete)
+                }
+                ReadState::Unknown => false,
+            }
+    })
+}
+
+/// Validate the actual outgoing resume frames against the latest observation
+/// in this step. A fresh inactive read must be able to replace an older Active
+/// snapshot; a newer Unknown must never fall back to an older paused value.
+fn validate_goal_resume_step(
+    admission: super::protocol::GoalResumeAdmission,
+    state: &Snapshot,
+    step: &Step,
+) -> Result<(), String> {
+    use super::protocol::GoalResumeAdmission;
+    if admission == GoalResumeAdmission::OriginalScope {
+        return Ok(());
+    }
+    for frame in step
+        .writes
+        .iter()
+        .filter(|frame| frame["method"] == "thread/resume")
+    {
+        let thread = frame["params"]["threadId"]
+            .as_str()
+            .ok_or("Goal resume requires the exact original thread")?;
+        let latest = step
+            .events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                Event::Goal(goal) if goal.thread_id == thread => Some(goal),
+                _ => None,
+            })
+            .or_else(|| state.goal.as_ref().filter(|goal| goal.thread_id == thread));
+        if admission != GoalResumeAdmission::InactiveOnly
+            || state.session_id.as_deref() != Some(thread)
+            || !goal_is_confirmed_inactive(latest, thread)
+        {
+            return Err("The original Goal resume authority or a confirmed inactive goal is unavailable; check, pause or clear the original goal before resuming".into());
+        }
+    }
+    Ok(())
 }
 
 /// Goal observations add a constraint; they never make a busy actor idle.
 fn goal_readiness(goal: Option<&super::goal::Snapshot>) -> Option<UpdateReadiness> {
     use super::goal::{ReadState, Status, Support};
     let goal = goal?;
-    if goal.pending || goal.uncertain {
+    if goal.pending || goal.uncertain || goal.support != Support::Supported {
         return Some(UpdateReadiness::Unready);
     }
     match &goal.read {
@@ -1929,16 +2026,14 @@ fn goal_readiness(goal: Option<&super::goal::Snapshot>) -> Option<UpdateReadines
             }
             Status::Paused | Status::Complete => None,
         },
-        ReadState::Unknown if goal.support != Support::Unsupported => {
-            Some(UpdateReadiness::Unready)
-        }
-        _ => None,
+        ReadState::Unknown => Some(UpdateReadiness::Unready),
+        ReadState::Known(None) => None,
     }
 }
 
 struct Actor {
     goal_directory: Option<GoalDirectory>,
-    goal_resume_requires_scope: bool,
+    goal_legacy_server: Option<super::protocol::ServerIdentity>,
     launch_account_scope: Option<crate::account::scope::LaunchAccountScope>,
     launch_context: Option<Arc<super::protocol::ExecutionContext>>,
     working_directory: std::path::PathBuf,
@@ -2051,6 +2146,20 @@ fn accepts_prompt(state: &Snapshot) -> bool {
 }
 
 impl Actor {
+    fn goal_resume_admission(&self) -> super::protocol::GoalResumeAdmission {
+        goal_resume_admission(
+            self.launch_account_scope.as_ref(),
+            self.adapter.server_identity(),
+            self.goal_legacy_server.as_ref(),
+            self.launch_context.as_deref(),
+            self.goal_directory.as_ref(),
+            &self.working_directory,
+        )
+    }
+    fn refresh_goal_resume_admission(&mut self) {
+        let admission = self.goal_resume_admission();
+        self.adapter.set_goal_resume_admission(admission);
+    }
     /// A history reader owns no process, network connection, or execution
     /// authority. It keeps the ordinary bounded store and paging contract.
     fn run_history(&mut self, initial: Step) -> Result<(), String> {
@@ -2130,6 +2239,7 @@ impl Actor {
                 }
                 let busy = self.state.lock().unwrap_or_else(|p| p.into_inner()).busy;
                 if busy && !interrupt_sent && self.pending.is_empty() {
+                    self.refresh_goal_resume_admission();
                     match self.adapter.command(Command::Interrupt) {
                         Ok(step) => {
                             self.step(step)?;
@@ -2179,6 +2289,7 @@ impl Actor {
                 partial_started = None;
                 parsed += 1;
                 self.first_frame = true;
+                self.refresh_goal_resume_admission();
                 let step = self.adapter.receive(frame)?;
                 self.provider_step(step)?;
             }
@@ -2630,6 +2741,7 @@ impl Actor {
                 let _ = reply.send(Err(error));
                 continue;
             }
+            self.refresh_goal_resume_admission();
             let prepared = match run {
                 Some(run) => self.adapter.command_for_run(run, command),
                 None => self.adapter.command(command),
@@ -2770,8 +2882,9 @@ impl Actor {
         // Inspect the entire step before enqueueing any frame. A resume can
         // restore autonomous work between ordinary turns. Fresh scoped actors
         // and trusted holder restorations must retain both original pins.
-        // Legacy holders with no tuple and an unknown goal remain an explicit
-        // compatibility limitation: absence of metadata is not proof of idle.
+        // Old holders with no tuple require a bound original server and a
+        // positively inactive current observation. Unknown/unsupported is not
+        // permission to resume merely to discover the old goal.
         let starts = step
             .writes
             .iter()
@@ -2785,31 +2898,7 @@ impl Actor {
                 && (frame["params"].get("objective").is_some()
                     || frame["params"]["status"] == "active")
         });
-        let goal_can_work = {
-            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            state
-                .goal
-                .iter()
-                .chain(step.events.iter().filter_map(|event| match event {
-                    Event::Goal(goal)
-                        if state.session_id.as_deref() == Some(goal.thread_id.as_str()) =>
-                    {
-                        Some(goal)
-                    }
-                    _ => None,
-                }))
-                .any(|snapshot| match &snapshot.read {
-                    super::goal::ReadState::Known(Some(goal)) => matches!(
-                        goal.status,
-                        super::goal::Status::Active
-                            | super::goal::Status::Blocked
-                            | super::goal::Status::UsageLimited
-                            | super::goal::Status::BudgetLimited
-                    ),
-                    _ => false,
-                })
-        };
-        if goal_work || resumes && (self.goal_resume_requires_scope || goal_can_work) {
+        if goal_work {
             validate_goal_work(
                 self.launch_account_scope.as_ref(),
                 self.adapter.server_identity(),
@@ -2817,7 +2906,32 @@ impl Actor {
                 self.goal_directory.as_ref(),
                 &self.working_directory,
             )?;
-        } else if starts && let Some(context) = &self.launch_context {
+        }
+        if resumes {
+            let admission = self.goal_resume_admission();
+            if admission == super::protocol::GoalResumeAdmission::Unavailable {
+                // Preserve the concrete physical refusal for fresh/trusted
+                // actors and the existing original-directory diagnostics.
+                if self.launch_account_scope.is_some() || self.goal_legacy_server.is_none() {
+                    validate_goal_work(
+                        self.launch_account_scope.as_ref(),
+                        self.adapter.server_identity(),
+                        self.launch_context.as_deref(),
+                        self.goal_directory.as_ref(),
+                        &self.working_directory,
+                    )?;
+                } else {
+                    validate_goal_directory(
+                        self.launch_context.as_deref(),
+                        self.goal_directory.as_ref(),
+                        &self.working_directory,
+                    )?;
+                }
+            }
+            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            validate_goal_resume_step(admission, &state, &step)?;
+        }
+        if starts && let Some(context) = &self.launch_context {
             context.verify_directory(&self.working_directory)?;
         }
         for value in step.writes {
