@@ -2316,12 +2316,10 @@ impl Cagents {
                 .width(Length::Fill).wrapping(iced::widget::text::Wrapping::WordOrGlyph).into());
         } else if notices.is_empty() {
             entries.push(
-                design::caption(
-                    "No attention entries. Desktop delivery is not required to read this journal.",
-                )
-                .width(Length::Fill)
-                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-                .into(),
+                design::caption("No attention entries.")
+                    .width(Length::Fill)
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                    .into(),
             );
         }
         for (index, notice) in notices.iter().skip(page * 20).take(20).enumerate() {
@@ -2389,6 +2387,11 @@ impl Cagents {
         widget::container(
             widget::column::with_children(vec![
                 header.into(),
+                // Shrink children are measured in order. Reserve the page
+                // controls before the list can consume the remaining height.
+                widget::row::with_children(navigation)
+                    .spacing(space::S)
+                    .into(),
                 widget::scrollable(
                     widget::column::with_children(entries)
                         .spacing(space::XS)
@@ -2399,9 +2402,6 @@ impl Cagents {
                 ))
                 .height(Length::Shrink)
                 .into(),
-                widget::row::with_children(navigation)
-                    .spacing(space::S)
-                    .into(),
             ])
             .spacing(space::S),
         )

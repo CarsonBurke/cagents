@@ -89,12 +89,28 @@ fn frame(
     whole_window: bool,
     click: Option<&str>,
 ) -> (iced_accessibility::A11yTree, Vec<Message>) {
+    frame_at_height(app, renderer, width, 900.0, whole_window, click)
+}
+
+fn frame_at_height(
+    app: &Cagents,
+    renderer: &mut cosmic::Renderer,
+    width: f32,
+    height: f32,
+    whole_window: bool,
+    click: Option<&str>,
+) -> (iced_accessibility::A11yTree, Vec<Message>) {
     let element = if whole_window {
         cosmic::ApplicationExt::view_main(app)
     } else {
         app.attention_journal().map(cosmic::Action::App)
     };
-    let mut ui = UserInterface::build(element, Size::new(width, 900.0), Cache::default(), renderer);
+    let mut ui = UserInterface::build(
+        element,
+        Size::new(width, height),
+        Cache::default(),
+        renderer,
+    );
     let mut messages = Vec::new();
     ui.update(
         &[],
@@ -127,8 +143,11 @@ fn frame(
         let node = buttons[0];
         let bounds = node.node().bounds().expect("actual button geometry");
         assert!(bounds.x0 >= 0.0 && bounds.x1 <= f64::from(width));
-        assert!(bounds.x1 > bounds.x0 && bounds.y1 > bounds.y0);
-        assert!(bounds.y0 >= 0.0 && bounds.y1 <= 900.0);
+        assert!(
+            bounds.x1 > bounds.x0 && bounds.y1 > bounds.y0,
+            "actual enabled {label} at {width}x{height}: {bounds:?}"
+        );
+        assert!(bounds.y0 >= 0.0 && bounds.y1 <= f64::from(height));
         use iced_accessibility::accesskit::{Action, ActionRequest, NodeId, TreeId};
         let target_node = NodeId::from(node.id().clone());
         let (_, statuses) = ui.update(
@@ -156,6 +175,20 @@ fn frame(
         })
         .collect();
     (nodes, messages)
+}
+
+fn journal_height(app: &Cagents, renderer: &cosmic::Renderer, width: f32, height: f32) -> f32 {
+    let mut element = app.attention_journal();
+    let mut tree = iced::advanced::widget::Tree::new(element.as_widget());
+    element
+        .as_widget_mut()
+        .layout(
+            &mut tree,
+            renderer,
+            &iced::advanced::layout::Limits::new(Size::ZERO, Size::new(width, height)),
+        )
+        .size()
+        .height
 }
 
 fn labels(nodes: &iced_accessibility::A11yTree) -> Vec<String> {
@@ -236,19 +269,32 @@ fn empty_window_attention_bell_and_narrow_journal_are_real_and_private_without_p
     };
     drop(app.update_chrome(action));
     assert!(app.attention_is_open());
-    for width in [280.0, 420.0] {
+    for (width, height) in [(280.0, 220.0), (420.0, 900.0)] {
         app.window_width = width;
-        let (nodes, _) = frame(&app, &mut renderer, width, false, None);
+        assert!(
+            journal_height(&app, &renderer, width, height) < height.min(408.0),
+            "empty journal keeps its natural compact height"
+        );
+        let (nodes, _) = frame_at_height(&app, &mut renderer, width, height, false, None);
         assert!(
             labels(&nodes)
                 .iter()
                 .any(|text| text.contains("No attention entries"))
         );
         snapshot(&mut app, vec![notice(0)]);
-        let (nodes, messages) = frame(
+        let one_entry_height = journal_height(&app, &renderer, width, height);
+        assert!(one_entry_height <= height.min(408.0));
+        if height > 408.0 {
+            assert!(
+                one_entry_height < 408.0,
+                "one short entry keeps its natural compact height with room available"
+            );
+        }
+        let (nodes, messages) = frame_at_height(
             &app,
             &mut renderer,
             width,
+            height,
             false,
             Some(&label(&app, notice(0).id)),
         );
@@ -270,15 +316,29 @@ fn empty_window_attention_bell_and_narrow_journal_are_real_and_private_without_p
 
 #[test]
 fn snapshots_deduplicate_stable_rows_and_actual_more_previous_buttons_page_twenty() {
+    for (width, height) in [(280.0, 220.0), (420.0, 900.0)] {
+        exercise_pagination_geometry(width, height);
+    }
+}
+
+fn exercise_pagination_geometry(width: f32, height: f32) {
     let mut renderer = super::super::tests::headless_renderer();
     let mut app = fixture(23);
+    app.window_width = width;
     let original = app.notification_ui.snapshot.clone();
     let mut duplicate = original.clone();
     duplicate.notices.push(duplicate.notices[0].clone());
     drop(app.update_notifications(Action::Snapshot(duplicate.clone())));
     drop(app.update_notifications(Action::Snapshot(duplicate)));
     open(&mut app);
-    let (nodes, messages) = frame(&app, &mut renderer, 420.0, false, Some("More entries"));
+    let (nodes, messages) = frame_at_height(
+        &app,
+        &mut renderer,
+        width,
+        height,
+        false,
+        Some("More entries"),
+    );
     assert_eq!(
         labels(&nodes)
             .iter()
@@ -291,7 +351,14 @@ fn snapshots_deduplicate_stable_rows_and_actual_more_previous_buttons_page_twent
         panic!("actual page callback")
     };
     drop(app.update_chrome(action));
-    let (nodes, messages) = frame(&app, &mut renderer, 420.0, false, Some("Previous entries"));
+    let (nodes, messages) = frame_at_height(
+        &app,
+        &mut renderer,
+        width,
+        height,
+        false,
+        Some("Previous entries"),
+    );
     let row_labels = labels(&nodes);
     assert_eq!(
         row_labels
@@ -308,7 +375,7 @@ fn snapshots_deduplicate_stable_rows_and_actual_more_previous_buttons_page_twent
         panic!("actual previous callback")
     };
     drop(app.update_chrome(action));
-    let (nodes, _) = frame(&app, &mut renderer, 420.0, false, None);
+    let (nodes, _) = frame_at_height(&app, &mut renderer, width, height, false, None);
     assert!(labels(&nodes).contains(&label(&app, notice(0).id)));
     for n in &original.notices {
         no_ack(&app, n.id);
@@ -321,7 +388,7 @@ fn snapshots_deduplicate_stable_rows_and_actual_more_previous_buttons_page_twent
     };
     conflicts.push(changed);
     snapshot(&mut app, conflicts);
-    let (nodes, _) = frame(&app, &mut renderer, 420.0, false, None);
+    let (nodes, _) = frame_at_height(&app, &mut renderer, width, height, false, None);
     assert!(app.attention_notices().iter().all(|n| n.id != notice(0).id));
     assert_eq!(
         labels(&nodes)
@@ -340,7 +407,7 @@ fn snapshots_deduplicate_stable_rows_and_actual_more_previous_buttons_page_twent
         "conflicting ID never supplies a row callback"
     );
     snapshot(&mut app, Vec::new());
-    let (nodes, _) = frame(&app, &mut renderer, 420.0, false, None);
+    let (nodes, _) = frame_at_height(&app, &mut renderer, width, height, false, None);
     assert!(
         labels(&nodes)
             .iter()
