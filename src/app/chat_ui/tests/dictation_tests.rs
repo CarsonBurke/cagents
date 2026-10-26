@@ -18,15 +18,12 @@ fn expose(app: &mut Cagents, card: CardId) {
 }
 
 fn assert_no_effects(task: Task<Message>) {
-    use iced::futures::StreamExt;
+    use iced::futures::{FutureExt, StreamExt};
     // Public dispatch batches its postlude even when every component is empty.
     // An allocated stream is not an emitted effect.
+    assert_eq!(task.units(), 0, "refused input must schedule no task units");
     if let Some(mut effects) = iced::runtime::task::into_stream(task) {
-        let executor = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        assert!(executor.block_on(effects.next()).is_none());
+        assert!(matches!(effects.next().now_or_never(), Some(None)));
     }
 }
 
