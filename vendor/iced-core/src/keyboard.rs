@@ -1,4 +1,5 @@
 //! Listen to keyboard events.
+pub mod input;
 pub mod key;
 
 mod event;
