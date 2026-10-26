@@ -63,6 +63,8 @@ pub(super) struct State {
     // Full snapshots advance view/agent authority. Metadata-only folds advance
     // the outer model sequence without supplying either of these collections.
     pub(super) snapshot_sequence: u64,
+    #[cfg(test)]
+    local_projection_count: std::cell::Cell<usize>,
     baseline: HashMap<Scope, Vec<Pane>>,
     initialized: HashSet<Scope>,
     seeding: HashSet<Scope>,
@@ -459,6 +461,10 @@ impl Cagents {
     }
 
     fn local_views(&self) -> LocalViews {
+        #[cfg(test)]
+        self.shared_views
+            .local_projection_count
+            .set(self.shared_views.local_projection_count.get() + 1);
         let roots = self.indexed_worktree_roots();
         let cards = self
             .durable
@@ -3412,6 +3418,221 @@ mod tests {
         }));
         assert!(rx.try_recv().is_err());
         assert!(!app.pane_transfer_pending(pane.id));
+    }
+
+    #[test]
+    fn complete_model_echo_reuses_one_projection_at_desktop_inventory_scale() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        let (mut app, _, _, template) = fixture();
+        let repository = PathBuf::from("/repo/.git");
+        let project = app.durable.channels[0].project_id;
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "repo".into(),
+            repository.clone(),
+            vec![],
+            vec![],
+        ));
+        let mut model = crate::workspace_model::WorkspaceModel {
+            identity: app.workspace_model.identity,
+            sequence: 17,
+            ..Default::default()
+        };
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.channels.clear();
+        durable.cards.clear();
+        durable.card_scopes.clear();
+        durable.active_channel = None;
+        for index in 0..30 {
+            let id = ChannelId::new();
+            durable.channels.push(ProjectChannel {
+                id,
+                project_id: project,
+                title: format!("Channel {index}"),
+                title_source: Default::default(),
+                ordinal: index,
+                shared: true,
+                cards: vec![],
+                focused: None,
+            });
+            model.channels.push(crate::workspace_model::ModelChannel {
+                id,
+                repository: repository.clone(),
+                title: format!("Channel {index}"),
+                title_source: Default::default(),
+                ordinal: index,
+            });
+            let scope = Scope::Channel(id);
+            model.views.push(View::empty(scope.clone()));
+            app.shared_views.initialized.insert(scope);
+        }
+        // The desktop has many historical cards and scopes, not 555 live
+        // providers. Only these 122 panes are open shared descriptors.
+        for index in 0..555 {
+            let mut pane = template.clone();
+            pane.id = CardId::new();
+            pane.title = format!("Pane {index}");
+            pane.scope = Some(PathBuf::from(format!("/repo/scope-{index}")));
+            if let CardKind::Browser(browser) = &mut pane.kind {
+                browser.id = BrowserId::new();
+            }
+            let open = index < 122;
+            durable.cards.push(CardState {
+                id: pane.id,
+                generation: 0,
+                title: pane.title.clone(),
+                width_fraction: pane.width_fraction,
+                existence: if open {
+                    Existence::Open
+                } else {
+                    super::super::project_ui::removed_existence("historical fixture")
+                },
+                exposure: Exposure::Offscreen,
+                residency: Residency::Hibernated,
+                kind: pane.kind.clone(),
+            });
+            durable
+                .card_scopes
+                .insert(pane.id, pane.scope.clone().unwrap());
+            app.cards.insert(pane.id, CardRuntime::Completed);
+            if open {
+                let channel = index % 30;
+                durable.channels[channel].cards.push(pane.id);
+                durable.channels[channel].focused.get_or_insert(pane.id);
+                model.views[channel].panes.push(pane);
+            }
+        }
+        for index in 0..1218 {
+            let scope = Scope::Worktree {
+                repository: repository.clone(),
+                path: format!("/repo/old-{index}").into(),
+            };
+            app.shared_views.initialized.insert(scope.clone());
+            model.views.push(View::empty(scope));
+        }
+        assert_eq!(model.views.len(), 1248);
+        assert_eq!(
+            model
+                .views
+                .iter()
+                .map(|view| view.panes.len())
+                .sum::<usize>(),
+            122
+        );
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        let before = app.durable.clone();
+        for _ in 0..8 {
+            app.shared_views.local_projection_count.set(0);
+            drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
+            assert_eq!(
+                app.shared_views.local_projection_count.get(),
+                1,
+                "the completed baseline and publication share one real LocalViews pass"
+            );
+            assert_eq!(app.durable.cards, before.cards);
+            assert_eq!(app.durable.channels, before.channels);
+            assert_eq!(app.durable.card_scopes, before.card_scopes);
+            assert_eq!(app.workspace.focused(), None);
+            assert!(
+                !std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| matches!(
+                    edit,
+                    ModelEdit::ChangeView { .. } | ModelEdit::SeedView { .. }
+                ))
+            );
+        }
+        // This is not an equal-model drop: actual canonical changes still
+        // project whole pane fields, and a later equal Read rolls optimism back.
+        let id = model.views[0].panes[0].id;
+        model.sequence += 1;
+        model.views[0].revision += 1;
+        model.views[0].panes[0].title = "Remote title".into();
+        model.views[0].panes[0].width_fraction = 0.72;
+        drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
+        assert_eq!(app.card_state(id).unwrap().title, "Remote title");
+        assert_eq!(app.card_state(id).unwrap().width_fraction, 0.72);
+        app.card_state_mut(id).unwrap().title = "Unaccepted optimism".into();
+        drop(app.apply_workspace_model_update(ModelUpdate::Read(model)));
+        assert_eq!(app.card_state(id).unwrap().title, "Remote title");
+        assert_eq!(app.durable.cards.len(), 555);
+    }
+
+    #[test]
+    fn reused_projection_seeds_new_scopes_and_drains_edits_after_equal_ack() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        let (mut app, source, destination, pane) = channel_move_fixture();
+        let mut next = pane.clone();
+        next.id = CardId::new();
+        if let CardKind::Browser(browser) = &mut next.kind {
+            browser.id = BrowserId::new();
+        }
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.push(CardState {
+            id: next.id,
+            generation: 0,
+            title: next.title.clone(),
+            width_fraction: next.width_fraction,
+            existence: Existence::Open,
+            exposure: Exposure::Offscreen,
+            residency: Residency::Hibernated,
+            kind: next.kind.clone(),
+        });
+        durable
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == destination)
+            .unwrap()
+            .cards = vec![next.id];
+        app.cards.insert(next.id, CardRuntime::Completed);
+        app.shared_views
+            .initialized
+            .remove(&Scope::Channel(destination));
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.reconcile_shared_views());
+        let requests = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(requests.iter().any(|edit| matches!(edit,
+            ModelEdit::SeedView { scope, panes, .. } if scope == &Scope::Channel(destination) && panes == &vec![next.clone()])));
+        app.card_state_mut(next.id).unwrap().title = "While seed is pending".into();
+        app.persist();
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|edit| matches!(edit, ModelEdit::ChangeView { .. }))
+        );
+        let mut model = app.workspace_model.clone();
+        model
+            .views
+            .iter_mut()
+            .find(|view| view.scope == Scope::Channel(destination))
+            .unwrap()
+            .panes = vec![next.clone()];
+        // A seed acknowledgement remains semantically required even with no
+        // newer outer sequence: it initializes and drains the retained edit.
+        drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+            scope: Scope::Channel(destination),
+            operation: None,
+            model,
+        }));
+        let requests = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(requests.iter().any(|edit| matches!(edit,
+            ModelEdit::ChangeView { scope, change: Change::Update { pane, .. }, .. }
+            if scope == &Scope::Channel(destination) && pane.id == next.id && pane.title == "While seed is pending")));
+        assert_eq!(
+            app.card_state(next.id).unwrap().title,
+            "While seed is pending"
+        );
+        // Normal local persistence still snapshots an active strip and emits
+        // its changed width; reuse is confined to completed reconciliation.
+        let _ = app
+            .workspace
+            .set_card_width(pane.id, CardWidth::Fraction(0.68))
+            .unwrap();
+        app.card_state_mut(pane.id).unwrap().width_fraction = 0.68;
+        app.persist();
+        assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| matches!(edit,
+            ModelEdit::ChangeView { scope, change: Change::Update { pane: changed, .. }, .. }
+            if scope == Scope::Channel(source) && changed.id == pane.id && changed.width_fraction == 0.68)));
     }
 
     #[test]
