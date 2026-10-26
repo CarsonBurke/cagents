@@ -27,6 +27,8 @@ pub(super) struct Presentation<'a> {
     pub uncertain: bool,
     /// Exact current actor/thread/context, established by the caller.
     pub current: bool,
+    /// Read/stop ownership does not by itself authorize new goal work.
+    pub work_ready: bool,
     pub observation_revision: u64,
 }
 
@@ -37,6 +39,7 @@ struct ControlsKey {
     pending: bool,
     uncertain: bool,
     current: bool,
+    work_ready: bool,
     revision: u64,
 }
 
@@ -170,6 +173,7 @@ pub(super) fn panel<'a, Message: Clone + 'a>(
     }
     let pause = change && goal.is_some_and(|goal| goal.status == Status::Active);
     let resume = change
+        && state.work_ready
         && goal.is_some_and(|goal| {
             matches!(
                 goal.status,
@@ -217,6 +221,7 @@ pub(super) fn panel<'a, Message: Clone + 'a>(
             pending: state.pending,
             uncertain: state.uncertain,
             current: state.current,
+            work_ready: state.work_ready,
             revision: state.observation_revision,
         },
         controls,
@@ -263,6 +268,7 @@ mod tests {
             pending: false,
             uncertain: false,
             current: true,
+            work_ready: true,
             observation_revision: 17,
         }
     }
@@ -356,6 +362,20 @@ mod tests {
             (
                 presentation(&paused),
                 vec![Operation::Get, Operation::Resume, Operation::Clear],
+            ),
+            (
+                Presentation {
+                    work_ready: false,
+                    ..presentation(&paused)
+                },
+                vec![Operation::Get, Operation::Clear],
+            ),
+            (
+                Presentation {
+                    work_ready: false,
+                    ..base
+                },
+                vec![Operation::Get, Operation::Pause, Operation::Clear],
             ),
             (presentation(&empty), vec![Operation::Get]),
             (

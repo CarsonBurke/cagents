@@ -28,6 +28,8 @@ mod find;
 mod find_navigation;
 mod flow_layout;
 mod fold;
+mod goal;
+mod goal_dispatch;
 mod hover;
 pub(super) mod images;
 mod layout;
@@ -231,6 +233,8 @@ pub enum Action {
         Result<Vec<Attachment>, String>,
     ),
     Submit(Target, PromptMode),
+    GoalPanel(Target, bool),
+    GoalIntent(Target, goal_dispatch::Control),
     /// Recalls the message sent before the one the composer shows, or the
     /// unsent draft again once the recall has walked forward past the newest.
     HistoryOlder(Target),
@@ -474,6 +478,8 @@ impl Action {
             | Self::ResumeAfterSignIn(target)
             | Self::AcceptSuggestion(target, _)
             | Self::Submit(target, _)
+            | Self::GoalPanel(target, _)
+            | Self::GoalIntent(target, _)
             | Self::DiscardClosedDraft(target, _)
             | Self::AppendProviderDraft(target)
             | Self::Command(target, _)
@@ -2024,6 +2030,8 @@ pub(super) struct Runtime {
     closed_elsewhere: bool,
     /// The first message of a draft, while its conversation starts.
     queued: Option<Queued>,
+    goal_open: bool,
+    goal_pending: Option<goal_dispatch::Pending>,
     /// Messages held here for the next turn, oldest first.
     followups: Vec<Followup>,
     next_followup: u64,
@@ -2254,6 +2262,9 @@ fn submission(
     attachments: &[Attachment],
     mode: PromptMode,
 ) -> Result<Command, &'static str> {
+    if chat::goal::parse(text).is_some() {
+        return Err("Native goals must use the goal controls, not a prompt or queued message.");
+    }
     match (mode, slash_invocation(text, snapshot)) {
         (_, Some(SlashInvocation::Permissions)) => {
             Err("Permissions are managed in the native permissions panel.")
@@ -2909,6 +2920,7 @@ impl Runtime {
     /// retire old insert ownership before those callbacks become unreachable.
     fn retarget(&mut self, target: Target) {
         if self.target != target {
+            self.cancel_goal_for_target(target);
             self.cancel_attachment_jobs();
             self.attachment_chooser_pending = None;
             self.target = target;
@@ -2948,6 +2960,8 @@ impl Runtime {
             connection,
             closed_elsewhere: false,
             queued: None,
+            goal_open: false,
+            goal_pending: None,
             followups: Vec::new(),
             next_followup: 0,
             recalling: Vec::new(),
@@ -3173,7 +3187,10 @@ impl Runtime {
     /// Whether this draft's provider, model and account can still change: it
     /// has not started, and its first message is not on its way.
     fn choosing(&self) -> bool {
-        self.is_draft() && self.queued.is_none() && self.attachment_chooser_pending.is_none()
+        self.is_draft()
+            && self.queued.is_none()
+            && self.goal_pending.is_none()
+            && self.attachment_chooser_pending.is_none()
     }
     /// Highlights the transcript's code blocks in `theme` from now on.
     pub(super) fn set_syntax_theme(&mut self, theme: crate::settings::EditorSyntaxTheme) {
@@ -4438,7 +4455,10 @@ impl Runtime {
     /// visibility recorded here.
     fn present(&self) -> Result<(), String> {
         let retain_body = self.visible.load(Ordering::Relaxed);
-        let interested = retain_body || self.queued.is_some() || !self.followups.is_empty();
+        let interested = retain_body
+            || self.queued.is_some()
+            || self.goal_pending.is_some()
+            || !self.followups.is_empty();
         match self.handle() {
             Some(handle) if handle.is_connected() => {
                 match handle.set_interest(interested, retain_body) {
@@ -5565,6 +5585,15 @@ impl Cagents {
                 .get(account::routing::AUTOMATIC_MARKER)
                 .map(String::as_str)
                 != Some("1")
+            || chat::goal::parse(&runtime.composer.text()).is_some()
+            || goal_dispatch::blocks_automatic(
+                runtime
+                    .handle()
+                    .map(|handle| handle.snapshot())
+                    .as_deref()
+                    .unwrap_or(runtime.snapshot.as_ref()),
+            )
+            || runtime.goal_pending.is_some()
             || slash_invocation(&runtime.composer.text(), &runtime.snapshot).is_some()
         {
             return None;
@@ -6536,6 +6565,12 @@ impl Cagents {
 
     pub(super) fn chat_forget(&mut self, card: CardId) {
         self.chat_ui.capacity_offers.remove(&card);
+        if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
+            runtime.cancel_unsent_goal();
+        }
+        if let Some(runtime) = self.chat_ui.parked.get_mut(&card) {
+            runtime.cancel_unsent_goal();
+        }
         // The runtime is about to be dropped, so its unsent text is captured
         // here rather than lost. `chat_forget` is the single place a chat
         // runtime stops existing while its card lives on.
@@ -7867,6 +7902,19 @@ impl Cagents {
         let Some(handle) = runtime.handle().cloned() else {
             return Task::none();
         };
+        if let Command::Goal {
+            thread_id,
+            revision,
+            ..
+        } = &command
+        {
+            if !goal_dispatch::current_goal(runtime, &handle).is_some_and(|goal| {
+                &goal.thread_id == thread_id && goal.revision == *revision && !goal.pending
+            }) {
+                runtime.error = Some("The native goal changed; check it before acting.".into());
+                return Task::none();
+            }
+        }
         let request = if let Command::Answer {
             request_id, action, ..
         } = &command
@@ -8515,6 +8563,11 @@ impl Cagents {
                 else {
                     return Task::none();
                 };
+                if result.is_err() {
+                    if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
+                        runtime.fail_goal_start(&attempt.session);
+                    }
+                }
                 let recovery = attempt.recovery.take();
                 let automatic_submit = recovery.as_ref().and_then(|recovery| recovery.submit);
                 let account_committed =
@@ -8735,6 +8788,7 @@ impl Cagents {
                             if let Some(queued) = &mut runtime.queued {
                                 queued.presentation = prompt::LocalPresentation::default();
                             }
+                            runtime.bind_started_goal(&attempt.session, target, &session, &handle);
                             runtime.retarget(target);
                             runtime.connection = Connection::Live(handle);
                             runtime.model_picker = None;
@@ -8838,6 +8892,7 @@ impl Cagents {
                             usage,
                             self.list_chat_models(target.card),
                             self.dispatch_queued(target),
+                            self.dispatch_goal(target),
                             focus,
                         ]);
                     }
@@ -9172,6 +9227,7 @@ impl Cagents {
                             self.list_chat_models(target.card),
                             self.resume_current_find(target, true),
                             self.dispatch_queued(target),
+                            self.dispatch_goal(target),
                             self.resume_history_navigation(target),
                             fork.map_or_else(Task::none, |session| {
                                 let scope = if let Some(channel) = self
@@ -9550,7 +9606,22 @@ impl Cagents {
                     }
                 }
             }
+            Action::GoalPanel(target, open) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.goal_open = open;
+                    if !open {
+                        runtime.cancel_unsent_goal();
+                    }
+                }
+            }
+            Action::GoalIntent(target, control) => return self.goal_control(target, control),
             Action::Submit(target, mode) => {
+                if let Some(parsed) = self
+                    .chat_runtime_mut(target)
+                    .and_then(|runtime| chat::goal::parse(&runtime.composer.text()))
+                {
+                    return self.submit_goal(target, mode, parsed);
+                }
                 if let Some((account, generation, revision)) =
                     self.automatic_chat_account(target, mode)
                 {
@@ -9947,6 +10018,12 @@ impl Cagents {
                 }
             }
             Action::Command(target, command) => {
+                if matches!(&command, Command::Goal { .. }) {
+                    if let Some(runtime) = self.chat_runtime_mut(target) {
+                        runtime.error = Some("Use the current native goal controls so the original actor stays bound.".into());
+                    }
+                    return Task::none();
+                }
                 if matches!(command, Command::Compact | Command::Branch { .. })
                     && let Some(runtime) = self.chat_runtime_mut(target)
                 {
@@ -10141,11 +10218,15 @@ impl Cagents {
                     return Task::none();
                 }
                 let pending = runtime.pending.take().unwrap();
+                let goal_command = runtime.goal_command_matches(id);
                 let provider = runtime.session.launch.provider;
                 if result.is_ok()
                     && let Some((model, reasoning)) = pending.model.clone()
                 {
                     self.remember_chat_model(provider, Some(model), reasoning);
+                }
+                if goal_command {
+                    return self.goal_command_finished(target, id, result);
                 }
                 if let Some(step) = pending.queued {
                     return self.queued_step_finished(target, step, pending.first_prompt, result);
@@ -10224,6 +10305,7 @@ impl Cagents {
                 // wake the follow-up again once the command releases it.
                 return Task::batch([
                     self.dispatch_queued(target),
+                    self.dispatch_goal(target),
                     self.resume_history_navigation(target),
                 ]);
             }
