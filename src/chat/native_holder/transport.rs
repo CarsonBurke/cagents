@@ -2089,7 +2089,10 @@ exec /bin/sleep 60
         .unwrap();
         assert!(record.root.is_current());
         crate::host::descriptor_limit::tests::assert_process_limit(record.root.pid as u32, &limit);
-        crate::host::descriptor_limit::tests::assert_process_limit(record.holder.pid as u32, &limit);
+        crate::host::descriptor_limit::tests::assert_process_limit(
+            record.holder.pid as u32,
+            &limit,
+        );
         crate::host::descriptor_limit::tests::assert_daemon_limit_remains_raised(&limit);
         crate::daemon::process_scope::tests::assert_separate(
             record.holder.pid as u32,
