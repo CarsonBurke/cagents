@@ -16081,7 +16081,8 @@ impl Application for Cagents {
                 self.refresh_settings_feedback();
                 Task::none()
             }
-            Message::UiUpdate(request) if self.pending_window_close.is_some() => {
+            Message::UiUpdate(request) if self.pending_window_close.is_some()
+                && !matches!(&request.action, instance::UiUpdateAction::Cancel) => {
                 let _ = request.response.try_send("error: window is saving before closing".into());
                 Task::none()
             }
@@ -16132,6 +16133,12 @@ impl Application for Cagents {
                             .response
                             .try_send("error: window is already closing".into());
                         return Task::none();
+                    }
+                    if self.pending_window_close.as_ref().is_some_and(|pending| pending.updater.is_some()) {
+                        let pending = self.pending_window_close.take().expect("updater close");
+                        if let Some((_, response)) = pending.updater {
+                            let _ = response.try_send("error: window update preparation was cancelled".into());
+                        }
                     }
                     self.update_prepared = false;
                     self.update_flush_pending = false;
@@ -16220,10 +16227,7 @@ impl Application for Cagents {
             Message::WindowCloseRequested(window) => {
                 // libcosmic reports the closed window through this same
                 // request, and a second close must not reopen the exit.
-                if self.exit.is_some()
-                    || self.dirty_repository_close.is_some()
-                    || self.core.main_window_id() != Some(window)
-                {
+                if self.exit.is_some() || self.dirty_repository_close.is_some() {
                     return Task::none();
                 }
                 if self.window_close_transient_blocker().is_some() {
@@ -20449,30 +20453,51 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn window_close_updater_commit_waits_for_current_final_save() {
-        for changed in [false, true] {
-            let directory = tempfile::tempdir().unwrap();
-            let (mut app, card, window) = window_close_draft_app(directory.path());
-            let (response, prepared) = std::sync::mpsc::sync_channel(1);
-            let task = app.update(Message::UiUpdate(instance::UiUpdateRequest {
-                action: instance::UiUpdateAction::Prepare,
-                response,
-            }));
-            let mut stream = iced::runtime::task::into_stream(task).expect("prepare flush");
-            let mut flushed = false;
-            while let Some(action) = stream.next().await {
-                if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
-                    let finished = matches!(message, Message::UiUpdateFlushed { .. });
-                    drop(app.update(message));
-                    if finished {
-                        flushed = true;
-                        break;
-                    }
+    async fn prepare_window_close_update(app: &mut Cagents) {
+        let (response, prepared) = std::sync::mpsc::sync_channel(1);
+        let task = app.update(Message::UiUpdate(instance::UiUpdateRequest {
+            action: instance::UiUpdateAction::Prepare,
+            response,
+        }));
+        let mut stream = iced::runtime::task::into_stream(task).expect("prepare flush");
+        let mut flushed = false;
+        while let Some(action) = stream.next().await {
+            if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                let finished = matches!(message, Message::UiUpdateFlushed { .. });
+                drop(app.update(message));
+                if finished {
+                    flushed = true;
+                    break;
                 }
             }
-            assert!(flushed);
-            assert_eq!(prepared.try_recv().unwrap(), "ok");
+        }
+        assert!(flushed);
+        assert_eq!(prepared.try_recv().unwrap(), "ok");
+    }
+
+    async fn window_close_update_ack(task: Task<Message>) -> Message {
+        let mut stream = iced::runtime::task::into_stream(task).expect("commit flush");
+        while let Some(action) = stream.next().await {
+            if let iced::runtime::Action::Output(cosmic::Action::App(
+                message @ Message::WindowCloseFlushed { .. },
+            )) = action
+            {
+                assert!(matches!(
+                    &message,
+                    Message::WindowCloseFlushed { result: Ok(()), .. }
+                ));
+                return message;
+            }
+        }
+        panic!("final save acknowledgement");
+    }
+
+    #[tokio::test]
+    async fn window_close_updater_commit_waits_for_current_final_save() {
+        for changed in ["healthy", "snapshot", "cancel"] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, card, window) = window_close_draft_app(directory.path());
+            prepare_window_close_update(&mut app).await;
             let (response, committed) = std::sync::mpsc::sync_channel(1);
             let task = app.update(Message::UiUpdate(instance::UiUpdateRequest {
                 action: instance::UiUpdateAction::Commit,
@@ -20484,31 +20509,44 @@ mod tests {
                 Err(std::sync::mpsc::TryRecvError::Empty)
             ));
             assert_eq!(app.core.main_window_id(), Some(window));
-            let mut stream = iced::runtime::task::into_stream(task).expect("commit flush");
-            let Some(iced::runtime::Action::Output(cosmic::Action::App(message))) =
-                stream.next().await
-            else {
-                panic!("final save acknowledgement");
-            };
-            assert!(matches!(
-                &message,
-                Message::WindowCloseFlushed { result: Ok(()), .. }
-            ));
+            let message = window_close_update_ack(task).await;
             assert!(matches!(
                 committed.try_recv(),
                 Err(std::sync::mpsc::TryRecvError::Empty)
             ));
-            if changed {
+            if changed == "snapshot" {
                 app.card_state_mut(card).unwrap().title = "New model state".into();
+            } else if changed == "cancel" {
+                let (response, cancelled) = std::sync::mpsc::sync_channel(1);
+                drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
+                    action: instance::UiUpdateAction::Cancel,
+                    response,
+                })));
+                assert_eq!(cancelled.try_recv().unwrap(), "ok");
+                assert!(app.pending_window_close.is_none());
             }
             drop(app.update(message));
             let result = committed.try_recv().unwrap();
-            if changed {
+            if changed != "healthy" {
                 assert!(result.starts_with("error:"));
                 assert!(!app.update_prepared);
                 assert!(!app.update_committed);
                 assert!(app.exit.is_none());
                 assert_eq!(app.core.main_window_id(), Some(window));
+                if changed == "cancel" {
+                    // The old successful ACK did nothing, and a new public
+                    // Prepare/Commit owns a new barrier rather than inheriting it.
+                    prepare_window_close_update(&mut app).await;
+                    let (response, committed) = std::sync::mpsc::sync_channel(1);
+                    let task = app.update(Message::UiUpdate(instance::UiUpdateRequest {
+                        action: instance::UiUpdateAction::Commit,
+                        response,
+                    }));
+                    let message = window_close_update_ack(task).await;
+                    drop(app.update(message));
+                    assert_eq!(committed.try_recv().unwrap(), "ok");
+                    assert!(app.exit.is_some());
+                }
             } else {
                 assert_eq!(result, "ok");
                 assert!(app.update_committed);
