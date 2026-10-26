@@ -3,6 +3,9 @@
 #[path = "support/hosted_agent_cleanup.rs"]
 mod hosted_agent_cleanup;
 
+#[path = "support/private_cli_capture.rs"]
+mod private_cli_capture;
+
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -113,24 +116,10 @@ impl Fixture {
     }
 
     fn output_until(&self, arguments: &[&str], deadline: Instant) -> Output {
-        let mut child = Self::command(self.root.path(), env!("CARGO_BIN_EXE_cagents"))
-            .arg("--json")
-            .args(arguments)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        while child.try_wait().unwrap().is_none() {
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                panic!(
-                    "CLI timed out: {arguments:?}: {:?}",
-                    child.wait_with_output()
-                );
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        let output = child.wait_with_output().unwrap();
+        let spec =
+            private_cli_capture::private_cli(self.root.path()).args(arguments.iter().copied());
+        let output = private_cli_capture::capture(spec, deadline)
+            .unwrap_or_else(|failure| panic!("CLI failed: {arguments:?}: {failure:?}"));
         self.agents.observe(&output);
         output
     }
