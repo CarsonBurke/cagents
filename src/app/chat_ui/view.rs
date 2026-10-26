@@ -1225,7 +1225,15 @@ impl Runtime {
                     } else {
                         Icon::AgentWorking
                     }),
-                    if child.detail.trim().is_empty() {
+                    if child.detail.trim().is_empty()
+                        || self
+                            .failure_ui
+                            .incidents
+                            .iter()
+                            .any(|incident| self.incident_has_child_detail(incident, &child.id))
+                    {
+                        // This source already has a selected transcript notice;
+                        // activity reports the child state without repeating it.
                         Self::native_child_status(child).to_owned()
                     } else {
                         Self::short_description(child.detail.trim(), 100)
