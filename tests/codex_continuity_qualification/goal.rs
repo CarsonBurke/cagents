@@ -388,7 +388,7 @@ fn goal_request(window: &mut Window, request: ClientRequest) -> Result<ServerRes
 /// It uses the same private profile after public close proved its actor gone.
 /// EOF/actual exit must settle this child; there is deliberately no kill path.
 struct Sdk<'a> {
-    fixture: &'a Fixture,
+    fixture: &'a mut Fixture,
     child: Child,
     input: Option<std::process::ChildStdin>,
     output: std::process::ChildStdout,
@@ -399,7 +399,7 @@ struct Sdk<'a> {
 }
 
 impl<'a> Sdk<'a> {
-    fn start(fixture: &'a Fixture) -> Self {
+    fn start(fixture: &'a mut Fixture) -> Self {
         let native = fs::canonicalize(fixture.root.path().join("bin/codex")).unwrap();
         let log = fs::File::create(fixture.root.path().join("goal-sdk.log")).unwrap();
         let mut child = Fixture::command(fixture.root.path(), &native)
@@ -548,7 +548,7 @@ impl Drop for Sdk<'_> {
 #[test]
 #[ignore = "real SDK contract observation only; no thread/resume is sent"]
 fn a_paused_persisted_goal_can_be_read_before_resuming_an_unloaded_thread() {
-    let fixture = Fixture::with_model_mode(ModelMode::Goal);
+    let mut fixture = Fixture::with_model_mode(ModelMode::Goal);
     let (mut window, chat) = start(&fixture);
     control(
         &mut window,
@@ -560,7 +560,7 @@ fn a_paused_persisted_goal_can_be_read_before_resuming_an_unloaded_thread() {
     close(&fixture, &mut window, &chat);
     let before = fixture.model.requests().len();
     let thread_id = chat.launch.session_id.as_deref().unwrap();
-    let mut sdk = Sdk::start(&fixture);
+    let mut sdk = Sdk::start(&mut fixture);
     let initialized = sdk
         .call(
             "initialize",
@@ -571,7 +571,7 @@ fn a_paused_persisted_goal_can_be_read_before_resuming_an_unloaded_thread() {
         .unwrap();
     assert_eq!(
         initialized["codexHome"].as_str(),
-        fixture.root.path().join("home/.codex").to_str()
+        sdk.fixture.root.path().join("home/.codex").to_str()
     );
     sdk.send(json!({"method":"initialized","params":{}}));
     let loaded = sdk.call("thread/loaded/list", json!({"limit":10})).unwrap();
