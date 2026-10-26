@@ -206,6 +206,124 @@ impl Registry {
     }
 }
 
+/// Populate a fresh published predecessor from this fixture's existing rows.
+/// Only objects/columns created by the actual published migrations are copied;
+/// the current database is never relabeled or stripped of newer schema objects.
+#[cfg(test)]
+pub(super) fn published_fixture_from_rows(source: &Registry, version: u32) -> std::path::PathBuf {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    assert!([3, 9, 10, 12, 15, 16, 20].contains(&version));
+    assert_eq!(
+        source
+            .db
+            .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        super::SCHEMA_VERSION
+    );
+    let path = source
+        .path
+        .with_file_name(format!("published-schema-{version}.sqlite3"));
+    drop(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap(),
+    );
+    let mut legacy = Connection::open(&path).unwrap();
+    legacy.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+    let tx = legacy.transaction().unwrap();
+    super::migrate_through(&tx, 0, version).unwrap();
+    tx.execute_batch("PRAGMA defer_foreign_keys=ON").unwrap();
+    let tables = {
+        let mut statement = tx.prepare(
+            "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(
+        tables
+            .iter()
+            .any(|name| name.contains("terminal_retention")),
+        version >= 20
+    );
+    let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+    for table in tables {
+        let table = quote(&table);
+        let columns = {
+            let mut statement = tx.prepare(&format!("PRAGMA table_info({table})")).unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert!(!columns.is_empty());
+        let selected = columns
+            .iter()
+            .map(|column| quote(column))
+            .collect::<Vec<_>>()
+            .join(",");
+        let rows = {
+            let mut statement = source
+                .db
+                .prepare(&format!("SELECT {selected} FROM {table}"))
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    (0..columns.len())
+                        .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        tx.execute(&format!("DELETE FROM {table}"), []).unwrap();
+        let placeholders = columns.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        for row in &rows {
+            assert_eq!(
+                tx.execute(
+                    &format!("INSERT INTO {table}({selected}) VALUES({placeholders})"),
+                    rusqlite::params_from_iter(row.iter()),
+                )
+                .unwrap(),
+                1
+            );
+        }
+        assert_eq!(
+            tx.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                .get::<_, usize>(0))
+                .unwrap(),
+            rows.len()
+        );
+    }
+    assert_eq!(
+        tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get::<_, usize>(0)
+        })
+        .unwrap(),
+        0
+    );
+    // Publish exactly the version whose real migration bodies created this file.
+    tx.pragma_update(None, "user_version", version).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(
+        legacy
+            .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        version
+    );
+    drop(legacy);
+    path
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,7 +633,7 @@ mod tests {
 
     #[test]
     fn legacy_registry_migration_preserves_schedules_and_starts_without_proposals() {
-        let (root, mut registry, proposal) = fixture();
+        let (_root, mut registry, proposal) = fixture();
         let automation = registry
             .create_automation(
                 proposal.definition.clone(),
@@ -523,16 +641,9 @@ mod tests {
                 proposal.target_identity.clone(),
             )
             .unwrap();
-        registry
-            .db
-            .execute_batch(
-                "DROP TABLE automation_run_attention;
-                 DROP TABLE automation_lifecycle;
-                 DROP TABLE automation_proposals; PRAGMA user_version=10;",
-            )
-            .unwrap();
+        let legacy = published_fixture_from_rows(&registry, 10);
         drop(registry);
-        let registry = Registry::at(&root.path().join("registry.sqlite3")).unwrap();
+        let registry = Registry::at(&legacy).unwrap();
         assert_eq!(registry.automation(automation.id).unwrap(), automation);
         assert!(
             registry

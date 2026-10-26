@@ -88,6 +88,33 @@ impl Drop for Registration {
     }
 }
 
+/// Keep an actual terminal or native chat Close's result queueable until its handler has
+/// removed custody and serve_with has enqueued the correlated reply. This is
+/// not a remote ACK: existing close_after_drain settles the actual writer.
+struct CheckedCloseReply {
+    host: SharedHost,
+    client_id: ClientId,
+}
+impl CheckedCloseReply {
+    fn new(host: &SharedHost, client_id: ClientId) -> Result<Self, ProtocolError> {
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .begin_checked_close_reply(client_id)?;
+        Ok(Self {
+            host: Arc::clone(host),
+            client_id,
+        })
+    }
+}
+impl Drop for CheckedCloseReply {
+    fn drop(&mut self) {
+        self.host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .finish_checked_close_reply(self.client_id);
+    }
+}
+
 type RequestHandler =
     fn(&SharedHost, ClientId, ClientRequest) -> Result<RequestOutcome, ProtocolError>;
 
@@ -253,6 +280,27 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
         // it is caught here, so it costs its sender one failed request rather
         // than the connection. The panic hook has already recorded it.
         let request = envelope.request;
+        // Register even before ordinary exit starts: its writer can enter
+        // after process_request releases control, before this reply is queued.
+        // The final HostMutex seal closes acquisition before any handler effect.
+        let _close_reply = if matches!(
+            &request,
+            ClientRequest::CloseTerminalChecked { .. }
+                | ClientRequest::ReleaseCompletedTerminal { .. }
+                | ClientRequest::ShutdownTerminal { .. }
+                | ClientRequest::ChatClose { .. }
+                | ClientRequest::ChatCloseRetained { .. }
+        ) {
+            match CheckedCloseReply::new(&host, client_id) {
+                Ok(reply) => Some(reply),
+                Err(error) => {
+                    let _ = push_error(&delivery, &host, envelope.request_id, error);
+                    break;
+                }
+            }
+        } else {
+            None
+        };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             handle(&host, client_id, request)
         }))
@@ -334,13 +382,67 @@ pub(super) fn ensure_control_open(host: &SharedHost) -> Result<(), ProtocolError
     Ok(())
 }
 
+/// Fresh read-only clients must still complete their Connect handshake while
+/// the ordinary exit caller retains original child tickets. This is not the
+/// general mutation gate used by account/worktree/provider operations.
+fn ensure_inspection_open(host: &SharedHost) -> Result<(), ProtocolError> {
+    if host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .ordinary_exit_cleanup_pending()
+    {
+        Ok(())
+    } else {
+        ensure_control_open(host)
+    }
+}
+
+fn ensure_request_open(host: &SharedHost, request: &ClientRequest) -> Result<(), ProtocolError> {
+    if !host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .ordinary_exit_cleanup_pending()
+    {
+        return ensure_control_open(host);
+    }
+    if matches!(
+        request,
+        ClientRequest::BuildInfo
+            | ClientRequest::List
+            | ClientRequest::Attach { .. }
+            | ClientRequest::Detach { .. }
+            | ClientRequest::Snapshot { .. }
+            | ClientRequest::TerminalAcknowledge { .. }
+            | ClientRequest::AcknowledgeRedraw { .. }
+            | ClientRequest::WatchTerminals
+            | ClientRequest::Authenticate { .. }
+            | ClientRequest::CloseTerminalChecked { .. }
+    ) {
+        return Ok(());
+    }
+    if let ClientRequest::ShutdownV1 { version, .. } = request
+        && *version != SHUTDOWN_VERSION
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::UnsupportedVersion,
+            format!("shutdown version {version} is unsupported; expected {SHUTDOWN_VERSION}"),
+            false,
+        ));
+    }
+    Err(ProtocolError::new(
+        ProtocolErrorCode::TerminalUnavailable,
+        "Ordinary daemon exit is waiting for exact original child cleanup; only inspection and explicit checked Close remain available",
+        false,
+    ))
+}
+
 fn disconnect_client(host: &SharedHost, client_id: ClientId) {
     {
         let gate = control_gate(host);
         let _control = gate.read().unwrap_or_else(|p| p.into_inner());
         let handles = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-            if state.shutting_down {
+            if state.shutting_down && !state.ordinary_exit_cleanup_pending() {
                 // Shutdown owns the remaining session state. Removing delivery is
                 // safe, but unregistering would enqueue visibility/redraw effects
                 // after the upgrade's terminal snapshots have been committed.
@@ -365,11 +467,390 @@ fn disconnect_client(host: &SharedHost, client_id: ClientId) {
 
 type RequestOutcome = (ServerResponse, Vec<ServerMessage>, bool);
 
+/// Recovery is deliberately a subset of existing authority-checked operations.
+/// No visibility operation retries adoption, and no new command may race a
+/// retained original whose commit outcome is unknown.
+fn ensure_startup_recovery_request(
+    host: &SharedHost,
+    request: &ClientRequest,
+) -> Result<(), ProtocolError> {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(detail) = state.startup_recovery() else {
+        return Ok(());
+    };
+    let inspection = matches!(
+        request,
+        ClientRequest::List
+            | ClientRequest::ChatList
+            | ClientRequest::Attach { .. }
+            | ClientRequest::Detach { .. }
+            | ClientRequest::Snapshot { .. }
+            | ClientRequest::TerminalAcknowledge { .. }
+            | ClientRequest::AcknowledgeRedraw { .. }
+            | ClientRequest::WatchTerminals
+            | ClientRequest::Authenticate { .. }
+            | ClientRequest::CloseTerminalChecked { .. }
+            | ClientRequest::ChatCloseRetained { .. }
+    );
+    let shutdown = matches!(
+        request,
+        ClientRequest::Shutdown | ClientRequest::ShutdownV1 { .. }
+    ) && !state.recovery_owns_work();
+    if inspection || shutdown {
+        return Ok(());
+    }
+    Err(ProtocolError::new(
+        ProtocolErrorCode::TerminalUnavailable,
+        format!(
+            "Startup recovery retained original ownership; inspect available sessions or explicitly Close the original actor: {detail}"
+        ),
+        false,
+    ))
+}
+
+fn ensure_terminal_close_open(host: &SharedHost) -> Result<(), ProtocolError> {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if state.terminal_close_admission_open() {
+        return Ok(());
+    }
+    Err(ProtocolError::new(
+        ProtocolErrorCode::TerminalUnavailable,
+        "Daemon exit has sealed terminal cleanup admission",
+        false,
+    ))
+}
+
+fn retention_pin_generation(
+    host: &SharedHost,
+    terminal: crate::model::TerminalId,
+) -> Result<Option<String>, String> {
+    let result = super::agent_execution::registry(host).and_then(|registry| {
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retention_pin_generation(terminal)
+    });
+    result
+}
+
+/// Capture the exact native pair before stopping the PTY. Re-resolving only
+/// its durable ID after a wait could close a replacement conversation.
+fn terminal_close_pair(
+    host: &SharedHost,
+    terminal: crate::model::TerminalId,
+    expected: &crate::terminal::TerminalHandle,
+) -> Result<Option<crate::chat::runtime::Handle>, ProtocolError> {
+    super::chat::preflight_for_terminal_close(host, terminal, expected)?;
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if !state
+        .terminals
+        .get(&terminal)
+        .is_some_and(|record| record.handle.same_worker(expected))
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::TerminalUnavailable,
+            "The terminal changed before close; its current owner was retained",
+            true,
+        ));
+    }
+    state
+        .chats
+        .get(&terminal)
+        .filter(|record| {
+            (record.session.launch.provider == crate::agent::Provider::Codex
+                || record.owns_execution_console())
+                && record
+                    .session
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|source| source.id == terminal)
+        })
+        .map(|record| {
+            if !record
+                .paired_terminal
+                .as_ref()
+                .is_some_and(|handle| handle.same_worker(expected))
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::TerminalUnavailable,
+                    "The terminal worker no longer belongs to this provider pairing",
+                    true,
+                ));
+            }
+            Ok(record.handle.clone())
+        })
+        .transpose()
+}
+
+struct TerminalCloseRetirement {
+    terminal: crate::model::TerminalId,
+    handle: crate::terminal::TerminalHandle,
+    source: crate::model::TerminalSession,
+    proof: Arc<HostSessionProof>,
+    generation: Result<Option<String>, String>,
+    ticket: uuid::Uuid,
+    _interrupted: ExplicitCloseGuard,
+    previous: Option<super::state::Retirement>,
+}
+
+struct ExplicitCloseGuard {
+    host: std::sync::Weak<super::state::HostLock>,
+    terminal: crate::model::TerminalId,
+    ticket: uuid::Uuid,
+}
+
+impl Drop for ExplicitCloseGuard {
+    fn drop(&mut self) {
+        let Some(host) = self.host.upgrade() else {
+            return;
+        };
+        let changed = {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(entry) = state.terminal_retirements.get_mut(&self.terminal)
+                && entry.ticket == self.ticket
+                && entry.explicit_close
+                && entry.failure.is_none()
+            {
+                entry.failure = Some("Explicit close was interrupted before cleanup could be confirmed; retry the retained result".into());
+                state.inventory_generation += 1;
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            crate::daemon::wake();
+        }
+    }
+}
+
+/// The caller dropped its shared reader. Drain earlier publications and reserve
+/// this exact owner under the writer BEFORE any destructive close or cache release.
+fn reserve_terminal_close(
+    host: &SharedHost,
+    terminal: crate::model::TerminalId,
+    expected: &crate::terminal::TerminalHandle,
+    source: &crate::model::TerminalSession,
+    paired: Option<&crate::chat::runtime::Handle>,
+    generation: Result<Option<String>, String>,
+) -> Result<TerminalCloseRetirement, ProtocolError> {
+    let gate = control_gate(host);
+    let _admission = gate.write().unwrap_or_else(|p| p.into_inner());
+    ensure_terminal_close_open(host)?;
+    let unavailable =
+        |message| ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true);
+    let captured = generation.as_ref().map_err(|cause| {
+        unavailable(format!(
+            "Saved terminal ownership was unknown before close: {cause}"
+        ))
+    })?;
+    let current = retention_pin_generation(host, terminal).map_err(|cause| {
+        unavailable(format!(
+            "Saved terminal ownership cannot be revalidated before close: {cause}"
+        ))
+    })?;
+    if &current != captured {
+        return Err(unavailable(
+            "Saved terminal ownership changed before close; no cleanup was started".into(),
+        ));
+    }
+    let (mut reservation, previous) = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let pair_matches = match paired {
+            Some(actor) => state.chats.get(&terminal).is_some_and(|record| {
+                record.handle.same_attachment(actor)
+                    && record
+                        .paired_terminal
+                        .as_ref()
+                        .is_some_and(|handle| handle.same_worker(expected))
+            }),
+            None => true,
+        };
+        if !pair_matches
+            || state.chats.values().any(|record| {
+                record
+                    .paired_terminal
+                    .as_ref()
+                    .is_some_and(|handle| handle.same_worker(expected))
+                    && paired.is_none_or(|actor| !record.handle.same_attachment(actor))
+            })
+            || super::chat::terminal_claim_pending(&state, terminal)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::TerminalUnavailable,
+                "The native conversation changed during close; its terminal pair was retained",
+                true,
+            ));
+        }
+        let source = state.terminals.get(&terminal)
+            .filter(|record| record.handle.same_worker(expected) && record.session == *source)
+            .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::TerminalUnavailable,
+                "The terminal changed during close; its current owner and saved pin were retained", true))?
+            .session.clone();
+        if state
+            .terminal_retirements
+            .get(&terminal)
+            .is_some_and(|entry| !entry.handle.same_worker(expected) || entry.failure.is_none())
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::TerminalUnavailable,
+                "Terminal cleanup already owns this result; retry after it settles",
+                true,
+            ));
+        }
+        let entry = super::state::Retirement::explicit_close(expected.clone());
+        let reservation = TerminalCloseRetirement {
+            terminal,
+            handle: expected.clone(),
+            source,
+            proof: state.proof_handle(),
+            generation,
+            ticket: entry.ticket,
+            _interrupted: ExplicitCloseGuard {
+                host: Arc::downgrade(host),
+                terminal,
+                ticket: entry.ticket,
+            },
+            previous: None,
+        };
+        let previous = state.terminal_retirements.insert(terminal, entry);
+        state.inventory_generation += 1;
+        (reservation, previous)
+    };
+    reservation.previous = previous;
+    Ok(reservation)
+}
+
+/// Joining can transfer a still-live original holder to the reaper. Check the
+/// held pidfd and exact authenticated receipt outside Host AND control locks.
+fn finish_terminal_close(
+    host: &SharedHost,
+    close: TerminalCloseRetirement,
+) -> Result<(), ProtocolError> {
+    let result = match close
+        .handle
+        .completed_retirement(&close.source, &close.proof)
+    {
+        crate::terminal::TerminalRetirement::Released => Ok(()),
+        crate::terminal::TerminalRetirement::Pending => {
+            Err("Terminal worker retirement is still pending".into())
+        }
+        crate::terminal::TerminalRetirement::WaitingForHolder(_) => {
+            Err("The original terminal holder has not exited; cleanup is pending".into())
+        }
+        crate::terminal::TerminalRetirement::Retained(error) => Err(error),
+    };
+    let gate = control_gate(host);
+    let _admission = gate.write().unwrap_or_else(|p| p.into_inner());
+    let error = |message| ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true);
+    if let Err(message) = result {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = state.terminal_retirements.get_mut(&close.terminal)
+            && entry.ticket == close.ticket
+            && entry.handle.same_worker(&close.handle)
+        {
+            entry.failure = Some(message.clone());
+            state.inventory_generation += 1;
+        }
+        return Err(error(message));
+    }
+    ensure_terminal_close_open(host)?;
+    // None is a known unpinned local window, not an unavailable Registry.
+    // The writer also drains publications that passed their initial check
+    // before our reservation. It fences local/shared edits through the final
+    // removal and conditional generation DELETE.
+    let captured = close.generation.as_ref().map_err(|cause| {
+        error(format!(
+            "Saved terminal ownership was unknown before close: {cause}"
+        ))
+    })?;
+    let current = retention_pin_generation(host, close.terminal).map_err(|cause| {
+        error(format!(
+            "Saved terminal ownership cannot be revalidated: {cause}"
+        ))
+    })?;
+    if &current != captured {
+        return Err(error(
+            "Saved terminal ownership changed during close; retry the retained result".into(),
+        ));
+    }
+    if !close_retirement_is_current(&host.lock().unwrap_or_else(|p| p.into_inner()), &close) {
+        return Err(error(
+            "Terminal ownership changed while cleanup settled; its cleanup record was retained"
+                .into(),
+        ));
+    }
+    if let Ok(Some(generation)) = &close.generation {
+        let result = super::agent_execution::registry(host).and_then(|registry| {
+            registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .forget_retention_pin(close.terminal, generation)
+        });
+        if let Err(cause) = result {
+            let message = format!(
+                "Saved terminal pin could not be removed; retry the retained cleanup record: {cause}"
+            );
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(entry) = state.terminal_retirements.get_mut(&close.terminal)
+                && entry.ticket == close.ticket
+                && entry.handle.same_worker(&close.handle)
+            {
+                entry.failure = Some(message.clone());
+                state.inventory_generation += 1;
+            }
+            return Err(error(message));
+        }
+    }
+    let retired = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if !close_retirement_is_current(&state, &close) {
+            return Err(error(
+                "The exact terminal changed during pin removal; its cleanup record was retained"
+                    .into(),
+            ));
+        }
+        // Released was proved outside both locks. Clear only this original's
+        // startup slot while its exact record still exists, then compact it.
+        state.startup_closed(close.terminal, &close.handle);
+        state.retire_terminal_if_current(close.terminal, &close.handle)
+    };
+    let retired =
+        retired.ok_or_else(|| error("The exact closed terminal is no longer available".into()))?;
+    drop(retired);
+    crate::daemon::wake();
+    Ok(())
+}
+
+fn close_retirement_is_current(
+    state: &super::state::HostState,
+    close: &TerminalCloseRetirement,
+) -> bool {
+    state
+        .terminal_retirements
+        .get(&close.terminal)
+        .is_some_and(|entry| {
+            entry.ticket == close.ticket && entry.handle.same_worker(&close.handle)
+        })
+        && state.terminals.get(&close.terminal).is_some_and(|record| {
+            record.handle.same_worker(&close.handle) && record.session == close.source
+        })
+        && !state.chats.values().any(|record| {
+            record
+                .paired_terminal
+                .as_ref()
+                .is_some_and(|handle| handle.same_worker(&close.handle))
+        })
+        && !super::chat::terminal_claim_pending(state, close.terminal)
+}
+
 pub(super) fn process_request(
     host: &SharedHost,
     client_id: ClientId,
     request: ClientRequest,
 ) -> Result<RequestOutcome, ProtocolError> {
+    ensure_request_open(host, &request)?;
+    ensure_startup_recovery_request(host, &request)?;
     let gate = control_gate(host);
     // The GitHub read must not monopolize the exclusive admission fence. All
     // authorizing local state is checked again only after that fence is held.
@@ -446,7 +927,8 @@ pub(super) fn process_request(
     );
     let _exclusive = exclusive.then(|| gate.write().unwrap_or_else(|p| p.into_inner()));
     let _shared = (!exclusive).then(|| gate.read().unwrap_or_else(|p| p.into_inner()));
-    ensure_control_open(host)?;
+    ensure_request_open(host, &request)?;
+    ensure_startup_recovery_request(host, &request)?;
     super::agent_execution::terminals::admit(host, client_id, &request)?;
     super::account_lifecycle::admit(host, &request)?;
     super::worktree_removal::admit(host, &request)?;
@@ -463,6 +945,31 @@ pub(super) fn process_request(
             super::state::RETAINED_CHILD_CLEANUP_MESSAGE,
             true,
         ));
+    }
+    if shutdown_admission
+        || matches!(
+            &request,
+            ClientRequest::PrepareUpgrade { .. }
+                | ClientRequest::PrepareConfirmedUpgrade { .. }
+                | ClientRequest::UpgradeImpact { .. }
+        )
+    {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if !state.terminal_retirements.is_empty() {
+            let failed = state
+                .terminal_retirements
+                .values()
+                .any(|entry| entry.failure.is_some());
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::TerminalUnavailable,
+                if failed {
+                    "Terminal retirement is unconfirmed; explicitly close the retained result before shutdown or upgrade"
+                } else {
+                    "Terminal retirement is pending; retry shutdown or upgrade after cleanup settles"
+                },
+                true,
+            ));
+        }
     }
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
@@ -515,6 +1022,15 @@ pub(super) fn process_request(
         ClientRequest::Authenticate { authority } => {
             super::agent_execution::terminals::authenticate(host, client_id, &authority)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
+        ClientRequest::ChannelWork { authority, request } => {
+            let response = if let crate::channel_work_api::Request::Refresh { home } = request {
+                drop(_shared);
+                super::channel_work::refresh(host, &authority, home)
+            } else {
+                super::channel_work::process(host, &authority, request)
+            };
+            Ok((ServerResponse::ChannelWork(response), Vec::new(), false))
         }
         ClientRequest::Work(request) => {
             // Admission was checked above. A board may wait on scans and
@@ -639,6 +1155,27 @@ pub(super) fn process_request(
                     "Invalid notification window ownership",
                     false,
                 ));
+            }
+            if presence.application == crate::notifications::Application::Cagents {
+                let registry = {
+                    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                    state.ensure_retention_available(&presence.sessions)?;
+                    state.execution_registry.clone()
+                };
+                // The shared control reader spans selection and publication;
+                // automatic cleanup takes its writer before reserving an ID.
+                // Disconnect is not card closure, so these pins are durable.
+                if let Some(registry) = registry {
+                    registry
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .pin_window_terminals(&presence.sessions)
+                        .map_err(|message| {
+                            ProtocolError::new(ProtocolErrorCode::Internal, message, true)
+                        })?;
+                }
+                // Missing Registry keeps the old UI delivery behavior. The
+                // automatic census separately refuses unknown ownership.
             }
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             // Watch and subsequent focus reports share the same live window
@@ -854,6 +1391,7 @@ pub(super) fn process_request(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .edit_model(client_id, edit)?;
+            crate::daemon::wake();
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
         }
         ClientRequest::Spawn { session, options } => {
@@ -1188,14 +1726,46 @@ pub(super) fn process_request(
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::ShutdownTerminal { terminal_id } => {
-            let handle = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .handle(client_id, terminal_id)?;
-            handle.shutdown().map_err(send_error)?;
+            let (handle, source) = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                state.ensure_retention_available(&[terminal_id])?;
+                (
+                    state.history_handle(client_id, terminal_id)?,
+                    state.terminals[&terminal_id].session.clone(),
+                )
+            };
+            let paired = terminal_close_pair(host, terminal_id, &handle)?;
+            let pin = retention_pin_generation(host, terminal_id);
+            drop(_shared);
+            let close =
+                reserve_terminal_close(host, terminal_id, &handle, &source, paired.as_ref(), pin)?;
+            // Explicit shutdown permits active work, but still needs the same
+            // inspected family cleanup proof as a checked close. A plain worker
+            // hangup/join cannot certify release of its original holder.
+            match handle.close_checked(true) {
+                crate::terminal_ipc::TerminalCloseResult::Closed => {}
+                crate::terminal_ipc::TerminalCloseResult::Active => {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::TerminalUnavailable,
+                        "Terminal process cleanup remains unconfirmed; its original owner is retained",
+                        true,
+                    ));
+                }
+                crate::terminal_ipc::TerminalCloseResult::Unknown(detail) => {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::TerminalUnavailable,
+                        detail,
+                        true,
+                    ));
+                }
+            }
             host.lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .close_terminal_attention(terminal_id, Some(&handle));
+            if let Some(paired) = paired {
+                super::chat::close_terminal_actor(host, terminal_id, &paired)?;
+            }
+            finish_terminal_close(host, close)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::ReleaseCompletedTerminal {
@@ -1216,15 +1786,22 @@ pub(super) fn process_request(
                     false,
                 ));
             }
-            let (handle, paired) = {
+            let (handle, paired, source) = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                state.ensure_retention_available(&[session.id])?;
                 let handle = match state.terminals.get(&session.id) {
-                    None => None,
+                    None => {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::TerminalUnavailable,
+                            "The completed terminal is no longer available; absence does not confirm cleanup",
+                            true,
+                        ));
+                    }
                     Some(record)
                         if record.session.launch == session.launch
                             && record.handle.is_completed() =>
                     {
-                        Some(record.handle.clone())
+                        record.handle.clone()
                     }
                     Some(_) => {
                         return Err(ProtocolError::new(
@@ -1236,7 +1813,7 @@ pub(super) fn process_request(
                 };
                 let paired = state.chats.get(&session.id).map(|record| {
                     if !record.paired_terminal.as_ref().is_some_and(|expected| {
-                        handle.as_ref().is_some_and(|actual| actual.same_worker(expected))
+                        handle.same_worker(expected)
                     }) || (record.session.launch.provider != crate::agent::Provider::Codex
                         && !record.owns_execution_console())
                         || !record.session.terminal.as_ref().is_some_and(|terminal| {
@@ -1248,8 +1825,9 @@ pub(super) fn process_request(
                     }
                     Ok(record.handle.clone())
                 }).transpose()?;
-                (handle, paired)
+                (handle, paired, state.terminals[&session.id].session.clone())
             };
+            let pin = retention_pin_generation(host, session.id);
             if paired.as_ref().is_some_and(|handle| handle.owns_work()) && !allow_active {
                 return Ok((
                     ServerResponse::TerminalCloseChecked {
@@ -1260,15 +1838,17 @@ pub(super) fn process_request(
                     false,
                 ));
             }
+            drop(_shared);
+            let close =
+                reserve_terminal_close(host, session.id, &handle, &source, paired.as_ref(), pin)?;
             if let Some(paired) = paired {
                 super::chat::close_terminal_actor(host, session.id, &paired)?;
             }
-            if let Some(handle) = &handle {
-                handle.shutdown().map_err(send_error)?;
-            }
+            handle.shutdown().map_err(send_error)?;
             host.lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .close_terminal_attention(session.id, handle.as_ref());
+                .close_terminal_attention(session.id, Some(&handle));
+            finish_terminal_close(host, close)?;
             Ok((
                 ServerResponse::TerminalCloseChecked {
                     terminal_id: session.id,
@@ -1282,17 +1862,47 @@ pub(super) fn process_request(
             terminal_id,
             allow_active,
         } => {
-            let handle = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .handle(client_id, terminal_id)?;
-            super::chat::preflight_for_terminal_close(host, terminal_id, &handle)?;
+            let (handle, source) = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                state.ensure_retention_available(&[terminal_id])?;
+                (
+                    state.history_handle(client_id, terminal_id)?,
+                    state.terminals[&terminal_id].session.clone(),
+                )
+            };
+            let paired = terminal_close_pair(host, terminal_id, &handle)?;
+            let pin = retention_pin_generation(host, terminal_id);
+            drop(_shared);
+            let mut close =
+                reserve_terminal_close(host, terminal_id, &handle, &source, paired.as_ref(), pin)?;
             let outcome = handle.close_checked(allow_active);
             if outcome == crate::terminal_ipc::TerminalCloseResult::Closed {
                 host.lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .close_terminal_attention(terminal_id, Some(&handle));
-                super::chat::close_for_terminal(host, terminal_id)?;
+                if let Some(paired) = paired {
+                    super::chat::close_terminal_actor(host, terminal_id, &paired)?;
+                }
+                finish_terminal_close(host, close)?;
+            } else if outcome == crate::terminal_ipc::TerminalCloseResult::Active {
+                let removed = {
+                    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                    if state
+                        .terminal_retirements
+                        .get(&terminal_id)
+                        .is_some_and(|entry| entry.ticket == close.ticket)
+                    {
+                        state.inventory_generation += 1;
+                        let removed = state.terminal_retirements.remove(&terminal_id);
+                        if let Some(previous) = close.previous.take() {
+                            state.terminal_retirements.insert(terminal_id, previous);
+                        }
+                        removed
+                    } else {
+                        None
+                    }
+                };
+                drop(removed);
             }
             Ok((
                 ServerResponse::TerminalCloseChecked {
@@ -1368,7 +1978,7 @@ fn prepare_resume(
 > {
     let gate = control_gate(host);
     let _control = gate.read().unwrap_or_else(|p| p.into_inner());
-    ensure_control_open(host)?;
+    ensure_inspection_open(host)?;
     let mut resumed = Vec::new();
     let mut replay = Vec::new();
     for cursor in cursors {
@@ -1512,6 +2122,1398 @@ mod tests {
     use crate::model::TerminalId;
 
     #[test]
+    fn recovery_chat_requests_preserve_ordinary_exit_and_committed_shutdown_fences() {
+        for ordinary_exit in [true, false] {
+            let (proof, host) = panic_test_host("recovery-chat-exit-fence");
+            host.lock()
+                .unwrap()
+                .retain_startup_recovery("original owner requires explicit Close".into());
+            // The new read-only request crosses the real dispatch path before
+            // shutdown, without requiring an actor, adoption or transcript.
+            assert!(matches!(
+                process_request(&host, 0, ClientRequest::ChatList).unwrap().0,
+                ServerResponse::ChatListed { sessions } if sessions.is_empty()
+            ));
+            let source = crate::chat::Session {
+                id: TerminalId::new(),
+                proof: Some(proof),
+                terminal: None,
+                native_continuity: Default::default(),
+                owned_codex_listener: None,
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Codex,
+                    session_id: None,
+                    recipe: crate::model::LaunchRecipe {
+                        program: "/must-not-execute".into(),
+                        arguments: Vec::new(),
+                        working_directory: "/".into(),
+                        environment: Default::default(),
+                        unset_environment: Default::default(),
+                    },
+                },
+            };
+            {
+                let mut state = host.lock().unwrap();
+                if ordinary_exit {
+                    state.begin_ordinary_exit_cleanup();
+                } else {
+                    // No live originals exist in this local gate fixture, so
+                    // the real request_shutdown transition may commit.
+                    state.request_shutdown();
+                }
+                assert!(state.shutting_down);
+            }
+            for request in [
+                ClientRequest::ChatList,
+                ClientRequest::ChatCloseRetained { session: source },
+            ] {
+                let failure = process_request(&host, 0, request).unwrap_err();
+                assert_eq!(failure.code, ProtocolErrorCode::TerminalUnavailable);
+                assert_eq!(
+                    failure.message,
+                    if ordinary_exit {
+                        "Ordinary daemon exit is waiting for exact original child cleanup; only inspection and explicit checked Close remain available"
+                    } else {
+                        "Daemon upgrade/shutdown is committed; no further control mutations are accepted"
+                    }
+                );
+                let state = host.lock().unwrap();
+                assert!(state.shutting_down);
+                assert_eq!(state.ordinary_exit_cleanup_pending(), ordinary_exit);
+                assert_eq!(
+                    state.startup_recovery(),
+                    Some("original owner requires explicit Close")
+                );
+                assert!(state.chats.is_empty());
+                assert!(state.chat_spawning.is_empty());
+                assert!(state.native_closing.is_empty());
+            }
+        }
+    }
+
+    fn wait_client_retirement(mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(
+                Instant::now() < deadline,
+                "original terminal retirement did not settle"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn finish_test_terminal_close(
+        host: &SharedHost,
+        terminal: TerminalId,
+        handle: &crate::terminal::TerminalHandle,
+        generation: Result<Option<String>, String>,
+    ) -> Result<(), ProtocolError> {
+        let source = host.lock().unwrap().terminals[&terminal].session.clone();
+        let close = reserve_terminal_close(host, terminal, handle, &source, None, generation)?;
+        finish_terminal_close(host, close)
+    }
+
+    fn retry_retirement_close(
+        host: &SharedHost,
+        request: impl Fn() -> ClientRequest,
+    ) -> RequestOutcome {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match process_request(host, 1, request()) {
+                Ok(reply) => return reply,
+                Err(error)
+                    if error.code == ProtocolErrorCode::TerminalUnavailable
+                        && error.retryable
+                        && (error.message.contains("original terminal holder")
+                            || error.message.contains("Terminal worker retirement")) =>
+                {
+                    assert!(Instant::now() < deadline, "close stayed pending: {error:?}");
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("unexpected close refusal: {error:?}"),
+            }
+        }
+    }
+
+    fn retention_client_host(
+        name: &str,
+    ) -> (
+        SharedHost,
+        tempfile::TempDir,
+        crate::model::TerminalSession,
+        crate::terminal::TerminalHandle,
+    ) {
+        let (_, host) = panic_test_host(name);
+        let directory = tempfile::Builder::new().prefix("rp-").tempdir().unwrap();
+        let mut recipe = crate::model::LaunchRecipe::shell(directory.path().into()).unwrap();
+        recipe.program = "/bin/true".into();
+        recipe.arguments.clear();
+        let session = crate::model::TerminalSession {
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let terminal =
+            crate::terminal::TerminalHandle::spawn(session.clone(), Default::default(), |_| {})
+                .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !terminal.is_completed() {
+            assert!(Instant::now() < deadline, "real PTY did not complete");
+            thread::sleep(Duration::from_millis(5));
+        }
+        terminal.shutdown().unwrap();
+        let proof = host.lock().unwrap().proof_handle();
+        wait_client_retirement(|| {
+            matches!(
+                terminal.completed_retirement(&session, &proof),
+                crate::terminal::TerminalRetirement::Released
+            )
+        });
+        {
+            let mut state = host.lock().unwrap();
+            state.install_model(
+                super::super::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
+            );
+            state.register_client(1);
+            state.reserve_spawn(session.id).unwrap();
+            state
+                .finish_spawn(1, session.clone(), terminal.clone(), false)
+                .unwrap();
+        }
+        (host, directory, session, terminal)
+    }
+
+    /// Hold the real handler after final retirement but before serve_with can
+    /// enqueue its response. Ordinary exit must not seal that delivery gap.
+    #[test]
+    fn destructive_terminal_replies_drain_before_ordinary_exit_seals_delivery() {
+        use std::sync::mpsc;
+        const CASE: &str = "CAGENTS_EXIT_DRAIN_TEST_CASE";
+        let name = thread::current().name().unwrap().to_owned();
+        let cases = match std::env::var(CASE) {
+            Ok(case) => vec![case],
+            Err(_) => ["checked", "release", "shutdown", "chat"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        };
+        fn chat_close_case() {
+            use crate::chat::protocol::{Adapter, ProcessSpec, Step};
+            struct Quiet;
+            impl Adapter for Quiet {
+                fn initialize(&mut self) -> Result<Step, String> {
+                    Ok(Step::default())
+                }
+                fn command(&mut self, _: crate::chat::Command) -> Result<Step, String> {
+                    Ok(Step::default())
+                }
+                fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                    Ok(Step::default())
+                }
+            }
+            thread_local! {
+                static PAUSE: std::cell::RefCell<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>> =
+                    const { std::cell::RefCell::new(None) };
+            }
+            fn close_then_pause(
+                host: &SharedHost,
+                client: ClientId,
+                request: ClientRequest,
+            ) -> Result<RequestOutcome, ProtocolError> {
+                let closing = matches!(&request, ClientRequest::ChatClose { .. });
+                if matches!(&request, ClientRequest::ChatCloseRetained { .. }) {
+                    assert!(
+                        host.lock().unwrap().ordinary_exit_cleanup_blocked(),
+                        "retained Close must own reply custody even on refusal"
+                    );
+                }
+                let result = process_request(host, client, request);
+                if closing {
+                    assert!(result.is_ok(), "real native chat close failed: {result:?}");
+                    assert!(host.lock().unwrap().chats.is_empty());
+                    PAUSE.with(|pause| {
+                        let (closed, resume) = pause.borrow_mut().take().unwrap();
+                        closed.send(()).unwrap();
+                        resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                    });
+                }
+                result
+            }
+            fn send(
+                stream: &mut UnixStream,
+                proof: &HostSessionProof,
+                id: u64,
+                request: ClientRequest,
+            ) {
+                FrameCodec::new(MAX_CLIENT_FRAME_BYTES)
+                    .write(
+                        stream,
+                        &ClientEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: id,
+                            proof: Some(proof.clone()),
+                            request,
+                        },
+                    )
+                    .unwrap();
+            }
+            fn reply(stream: &mut UnixStream, id: u64) -> ServerMessage {
+                let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+                loop {
+                    let envelope = codec
+                        .read::<ServerEnvelope>(stream)
+                        .unwrap()
+                        .expect("native close reply lost before delivery drained");
+                    if envelope.request_id == Some(id) {
+                        return envelope.message;
+                    }
+                }
+            }
+            let (proof, host) = panic_test_host("chat-reply-custody");
+            let directory = tempfile::Builder::new().prefix("cq-").tempdir().unwrap();
+            let mut recipe = crate::model::LaunchRecipe::shell(directory.path().into()).unwrap();
+            // The adapter is in-process; its harmless JSON-lines transport
+            // is a real local cat, never an installed model/provider.
+            recipe.program = "/bin/cat".into();
+            recipe.arguments.clear();
+            let spec = ProcessSpec::from(&recipe);
+            let mut initial = Step::default();
+            let store = crate::chat::runtime::preflight(&spec, &mut initial).unwrap();
+            let actor = crate::chat::runtime::Handle::start(
+                spec,
+                Box::new(Quiet),
+                initial,
+                store,
+                None,
+                |_| {},
+            )
+            .unwrap();
+            assert!(!actor.is_completed());
+            let source = crate::chat::Session {
+                id: TerminalId::new(),
+                proof: Some(proof.clone()),
+                terminal: None,
+                native_continuity: Default::default(),
+                owned_codex_listener: None,
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Omp,
+                    recipe,
+                    session_id: None,
+                },
+            };
+            {
+                let mut state = host.lock().unwrap();
+                state.install_model(
+                    super::super::model::Registry::at(&directory.path().join("model.sqlite3"))
+                        .unwrap(),
+                );
+                state.chats.insert(
+                    source.id,
+                    super::super::chat::Record {
+                        execution_instance: uuid::Uuid::new_v4(),
+                        console_recipe: None,
+                        paired_terminal: None,
+                        session: source.clone(),
+                        handle: actor.clone(),
+                        source_process: None,
+                        subscribers: std::collections::BTreeMap::from([(1, false)]),
+                        observations: Default::default(),
+                        completion_observed: false,
+                        returning_terminal: false,
+                    },
+                );
+            }
+            let (mut stream, server_stream) = UnixStream::pair().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let (closed_tx, closed_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let serving_host = Arc::clone(&host);
+            let serving = thread::spawn(move || {
+                PAUSE.with(|pause| *pause.borrow_mut() = Some((closed_tx, resume_rx)));
+                serve_with(server_stream, 1, serving_host, close_then_pause);
+            });
+            send(
+                &mut stream,
+                &proof,
+                1,
+                ClientRequest::Connect {
+                    expected_host: Some(proof.clone()),
+                    resume: Vec::new(),
+                },
+            );
+            assert!(matches!(
+                reply(&mut stream, 1),
+                ServerMessage::Response {
+                    response: ServerResponse::Connected { .. }
+                }
+            ));
+            // This actor has no detached authenticated holder. Real retained
+            // cleanup must refuse it; its error reply must release the guard.
+            // Successful retained-native teardown is not claimed here.
+            send(
+                &mut stream,
+                &proof,
+                2,
+                ClientRequest::ChatCloseRetained {
+                    session: source.clone(),
+                },
+            );
+            assert!(matches!(reply(&mut stream, 2), ServerMessage::Error(error)
+                if error.code == ProtocolErrorCode::TerminalUnavailable && error.retryable));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while host.lock().unwrap().ordinary_exit_cleanup_blocked() {
+                assert!(
+                    Instant::now() < deadline,
+                    "refused retained close leaked reply custody"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(!actor.is_completed());
+            assert!(
+                host.lock().unwrap().chats[&source.id]
+                    .handle
+                    .same_attachment(&actor)
+            );
+            assert!(host.lock().unwrap().chat_spawning.is_empty());
+            assert!(host.lock().unwrap().native_closing.is_empty());
+            send(
+                &mut stream,
+                &proof,
+                3,
+                ClientRequest::ChatClose { chat_id: source.id },
+            );
+            closed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(actor.is_completed());
+            assert!(host.lock().unwrap().chats.is_empty());
+            let drain = super::super::begin_ordinary_exit(&host).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !drain.try_seal_absence() {
+                assert!(
+                    Instant::now() < deadline,
+                    "chat child custody did not settle"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            let mut cleanup_error = None;
+            assert!(host.lock().unwrap().ordinary_exit_cleanup_blocked());
+            assert!(!super::super::finish_shutdown_owners(
+                &host,
+                &mut cleanup_error,
+                false
+            ));
+            resume_tx.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while host.lock().unwrap().ordinary_exit_cleanup_blocked() {
+                assert!(
+                    Instant::now() < deadline,
+                    "native chat reply guard did not release"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(super::super::finish_shutdown_owners(
+                &host,
+                &mut cleanup_error,
+                false
+            ));
+            assert!(cleanup_error.is_none());
+            let deliveries = {
+                let mut state = host.lock().unwrap();
+                assert!(drain.try_seal_absence());
+                assert!(!state.ordinary_exit_cleanup_blocked());
+                let deliveries = state.close_ordinary_exit_registration();
+                assert_eq!(
+                    state.begin_checked_close_reply(99).unwrap_err().code,
+                    ProtocolErrorCode::TerminalUnavailable
+                );
+                deliveries
+            };
+            super::super::close_shutdown_deliveries(&host, &deliveries);
+            assert!(matches!(reply(&mut stream, 3), ServerMessage::Response {
+                response: ServerResponse::ChatClosed { chat_id, .. }
+            } if chat_id == source.id));
+            let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+            while let Some(envelope) = codec.read::<ServerEnvelope>(&mut stream).unwrap() {
+                assert_eq!(envelope.request_id, None);
+                assert!(matches!(envelope.message, ServerMessage::HostShuttingDown));
+            }
+            serving.join().unwrap();
+            assert!(host.lock().unwrap().clients.is_empty());
+            assert!(!host.lock().unwrap().ordinary_exit_cleanup_blocked());
+        }
+        for case in cases {
+            let Some(_root) =
+                super::super::exit_drain_tests::private_runtime_case(&name, Some(&case))
+            else {
+                continue;
+            };
+            if case == "chat" {
+                chat_close_case();
+                continue;
+            }
+            thread_local! {
+                static PAUSE: std::cell::RefCell<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>> =
+                    const { std::cell::RefCell::new(None) };
+            }
+            fn retire_then_pause(
+                host: &SharedHost,
+                client: ClientId,
+                request: ClientRequest,
+            ) -> Result<RequestOutcome, ProtocolError> {
+                let closing = matches!(
+                    &request,
+                    ClientRequest::CloseTerminalChecked { .. }
+                        | ClientRequest::ReleaseCompletedTerminal { .. }
+                        | ClientRequest::ShutdownTerminal { .. }
+                );
+                let result = process_request(host, client, request);
+                if closing {
+                    assert!(
+                        result.is_ok(),
+                        "real terminal retirement failed: {result:?}"
+                    );
+                    let state = host.lock().unwrap();
+                    assert!(state.terminals.is_empty());
+                    assert!(state.terminal_retirements.is_empty());
+                    drop(state);
+                    PAUSE.with(|pause| {
+                        let (retired, resume) = pause.borrow_mut().take().unwrap();
+                        retired.send(()).unwrap();
+                        resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                    });
+                }
+                result
+            }
+            fn send(
+                stream: &mut UnixStream,
+                proof: &HostSessionProof,
+                request_id: u64,
+                request: ClientRequest,
+            ) {
+                FrameCodec::new(MAX_CLIENT_FRAME_BYTES)
+                    .write(
+                        stream,
+                        &ClientEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: Some(proof.clone()),
+                            request,
+                        },
+                    )
+                    .unwrap();
+            }
+            fn reply(stream: &mut UnixStream, request_id: u64) -> ServerMessage {
+                let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+                loop {
+                    let envelope = codec
+                        .read::<ServerEnvelope>(stream)
+                        .unwrap()
+                        .expect("correlated reply was lost before delivery drained");
+                    if envelope.request_id == Some(request_id) {
+                        return envelope.message;
+                    }
+                }
+            }
+
+            let (host, _directory, mut session, _terminal) = retention_client_host(&case);
+            let proof = current_proof(&host);
+            assert!(!host.lock().unwrap().ordinary_exit_cleanup_blocked());
+            let (mut stream, server_stream) = UnixStream::pair().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let (retired_tx, retired_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let serving_host = Arc::clone(&host);
+            let serving = thread::spawn(move || {
+                PAUSE.with(|pause| *pause.borrow_mut() = Some((retired_tx, resume_rx)));
+                serve_with(server_stream, 1, serving_host, retire_then_pause);
+            });
+            send(
+                &mut stream,
+                &proof,
+                1,
+                ClientRequest::Connect {
+                    expected_host: Some(proof.clone()),
+                    resume: Vec::new(),
+                },
+            );
+            assert!(matches!(
+                reply(&mut stream, 1),
+                ServerMessage::Response {
+                    response: ServerResponse::Connected { .. }
+                }
+            ));
+            let id = session.id;
+            let request = match case.as_str() {
+                "checked" => ClientRequest::CloseTerminalChecked {
+                    terminal_id: id,
+                    allow_active: false,
+                },
+                "release" => {
+                    session.continuity = crate::model::TerminalContinuity::Exited {
+                        last_exit: crate::model::TerminalExit {
+                            code: Some(0),
+                            signal: None,
+                            occurred_at_unix_ms: 1,
+                        },
+                    };
+                    ClientRequest::ReleaseCompletedTerminal {
+                        session,
+                        allow_active: false,
+                    }
+                }
+                "shutdown" => ClientRequest::ShutdownTerminal { terminal_id: id },
+                _ => panic!("unknown destructive request fixture"),
+            };
+            send(&mut stream, &proof, 2, request);
+            retired_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(retention_pin_generation(&host, id), Ok(None));
+            let drain = super::super::begin_ordinary_exit(&host).unwrap();
+            wait_client_retirement(|| drain.try_seal_absence());
+            // Actual original-child absence is already sealed: only the
+            // outstanding correlated reply can block final Host registration.
+            assert!(host.lock().unwrap().ordinary_exit_cleanup_blocked());
+            resume_tx.send(()).unwrap();
+            wait_client_retirement(|| !host.lock().unwrap().ordinary_exit_cleanup_blocked());
+            let deliveries = {
+                let mut state = host.lock().unwrap();
+                assert!(drain.try_seal_absence());
+                assert!(!state.ordinary_exit_cleanup_blocked());
+                let deliveries = state.close_ordinary_exit_registration();
+                assert_eq!(
+                    state.begin_checked_close_reply(99).unwrap_err().code,
+                    ProtocolErrorCode::TerminalUnavailable,
+                );
+                deliveries
+            };
+            // Close the real writer BEFORE reading the queued success: the
+            // frame must survive close_after_drain, not merely a live socket.
+            super::super::close_shutdown_deliveries(&host, &deliveries);
+            let response = reply(&mut stream, 2);
+            if case == "shutdown" {
+                assert!(matches!(
+                    response,
+                    ServerMessage::Response {
+                        response: ServerResponse::Accepted
+                    }
+                ));
+            } else {
+                assert!(matches!(response, ServerMessage::Response {
+                    response: ServerResponse::TerminalCloseChecked {
+                        terminal_id,
+                        outcome: crate::terminal_ipc::TerminalCloseResult::Closed,
+                    }
+                } if terminal_id == id));
+            }
+            let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+            while let Some(envelope) = codec.read::<ServerEnvelope>(&mut stream).unwrap() {
+                assert_eq!(envelope.request_id, None);
+                assert!(matches!(envelope.message, ServerMessage::HostShuttingDown));
+            }
+            serving.join().unwrap();
+            assert!(host.lock().unwrap().clients.is_empty());
+            assert!(!host.lock().unwrap().ordinary_exit_cleanup_blocked());
+        }
+    }
+
+    fn terminal_presence(id: TerminalId) -> crate::notifications::Presence {
+        crate::notifications::Presence {
+            application: crate::notifications::Application::Cagents,
+            window: "retention-client".into(),
+            focused_target: None,
+            sessions: vec![id],
+            focused: None,
+        }
+    }
+
+    #[test]
+    fn notification_presence_reservation_fences_durable_pins_and_shutdown() {
+        let (host, directory, session, handle) = retention_client_host("presence-retention");
+        let id = session.id;
+        {
+            let mut state = host.lock().unwrap();
+            state
+                .terminal_retirements
+                .insert(id, super::super::state::Retirement::submitting(handle));
+        }
+        let registry = super::super::agent_execution::registry(&host).unwrap();
+        for watch in [false, true] {
+            let request = if watch {
+                ClientRequest::WatchNotifications {
+                    presence: terminal_presence(id),
+                }
+            } else {
+                ClientRequest::NotificationPresence {
+                    presence: terminal_presence(id),
+                }
+            };
+            let error = process_request(&host, 1, request).unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+            assert!(error.retryable);
+            assert!(
+                registry
+                    .lock()
+                    .unwrap()
+                    .retention_pin_generation(id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        for request in [
+            ClientRequest::Shutdown,
+            ClientRequest::ShutdownV1 {
+                version: SHUTDOWN_VERSION,
+                operation: ShutdownOperation::Preflight,
+            },
+            ClientRequest::UpgradeImpact {
+                policy: crate::update::impact::Policy::Interrupt,
+            },
+        ] {
+            let error = process_request(&host, 1, request).unwrap_err();
+            assert!(error.retryable && error.message.contains("pending"));
+        }
+        host.lock()
+            .unwrap()
+            .terminal_retirements
+            .get_mut(&id)
+            .unwrap()
+            .failure = Some("retained exact owner".into());
+        let error = process_request(&host, 1, ClientRequest::Shutdown).unwrap_err();
+        assert!(error.retryable && error.message.contains("unconfirmed"));
+        assert!(!host.lock().unwrap().shutting_down);
+        // Failed cleanup remains conservatively claimable for presentation;
+        // only the in-flight cleanup reservation refuses a new saved claim.
+        process_request(
+            &host,
+            1,
+            ClientRequest::NotificationPresence {
+                presence: terminal_presence(id),
+            },
+        )
+        .unwrap();
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .retention_pin_generation(id)
+                .unwrap()
+                .is_some()
+        );
+        let mut editor = terminal_presence(id);
+        editor.application = crate::notifications::Application::Ceditor;
+        assert!(
+            process_request(
+                &host,
+                1,
+                ClientRequest::NotificationPresence { presence: editor }
+            )
+            .is_err()
+        );
+        process_request(
+            &host,
+            1,
+            ClientRequest::ShutdownTerminal { terminal_id: id },
+        )
+        .unwrap();
+        let state = host.lock().unwrap();
+        assert!(!state.terminals.contains_key(&id));
+        assert!(!state.terminal_retirements.contains_key(&id));
+        drop(state);
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .retention_pin_generation(id)
+                .unwrap()
+                .is_none()
+        );
+        let (_, missing_registry) = panic_test_host("presence-without-registry");
+        missing_registry.lock().unwrap().register_client(1);
+        assert!(
+            process_request(
+                &missing_registry,
+                1,
+                ClientRequest::NotificationPresence {
+                    presence: terminal_presence(TerminalId::new()),
+                }
+            )
+            .is_ok(),
+            "unavailable retention storage must not break the conservative old notification path"
+        );
+        assert!(
+            super::super::model::Registry::at(&directory.path().join("model.sqlite3"))
+                .unwrap()
+                .retention_pin_generation(id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn explicit_completed_close_cannot_forget_a_republished_pin_or_fake_missing_cleanup() {
+        let (host, _directory, mut session, handle) = retention_client_host("close-republication");
+        let id = session.id;
+        process_request(
+            &host,
+            1,
+            ClientRequest::NotificationPresence {
+                presence: terminal_presence(id),
+            },
+        )
+        .unwrap();
+        let closing_generation = retention_pin_generation(&host, id);
+        assert!(closing_generation.as_ref().unwrap().is_some());
+        handle.shutdown().unwrap();
+        // An already-admitted presence can publish after its initial Host
+        // check. Final compaction must drain this real reader before deciding.
+        let gate = control_gate(&host);
+        let publication = gate.read().unwrap();
+        host.lock()
+            .unwrap()
+            .ensure_retention_available(&[id])
+            .unwrap();
+        let worker_host = host.clone();
+        let worker_handle = handle.clone();
+        let worker_source = host.lock().unwrap().terminals[&id].session.clone();
+        let worker_generation = closing_generation.clone();
+        let (started, start) = crossbeam_channel::bounded(1);
+        let (finished, finish) = crossbeam_channel::bounded(1);
+        let worker = thread::spawn(move || {
+            started.send(()).unwrap();
+            assert!(
+                finished
+                    .send(reserve_terminal_close(
+                        &worker_host,
+                        id,
+                        &worker_handle,
+                        &worker_source,
+                        None,
+                        worker_generation
+                    ))
+                    .is_ok()
+            );
+        });
+        start.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            matches!(
+                finish.recv_timeout(Duration::from_millis(100)),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout)
+            ),
+            "compaction bypassed admitted ownership publication"
+        );
+        super::super::agent_execution::registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .pin_window_terminals(&[id])
+            .unwrap();
+        let replacement_generation = retention_pin_generation(&host, id);
+        assert_ne!(closing_generation, replacement_generation);
+        drop(publication);
+        assert!(
+            finish
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .is_err()
+        );
+        worker.join().unwrap();
+        assert!(host.lock().unwrap().terminals.contains_key(&id));
+        assert_eq!(retention_pin_generation(&host, id), replacement_generation);
+        // Retry captures the newly published generation only after the old
+        // attempt truthfully retained both record and newer saved membership.
+        let latest = retention_pin_generation(&host, id);
+        finish_test_terminal_close(&host, id, &handle, latest).unwrap();
+        assert!(!host.lock().unwrap().terminals.contains_key(&id));
+        session.continuity = crate::model::TerminalContinuity::Exited {
+            last_exit: crate::model::TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 1,
+            },
+        };
+        let error = process_request(
+            &host,
+            1,
+            ClientRequest::ReleaseCompletedTerminal {
+                session,
+                allow_active: true,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+        assert!(error.retryable);
+        assert_eq!(retention_pin_generation(&host, id), Ok(None));
+        let (ended_host, _ended_directory, ended, _) =
+            retention_client_host("checked-ended-history");
+        assert!(
+            matches!(
+                process_request(
+                    &ended_host,
+                    1,
+                    ClientRequest::CloseTerminalChecked {
+                        terminal_id: ended.id,
+                        allow_active: false,
+                    }
+                )
+                .unwrap()
+                .0,
+                ServerResponse::TerminalCloseChecked {
+                    outcome: crate::terminal_ipc::TerminalCloseResult::Closed,
+                    ..
+                }
+            ),
+            "completed history still has a real close/join path"
+        );
+        assert!(!ended_host.lock().unwrap().terminals.contains_key(&ended.id));
+        let (unknown_host, unknown_directory, unknown, _) =
+            retention_client_host("unknown-pin-storage");
+        let writer =
+            rusqlite::Connection::open(unknown_directory.path().join("model.sqlite3")).unwrap();
+        writer
+            .execute_batch("PRAGMA user_version=2147483647")
+            .unwrap();
+        let error = process_request(
+            &unknown_host,
+            1,
+            ClientRequest::CloseTerminalChecked {
+                terminal_id: unknown.id,
+                allow_active: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+        assert!(error.retryable && error.message.contains("ownership was unknown"));
+        assert!(
+            unknown_host
+                .lock()
+                .unwrap()
+                .terminals
+                .contains_key(&unknown.id),
+            "unknown pin storage must not be treated as a known absent local pin"
+        );
+    }
+
+    #[test]
+    fn completed_close_preserves_a_replacement_worker_and_exact_native_pair() {
+        use crate::chat::protocol::{Adapter, ProcessSpec, Step};
+        struct Quiet;
+        impl Adapter for Quiet {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: crate::chat::Command) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let (host, _directory, session, old) = retention_client_host("close-worker-replacement");
+        let id = session.id;
+        process_request(
+            &host,
+            1,
+            ClientRequest::NotificationPresence {
+                presence: terminal_presence(id),
+            },
+        )
+        .unwrap();
+        let old_pin = retention_pin_generation(&host, id);
+        let removed = host.lock().unwrap().retire_terminal(id).unwrap();
+        drop(removed);
+        let mut current = session.clone();
+        current.launch.program = "/bin/cat".into();
+        let replacement =
+            crate::terminal::TerminalHandle::spawn(current.clone(), Default::default(), |_| {})
+                .unwrap();
+        {
+            let mut state = host.lock().unwrap();
+            state.reserve_spawn(id).unwrap();
+            state
+                .finish_spawn(1, current.clone(), replacement.clone(), false)
+                .unwrap();
+        }
+        assert!(terminal_close_pair(&host, id, &old).is_err());
+        assert!(finish_test_terminal_close(&host, id, &old, old_pin.clone()).is_err());
+        assert!(
+            host.lock().unwrap().terminals[&id]
+                .handle
+                .same_worker(&replacement)
+        );
+        assert!(!replacement.is_completed());
+        assert_eq!(retention_pin_generation(&host, id), old_pin);
+
+        let mut initial = Step::default();
+        let spec = ProcessSpec::from(&current.launch);
+        let store = crate::chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let actor = crate::chat::runtime::Handle::start(
+            spec,
+            Box::new(Quiet),
+            initial,
+            store,
+            Some("pair-one".into()),
+            |_| {},
+        )
+        .unwrap();
+        {
+            let mut state = host.lock().unwrap();
+            let proof = state.proof_handle().as_ref().clone();
+            state.chats.insert(
+                id,
+                super::super::chat::Record {
+                    execution_instance: uuid::Uuid::new_v4(),
+                    session: crate::chat::Session {
+                        id,
+                        proof: Some(proof),
+                        terminal: Some(current.clone()),
+                        launch: crate::chat::Launch {
+                            provider: crate::agent::Provider::Codex,
+                            recipe: current.launch.clone(),
+                            session_id: Some("pair-one".into()),
+                        },
+                        native_continuity: Default::default(),
+                        owned_codex_listener: None,
+                    },
+                    console_recipe: None,
+                    paired_terminal: Some(replacement.clone()),
+                    handle: actor.clone(),
+                    source_process: None,
+                    subscribers: Default::default(),
+                    observations: Default::default(),
+                    completion_observed: false,
+                    returning_terminal: false,
+                },
+            );
+        }
+        let captured = terminal_close_pair(&host, id, &replacement)
+            .unwrap()
+            .unwrap();
+        let spec = ProcessSpec::from(&current.launch);
+        let mut initial = Step::default();
+        let store = crate::chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let next_actor = crate::chat::runtime::Handle::start(
+            spec,
+            Box::new(Quiet),
+            initial,
+            store,
+            Some("pair-two".into()),
+            |_| {},
+        )
+        .unwrap();
+        {
+            let mut state = host.lock().unwrap();
+            let record = state.chats.get_mut(&id).unwrap();
+            record.handle = next_actor.clone();
+            record.execution_instance = uuid::Uuid::new_v4();
+        }
+        super::super::chat::close_terminal_actor(&host, id, &captured).unwrap();
+        assert!(
+            !next_actor.is_completed(),
+            "old receipt must not close a replacement actor"
+        );
+        assert!(finish_test_terminal_close(&host, id, &replacement, old_pin.clone()).is_err());
+        assert!(
+            host.lock().unwrap().terminals[&id]
+                .handle
+                .same_worker(&replacement)
+        );
+        assert_eq!(retention_pin_generation(&host, id), old_pin);
+        let removed = host.lock().unwrap().chats.remove(&id).unwrap();
+        drop(removed);
+        actor.close().unwrap();
+        next_actor.close().unwrap();
+        assert!(matches!(
+            retry_retirement_close(&host, || ClientRequest::CloseTerminalChecked {
+                terminal_id: id,
+                allow_active: true,
+            })
+            .0,
+            ServerResponse::TerminalCloseChecked {
+                outcome: crate::terminal_ipc::TerminalCloseResult::Closed,
+                ..
+            }
+        ));
+        assert!(!host.lock().unwrap().terminals.contains_key(&id));
+        assert!(retention_pin_generation(&host, id).unwrap().is_none());
+    }
+
+    #[test]
+    fn explicit_close_retains_registered_original_until_actual_holder_receipt() {
+        use std::os::unix::{
+            ffi::{OsStrExt, OsStringExt},
+            fs::PermissionsExt,
+        };
+        const CHILD: &str = "CAGENTS_EXPLICIT_RECEIPT_CHILD";
+        const AUTH_PRESENT: &str = "CAGENTS_EXPLICIT_RECEIPT_AUTH_PRESENT";
+        let name = thread::current().name().unwrap().to_owned();
+        if std::env::var(CHILD).as_deref() != Ok(name.as_str()) {
+            let private = tempfile::Builder::new().prefix("cr-").tempdir().unwrap();
+            std::fs::set_permissions(private.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let stdout = private.path().join("stdout.log");
+            let stderr = private.path().join("stderr.log");
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                .env(CHILD, &name)
+                .env("TMPDIR", private.path())
+                .env("XDG_RUNTIME_DIR", private.path())
+                .env(
+                    AUTH_PRESENT,
+                    std::env::var_os(crate::agent_execution::AUTHORITY_ENV)
+                        .is_some()
+                        .to_string(),
+                )
+                .stdout(std::fs::File::create(&stdout).unwrap())
+                .stderr(std::fs::File::create(&stderr).unwrap())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(40);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    if let Ok(bytes) = std::fs::read(private.path().join("release-obstruction")) {
+                        let fault = std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes));
+                        if fault.starts_with(private.path()) {
+                            let _ = std::fs::remove_dir(fault);
+                        }
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "explicit receipt child timed out; evidence {}",
+                        private.keep().display()
+                    );
+                }
+                thread::sleep(Duration::from_millis(5));
+            };
+            let raw_out = std::fs::read_to_string(stdout).unwrap();
+            let raw_err = std::fs::read_to_string(stderr).unwrap();
+            print!("{raw_out}");
+            eprint!("{raw_err}");
+            assert!(
+                status.success(),
+                "receipt child {status}; evidence {}",
+                private.keep().display()
+            );
+            assert!(raw_out.contains(&name) && raw_out.contains("1 passed; 0 failed"));
+            return;
+        }
+        assert_eq!(
+            std::env::var(AUTH_PRESENT).unwrap(),
+            std::env::var_os(crate::agent_execution::AUTHORITY_ENV)
+                .is_some()
+                .to_string()
+        );
+        let proof = HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new(uuid::Uuid::new_v4().to_string()),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: crate::model::HostIncarnation::new(uuid::Uuid::new_v4().to_string()),
+        };
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let directory = tempfile::Builder::new().prefix("rp-").tempdir().unwrap();
+        let mut recipe = crate::model::LaunchRecipe::shell(directory.path().into()).unwrap();
+        recipe.program = "/bin/sh".into();
+        recipe.arguments = vec![
+            "-c".into(),
+            "printf 'exact-registered-close-result'; exit 0".into(),
+        ];
+        let source = crate::model::TerminalSession {
+            id: TerminalId::new(),
+            launch: recipe,
+            transcript_path: None,
+            resume_hint: None,
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            continuity: crate::model::TerminalContinuity::DetachedSameBoot {
+                host_session_id: proof.host_session_id.clone(),
+                boot_id: proof.boot_id.clone(),
+                host_incarnation: proof.host_incarnation.clone(),
+            },
+        };
+        let recovery = crate::terminal::holder::Recovery {
+            source: source.clone(),
+            previous_sources: vec![],
+            relaunches: vec![],
+            options: Default::default(),
+            execution_environment: None,
+            execution_recipe: None,
+        };
+        let handle = crate::terminal::TerminalHandle::spawn(
+            source.clone(),
+            crate::terminal::TerminalConfig {
+                holder_recovery: Some(recovery),
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+        wait_client_retirement(|| handle.is_completed() && handle.worker_joined_for_test());
+        let original = handle.holder_identity().unwrap().clone();
+        assert!(original.holder.is_current());
+        assert!(!original.root.is_current());
+        let host = Arc::new(super::super::state::HostLock::new(
+            super::super::state::HostState::new(proof.clone()),
+        ));
+        {
+            let mut state = host.lock().unwrap();
+            state.install_model(
+                super::super::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
+            );
+            state.register_client(1);
+            state.reserve_spawn(source.id).unwrap();
+            state
+                .finish_spawn(1, source.clone(), handle.clone(), false)
+                .unwrap();
+        }
+        process_request(
+            &host,
+            1,
+            ClientRequest::NotificationPresence {
+                presence: terminal_presence(source.id),
+            },
+        )
+        .unwrap();
+        let pin = retention_pin_generation(&host, source.id);
+        assert!(pin.as_ref().unwrap().is_some());
+        let receipt = paths.directory.join("holders").join(format!(
+            "{}-{}-{}.closed",
+            original.terminal, original.holder.pid, original.holder.start
+        ));
+        std::fs::create_dir(&receipt).unwrap();
+        struct Obstruction(std::path::PathBuf);
+        impl Drop for Obstruction {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        let obstruction = Obstruction(receipt.clone());
+        let marker = std::env::temp_dir().join("release-obstruction");
+        std::fs::write(&marker, receipt.as_os_str().as_bytes()).unwrap();
+        let error = process_request(
+            &host,
+            1,
+            ClientRequest::ShutdownTerminal {
+                terminal_id: source.id,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+        assert!(error.retryable);
+        assert!(handle.worker_joined_for_test());
+        assert!(
+            original.holder.is_current(),
+            "join must not be mistaken for original holder exit"
+        );
+        assert!(matches!(
+            handle.completed_retirement(&source, &proof),
+            crate::terminal::TerminalRetirement::WaitingForHolder(_)
+        ));
+        assert!(
+            host.lock().unwrap().terminals[&source.id]
+                .handle
+                .same_worker(&handle)
+        );
+        assert_eq!(retention_pin_generation(&host, source.id), pin);
+        // Force the unlocked-probe admission interval and its interrupted
+        // request path without starting any provider or installing a test hook.
+        let current_source = host.lock().unwrap().terminals[&source.id].session.clone();
+        let interrupted = reserve_terminal_close(
+            &host,
+            source.id,
+            &handle,
+            &current_source,
+            None,
+            pin.clone(),
+        )
+        .unwrap();
+        let mut refused_recipe = source.launch.clone();
+        refused_recipe.program = "/missing-retirement-claim-never-started".into();
+        let candidate = crate::chat::Session {
+            id: TerminalId::new(),
+            terminal: Some(source.clone()),
+            proof: Some(proof.clone()),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: refused_recipe,
+                session_id: None,
+            },
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+        };
+        let error = process_request(
+            &host,
+            1,
+            ClientRequest::ChatStart {
+                session: candidate.clone(),
+                source: None,
+                terminate_source: false,
+                execution_environment: Default::default(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+        assert!(error.retryable && error.message.contains("completing retirement"));
+        drop(interrupted);
+        assert!(
+            host.lock().unwrap().terminal_retirements[&source.id]
+                .failure
+                .is_some()
+        );
+        let error = process_request(
+            &host,
+            1,
+            ClientRequest::ChatStart {
+                session: candidate,
+                source: None,
+                terminate_source: false,
+                execution_environment: Default::default(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+        assert!(
+            error.retryable && error.message.contains("unconfirmed"),
+            "retained failure permits inspection/retry, never a new native writer"
+        );
+        let error = process_request(
+            &host,
+            1,
+            ClientRequest::CloseTerminalChecked {
+                terminal_id: source.id,
+                allow_active: false,
+            },
+        )
+        .unwrap_err();
+        assert!(error.retryable && original.holder.is_current());
+        let mut ended = source.clone();
+        ended.continuity = crate::model::TerminalContinuity::Exited {
+            last_exit: crate::model::TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 1,
+            },
+        };
+        assert!(
+            process_request(
+                &host,
+                1,
+                ClientRequest::ReleaseCompletedTerminal {
+                    session: ended.clone(),
+                    allow_active: false,
+                }
+            )
+            .unwrap_err()
+            .retryable
+        );
+        assert_eq!(retention_pin_generation(&host, source.id), pin);
+        drop(obstruction);
+        std::fs::remove_file(marker).unwrap();
+        wait_client_retirement(|| {
+            matches!(
+                handle.completed_retirement(&source, &proof),
+                crate::terminal::TerminalRetirement::Released
+            )
+        });
+        let exact_receipt = std::fs::read(&receipt).unwrap();
+        assert!(!exact_receipt.is_empty());
+        let saved_receipt = receipt.with_extension("closed.saved");
+        std::fs::rename(&receipt, &saved_receipt).unwrap();
+        let error = process_request(
+            &host,
+            1,
+            ClientRequest::ReleaseCompletedTerminal {
+                session: ended.clone(),
+                allow_active: false,
+            },
+        )
+        .unwrap_err();
+        assert!(error.retryable);
+        assert!(
+            host.lock().unwrap().terminals[&source.id]
+                .handle
+                .same_worker(&handle)
+        );
+        assert_eq!(
+            retention_pin_generation(&host, source.id),
+            pin,
+            "kernel exit without the exact receipt must retain the retry surface"
+        );
+        std::fs::rename(&saved_receipt, &receipt).unwrap();
+        assert_eq!(std::fs::read(&receipt).unwrap(), exact_receipt);
+        // A separate real WAL writer permits the membership read but refuses
+        // our IMMEDIATE deletion for the existing bounded busy timeout.
+        let blocked = rusqlite::Connection::open(directory.path().join("model.sqlite3")).unwrap();
+        blocked.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let error = process_request(
+            &host,
+            1,
+            ClientRequest::ReleaseCompletedTerminal {
+                session: ended.clone(),
+                allow_active: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+        assert!(error.retryable && error.message.contains("pin could not be removed"));
+        assert!(
+            host.lock().unwrap().terminals[&source.id]
+                .handle
+                .same_worker(&handle)
+        );
+        assert_eq!(retention_pin_generation(&host, source.id), pin);
+        assert!(
+            host.lock().unwrap().terminal_retirements[&source.id]
+                .failure
+                .is_some()
+        );
+        blocked.execute_batch("ROLLBACK").unwrap();
+        assert!(matches!(
+            process_request(
+                &host,
+                1,
+                ClientRequest::ReleaseCompletedTerminal {
+                    session: ended,
+                    allow_active: false,
+                }
+            )
+            .unwrap()
+            .0,
+            ServerResponse::TerminalCloseChecked {
+                outcome: crate::terminal_ipc::TerminalCloseResult::Closed,
+                ..
+            }
+        ));
+        assert!(!host.lock().unwrap().terminals.contains_key(&source.id));
+        assert!(
+            !host
+                .lock()
+                .unwrap()
+                .terminal_retirements
+                .contains_key(&source.id)
+        );
+        assert_eq!(retention_pin_generation(&host, source.id), Ok(None));
+        wait_client_retirement(|| {
+            !original.holder.is_current()
+                && !crate::daemon::child_reaper::has_outstanding_ownership()
+        });
+        assert_eq!(std::fs::read(receipt).unwrap(), exact_receipt);
+    }
+
+    #[test]
     fn resident_release_drains_admitted_control_operations_before_retirement() {
         let (proof, host) = panic_test_host("resident-release-gate");
         let gate = control_gate(&host);
@@ -1598,6 +3600,10 @@ mod tests {
         let host = Arc::new(crate::host::state::HostLock::new(
             super::super::state::HostState::new(proof),
         ));
+        let model = tempfile::tempdir().unwrap();
+        host.lock().unwrap().install_model(
+            super::super::model::Registry::at(&model.path().join("model.sqlite3")).unwrap(),
+        );
         let mut recipe = LaunchRecipe::shell("/".into()).unwrap();
         recipe.program = "/bin/cat".into();
         recipe.arguments.clear();
@@ -1664,17 +3670,10 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            process_request(
-                &host,
-                1,
-                ClientRequest::ReleaseCompletedTerminal {
-                    session,
-                    allow_active: false
-                }
-            )
-            .is_ok()
-        );
+        let _ = retry_retirement_close(&host, || ClientRequest::ReleaseCompletedTerminal {
+            session: session.clone(),
+            allow_active: false,
+        });
     }
 
     #[test]
@@ -1718,6 +3717,10 @@ mod tests {
         let host = Arc::new(crate::host::state::HostLock::new(
             super::super::state::HostState::new(proof.clone()),
         ));
+        let model = tempfile::tempdir().unwrap();
+        host.lock().unwrap().install_model(
+            super::super::model::Registry::at(&model.path().join("model.sqlite3")).unwrap(),
+        );
         let mut recipe = crate::model::LaunchRecipe::shell("/".into()).unwrap();
         recipe.program = "/bin/true".into();
         recipe.arguments.clear();
@@ -1837,7 +3840,7 @@ mod tests {
             .session
             .terminal = Some(session.clone());
         assert!(matches!(
-            process_request(&host, 1, request(true)).unwrap().0,
+            retry_retirement_close(&host, || request(true)).0,
             ServerResponse::TerminalCloseChecked {
                 outcome: crate::terminal_ipc::TerminalCloseResult::Closed,
                 ..
@@ -1845,12 +3848,9 @@ mod tests {
         ));
         assert!(actor.is_completed());
         assert!(!host.lock().unwrap().chats.contains_key(&session.id));
-        assert!(
-            host.lock()
-                .unwrap()
-                .notification_closed
-                .contains(&session.id)
-        );
+        let state = host.lock().unwrap();
+        assert!(!state.terminals.contains_key(&session.id));
+        assert!(!state.notification_closed.contains(&session.id));
     }
 
     #[test]

@@ -1886,6 +1886,108 @@ mod tests {
             "new delivery must follow withdrawal, otherwise cleanup would delete its replacement"
         );
     }
+
+    #[test]
+    fn no_run_commit_privacy_and_exact_group_activation_survive_reopen() {
+        use crate::notifications::{Content, Evidence, Kind};
+        for previews in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("no-run.sqlite3");
+            let mut journal = Journal::open(&path).unwrap();
+            let policy = Preferences {
+                message_previews: previews,
+                ..Default::default()
+            };
+            let id = Uuid::new_v4();
+            let make = |sequence, kind| Event {
+                target: Target::Automation { id, sequence },
+                source_session: None,
+                provider: None,
+                directory: None,
+                destination: None,
+                evidence: Evidence {
+                    key: format!("automation:{id}:lifecycle:{sequence}"),
+                    kind,
+                },
+                content: Some(Content {
+                    conversation: "PRIVATE_AUTOMATION_TITLE".into(),
+                    preview: "PRIVATE_AUTOMATION_REASON".into(),
+                    request: None,
+                }),
+            };
+            let (shared, _wake) = shared();
+            let handle = Handle(shared.clone());
+            let mut committed = Vec::new();
+            for event in [
+                make(17, Kind::AutomationPaused),
+                make(18, Kind::AutomationBlocked),
+            ] {
+                let exact = event.target.clone();
+                let reply = handle.record_committed(event).unwrap();
+                assert!(matches!(
+                    reply.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ));
+                let (queued, receipt) = shared
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .committed_events
+                    .pop_front()
+                    .unwrap();
+                let notice = record_attention_committed_policy(
+                    &mut journal,
+                    queued,
+                    false,
+                    Some(receipt),
+                    &policy,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(reply.recv_timeout(Duration::from_secs(1)).unwrap(), Ok(()));
+                assert_eq!(notice.event.target, exact);
+                assert_eq!(notice.event.content.is_some(), previews);
+                committed.push(notice);
+            }
+            let old = &committed[0];
+            let current = &committed[1];
+            assert_eq!(
+                batching::desktop_id(&old.event.target),
+                batching::desktop_id(&current.event.target)
+            );
+            assert_ne!(old.event.target, current.event.target);
+            drop(journal);
+            let mut reopened = Journal::open(&path).unwrap();
+            let snapshot = Snapshot {
+                notices: reopened.list().unwrap(),
+                diagnostic: None,
+            };
+            assert_eq!(snapshot.notices, vec![current.clone()]);
+            let serialized = serde_json::to_string(&snapshot).unwrap();
+            assert_eq!(serialized.contains("PRIVATE_AUTOMATION_TITLE"), previews);
+            assert_eq!(serialized.contains("PRIVATE_AUTOMATION_REASON"), previews);
+            assert_eq!(
+                action_notice(&snapshot, batching::desktop_id(&old.event.target))
+                    .unwrap()
+                    .event
+                    .target,
+                current.event.target
+            );
+            assert!(
+                action_notice(&snapshot, old.id).is_none(),
+                "old journal UUID cannot silently activate a new lifecycle receipt"
+            );
+            assert_eq!(
+                action_notice(&snapshot, current.id).unwrap().event.target,
+                current.event.target
+            );
+            reopened.acknowledge(old.id).unwrap();
+            assert!(
+                !reopened.list().unwrap()[0].acknowledged,
+                "old exact ACK does not consume successor attention"
+            );
+        }
+    }
 }
 
 async fn run(

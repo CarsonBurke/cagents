@@ -655,7 +655,7 @@ mod tests {
 
     #[test]
     fn published_sixteen_waiting_run_stays_history_until_a_new_edge_after_migration() {
-        let (mut registry, directory, accepted) = fixture();
+        let (mut registry, _directory, accepted) = fixture();
         let running = start(&mut registry, &accepted.run);
         let waiting = registry
             .update_agent_run(running.id, running.revision, Update::Waiting, 400)
@@ -664,12 +664,9 @@ mod tests {
         let before_detail = registry.automation_detail_for_run(waiting.id).unwrap();
         // Construct the exact published16 preimage, not a newer layout with
         // a downgraded header. None of the historical source rows are changed.
-        registry
-            .db
-            .execute_batch("DROP TABLE automation_run_attention; PRAGMA user_version=16;")
-            .unwrap();
+        let legacy = super::super::automation_proposals::published_fixture_from_rows(&registry, 16);
         drop(registry);
-        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let mut registry = Registry::at(&legacy).unwrap();
         assert_eq!(registry.model().unwrap(), before_model);
         assert_eq!(registry.agent_run(waiting.id).unwrap(), waiting);
         assert_eq!(
@@ -697,6 +694,143 @@ mod tests {
             pending[0].event.evidence.key,
             format!("{}:waiting:{}", waiting.id, new_waiting.revision)
         );
+    }
+
+    #[test]
+    fn published_twenty_upgrade_preserves_all_rows_without_replaying_run_history() {
+        fn rows(db: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+            let table = table.replace('"', "\"\"");
+            let mut query = db.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+            let columns = query.column_count();
+            let mut rows = query
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows.sort_by_key(|row| format!("{row:?}"));
+            rows
+        }
+
+        let (mut registry, _directory, accepted) = fixture();
+        let running = start(&mut registry, &accepted.run);
+        registry
+            .update_agent_run(running.id, running.revision, Update::Waiting, 400)
+            .unwrap();
+        let original_id = registry.automations(None, 100).unwrap().remove(0).id;
+        let original = registry.automation(original_id).unwrap();
+        let no_run = registry
+            .create_automation(
+                original.definition.clone(),
+                500,
+                crate::automations::DirectoryIdentity {
+                    device: 1,
+                    inode: 1,
+                },
+            )
+            .unwrap();
+        let no_run = registry
+            .set_automation_enabled(
+                no_run.id,
+                no_run.revision,
+                Some(crate::automations::Occurrence {
+                    due_ms: 10_000,
+                    local: "fixture future".into(),
+                }),
+                true,
+                600,
+            )
+            .unwrap();
+        assert!(no_run.enabled);
+        registry
+            .pin_window_terminals(&[crate::model::TerminalId::new()])
+            .unwrap();
+        registry
+            .apply(&ModelEdit::CloseProject {
+                repository: "/fixture".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            registry
+                .pending_automation_notifications(100)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            !registry
+                .pending_automation_attention(100)
+                .unwrap()
+                .is_empty()
+        );
+        let expected_model = registry.model().unwrap();
+        let legacy = super::super::automation_proposals::published_fixture_from_rows(&registry, 20);
+        drop(registry);
+        let db = Connection::open(&legacy).unwrap();
+        let tables: Vec<String> = db
+            .prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            !tables
+                .iter()
+                .any(|table| table == "automation_run_attention")
+        );
+        let before = tables
+            .iter()
+            .map(|table| (table.clone(), rows(&db, table)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM terminal_retention_pins", [], |row| {
+                row.get::<_, u64>(0)
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            20
+        );
+        drop(db);
+        for _ in 0..2 {
+            let registry = Registry::at(&legacy).unwrap();
+            assert_eq!(registry.model().unwrap(), expected_model);
+            assert_eq!(
+                registry
+                    .db
+                    .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+                    .unwrap(),
+                21
+            );
+            assert!(
+                registry
+                    .pending_automation_attention(100)
+                    .unwrap()
+                    .is_empty(),
+                "migration/reopen must not backfill old Waiting or terminal history"
+            );
+            assert_eq!(
+                registry
+                    .pending_automation_notifications(100)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            for (table, expected) in &before {
+                assert_eq!(
+                    &rows(&registry.db, table),
+                    expected,
+                    "published20 payload changed in {table}"
+                );
+            }
+        }
     }
 
     #[test]

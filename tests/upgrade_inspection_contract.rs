@@ -7,14 +7,15 @@ use cagents::{
     agent_execution::Authority,
     control::{ControlClient, ControlError},
     model::{
-        CardId, CardKind, CardState, Existence, Exposure, LaunchRecipe, Residency, TerminalId,
-        WorkspaceState,
+        CardId, CardKind, CardState, Existence, Exposure, LaunchRecipe, Residency,
+        TerminalContinuity, TerminalId, TerminalSession, WorkspaceState,
     },
     persistence::{SnapshotBase, StateStore},
     process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor},
     terminal::TerminalSpawnOptions,
-    terminal_ipc::{ProtocolErrorCode, TerminalDescriptor},
+    terminal_ipc::{ProtocolErrorCode, TerminalCloseResult, TerminalDescriptor},
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
@@ -180,6 +181,24 @@ fn live(fd: &OwnedFd) -> bool {
         revents: 0,
     };
     unsafe { libc::poll(&mut poll, 1, 0) == 0 }
+}
+
+// Receipt aliases bind the authenticated immutable source, with only its
+// presentation state and resume cursor normalized by the published contract.
+fn source_digest(source: &TerminalSession) -> Result<[u8; 32], String> {
+    let mut source = source.clone();
+    let proof = source
+        .continuity
+        .live_proof()
+        .filter(|proof| proof.is_complete())
+        .ok_or("receipt source has no complete ownership proof")?;
+    source.continuity = TerminalContinuity::DetachedSameBoot {
+        host_session_id: proof.host_session_id,
+        boot_id: proof.boot_id,
+        host_incarnation: proof.host_incarnation,
+    };
+    source.resume_hint = None;
+    Ok(Sha256::digest(serde_json::to_vec(&source).map_err(|e| e.to_string())?).into())
 }
 
 #[test]
@@ -362,6 +381,8 @@ fn actual_same_generation_inspection_and_upgrade_keep_the_original_saved_pty() {
         if bytes.len() > 16 * 1024 {
             return Err("original private holder record exceeds limit".into());
         }
+        let original_record: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
         let record: OriginalHolder = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
         if record.terminal != id
             || record.application != cagents::instance::APPLICATION_ID
@@ -391,6 +412,18 @@ fn actual_same_generation_inspection_and_upgrade_keep_the_original_saved_pty() {
         {
             return Err("acquired epoch does not belong to the original private holder".into());
         }
+        let raw_holder = unsafe { libc::syscall(libc::SYS_pidfd_open, record.holder.pid, 0) };
+        if raw_holder < 0 {
+            return Err("cannot retain original private holder pidfd".into());
+        }
+        let holder_pidfd = unsafe { OwnedFd::from_raw_fd(raw_holder as i32) };
+        if !live(&holder_pidfd) || birth(record.holder.pid)? != record.holder.start.to_string() {
+            return Err("acquired holder epoch changed before upgrade".into());
+        }
+        let receipt_path = socket.parent().unwrap().join("holders").join(format!(
+            "{id}-{}-{}.closed",
+            record.holder.pid, record.holder.start
+        ));
         let mut expected = saved.launch.program.as_bytes().to_vec();
         expected.push(0);
         for argument in &saved.launch.arguments {
@@ -476,6 +509,7 @@ fn actual_same_generation_inspection_and_upgrade_keep_the_original_saved_pty() {
             .iter()
             .find(|entry| entry.session.id == id)
             .ok_or("original terminal absent from successor")?;
+        let restored_source = restored.session.clone();
         let exact_launch = restored.session.launch == saved.launch;
         inspect(&root, &new_proof, "successor", deadline)?;
         client
@@ -492,13 +526,92 @@ fn actual_same_generation_inspection_and_upgrade_keep_the_original_saved_pty() {
         let same_root = live(&pidfd.0)
             && birth(pid)? == original_birth
             && (tty.dev(), tty.ino(), tty.rdev()) == tty_stamp;
-        client.close_terminal(id).map_err(|e| e.to_string())?;
-        while live(&pidfd.0) {
+        // This noninteractive shell is active by policy. Declining its close
+        // must preserve this exact original worker/holder and create no receipt.
+        let before_decline = client.list().map_err(|e| e.to_string())?;
+        assert_eq!(
+            client
+                .close_terminal_checked(id, false)
+                .map_err(|e| e.to_string())?,
+            TerminalCloseResult::Active
+        );
+        assert!(live(&pidfd.0) && live(&holder_pidfd));
+        assert_eq!(birth(pid)?, original_birth);
+        assert_eq!(
+            client
+                .list()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|entry| entry.session)
+                .collect::<Vec<_>>(),
+            before_decline
+                .into_iter()
+                .map(|entry| entry.session)
+                .collect::<Vec<_>>(),
+            "declined close must preserve the exact successor source inventory"
+        );
+        assert!(!receipt_path.exists());
+        // Exercise the ordinary ShutdownTerminal route, not another checked
+        // close call. Success now requires genuine original-holder proof.
+        client
+            .close_terminal(id)
+            .map_err(|e| format!("upgraded original public close failed: {e}"))?;
+        while live(&pidfd.0) || live(&holder_pidfd) {
             if Instant::now() >= deadline {
-                return Err("original shell did not settle after explicit close".into());
+                return Err("original shell/holder did not settle after explicit close".into());
             }
             thread::sleep(Duration::from_millis(10));
         }
+        let receipt_file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&receipt_path)
+            .map_err(|e| e.to_string())?;
+        let stat = receipt_file.metadata().map_err(|e| e.to_string())?;
+        assert!(stat.is_file() && stat.uid() == unsafe { libc::geteuid() });
+        assert_eq!(stat.mode() & 0o777, 0o600);
+        assert_eq!(stat.nlink(), 1);
+        assert!(stat.len() <= 256 * 1024);
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(receipt_file, 256 * 1024 + 1),
+            &mut bytes,
+        )
+        .map_err(|e| e.to_string())?;
+        assert!(bytes.len() <= 256 * 1024);
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        assert_eq!(receipt["record"], original_record);
+        let aliases: Vec<[u8; 32]> =
+            serde_json::from_value(receipt["sources"].clone()).map_err(|e| e.to_string())?;
+        assert!(aliases.contains(&source_digest(&saved)?));
+        assert!(aliases.contains(&source_digest(&restored_source)?));
+        let mut foreign_source = restored_source.clone();
+        foreign_source
+            .launch
+            .arguments
+            .push("foreign-source".into());
+        assert!(!aliases.contains(&source_digest(&foreign_source)?));
+        let mut wrong_proof = restored_source.clone();
+        wrong_proof.continuity = TerminalContinuity::DetachedSameBoot {
+            host_session_id: cagents::model::HostSessionId::new("foreign-close-source"),
+            boot_id: new_proof.boot_id.clone(),
+            host_incarnation: new_proof.host_incarnation.clone(),
+        };
+        assert!(!aliases.contains(&source_digest(&wrong_proof)?));
+        let mut proofless = restored_source.clone();
+        proofless.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: proofless.launch.clone(),
+            last_exit: None,
+        };
+        assert!(source_digest(&proofless).is_err());
+        assert!(
+            client
+                .list()
+                .map_err(|e| format!("inventory after confirmed original close failed: {e}"))?
+                .iter()
+                .all(|entry| entry.session.id != id)
+        );
         Ok((
             original_proof,
             new_proof,

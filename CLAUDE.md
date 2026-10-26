@@ -8,6 +8,14 @@ You are a senior app developer tasked with creating a great Agent Development En
 - Do your work in PRs against `main`.
 - Oversee, sub review, and merge PRs as you see reasonable; and sync main.
 
+## Pull request screenshots
+
+- PRs that change something people see must include before and after screenshots in the PR description, shown side by side and labeled for the page or interaction state.
+- Capture each pair through the actual native app, using the development runner, with the same viewport, scale, theme, data, and interaction state. Identify the before revision and the tested after head. Capture the affected states, including expanded, empty, error, and narrow layouts when the change affects them.
+- Save images as WebP with descriptive names such as `before-channel-prs.webp` and `after-channel-prs.webp`. Check that they show the intended change and contain no secrets or private user content.
+- Keep screenshots off the product PR branch. Commit only the images under `pr-screenshots/` on a separate `<branch>-screenshots` branch, and embed immutable links in the description: `https://github.com/CarsonBurke/cagents/blob/<sha>/pr-screenshots/<name>.webp?raw=true`. Keep the screenshot branch so the images remain reachable.
+- Refresh the comparison when a later change alters the visible result. If a state could not be captured, say exactly what is missing; mockups or fixture screenshots must be labeled and do not establish actual native UI validation.
+
 ## Development and product
 
 - We use iced/cosmic for our UI. It can be very performant, scalable and maintainable when done right.

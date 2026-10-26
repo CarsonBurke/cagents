@@ -485,7 +485,7 @@ mod tests {
 
     #[test]
     fn version_three_registries_move_children_to_their_parents_lineage() {
-        let (mut registry, directory, mut request) = fixture();
+        let (mut registry, _directory, mut request) = fixture();
         let root = TerminalId::new();
         let relaunch = TerminalId::new();
         let converted = TerminalId::new();
@@ -511,17 +511,9 @@ mod tests {
         let from_unrelated = registry
             .submit_agent(&child(unrelated), &request, 3)
             .unwrap();
-        registry
-            .db
-            .execute_batch(
-                "DROP TABLE automation_run_attention;
-                 DROP TABLE automation_lifecycle;
-                 DROP TABLE session_lineages; PRAGMA user_version = 3;",
-            )
-            .unwrap();
+        let path = super::super::automation_proposals::published_fixture_from_rows(&registry, 3);
         drop(registry);
 
-        let path = directory.path().join("model.sqlite3");
         let registry = Registry::at(&path).unwrap();
         for session in [root, relaunch, converted] {
             assert_eq!(
