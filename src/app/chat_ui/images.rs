@@ -119,26 +119,15 @@ fn decode_handle(bytes: &[u8], budget: &Budget, edge: Option<u32>, max_bytes: us
     if bytes.len() > max_bytes {
         return Loaded::Unavailable;
     }
-    let Some((width, height)) = image::ImageReader::new(std::io::Cursor::new(&bytes))
-        .with_guessed_format()
-        .ok()
-        .and_then(|reader| reader.into_dimensions().ok())
-    else {
-        return Loaded::Unavailable;
-    };
-    let pixels = u64::from(width) * u64::from(height);
-    if width == 0 || height == 0 || pixels > MAX_PIXELS {
-        return Loaded::Unavailable;
-    }
     let encoded = match reserve(&budget.encoded, bytes.len() as u32, false) {
         Ok(permit) => permit,
         Err(deferred) => return deferred,
     };
-    // Reserve before decode so temporary budget pressure can retry without
-    // repeatedly spending the two workers on full-size pixel conversion. The
-    // thumbnail never upscales and fits inside edge², even after orientation.
-    let retained_pixels = edge.map_or(pixels, |edge| pixels.min(u64::from(edge).pow(2)));
-    let mut pixels = match reserve(&budget.pixels, (retained_pixels * 4) as u32, true) {
+    // Constructing a decoder can inflate metadata before exposing dimensions.
+    // Admit that work too, and keep one decoder through conversion. Holding the
+    // existing whole budget serializes decoding, not the two worker/IO slots;
+    // it avoids partial-reservation upgrades while metadata remains live.
+    let _decode = match reserve(&budget.decode, DECODE_BUDGET as u32, false) {
         Ok(permit) => permit,
         Err(deferred) => return deferred,
     };
@@ -149,28 +138,38 @@ fn decode_handle(bytes: &[u8], budget: &Budget, edge: Option<u32>, max_bytes: us
             Err(_) => return Loaded::Unavailable,
         };
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(width);
-    limits.max_image_height = Some(height);
+    // Each axis of a positive image within the existing pixel-product limit
+    // fits this ceiling, without an unadmitted dimension-only constructor.
+    limits.max_image_width = Some(MAX_PIXELS as u32);
+    limits.max_image_height = Some(MAX_PIXELS as u32);
     limits.max_alloc = Some(MAX_DECODE_BYTES);
     reader.limits(limits);
     let Ok(mut decoder) = reader.into_decoder() else {
         return Loaded::Unavailable;
     };
+    let (width, height) = decoder.dimensions();
+    let pixel_count = u64::from(width) * u64::from(height);
     let decoded_bytes = decoder.total_bytes();
-    if decoder.dimensions() != (width, height) || decoded_bytes > MAX_DECODE_BYTES {
+    if width == 0 || height == 0 || pixel_count > MAX_PIXELS || decoded_bytes > MAX_DECODE_BYTES {
         return Loaded::Unavailable;
     }
-    // Account for the decoder's output and simultaneous RGBA conversion/rotation
-    // buffers. This bounds known pixel buffers across both workers, rather than
-    // assuming a four-byte pixel for 16-bit or floating-point source formats.
-    let rgba_bytes = u64::from(width) * u64::from(height) * 4;
-    let Some(decode_bytes) = decoded_bytes
-        .checked_add(rgba_bytes * 2)
-        .and_then(|total| u32::try_from(total).ok())
+    // Codec limits remain best-effort, not a universal RSS/GPU bound. Account
+    // conservatively for constructor/metadata scratch alongside decoded pixels
+    // and simultaneous RGBA conversion/rotation buffers. An impossible working
+    // set is unavailable, never a waiter requesting more than the budget.
+    let rgba_bytes = pixel_count * 4;
+    let Some(working_bytes) = MAX_DECODE_BYTES
+        .checked_add(decoded_bytes)
+        .and_then(|total| total.checked_add(rgba_bytes * 2))
     else {
         return Loaded::Unavailable;
     };
-    let _decode = match reserve(&budget.decode, decode_bytes, false) {
+    if working_bytes > DECODE_BUDGET as u64 {
+        return Loaded::Unavailable;
+    }
+    // The thumbnail never upscales and fits inside edge², even after orientation.
+    let retained_pixels = edge.map_or(pixel_count, |edge| pixel_count.min(u64::from(edge).pow(2)));
+    let mut pixels = match reserve(&budget.pixels, (retained_pixels * 4) as u32, true) {
         Ok(permit) => permit,
         Err(deferred) => return deferred,
     };
@@ -2123,6 +2122,93 @@ mod tests {
         }
     }
     #[test]
+    fn decoder_metadata_is_admitted_before_construction_and_releases_its_leases() {
+        use image::ImageEncoder;
+        let mut bytes = Vec::new();
+        let mut encoder = image::codecs::png::PngEncoder::new(&mut bytes);
+        encoder.set_icc_profile(vec![0; 4096]).unwrap();
+        encoder
+            .write_image(&[1, 2, 3, 255], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        assert!(bytes.windows(4).any(|chunk| chunk == b"iCCP"));
+        assert!(
+            bytes.len() < 4096,
+            "the small fixture contains compressed metadata"
+        );
+        let mut chunk = 8; // Skip the PNG signature, then follow chunk lengths.
+        while &bytes[chunk + 4..chunk + 8] != b"IDAT" {
+            let length = u32::from_be_bytes(bytes[chunk..chunk + 4].try_into().unwrap()) as usize;
+            chunk += length + 12;
+        }
+        let truncated_metadata = bytes[..chunk].to_vec();
+        let budget = Budget::new(bytes.len(), 4);
+        for remaining in [0, 16] {
+            let busy = budget
+                .decode
+                .clone()
+                .try_acquire_many_owned((DECODE_BUDGET - remaining) as u32)
+                .unwrap();
+            // Sixteen bytes fit the old 1-pixel-only estimate, but cannot
+            // cover this decoder's live metadata. No metadata/RGBA work may
+            // bypass the existing transient admission because pixels are tiny.
+            assert!(matches!(
+                bounded_handle(bytes.clone(), &budget),
+                Loaded::Deferred(pressure)
+                    if !pressure.retained && pressure.permits as usize <= DECODE_BUDGET
+            ));
+            // Without admission, even malformed metadata must wait rather
+            // than constructing a decoder merely to reject its missing IDAT.
+            assert!(matches!(
+                bounded_handle(truncated_metadata.clone(), &budget),
+                Loaded::Deferred(_)
+            ));
+            assert_eq!(budget.encoded.available_permits(), bytes.len());
+            assert_eq!(budget.pixels.available_permits(), 4);
+            assert_eq!(budget.decode.available_permits(), remaining);
+            drop(busy);
+            assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+        }
+        assert!(matches!(
+            bounded_handle(truncated_metadata, &budget),
+            Loaded::Unavailable
+        ));
+        assert_eq!(budget.encoded.available_permits(), bytes.len());
+        assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+        assert_eq!(budget.pixels.available_permits(), 4);
+        let Loaded::Ready(handle) = bounded_handle(bytes.clone(), &budget) else {
+            panic!("the admitted tiny image with metadata must still decode");
+        };
+        let iced::widget::image::Handle::Rgba {
+            pixels,
+            width,
+            height,
+            ..
+        } = &handle
+        else {
+            unreachable!()
+        };
+        assert_eq!((*width, *height), (1, 1));
+        assert_eq!(pixels.as_ref(), &[1, 2, 3, 255]);
+        assert_eq!(budget.encoded.available_permits(), bytes.len());
+        assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+        assert_eq!(budget.pixels.available_permits(), 0);
+        drop(handle);
+        assert_eq!(budget.pixels.available_permits(), 4);
+
+        // Corrupt the IDAT stream after its metadata. Construction is admitted
+        // and the later decode error must release every transient/retained lease.
+        let mut damaged = bytes.clone();
+        damaged[chunk + 8] ^= 0xff;
+        assert!(matches!(
+            bounded_handle(damaged, &budget),
+            Loaded::Unavailable
+        ));
+        assert_eq!(budget.encoded.available_permits(), bytes.len());
+        assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+        assert_eq!(budget.pixels.available_permits(), 4);
+    }
+
+    #[test]
     fn decoded_preview_converts_high_depth_pixels_and_releases_transient_leases() {
         let mut bytes = Vec::new();
         image::write_buffer_with_format(
@@ -2149,8 +2235,12 @@ mod tests {
         assert_eq!(budget.pixels.available_permits(), 0);
         drop(pixels);
         assert_eq!(budget.pixels.available_permits(), 4);
-        let mut budget = Budget::new(bytes.len(), 4);
-        budget.decode = Arc::new(tokio::sync::Semaphore::new(15));
+        let budget = Budget::new(bytes.len(), 4);
+        let busy = budget
+            .decode
+            .clone()
+            .try_acquire_many_owned((DECODE_BUDGET - 15) as u32)
+            .unwrap();
         assert!(matches!(
             bounded_handle(bytes.clone(), &budget),
             Loaded::Deferred(_)
@@ -2158,6 +2248,8 @@ mod tests {
         assert_eq!(budget.encoded.available_permits(), bytes.len());
         assert_eq!(budget.pixels.available_permits(), 4);
         assert_eq!(budget.decode.available_permits(), 15);
+        drop(busy);
+        assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
         let budget = Budget::new(1024, 4);
         assert!(matches!(
             bounded_handle(png()[..40].to_vec(), &budget),
