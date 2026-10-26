@@ -81,6 +81,10 @@ impl Broker {
     pub(super) fn start(host: &SharedHost, root: PathBuf) -> Result<Self, String> {
         let cleanup = std::fs::read_dir(&root).map_err(|error| error.to_string())?;
         let registry = agent_execution::registry(host)?;
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .maintain_automation_history(service::now()?)?;
         let handle = Handle(Arc::new(Inner {
             host: Arc::downgrade(host),
             registry,
@@ -221,11 +225,17 @@ impl Handle {
             return Ok(());
         }
         if let Err(error) = crate::host::client::ensure_control_open(host) {
-            self.0
-                .registry
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .fail_automation_start(claim.firing.id, error.message, service::now()?, false)?;
+            let now = service::now()?;
+            let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
+            registry.fail_automation_start(claim.firing.id, error.message, now, false)?;
+            if claim.definition.precheck.is_some() {
+                // This branch precedes any Worker::launch attempt or proof file.
+                registry.confirm_unlaunched_automation_precheck(
+                    claim.firing.id,
+                    claim.firing.revision,
+                    now,
+                )?;
+            }
             return Ok(());
         }
         let directory =
@@ -235,11 +245,17 @@ impl Handle {
                 }) {
                 Ok(directory) => directory,
                 Err(error) => {
-                    self.0
-                        .registry
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .fail_automation_start(claim.firing.id, error, service::now()?, true)?;
+                    let now = service::now()?;
+                    let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
+                    registry.fail_automation_start(claim.firing.id, error, now, true)?;
+                    if claim.definition.precheck.is_some() {
+                        // Target/account refusal happened before Worker::launch.
+                        registry.confirm_unlaunched_automation_precheck(
+                            claim.firing.id,
+                            claim.firing.revision,
+                            now,
+                        )?;
+                    }
                     return Ok(());
                 }
             };
@@ -281,6 +297,22 @@ impl Handle {
                             service::now()?,
                             false,
                         )?;
+                        drop(registry);
+                        // Failed launch may have written partial private proof.
+                        // Retain actual Worker::retire custody even if no child
+                        // spawned; directory absence alone is not our ACK.
+                        self.0
+                            .workers
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(
+                                claim.firing.id,
+                                Worker::recover(
+                                    &self.0.root,
+                                    claim.firing.id,
+                                    claim.firing.revision,
+                                ),
+                            );
                     }
                 }
             }
@@ -289,7 +321,37 @@ impl Handle {
     }
 
     fn run(&self) {
-        self.run_with(|host| self.tick(host));
+        let mut maintained = Instant::now();
+        self.run_with(|host| {
+            if maintained.elapsed() >= Duration::from_secs(60)
+                && self.maintain_history_under_control(host)?
+            {
+                maintained = Instant::now();
+            }
+            self.tick(host)
+        });
+    }
+
+    fn maintain_history_under_control(&self, host: &SharedHost) -> Result<bool, String> {
+        let control = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .control_gate
+            .clone();
+        let _control = match control.try_read() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+        };
+        if crate::host::client::ensure_control_open(host).is_err() {
+            return Ok(false);
+        }
+        self.0
+            .registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .maintain_removed_automation_history(service::now()?)?;
+        Ok(true)
     }
 
     fn run_with(&self, mut tick: impl FnMut(&SharedHost) -> Result<Duration, String>) {
@@ -415,23 +477,35 @@ impl Handle {
         for id in candidates {
             // A manual request can add a worker after the active census. The
             // absent snapshot entry alone never authorizes deleting its proof.
-            if self
+            let revision = self
                 .0
                 .registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .retired_automation_precheck(id)?
-                .is_none()
-            {
+                .retired_automation_precheck(id)?;
+            let Some(revision) = revision else {
                 continue;
-            }
+            };
             let mut workers = self.0.workers.lock().unwrap_or_else(|p| p.into_inner());
             let Some(worker) = workers.get_mut(&id) else {
                 continue;
             };
             match worker.retire() {
                 Ok(true) => {
-                    workers.remove(&id);
+                    // Keep this reaped Worker until the SQLite ACK commits.
+                    // On ACK error the next tick retries retire(true), without
+                    // launching anything or losing cleanup custody.
+                    drop(workers);
+                    self.0
+                        .registry
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .confirm_retired_automation_precheck(id, revision, service::now()?)?;
+                    self.0
+                        .workers
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&id);
                 }
                 Ok(false) => {} // Reap/reclaim again on the next bounded tick.
                 Err(error) => {
@@ -703,17 +777,27 @@ impl Handle {
             let Some(revision) = revision else {
                 continue;
             };
-            let mut worker = Worker::recover(&self.0.root, id, revision);
+            let mut workers = self.0.workers.lock().unwrap_or_else(|p| p.into_inner());
+            let worker = workers
+                .entry(id)
+                .or_insert_with(|| Worker::recover(&self.0.root, id, revision));
             match worker.retire() {
-                Ok(true) => {}
-                Ok(false) => {
+                Ok(true) => {
+                    // Retire the actual mapped owner, including its Child. A
+                    // recovered observer cannot replace that reaping custody.
+                    drop(workers);
+                    self.0
+                        .registry
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .confirm_retired_automation_precheck(id, revision, service::now()?)?;
                     self.0
                         .workers
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .entry(id)
-                        .or_insert(worker);
+                        .remove(&id);
                 }
+                Ok(false) => {} // Keep the actual mapped owner for retry.
                 Err(error) => {
                     tracing::warn!(%id, %error, "retired precheck files could not be reclaimed")
                 }
@@ -1752,4 +1836,5 @@ mod tests {
             "a no-run event cannot invent AgentRun attention"
         );
     }
+    include!("broker/history_tests.rs");
 }

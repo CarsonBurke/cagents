@@ -803,6 +803,7 @@ mod tests {
         let (mut registry, _directory, mut automation) = fixture();
         let trigger = crate::automations::Trigger::Manual {
             request: Uuid::new_v4(),
+            skipped_occurrences: None,
         };
         let claimed = registry
             .claim_automation(

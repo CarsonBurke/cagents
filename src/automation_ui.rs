@@ -2522,13 +2522,17 @@ impl State {
                             None
                         }
                         HistoryStatus::Loaded if self.history.is_empty() => Some(
-                            crate::ui_controls::placeholder("No runs yet")
-                                .icon(crate::ui_controls::Icon::History.handle())
-                                .detail(if self.all_history {
-                                    "Runs of every automation appear here, newest first."
-                                } else {
-                                    "Runs appear here when the schedule fires or you choose Run now."
-                                }),
+                            crate::ui_controls::placeholder(if self.all_history {
+                                "No run history available"
+                            } else {
+                                "No runs yet"
+                            })
+                            .icon(crate::ui_controls::Icon::History.handle())
+                            .detail(if self.all_history {
+                                "Runs of every automation appear here, newest first."
+                            } else {
+                                "Runs appear here when the schedule fires or you choose Run now."
+                            }),
                         ),
                         HistoryStatus::Unrequested
                         | HistoryStatus::Loading
@@ -2544,6 +2548,13 @@ impl State {
                             content = content.push(empty.height(Length::Shrink));
                         }
                     }
+                    if !self.history.is_empty() {
+                        content = content.push(crate::design::caption(format!(
+                            "Up to {} settled history entries per automation. Settled history of removed automations expires after {} days; active or unresolved work is retained. Older settled details may be unavailable.",
+                            crate::automations::HISTORY_RETAINED_ROWS,
+                            crate::automations::REMOVED_HISTORY_RETENTION_DAYS,
+                        )));
+                    }
                     for firing in &self.history {
                         let origin = match &firing.trigger {
                             crate::automations::Trigger::Manual { .. } => "Manual".to_owned(),
@@ -2557,7 +2568,7 @@ impl State {
                                 firing.name,
                                 timestamp(firing.created_ms),
                                 origin,
-                                state_label(firing.state),
+                                firing_state_label(firing),
                                 if firing.release_pending {
                                     " · Session release pending"
                                 } else {
@@ -2579,7 +2590,7 @@ impl State {
                     .push(crate::design::title(format!(
                         "{} · {}",
                         run.definition.name,
-                        state_label(run.firing.state)
+                        firing_state_label(&run.firing)
                     )))
                     .push(crate::design::body(format!(
                         "Started: {}\nTarget: {}",
@@ -3310,6 +3321,24 @@ fn timestamp(milliseconds: u64) -> String {
         .unwrap_or_else(|| "Unavailable time".into())
 }
 
+fn firing_state_label(firing: &Firing) -> String {
+    let state = state_label(firing.state);
+    match &firing.skipped_occurrences {
+        Some(skipped) => format!(
+            "{state} · {} {} · {} – {}",
+            skipped.count,
+            if skipped.count == 1 {
+                "occurrence"
+            } else {
+                "occurrences"
+            },
+            timestamp(skipped.first_occurrence_ms),
+            timestamp(skipped.last_occurrence_ms),
+        ),
+        None => state.to_owned(),
+    }
+}
+
 fn provider(index: usize) -> Provider {
     [Provider::Claude, Provider::Codex, Provider::Omp]
         .get(index)
@@ -3623,7 +3652,121 @@ mod tests {
             run: None,
             skip: None,
             diagnostic: None,
+            skipped_occurrences: None,
         }
+    }
+
+    #[test]
+    fn coalesced_skips_keep_one_history_identity_and_show_the_range_in_detail() {
+        use crate::automations::{
+            FiringState, HistoryPage, Occurrence, SkipReason, SkippedOccurrences,
+        };
+
+        for (count, last) in [(None, 60_000), (Some(1), 60_000), (Some(3), 180_000)] {
+            let owner = automation();
+            let mut firing = history_firing(60_000, FiringState::Skipped);
+            firing.automation = owner.id;
+            firing.name = owner.definition.name.clone();
+            firing.trigger = crate::automations::Trigger::Scheduled {
+                occurrence: Occurrence {
+                    due_ms: 60_000,
+                    local: "fixture-first".into(),
+                },
+            };
+            firing.skip = Some(SkipReason::Capacity);
+            firing.diagnostic = Some("At capacity; try later".into());
+            firing.skipped_occurrences = count.map(|count| SkippedOccurrences {
+                count,
+                first_occurrence_ms: 60_000,
+                last_occurrence_ms: last,
+            });
+            let cursor = HistoryCursor {
+                created_ms: firing.created_ms,
+                id: firing.id,
+            };
+            let mut state = State::default();
+            let Some(Effect::Request {
+                sequence,
+                request: Request::History { id: None, .. },
+            }) = state.update(Action::AllHistory)
+            else {
+                panic!("read the real history page");
+            };
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
+                    firings: vec![firing.clone()],
+                    next: Some(cursor.clone()),
+                }))),
+            });
+            assert_eq!(state.history.len(), 1);
+            assert_eq!(state.history[0].id, firing.id);
+            assert_eq!(state.history_next, Some(cursor.clone()));
+            let expected_state = match count {
+                Some(count) => format!(
+                    "Skipped · {count} {} · {} – {}",
+                    if count == 1 {
+                        "occurrence"
+                    } else {
+                        "occurrences"
+                    },
+                    timestamp(60_000),
+                    timestamp(last),
+                ),
+                None => "Skipped".to_owned(),
+            };
+            let row = format!(
+                "Daily review · {} · Scheduled fixture-first · {expected_state}",
+                timestamp(60_000),
+            );
+            for width in [300.0, 900.0] {
+                let history = Outline::of(&state, width, 700.0);
+                history.text(&row);
+                history.text(&format!(
+                    "Up to {} settled history entries per automation. Settled history of removed automations expires after {} days; active or unresolved work is retained. Older settled details may be unavailable.",
+                    crate::automations::HISTORY_RETAINED_ROWS,
+                    crate::automations::REMOVED_HISTORY_RETENTION_DAYS,
+                ));
+                assert!(buttons(&state, width).contains(&(row.clone(), true)));
+                assert!(buttons(&state, width).contains(&("Older runs".to_owned(), true)));
+            }
+            let Some(Effect::Request {
+                sequence,
+                request: Request::ShowFiring { id },
+            }) = state.update(Action::Run(firing.id))
+            else {
+                panic!("the existing history identity opens its exact detail");
+            };
+            assert_eq!(id, firing.id);
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::Detail(RunDetail {
+                    definition: owner.definition,
+                    firing,
+                    agent: None,
+                    run: None,
+                }))),
+            });
+            let detail = Outline::of(&state, 900.0, 700.0);
+            detail.text(&format!("Daily review · {expected_state}"));
+            detail.text("At capacity; try later");
+            assert_eq!(state.history_next, Some(cursor));
+            assert!(state.pending.is_none());
+        }
+        let empty = State {
+            all_history: true,
+            history_status: HistoryStatus::Loaded,
+            ..Default::default()
+        };
+        let history = Outline::of(&empty, 900.0, 700.0);
+        history.text("No run history available");
+        assert!(!history.texts.iter().any(|(text, _)| text == "No runs yet"));
+        let selected = State {
+            selected: Some(automation()),
+            history_status: HistoryStatus::Loaded,
+            ..Default::default()
+        };
+        Outline::of(&selected, 900.0, 700.0).text("No runs yet");
     }
 
     #[test]

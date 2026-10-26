@@ -277,6 +277,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static NINETEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_ONE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY_TWO: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -288,6 +289,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         19 => &NINETEEN,
         20 => &TWENTY,
         21 => &TWENTY_ONE,
+        22 => &TWENTY_TWO,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -769,6 +771,13 @@ mod tests {
             (15, "DROP TABLE native_actor_retirements;"),
             (16, "DROP TABLE automation_lifecycle;"),
             (16, "DROP INDEX automation_lifecycle_scoped;"),
+            (22, "DROP TABLE automation_precheck_history_cleanup;"),
+            (22, "DROP TABLE automation_retired_manual_requests;"),
+            (22, "DROP INDEX automation_removed_history;"),
+            (
+                22,
+                "ALTER TABLE automation_firings DROP COLUMN previous_firing;",
+            ),
             (17, "DROP TABLE channel_work_operations;"),
             (17, "DROP TABLE channel_work_entries;"),
             (17, "DROP TABLE channel_work_homes;"),
@@ -851,7 +860,7 @@ mod tests {
 
     #[test]
     fn native_actor_schema_generations_preserve_existing_receipts_on_upgrade_and_reopen() {
-        for version in [13, 14, 15, 16, 17] {
+        for version in [13, 14, 15, 16, 17, 18] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("native-actor-generations.sqlite3");
             legacy(&path, version);
@@ -1046,6 +1055,9 @@ mod tests {
                 "shared_terminal_retention_pins",
                 "shared_terminal_retention_by_terminal",
                 "automation_run_attention",
+                "automation_precheck_history_cleanup",
+                "automation_retired_manual_requests",
+                "automation_removed_history",
             ];
             for name in retention_names {
                 let index = inventory
@@ -1058,6 +1070,8 @@ mod tests {
                 "terminal_retention_pins",
                 "shared_terminal_retention_pins",
                 "automation_run_attention",
+                "automation_precheck_history_cleanup",
+                "automation_retired_manual_requests",
             ] {
                 assert_eq!(
                     registry
@@ -1068,9 +1082,19 @@ mod tests {
                     0
                 );
             }
+            // History22 appends only this column to an existing table. Compare
+            // the exact original published DDL after removing that known suffix.
+            let firing = inventory
+                .iter_mut()
+                .find(|object| object.1 == "automation_firings")
+                .unwrap();
+            let suffix = tokens(", previous_firing TEXT").unwrap();
+            let close = firing.3.len() - 2; // final ')' then STRICT
+            assert_eq!(&firing.3[close - suffix.len()..close], &suffix);
+            firing.3.drain(close - suffix.len()..close);
             assert_eq!(
                 inventory, old_layout,
-                "only lifecycle/run outboxes and retention objects may be added"
+                "only lifecycle/run outboxes, retention objects and the exact history suffix may be added"
             );
             assert!(
                 registry
@@ -1398,7 +1422,7 @@ mod tests {
     fn each_actual_migration_failure_rolls_back_all_prior_steps_and_header() {
         let _clear = Clear;
         for step in [
-            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("rollback.sqlite3");

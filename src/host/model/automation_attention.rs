@@ -700,7 +700,14 @@ mod tests {
     fn published_twenty_upgrade_preserves_all_rows_without_replaying_run_history() {
         fn rows(db: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
             let table = table.replace('"', "\"\"");
-            let mut query = db.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+            let selected = if table == "automation_firings" {
+                "id,automation,revision,occurrence_key,record,created_ms,state,run_id"
+            } else {
+                "*"
+            };
+            let mut query = db
+                .prepare(&format!("SELECT {selected} FROM \"{table}\""))
+                .unwrap();
             let columns = query.column_count();
             let mut rows = query
                 .query_map([], |row| {
@@ -807,7 +814,7 @@ mod tests {
                     .db
                     .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
                     .unwrap(),
-                21
+                super::super::SCHEMA_VERSION
             );
             assert!(
                 registry

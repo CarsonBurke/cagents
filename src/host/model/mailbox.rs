@@ -666,7 +666,11 @@ mod tests {
         registry
             .db
             .execute_batch(
-                "DROP TABLE channel_work_operations;
+                "DROP TABLE automation_precheck_history_cleanup;
+                 DROP TABLE automation_retired_manual_requests;
+                 DROP INDEX automation_removed_history;
+                 ALTER TABLE automation_firings DROP COLUMN previous_firing;
+                 DROP TABLE channel_work_operations;
                 DROP TABLE channel_work_entries;
                 DROP TABLE channel_work_homes;
                 DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;",
@@ -902,7 +906,11 @@ mod tests {
         registry
             .db
             .execute_batch(
-                "DROP TABLE channel_work_operations;
+                "DROP TABLE automation_precheck_history_cleanup;
+                 DROP TABLE automation_retired_manual_requests;
+                 DROP INDEX automation_removed_history;
+                 ALTER TABLE automation_firings DROP COLUMN previous_firing;
+                 DROP TABLE channel_work_operations;
                 DROP TABLE channel_work_entries;
                 DROP TABLE channel_work_homes;
                 DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;",

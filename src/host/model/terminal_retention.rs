@@ -708,6 +708,24 @@ mod tests {
                 after.remove("automation_run_attention").unwrap().is_empty(),
                 "the added run-attention table must not replay historical runs"
             );
+            assert!(
+                after
+                    .remove("automation_precheck_history_cleanup")
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                after
+                    .remove("automation_retired_manual_requests")
+                    .unwrap()
+                    .is_empty()
+            );
+            // History22 appends one nullable column; preserve every original
+            // firing payload in this published19 comparison.
+            for row in after.get_mut("automation_firings").unwrap() {
+                assert_eq!(row.len(), 9);
+                row.pop().unwrap();
+            }
             assert!(after.remove("terminal_retention_pins").unwrap().is_empty());
             assert_eq!(
                 after.remove("shared_terminal_retention_pins").unwrap(),
