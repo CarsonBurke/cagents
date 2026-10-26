@@ -17408,6 +17408,23 @@ pub(crate) mod tests {
             .as_widget_mut()
             .operate(&mut tree, Layout::new(&node), &renderer, &mut focus);
         assert_eq!(focus.0, Some(id.clone()));
+        // Check keyboard focus across a cache hit before sending pointer input.
+        // The native button intentionally clears keyboard focus on mouse press.
+        element = make(1, false);
+        tree.diff(element.as_widget_mut());
+        node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let mut focus = Focus::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut focus);
+        assert_eq!(
+            focus.0,
+            Some(id.clone()),
+            "keyboard focus survives a cache hit before pointer input"
+        );
+        assert_eq!(builds.get(), 1);
         let mut messages = Vec::new();
         element.as_widget_mut().update(
             &mut tree,
@@ -17429,6 +17446,17 @@ pub(crate) mod tests {
             }]
         );
         messages.clear();
+        let mut after_press_focus = Focus::default();
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut after_press_focus,
+        );
+        assert_eq!(
+            after_press_focus.0, None,
+            "the pinned native button clears keyboard focus on pointer press"
+        );
         element = make(1, false);
         tree.diff(element.as_widget_mut());
         node = element
@@ -17452,8 +17480,8 @@ pub(crate) mod tests {
             .operate(&mut tree, Layout::new(&node), &renderer, &mut focus);
         assert_eq!(
             focus.0,
-            Some(id.clone()),
-            "the same native focus survives the cache hit"
+            after_press_focus.0,
+            "the post-press native focus survives the cache hit"
         );
         assert_eq!(
             builds.get(),
