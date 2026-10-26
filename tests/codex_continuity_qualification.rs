@@ -107,6 +107,220 @@ struct Model {
     port: u16,
     requests: Arc<Mutex<Vec<ModelRequest>>>,
     over_limit: Arc<std::sync::atomic::AtomicBool>,
+    goal_response_gate: Arc<Mutex<Option<Arc<GoalResponseGate>>>>,
+}
+
+/// SDK2 and SDK3 opt into pacing completed Responses, not native Goal commands
+/// or turns. Other Continuity cases and the external GUI endpoint stay unpaced.
+struct GoalResponseGate {
+    state: Mutex<GoalResponseState>,
+    changed: std::sync::Condvar,
+}
+
+struct GoalResponseState {
+    permitted_through: usize,
+    held: usize,
+    cancelled: bool,
+    timed_out: bool,
+}
+
+impl GoalResponseGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(GoalResponseState {
+                permitted_through: 1, // The ordinary initial turn only.
+                held: 0,
+                cancelled: false,
+                timed_out: false,
+            }),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn permit_through(&self, number: usize) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Keep the existing eight-request refusal meaningful. No refill,
+        // automatic credit or late permission after cancellation is allowed.
+        if number > 8 || number < state.permitted_through || state.cancelled {
+            return false;
+        }
+        state.permitted_through = number;
+        self.changed.notify_all();
+        true
+    }
+
+    fn release_after_confirmed_pause(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(next) = state
+            .permitted_through
+            .checked_add(1)
+            .filter(|next| *next <= 8)
+        else {
+            return false;
+        };
+        if state.cancelled {
+            return false;
+        }
+        // Pause prevents the next continuation, but does not interrupt a
+        // response already in progress. Let exactly that one settle.
+        state.permitted_through = next;
+        self.changed.notify_all();
+        true
+    }
+
+    fn wait(&self, number: usize, deadline: Instant) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.held += 1;
+        self.changed.notify_all();
+        while !state.cancelled && number > state.permitted_through {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                state.timed_out = true;
+                state.cancelled = true;
+                self.changed.notify_all();
+                break;
+            }
+            (state, _) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state.held -= 1;
+        self.changed.notify_all();
+        !state.cancelled
+    }
+
+    fn cancel(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.cancelled = true;
+        self.changed.notify_all();
+    }
+}
+
+/// Declare after Fixture: its drop wakes held HTTP handlers BEFORE Fixture's
+/// public agent/daemon cleanup, including on an assertion panic. The model's
+/// slot remains permanently cancelled, so cleanup cannot bypass the gate.
+struct GoalResponsePacing(Arc<GoalResponseGate>);
+
+impl GoalResponsePacing {
+    fn permit_through(&self, number: usize) {
+        assert!(
+            self.0.permit_through(number),
+            "invalid Goal response allowance"
+        );
+    }
+
+    fn after_confirmed_pause(&self) {
+        assert!(
+            self.0.release_after_confirmed_pause(),
+            "invalid paused response allowance"
+        );
+    }
+
+    fn has_held_response(&self) -> bool {
+        let state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.held == 1 && !state.cancelled && !state.timed_out
+    }
+
+    fn assert_healthy(&self) {
+        let state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            !state.timed_out && !state.cancelled,
+            "Goal response gate failed closed"
+        );
+    }
+}
+
+impl Drop for GoalResponsePacing {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+#[test]
+fn goal_response_permits_are_bounded_and_owner_drop_wakes_held_responses() {
+    fn held(gate: &GoalResponseGate) {
+        let state = gate.state.lock().unwrap();
+        let (state, wait) = gate
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(20), |state| state.held == 0)
+            .unwrap();
+        assert!(!wait.timed_out() && state.held == 1);
+    }
+    let gate = Arc::new(GoalResponseGate::new());
+    let owner = GoalResponsePacing(gate.clone());
+    assert!(gate.wait(1, Instant::now()));
+    assert!(!gate.permit_through(9));
+    assert_eq!(gate.state.lock().unwrap().permitted_through, 1);
+    let (sent, received) = std::sync::mpsc::channel();
+    let waiting = gate.clone();
+    let worker = thread::spawn(move || {
+        sent.send(waiting.wait(2, Instant::now() + Duration::from_secs(20)))
+            .unwrap();
+    });
+    held(&gate);
+    assert!(matches!(
+        received.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    assert!(gate.permit_through(2));
+    assert!(received.recv_timeout(Duration::from_secs(20)).unwrap());
+    worker.join().unwrap();
+    assert!(
+        !gate.permit_through(1),
+        "old credits cannot reset the allowance"
+    );
+    assert!(gate.release_after_confirmed_pause());
+    assert_eq!(gate.state.lock().unwrap().permitted_through, 3);
+    let (sent, received) = std::sync::mpsc::channel();
+    let waiting = gate.clone();
+    let worker = thread::spawn(move || {
+        sent.send(waiting.wait(4, Instant::now() + Duration::from_secs(20)))
+            .unwrap();
+    });
+    held(&gate);
+    drop(owner); // The same guard used before Fixture's public cleanup.
+    assert!(!received.recv_timeout(Duration::from_secs(20)).unwrap());
+    worker.join().unwrap();
+    assert!(!gate.permit_through(4));
+    assert!(!gate.release_after_confirmed_pause());
+    assert!(
+        !gate.wait(1, Instant::now()),
+        "cancellation cannot reply even to an old allowance"
+    );
+    let expired = GoalResponseGate::new();
+    assert!(!expired.wait(2, Instant::now()));
+    let state = expired.state.lock().unwrap();
+    assert!(state.timed_out && state.cancelled && state.held == 0);
+    drop(state);
+    assert!(
+        !expired.permit_through(2),
+        "expiry never auto-releases a successful response"
+    );
+    let bounded = GoalResponseGate::new();
+    assert!(bounded.permit_through(8));
+    assert!(!bounded.release_after_confirmed_pause());
+    assert_eq!(bounded.state.lock().unwrap().permitted_through, 8);
 }
 
 impl Model {
@@ -117,22 +331,40 @@ impl Model {
         let seen = requests.clone();
         let over_limit = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let rejected = over_limit.clone();
+        let goal_response_gate = Arc::new(Mutex::new(None::<Arc<GoalResponseGate>>));
+        let response_gate = goal_response_gate.clone();
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let seen = seen.clone();
                 let rejected = rejected.clone();
-                thread::spawn(move || serve(stream, &seen, mode, &rejected));
+                let gate = response_gate.lock().unwrap().clone();
+                thread::spawn(move || {
+                    serve_with_goal_gate(stream, &seen, mode, &rejected, gate.as_deref())
+                });
             }
         });
         Self {
             port,
             requests,
             over_limit,
+            goal_response_gate,
         }
     }
 
     fn requests(&self) -> Vec<ModelRequest> {
         self.requests.lock().unwrap().clone()
+    }
+
+    fn pace_goal_responses(&self) -> GoalResponsePacing {
+        assert!(
+            self.requests().is_empty(),
+            "install pacing before starting the SDK"
+        );
+        let gate = Arc::new(GoalResponseGate::new());
+        let mut slot = self.goal_response_gate.lock().unwrap();
+        assert!(slot.is_none(), "Goal response pacing was already installed");
+        *slot = Some(gate.clone());
+        GoalResponsePacing(gate)
     }
 }
 
@@ -161,6 +393,16 @@ fn serve(
     seen: &Mutex<Vec<ModelRequest>>,
     mode: ModelMode,
     over_limit: &std::sync::atomic::AtomicBool,
+) {
+    serve_with_goal_gate(stream, seen, mode, over_limit, None);
+}
+
+fn serve_with_goal_gate(
+    stream: TcpStream,
+    seen: &Mutex<Vec<ModelRequest>>,
+    mode: ModelMode,
+    over_limit: &std::sync::atomic::AtomicBool,
+    goal_response_gate: Option<&GoalResponseGate>,
 ) {
     if matches!(mode, ModelMode::Goal) {
         stream
@@ -290,6 +532,15 @@ fn serve(
         });
         seen.len()
     };
+    // The request counter's mutex has been released. This wait holds neither
+    // a host/Window lock nor a socket operation; native Get/Pause/Clear remain
+    // serviceable while a no-tool model response is held. Expiry closes this
+    // connection without a successful response and cannot qualify the case.
+    if let Some(gate) = goal_response_gate
+        && !gate.wait(number, Instant::now() + Duration::from_secs(20))
+    {
+        return;
+    }
     let id = format!("response-{number}");
     let shell = |call: &str, command: String, yield_ms: u64| {
         tool_call(

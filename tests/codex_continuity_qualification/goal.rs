@@ -168,21 +168,29 @@ impl Drop for GoalWaitDiagnostics {
         }
     }
 }
-struct FailedGoalModelEvidence<'a>(&'a Model);
-impl Drop for FailedGoalModelEvidence<'_> {
+// Own only the two diagnostic publications. A borrowed Model would prevent
+// SDK3's existing mutable Fixture::replace_daemon while this unwind guard lives.
+struct FailedGoalModelEvidence {
+    requests: Arc<Mutex<Vec<ModelRequest>>>,
+    over_limit: Arc<std::sync::atomic::AtomicBool>,
+}
+impl FailedGoalModelEvidence {
+    fn new(model: &Model) -> Self {
+        Self {
+            requests: model.requests.clone(),
+            over_limit: model.over_limit.clone(),
+        }
+    }
+}
+impl Drop for FailedGoalModelEvidence {
     fn drop(&mut self) {
         if std::thread::panicking() {
             // No waiting on a model handler while unwinding. An unavailable
             // count is explicit, never inferred as zero; no request text read.
-            let accepted = self
-                .0
-                .requests
-                .try_lock()
-                .ok()
-                .map(|requests| requests.len());
+            let accepted = self.requests.try_lock().ok().map(|requests| requests.len());
             eprintln!(
                 "Goal model at failed wait: accepted_requests={accepted:?} over_limit={}",
-                self.0.over_limit.load(std::sync::atomic::Ordering::Acquire)
+                self.over_limit.load(std::sync::atomic::Ordering::Acquire)
             );
         }
     }
@@ -269,7 +277,19 @@ fn pause(window: &mut Window, chat: &Session, phase: &'static str) -> Goal {
 }
 
 fn finish(fixture: &Fixture, window: &mut Window, chat: &Session) {
+    finish_with_pacing(fixture, window, chat, None);
+}
+
+fn finish_with_pacing(
+    fixture: &Fixture,
+    window: &mut Window,
+    chat: &Session,
+    paced_resume: Option<(&GoalResponsePacing, u64)>,
+) {
     pause(window, chat, "FinalPause");
+    if let Some((pacing, _)) = paced_resume {
+        pacing.after_confirmed_pause();
+    }
     let revision = control(window, chat, Operation::Clear, "FinalClear");
     assert!(observed(window, chat, "FinalClearNone", revision, Option::is_none).is_none());
     // A paused goal need not have stopped a turn already in progress.
@@ -278,6 +298,16 @@ fn finish(fixture: &Fixture, window: &mut Window, chat: &Session) {
         "the no-tool turn to settle",
         || {
             let snapshot = window.read(chat.id);
+            if let Some((pacing, resumed_turn)) = paced_resume {
+                pacing.assert_healthy();
+                assert_eq!(snapshot.session_id, chat.launch.session_id);
+                assert!(!snapshot.exited);
+                assert!(snapshot.error.is_none());
+                if !snapshot.busy && snapshot.requests.is_empty() {
+                    assert!(snapshot.finished_at.is_some());
+                    assert!(snapshot.turn_generation >= resumed_turn);
+                }
+            }
             (!snapshot.busy && snapshot.requests.is_empty()).then_some(())
         },
     );
@@ -294,7 +324,11 @@ fn finish(fixture: &Fixture, window: &mut Window, chat: &Session) {
 #[ignore = "needs the explicitly supplied real SDK and matched Goal-enabled binaries"]
 fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_extra_prompt() {
     let fixture = Fixture::with_model_mode(ModelMode::Goal);
-    let _failed_model_evidence = FailedGoalModelEvidence(&fixture.model);
+    // This guard drops before Fixture even on failure, waking held responses
+    // before the fixture performs its existing public cleanup. No other case
+    // or external GUI model has response pacing enabled.
+    let pacing = fixture.model.pace_goal_responses();
+    let _failed_model_evidence = FailedGoalModelEvidence::new(&fixture.model);
     let (mut window, chat) = start(&fixture);
     let read_revision = control(&mut window, &chat, Operation::Get, "InitialGet");
     assert!(
@@ -348,6 +382,10 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
         is_status(goal, Status::Active)
     })
     .unwrap();
+    // The baseline's one completed response cannot authorize Goal work. Only
+    // this second real request receives the next no-tool response allowance.
+    assert_eq!(baseline_requests, 1);
+    pacing.permit_through(baseline_requests + 1);
     // Between the baseline and this observation the only effectful request is
     // that one Goal Set: no Prompt, turn/start or mutation retry can make a
     // metadata-only implementation pass. The model counter alone also cannot
@@ -358,6 +396,7 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
         Duration::from_secs(30),
         "Goal Set alone to produce a model response in a new native turn",
         || {
+            pacing.assert_healthy();
             let snapshot = window.read(chat.id);
             assert_eq!(snapshot.session_id, baseline.session_id);
             assert!(
@@ -392,12 +431,14 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
     // This is the existing first Pause, moved directly after positive work:
     // Pause prevents further Goal continuation but does not stop a live turn.
     let paused = pause(&mut window, &chat, "PauseAfterAutonomousWork");
+    pacing.after_confirmed_pause();
     assert_eq!(paused.objective, active.objective);
     assert_eq!(paused.token_budget, active.token_budget);
-    let settled_turn = until(
+    let settled = until(
         settlement_budget,
         "the autonomous native turn to settle after explicit Goal Pause",
         || {
+            pacing.assert_healthy();
             let snapshot = window.read(chat.id);
             assert_eq!(snapshot.session_id, baseline.session_id);
             assert!(
@@ -423,9 +464,10 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
                 && snapshot.error.is_none()
                 && snapshot.requests.is_empty()
                 && still_paused)
-                .then_some(snapshot.turn_generation)
+                .then_some(snapshot)
         },
     );
+    let settled_turn = settled.turn_generation;
     eprintln!(
         "NATIVE_GOAL_AUTONOMOUS_NO_TOOL_TURN {}",
         json!({
@@ -440,6 +482,10 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
     // The operation has no budget field. A provider-returned default is an
     // observation, not proof this client supplied a budget.
     eprintln!("SDK-observed Goal budget: {:?}", active.token_budget);
+    let resume_baseline_requests = fixture.model.requests().len();
+    let resume_baseline_items: BTreeSet<_> =
+        settled.items.iter().map(|item| item.id.clone()).collect();
+    let resume_started = Instant::now();
     let resume_revision = control(&mut window, &chat, Operation::Resume, "Resume");
     let resumed = observed(
         &mut window,
@@ -451,9 +497,43 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
     .unwrap();
     assert_eq!(resumed.objective, active.objective);
     assert_eq!(resumed.token_budget, active.token_budget);
+    pacing.permit_through(resume_baseline_requests + 1);
+    // Use what remains of the existing Resume observation allowance, not a
+    // second 30-second work budget. Provider-confirmed Active is necessary,
+    // but cannot by itself prove that Resume actually continued this thread.
+    let resumed_turn = until(
+        Duration::from_secs(30).saturating_sub(resume_started.elapsed()),
+        "Goal Resume to produce a new original-thread no-tool response",
+        || {
+            pacing.assert_healthy();
+            let snapshot = window.read(chat.id);
+            assert_eq!(snapshot.session_id, baseline.session_id);
+            assert!(!snapshot.exited);
+            assert!(
+                !fixture
+                    .model
+                    .over_limit
+                    .load(std::sync::atomic::Ordering::Acquire)
+            );
+            let new_final_response = snapshot.items.iter().any(|item| {
+                !resume_baseline_items.contains(&item.id)
+                    && item.role == cagents::chat::Role::Assistant
+                    && matches!(&item.content, cagents::chat::ItemContent::Text {
+                        text, phase: cagents::chat::Phase::Final, ..
+                    } if text.contains("GOAL_FIXTURE_OBSERVED_NO_TOOLS"))
+            });
+            (fixture.model.requests().len() > resume_baseline_requests
+                && snapshot.turn_generation > settled_turn
+                && snapshot.error.is_none()
+                && snapshot.requests.is_empty()
+                && new_final_response)
+                .then_some(snapshot.turn_generation)
+        },
+    );
     // Native continuation can produce model requests. This asserts a finite
     // no-tool script, not that a real active goal is continuously idle.
-    finish(&fixture, &mut window, &chat);
+    finish_with_pacing(&fixture, &mut window, &chat, Some((&pacing, resumed_turn)));
+    pacing.assert_healthy();
     assert!(
         fixture
             .model
@@ -467,6 +547,12 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
 #[ignore = "requires an already continuity-qualified SDK; never extends the allowlist"]
 fn an_active_goal_reconnects_with_the_original_server_thread_and_physical_scope() {
     let mut fixture = Fixture::with_model_mode(ModelMode::Goal);
+    // Hold the first autonomous response through the existing crash boundary.
+    // Otherwise the immediate no-tool endpoint can consume all eight responses
+    // while a replacement daemon starts. This does not change native Goal state
+    // or grant any extra request: only the initial response is permitted so far.
+    let pacing = fixture.model.pace_goal_responses();
+    let _failed_model_evidence = FailedGoalModelEvidence::new(&fixture.model);
     let (mut window, chat) = start(&fixture);
     // This prerequisite intentionally fails on e.g. 0.160.0 rather than
     // converting a schema observation into durable continuity qualification.
@@ -489,6 +575,35 @@ fn an_active_goal_reconnects_with_the_original_server_thread_and_physical_scope(
         set_revision,
         |goal| is_status(goal, Status::Active),
     );
+    until(
+        Duration::from_secs(30),
+        "the original active Goal's autonomous response to be held",
+        || {
+            pacing.assert_healthy();
+            let snapshot = window.read(chat.id);
+            assert_eq!(snapshot.session_id, chat.launch.session_id);
+            assert!(!snapshot.exited && snapshot.error.is_none());
+            assert!(
+                !fixture
+                    .model
+                    .over_limit
+                    .load(std::sync::atomic::Ordering::Acquire)
+            );
+            let active = snapshot.goal.as_ref().is_some_and(|goal| {
+                goal.support == Support::Supported
+                    && !goal.pending
+                    && !goal.uncertain
+                    && matches!(&goal.read, ReadState::Known(goal)
+                        if is_status(goal, Status::Active))
+            });
+            (active
+                && snapshot.busy
+                && snapshot.turn_generation > 1
+                && fixture.model.requests().len() == 2
+                && pacing.has_held_response())
+            .then_some(())
+        },
+    );
     let servers = fixture.servers();
     assert!(!servers.is_empty());
     drop(window);
@@ -500,19 +615,40 @@ fn an_active_goal_reconnects_with_the_original_server_thread_and_physical_scope(
     assert_eq!(restored.launch, chat.launch);
     window.attach(restored.clone());
     let read_revision = control(&mut window, &restored, Operation::Get, "ReconnectGet");
-    observed(
-        &mut window,
-        &restored,
-        "ReconnectActive",
-        read_revision,
-        |goal| is_status(goal, Status::Active),
-    );
+    let mut diagnostics = GoalWaitDiagnostics::new("ReconnectActive", Some(read_revision));
+    until(Duration::from_secs(30), "ReconnectActive", || {
+        pacing.assert_healthy();
+        let state = publication(&mut window, &restored, &mut diagnostics);
+        assert_ne!(
+            state.support,
+            Support::Unsupported,
+            "native Goal API unavailable"
+        );
+        let confirmed = state.last_result.is_some_and(|result| {
+            result.revision == read_revision
+                && result.outcome == cagents::chat::goal::Outcome::Confirmed
+        });
+        (state.support == Support::Supported
+            && !state.uncertain
+            && confirmed
+            && matches!(state.read, ReadState::Known(goal) if is_status(&goal, Status::Active)))
+        .then_some(())
+    });
+    assert_eq!(fixture.servers(), servers);
+    assert_eq!(fixture.model.requests().len(), 2);
+    assert!(pacing.has_held_response());
     pause(&mut window, &restored, "PauseBeforeDirectoryReplacement");
+    // A confirmed Pause stops future continuation, not the response already
+    // underway on the retained server. Release exactly that response to settle.
+    pacing.after_confirmed_pause();
     until(
         Duration::from_secs(30),
         "the paused no-tool turn to settle",
         || {
+            pacing.assert_healthy();
             let snapshot = window.read(restored.id);
+            assert_eq!(snapshot.session_id, chat.launch.session_id);
+            assert!(!snapshot.exited && snapshot.error.is_none());
             (!snapshot.busy && snapshot.requests.is_empty()).then_some(())
         },
     );
@@ -567,6 +703,7 @@ fn an_active_goal_reconnects_with_the_original_server_thread_and_physical_scope(
         "a refused Resume or read-only Get started model work"
     );
     finish(&fixture, &mut window, &restored);
+    pacing.assert_healthy();
     assert!(fixture.servers().is_empty());
 }
 
