@@ -138,6 +138,10 @@ pub(super) struct State {
 }
 
 impl State {
+    pub(super) fn pending_transfer_cards(&self) -> impl Iterator<Item = CardId> + '_ {
+        self.requested_transfers.values().copied()
+    }
+
     pub(super) fn requested_transfer_card(&self, operation: uuid::Uuid) -> Option<CardId> {
         self.requested_transfers.get(&operation).copied()
     }

@@ -9948,7 +9948,7 @@ impl Cagents {
             ),
             Some(CardRuntime::Accounts) => self.accounts_pane(),
             Some(CardRuntime::Automations) => self.automation_ui.view().map(Message::AutomationUi),
-            Some(CardRuntime::Work) => self.work_ui.view().map(Message::WorkUi),
+            Some(CardRuntime::Work) => self.work_view(id),
             Some(CardRuntime::Completed) => {
                 self.ended_terminal_placeholder(id, ended_terminal(card))
             }
