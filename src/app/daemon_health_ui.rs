@@ -203,14 +203,13 @@ impl Cagents {
             .focused()
             .map(|card| self.card_keyboard_focus(card))
             .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID));
-        iced::runtime::task::widget(HealthFocus {
+        iced::runtime::task::effect(iced::runtime::Action::widget(HealthFocus {
             marker: None,
             target,
             mounted: false,
             present: false,
             foreign_focus: false,
-        })
-        .map(cosmic::Action::App)
+        }))
     }
     pub(super) fn adopt_daemon_health_keyboard_nav(&mut self, restore: bool) -> bool {
         if !self.daemon_health_ui.confirmation {
@@ -409,7 +408,7 @@ fn health_marker(generation: u64) -> widget::Id {
 }
 
 fn health_focus(state: &State, index: usize) -> Task<Message> {
-    iced::runtime::task::widget(HealthFocus {
+    iced::runtime::task::effect(iced::runtime::Action::widget(HealthFocus {
         marker: Some(health_marker(state.generation)),
         target: if index == 1 {
             health_action_id(state)
@@ -419,8 +418,7 @@ fn health_focus(state: &State, index: usize) -> Task<Message> {
         mounted: false,
         present: false,
         foreign_focus: false,
-    })
-    .map(cosmic::Action::App)
+    }))
 }
 
 /// Check the mounted frame before chaining focus. A different dialog can open
