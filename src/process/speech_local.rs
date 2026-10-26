@@ -554,8 +554,10 @@ mod tests {
 pid=os.fork()
 if pid==0:
  os.setsid()
- with open(os.environ['PID_FILE'],'w') as f: f.write(str(os.getpid()))
- while True: time.sleep(1)
+ with open(os.environ['PID_FILE']+'.tmp','w') as f: f.write(str(os.getpid()))
+ os.replace(os.environ['PID_FILE']+'.tmp',os.environ['PID_FILE'])
+ time.sleep(5)
+ os._exit(0)
 else:
  while not os.path.exists(os.environ['PID_FILE']): time.sleep(0.005)
  os.write(1,b'x'*131072)
