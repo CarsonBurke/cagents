@@ -558,13 +558,23 @@ mod tests {
             .unwrap()[0],
             38
         );
+        // Frozen version-100 envelope: request 7, proof s/b/i and empty ChatListed.
+        // Only the version scalar changes; postcard u16 grows at protocol 128.
+        let payload = [100, 1, 7, 1, b's', 1, b'b', 1, b'i', 0, 13, 0];
+        let mut frozen = (payload.len() as u32).to_be_bytes().to_vec();
+        frozen.extend(payload);
+        for (protocol, prefix) in [(127, &[0x7f][..]), (128, &[0x80, 0x01][..])] {
+            let frame = source_frame_version(&frozen, protocol);
+            assert_eq!(&frame[4..4 + prefix.len()], prefix);
+            assert_eq!(&frame[4 + prefix.len()..], &frozen[5..]);
+            assert_eq!(
+                u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize,
+                frame.len() - 4
+            );
+        }
         for protocol in source_protocols() {
             assert!(supports_protocol(protocol));
-            // Frozen postcard envelope with request 7, proof s/b/i and an empty
-            // ChatListed response. The only version-specific byte is first.
-            let payload = [protocol as u8, 1, 7, 1, b's', 1, b'b', 1, b'i', 0, 13, 0];
-            let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
-            frame.extend(payload);
+            let frame = source_frame_version(&frozen, protocol);
             let envelope = read_response(&mut frame.as_slice()).unwrap();
             assert_eq!(envelope.version, protocol);
             assert_eq!(envelope.request_id, Some(7));
