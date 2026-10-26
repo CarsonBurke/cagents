@@ -2061,6 +2061,10 @@ impl Adapter for Codex {
                 // The exact RPC resolved (including an invalid response). Only
                 // this request can release its slot; notification epochs decide
                 // whether its observation may still be adopted.
+                let disabled = frame.get("error").is_some_and(|error| {
+                    error["code"].as_i64() == Some(-32600)
+                        && error["message"].as_str() == Some("goals feature is disabled")
+                });
                 let result = if let Some(error) = frame.get("error") {
                     Err(if error["code"].as_i64() == Some(-32601) {
                         chat::goal::Failure::Unsupported
@@ -2076,12 +2080,20 @@ impl Adapter for Codex {
                                 .map_err(|_| chat::goal::Failure::Unavailable)
                         })
                 };
-                if let Some(state) = &mut self.goal {
+                let current = if let Some(state) = &mut self.goal {
                     state
                         .complete(&request, result)
-                        .map_err(|error| error.to_string())?;
-                }
+                        .map_err(|error| error.to_string())?
+                } else {
+                    false
+                };
                 self.publish_goal(&mut step);
+                if current && disabled {
+                    step.events.push(Event::Error {
+                        message: "Goals are disabled in this Codex connection. Enable Goals in the selected Codex configuration before starting a new connection. Your input is kept.".into(),
+                        fatal: false,
+                    });
+                }
                 self.resume_after_goal_read(&mut step)?;
                 return Ok(step);
             }
