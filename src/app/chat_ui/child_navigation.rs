@@ -1,6 +1,8 @@
 //! Named child tabs with bounded transcript preparation and a searchable chooser.
 use super::*;
 
+mod reveal;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum Filter {
     #[default]
@@ -204,6 +206,7 @@ impl Runtime {
                 )
             })
             .collect();
+        let scroll_id = card_control_id(target.card, "chat-subagent-tabs");
         let tabs = widget::scrollable(crate::interaction::keyed_control_row(
             tabs,
             space::XS,
@@ -211,11 +214,16 @@ impl Runtime {
                 *focus.borrow_mut() = key.and_then(|key| identities.get(&key).cloned());
             },
         ))
-        .id(card_control_id(target.card, "chat-subagent-tabs"))
+        .id(scroll_id.clone())
         .direction(iced::widget::scrollable::Direction::Horizontal(
             iced::widget::scrollable::Scrollbar::hidden(),
         ))
         .width(Length::Fill);
+        let tabs = reveal::view(
+            tabs,
+            scroll_id,
+            selected.map(|id| card_control_id(target.card, &format!("chat-subagent-tab-{id}"))),
+        );
         let trigger = widget::button::custom(crate::ui_controls::passive_icon(
             Icon::PanDown,
             design::COMPACT_ICON_SIZE,
