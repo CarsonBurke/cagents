@@ -49,6 +49,17 @@ fn composer_action_key(kind: &str, insertion: &str) -> [u8; 32] {
     hash.finalize().into()
 }
 
+/// Keep the original allocation identifiable across a retained Stop gesture
+/// without retaining its live provider connection or allowing pointer reuse.
+#[derive(Clone)]
+struct NativeChildStopHandle(std::sync::Weak<ClientHandle>);
+impl PartialEq for NativeChildStopHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.ptr_eq(&other.0)
+    }
+}
+impl Eq for NativeChildStopHandle {}
+
 /// The composer's own line height and inner padding.
 ///
 /// Named because the composer's height is computed from the draft rather than
@@ -1877,39 +1888,18 @@ impl Runtime {
         let mut transcript = VirtualRows::new(step::GAP_L);
         let mut selected_identity: Option<Element<'_, Message>> = None;
         if let Some(agent) = selected {
-            let provider = match self.session.launch.provider {
-                Provider::Codex => "Codex",
-                Provider::Claude => "Claude",
-                Provider::Omp => "OMP",
-            };
-            let model = agent
-                .model
-                .as_deref()
-                .map(str::trim)
-                .filter(|model| !model.is_empty())
-                .unwrap_or("Model not reported");
-            let heading: Element<'_, Message> = widget::column::with_children(vec![
-                widget::row::with_children(vec![
-                    chat_title(Self::short_description(Self::native_child_name(agent), 80))
-                        .width(Length::Fill)
-                        .into(),
-                    design::heading(Self::native_child_status(agent))
-                        .size(design::TEXT_CAPTION)
-                        .into(),
-                ])
-                .spacing(step::GAP_S)
-                .align_y(Alignment::Center)
-                .into(),
+            let heading: Element<'_, Message> = widget::row::with_children(vec![
                 crate::interaction::tooltip(
-                    design::caption(format!(
-                        "Native subagent · {provider} · {}",
-                        Self::short_description(model, 80)
-                    )),
+                    chat_title(Self::short_description(Self::native_child_name(agent), 80))
+                        .width(Length::Fill),
                     self.native_child_identity(agent),
-                )
-                .into(),
+                ),
+                design::heading(Self::native_child_status(agent))
+                    .size(design::TEXT_CAPTION)
+                    .into(),
             ])
-            .spacing(step::GAP_XS)
+            .spacing(step::GAP_S)
+            .align_y(Alignment::Center)
             .width(Length::Fill)
             .into();
             selected_identity = Some(
@@ -1917,20 +1907,32 @@ impl Runtime {
                 {
                     widget::row::with_children(vec![
                         heading.into(),
-                        crate::ui_controls::button::quiet("Stop")
-                            .icon(Icon::Stop)
-                            .name(
-                                "Stop this subagent; the conversation and other subagents carry on",
-                            )
-                            .on_press_maybe(available.then(|| {
-                                action(Action::Command(
-                                    target,
-                                    Command::StopSubagent {
-                                        id: agent.id.clone(),
-                                    },
+                        crate::ui_controls::owned(
+                            (
+                                target,
+                                agent.id.clone(),
+                                self.handle()
+                                    .map(|handle| NativeChildStopHandle(Arc::downgrade(handle))),
+                                available,
+                            ),
+                            crate::ui_controls::button::quiet("Stop")
+                                .icon(Icon::Stop)
+                                .name(
+                                    "Stop this subagent; the conversation and other subagents carry on",
+                                )
+                                .id(card_control_id(
+                                    target.card,
+                                    &format!("subagent-stop-{}-{}", target.generation, agent.id),
                                 ))
-                            }))
-                            .into(),
+                                .on_press_maybe(available.then(|| {
+                                    action(Action::Command(
+                                        target,
+                                        Command::StopSubagent {
+                                            id: agent.id.clone(),
+                                        },
+                                    ))
+                                })),
+                        ),
                     ])
                     .spacing(step::GAP_XS)
                     .align_y(Alignment::Center)
@@ -7067,8 +7069,8 @@ mod tests {
         child.detail = "Waiting for your approval".into();
         let known = runtime.native_child_identity(&child);
         assert!(known.contains("child-model"));
-        assert!(known.contains("Waiting for you"));
-        assert!(known.contains("Waiting for your approval"));
+        assert!(known.contains(" · Waiting · Waiting for your approval"));
+        assert!(known.ends_with("Waiting for your approval"));
         child.status = chat::ToolStatus::Succeeded;
         assert_eq!(Runtime::native_child_status(&child), "Finished");
     }

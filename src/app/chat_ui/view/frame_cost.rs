@@ -935,16 +935,16 @@ fn install(update: chat::presentation::Presentation, installed: Arc<Snapshot>) -
     Arc::new(update.apply(&installed).expect("a patch that applies"))
 }
 
-/// Sparse child metadata must refresh a kept launch card even when neither
-/// its tool content nor the child's running status changed.
+/// Sparse child metadata must refresh kept native cards and the selected-child
+/// heading without restoring a default wall of provider/model metadata.
 #[test]
 fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
     use iced::advanced::{
         Layout, layout,
         widget::{Operation, Tree},
     };
-    #[derive(Default)]
-    struct ReadLabels(Vec<String>);
+    #[derive(Default, Debug)]
+    struct ReadLabels(Vec<(String, iced::Rectangle)>);
     impl Operation for ReadLabels {
         fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
             visit(self);
@@ -956,9 +956,85 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
             text: &str,
         ) {
             if bounds.width > 0.0 && bounds.height > 0.0 {
-                self.0.push(text.to_owned());
+                self.0.push((text.to_owned(), bounds));
             }
         }
+    }
+    #[derive(Debug)]
+    struct NativeLabels {
+        text: ReadLabels,
+        buttons: Vec<String>,
+    }
+    impl NativeLabels {
+        fn compact(&self) {
+            assert!(
+                !self
+                    .text
+                    .0
+                    .iter()
+                    .any(|(label, _)| label.contains("Model not reported")
+                        || label.contains("gpt-child-reported")
+                        || label.contains("Native subagent")),
+                "{self:?}"
+            );
+        }
+        fn has_text(&self, expected: &str) -> bool {
+            self.text.0.iter().any(|(label, _)| label == expected)
+        }
+        fn card(&self, name: &str, status: &str) {
+            assert!(self.has_text(name), "{self:?}");
+            assert!(
+                self.buttons
+                    .iter()
+                    .any(|label| label == &format!("Show details for {name} ({status})")),
+                "{self:?}"
+            );
+            self.compact();
+        }
+        fn heading(&self, name: &str, status: &str) {
+            // A matching name in the tab strip alone is insufficient: the
+            // actual selected heading's name and status share a native row.
+            assert!(
+                self.text.0.iter().any(|(label, title)| label == name
+                    && self.text.0.iter().any(|(label, state)| label == status
+                        && title.y < state.y + state.height
+                        && state.y < title.y + title.height)),
+                "{self:?}"
+            );
+            self.compact();
+            assert!(
+                !self.has_text("Inspect parser"),
+                "the child heading must not substitute task prose for its name: {self:?}"
+            );
+        }
+    }
+    fn read(
+        mut element: Element<'_, Message>,
+        tree: &mut Tree,
+        renderer: &cosmic::Renderer,
+    ) -> NativeLabels {
+        tree.diff(element.as_widget_mut());
+        let node = element.as_widget_mut().layout(
+            tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(640.0, 2400.0)),
+        );
+        let mut text = ReadLabels::default();
+        element
+            .as_widget_mut()
+            .operate(tree, Layout::new(&node), renderer, &mut text);
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), tree, mouse::Cursor::Unavailable);
+        let buttons = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter(|node| node.node().role() == iced_accessibility::accesskit::Role::Button)
+            .filter_map(|node| node.node().label().map(str::to_owned))
+            .collect();
+        NativeLabels { text, buttons }
     }
     let items = vec![
         item(
@@ -994,100 +1070,381 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
         ),
     ];
     let (mut runtime, _handle) = live_runtime(&items);
-    Arc::make_mut(&mut runtime.snapshot)
-        .subagents
-        .push(chat::Subagent {
-            id: "native-child".into(),
-            kind: "Scout".into(),
-            description: "Inspect parser".into(),
-            status: chat::ToolStatus::Running,
-            model: None,
-            waiting: false,
-            detail: String::new(),
-            background: true,
-            items: Vec::new(),
-        });
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.capabilities.stop_subagent = true;
+    snapshot.subagents.push(chat::Subagent {
+        id: "native-child".into(),
+        kind: String::new(),
+        description: "Inspect parser".into(),
+        status: chat::ToolStatus::Running,
+        model: None,
+        waiting: false,
+        detail: String::new(),
+        background: true,
+        items: Vec::new(),
+    });
     assert_eq!(runtime.turns.len(), 2);
     let dark = cosmic::theme::is_dark();
     let settings =
         crate::design::markdown_settings(&cosmic::theme::active(), crate::design::TEXT_PROSE);
     let renderer = crate::app::tests::headless_renderer();
-    let mut tree = Tree::new(
-        runtime
-            .turn_view(&runtime.turns[0], settings, dark)
-            .as_widget(),
-    );
+    let mut card_tree = Tree::empty();
+    let mut selected_tree = Tree::empty();
+    let shortcuts = crate::settings::KeyboardShortcuts::default();
     let labels = |runtime: &Runtime, tree: &mut Tree| {
-        let mut element = runtime.turn_view(&runtime.turns[0], settings, dark);
-        tree.diff(element.as_widget_mut());
-        let node = element.as_widget_mut().layout(
+        read(
+            runtime.turn_view(&runtime.turns[0], settings, dark),
             tree,
             &renderer,
-            &layout::Limits::new(Size::ZERO, Size::new(640.0, 2400.0)),
-        );
-        let mut labels = ReadLabels::default();
-        element
-            .as_widget_mut()
-            .operate(tree, Layout::new(&node), &renderer, &mut labels);
-        labels.0
+        )
     };
-    let initial = labels(&runtime, &mut tree);
+    let selected_labels = |runtime: &mut Runtime, tree: &mut Tree| {
+        runtime.selected_subagent = Some("native-child".into());
+        let labels = read(
+            runtime.view(
+                None,
+                false,
+                true,
+                &shortcuts,
+                640.0,
+                Place {
+                    name: "Fixture".into(),
+                    branch: None,
+                    channel: None,
+                },
+                true,
+                None,
+                Vec::new(),
+            ),
+            tree,
+            &renderer,
+        );
+        runtime.selected_subagent = None;
+        labels
+    };
+    let initial = labels(&runtime, &mut card_tree);
+    initial.card("Agent", "Working");
+    assert!(!initial.has_text("Starting…"));
+    let selected = selected_labels(&mut runtime, &mut selected_tree);
+    selected.heading("Agent", "Working");
     assert!(
-        initial
+        selected
+            .buttons
             .iter()
-            .any(|label| label.contains("Model not reported")),
-        "{initial:?}"
+            .any(|label| label
+                == "Stop this subagent; the conversation and other subagents carry on")
     );
-    assert!(
-        initial.iter().any(|label| label == "Working"),
-        "{initial:?}"
-    );
-    assert!(
-        !initial.iter().any(|label| label == "Starting…"),
-        "{initial:?}"
-    );
+    let unknown = runtime.native_child_identity(&runtime.snapshot.subagents[0]);
+    assert!(unknown.contains("Claude native subagent") && unknown.contains("Model not reported"));
     let unrelated = runtime.turn_fingerprint(&runtime.turns[1], dark);
+    let relevant = runtime.turn_fingerprint(&runtime.turns[0], dark);
     Arc::make_mut(&mut runtime.snapshot).subagents[0].model = Some("gpt-child-reported".into());
-    let hydrated = labels(&runtime, &mut tree);
+    labels(&runtime, &mut card_tree).card("Agent", "Working");
+    selected_labels(&mut runtime, &mut selected_tree).heading("Agent", "Working");
     assert!(
-        hydrated
-            .iter()
-            .any(|label| label.contains("gpt-child-reported")),
-        "{hydrated:?}"
+        runtime
+            .native_child_identity(&runtime.snapshot.subagents[0])
+            .contains(" · Agent · gpt-child-reported · Working")
     );
+    // Model-only hydration updates intentional metadata, not the compact
+    // card's visual identity or any unrelated retained exchange.
+    assert_eq!(runtime.turn_fingerprint(&runtime.turns[0], dark), relevant);
+    assert_eq!(runtime.turn_fingerprint(&runtime.turns[1], dark), unrelated);
+    Arc::make_mut(&mut runtime.snapshot).subagents[0].kind = "Scout".into();
+    let hydrated = labels(&runtime, &mut card_tree);
+    hydrated.card("Scout", "Working");
     assert!(
-        !hydrated
-            .iter()
-            .any(|label| label.contains("Model not reported")),
-        "{hydrated:?}"
+        !hydrated.has_text("Agent"),
+        "the retained launch card must refresh its actual name"
     );
+    let selected = selected_labels(&mut runtime, &mut selected_tree);
+    selected.heading("Scout", "Working");
+    let identity = runtime.native_child_identity(&runtime.snapshot.subagents[0]);
+    assert!(identity.contains("Claude native subagent · Scout · gpt-child-reported · Working"));
+    assert!(!identity.contains("Model not reported"));
+    assert_ne!(runtime.turn_fingerprint(&runtime.turns[0], dark), relevant);
     assert_eq!(runtime.turn_fingerprint(&runtime.turns[1], dark), unrelated);
     Arc::make_mut(&mut runtime.snapshot).subagents[0].waiting = true;
-    let waiting = labels(&runtime, &mut tree);
+    let waiting = labels(&runtime, &mut card_tree);
+    waiting.card("Scout", "Waiting for you");
     assert!(
-        waiting
+        !waiting
+            .buttons
             .iter()
-            .any(|label| label.contains("Waiting for you")),
-        "{waiting:?}"
+            .any(|label| label == "Show details for Scout (Working)")
     );
+    let selected = selected_labels(&mut runtime, &mut selected_tree);
+    selected.heading("Scout", "Waiting");
     assert!(
-        !waiting.iter().any(|label| label == "Working"),
-        "{waiting:?}"
+        runtime
+            .native_child_identity(&runtime.snapshot.subagents[0])
+            .ends_with(" · Waiting")
     );
     assert_eq!(runtime.turn_fingerprint(&runtime.turns[1], dark), unrelated);
     Arc::make_mut(&mut runtime.snapshot).subagents[0].status = chat::ToolStatus::Stopped;
-    let stopped = labels(&runtime, &mut tree);
-    assert!(
-        stopped.iter().any(|label| label == "Stopped"),
-        "{stopped:?}"
-    );
+    let stopped = labels(&runtime, &mut card_tree);
+    stopped.card("Scout", "Stopped");
     assert!(
         !stopped
+            .buttons
             .iter()
-            .any(|label| label == "Starting…" || label == "Working" || label == "Waiting for you"),
-        "{stopped:?}"
+            .any(|label| label == "Show details for Scout (Working)"
+                || label == "Show details for Scout (Waiting for you)")
+    );
+    let selected = selected_labels(&mut runtime, &mut selected_tree);
+    selected.heading("Scout", "Stopped");
+    assert!(!selected.has_text("Working") && !selected.has_text("Waiting"));
+    assert!(
+        !selected
+            .buttons
+            .iter()
+            .any(|label| label
+                == "Stop this subagent; the conversation and other subagents carry on")
     );
     assert_eq!(runtime.turn_fingerprint(&runtime.turns[1], dark), unrelated);
+}
+
+/// A press belongs to the exact native child and parent connection the user
+/// pressed. Repainting in place must not transfer it to another Stop callback.
+#[test]
+fn selected_native_child_stop_press_cannot_cross_child_target_handle_or_availability() {
+    use iced::advanced::{clipboard, widget::operation};
+    use iced::mouse::{Button, Cursor, Event};
+    const STOP: &str = "Stop this subagent; the conversation and other subagents carry on";
+    fn mount<'a>(
+        runtime: &'a Runtime,
+        shortcuts: &'a crate::settings::KeyboardShortcuts,
+        width: f32,
+        transitioning: bool,
+        cache: Cache,
+        renderer: &mut cosmic::Renderer,
+    ) -> UserInterface<'a, Message, cosmic::Theme, cosmic::Renderer> {
+        let mut ui = UserInterface::build(
+            runtime.view(
+                None,
+                transitioning,
+                true,
+                shortcuts,
+                width,
+                Place {
+                    name: "Fixture".into(),
+                    branch: None,
+                    channel: None,
+                },
+                true,
+                None,
+                Vec::new(),
+            ),
+            Size::new(width, 900.0),
+            cache,
+            renderer,
+        );
+        ui.draw(
+            renderer,
+            &cosmic::theme::active(),
+            &iced::advanced::renderer::Style::default(),
+            Cursor::Unavailable,
+        );
+        ui
+    }
+    fn stop_bounds(
+        ui: &UserInterface<'_, Message, cosmic::Theme, cosmic::Renderer>,
+        width: f32,
+        enabled: bool,
+        title: &str,
+    ) -> iced::Rectangle {
+        let nodes = ui.a11y_nodes(Cursor::Unavailable);
+        let buttons = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter(|node| {
+                node.node().role() == iced_accessibility::accesskit::Role::Button
+                    && node.node().label() == Some(STOP)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(buttons.len(), 1, "one real selected-child Stop");
+        assert_eq!(!buttons[0].node().is_disabled(), enabled);
+        let bounds = buttons[0].node().bounds().expect("mounted Stop geometry");
+        assert!(bounds.x1 > bounds.x0 && bounds.y1 > bounds.y0);
+        assert!(
+            bounds.x0 >= 0.0
+                && bounds.x1 <= f64::from(width)
+                && bounds.y0 >= 0.0
+                && bounds.y1 <= 900.0
+        );
+        for expected in [title, "Working"] {
+            assert!(
+                nodes.root().iter().chain(nodes.children()).any(|node| {
+                    let node = node.node();
+                    (node.value() == Some(expected) || node.label() == Some(expected))
+                        && node.bounds().is_some_and(|b| {
+                            b.x0 >= 0.0
+                                && b.y0 >= 0.0
+                                && b.x1 <= f64::from(width)
+                                && b.y1 <= 900.0
+                                && b.x1 > b.x0
+                                && b.y1 > b.y0
+                        })
+                }),
+                "actual selected heading is readable inside {width}px: {expected}"
+            );
+        }
+        iced::Rectangle {
+            x: bounds.x0 as f32,
+            y: bounds.y0 as f32,
+            width: (bounds.x1 - bounds.x0) as f32,
+            height: (bounds.y1 - bounds.y0) as f32,
+        }
+    }
+    fn pointer(
+        ui: &mut UserInterface<'_, Message, cosmic::Theme, cosmic::Renderer>,
+        renderer: &mut cosmic::Renderer,
+        point: iced::Point,
+        down: bool,
+    ) -> Vec<Message> {
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[iced::Event::Mouse(if down {
+                Event::ButtonPressed(Button::Left)
+            } else {
+                Event::ButtonReleased(Button::Left)
+            })],
+            Cursor::Available(point),
+            renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        messages
+    }
+    fn no_stop(messages: &[Message], expected: Target, down: bool) {
+        // The real composer emits ClearSelection on outside mouse-down, even
+        // while already unfocused. The app's existing blur policy handles it;
+        // this widget-only contract must reject every other callback.
+        assert!((down || messages.is_empty()) && messages.len() <= 1 && messages.iter().all(|message| matches!(message,
+            Message::ChatUi(Action::Composer(target, text_editor::Action::ClearSelection)) if *target == expected)),
+            "only native editor blur may accompany a non-activating press: {messages:?}");
+    }
+    fn exact_stop(messages: &[Message], expected: Target, child: &str) {
+        assert!(
+            matches!(messages, [Message::ChatUi(Action::Command(target, Command::StopSubagent { id }))]
+            if *target == expected && id == child),
+            "{messages:?}"
+        );
+    }
+    for (width, change) in [280.0, 640.0].into_iter().flat_map(|width| {
+        ["unchanged", "child", "target", "handle", "availability"].map(|change| (width, change))
+    }) {
+        let (mut runtime, original_handle) = live_runtime(&[]);
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.capabilities.stop_subagent = true;
+        let title = "Scout · Long reported reviewer name · Long reported reviewer name · Long reported reviewer name · Long reported reviewer name";
+        for id in ["child-a", "child-b"] {
+            snapshot.subagents.push(chat::Subagent {
+                id: id.into(),
+                // Different actual names truncate to the same visible title;
+                // label/geometry equality must never imply action identity.
+                kind: format!("{title} {id}"),
+                description: String::new(),
+                status: chat::ToolStatus::Running,
+                model: None,
+                waiting: false,
+                detail: String::new(),
+                background: true,
+                items: Vec::new(),
+            });
+        }
+        runtime.selected_subagent = Some("child-a".into());
+        let shown_title = Runtime::short_description(title, 80);
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        let mut renderer = crate::app::tests::headless_renderer();
+        let mut ui = mount(
+            &runtime,
+            &shortcuts,
+            width,
+            false,
+            Cache::new(),
+            &mut renderer,
+        );
+        let before = stop_bounds(&ui, width, true, &shown_title);
+        let point = before.center();
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(card_control_id(
+                runtime.target.card,
+                &format!("subagent-stop-{}-child-a", runtime.target.generation),
+            )),
+        );
+        no_stop(
+            &pointer(&mut ui, &mut renderer, point, true),
+            runtime.target,
+            true,
+        );
+        let mut cache = ui.into_cache();
+        match change {
+            "unchanged" => {}
+            "child" => runtime.selected_subagent = Some("child-b".into()),
+            "target" => runtime.target.generation += 1,
+            "handle" => {
+                let replacement = Arc::new(ClientHandle::fixture(
+                    runtime.session.clone(),
+                    (*runtime.snapshot).clone(),
+                ));
+                assert!(!Arc::ptr_eq(&original_handle, &replacement));
+                runtime.connection = Connection::Live(replacement);
+            }
+            "availability" => {
+                let mut ui = mount(&runtime, &shortcuts, width, true, cache, &mut renderer);
+                assert_eq!(stop_bounds(&ui, width, false, &shown_title), before);
+                no_stop(
+                    &pointer(&mut ui, &mut renderer, point, false),
+                    runtime.target,
+                    false,
+                );
+                no_stop(
+                    &pointer(&mut ui, &mut renderer, point, true),
+                    runtime.target,
+                    true,
+                );
+                cache = ui.into_cache();
+            }
+            _ => unreachable!(),
+        }
+        let mut ui = mount(&runtime, &shortcuts, width, false, cache, &mut renderer);
+        assert_eq!(
+            stop_bounds(&ui, width, true, &shown_title),
+            before,
+            "same native hit geometry isolates ownership: {change}"
+        );
+        let released = pointer(&mut ui, &mut renderer, point, false);
+        let selected = runtime.selected_subagent.as_deref().unwrap();
+        if change == "unchanged" {
+            exact_stop(&released, runtime.target, "child-a");
+        } else {
+            no_stop(&released, runtime.target, false);
+        }
+        no_stop(
+            &pointer(&mut ui, &mut renderer, point, true),
+            runtime.target,
+            true,
+        );
+        exact_stop(
+            &pointer(&mut ui, &mut renderer, point, false),
+            runtime.target,
+            selected,
+        );
+        // Capture only widget messages. No Command is dispatched or provider
+        // future polled; both synthetic child statuses remain unchanged.
+        drop(ui);
+        assert!(
+            runtime
+                .snapshot
+                .subagents
+                .iter()
+                .all(|agent| agent.status == chat::ToolStatus::Running)
+        );
+        assert!(runtime.pending.is_none() && runtime.queued.is_none());
+    }
 }
 
 /// Run with the optimized dev-runtime command above. This includes the actual
