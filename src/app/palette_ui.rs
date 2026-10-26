@@ -2073,10 +2073,9 @@ mod tests {
         };
         // listen_with delivers releases whether another native control
         // captured them or left them ignored. Neither status may pin a key.
-        for (captured, cover) in [false, true]
-            .into_iter()
-            .flat_map(|captured| ["none", "approval", "image"].map(|cover| (captured, cover)))
-        {
+        for (captured, cover) in [false, true].into_iter().flat_map(|captured| {
+            ["none", "approval", "image", "update"].map(|cover| (captured, cover))
+        }) {
             let mut app = branch_palette_fixture();
             assert!(
                 app.cards
@@ -2093,7 +2092,34 @@ mod tests {
                 app.terminal_review_input
                     .owns_keyboard(&Event::Keyboard(press.clone()))
             );
+            let fresh_shortcut = keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character("P".into()),
+                modified_key: keyboard::Key::Character("P".into()),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyP),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+                text: None,
+                repeat: false,
+            };
             match cover {
+                "update" => {
+                    // Model an already-admitted update without polling the
+                    // unrelated disk flush; cancellation below is the real reducer.
+                    app.update_prepared = true;
+                    drop(app.update(Message::KeyEvent {
+                        event: fresh_shortcut.clone(),
+                        captured: false,
+                    }));
+                    assert!(
+                        !app.palette.is_open(),
+                        "fresh unowned shortcut stays frozen"
+                    );
+                    assert!(
+                        !app.terminal_review_input
+                            .owns_keyboard(&Event::Keyboard(fresh_shortcut.clone())),
+                        "update freeze must not invent activation ownership"
+                    );
+                }
                 "approval" => open_copy_release_approval(&mut app),
                 "image" => {
                     app.chat_ui.image_viewer = Some(chat_ui::images::Gallery::file(
@@ -2144,6 +2170,30 @@ mod tests {
             assert_eq!(app.terminal_review_revision, review_revision);
             assert!(!app.palette.is_open());
             match cover {
+                "update" => {
+                    assert!(
+                        app.update_prepared,
+                        "key cleanup must not unfreeze the update"
+                    );
+                    let (response, receiver) = std::sync::mpsc::sync_channel(1);
+                    drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
+                        action: instance::UiUpdateAction::Cancel,
+                        response,
+                    })));
+                    assert_eq!(receiver.try_recv().unwrap(), "ok");
+                    assert!(!app.update_prepared);
+                    drop(app.update(Message::KeyEvent {
+                        event: fresh_shortcut.clone(),
+                        captured: false,
+                    }));
+                    assert!(app.palette.is_open(), "fresh shortcut works after rollback");
+                    assert!(
+                        !app.terminal_review_input
+                            .owns_keyboard(&Event::Keyboard(fresh_shortcut)),
+                        "fresh shortcut is not owned by the old activation"
+                    );
+                    drop(app.update_palette(Action::Close));
+                }
                 "approval" => {
                     assert!(
                         app.automation_approval_open(),
