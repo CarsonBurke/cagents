@@ -10348,14 +10348,27 @@ impl Cagents {
                 if kind == completion::Kind::Skill {
                     // The normal editor path maps pending image bookmarks and
                     // leaves attachment identity and the rest of the draft intact.
-                    let cursor = runtime.composer.cursor().position;
-                    let prefix = runtime
-                        .composer
-                        .line(cursor.line)
-                        .and_then(|line| line.text.get(..cursor.column).map(str::to_owned))
-                        .is_some_and(|before| {
-                            before.chars().last().is_some_and(|c| !c.is_whitespace())
-                        });
+                    let replacement = attachment_draft::Bookmark::capture(&runtime.composer);
+                    let prefix = if replacement.valid {
+                        let cursor = replacement.cursor;
+                        let start = cursor
+                            .selection
+                            .filter(|anchor| {
+                                (anchor.line, anchor.column)
+                                    < (cursor.position.line, cursor.position.column)
+                            })
+                            .unwrap_or(cursor.position);
+                        runtime
+                            .composer
+                            .line(start.line)
+                            .and_then(|line| line.text.get(..start.column)?.chars().next_back())
+                            .is_some_and(|before| !before.is_whitespace())
+                    } else {
+                        // A native word/line selection may expose an ambiguous
+                        // anchor. A separator is safe without guessing its span;
+                        // the native Paste still owns the exact replacement.
+                        true
+                    };
                     let insertion = format!("{}{} ", if prefix { " " } else { "" }, insertion);
                     return Task::batch([
                         self.handle_chat_ui(Action::Composer(
@@ -24628,6 +24641,254 @@ mod tests {
             runtime.composer.cursor().position.column,
             "Review 🦀 $review ".len()
         );
+    }
+
+    fn skill_selection_action(app: &mut Cagents, target: Target, action: text_editor::Action) {
+        let task = app.handle_chat_ui(Action::Composer(target, action));
+        assert_eq!(task.units(), 0, "native selection schedules no effects");
+        drop(task);
+    }
+
+    #[test]
+    fn plus_skill_replacement_uses_selection_start_in_both_multiline_directions() {
+        let _admission = attachment_draft::test_admission();
+        chat::attachment_assets::with_test_image(|image| {
+            let token = image.reference.as_ref().unwrap().token();
+            for provider in [Provider::Codex, Provider::Omp] {
+                let invocation = if provider == Provider::Codex {
+                    "$review"
+                } else {
+                    "/skill:review"
+                };
+                for (text, start_steps, selected, end_column) in [
+                    ("α🦀XYZ\n tail", 2, "XYZ\n ", 1),
+                    ("α🦀 XYZ\n🙂tail", 3, "XYZ\n🙂", "🙂".len()),
+                ] {
+                    for reverse in [false, true] {
+                        let mut app = crate::app::tests::context_inspector_test_app(false);
+                        let card =
+                            live_chat_for_provider(&mut app, provider, Some("plus-selection"));
+                        app.workspace.focus(card).unwrap();
+                        let target = chat_runtime(&app, card).target;
+                        let runtime = app.chat_runtime_mut(target).unwrap();
+                        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+                        snapshot.skills = vec![chat::Skill {
+                            name: "review".into(),
+                            description: "Review changes".into(),
+                            invocation: invocation.into(),
+                        }];
+                        snapshot.skill_reach = if provider == Provider::Omp {
+                            chat::SkillReach::First
+                        } else {
+                            chat::SkillReach::Anywhere
+                        };
+                        runtime.replace_draft(text_editor::Content::with_text(&format!(
+                            "{text} {token} retained"
+                        )));
+                        runtime.merge_attachments([image.clone()]);
+                        skill_selection_action(
+                            &mut app,
+                            target,
+                            text_editor::Action::Move(text_editor::Motion::DocumentEnd),
+                        );
+                        let pending = app
+                            .chat_runtime_mut(target)
+                            .unwrap()
+                            .begin_attachment_insert();
+                        skill_selection_action(
+                            &mut app,
+                            target,
+                            text_editor::Action::Move(text_editor::Motion::DocumentStart),
+                        );
+                        for _ in 0..start_steps + if reverse { 5 } else { 0 } {
+                            skill_selection_action(
+                                &mut app,
+                                target,
+                                text_editor::Action::Move(text_editor::Motion::Right),
+                            );
+                        }
+                        for _ in 0..5 {
+                            skill_selection_action(
+                                &mut app,
+                                target,
+                                text_editor::Action::Select(if reverse {
+                                    text_editor::Motion::Left
+                                } else {
+                                    text_editor::Motion::Right
+                                }),
+                            );
+                        }
+                        let runtime = chat_runtime(&app, card);
+                        assert_eq!(runtime.composer.selection().as_deref(), Some(selected));
+                        let start = text_editor::Position {
+                            line: 0,
+                            column: if start_steps == 2 {
+                                "α🦀".len()
+                            } else {
+                                "α🦀 ".len()
+                            },
+                        };
+                        let end = text_editor::Position {
+                            line: 1,
+                            column: end_column,
+                        };
+                        assert_eq!(
+                            runtime.composer.cursor(),
+                            text_editor::Cursor {
+                                position: if reverse { start } else { end },
+                                selection: Some(if reverse { end } else { start }),
+                            }
+                        );
+                        assert!(attachment_draft::Bookmark::capture(&runtime.composer).valid);
+                        let revision = runtime.revision;
+                        let next_command = runtime.next_command;
+                        drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
+                        drop(
+                            app.handle_chat_ui(Action::ComposerActionsQuery(
+                                target,
+                                "review".into(),
+                            )),
+                        );
+                        let task =
+                            app.handle_chat_ui(Action::ComposerAction(target, invocation.into()));
+                        assert_eq!(
+                            task.units(),
+                            1,
+                            "inserting a skill only returns editor focus"
+                        );
+                        drop(task);
+                        let runtime = chat_runtime(&app, card);
+                        let expected = format!("α🦀 {invocation} tail {token} retained");
+                        assert_eq!(
+                            runtime.composer.text(),
+                            expected,
+                            "{provider:?}, reverse={reverse}, selection={selected:?}"
+                        );
+                        assert!(runtime.composer.cursor().selection.is_none());
+                        assert_eq!(runtime.attachments, [image.clone()]);
+                        assert_eq!(runtime.revision, revision.wrapping_add(1));
+                        assert_eq!(runtime.next_command, next_command);
+                        assert!(!runtime.composer_actions);
+                        assert!(
+                            runtime.pending.is_none()
+                                && runtime.queued.is_none()
+                                && runtime.followups.is_empty()
+                        );
+                        assert_eq!(
+                            expected
+                                .split_whitespace()
+                                .filter(|word| *word == invocation)
+                                .count(),
+                            1,
+                            "the provider invocation remains a standalone token"
+                        );
+                        assert!(
+                            completion::unloaded(
+                                &expected,
+                                &runtime.snapshot.skills,
+                                runtime.snapshot.skill_reach
+                            )
+                            .is_empty()
+                        );
+                        assert!(pending.active());
+                        assert!(runtime.attachment_ticket(pending.id).is_some());
+                        let mapped = &runtime.attachment_bookmarks[&pending.id];
+                        assert!(mapped.valid);
+                        assert_eq!(
+                            mapped.cursor,
+                            text_editor::Cursor {
+                                position: text_editor::Position {
+                                    line: 0,
+                                    column: expected.len()
+                                },
+                                selection: None,
+                            },
+                            "the unrelated pending image follows the actual replacement"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn plus_skill_ambiguous_native_word_selection_still_replaces_without_sending() {
+        chat::attachment_assets::with_test_image(|image| {
+            let token = image.reference.as_ref().unwrap().token();
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat_for_provider(&mut app, Provider::Omp, Some("plus-word-selection"));
+            app.workspace.focus(card).unwrap();
+            let target = chat_runtime(&app, card).target;
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            let snapshot = Arc::make_mut(&mut runtime.snapshot);
+            snapshot.skills = vec![chat::Skill {
+                name: "review".into(),
+                description: "Review changes".into(),
+                invocation: "/skill:review".into(),
+            }];
+            snapshot.skill_reach = chat::SkillReach::First;
+            runtime.replace_draft(text_editor::Content::with_text(&format!(
+                "{token} 中中中 tail"
+            )));
+            runtime.merge_attachments([image.clone()]);
+            skill_selection_action(
+                &mut app,
+                target,
+                text_editor::Action::Move(text_editor::Motion::DocumentStart),
+            );
+            for _ in 0..token.chars().count() + 2 {
+                skill_selection_action(
+                    &mut app,
+                    target,
+                    text_editor::Action::Move(text_editor::Motion::Right),
+                );
+            }
+            skill_selection_action(&mut app, target, text_editor::Action::SelectWord);
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(
+                runtime.composer.cursor().position.column,
+                token.len() + 1 + "中".len()
+            );
+            assert_eq!(runtime.composer.selection().as_deref(), Some("中中"));
+            assert!(
+                !attachment_draft::Bookmark::capture(&runtime.composer).valid,
+                "the native repeated-word span cannot be inferred from its exposed anchor"
+            );
+            let revision = runtime.revision;
+            let next_command = runtime.next_command;
+            drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
+            drop(app.handle_chat_ui(Action::ComposerActionsQuery(target, "review".into())));
+            let task = app.handle_chat_ui(Action::ComposerAction(target, "/skill:review".into()));
+            assert_eq!(task.units(), 1, "only return focus, never start a provider");
+            drop(task);
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(
+                runtime.composer.text(),
+                format!("{token}  /skill:review 中 tail"),
+                "native word selection replaces its first two characters and preserves the remainder"
+            );
+            assert!(runtime.composer.cursor().selection.is_none());
+            assert_eq!(runtime.attachments, [image]);
+            let text = runtime.composer.text();
+            assert_eq!(
+                text.split_whitespace()
+                    .filter(|word| *word == "/skill:review")
+                    .count(),
+                1
+            );
+            assert!(
+                completion::unloaded(&text, &runtime.snapshot.skills, chat::SkillReach::First)
+                    .is_empty()
+            );
+            assert_eq!(runtime.revision, revision.wrapping_add(1));
+            assert_eq!(runtime.next_command, next_command);
+            assert!(
+                runtime.pending.is_none()
+                    && runtime.queued.is_none()
+                    && runtime.followups.is_empty()
+            );
+            assert!(runtime.error.is_none());
+        });
     }
 
     #[test]
