@@ -239,7 +239,7 @@ fn dictation_control_native_escape_cancels_without_agent_interrupt() {
     use iced::advanced::{clipboard, widget::operation};
     use iced::runtime::{UserInterface, user_interface::Cache};
     let mut renderer = crate::app::tests::headless_renderer();
-    for control in ["chat-dictation-stop", "chat-dictation-cancel"] {
+    for stop in [true, false] {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some("dictation-control-escape"));
         let target = chat_runtime(&app, card).target;
@@ -262,7 +262,11 @@ fn dictation_control_native_escape_cancels_without_agent_interrupt() {
             );
             ui.operate(
                 &renderer,
-                &mut operation::focusable::focus::<()>(card_control_id(card, control)),
+                &mut operation::focusable::focus::<()>(if stop {
+                    dictation::Action::StopRecording(ticket.clone()).control_id(target)
+                } else {
+                    dictation::Action::Cancel(ticket.clone()).control_id(target)
+                }),
             );
             let mut messages = Vec::new();
             ui.update(
@@ -462,4 +466,176 @@ fn replaced_draft_rejects_queued_idle_start_epoch() {
     drop(app.handle_chat_ui(queued));
     assert!(!app.chat_ui.dictation_setup.shown(target));
     assert_eq!(chat_runtime(&app, card).composer.text(), "new draft");
+}
+
+#[test]
+fn native_record_press_and_focus_do_not_cross_operations_without_intermediate_frame() {
+    use iced::advanced::{
+        clipboard,
+        widget::{Operation, operation},
+    };
+    use iced::runtime::{UserInterface, user_interface::Cache};
+    #[derive(Default)]
+    struct Focus(Option<widget::Id>);
+    impl Operation for Focus {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn focusable(
+            &mut self,
+            id: Option<&widget::Id>,
+            _: iced::Rectangle,
+            state: &mut dyn operation::Focusable,
+        ) {
+            if state.is_focused() {
+                self.0 = id.cloned();
+            }
+        }
+    }
+    let mut renderer = crate::app::tests::headless_renderer();
+    let viewport = iced::Size::new(620.0, 720.0);
+    for stop in [true, false] {
+        for replace in [true, false] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some("dictation-held-press"));
+            let target = chat_runtime(&app, card).target;
+            let first = capture(&mut app, target);
+            app.chat_runtime_mut(target).unwrap().dictation.progress(
+                target,
+                &first,
+                crate::speech::Phase::Recording,
+                Instant::now(),
+            );
+            let control = |ticket: crate::speech::Ticket<Target>| {
+                if stop {
+                    dictation::Action::StopRecording(ticket)
+                } else {
+                    dictation::Action::Cancel(ticket)
+                }
+            };
+            let label = if stop {
+                "Finish dictation recording and transcribe"
+            } else {
+                "Cancel dictation and discard recording (Esc)"
+            };
+            let (cache, pointer) = {
+                let mut ui = UserInterface::build(
+                    app.chat_view(card),
+                    viewport,
+                    Cache::new(),
+                    &mut renderer,
+                );
+                let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+                let bounds = nodes
+                    .root()
+                    .iter()
+                    .chain(nodes.children())
+                    .find(|node| {
+                        node.node().role() == iced_accessibility::accesskit::Role::Button
+                            && node.node().label() == Some(label)
+                    })
+                    .unwrap()
+                    .node()
+                    .bounds()
+                    .unwrap();
+                let pointer = iced::Point::new(
+                    ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                    ((bounds.y0 + bounds.y1) / 2.0) as f32,
+                );
+                let mut messages = Vec::new();
+                ui.update(
+                    &[iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                        iced::mouse::Button::Left,
+                    ))],
+                    iced::mouse::Cursor::Available(pointer),
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                assert!(
+                    messages.is_empty(),
+                    "release owns the native control action"
+                );
+                let id = control(first.clone()).control_id(target);
+                ui.operate(
+                    &renderer,
+                    &mut operation::focusable::focus::<()>(id.clone()),
+                );
+                let mut focused = Focus::default();
+                ui.operate(&renderer, &mut focused);
+                assert_eq!(focused.0, Some(id));
+                (ui.into_cache(), pointer)
+            };
+            let current = if replace {
+                drop(app.handle_dictation(target, dictation::Action::Cancel(first.clone())));
+                let second = capture(&mut app, target);
+                app.chat_runtime_mut(target).unwrap().dictation.progress(
+                    target,
+                    &second,
+                    crate::speech::Phase::Recording,
+                    Instant::now(),
+                );
+                second
+            } else {
+                first
+            };
+            let mut ui = UserInterface::build(app.chat_view(card), viewport, cache, &mut renderer);
+            let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+            let bounds = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|node| {
+                    node.node().role() == iced_accessibility::accesskit::Role::Button
+                        && node.node().label() == Some(label)
+                })
+                .unwrap()
+                .node()
+                .bounds()
+                .unwrap();
+            assert!(
+                f64::from(pointer.x) >= bounds.x0
+                    && f64::from(pointer.x) <= bounds.x1
+                    && f64::from(pointer.y) >= bounds.y0
+                    && f64::from(pointer.y) <= bounds.y1,
+                "same actual control geometry is required; a moved target cannot explain rejection"
+            );
+            let mut focused = Focus::default();
+            ui.operate(&renderer, &mut focused);
+            assert_eq!(
+                focused.0,
+                (!replace).then(|| control(current.clone()).control_id(target))
+            );
+            let mut messages = Vec::new();
+            ui.update(
+                &[iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                ))],
+                iced::mouse::Cursor::Available(pointer),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            let invoked = messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::ChatUi(Action::Dictation(
+                        _,
+                        dictation::Action::StopRecording(ticket)
+                        | dictation::Action::Cancel(ticket),
+                    )) => Some(ticket),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if replace {
+                assert!(invoked.is_empty(), "A's held native press cannot invoke B");
+            } else {
+                assert_eq!(
+                    invoked,
+                    vec![&current],
+                    "same-operation held press remains usable"
+                );
+            }
+        }
+    }
 }

@@ -32,6 +32,38 @@ pub(super) enum Action {
     Finished(Delivery),
 }
 impl Action {
+    /// Native pressed/focus state belongs to the same exact owner as the
+    /// message. A new custom ID makes Iced recreate that button's real State,
+    /// even when A→B skips an intermediate view frame.
+    pub(super) fn control_id(&self, target: Target) -> super::widget::Id {
+        let (role, operation) = match self {
+            Self::Start { epoch, prepared } => (
+                if *prepared {
+                    "microphone"
+                } else {
+                    "microphone-setup"
+                },
+                *epoch,
+            ),
+            Self::StopRecording(ticket) => ("record-stop", ticket.operation()),
+            Self::Cancel(ticket) => ("record-cancel", ticket.operation()),
+            Self::InsertRetained(ticket) => ("retained-insert", ticket.operation()),
+            Self::DiscardRetained(ticket) => ("retained-discard", ticket.operation()),
+            Self::Install(presentation) => ("setup-install", *presentation),
+            Self::DismissSetup(presentation) => ("setup-dismiss", *presentation),
+            Self::CancelSetup(ticket) => ("setup-cancel", ticket.0),
+            Self::Progress(..)
+            | Self::Finished(..)
+            | Self::SetupProgress(..)
+            | Self::SetupFinished(..) => {
+                unreachable!("async dictation message is not a native control")
+            }
+        };
+        super::card_control_id(
+            target.card,
+            &format!("dictation-{}-{role}-{operation}", target.generation),
+        )
+    }
     pub fn asynchronous(&self) -> bool {
         matches!(
             self,
@@ -687,11 +719,7 @@ impl super::Runtime {
                       action: Action,
                       enabled: bool|
          -> super::Element<'a, super::Message> {
-            let id = if matches!(action, Action::StopRecording(_)) {
-                "chat-dictation-stop"
-            } else {
-                "chat-dictation-cancel"
-            };
+            let id = action.control_id(target);
             let cancel = match &action {
                 Action::StopRecording(ticket) | Action::Cancel(ticket) => ticket.clone(),
                 _ => unreachable!("active dictation control"),
@@ -699,7 +727,7 @@ impl super::Runtime {
             crate::interaction::focused_escape(
                 crate::ui_controls::icon_button(icon, label)
                     .compact()
-                    .id(super::card_control_id(target.card, id))
+                    .id(id)
                     .on_press_maybe(
                         enabled.then_some(super::action(ChatAction::Dictation(target, action))),
                     ),
@@ -740,33 +768,30 @@ impl super::Runtime {
                     true,
                 ),
             ],
-            None => vec![
-                crate::ui_controls::icon_button(
-                    Icon::Microphone,
-                    if setup.is_some_and(|setup| setup.prepared().is_some()) {
-                        "Start local dictation"
-                    } else {
-                        "Set up local dictation"
-                    },
-                )
-                .compact()
-                .id(super::card_control_id(
-                    target.card,
-                    "chat-dictation-microphone",
-                ))
-                .on_press_maybe(
-                    (available && self.dictation.retained_reason().is_none()).then(|| {
-                        action(ChatAction::Dictation(
-                            target,
-                            Action::Start {
-                                epoch: self.dictation.epoch(),
-                                prepared: setup.is_some_and(|setup| setup.prepared().is_some()),
-                            },
-                        ))
-                    }),
-                )
-                .into(),
-            ],
+            None => {
+                let prepared = setup.is_some_and(|setup| setup.prepared().is_some());
+                let start = Action::Start {
+                    epoch: self.dictation.epoch(),
+                    prepared,
+                };
+                vec![
+                    crate::ui_controls::icon_button(
+                        Icon::Microphone,
+                        if prepared {
+                            "Start local dictation"
+                        } else {
+                            "Set up local dictation"
+                        },
+                    )
+                    .compact()
+                    .id(start.control_id(target))
+                    .on_press_maybe(
+                        (available && self.dictation.retained_reason().is_none())
+                            .then(|| action(ChatAction::Dictation(target, start))),
+                    )
+                    .into(),
+                ]
+            }
         }
     }
     pub(super) fn dictation_notice<'a>(
@@ -781,6 +806,7 @@ impl super::Runtime {
                       enabled: bool|
          -> super::Element<'a, super::Message> {
             crate::ui_controls::button::secondary(label)
+                .id(operation.control_id(target))
                 .on_press_maybe(enabled.then_some(action(ChatAction::Dictation(target, operation))))
                 .into()
         };
