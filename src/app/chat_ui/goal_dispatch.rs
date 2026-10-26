@@ -948,6 +948,24 @@ mod tests {
             }
         }
         let (mut app, card, target) = live();
+        // Mount the card through the same viewport event as the real UI before
+        // asking its presentation which native Goal controls can take focus.
+        drop(app.update(Message::WorkspaceViewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1_600.0),
+        }));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        // Exposure requests history asynchronously. Deliver the fixture's
+        // original full publication, then its real wake, before using it.
+        let hydrated = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+        publish(&mut app, card, hydrated);
+        let rt = runtime(&app, card);
+        assert!(rt.snapshot.ready);
+        assert_eq!(rt.snapshot.goal, rt.handle().unwrap().snapshot().goal);
+        assert!(rt.goal_presentation().current);
         write(&mut app, target, "ordinary unsent draft");
         let before = runtime(&app, card).composer.text();
         drop(app.handle_chat_ui(Action::GoalPanel(target, true)));
@@ -1543,6 +1561,38 @@ mod tests {
     fn native_goal_activity_blocks_automatic_account_handoff_between_turns_without_faking_turn_busy()
      {
         let (mut app, card, target) = live();
+        // Ready behind an unmeasured workspace deliberately keeps its old
+        // presentation. Real exposure must hydrate it before an idle routing
+        // positive can distinguish Goal activity from ordinary loading.
+        drop(app.update(Message::WorkspaceViewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1_600.0),
+        }));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        // Exposure requests history asynchronously. Deliver the fixture's
+        // original full publication, then its real wake, before using it.
+        let hydrated = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+        publish(&mut app, card, hydrated);
+        let rt = runtime(&app, card);
+        assert!(rt.snapshot.ready && !rt.snapshot.busy && !rt.disconnected);
+        assert_eq!(rt.snapshot.goal, rt.handle().unwrap().snapshot().goal);
+        assert!(rt.goal_presentation().current);
+        assert_eq!(
+            rt.session
+                .launch
+                .recipe
+                .environment
+                .get(account::routing::AUTOMATIC_MARKER)
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            app.chat_account(Provider::Codex, &rt.session.launch.recipe),
+            Some(Account::system(Provider::Codex).id())
+        );
         let alternate = app.account_ui.add_managed_fixture(Provider::Codex, 106);
         let now = chat::now_ms().unwrap();
         for (id, status) in [
@@ -1565,6 +1615,12 @@ mod tests {
                 })),
             );
         }
+        assert_eq!(
+            app.automatic_account(&Account::system(Provider::Codex))
+                .map(|account| account.id()),
+            Some(alternate.clone()),
+            "current quota and identity evidence offers this alternate before Goal policy"
+        );
         write(&mut app, target, "ordinary unsent message");
         assert_eq!(
             app.automatic_chat_account(target, PromptMode::Send)
