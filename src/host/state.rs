@@ -4331,7 +4331,7 @@ fn start_terminal_view_owned_reserved(
         rows: options.rows,
         cell_width_px: options.cell_width_px,
         cell_height_px: options.cell_height_px,
-        max_scrollback: options.max_scrollback,
+        max_scrollback_bytes: options.max_scrollback_bytes,
         initially_visible: options.initially_visible,
         theme: options.theme,
         execution_environment,
@@ -4728,7 +4728,7 @@ fn validate_spawn_options(options: &TerminalSpawnOptions) -> Result<(), Protocol
         || !(1..=500).contains(&options.rows)
         || !(1..=4096).contains(&options.cell_width_px)
         || !(1..=4096).contains(&options.cell_height_px)
-        || options.max_scrollback > 1_000_000
+        || options.max_scrollback_bytes > TerminalConfig::MAX_SCROLLBACK_BYTES
     {
         return Err(ProtocolError::new(
             ProtocolErrorCode::InvalidRequest,
@@ -5080,6 +5080,36 @@ mod tests {
 
     fn test_host() -> HostState {
         test_host_with_incarnation("test-incarnation")
+    }
+
+    #[test]
+    fn terminal_spawn_accepts_byte_budgets_and_refuses_over_limit_before_spawn() {
+        assert_eq!(
+            TerminalSpawnOptions::default().max_scrollback_bytes,
+            16 * 1024 * 1024
+        );
+        for bytes in [0, 16 * 1024 * 1024, TerminalConfig::MAX_SCROLLBACK_BYTES] {
+            let options = TerminalSpawnOptions {
+                max_scrollback_bytes: bytes,
+                ..Default::default()
+            };
+            validate_spawn_options(&options).unwrap();
+        }
+        let error = validate_spawn_options(&TerminalSpawnOptions {
+            max_scrollback_bytes: TerminalConfig::MAX_SCROLLBACK_BYTES + 1,
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+        assert!(!error.retryable);
+        // A byte budget does not relax any independent dimension guard.
+        assert!(
+            validate_spawn_options(&TerminalSpawnOptions {
+                columns: 0,
+                ..Default::default()
+            })
+            .is_err()
+        );
     }
 
     #[test]
