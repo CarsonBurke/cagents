@@ -915,7 +915,7 @@ or `/goal status` to open the goal panel and check its current state. Use
 first word is not a control name. Objectives can contain up to 4,000 Unicode
 characters. Explicit `set` also permits an objective such as `pause`.
 
-The panel shows the provider's objective, status, tokens and elapsed time.
+The panel shows the provider's objective, status, tokens and reported time used.
 **Check**, **Pause**, **Resume** and **Clear** act on that same conversation;
 `/goal pause`, `/goal resume` and `/goal clear` expose the same controls.
 Pause and Clear do not interrupt an already running turn; use the ordinary
