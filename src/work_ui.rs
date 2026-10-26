@@ -68,12 +68,13 @@ pub enum Watch {
     /// A board, and whether it is the first of its connection, whose
     /// revisions start where that daemon's do.
     Board {
+        epoch: u64,
         revision: u64,
         board: Arc<Board>,
         first: bool,
     },
     /// The subscription failed and is being retried.
-    Lost(String),
+    Lost { epoch: u64, error: String },
 }
 
 #[derive(Debug, Clone)]
@@ -148,6 +149,11 @@ pub struct State {
     /// Each card's searchable text, lowercase, in board order.
     search: Vec<String>,
     revision: u64,
+    /// Never reused, including across closing/reopening this pane.
+    watch_epoch: u64,
+    listening: bool,
+    /// Retained rows are historical until this listener receives a board.
+    awaiting_current: bool,
     /// Why the subscription is down, while it is retried.
     lost: Option<String>,
     scope: Option<PathBuf>,
@@ -169,20 +175,46 @@ impl State {
     pub fn reset(&mut self) {
         let scope = self.scope.take();
         let layout = self.layout;
+        let watch_epoch = self.watch_epoch;
         *self = Self {
             scope,
             layout,
+            watch_epoch,
             ..Self::default()
         };
+    }
+
+    /// Synchronize actual visible demand before the first subscription and
+    /// after every application update. Suspending never cancels explicit work.
+    pub fn set_listening(&mut self, enabled: bool) {
+        if self.listening == enabled {
+            return;
+        }
+        self.listening = false;
+        self.awaiting_current = false;
+        self.lost = None;
+        if enabled && let Some(epoch) = self.watch_epoch.checked_add(1) {
+            self.watch_epoch = epoch;
+            self.listening = true;
+            self.awaiting_current = true;
+        }
+    }
+
+    pub fn listening_epoch(&self) -> Option<u64> {
+        self.listening.then_some(self.watch_epoch)
     }
 
     pub fn update(&mut self, action: Action) -> Option<Effect> {
         match action {
             Action::Watched(Watch::Board {
+                epoch,
                 revision,
                 board,
                 first,
             }) => {
+                if self.listening_epoch() != Some(epoch) {
+                    return None;
+                }
                 // A board pushed while the subscription was answered can
                 // arrive before the answer; the newer one stands.
                 if first || revision > self.revision {
@@ -214,11 +246,16 @@ impl State {
                     self.confirmed = Some(board.clone());
                     self.board = Some(board);
                     self.lost = None;
+                    self.awaiting_current = false;
                 }
                 None
             }
-            Action::Watched(Watch::Lost(error)) => {
+            Action::Watched(Watch::Lost { epoch, error }) => {
+                if self.listening_epoch() != Some(epoch) {
+                    return None;
+                }
                 self.lost = Some(error);
+                self.awaiting_current = true;
                 None
             }
             Action::Tick => {
@@ -394,6 +431,12 @@ impl State {
     }
 
     fn waiting(&self) -> Element<'_, Action> {
+        if !self.listening && self.watch_epoch == u64::MAX {
+            return placeholder("Work updates cannot restart")
+                .icon(Icon::Warning.handle())
+                .detail("Reopen this window to watch the Work board again.")
+                .into();
+        }
         match &self.lost {
             Some(error) => placeholder("The Work board is unavailable")
                 .icon(Icon::Warning.handle())
@@ -550,6 +593,14 @@ impl State {
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .into(),
         ];
+        if self.awaiting_current {
+            parts.push(design::caption("Updating Work…").into());
+        }
+        if !self.listening && self.watch_epoch == u64::MAX {
+            parts.push(warning(
+                "Work updates cannot restart; reopen this window.".to_owned(),
+            ));
+        }
         if let Some(error) = &self.lost {
             parts.push(warning(format!("Disconnected: {error}")));
         }
@@ -1872,7 +1923,9 @@ mod tests {
     }
 
     fn watched(state: &mut State, revision: u64, board: Arc<Board>) {
+        state.set_listening(true);
         state.update(Action::Watched(Watch::Board {
+            epoch: state.listening_epoch().unwrap(),
             revision,
             board,
             first: false,
@@ -1880,7 +1933,9 @@ mod tests {
     }
 
     fn connected(state: &mut State, revision: u64, board: Arc<Board>) {
+        state.set_listening(true);
         state.update(Action::Watched(Watch::Board {
+            epoch: state.listening_epoch().unwrap(),
             revision,
             board,
             first: true,
@@ -1998,6 +2053,181 @@ mod tests {
         assert_eq!(
             age(30 * 24 * 60 * minute, 27 * 24 * 60 * minute, false),
             "3d"
+        );
+    }
+
+    fn current_view_labels(state: &State) -> Vec<String> {
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut ui = Ui::build(
+            state.view(),
+            iced::Size::new(800.0, 800.0),
+            iced::runtime::user_interface::Cache::new(),
+            &mut renderer,
+        );
+        draw(&mut ui, &mut renderer);
+        labels(&ui)
+    }
+
+    #[test]
+    fn hidden_listener_cannot_publish_old_first_or_lost_and_reveal_waits_for_current_board() {
+        let mut state = State::default();
+        assert_eq!(state.listening_epoch(), None);
+        state.set_listening(true);
+        let original = state.listening_epoch().unwrap();
+        connected(
+            &mut state,
+            10,
+            board(vec![item("feat/original", "cagents")]),
+        );
+        assert!(!state.awaiting_current);
+        state.update(Action::Query("feat".into()));
+        state.update(Action::Layout(Layout::List));
+        assert!(matches!(
+            state.update(Action::Refresh),
+            Some(Effect::Refresh)
+        ));
+        let card = CardRef::of(&state.board.as_ref().unwrap().items[0]);
+        assert!(matches!(
+            state.update(Action::Pin(card.clone(), Some(Column::Stale))),
+            Some(Effect::Pin {
+                column: Some(Column::Stale),
+                ..
+            })
+        ));
+        let retained = state.board.clone().unwrap();
+        let old_first = Watch::Board {
+            epoch: original,
+            revision: 1_000,
+            board: board(vec![item("wrong", "elsewhere")]),
+            first: true,
+        };
+        state.set_listening(false);
+        state.update(Action::Watched(old_first.clone()));
+        state.update(Action::Watched(Watch::Lost {
+            epoch: original,
+            error: "old hidden connection".into(),
+        }));
+        assert!(Arc::ptr_eq(state.board.as_ref().unwrap(), &retained));
+        assert_eq!(state.listening_epoch(), None);
+        assert!(state.lost.is_none());
+        assert!(state.refreshing);
+
+        state.set_listening(true);
+        let current = state.listening_epoch().unwrap();
+        assert!(current > original);
+        state.set_listening(true);
+        assert_eq!(state.listening_epoch(), Some(current));
+        state.update(Action::Watched(old_first));
+        state.update(Action::Watched(Watch::Lost {
+            epoch: original,
+            error: "old queued failure".into(),
+        }));
+        assert!(Arc::ptr_eq(state.board.as_ref().unwrap(), &retained));
+        assert_eq!(state.item(&card).unwrap().column, Column::Stale);
+        assert!(state.refreshing);
+        assert_eq!(state.query, "feat");
+        assert_eq!(state.layout, Layout::List);
+        assert!(state.lost.is_none());
+        assert!(state.awaiting_current);
+        assert!(
+            current_view_labels(&state)
+                .iter()
+                .any(|label| label == "Updating Work…")
+        );
+
+        // A real current first reply can reset the daemon's revision. An old
+        // first reply cannot impersonate it even with a larger revision.
+        state.update(Action::Watched(Watch::Board {
+            epoch: current,
+            revision: 1,
+            board: board(vec![item("feat/current", "cagents")]),
+            first: true,
+        }));
+        assert_eq!(state.revision, 1);
+        assert_eq!(
+            state.visible().map(Item::label).collect::<Vec<_>>(),
+            ["feat/current"]
+        );
+        assert!(!state.awaiting_current);
+        assert!(
+            state.refreshing,
+            "visibility does not finish an explicit request"
+        );
+        assert!(
+            !current_view_labels(&state)
+                .iter()
+                .any(|label| label == "Updating Work…")
+        );
+        state.update(Action::Refreshed(Ok(())));
+        assert!(!state.refreshing);
+        state.update(Action::Pinned(Err("original pin refused".into())));
+        assert_eq!(state.error.as_deref(), Some("original pin refused"));
+        assert_eq!(
+            state.visible().map(Item::label).collect::<Vec<_>>(),
+            ["feat/current"]
+        );
+
+        state.update(Action::Watched(Watch::Lost {
+            epoch: current,
+            error: "current connection lost".into(),
+        }));
+        assert!(state.awaiting_current);
+        let shown = current_view_labels(&state);
+        assert!(shown.iter().any(|label| label == "Updating Work…"));
+        assert!(
+            shown
+                .iter()
+                .any(|label| label.contains("current connection lost"))
+        );
+        connected(
+            &mut state,
+            1,
+            board(vec![item("feat/reconnected", "cagents")]),
+        );
+        assert!(!state.awaiting_current);
+        assert!(state.lost.is_none());
+        assert_eq!(state.error.as_deref(), Some("original pin refused"));
+    }
+
+    #[test]
+    fn closing_and_exhausted_listener_epochs_never_reuse_queued_publication_authority() {
+        let mut state = State::default();
+        connected(&mut state, 1, board(vec![item("original", "cagents")]));
+        let first = state.listening_epoch().unwrap();
+        state.reset();
+        assert_eq!(state.listening_epoch(), None);
+        assert!(state.board.is_none());
+        state.set_listening(true);
+        let next = state.listening_epoch().unwrap();
+        assert!(next > first);
+        state.update(Action::Watched(Watch::Board {
+            epoch: first,
+            revision: 99,
+            board: board(vec![item("old closed pane", "cagents")]),
+            first: true,
+        }));
+        assert!(state.board.is_none());
+
+        // Exercise the checked boundary without looping or wrapping a token.
+        state.set_listening(false);
+        state.watch_epoch = u64::MAX - 1;
+        state.set_listening(true);
+        assert_eq!(state.listening_epoch(), Some(u64::MAX));
+        connected(&mut state, 1, board(vec![item("last epoch", "cagents")]));
+        state.reset();
+        state.set_listening(true);
+        assert_eq!(state.listening_epoch(), None);
+        state.update(Action::Watched(Watch::Board {
+            epoch: u64::MAX,
+            revision: 2,
+            board: board(vec![item("must not return", "cagents")]),
+            first: true,
+        }));
+        assert!(state.board.is_none());
+        assert!(
+            current_view_labels(&state)
+                .iter()
+                .any(|label| label == "Work updates cannot restart")
         );
     }
 }
