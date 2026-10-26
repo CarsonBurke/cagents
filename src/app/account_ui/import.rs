@@ -34,6 +34,9 @@ pub struct Target {
 pub enum Failure {
     Unavailable,
     Changed,
+    /// Only Prepare's local target validation, before device_operation.
+    /// A remote error, lost reply, Status or Verify can never produce this.
+    PrepareNotSent,
     Invalid,
     Journal,
 }
@@ -45,6 +48,9 @@ impl Failure {
             }
             Self::Changed => {
                 "The selected device or installation changed. No replacement operation was sent."
+            }
+            Self::PrepareNotSent => {
+                "Preparation was not sent because the destination changed. Inspect the staged file again before preparing a new import."
             }
             Self::Invalid => {
                 "The device returned inconsistent import metadata. Preserve the original operation."
@@ -277,6 +283,22 @@ impl State {
                     "Inspection did not return a result. Inspect again explicitly; no import was prepared.",
                 );
             }
+            Err(Failure::PrepareNotSent)
+                if matches!(&kind, RequestKind::Prepare(plan, _) if self.plan.as_ref() == Some(plan))
+                    && self.status.is_none() =>
+            {
+                // This fresh operation never crossed the dispatch boundary.
+                // Keep user input/consent, but require a new inspection and
+                // invalidate held controls before another explicit Prepare.
+                self.plan = None;
+                self.inspection = None;
+                self.local_uncertain = false;
+                self.rotate_owner();
+                self.problem = Some(Failure::PrepareNotSent.description());
+            }
+            Err(Failure::PrepareNotSent) => {
+                self.problem = Some(Failure::Invalid.description());
+            }
             Err(failure) => self.problem = Some(failure.description()),
         }
         false
@@ -490,7 +512,7 @@ fn wire_operation(request: &Request, proof: &HostSessionProof) -> Result<ImportO
                 || *proof != plan.destination
                 || target.profile != request.profile
             {
-                return Err(Failure::Changed);
+                return Err(Failure::PrepareNotSent);
             }
             ImportOperation::Prepare { plan: plan.clone() }
         }

@@ -1511,3 +1511,219 @@ fn lost_verify_existing_profile_preserves_original_intent_and_requires_an_explic
         assert_eq!(app.account_ui.registry, registry);
     }
 }
+
+#[test]
+fn an_unsent_prepare_after_destination_change_restores_explicit_inspection_without_resending() {
+    let mut state = inspected();
+    let old_owner = state.owner;
+    act(&mut state, Action::WorkspaceWrite(old_owner, true));
+    act(&mut state, Action::Network(old_owner, true));
+    let input = (
+        state.path.clone(),
+        state.email.clone(),
+        state.copy,
+        state.session,
+        state.write,
+        state.network,
+        state.profile.clone(),
+    );
+    let prepare = act(&mut state, Action::Prepare(old_owner)).unwrap();
+    let old_plan = state.plan.clone().unwrap();
+    assert_eq!(
+        wire_operation(&prepare, &target().proof).unwrap(),
+        ImportOperation::Prepare {
+            plan: old_plan.clone()
+        },
+        "an unchanged destination still produces the exact original dispatch shape"
+    );
+    let restarted = proof("restarted-before-prepare");
+    let not_sent = wire_operation(&prepare, &restarted).unwrap_err();
+    assert!(matches!(not_sent, Failure::PrepareNotSent));
+    assert!(
+        act(
+            &mut state,
+            Action::Finished {
+                sequence: prepare.sequence + 1,
+                result: Err(not_sent),
+            }
+        )
+        .is_none()
+    );
+    assert_eq!(state.plan.as_ref(), Some(&old_plan));
+    assert_eq!(state.pending.as_ref().unwrap().sequence, prepare.sequence);
+    assert!(state.local_uncertain && !state.editable());
+
+    let mut app = context_inspector_test_app(false);
+    app.account_ui.import = state;
+    let task = app.update_account_import(Action::Finished {
+        sequence: prepare.sequence,
+        result: Err(not_sent),
+    });
+    assert_eq!(
+        task.units(),
+        0,
+        "a proven unsent result cannot reload the registry or send another import"
+    );
+    drop(task);
+    let state = &app.account_ui.import;
+    assert!(state.plan.is_none() && state.pending.is_none() && state.status.is_none());
+    assert!(state.inspection.is_none() && !state.local_uncertain);
+    assert!(state.editable() && !state.can_prepare());
+    assert_ne!(state.owner, old_owner);
+    assert_eq!(
+        (
+            state.path.clone(),
+            state.email.clone(),
+            state.copy,
+            state.session,
+            state.write,
+            state.network,
+            state.profile.clone()
+        ),
+        input
+    );
+    assert_eq!(state.problem, Some(Failure::PrepareNotSent.description()));
+    let owner = state.owner;
+    assert!(act(&mut app.account_ui.import, Action::Prepare(old_owner)).is_none());
+    assert!(
+        act(&mut app.account_ui.import, Action::Prepare(owner)).is_none(),
+        "no preparation without a fresh explicit inspection"
+    );
+
+    let messages = click(view(&app).unwrap(), "Inspect file");
+    assert_eq!(messages.len(), 1, "one explicit inspection callback only");
+    let inspect_action = match messages
+        .into_iter()
+        .next()
+        .expect("enabled explicit Inspect")
+    {
+        Message::AccountUi(super::super::Action::Import(action)) => action,
+        Message::UtilityPaneUi(message) => match *message {
+            Message::AccountUi(super::super::Action::Import(action)) => action,
+            _ => panic!("expected the import inspector"),
+        },
+        _ => panic!("expected the import inspector"),
+    };
+    assert!(matches!(&inspect_action, Action::Inspect(n) if *n == owner));
+    let inspect = act(&mut app.account_ui.import, inspect_action).unwrap();
+    assert!(matches!(&inspect.kind, RequestKind::Inspect(_)));
+    assert!(
+        act(
+            &mut app.account_ui.import,
+            Action::Finished {
+                sequence: inspect.sequence,
+                result: Ok(Response {
+                    target: Target {
+                        proof: restarted.clone(),
+                        ..target()
+                    },
+                    reply: ImportReply::Inspected(ImportInspection {
+                        destination: restarted.clone(),
+                        observation: observation(),
+                    }),
+                }),
+            }
+        )
+        .is_none()
+    );
+    assert!(
+        app.account_ui.import.pending.is_none() && app.account_ui.import.plan.is_none(),
+        "inspection alone never starts preparation"
+    );
+    let second = act(&mut app.account_ui.import, Action::Prepare(owner)).unwrap();
+    let new_plan = app.account_ui.import.plan.clone().unwrap();
+    assert_ne!(new_plan.operation, old_plan.operation);
+    assert_eq!(new_plan.destination, restarted);
+    assert_eq!(new_plan.expected_email, old_plan.expected_email);
+    assert_eq!(new_plan.consent, old_plan.consent);
+    assert_eq!(new_plan.profile, old_plan.profile);
+    assert_eq!(
+        wire_operation(&second, &restarted).unwrap(),
+        ImportOperation::Prepare {
+            plan: new_plan.clone()
+        }
+    );
+    assert!(
+        act(
+            &mut app.account_ui.import,
+            Action::Finished {
+                sequence: prepare.sequence,
+                result: Err(not_sent),
+            }
+        )
+        .is_none()
+    );
+    assert_eq!(app.account_ui.import.plan.as_ref(), Some(&new_plan));
+    assert_eq!(
+        app.account_ui.import.pending.as_ref().unwrap().sequence,
+        second.sequence
+    );
+    assert!(app.account_ui.import.local_uncertain && !app.account_ui.import.editable());
+}
+
+#[test]
+fn only_a_matching_fresh_prepare_not_sent_result_can_release_local_custody() {
+    for failure in [
+        Failure::Unavailable,
+        Failure::Changed,
+        Failure::Invalid,
+        Failure::Journal,
+    ] {
+        let (mut state, prepare) = prepared();
+        let plan = state.plan.clone().unwrap();
+        let owner = state.owner;
+        act(
+            &mut state,
+            Action::Finished {
+                sequence: prepare.sequence,
+                result: Err(failure),
+            },
+        );
+        assert_eq!(state.plan.as_ref(), Some(&plan));
+        assert!(state.pending.is_none() && state.local_uncertain);
+        assert!(!state.editable() && !state.can_new());
+        assert!(act(&mut state, Action::Inspect(owner)).is_none());
+        assert!(act(&mut state, Action::New(owner)).is_none());
+    }
+    for verify in [false, true] {
+        let (mut state, prepare) = prepared();
+        let plan = state.plan.clone().unwrap();
+        let owner = state.owner;
+        if verify {
+            let mut published = status(&plan, ImportStage::Published);
+            published.uncertain = true;
+            finish(&mut state, &prepare, published);
+        } else {
+            act(
+                &mut state,
+                Action::Finished {
+                    sequence: prepare.sequence,
+                    result: Err(Failure::Unavailable),
+                },
+            );
+        }
+        let followup = act(
+            &mut state,
+            if verify {
+                Action::Verify(owner)
+            } else {
+                Action::Status(owner)
+            },
+        )
+        .unwrap();
+        // The typed local outcome has no production path from Status/Verify;
+        // even a mismatched internal result cannot unlock those originals.
+        act(
+            &mut state,
+            Action::Finished {
+                sequence: followup.sequence,
+                result: Err(Failure::PrepareNotSent),
+            },
+        );
+        assert_eq!(state.plan.as_ref(), Some(&plan));
+        assert!(state.pending.is_none() && state.local_uncertain);
+        assert!(!state.editable() && !state.can_new());
+        assert_eq!(state.problem, Some(Failure::Invalid.description()));
+        assert_eq!(state.owner, owner);
+    }
+}
