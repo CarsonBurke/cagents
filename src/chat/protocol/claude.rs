@@ -2028,6 +2028,7 @@ impl Adapter for Claude {
                 }
                 self.control(json!({"subtype":"cancel_async_message", "message_uuid":id}))
             }
+            Command::Goal { .. } => Err("Native thread goals are not supported by Claude".into()),
             Command::StartQueued { .. }
             | Command::SetInterruptMode { .. }
             | Command::ListBranches

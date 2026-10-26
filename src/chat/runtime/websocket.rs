@@ -320,6 +320,7 @@ impl Actor {
                 && !flushing
             {
                 if busy && !interrupt_sent {
+                    self.refresh_goal_resume_admission();
                     match self.adapter.command(Command::Interrupt) {
                         Ok(step) => {
                             self.step(step)?;
@@ -386,6 +387,7 @@ impl Actor {
                         let frame = serde_json::from_str(&text).map_err(|error| {
                             format!("Codex WebSocket text is not JSON: {error}")
                         })?;
+                        self.refresh_goal_resume_admission();
                         let step = self.adapter.receive(frame)?;
                         self.provider_step(step)?;
                         read_again = true;

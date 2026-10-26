@@ -329,9 +329,22 @@ pub struct ServerIdentity {
     pub canonical_home: PathBuf,
     pub reported_home: String,
 }
+
+/// Advisory preparation for a native resume. The runtime rechecks authority at
+/// the actual write boundary; this value never authorizes a write by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GoalResumeAdmission {
+    OriginalScope,
+    /// An original legacy actor may resume only after a side-effect-free read
+    /// positively establishes that its goal cannot continue automatically.
+    InactiveOnly,
+    #[default]
+    Unavailable,
+}
 /// An adapter is confined to one daemon worker. No UI state, subprocesses,
 /// unbounded transcript storage, credentials, or global mutable state live here.
 pub trait Adapter: Send {
+    fn set_goal_resume_admission(&mut self, _admission: GoalResumeAdmission) {}
     /// Private launch selection, distinct from a provider-confirmed session.
     /// Only a provider with a retained bootstrap contract supplies this value.
     fn prepared_launch_identity(&self) -> Option<claude::PreparedIdentity> {

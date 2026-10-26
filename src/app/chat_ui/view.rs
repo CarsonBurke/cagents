@@ -3064,6 +3064,22 @@ impl Runtime {
             Vec::new()
         };
         let mut footer = status;
+        let goal_panel = self.goal_panel();
+        if self.session.launch.provider == Provider::Codex {
+            footer.push(
+                widget::button::custom(design::caption("Goal"))
+                    .id(card_control_id(target.card, "chat-goal"))
+                    .name("Conversation goal")
+                    .selected(goal_panel.is_some())
+                    .class(crate::ui_controls::control_style(
+                        goal_panel.is_some(),
+                        None,
+                    ))
+                    .padding(CONTROL_PADDING)
+                    .on_press(action(Action::GoalPanel(target, true)))
+                    .into(),
+            );
+        }
         if let Some(notice) = permissions::notice(snapshot) {
             footer.push(
                 widget::button::custom(
@@ -3158,6 +3174,16 @@ impl Runtime {
                 .then(|| self.permissions_view(available, content_width - 32.0)),
             widget::popover::Position::Top,
             action(Action::PermissionPicker(target, false)),
+        );
+        let footer = crate::interaction::composer_popover(
+            footer,
+            goal_panel.map(|panel| {
+                widget::container(widget::scrollable(panel).height(Length::Shrink))
+                    .width((content_width - 32.0).clamp(180.0, 460.0))
+                    .max_height(360.0)
+                    .into()
+            }),
+            action(Action::GoalPanel(target, false)),
         );
         let pane = widget::container(super::layout::pane(
             widget::column::with_children(content.into_iter().enumerate().map(|(index, child)| {
