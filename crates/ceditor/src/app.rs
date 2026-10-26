@@ -680,6 +680,8 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::DirectorySearchLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
             | RepositoryAction::FileLoadedAt { .. }
+            | RepositoryAction::DocumentChanged { .. }
+            | RepositoryAction::DocumentReloaded { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::WorkingDiffDue { .. }
@@ -4675,6 +4677,12 @@ impl Application for Editor {
             frames,
             review_requests,
             self.document_tone_subscription(),
+            Subscription::batch(
+                self.tabs
+                    .iter()
+                    .map(|tab| tab.runtime.document_subscription(tab.id)),
+            )
+            .map(Message::Repository),
         ])
     }
 

@@ -2562,6 +2562,8 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
         RepositoryAction::FilesLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
             | RepositoryAction::FileLoadedAt { .. }
+            | RepositoryAction::DocumentChanged { .. }
+            | RepositoryAction::DocumentReloaded { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::SaveFinished { .. }
@@ -17795,6 +17797,16 @@ impl Application for Cagents {
                 lsp_event_stream,
             )
             .map(Message::Lsp),
+        );
+        subscriptions.extend(
+            self.cards
+                .iter()
+                .filter_map(|(&card, runtime)| match runtime {
+                    CardRuntime::Repository(runtime) => {
+                        Some(runtime.document_subscription(card).map(Message::Repository))
+                    }
+                    _ => None,
+                }),
         );
         subscriptions.extend(operation_subscriptions);
         if let Some(window) = self.core.main_window_id()

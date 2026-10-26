@@ -14,6 +14,10 @@ use std::{
 pub(crate) mod text_editor;
 
 mod diff_layout;
+mod document_watch;
+#[cfg(test)]
+mod live_tests;
+use document_watch::DocumentWatch;
 mod preview;
 #[cfg(test)]
 pub(crate) mod retained_save_tests;
@@ -523,6 +527,17 @@ pub enum RepositoryAction {
         result: Result<LoadedFile, FileIoError>,
     },
     /// Actual file-worker completion, carrying the root used for the read.
+    RetryDocumentWatch {
+        card: CardId,
+    },
+    DocumentReloaded {
+        identity: AsyncIdentity,
+        result: Result<crate::editor::FileRead, FileIoError>,
+    },
+    DocumentChanged {
+        card: CardId,
+        watch: uuid::Uuid,
+    },
     FileLoadedAt {
         identity: AsyncIdentity,
         result: Result<crate::editor::FileRead, FileIoError>,
@@ -814,6 +829,8 @@ impl RepositoryAction {
             | Self::Language { card, .. }
             | Self::Clipboard { card, .. }
             | Self::Save { card, .. }
+            | Self::RetryDocumentWatch { card }
+            | Self::DocumentChanged { card, .. }
             | Self::Reload { card }
             | Self::DiscardEdits { card }
             | Self::Undo { card }
@@ -864,6 +881,7 @@ impl RepositoryAction {
             | Self::FileListUnchanged { identity }
             | Self::DirectoryListed { identity, .. }
             | Self::FileLoaded { identity, .. }
+            | Self::DocumentReloaded { identity, .. }
             | Self::FileLoadedAt { identity, .. }
             | Self::DiagramsRendered { identity, .. }
             | Self::DiffLoaded { identity, .. }
@@ -2196,6 +2214,9 @@ pub struct RepositoryRuntime {
     files: FileListState,
     selected: Option<RepositoryFile>,
     document: DocumentState,
+    document_watch: Option<DocumentWatch>,
+    document_reading: bool,
+    document_reload_pending: bool,
     search_mode: bool,
     /// Accepted caret/selection intent, independent of text version and response epoch.
     completion_intent: u64,
@@ -2434,6 +2455,9 @@ impl RepositoryRuntime {
             find_origin: None,
             find_error: None,
             document: DocumentState::None,
+            document_watch: None,
+            document_reading: false,
+            document_reload_pending: false,
             diffs: Vec::new(),
             working_diff: WorkingDiffRefresh::default(),
             next_diff_request: 0,
@@ -5788,6 +5812,54 @@ impl RepositoryRuntime {
         })
     }
 
+    /// The shell owns this subscription for every open buffer, including
+    /// background tabs. Its identity is the document lifetime, not its path.
+    pub fn document_subscription(&self, card: CardId) -> iced::Subscription<RepositoryAction> {
+        let Some(watch) = &self.document_watch else {
+            return iced::Subscription::none();
+        };
+        #[derive(Clone)]
+        struct Source(CardId, DocumentWatch);
+        impl std::hash::Hash for Source {
+            fn hash<H: std::hash::Hasher>(&self, hasher: &mut H) {
+                self.0.hash(hasher);
+                self.1.id().hash(hasher);
+            }
+        }
+        iced::Subscription::run_with(Source(card, watch.clone()), |source| {
+            let card = source.0;
+            let watch = source.1.id();
+            let receiver = source.1.receiver();
+            iced::futures::stream::unfold(receiver, move |receiver| async move {
+                receiver.recv().await.ok()?;
+                Some((RepositoryAction::DocumentChanged { card, watch }, receiver))
+            })
+        })
+    }
+
+    fn reload_changed_document(&mut self, card: CardId) -> Task<RepositoryAction> {
+        if !self.document_reload_pending
+            || self.document_reading
+            || self.is_saving()
+            || self.has_editor_recovery()
+        {
+            return Task::none();
+        }
+        let (Some(watch), Some(selected)) = (&self.document_watch, &self.selected) else {
+            return Task::none();
+        };
+        self.document_reload_pending = false;
+        self.document_reading = true;
+        let identity = self.current_identity(card, selected.path.clone());
+        file_task(
+            identity,
+            self.document_tone,
+            self.original_editor_root.clone(),
+            Some(watch.clone()),
+            true,
+        )
+    }
+
     pub fn update(&mut self, action: RepositoryAction) -> Task<RepositoryAction> {
         self.clear_resolved_operation_recovery();
         if let Some(authority) = action
@@ -5808,7 +5880,11 @@ impl RepositoryRuntime {
         {
             active.cancellation.cancel();
         }
-        Task::batch([task, self.find_task(card)])
+        Task::batch([
+            task,
+            self.find_task(card),
+            self.reload_changed_document(card),
+        ])
     }
 
     fn update_inner(&mut self, action: RepositoryAction) -> Task<RepositoryAction> {
@@ -5934,8 +6010,43 @@ impl RepositoryRuntime {
                 }
                 self.open_file_entry(card, file)
             }
-            RepositoryAction::FileLoadedAt { identity, result } => {
+            RepositoryAction::DocumentReloaded { identity, result } => {
+                self.update_inner(RepositoryAction::FileLoadedAt { identity, result })
+            }
+            RepositoryAction::RetryDocumentWatch { .. } => {
+                self.document_reload_pending = self.document_watch.is_some();
+                Task::none()
+            }
+            RepositoryAction::DocumentChanged { card: _, watch } => {
+                if self
+                    .document_watch
+                    .as_ref()
+                    .is_some_and(|current| current.id() == watch)
+                {
+                    self.document_reload_pending = true;
+                }
+                Task::none()
+            }
+            RepositoryAction::FileLoadedAt {
+                mut identity,
+                result,
+            } => {
                 if !self.accepts_selected(&identity) {
+                    return Task::none();
+                }
+                self.document_reading = false;
+                let watched = result.as_ref().ok().and_then(|read| read.watch_revision);
+                if let (Some(revision), Some(watch)) = (watched, &self.document_watch)
+                    && revision != watch.revision()
+                {
+                    self.document_reload_pending = true;
+                    return Task::none();
+                }
+                let background = self.document_watch.is_some()
+                    && !matches!(self.document, DocumentState::Loading);
+                // A save's events are reconciled against its final disk hash.
+                if background && (self.is_saving() || self.has_editor_recovery()) {
+                    self.document_reload_pending = true;
                     return Task::none();
                 }
                 let result = match result {
@@ -5956,6 +6067,34 @@ impl RepositoryRuntime {
                     Err(error) => Err(error),
                 };
                 let attested = result.is_ok();
+                if background {
+                    if let DocumentState::Editable(document) = &mut self.document {
+                        let unchanged = matches!(&result, Ok(LoadedFile { source, content: FileContent::Editable { content_hash, .. } }) if *content_hash == document.disk_hash && *source == document.source);
+                        if unchanged {
+                            return Task::none();
+                        }
+                        if document.dirty || document.durability_warning().is_some() {
+                            document.conflict = true;
+                            document.error = Some(match &result {
+                                Err(error) => format!("File unavailable on disk: {error}. Your edits are preserved."),
+                                _ => "File changed on disk. Your edits are preserved. Reload or overwrite to resolve.".into(),
+                            });
+                            return Task::none();
+                        }
+                    }
+                    // A new buffer must not share revision-zero jobs or find
+                    // caches with the old document, even at the same path.
+                    identity = self.next_identity(identity.card, identity.path.clone());
+                    self.capture_native_viewport();
+                    if let Some(navigation) = self.navigation()
+                        && let Some(editor) = navigation.editor
+                    {
+                        self.pending_editor_navigation = Some((identity.path.clone(), editor));
+                    }
+                    self.push_lsp_close();
+                    self.dismiss_editor_results();
+                    self.diffs.retain(|(basis, _)| basis.is_immutable());
+                }
                 let task = self.update_inner(RepositoryAction::FileLoaded { identity, result });
                 self.original_read_attested = attested;
                 task
@@ -6574,6 +6713,9 @@ impl RepositoryRuntime {
                 self.selected = None;
                 self.committed_selection = None;
                 self.document = DocumentState::None;
+                self.document_watch = None;
+                self.document_reading = false;
+                self.document_reload_pending = false;
                 self.diffs.clear();
                 self.basis_resolution = None;
                 self.source_surface = SourceSurface::Editor;
@@ -7271,6 +7413,9 @@ impl RepositoryRuntime {
             ..RepositoryFile::default()
         });
         self.document = DocumentState::None;
+        self.document_watch = None;
+        self.document_reading = false;
+        self.document_reload_pending = false;
         self.diffs.clear();
         self.basis_resolution = None;
         self.source_surface = SourceSurface::Diff;
@@ -7354,10 +7499,16 @@ impl RepositoryRuntime {
         self.markdown_mode = MarkdownMode::Edit;
         self.document_tone = pdf_tone(&cosmic::theme::active());
         let identity = self.next_identity(card, path);
+        let watch = DocumentWatch::new();
+        self.document_watch = Some(watch.clone());
+        self.document_reading = true;
+        self.document_reload_pending = false;
         file_task(
             identity,
             self.document_tone,
             self.original_editor_root.clone(),
+            Some(watch),
+            false,
         )
     }
 
@@ -7946,17 +8097,48 @@ fn file_task(
     identity: AsyncIdentity,
     tone: crate::editor::PdfTone,
     original: Option<Arc<crate::fs_safety::Root>>,
+    watch: Option<DocumentWatch>,
+    background: bool,
 ) -> Task<RepositoryAction> {
     let worktree = identity.worktree.clone();
     let path = identity.path.clone();
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || {
-            crate::editor::read_file_at(&worktree, &path, tone, original)
+            let mut targets = vec![worktree.join(&path)];
+            if let Some(watch) = &watch {
+                watch.arm(targets.clone());
+            }
+            // A symlink can be retargeted while its source is discovered.
+            // Accept only a read whose actual source was already watched.
+            for _ in 0..4 {
+                let revision = watch.as_ref().map(DocumentWatch::revision);
+                let mut result =
+                    crate::editor::read_file_at(&worktree, &path, tone, original.clone());
+                if let (Some(watch), Ok(read)) = (&watch, &result)
+                    && let Some(source) = read.source()
+                    && !targets.contains(&worktree.join(source))
+                {
+                    targets.push(worktree.join(source));
+                    watch.arm(targets.clone());
+                    continue;
+                }
+                if let Ok(read) = &mut result {
+                    read.watch_revision = revision;
+                }
+                return result;
+            }
+            Err(FileIoError::Io(
+                "The file's link target keeps changing; retry opening the file".into(),
+            ))
         })
         .await
         .map_err(|error| FileIoError::Io(format!("file worker failed: {error}")))
         .and_then(|result| result);
-        RepositoryAction::FileLoadedAt { identity, result }
+        if background {
+            RepositoryAction::DocumentReloaded { identity, result }
+        } else {
+            RepositoryAction::FileLoadedAt { identity, result }
+        }
     })
 }
 
@@ -9406,7 +9588,27 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
             message,
         ),
     };
-    widget::column::with_children([content])
+    let mut rows = Vec::new();
+    if let Some(error) = runtime
+        .document_watch
+        .as_ref()
+        .and_then(DocumentWatch::error)
+    {
+        rows.push(
+            widget::row::with_children(vec![
+                crate::design::body(format!("Live updates unavailable: {error}"))
+                    .width(Length::Fill)
+                    .into(),
+                icon_button(Icon::Refresh, "Retry live updates")
+                    .on_press(RepositoryAction::RetryDocumentWatch { card })
+                    .into(),
+            ])
+            .spacing(space::S)
+            .into(),
+        );
+    }
+    rows.push(content);
+    widget::column::with_children(rows)
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
