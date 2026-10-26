@@ -4069,7 +4069,21 @@ mod tests {
         let runtime = match state {
             "dirty" => RepositoryRuntime::dirty_fixture(pane.id),
             "saving" => RepositoryRuntime::post_persist_failure_fixture(pane.id).0,
-            "warning" => RepositoryRuntime::post_persist_warning_fixture(pane.id),
+            "warning" => {
+                let (mut runtime, completion) =
+                    RepositoryRuntime::post_persist_failure_fixture(pane.id);
+                drop(runtime.update(completion));
+                // This fixture's submitted B snapshot differs from its A
+                // buffer, so its save receipt initially leaves it dirty.
+                assert!(runtime.is_dirty());
+                let warning = runtime.save_error().unwrap().to_owned();
+                assert!(runtime.has_durability_warning());
+                drop(runtime.update(RepositoryAction::DiscardEdits { card: pane.id }));
+                // Discarding unsaved text does not confirm disk durability.
+                assert_eq!(runtime.editor_text().as_deref(), Some("B\n"));
+                assert_eq!(runtime.save_error(), Some(warning.as_str()));
+                runtime
+            }
             "recovery" => {
                 let (mut runtime, mut identity) =
                     RepositoryRuntime::open_fixture(pane.id, "notes.txt", "saved\n");
@@ -4196,6 +4210,36 @@ mod tests {
                 .iter()
                 .any(|current| { current.id == channel && !current.cards.contains(&pane.id) })
         );
+    }
+
+    #[test]
+    fn shared_repository_replacement_still_adopts_a_clean_editor() {
+        let (mut app, _, pane) = repository_retention_fixture("clean");
+        let CardKind::Repository(mut replacement) = pane.kind else {
+            unreachable!()
+        };
+        replacement.selected_file = Some("other.txt".into());
+        app.workspace_model.views[0].panes[0].kind = CardKind::Repository(replacement.clone());
+        drop(app.reconcile_shared_views());
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&pane.id) else {
+            panic!("a clean editor must adopt the shared replacement");
+        };
+        assert_eq!(runtime.descriptor, replacement);
+        assert_eq!(runtime.selected_path(), Some(Path::new("other.txt")));
+        assert!(!runtime.blocks_navigation());
+        let identity = &**runtime as *const RepositoryRuntime;
+        drop(app.reconcile_shared_views());
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&pane.id) else {
+            panic!("the adopted editor must remain attached");
+        };
+        assert_eq!(&**runtime as *const RepositoryRuntime, identity);
+        assert_eq!(runtime.descriptor, replacement);
+        assert_eq!(
+            app.card_state(pane.id).unwrap().kind,
+            CardKind::Repository(replacement)
+        );
+        assert!(app.card_state(pane.id).unwrap().existence.is_open());
+        assert!(!app.shared_views.retained.contains(&pane.id));
     }
 
     #[cfg(not(feature = "integrated-browser"))]
