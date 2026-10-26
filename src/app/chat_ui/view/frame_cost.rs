@@ -5,7 +5,8 @@
 //!
 //! ```sh
 //! cargo test --locked --no-default-features --features ui --profile dev-runtime \
-//!     --config 'profile.dev-runtime.opt-level=2' --lib \
+//!     --config 'profile.dev-runtime.opt-level=2' \
+//!     --config 'profile.dev-runtime.debug-assertions=false' --lib \
 //!     chat_ui::view::frame_cost -- --ignored --nocapture --test-threads=1
 //! ```
 //!
@@ -167,6 +168,7 @@ struct Stages {
     view: Stage,
     layout: Stage,
     draw: Stage,
+    preparation: Stage,
 }
 
 impl Stages {
@@ -179,6 +181,10 @@ impl Stages {
     }
 
     fn report(&mut self) {
+        if !self.preparation.0.is_empty() {
+            self.preparation
+                .report("refresh + owned preparation + install + geometry settle (fixture wall)");
+        }
         let total = self.update.report("update")
             + self.view.report("view")
             + self.layout.report("layout")
@@ -188,6 +194,12 @@ impl Stages {
 
     /// One line of medians, for a workload that reports several cases.
     fn row(&mut self, name: &str) {
+        if !self.preparation.0.is_empty() {
+            println!(
+                "{name:>28}: fixture refresh+preparation+install+geometry median {:>8.3} ms (outside steady event stages)",
+                self.preparation.median().as_secs_f64() * 1e3
+            );
+        }
         let stages = [
             self.update.median(),
             self.view.median(),
@@ -241,13 +253,16 @@ pub(super) fn live_runtime(items: &[chat::Item]) -> (Runtime, Arc<ClientHandle>)
         card: CardId::new(),
         generation: 1,
     };
-    let runtime = Runtime::new(
+    let mut runtime = Runtime::new(
         target,
         session,
         Connection::Live(handle.clone()),
         true,
         crate::settings::EditorSyntaxTheme::default(),
     );
+    // This helper supplies ready rendered content to focused widget tests.
+    // Native/cold preparation timing must drive the actual async subscription.
+    preparation::drain_fixture(&mut runtime);
     (runtime, handle)
 }
 
@@ -263,6 +278,7 @@ struct Pane {
     cache: Cache,
     theme: cosmic::Theme,
     shortcuts: crate::settings::KeyboardShortcuts,
+    last_event_phases: [Duration; 3],
 }
 
 impl Pane {
@@ -281,7 +297,102 @@ impl Pane {
             cache: Cache::new(),
             theme: cosmic::Theme::dark(),
             shortcuts: crate::settings::KeyboardShortcuts::default(),
+            last_event_phases: [Duration::ZERO; 3],
         }
+    }
+
+    /// Explicitly prepare geometry outside the steady-frame timing. A
+    /// Loading placeholder is never accepted as the giant-body workload.
+    fn settle_geometry(&mut self) -> usize {
+        use iced::advanced::widget::Operation;
+        #[derive(Default)]
+        struct Probe {
+            pending: usize,
+            ready_bytes: usize,
+            plain_bytes: usize,
+        }
+        impl Operation for Probe {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn custom(
+                &mut self,
+                _: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                if let Some(state) = state.downcast_ref::<selectable_prose::State>() {
+                    self.plain_bytes += state.plain.len();
+                    match state.flow_readiness() {
+                        Some(false) => self.pending += 1,
+                        Some(true) => self.ready_bytes += state.plain.len(),
+                        None => {}
+                    }
+                }
+            }
+        }
+        self.runtime.refresh();
+        preparation::drain_fixture(&mut self.runtime);
+        for _ in 0..16 {
+            let element = self.runtime.view(
+                None,
+                false,
+                true,
+                &self.shortcuts,
+                720.0,
+                Place {
+                    channel: None,
+                    name: "project".into(),
+                    branch: None,
+                },
+                true,
+                None,
+                Vec::new(),
+            );
+            let mut ui = UserInterface::build(
+                element,
+                WINDOW,
+                std::mem::replace(&mut self.cache, Cache::new()),
+                &mut self.renderer,
+            );
+            let mut changed = Vec::new();
+            for (id, cached) in self.runtime.presentation_cache() {
+                let mut completed = cached.flow_cache.complete_fixture();
+                for tool in cached
+                    .tool_input
+                    .iter()
+                    .chain(cached.tool_output.iter())
+                    .chain(cached.patches.iter())
+                {
+                    completed |= tool.flow_cache.complete_fixture();
+                }
+                if completed {
+                    changed.push(id.clone());
+                }
+            }
+            let mut probe = Probe::default();
+            ui.operate(&self.renderer, &mut probe);
+            self.cache = ui.into_cache();
+            if changed.is_empty() {
+                assert_eq!(
+                    probe.pending, 0,
+                    "steady benchmark must not measure Loading placeholders"
+                );
+                assert!(
+                    probe.plain_bytes > 0,
+                    "steady benchmark must expose actual transcript text"
+                );
+                return probe.ready_bytes;
+            }
+            for id in changed {
+                self.runtime
+                    .presentation_cache_mut()
+                    .get_mut(&id)
+                    .unwrap()
+                    .revision = CachedItem::next_revision();
+            }
+        }
+        panic!("visible geometry preparation did not quiesce");
     }
 
     /// The text of the newest item, which is the one a workload streams into.
@@ -307,7 +418,49 @@ impl Pane {
         {
             child.items = vec![snapshot.items.pop().expect("streamed child item")];
         }
-        self.handle.publish_snapshot_for_test(snapshot);
+        use chat::presentation::{ChildUpdate, ItemChange, Presentation};
+        let previous = self.handle.snapshot();
+        let changes = |old: &[Arc<chat::Item>], next: &[Arc<chat::Item>]| {
+            let previous: HashMap<_, _> = old
+                .iter()
+                .map(|item| (item.id.as_str(), item.as_ref()))
+                .collect();
+            next.iter()
+                .filter_map(|item| {
+                    let old = previous.get(item.id.as_str()).copied();
+                    (old != Some(item.as_ref())).then(|| ItemChange::between(old, item))
+                })
+                .collect()
+        };
+        let order = snapshot.items.iter().map(|item| item.id.clone()).collect();
+        let parent_changes = changes(&previous.items, &snapshot.items);
+        snapshot.items.clear();
+        let children = snapshot
+            .subagents
+            .iter_mut()
+            .map(|child| {
+                let old = previous
+                    .subagents
+                    .iter()
+                    .find(|old| old.id == child.id)
+                    .map_or(&[][..], |old| old.items.as_slice());
+                let update = ChildUpdate {
+                    id: child.id.clone(),
+                    order: child.items.iter().map(|item| item.id.clone()).collect(),
+                    changes: changes(old, &child.items),
+                };
+                child.items.clear();
+                update
+            })
+            .collect();
+        self.handle.publish_presentation_for_test(Presentation {
+            base_generation: previous.generation,
+            file_changes_unchanged: false,
+            metadata: snapshot,
+            order,
+            changes: parent_changes,
+            children,
+        });
     }
 
     /// Opens `id` the way pressing its header does.
@@ -329,7 +482,6 @@ impl Pane {
         {
             runtime.opened.insert(turn.key.clone(), true);
         }
-        let coordination = chat::coordination::recognize(item, runtime.session.launch.provider);
         let previous = runtime.cache.remove(id);
         runtime.cache.insert(
             id.to_owned(),
@@ -339,13 +491,17 @@ impl Pane {
                 previous,
                 true,
                 false,
-                coordination,
+                None,
             ),
         );
     }
 
     /// One frame: the refresh, the view, its diff and layout, and its draw.
     fn frame(&mut self) -> [Duration; 4] {
+        self.frame_with_pointer(false)
+    }
+
+    fn frame_with_pointer(&mut self, pointer_event: bool) -> [Duration; 4] {
         let clock = Instant::now();
         self.runtime.refresh();
         let refreshed = clock.elapsed();
@@ -375,19 +531,64 @@ impl Pane {
         );
         let laid_out = clock.elapsed();
         let clock = Instant::now();
+        if pointer_event {
+            let point = cosmic::iced::Point::new(400.0, 400.0);
+            ui.update(
+                &[cosmic::iced::Event::Mouse(mouse::Event::CursorMoved {
+                    position: point,
+                })],
+                mouse::Cursor::Available(point),
+                &mut self.renderer,
+                &mut cosmic::iced::advanced::clipboard::Null,
+                &mut Vec::new(),
+            );
+        }
+        let pointer = clock.elapsed();
+        let paint_clock = Instant::now();
         ui.draw(
             &mut self.renderer,
             &self.theme,
             &cosmic::iced::advanced::renderer::Style::default(),
             mouse::Cursor::Unavailable,
         );
-        let drawn = clock.elapsed();
+        let painted = paint_clock.elapsed();
+        let disposal_clock = Instant::now();
         self.cache = ui.into_cache();
+        self.last_event_phases = [pointer, painted, disposal_clock.elapsed()];
+        // The rebuilt view and retired payload owners are part of the event.
+        let drawn = clock.elapsed();
         [refreshed, viewed, laid_out, drawn]
+    }
+
+    /// Complete the same owned preparation engine before a sampled new body.
+    /// This synchronous fixture wall phase includes install and geometry settling;
+    /// it is reported separately and is not native worker scheduling latency.
+    fn prepare_publication(&mut self) -> Duration {
+        let start = Instant::now();
+        self.settle_geometry();
+        let expected = self.items.last().expect("streamed item");
+        let cached = self
+            .runtime
+            .presentation_cache()
+            .get(&expected.id)
+            .expect("active streamed cache");
+        // `preparing` also keeps a running source's canonical parser alive;
+        // it remains true after installing the exact current growing version.
+        assert!(
+            !cached.placeholder,
+            "new publication must have rendered content"
+        );
+        assert_eq!(
+            cached.item.as_deref(),
+            Some(expected),
+            "cannot time a stale rendered prefix as the new body"
+        );
+        start.elapsed()
     }
 
     /// Streams prose into the newest item for `FRAMES` frames.
     fn stream_prose(&mut self) -> Stages {
+        self.metadata.busy = true;
         let mut stages = Stages::default();
         for frame in 0..FRAMES {
             let text = self.tail();
@@ -397,8 +598,10 @@ impl Pane {
                 text.push_str("\n\n");
             }
             self.publish();
+            let prepared = self.prepare_publication();
             let stage = self.frame();
             if frame >= WARMUP {
+                stages.preparation.0.push(prepared);
                 stages.record(stage);
             }
         }
@@ -498,7 +701,7 @@ fn long_streaming_block(background: bool) {
     println!(
         "one fenced block streamed {DELTA} bytes a frame, {SAMPLES} frames ending at each length:"
     );
-    let (mut lines, mut refreshing) = (0, Duration::ZERO);
+    let (mut lines, mut refreshing, mut preparing) = (0, Duration::ZERO, Duration::ZERO);
     let mut checkpoints = CHECKPOINTS.iter().copied().peekable();
     let mut window: Vec<[Duration; 4]> = Vec::new();
     for delta in source.as_bytes().chunks(DELTA) {
@@ -506,6 +709,7 @@ fn long_streaming_block(background: bool) {
         pane.tail().push_str(delta);
         lines += delta.matches('\n').count();
         pane.publish();
+        preparing += pane.prepare_publication();
         let Some(checkpoint) = checkpoints.peek().copied() else {
             break;
         };
@@ -530,6 +734,10 @@ fn long_streaming_block(background: bool) {
             checkpoints.next();
         }
     }
+    println!(
+        "    all fixture refresh/preparation/install/geometry settling: {:>8.1} ms (not native scheduling)",
+        preparing.as_secs_f64() * 1e3
+    );
     println!(
         "    every refresh of the stream together: {:>8.1} ms",
         refreshing.as_secs_f64() * 1e3
@@ -800,7 +1008,6 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
             items: Vec::new(),
         });
     assert_eq!(runtime.turns.len(), 2);
-    assert!(runtime.retainable(&runtime.turns[0]));
     let dark = cosmic::theme::is_dark();
     let settings =
         crate::design::markdown_settings(&cosmic::theme::active(), crate::design::TEXT_PROSE);
@@ -881,4 +1088,167 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
         "{stopped:?}"
     );
     assert_eq!(runtime.turn_fingerprint(&runtime.turns[1], dark), unrelated);
+}
+
+/// Run with the optimized dev-runtime command above. This includes the actual
+/// pane/composer, one loaded huge source and300 tool rows, rather than only a
+/// short collapsed tail. Pointer update/draw includes mouse-interaction work;
+/// GPU submission and compositor presentation are deliberately outside it.
+#[test]
+#[ignore = "optimized viewport scaling measurement; records fixed budget and size ratio"]
+fn viewport_cost_with_a_megabyte_answer_and_three_hundred_tools() {
+    assert!(
+        !cfg!(debug_assertions),
+        "use optimized dev-runtime with opt-level2"
+    );
+    let medians = viewport_workloads(&[
+        ("small", 16_usize * 1024, 10, 0),
+        ("giant paragraph", 1024 * 1024, 300, 0),
+        ("many paragraphs", 1024 * 1024, 300, 1),
+        ("giant fence", 1024 * 1024, 300, 2),
+    ]);
+    let small = medians[0].1;
+    for (name, median) in medians {
+        println!(
+            "{name}: event median {:.3}ms, ratio {:.3}",
+            median.as_secs_f64() * 1000.0,
+            median.as_secs_f64() / small.as_secs_f64()
+        );
+        assert!(
+            median <= Duration::from_millis(2),
+            "{name} exceeded2ms viewport budget: {median:?}"
+        );
+        assert!(
+            median <= small * 2,
+            "{name} exceeded2x fixed-viewport scaling budget"
+        );
+    }
+}
+
+/// Diagnostic factorial: separate the tool-count and body-size variables.
+/// The required combined four-case acceptance above remains unchanged.
+#[test]
+#[ignore = "optimized attribution measurement; not a substitute for the combined viewport budget"]
+fn viewport_cost_factorial_attribution() {
+    assert!(
+        !cfg!(debug_assertions),
+        "use optimized dev-runtime with opt-level2"
+    );
+    viewport_workloads(&[
+        ("small", 16 * 1024, 10, 0),
+        ("many tools only", 16 * 1024, 300, 0),
+        ("giant paragraph only", 1024 * 1024, 10, 0),
+        ("many paragraphs only", 1024 * 1024, 10, 1),
+    ]);
+}
+
+fn viewport_workloads(
+    workloads: &[(&'static str, usize, usize, usize)],
+) -> Vec<(&'static str, Duration)> {
+    let mut medians = Vec::new();
+    for &(name, bytes, tools, form) in workloads {
+        let mut items = vec![item(
+            "viewport-prompt".into(),
+            chat::Role::User,
+            prose("Inspect the transcript.".into(), false, chat::Phase::Final),
+        )];
+        for index in 0..tools {
+            items.push(item(
+                format!("viewport-tool-{index}"),
+                chat::Role::Assistant,
+                ItemContent::Command {
+                    label: String::new(),
+                    command: format!("read file-{index}.rs"),
+                    working_directory: "/fixture".into(),
+                    action: chat::CommandAction::Read,
+                    status: chat::ToolStatus::Succeeded,
+                    exit_code: Some(0),
+                    duration_ms: Some(1),
+                    output: "fixture output\n".repeat(8),
+                },
+            ));
+        }
+        let atom = if form == 1 {
+            "Measured plain paragraph.\n\n"
+        } else {
+            "Measured plain paragraph. "
+        };
+        let mut body = atom.repeat(bytes.div_ceil(atom.len()));
+        body.truncate(bytes);
+        if form == 2 {
+            body = format!("```text\n{body}\n```\n");
+        }
+        items.push(item(
+            "viewport-answer".into(),
+            chat::Role::Assistant,
+            prose(body, false, chat::Phase::Final),
+        ));
+        let mut pane = Pane::new(items);
+        pane.runtime.tool_groups_expanded = true;
+        let prepared_bytes = pane.settle_geometry();
+        if form != 1 {
+            assert!(
+                prepared_bytes >= bytes,
+                "the full giant physical paragraph/code line must be prepared"
+            );
+        }
+        println!(
+            "settled geometry ready visible-flow bytes={prepared_bytes}; cold worker work excluded from this steady-frame measurement"
+        );
+        for _ in 0..WARMUP {
+            pane.frame_with_pointer(true);
+        }
+        let mut totals = Stage::default();
+        let mut stages = Stages::default();
+        let mut phases = [Stage::default(), Stage::default(), Stage::default()];
+        for _ in 0..SAMPLES {
+            let sample = pane.frame_with_pointer(true);
+            totals.0.push(sample[1] + sample[2] + sample[3]);
+            stages.record(sample);
+            for (phase, elapsed) in phases.iter_mut().zip(pane.last_event_phases) {
+                phase.0.push(elapsed);
+            }
+        }
+        println!("viewport workload {name}: bytes={bytes}, tools={tools}");
+        stages.report();
+        for (phase, name) in phases.iter_mut().zip(["pointer", "paint", "dispose"]) {
+            phase.report(name);
+        }
+        let median = totals.report("event");
+        medians.push((name, median));
+    }
+    medians
+}
+
+#[test]
+fn streaming_fixture_applies_validated_deltas_and_prepares_each_visible_revision() {
+    let mut pane = Pane::new(vec![item(
+        "answer".into(),
+        chat::Role::Assistant,
+        prose(
+            "Answer **bold** ordinary tail".into(),
+            false,
+            chat::Phase::Final,
+        ),
+    )]);
+    pane.metadata.busy = true;
+    for suffix in [" more words", " and still more"] {
+        let previous = pane.handle.snapshot().items[0].clone();
+        pane.tail().push_str(suffix);
+        pane.publish();
+        let current = pane.handle.snapshot().items[0].clone();
+        assert!(
+            pane.handle.known_append(&previous, &current),
+            "fixture must exercise accepted append lineage"
+        );
+        pane.prepare_publication();
+        assert!(
+            pane.runtime.snapshot.busy,
+            "streaming fixture must be a running parent"
+        );
+        assert!(Arc::ptr_eq(
+            pane.runtime.cache["answer"].item.as_ref().unwrap(),
+            &current
+        ));
+    }
 }

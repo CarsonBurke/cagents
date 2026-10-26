@@ -1,110 +1,12 @@
 use super::*;
 use std::{
-    os::unix::fs::OpenOptionsExt,
     process::{Command, Output},
     sync::Mutex,
 };
 
 type Interceptor = Box<dyn FnMut(&CommandSpec) + Send>;
 
-// Isolate before application code snapshots GIT_CONFIG_PARAMETERS/COUNT. A
-// launch-only executor scrub cannot undo their later controlled re-export.
-fn isolated_fixture_case(qualified: &str) -> bool {
-    let prefix = concat!(env!("CARGO_CRATE_NAME"), "::");
-    let case = qualified.strip_prefix(prefix).unwrap_or(qualified);
-    if std::env::var("CAGENTS_PR_FIXTURE_CASE").as_deref() == Ok(case) {
-        assert!(
-            std::env::vars_os().all(|(name, _)| !name.as_encoded_bytes().starts_with(b"GIT_")),
-            "owning child must start before any ambient Git configuration is captured"
-        );
-        for (marker, setting) in [
-            ("CAGENTS_PR_FIXTURE_RUNTIME", "XDG_RUNTIME_DIR"),
-            ("CAGENTS_PR_FIXTURE_DATA", "XDG_DATA_HOME"),
-        ] {
-            let path = std::env::var_os(marker).expect("owned isolated fixture directory");
-            assert_eq!(std::env::var_os(setting), Some(path.clone()));
-            let metadata = fs::metadata(path).unwrap();
-            assert!(metadata.is_dir());
-            assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
-            assert_eq!(metadata.mode() & 0o777, 0o700);
-        }
-        return false;
-    }
-    let private = |prefix: &str| {
-        tempfile::Builder::new()
-            .prefix(prefix)
-            .permissions(fs::Permissions::from_mode(0o700))
-            .tempdir()
-            .unwrap()
-    };
-    let runtime = private("cagents-pr-runtime-");
-    let data = private("cagents-pr-data-");
-    let mut command = CommandSpec::new(std::env::current_exe().unwrap())
-        .args([
-            case,
-            "--exact",
-            "--nocapture",
-            "--test-threads=1",
-            "--color=never",
-        ])
-        .env("CAGENTS_PR_FIXTURE_CASE", case)
-        .env("CAGENTS_PR_FIXTURE_RUNTIME", runtime.path())
-        .env("CAGENTS_PR_FIXTURE_DATA", data.path())
-        .env("XDG_RUNTIME_DIR", runtime.path())
-        .env("XDG_DATA_HOME", data.path())
-        .timeout(Duration::from_secs(90))
-        .output_limits(1024 * 1024, 1024 * 1024);
-    for (name, _) in std::env::vars_os() {
-        if name.as_encoded_bytes().starts_with(b"GIT_") {
-            command = command.env_remove(name);
-        }
-    }
-    // Reuse the existing bounded executor instead of writing an unbounded
-    // child stream to disk. Private files contain only the bounded result.
-    let (success, stdout, stderr, status) =
-        match SystemProcessExecutor.execute(&command, &CancellationToken::default()) {
-            Ok(output) => (
-                output.success,
-                output.stdout,
-                output.stderr,
-                format!("exit {:?}, signal {:?}", output.exit_code, output.signal),
-            ),
-            Err(failure) => (
-                false,
-                failure.stdout,
-                failure.stderr,
-                format!("{:?}: {}", failure.kind, failure.message),
-            ),
-        };
-    for (name, bytes) in [("case.stdout", &stdout), ("case.stderr", &stderr)] {
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(runtime.path().join(name))
-            .unwrap()
-            .write_all(bytes)
-            .unwrap();
-    }
-    let stdout = String::from_utf8_lossy(&stdout);
-    let stderr = String::from_utf8_lossy(&stderr);
-    assert!(success, "owning case {case}: {status}\n{stdout}\n{stderr}");
-    assert!(
-        stdout
-            .lines()
-            .any(|line| line.contains(&format!("test {case} ... ok"))),
-        "actual named owning test did not pass: {stdout}\n{stderr}"
-    );
-    assert!(
-        stdout
-            .lines()
-            .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
-        "exact selector must run one owning case: {stdout}\n{stderr}"
-    );
-    print!("{stdout}");
-    eprint!("{stderr}");
-    true
-}
+use crate::repository::test_fixture::isolated_fixture_case;
 
 #[derive(Default)]
 struct NativeExecutor {
@@ -1631,6 +1533,22 @@ fn detached_policy_descendant_keeps_operation_running_and_protected_through_canc
     )) {
         return;
     }
+    detached_policy_descendant_is_retained_through_settlement(true);
+}
+
+#[test]
+fn retained_checkout_lease_refuses_success_without_claiming_a_known_holder() {
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(retained_checkout_lease_refuses_success_without_claiming_a_known_holder)
+    )) {
+        return;
+    }
+    detached_policy_descendant_is_retained_through_settlement(false);
+}
+
+fn detached_policy_descendant_is_retained_through_settlement(cancelled: bool) {
     let fixture = Fixture::new(true);
     let new = fixture.advance(|root| fs::write(root.join("file"), "new\n").unwrap());
     let policy = fixture.root.join(".git/descendant-policy");
@@ -1646,10 +1564,18 @@ fn detached_policy_descendant_keeps_operation_running_and_protected_through_canc
     let cancel = CancellationToken::default();
     std::thread::scope(|scope| {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let (observed_sender, observed_receiver) = std::sync::mpsc::sync_channel(1);
         let service = &fixture.service;
         let plan = &plan;
         let worker_cancel = &cancel;
         let worker = scope.spawn(move || {
+            effect::RECONCILIATION_TEST_HOOK.with_borrow_mut(|hook| {
+                *hook = Some(Box::new(move |phase| {
+                    if phase == "retained_lease_observed" {
+                        observed_sender.send(()).unwrap();
+                    }
+                }));
+            });
             sender
                 .send(service.reconcile_existing_pr_checkout(plan, worker_cancel))
                 .unwrap();
@@ -1673,7 +1599,9 @@ fn detached_policy_descendant_keeps_operation_running_and_protected_through_canc
             assert!(Instant::now() < deadline, "owned fixture policy must start");
             thread::sleep(Duration::from_millis(5));
         };
-        cancel.cancel();
+        if cancelled {
+            cancel.cancel();
+        }
         let lease = fs::File::open(operation.join("lease")).unwrap();
         // SAFETY: owned independent file remains live for this probe.
         assert_ne!(
@@ -1682,14 +1610,30 @@ fn detached_policy_descendant_keeps_operation_running_and_protected_through_canc
         );
         assert!(
             receiver.recv_timeout(Duration::from_millis(100)).is_err(),
-            "cancellation is a request, not process settlement"
+            "an inherited lease must prevent success until its holder exits"
         );
+        observed_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the original lease must be observed before releasing its fixture holder");
         fs::write(operation.join("release-descendant"), b"release").unwrap();
         let failure = receiver
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap_err();
         assert_eq!(failure.kind, PrCheckoutFailureKind::PartialOrUnknown);
+        if !cancelled {
+            assert!(
+                failure
+                    .detail
+                    .contains("Its holder could not be identified")
+            );
+            assert!(failure.detail.contains("unrelated child before exec"));
+            assert!(
+                !failure
+                    .detail
+                    .contains("A policy or Git descendant outlived")
+            );
+        }
         assert!(operation.join("descendant-retired").exists());
         assert_eq!(
             unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },

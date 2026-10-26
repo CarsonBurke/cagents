@@ -40,23 +40,26 @@ pub(in crate::host) fn process_under_control(
                 "Prepare automation approval requests from a live hosted conversation".into(),
             );
         }
-        Request::Proposal { id } => Response::Proposal(Box::new(
-            registry
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .automation_proposal(id, None)?
-                .ok_or("The automation proposal is unavailable")?,
-        )),
+        Request::Proposal { id } => {
+            return Ok(Response::Proposal(Box::new(
+                registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .automation_proposal(id, None)?
+                    .ok_or("The automation proposal is unavailable")?,
+            )));
+        }
         Request::PendingProposals {
             repository,
             after,
             limit,
-        } => Response::Proposals(
-            registry
+        } => {
+            return registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .pending_automation_proposals(&repository, after, limit)?,
-        ),
+                .pending_automation_proposals(&repository, after, limit)
+                .map(Response::Proposals);
+        }
         Request::ResolveProposal {
             id,
             revision,
