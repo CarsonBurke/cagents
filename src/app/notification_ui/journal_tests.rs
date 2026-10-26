@@ -938,3 +938,197 @@ fn retained_pointer_press_cannot_activate_the_incident_that_replaces_its_row() {
         no_ack(&app, current);
     }
 }
+
+// Append inside app::notification_ui::journal_tests, after its existing parents.
+// Reuses that child's fixture/snapshot/frame/click/no_ack helpers unchanged.
+// Source-only proposed fragment: no test execution or RPC/native claim.
+
+#[test]
+fn public_attention_row_closes_only_its_popup_and_starts_exact_read_after_existing_guards() {
+    let mut renderer = super::super::tests::headless_renderer();
+    let mut app = fixture(1);
+    let original_notice = notice(0);
+    let (automation_id, lifecycle_sequence) = match &original_notice.event.target {
+        Target::Automation { id, sequence } => (*id, *sequence),
+        _ => panic!("automation fixture target"),
+    };
+    let proof = app.notification_ui.host.clone().unwrap();
+    let original_snapshot = app.notification_ui.snapshot.clone();
+    // Public observer ordering, not direct snapshot_host/readiness assignment.
+    drop(app.update(Message::NotificationUi(Action::HostBound(proof.clone()))));
+    drop(app.update(Message::NotificationUi(Action::Snapshot(original_snapshot))));
+    assert!(app.attention_backend_current());
+    drop(app.update(Message::ChromeUi(
+        super::super::chrome_ui::Action::ToggleAttention,
+    )));
+    assert!(app.attention_is_open());
+    let original_cards = app.durable.cards.clone();
+    let original_focus = app.workspace.focused();
+    let message = click(&app, &mut renderer, original_notice.id);
+    let Message::NotificationUi(Action::OpenNotice(bound)) = &message else {
+        panic!("real rendered row callback");
+    };
+    assert_eq!(bound.notice, original_notice.id);
+    assert_eq!(bound.target, original_notice.event.target);
+    assert_eq!(bound.host.as_ref(), Some(&proof));
+    assert_eq!(bound.registry, app.workspace_model.identity);
+    let read = app.update(message);
+    let activation = app
+        .notification_ui
+        .lifecycle_activation
+        .as_ref()
+        .expect("Attention must not block its own accepted row");
+    assert_eq!(
+        (activation.id, activation.sequence),
+        (automation_id, lifecycle_sequence)
+    );
+    assert_eq!(activation.host, proof);
+    assert_eq!(activation.registry, app.workspace_model.identity);
+    assert_eq!(activation.backend, lifecycle_backend());
+    assert_eq!(activation.workspace.as_ptr(), Arc::as_ptr(&app.durable));
+    assert_eq!(
+        app.notification_ui.lifecycle_read,
+        Some(activation.generation)
+    );
+    assert!(!app.attention_is_open());
+    assert_eq!(
+        app.durable.cards, original_cards,
+        "read before utility creation"
+    );
+    assert_eq!(app.workspace.focused(), original_focus);
+    no_ack(&app, original_notice.id);
+    drop(read); // Deliberately unpolled: proves handler routing, not an RPC.
+
+    // An exception for the owned Attention popup must not dismiss or bypass
+    // other input owners. Existing focused-save parent stays unchanged too.
+    for blocked in ["modal", "draft", "work"] {
+        let mut app = fixture(1);
+        let snapshot = app.notification_ui.snapshot.clone();
+        drop(app.update(Message::NotificationUi(Action::Snapshot(snapshot))));
+        drop(app.update(Message::ChromeUi(
+            super::super::chrome_ui::Action::ToggleAttention,
+        )));
+        let queued = click(&app, &mut renderer, notice(0).id);
+        match blocked {
+            "modal" => app.settings_reset_confirm = true,
+            "draft" => {
+                drop(app.update_automation_ui(crate::automation_ui::Action::New));
+                assert!(app.automation_ui.has_draft());
+            }
+            "work" => {
+                let channel = ChannelId::new();
+                app.workspace_model
+                    .channels
+                    .push(crate::workspace_model::ModelChannel {
+                        id: channel,
+                        repository: "/attention-work-fixture".into(),
+                        title: "Original".into(),
+                        title_source: Default::default(),
+                        ordinal: 1,
+                    });
+                drop(app.open_channel_work(channel));
+                assert!(app.channel_work_is_main());
+            }
+            _ => unreachable!(),
+        }
+        let cards = app.durable.cards.clone();
+        let focus = app.workspace.focused();
+        drop(app.update(queued));
+        assert!(
+            app.notification_ui.lifecycle_activation.is_none(),
+            "{blocked}"
+        );
+        assert!(app.notification_ui.lifecycle_read.is_none(), "{blocked}");
+        assert_eq!(app.durable.cards, cards);
+        assert_eq!(app.workspace.focused(), focus);
+        match blocked {
+            "modal" => assert!(app.settings_reset_confirm),
+            "draft" => assert!(app.automation_ui.has_draft()),
+            "work" => assert!(app.channel_work_is_main()),
+            _ => unreachable!(),
+        }
+        no_ack(&app, notice(0).id);
+    }
+}
+
+#[test]
+fn locally_read_session_stays_out_of_new_attention_after_stale_snapshot_without_acknowledging_automation()
+ {
+    let mut renderer = super::super::tests::headless_renderer();
+    let mut app = super::super::tests::context_inspector_test_app(true);
+    // Current Attention requires an accepted Registry identity before opening rows.
+    app.workspace_model.identity = uuid::Uuid::new_v4();
+    app.context_inspector_open = false;
+    let card = app.workspace.focused().unwrap();
+    let session = card_session(&app.durable.cards[0]).unwrap();
+    let local = crate::notifications::Notice {
+        id: uuid::Uuid::new_v4(),
+        event: crate::notifications::Event::session(
+            session,
+            Provider::Claude,
+            "/tmp".into(),
+            crate::notifications::Evidence {
+                key: "read-before-broker-ack".into(),
+                kind: crate::notifications::Kind::Succeeded,
+            },
+        ),
+        delivered: true,
+        acknowledged: false,
+        window: None,
+    };
+    let automation = notice(0);
+    assert_ne!(local.id, automation.id);
+    let proof = HostSessionProof {
+        host_session_id: crate::model::HostSessionId::new("attention-local-ack"),
+        boot_id: crate::model::BootId::new("attention-local-ack"),
+        host_incarnation: crate::model::HostIncarnation::new("attention-local-ack"),
+    };
+    let stale = Snapshot {
+        notices: vec![local.clone(), automation.clone()],
+        diagnostic: None,
+    };
+    drop(app.update(Message::NotificationUi(Action::HostBound(proof))));
+    drop(app.update(Message::NotificationUi(Action::Snapshot(stale.clone()))));
+    assert!(app.attention_backend_current());
+    assert!(app.attention_notices().iter().any(|n| n.id == local.id));
+    // The existing explicit local Mark Read path, not a fabricated broker ACK.
+    drop(app.mark_cards_read(vec![card]));
+    assert!(app.notification_ui.acknowledged_for_test(local.id));
+    assert!(
+        app.notification_ui
+            .pending
+            .lock()
+            .unwrap()
+            .acknowledged
+            .contains(&local.id)
+    );
+    no_ack(&app, automation.id);
+
+    // Broker's unchanged unacknowledged snapshot arrives before queued ACK.
+    // Feed the real public message so accepted snapshot ownership is current.
+    drop(app.update(Message::NotificationUi(Action::Snapshot(stale))));
+    assert!(app.notification_ui.acknowledged_for_test(local.id));
+    drop(app.update(Message::ChromeUi(
+        super::super::chrome_ui::Action::ToggleAttention,
+    )));
+    assert!(app.attention_is_open());
+    let visible = app
+        .attention_notices()
+        .iter()
+        .map(|n| n.id)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(visible, BTreeSet::from([automation.id]));
+    let (nodes, messages) = frame(&app, &mut renderer, 420.0, false, None);
+    assert!(messages.is_empty(), "rendering is not activation");
+    assert!(labels(&nodes).contains(&label(&app, automation.id)));
+    no_ack(&app, automation.id);
+    assert!(app.notification_ui.lifecycle_read.is_none());
+    assert!(app.notification_ui.lifecycle_activation.is_none());
+    drop(app.update(Message::ChromeUi(super::super::chrome_ui::Action::Close)));
+    no_ack(&app, automation.id);
+    assert_eq!(
+        app.notification_ui.pending.lock().unwrap().acknowledged,
+        BTreeSet::from([local.id]),
+        "opening/reading/closing Attention must not ACK Automation",
+    );
+}

@@ -599,7 +599,10 @@ impl Cagents {
             .notices
             .iter()
             .filter(|notice| {
-                !notice.acknowledged && !conflicts.contains(&notice.id) && ids.insert(notice.id)
+                !notice.acknowledged
+                    && !self.notification_ui.acknowledged.contains(&notice.id)
+                    && !conflicts.contains(&notice.id)
+                    && ids.insert(notice.id)
             })
             .collect()
     }
