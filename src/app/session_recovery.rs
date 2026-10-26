@@ -107,15 +107,18 @@ impl Cagents {
 
     pub(super) fn session_recovery_action(&self) -> Option<Element<'_, Message>> {
         let card = self.refused_terminal_recovery_target()?;
-        Some(
+        let CardKind::Terminal(terminal) = &self.card_state(card)?.kind else {
+            return None;
+        };
+        Some(crate::ui_controls::owned(
+            (card, terminal.clone()),
             crate::ui_controls::button::secondary("Recover terminal ownership…")
                 .id(widget::Id::new("session-recovery.open"))
                 .name("Review recovery of the refused terminal from its closed pane")
                 .on_press_maybe(
                     (!self.modal_is_open()).then_some(Message::SessionRecovery(Action::Open(card))),
-                )
-                .into(),
-        )
+                ),
+        ))
     }
 
     fn session_recovery_review_is_current(&self, review: &Review) -> bool {
@@ -434,6 +437,166 @@ mod tests {
         app.save_health = Some(save_health);
         app.core.set_keyboard_nav(true);
         (directory, app, card)
+    }
+
+    #[test]
+    fn retained_recovery_control_keeps_press_and_focus_with_its_original_terminal() {
+        use iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
+        use iced::{Event, Rectangle, Size};
+
+        let renderer = super::super::tests::headless_renderer();
+        for keyboard in [false, true] {
+            for replacement in [0, 1, 2] {
+                let (_directory, mut app, original) = fixture();
+                assert_eq!(app.refused_terminal_recovery_target(), Some(original));
+                let viewport = Rectangle::with_size(Size::new(500.0, 80.0));
+                let mut element = app.session_recovery_action().unwrap();
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, viewport.size()),
+                );
+                let mut messages = Vec::new();
+                if keyboard {
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut iced::advanced::widget::operation::focusable::focus::<()>(
+                            widget::Id::new("session-recovery.open"),
+                        ),
+                    );
+                } else {
+                    element.as_widget_mut().update(
+                        &mut tree,
+                        &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                        Layout::new(&node),
+                        mouse::Cursor::Available(node.bounds().center()),
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut Shell::new(&mut messages),
+                        &viewport,
+                    );
+                }
+                assert!(messages.is_empty(), "press/focus must not dispatch early");
+                drop(element);
+
+                let expected = if replacement == 1 {
+                    // A later health snapshot offers a different unsaved pane.
+                    // Keep the existing closed owner; no recovery is performed.
+                    let mut next = app.card_state(original).unwrap().clone();
+                    next.id = CardId::new();
+                    let id = next.id;
+                    Arc::make_mut(&mut app.durable).cards.push(next);
+                    app.cards.insert(id, CardRuntime::Loading);
+                    for write in &mut app.save_health.as_mut().unwrap().quarantined {
+                        if matches!(write.subject, WriteSubject::Workspace { card: Some(card) } if card == original)
+                        {
+                            write.subject = WriteSubject::Workspace { card: Some(id) };
+                        }
+                    }
+                    id
+                } else {
+                    if replacement == 2 {
+                        // The same pane ID can acquire different terminal evidence.
+                        // Both in-memory projections must agree to remain eligible.
+                        for card in &mut Arc::make_mut(&mut app.durable).cards {
+                            if let CardKind::Terminal(terminal) = &mut card.kind {
+                                terminal.resume_hint = Some("different terminal evidence".into());
+                            }
+                        }
+                    }
+                    original
+                };
+                assert_eq!(app.refused_terminal_recovery_target(), Some(expected));
+                let mut element = app.session_recovery_action().unwrap();
+                tree.diff(element.as_widget_mut());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, viewport.size()),
+                );
+                let activation = if keyboard {
+                    Event::Keyboard(key(keyboard::key::Named::Enter, false))
+                } else {
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+                };
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &activation,
+                    Layout::new(&node),
+                    mouse::Cursor::Available(node.bounds().center()),
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                if replacement == 0 {
+                    assert!(matches!(
+                        messages.as_slice(),
+                        [Message::SessionRecovery(Action::Open(card))] if *card == original
+                    ));
+                } else {
+                    assert!(messages.is_empty(), "old gesture/focus retargeted recovery");
+                    if keyboard {
+                        element.as_widget_mut().operate(
+                            &mut tree,
+                            Layout::new(&node),
+                            &renderer,
+                            &mut iced::advanced::widget::operation::focusable::focus::<()>(
+                                widget::Id::new("session-recovery.open"),
+                            ),
+                        );
+                    } else {
+                        element.as_widget_mut().update(
+                            &mut tree,
+                            &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                            Layout::new(&node),
+                            mouse::Cursor::Available(node.bounds().center()),
+                            &renderer,
+                            &mut clipboard::Null,
+                            &mut Shell::new(&mut messages),
+                            &viewport,
+                        );
+                    }
+                    element.as_widget_mut().update(
+                        &mut tree,
+                        &activation,
+                        Layout::new(&node),
+                        mouse::Cursor::Available(node.bounds().center()),
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut Shell::new(&mut messages),
+                        &viewport,
+                    );
+                    assert!(matches!(
+                        messages.as_slice(),
+                        [Message::SessionRecovery(Action::Open(card))] if *card == expected
+                    ));
+                }
+                drop(element);
+                if replacement == 1 {
+                    drop(app.update_session_recovery(Action::Open(original)));
+                    assert!(
+                        !app.session_recovery.open(),
+                        "queued old target was accepted"
+                    );
+                }
+                let Message::SessionRecovery(action) = messages.pop().unwrap() else {
+                    panic!("rendered recovery control emitted another action");
+                };
+                // Dispatch the genuine widget message. Do not poll preparation:
+                // this is interaction ownership, not an RPC/storage success test.
+                drop(app.update_session_recovery(action));
+                assert_eq!(app.session_recovery.target, Some(expected));
+                assert!(app.session_recovery.preparing);
+                assert!(!app.session_recovery.pending);
+                drop(app.update_session_recovery(Action::Cancel));
+                assert!(!app.session_recovery.open());
+                app.session.as_mut().unwrap().shutdown();
+            }
+        }
     }
 
     #[test]
