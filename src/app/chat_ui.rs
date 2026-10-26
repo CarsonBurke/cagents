@@ -31,6 +31,7 @@ mod flow_layout;
 mod fold;
 mod goal;
 mod goal_dispatch;
+mod goal_focus;
 mod hover;
 pub(super) mod images;
 mod layout;
@@ -2049,6 +2050,7 @@ pub(super) struct Runtime {
     /// The first message of a draft, while its conversation starts.
     queued: Option<Queued>,
     goal_open: bool,
+    goal_focus: goal_focus::Controller,
     goal_pending: Option<goal_dispatch::Pending>,
     /// Messages held here for the next turn, oldest first.
     followups: Vec<Followup>,
@@ -3018,6 +3020,7 @@ impl Runtime {
             closed_elsewhere: false,
             queued: None,
             goal_open: false,
+            goal_focus: goal_focus::Controller::default(),
             goal_pending: None,
             followups: Vec::new(),
             next_followup: 0,
@@ -4419,6 +4422,7 @@ impl Runtime {
     }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         if !visible {
+            self.goal_focus.clear();
             self.dictation.cancel_active(self.target);
             self.find_navigation.cancel_all();
             self.preparation.clear_local();
@@ -6282,6 +6286,7 @@ impl Cagents {
             || runtime.branch_picker
             || runtime.goal_open;
         runtime.goal_open = false;
+        runtime.goal_focus.clear();
         runtime.reasoning_picker = false;
         runtime.permission_picker = false;
         runtime.footer_picker = false;
@@ -8108,6 +8113,17 @@ impl Cagents {
         {
             return Task::none();
         }
+        let goal_focus = match &action {
+            Action::Wake(target, Wake::Changed) => {
+                self.cards.get(&target.card).and_then(|card| match card {
+                    CardRuntime::Chat(runtime) if runtime.target == *target => {
+                        runtime.goal_focus.before_refresh(runtime)
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
+        };
         let closed_refresh = match &action {
             Action::Ready(target, _) => Some(target.card),
             _ => None,
@@ -8182,7 +8198,10 @@ impl Cagents {
                     .map(cosmic::Action::App),
             ]);
         }
-        task
+        match goal_focus {
+            Some(ticket) => Task::batch([task, self.restore_goal_focus(ticket)]),
+            None => task,
+        }
     }
 
     pub(super) fn reconcile_chat_failure_presentations(&mut self) {
@@ -8305,6 +8324,7 @@ impl Cagents {
             && let Some(runtime) = self.chat_runtime_mut(*target)
         {
             runtime.goal_open = false;
+            runtime.goal_focus.clear();
         }
         match action {
             Action::Dictation(target, action) => return self.handle_dictation(target, action),
@@ -9748,6 +9768,7 @@ impl Cagents {
                         // A queued close only hides presentation. It cannot
                         // cancel an intent created after that button rendered.
                         runtime.goal_open = false;
+                        runtime.goal_focus.clear();
                     }
                 }
             }

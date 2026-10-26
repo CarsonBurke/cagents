@@ -103,6 +103,15 @@ pub(super) fn panel_with_ids<'a, Message: Clone + 'a>(
     ids: [widget::Id; 4],
     on_action: impl Fn(Intent) -> Message,
 ) -> Element<'a, Message> {
+    panel_with_focus(state, ids, None, on_action)
+}
+
+pub(super) fn panel_with_focus<'a, Message: Clone + 'a>(
+    state: Presentation<'a>,
+    ids: [widget::Id; 4],
+    focus: Option<super::goal_focus::Controls>,
+    on_action: impl Fn(Intent) -> Message,
+) -> Element<'a, Message> {
     let goal = match state.read {
         ReadState::Known(Some(goal)) => Some(goal),
         _ => None,
@@ -233,41 +242,90 @@ pub(super) fn panel_with_ids<'a, Message: Clone + 'a>(
                 .into(),
         );
     }
+    let mark = |index: usize, content: Element<'a, Message>| {
+        if let Some(focus) = &focus
+            && [check, pause, resume, change][index]
+        {
+            widget::container(content)
+                .id(focus.marker(index))
+                .width(Length::Fill)
+                .into()
+        } else {
+            content
+        }
+    };
+    let control_row = |row: usize, children: Vec<Element<'a, Message>>| -> Element<'a, Message> {
+        if let Some(focus) = focus.clone() {
+            widget::container(crate::interaction::keyed_control_row(
+                children
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, child)| {
+                        (
+                            super::goal_focus::Control::from_index(row * 2 + index).key(),
+                            child,
+                        )
+                    })
+                    .collect(),
+                space::S,
+                move |key| focus.observe(row, key),
+            ))
+            .width(Length::Fill)
+            .into()
+        } else {
+            widget::row::with_children(children)
+                .width(Length::Fill)
+                .spacing(space::S)
+                .into()
+        }
+    };
     let controls = widget::column::with_children(vec![
-        widget::row::with_children(vec![
-            button::secondary("Check")
-                .id(ids[0].clone())
-                .name("Check native goal")
-                .width(Length::Fill)
-                .on_press_maybe(check.then(|| on_action(intent(Operation::Get))))
-                .into(),
-            button::secondary("Pause")
-                .id(ids[1].clone())
-                .name("Pause native goal")
-                .width(Length::Fill)
-                .on_press_maybe(pause.then(|| on_action(intent(Operation::Pause))))
-                .into(),
-        ])
-        .width(Length::Fill)
-        .spacing(space::S)
-        .into(),
-        widget::row::with_children(vec![
-            button::secondary("Resume")
-                .id(ids[2].clone())
-                .name("Resume native goal")
-                .width(Length::Fill)
-                .on_press_maybe(resume.then(|| on_action(intent(Operation::Resume))))
-                .into(),
-            button::secondary("Clear")
-                .id(ids[3].clone())
-                .name("Clear native goal")
-                .width(Length::Fill)
-                .on_press_maybe(change.then(|| on_action(intent(Operation::Clear))))
-                .into(),
-        ])
-        .width(Length::Fill)
-        .spacing(space::S)
-        .into(),
+        control_row(
+            0,
+            vec![
+                mark(
+                    0,
+                    button::secondary("Check")
+                        .id(ids[0].clone())
+                        .name("Check native goal")
+                        .width(Length::Fill)
+                        .on_press_maybe(check.then(|| on_action(intent(Operation::Get))))
+                        .into(),
+                ),
+                mark(
+                    1,
+                    button::secondary("Pause")
+                        .id(ids[1].clone())
+                        .name("Pause native goal")
+                        .width(Length::Fill)
+                        .on_press_maybe(pause.then(|| on_action(intent(Operation::Pause))))
+                        .into(),
+                ),
+            ],
+        ),
+        control_row(
+            1,
+            vec![
+                mark(
+                    2,
+                    button::secondary("Resume")
+                        .id(ids[2].clone())
+                        .name("Resume native goal")
+                        .width(Length::Fill)
+                        .on_press_maybe(resume.then(|| on_action(intent(Operation::Resume))))
+                        .into(),
+                ),
+                mark(
+                    3,
+                    button::secondary("Clear")
+                        .id(ids[3].clone())
+                        .name("Clear native goal")
+                        .width(Length::Fill)
+                        .on_press_maybe(change.then(|| on_action(intent(Operation::Clear))))
+                        .into(),
+                ),
+            ],
+        ),
     ])
     .width(Length::Fill)
     .spacing(space::XS);

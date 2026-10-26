@@ -131,23 +131,29 @@ impl Runtime {
         let presentation = self.goal_presentation();
         let target = self.target;
         let thread = observed.map_or_else(String::new, |goal| goal.thread_id.clone());
-        let panel = goal::panel_with_ids(presentation, self.goal_control_ids(), move |intent| {
-            // Disabled controls never call the reducer. Keep the callback pure
-            // even for an unavailable observation; there is no I/O here.
-            let binding = binding.clone().unwrap_or_else(|| Binding {
-                target,
-                session: self.session.clone(),
-                handle: Weak::new(),
-            });
-            Message::ChatUi(Action::GoalIntent(
-                target,
-                Control {
-                    binding,
-                    thread: thread.clone(),
-                    intent,
-                },
-            ))
-        });
+        let focus = self.goal_focus.controls(self, presentation);
+        let panel = goal::panel_with_focus(
+            presentation,
+            self.goal_control_ids(),
+            focus,
+            move |intent| {
+                // Disabled controls never call the reducer. Keep the callback pure
+                // even for an unavailable observation; there is no I/O here.
+                let binding = binding.clone().unwrap_or_else(|| Binding {
+                    target,
+                    session: self.session.clone(),
+                    handle: Weak::new(),
+                });
+                Message::ChatUi(Action::GoalIntent(
+                    target,
+                    Control {
+                        binding,
+                        thread: thread.clone(),
+                        intent,
+                    },
+                ))
+            },
+        );
         Some(
             crate::ui_controls::owned(
                 (
