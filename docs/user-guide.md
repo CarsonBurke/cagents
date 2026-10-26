@@ -889,11 +889,12 @@ activity stays in the scrolling conversation so the composer remains available.
 
 ### Local dictation
 
-Local dictation currently requires x86-64 Linux with a working PipeWire
-microphone input. It uses this computer's microphone, including when the
-conversation works on a remote device. Click the
-microphone to open setup, then choose **Download and set up** to approve the
-optional **821 MiB** speech download. Allow additional disk space for the speech
+Local dictation requires x86-64 Linux, PipeWire with its `pw-record` recording
+tool, and a working microphone input. Setup also uses `curl`, `tar`, and `bzip2`.
+It uses this computer's microphone, including when the conversation works on a
+remote device. Click the microphone to open setup, then choose
+**Download and set up** to approve the optional **821 MiB** speech download.
+Allow additional disk space for the speech
 files. Opening a conversation or setup does not start a download or recording.
 Setup shows its progress; **Cancel setup** stops it, and a failed setup offers
 **Retry setup**.
@@ -908,8 +909,9 @@ key.
 
 Recognized text goes into the draft at the caret or selection where recording
 started. You can keep editing; if those edits make the original insertion
-position ambiguous, the text is kept for **Insert here** at the current caret
-or **Discard**. Existing attachments stay attached. Dictation never sends the
+position ambiguous, the text is kept until you choose **Insert here** or
+**Discard**. **Insert here** inserts at the current caret or replaces the current
+selection. Existing attachments stay attached. Dictation never sends the
 message: review the draft and send it yourself. Sending, replacing, or leaving
 the draft cancels its active dictation; opening an image viewer keeps the same
 draft available. If capture fails, check the desktop input device and access
