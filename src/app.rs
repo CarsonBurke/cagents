@@ -14153,6 +14153,12 @@ impl Application for Cagents {
         // through the lightweight visibility/presence postlude below.
         #[rustfmt::skip]
         let task = (|| {
+        if let Message::KeyEvent { event, .. } = &message
+            && matches!(event, keyboard::Event::KeyReleased { .. } | keyboard::Event::KeyPressed { repeat: true, .. })
+            && self.terminal_review_input.consume_keyboard(event)
+        {
+            return Task::none();
+        }
         if pane_origin && self.channel_work_is_main() {
             return Task::none();
         }

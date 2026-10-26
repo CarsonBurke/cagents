@@ -451,6 +451,16 @@ impl Cagents {
     }
 
     pub(super) fn palette_key_event(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
+        // Contextual commands can restore a nonterminal pane and close the
+        // palette before key-up. Its window-owned key still needs retiring
+        // when no terminal widget is mounted to observe that release.
+        if matches!(
+            event,
+            keyboard::Event::KeyReleased { .. } | keyboard::Event::KeyPressed { repeat: true, .. }
+        ) && self.terminal_review_input.consume_keyboard(event)
+        {
+            return Some(Task::none());
+        }
         if let Some(field) = self.palette.recording {
             // Recording is globally visible, but a real dialog owns its
             // key before the recording or settings draft can change.
@@ -532,13 +542,6 @@ impl Cagents {
             return Some(Task::none());
         }
         self.palette.query.as_ref()?;
-        if matches!(
-            event,
-            keyboard::Event::KeyReleased { .. } | keyboard::Event::KeyPressed { repeat: true, .. }
-        ) && self.terminal_review_input.consume_keyboard(event)
-        {
-            return Some(Task::none());
-        }
         if is_escape_press(event) {
             return Some(self.update_palette(Action::Close));
         }
@@ -1847,6 +1850,98 @@ mod tests {
         assert!(!app.palette.is_open());
     }
 
+    fn click_current_contextual_palette_row(
+        app: &Cagents,
+        identity: &EntryIdentity,
+    ) -> Vec<Message> {
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+        use iced::{Event, Rectangle, Size, mouse};
+        use iced_accessibility::accesskit::{Action as A11yAction, ActionRequest, NodeId, TreeId};
+        let target: iced_accessibility::A11yId = identity.widget_id().into();
+        let renderer = crate::app::tests::headless_renderer();
+        let mut element = app.palette_surface().unwrap();
+        let mut tree = Tree::new(element.as_widget());
+        let bounds = Rectangle::with_size(Size::new(880.0, 800.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, bounds.size()),
+        );
+        let accessible =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let advertised = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .find(|node| iced_accessibility::IdEq::eq(node.id(), &target))
+            .expect("current contextual result is advertised by this actual native tree");
+        let target_node: NodeId = advertised.id().clone().into();
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::A11y(
+                widget::Id::from(target_node.0),
+                ActionRequest {
+                    action: A11yAction::Click,
+                    target_tree: TreeId::ROOT,
+                    target_node,
+                    data: None,
+                },
+            ),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        assert_eq!(
+            messages.len(),
+            1,
+            "only the advertised current result owns the AX click"
+        );
+        assert!(
+            matches!(&messages[0], Message::Palette(Action::Run(MessageBox(message)))
+            if identity.matches(message))
+        );
+        messages
+    }
+
+    #[test]
+    fn current_contextual_palette_accessibility_click_runs_its_captured_branch_copy() {
+        let mut app = branch_palette_fixture();
+        let entry = app.palette_entries().pop().unwrap();
+        let identity = EntryIdentity::capture(&entry.2).unwrap();
+        let mut messages = click_current_contextual_palette_row(&app, &identity);
+        let focus = app.workspace.focused();
+        assert_eq!(
+            clipboard_writes(app.update(messages.pop().unwrap())),
+            ["feature/日本語-copy"]
+        );
+        assert_eq!(app.workspace.focused(), focus);
+        assert!(!app.palette.is_open());
+    }
+
+    #[test]
+    fn current_terminal_palette_accessibility_click_reviews_and_returns_exact_origin() {
+        let (mut app, card, _directory) = terminal_palette_fixture();
+        for active in [true, false] {
+            if !active {
+                drop(app.update_palette(Action::Open));
+                drop(app.update_palette(Action::Query(">return to terminal input".into())));
+            }
+            let entry = app.palette_entries().pop().unwrap();
+            let identity = EntryIdentity::capture(&entry.2).unwrap();
+            let mut messages = click_current_contextual_palette_row(&app, &identity);
+            drop(app.update(messages.pop().unwrap()));
+            assert_eq!(app.terminal_review_card, active.then_some(card));
+            assert_eq!(app.workspace.focused(), Some(card));
+            assert!(!app.palette.is_open());
+        }
+    }
+
     #[test]
     fn contextual_palette_query_keeps_native_focus_and_caret_when_result_kind_changes() {
         use iced::advanced::widget::Tree;
@@ -1878,6 +1973,340 @@ mod tests {
                 "native query focus and its advanced caret survive result-kind transition {index}"
             );
         }
+    }
+
+    fn open_copy_release_approval(app: &mut Cagents) {
+        use crate::{
+            agent::Provider,
+            agent_execution::{Origin, Spec, Surface, Target},
+            automations::{
+                Definition, DirectoryIdentity, Proposal, ProposalState, Schedule, SchedulePattern,
+                SessionMode,
+            },
+        };
+        app.active_workspace = Some(
+            app.sidebar_state
+                .active_worktree()
+                .unwrap()
+                .canonical_path
+                .clone(),
+        );
+        let definition = Definition {
+            name: "Copy release fixture".into(),
+            prompt: "Review only the approved fixture".into(),
+            agent: Spec {
+                provider: Provider::Codex,
+                account: Some("codex/system".parse().unwrap()),
+                target: Target {
+                    repository: app.sidebar_model.projects[0].repository.clone(),
+                    directory: app.active_workspace.clone().unwrap(),
+                    placement: None,
+                },
+                surface: Surface::Chat,
+                model: Some("offline".into()),
+                reasoning_effort: Some("low".into()),
+                permission_mode: None,
+            },
+            schedule: Schedule {
+                timezone: "America/Vancouver".into(),
+                pattern: SchedulePattern::Weekdays {
+                    hour: 9,
+                    minute: 30,
+                },
+            },
+            session_mode: SessionMode::Fresh,
+            precheck: None,
+        };
+        let proposal = Proposal {
+            id: uuid::Uuid::new_v4(),
+            revision: 1,
+            owner: Origin::User,
+            requested: definition.clone(),
+            definition,
+            target_identity: DirectoryIdentity {
+                device: 1,
+                inode: 2,
+            },
+            channel_title: None,
+            created_ms: 1,
+            state: ProposalState::Pending,
+        };
+        // Existing local reducers install and open the immutable proposal;
+        // no daemon read, decision or provider task is polled.
+        drop(
+            app.update_automation_approval(automation_approval::Action::Read {
+                generation: 0,
+                result: Arc::new(Ok(vec![proposal.clone()])),
+            }),
+        );
+        drop(
+            app.update_automation_approval(automation_approval::Action::Open {
+                id: proposal.id,
+                revision: proposal.revision,
+            }),
+        );
+        assert!(app.automation_approval_open());
+    }
+
+    #[test]
+    fn closed_copy_palette_retires_activation_without_a_terminal_before_fresh_terminal_input() {
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout,
+            widget::{Tree, operation},
+        };
+        use iced::{Event, Rectangle, Size, mouse};
+        let press = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        };
+        let release = keyboard::Event::KeyReleased {
+            key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+        };
+        // listen_with delivers releases whether another native control
+        // captured them or left them ignored. Neither status may pin a key.
+        for (captured, cover) in [false, true].into_iter().flat_map(|captured| {
+            ["none", "approval", "image", "update"].map(|cover| (captured, cover))
+        }) {
+            let mut app = branch_palette_fixture();
+            assert!(
+                app.cards
+                    .values()
+                    .all(|runtime| !matches!(runtime, CardRuntime::Terminal(_)))
+            );
+            let copy = app.update(Message::KeyEvent {
+                event: press.clone(),
+                captured: true,
+            });
+            assert_eq!(clipboard_writes(copy), ["feature/日本語-copy"]);
+            assert!(!app.palette.is_open());
+            assert!(
+                app.terminal_review_input
+                    .owns_keyboard(&Event::Keyboard(press.clone()))
+            );
+            let fresh_shortcut = keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character("P".into()),
+                modified_key: keyboard::Key::Character("P".into()),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyP),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+                text: None,
+                repeat: false,
+            };
+            match cover {
+                "update" => {
+                    // Model an already-admitted update without polling the
+                    // unrelated disk flush; cancellation below is the real reducer.
+                    app.update_prepared = true;
+                    drop(app.update(Message::KeyEvent {
+                        event: fresh_shortcut.clone(),
+                        captured: false,
+                    }));
+                    assert!(
+                        !app.palette.is_open(),
+                        "fresh unowned shortcut stays frozen"
+                    );
+                    assert!(
+                        !app.terminal_review_input
+                            .owns_keyboard(&Event::Keyboard(fresh_shortcut.clone())),
+                        "update freeze must not invent activation ownership"
+                    );
+                }
+                "approval" => open_copy_release_approval(&mut app),
+                "image" => {
+                    app.chat_ui.image_viewer = Some(chat_ui::images::Gallery::file(
+                        "/copy-release-fixture.png".into(),
+                        None,
+                        iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
+                    ));
+                }
+                _ => {}
+            }
+            let focus = app.workspace.focused();
+            let review_revision = app.terminal_review_revision;
+            let mut unrelated_release = release.clone();
+            if let keyboard::Event::KeyReleased { physical_key, .. } = &mut unrelated_release {
+                *physical_key = keyboard::key::Physical::Code(keyboard::key::Code::NumpadEnter);
+            }
+            drop(app.update(Message::KeyEvent {
+                event: unrelated_release,
+                captured,
+            }));
+            assert!(
+                app.terminal_review_input
+                    .owns_keyboard(&Event::Keyboard(press.clone())),
+                "logically equal but physically different key-up cannot retire Enter"
+            );
+            let mut repeat = press.clone();
+            if let keyboard::Event::KeyPressed { repeat, .. } = &mut repeat {
+                *repeat = true;
+            }
+            drop(app.update(Message::KeyEvent {
+                event: repeat,
+                captured,
+            }));
+            assert!(
+                app.terminal_review_input
+                    .owns_keyboard(&Event::Keyboard(press.clone()))
+            );
+            drop(app.update(Message::KeyEvent {
+                event: release.clone(),
+                captured,
+            }));
+            assert!(
+                !app.terminal_review_input
+                    .owns_keyboard(&Event::Keyboard(press.clone())),
+                "actual App routing must clean key-up after the palette closed under {cover}"
+            );
+            assert_eq!(app.workspace.focused(), focus);
+            assert_eq!(app.terminal_review_revision, review_revision);
+            assert!(!app.palette.is_open());
+            match cover {
+                "update" => {
+                    assert!(
+                        app.update_prepared,
+                        "key cleanup must not unfreeze the update"
+                    );
+                    let (response, receiver) = std::sync::mpsc::sync_channel(1);
+                    drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
+                        action: instance::UiUpdateAction::Cancel,
+                        response,
+                    })));
+                    assert_eq!(receiver.try_recv().unwrap(), "ok");
+                    assert!(!app.update_prepared);
+                    drop(app.update(Message::KeyEvent {
+                        event: fresh_shortcut.clone(),
+                        captured: false,
+                    }));
+                    assert!(app.palette.is_open(), "fresh shortcut works after rollback");
+                    assert!(
+                        !app.terminal_review_input
+                            .owns_keyboard(&Event::Keyboard(fresh_shortcut)),
+                        "fresh shortcut is not owned by the old activation"
+                    );
+                    drop(app.update_palette(Action::Close));
+                }
+                "approval" => {
+                    assert!(
+                        app.automation_approval_open(),
+                        "owned repeat cannot dismiss approval"
+                    );
+                    // A genuine new press still belongs to the approval. Its
+                    // first button dismisses locally; nothing approves work.
+                    drop(app.update(Message::KeyEvent {
+                        event: press.clone(),
+                        captured: false,
+                    }));
+                    assert!(
+                        !app.automation_approval_open(),
+                        "fresh Enter must reach the top owner"
+                    );
+                }
+                "image" => {
+                    assert!(app.chat_ui.image_viewer.is_some());
+                    app.chat_ui.image_viewer = None;
+                }
+                _ => {}
+            }
+            assert!(
+                app.palette_key_event(&press).is_none(),
+                "a fresh closed-palette Enter is not consumed"
+            );
+
+            let (mut fixture, card, _directory) =
+                crate::app::tests::live_agent_app("copy-release-terminal");
+            let state = fixture.card_state(card).unwrap().clone();
+            let runtime = fixture.cards.remove(&card).unwrap();
+            let durable = Arc::make_mut(&mut app.durable);
+            durable.cards.push(state);
+            durable.focused = Some(card);
+            app.workspace = Cagents::rebuild_workspace(&app.durable);
+            app.cards.insert(card, runtime);
+            let focus_id = app.card_keyboard_focus(card);
+            let renderer = crate::app::tests::headless_renderer();
+            let mut element = app.card_view(card, true, false);
+            let mut tree = Tree::new(element.as_widget());
+            let bounds = Rectangle::with_size(Size::new(800.0, 480.0));
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, bounds.size()),
+            );
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut operation::focusable::focus::<()>(focus_id),
+            );
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Keyboard(press.clone()),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &bounds,
+            );
+            assert!(
+                shell.is_event_captured(),
+                "fresh Enter is admitted by the mounted terminal widget"
+            );
+            drop(element);
+            assert!(
+                !app.terminal_review_input
+                    .owns_keyboard(&Event::Keyboard(press.clone())),
+                "fresh terminal input is not swallowed into review ownership"
+            );
+            assert_eq!(app.terminal_review_card, None);
+        }
+    }
+
+    #[test]
+    fn closed_palette_ignores_unrelated_keyboard_without_effects() {
+        let mut app = settings_focus_fixture();
+        let event = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character("q".into()),
+            modified_key: keyboard::Key::Character("q".into()),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyQ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: Some("q".into()),
+            repeat: false,
+        };
+        let before = (
+            app.workspace.focused(),
+            app.settings_search.clone(),
+            app.terminal_review_revision,
+        );
+        assert!(app.palette_key_event(&event).is_none());
+        drop(app.update(Message::KeyEvent {
+            event: event.clone(),
+            captured: false,
+        }));
+        assert_eq!(
+            (
+                app.workspace.focused(),
+                app.settings_search.clone(),
+                app.terminal_review_revision
+            ),
+            before
+        );
+        assert!(!app.palette.is_open());
+        assert!(
+            !app.terminal_review_input
+                .owns_keyboard(&iced::Event::Keyboard(event))
+        );
     }
 
     #[test]
@@ -1994,24 +2423,29 @@ mod tests {
             let keys = if row_focus {
                 vec![
                     (
-                        keyboard::key::Named::Enter,
+                        keyboard::Key::Named(keyboard::key::Named::Enter),
                         keyboard::key::Code::Enter,
                         keyboard::Modifiers::empty(),
                     ),
                     (
-                        keyboard::key::Named::Enter,
+                        keyboard::Key::Named(keyboard::key::Named::Enter),
                         keyboard::key::Code::NumpadEnter,
                         keyboard::Modifiers::CTRL,
                     ),
                     (
-                        keyboard::key::Named::Space,
+                        keyboard::Key::Named(keyboard::key::Named::Space),
+                        keyboard::key::Code::Space,
+                        keyboard::Modifiers::empty(),
+                    ),
+                    (
+                        keyboard::Key::Character(" ".into()),
                         keyboard::key::Code::Space,
                         keyboard::Modifiers::empty(),
                     ),
                 ]
             } else {
                 vec![(
-                    keyboard::key::Named::Enter,
+                    keyboard::Key::Named(keyboard::key::Named::Enter),
                     keyboard::key::Code::Enter,
                     keyboard::Modifiers::empty(),
                 )]
@@ -2042,8 +2476,8 @@ mod tests {
                     &mut operation::focusable::focus::<()>(id),
                 );
                 let press = keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(key),
-                    modified_key: keyboard::Key::Named(key),
+                    key: key.clone(),
+                    modified_key: key.clone(),
                     physical_key: keyboard::key::Physical::Code(physical),
                     location: keyboard::Location::Standard,
                     modifiers,
@@ -2104,8 +2538,8 @@ mod tests {
                 assert!(!app.palette.is_open());
                 assert!(app.terminal_review_input.consume_keyboard(&repeat));
                 let release = keyboard::Event::KeyReleased {
-                    key: keyboard::Key::Named(key),
-                    modified_key: keyboard::Key::Named(key),
+                    key: key.clone(),
+                    modified_key: key.clone(),
                     physical_key: keyboard::key::Physical::Code(physical),
                     location: keyboard::Location::Standard,
                     modifiers,
