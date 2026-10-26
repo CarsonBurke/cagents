@@ -1511,9 +1511,19 @@ impl Cagents {
                     }
                     self.sync_closed_chat_draft(id);
                 }
-                self.status = Some(TransientNotice::warning(
-                    "A pane was closed in another client. Its unsaved edits are retained here; save or discard them before closing it.",
-                ));
+                let message = match self.cards.get(&id) {
+                    Some(CardRuntime::Repository(runtime)) if !runtime.is_dirty() => {
+                        if runtime.is_saving() {
+                            "A pane was closed in another client. Its editor is retained here; wait for its save to finish before closing it."
+                        } else {
+                            "A pane was closed in another client. Its editor is retained here; resolve its file recovery or durability warning before closing it."
+                        }
+                    }
+                    _ => {
+                        "A pane was closed in another client. Its unsaved edits are retained here; save or discard them before closing it."
+                    }
+                };
+                self.status = Some(TransientNotice::warning(message));
                 continue;
             }
             self.detach_shared_pane(id);
@@ -4159,6 +4169,16 @@ mod tests {
                 assert!(app.card_state(pane.id).unwrap().existence.is_open());
                 assert!(app.shared_views.retained.contains(&pane.id));
                 assert!(app.durable.local_only_cards.contains(&pane.id));
+                let notice = app.status.as_ref().unwrap().message.as_str();
+                match state {
+                    "dirty" => assert!(notice.contains("save or discard them before closing")),
+                    "saving" => assert!(notice.contains("wait for its save to finish")),
+                    "warning" | "recovery" => {
+                        assert!(notice.contains("file recovery or durability warning"));
+                        assert!(!notice.contains("unsaved edits"));
+                    }
+                    _ => unreachable!(),
+                }
                 assert!(
                     app.durable.channels.iter().any(|current| {
                         current.id == channel && current.cards.contains(&pane.id)
