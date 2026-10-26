@@ -545,10 +545,12 @@ fn native_microphone_click_preserves_selected_draft_and_pending_image_range() {
         },
     );
     let selected = runtime.composer.cursor();
-    let revision = runtime.revision;
     let pending_image = runtime.try_attachment_insert().unwrap();
     let attachment = Attachment::file("/tmp/dictation-mic-reference.txt");
     runtime.merge_attachments([attachment.clone()]);
+    // Adding the retained attachment advances the draft revision. Compare the
+    // native gesture with the fully prepared draft, not its pre-attachment state.
+    let revision = runtime.revision;
     let Action::Dictation(_, start_action) = start(&app, target) else {
         unreachable!()
     };
