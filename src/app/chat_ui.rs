@@ -280,6 +280,7 @@ pub enum Action {
     OpenChangedFile(Target, PathBuf),
     ChangedFileResolved(Target, u64, PathBuf, Result<PathBuf, String>),
     OpenImage(Target, String),
+    OpenImageFrom(Target, Option<String>, Arc<chat::Item>),
     LoadImage(Target, String),
     ImageLoaded(Target, Arc<chat::Item>, u64, images::Loaded),
     ThumbnailLoaded(Target, Arc<PathBuf>, images::Loaded),
@@ -10710,6 +10711,17 @@ impl Cagents {
                     }
                 }
             }
+            Action::OpenImageFrom(target, agent, source) => {
+                if self.chat_runtime_mut(target).is_some_and(|runtime| {
+                    runtime.selected_subagent == agent
+                        && runtime.visible.load(Ordering::Relaxed)
+                        && runtime
+                            .active_item(&source.id)
+                            .is_some_and(|current| Arc::ptr_eq(current, &source))
+                }) {
+                    return self.handle_chat_ui(Action::OpenImage(target, source.id.clone()));
+                }
+            }
             Action::OpenImage(target, id) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     let gallery = images::Gallery::new(runtime, &id);
@@ -12115,11 +12127,9 @@ mod tests {
             app.chat_ui.image_viewer.is_some(),
             "another runtime generation cannot close the old gallery"
         );
-        app.cards.get_mut(&target.card).map(|card| {
-            if let CardRuntime::Chat(runtime) = card {
-                runtime.target = target;
-            }
-        });
+        if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&target.card) {
+            runtime.target = target;
+        }
         assert!(Action::ImageNext(true).allowed_while_modal());
         assert!(!Action::OpenImage(target, "image".into()).allowed_while_modal());
         drop(app.update(Message::ChatUi(Action::CloseImage)));

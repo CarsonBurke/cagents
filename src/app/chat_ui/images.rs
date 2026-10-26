@@ -1265,7 +1265,13 @@ impl Runtime {
                 widget::button::custom(preview)
                     .class(crate::ui_controls::control_style(false, None))
                     .padding(0)
-                    .on_press(action(Action::OpenImage(self.target, item.id.clone())))
+                    .on_press_maybe(self.active_item(&item.id).cloned().map(|source| {
+                        action(Action::OpenImageFrom(
+                            self.target,
+                            self.selected_subagent.clone(),
+                            source,
+                        ))
+                    }))
                     .width(Length::Fill)
                     .into(),
                 design::caption(format!("{label} · Click to enlarge")).into(),

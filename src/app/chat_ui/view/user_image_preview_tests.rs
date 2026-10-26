@@ -112,8 +112,8 @@ fn click_prompt(
     let actions: Vec<_> = messages
         .iter()
         .map(|message| match message {
-            Message::ChatUi(Action::OpenImage(target, id)) => {
-                format!("OpenImage({target:?}, {id})")
+            Message::ChatUi(Action::OpenImageFrom(target, _, item)) => {
+                format!("OpenImageFrom({target:?}, {})", item.id)
             }
             Message::ChatUi(Action::LoadImage(target, id)) => {
                 format!("LoadImage({target:?}, {id})")
@@ -146,8 +146,8 @@ fn restored_user_image_opens_viewer_from_its_rendered_preview() {
             .any(|text| text.contains("image-internal-digest"))
     );
     assert!(matches!(messages.as_slice(),
-        [Message::ChatUi(Action::OpenImage(target, id))]
-            if *target == runtime.target && id == &item.id));
+        [Message::ChatUi(Action::OpenImageFrom(target, _, source))]
+            if *target == runtime.target && source.id == item.id));
     let Message::ChatUi(open) = messages.into_iter().next().unwrap() else {
         unreachable!()
     };
@@ -198,7 +198,7 @@ fn unavailable_user_image_preserves_its_error_without_a_viewer_action() {
     );
     assert!(!messages.iter().any(|message| matches!(
         message,
-        Message::ChatUi(Action::OpenImage(..) | Action::LoadImage(..))
+        Message::ChatUi(Action::OpenImageFrom(..) | Action::LoadImage(..))
     )));
     assert!(
         !texts
@@ -244,7 +244,7 @@ fn claude_document_placeholder_keeps_its_title_without_image_actions() {
     assert!(!texts.iter().any(|text| text == "Load preview"));
     assert!(!messages.iter().any(|message| matches!(
         message,
-        Message::ChatUi(Action::OpenImage(..) | Action::LoadImage(..))
+        Message::ChatUi(Action::OpenImageFrom(..) | Action::LoadImage(..))
     )));
 }
 
@@ -294,10 +294,49 @@ fn selected_child_user_image_uses_its_own_preview_despite_parent_id_collision() 
             .any(|text| text == "Image 47 · Click to enlarge")
     );
     assert!(matches!(messages.as_slice(),
-        [Message::ChatUi(Action::OpenImage(found, id))] if *found == target && id == &child.id));
+        [Message::ChatUi(Action::OpenImageFrom(found, agent, source))] if *found == target && agent.as_deref() == Some("native-child") && source.id == child.id));
     let Message::ChatUi(open) = messages.into_iter().next().unwrap() else {
         unreachable!()
     };
+    // A callback retired by a tab switch must never resolve the parent's
+    // coincident item ID, even when that parent image is already decoded.
+    drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+    ready(
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .cache
+            .get_mut(&parent.id)
+            .unwrap(),
+    );
+    drop(app.handle_chat_ui(open.clone()));
+    assert!(app.chat_ui.image_viewer.is_none());
+    app.chat_runtime_mut(target)
+        .unwrap()
+        .cache
+        .get_mut(&parent.id)
+        .unwrap()
+        .image = None;
+    drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("native-child".into()))));
+    ready(
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .child_cache
+            .get_mut(&child.id)
+            .unwrap(),
+    );
+    // A same-ID replacement in the same agent is a different source too.
+    let original = app
+        .chat_runtime_mut(target)
+        .unwrap()
+        .active_item(&child.id)
+        .unwrap()
+        .clone();
+    Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).subagents[0].items[0] =
+        Arc::new(image(&child.id, 48));
+    drop(app.handle_chat_ui(open.clone()));
+    assert!(app.chat_ui.image_viewer.is_none());
+    Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).subagents[0].items[0] =
+        original;
     drop(app.handle_chat_ui(open));
     assert!(app.chat_ui.image_viewer.is_some());
     for action in [
@@ -321,7 +360,7 @@ fn selected_child_user_image_uses_its_own_preview_despite_parent_id_collision() 
     assert!(
         !messages
             .iter()
-            .any(|message| matches!(message, Message::ChatUi(Action::OpenImage(..)))),
+            .any(|message| matches!(message, Message::ChatUi(Action::OpenImageFrom(..)))),
         "child pixels never make the parent clickable"
     );
 }
@@ -342,6 +381,6 @@ fn uncached_managed_user_image_keeps_its_stable_label() {
     assert!(
         !messages
             .iter()
-            .any(|message| matches!(message, Message::ChatUi(Action::OpenImage(..))))
+            .any(|message| matches!(message, Message::ChatUi(Action::OpenImageFrom(..))))
     );
 }
