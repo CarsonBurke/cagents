@@ -51,6 +51,18 @@ impl Cagents {
     }
 
     pub(super) fn startup_pane_check(&self) -> Result<bool, String> {
+        if let Some(failure) = self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open())
+            .find_map(|card| self.shared_chat_admission_failure(card.id))
+        {
+            return Err(format!(
+                "Saved workspace recovery failed: {}",
+                failure.message()
+            ));
+        }
         // A native window opens independently of the observer/SeedView task.
         // Wait for that actual admission boundary before judging saved chats
         // or declaring a formerly shared workspace recovered.

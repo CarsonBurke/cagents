@@ -55,6 +55,20 @@ pub enum ModelUpdate {
         operation: Option<uuid::Uuid>,
         model: WorkspaceModel,
     },
+    /// A private publisher attempt for the exact immutable queued seed. This
+    /// adds no daemon authority and is never a successful admission receipt.
+    ViewSeedStarted {
+        scope: crate::workspace_model::views::Scope,
+        panes: Vec<crate::workspace_model::views::Pane>,
+        closed: Vec<CardId>,
+        attempt: uuid::Uuid,
+    },
+    ViewSeedRefused {
+        scope: crate::workspace_model::views::Scope,
+        attempt: uuid::Uuid,
+        registry: Option<uuid::Uuid>,
+        error: String,
+    },
     NavigationFailed(String),
     /// Optional naming yielded after temporary admission pressure. The next
     /// real wake may retry this exact current candidate; this is not a timer.
@@ -259,6 +273,45 @@ fn publish(
     }
 }
 
+fn report_seed_refusal(
+    client: &mut ControlClient,
+    seed: &Option<(crate::workspace_model::views::Scope, uuid::Uuid)>,
+    updates: &async_channel::Sender<ModelUpdate>,
+    error: &ControlError,
+) {
+    if let Some((scope, attempt)) = seed
+        && matches!(
+            error,
+            ControlError::Remote {
+                retryable: false,
+                ..
+            }
+        )
+    {
+        // Stay on the failed request's authenticated connection. Unavailable
+        // evidence is reported as such, never replaced with a new host proof.
+        let registry = client
+            .read_workspace_model()
+            .ok()
+            .map(|model| model.identity);
+        let _ = updates.send_blocking(ModelUpdate::ViewSeedRefused {
+            scope: scope.clone(),
+            attempt: *attempt,
+            registry,
+            error: error.to_string(),
+        });
+    }
+}
+
+#[cfg(test)]
+pub(in crate::app) fn send_seed_for_test(
+    client: &mut ControlClient,
+    edit: ModelEdit,
+    updates: &async_channel::Sender<ModelUpdate>,
+) -> Result<(), ControlError> {
+    send(client, edit, updates)
+}
+
 fn send(
     client: &mut ControlClient,
     edit: ModelEdit,
@@ -281,6 +334,23 @@ fn send(
         ModelEdit::ChangeView {
             scope, operation, ..
         } => Some((scope.clone(), Some(*operation))),
+        _ => None,
+    };
+    let seed_attempt = match &edit {
+        ModelEdit::SeedView {
+            scope,
+            panes,
+            closed,
+        } => {
+            let attempt = uuid::Uuid::new_v4();
+            let _ = updates.send_blocking(ModelUpdate::ViewSeedStarted {
+                scope: scope.clone(),
+                panes: panes.clone(),
+                closed: closed.clone(),
+                attempt,
+            });
+            Some((scope.clone(), attempt))
+        }
         _ => None,
     };
     let mut request = edit;
@@ -315,6 +385,7 @@ fn send(
             ) => {
                 conflicts += 1;
                 if conflicts > 8 {
+                    report_seed_refusal(client, &seed_attempt, updates, &error);
                     return Err(error);
                 }
                 std::thread::sleep(Duration::from_millis(20 * conflicts));
@@ -352,7 +423,10 @@ fn send(
                         .unwrap_or(0);
                 }
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                report_seed_refusal(client, &seed_attempt, updates, &error);
+                return Err(error);
+            }
         }
     };
     if let Some((scope, operation)) = view_edit {
@@ -543,6 +617,31 @@ impl Cagents {
 
     fn apply_workspace_model_update_inner(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
+            ModelUpdate::ViewSeedStarted {
+                scope,
+                panes,
+                closed,
+                attempt,
+            } => {
+                self.shared_view_seed_started(&scope, &panes, &closed, attempt);
+                Task::none()
+            }
+            ModelUpdate::ViewSeedRefused {
+                scope,
+                attempt,
+                registry,
+                error,
+            } => {
+                tracing::warn!(%error, "saved workspace admission was refused");
+                self.refuse_shared_view_seed(
+                    scope,
+                    attempt,
+                    registry,
+                    "The daemon refused this saved workspace. Retry the workspace connection; no conversation was started.".into(),
+                    true,
+                );
+                Task::none()
+            }
             ModelUpdate::TitleDeferred(edit) => {
                 self.defer_channel_title_suggestion(&edit);
                 Task::none()
@@ -1537,6 +1636,28 @@ impl Cagents {
         );
         if let Err(error) = self.workspace_model_tx.try_send(edit) {
             tracing::debug!(%error, "a shared workspace model edit was not queued");
+            let retry_available = error.is_full();
+            let seed_error = if retry_available {
+                "The workspace request queue is full; retry reconnecting this saved conversation"
+            } else {
+                "Workspace connection stopped; close and reopen this window to reconnect. Saved drafts and sessions are retained"
+            };
+            if let ModelEdit::SeedView {
+                scope,
+                panes,
+                closed,
+            } = error.into_inner()
+            {
+                let attempt = uuid::Uuid::new_v4();
+                self.shared_view_seed_started(&scope, &panes, &closed, attempt);
+                self.refuse_shared_view_seed(
+                    scope,
+                    attempt,
+                    None,
+                    seed_error.into(),
+                    retry_available,
+                );
+            }
             if navigation {
                 self.status = Some(TransientNotice::warning(
                     "Could not save the sidebar order; try again once the selected device is connected",
