@@ -216,6 +216,94 @@ mod tests {
     }
 
     #[test]
+    fn group_channel_delete_rejects_panes_added_after_confirmation_without_deleting_a_subset() {
+        let (mut app, _, ids) = fixture();
+        select(&mut app, &ids[..2]);
+        drop(app.begin_sidebar_group_delete());
+        let card = app.durable.cards[0].id;
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|row| row.id == ids[1])
+            .unwrap()
+            .cards
+            .push(card);
+        drop(app.update_sidebar_selection(Action::Confirm));
+        assert!(
+            app.sidebar_selection_ui
+                .dialog
+                .as_ref()
+                .unwrap()
+                .error
+                .is_some()
+        );
+        assert!(
+            ids.iter()
+                .all(|id| app.durable.channels.iter().any(|row| row.id == *id))
+        );
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.channel_ui.deletion_running());
+    }
+
+    #[test]
+    fn group_channel_delete_rechecks_dirty_and_recovery_editor_barriers() {
+        for warning in [false, true] {
+            let (mut app, _, ids) = fixture();
+            let editor = app.durable.cards[0].id;
+            let (clean, _) =
+                repository_widget::RepositoryRuntime::open_fixture(editor, "notes.txt", "saved\n");
+            app.card_state_mut(editor).unwrap().kind =
+                CardKind::Repository(clean.descriptor.clone());
+            app.cards
+                .insert(editor, CardRuntime::Repository(Box::new(clean)));
+            Arc::make_mut(&mut app.durable)
+                .channels
+                .iter_mut()
+                .find(|row| row.id == ids[1])
+                .unwrap()
+                .cards
+                .push(editor);
+            select(&mut app, &ids[..2]);
+            drop(app.begin_sidebar_group_delete());
+            let blocked = if warning {
+                let mut runtime =
+                    repository_widget::RepositoryRuntime::post_persist_warning_fixture(editor);
+                for action in [
+                    iced::widget::text_editor::Action::SelectAll,
+                    iced::widget::text_editor::Action::Edit(
+                        iced::widget::text_editor::Edit::Paste(Arc::new("B\n".into())),
+                    ),
+                ] {
+                    drop(
+                        runtime.update(repository_widget::RepositoryAction::EditorAction {
+                            card: editor,
+                            action,
+                        }),
+                    );
+                }
+                assert!(!runtime.is_dirty());
+                runtime
+            } else {
+                repository_widget::RepositoryRuntime::dirty_fixture(editor)
+            };
+            assert!(blocked.blocks_navigation());
+            app.cards
+                .insert(editor, CardRuntime::Repository(Box::new(blocked)));
+            drop(app.update_sidebar_selection(Action::Confirm));
+            assert_eq!(
+                app.sidebar_selection_ui.dialog.as_ref().unwrap().blocked(),
+                1
+            );
+            assert!(
+                ids.iter()
+                    .all(|id| app.durable.channels.iter().any(|row| row.id == *id))
+            );
+            assert!(app.card_state(editor).unwrap().existence.is_open());
+            assert!(!app.channel_ui.deletion_running());
+        }
+    }
+
+    #[test]
     fn changed_target_aborts_the_entire_confirmed_group_before_deletion() {
         let (mut app, _, ids) = fixture();
         select(&mut app, &ids[..2]);
@@ -378,7 +466,7 @@ pub enum Action {
     Dismiss,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct Target {
     row: SelectionRow,
     directory: PathBuf,
@@ -389,6 +477,7 @@ struct Target {
     /// Why this member cannot go yet. Any blocker holds the whole group, so
     /// the confirmation never deletes a subset the user did not choose.
     blocker: Option<String>,
+    channel: Option<channel_ui::ChannelDeletionTarget>,
 }
 
 #[derive(Debug)]
@@ -510,6 +599,7 @@ impl Cagents {
                     label: project.name.clone(),
                     detail: project.repository.display().to_string(),
                     blocker: self.selected_project_removal_blocker(id),
+                    channel: None,
                 })
             }
             SelectionRow::Worktree(project, id) => {
@@ -524,6 +614,7 @@ impl Cagents {
                     label: worktree.label().to_owned(),
                     detail: worktree.path.display().to_string(),
                     blocker: self.selected_worktree_deletion_blocker(project, id),
+                    channel: None,
                 })
             }
             SelectionRow::Channel(id) => {
@@ -539,10 +630,8 @@ impl Cagents {
                     .ok_or("The selected channel's project is no longer open.")?;
                 let blocker = if self.channel_ui.is_deleting(id) {
                     Some("Channel deletion is already in progress.".into())
-                } else if channel.cards.iter().any(|card| matches!(self.cards.get(card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())) {
-                    Some("Save or close this channel's unsaved editor buffers first.".into())
                 } else {
-                    None
+                    self.channel_deletion_blocker(id)
                 };
                 Ok(Target {
                     row,
@@ -554,6 +643,7 @@ impl Cagents {
                     .into_owned(),
                     detail: project.name.clone(),
                     blocker,
+                    channel: self.channel_deletion_target(id),
                 })
             }
         }
@@ -621,12 +711,23 @@ impl Cagents {
         dialog.error = None;
         for target in &mut dialog.targets {
             match self.selected_row_target(target.row) {
-                Ok(current) if current.directory == target.directory => {
+                Ok(current)
+                    if current.directory == target.directory
+                        && target
+                            .channel
+                            .as_ref()
+                            .is_none_or(|consent| match target.row {
+                                SelectionRow::Channel(id) => {
+                                    self.channel_deletion_target_current(id, consent)
+                                }
+                                _ => false,
+                            }) =>
+                {
                     target.blocker = current.blocker;
                 }
                 Ok(_) => {
                     dialog.error = Some(
-                        "A selected row changed location. Cancel and select it again.".to_owned(),
+                        "A selected row or its panes changed. Cancel and review the selection again.".to_owned(),
                     );
                 }
                 Err(error) => dialog.error = Some(error),
@@ -640,7 +741,9 @@ impl Cagents {
         let mut tasks = Vec::new();
         for target in dialog.targets {
             tasks.push(match target.row {
-                SelectionRow::Channel(id) => self.delete_channel(id),
+                SelectionRow::Channel(id) => {
+                    self.delete_confirmed_channel(id, target.channel.unwrap())
+                }
                 SelectionRow::Worktree(project, id) => self.delete_selected_worktree(project, id),
                 SelectionRow::Project(project_id) => {
                     // Prepare the same project removal used by its row, then
