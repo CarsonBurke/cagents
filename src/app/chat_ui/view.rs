@@ -1722,6 +1722,7 @@ impl Runtime {
         })
     }
 
+    #[cfg(test)]
     fn view<'a>(
         &'a self,
         recovery: Option<auth_recovery::Recovery>,
@@ -5805,6 +5806,8 @@ mod issue1506_tests;
 
 #[cfg(test)]
 mod user_image_preview_tests;
+#[cfg(test)]
+mod image_viewer_tests;
 
 #[cfg(test)]
 pub(super) fn prepared_runtime_for_test(items: &[chat::Item]) -> (Runtime, Arc<ClientHandle>) {

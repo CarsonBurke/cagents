@@ -1060,6 +1060,13 @@ impl Gallery {
                         None,
                     ))
                     .padding(2)
+                    .name(format!(
+                        "View {} · image {} of {}",
+                        entry.label,
+                        index + 1,
+                        self.entries.len()
+                    ))
+                    .selected(index == self.selected)
                     .on_press(action(Action::ImageSelect(index)))
                     .into()
                 })

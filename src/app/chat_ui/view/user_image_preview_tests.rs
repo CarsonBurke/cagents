@@ -276,6 +276,13 @@ fn selected_child_user_image_uses_its_own_preview_despite_parent_id_collision() 
     let mut app = crate::app::tests::context_inspector_test_app(false);
     app.cards
         .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+    {
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.composer = text_editor::Content::with_text("Feedback on this exact image");
+        runtime
+            .attachments
+            .push(chat::Attachment::file("/fixture/keep-this-attachment.txt"));
+    }
     drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("native-child".into()))));
     let renderer = crate::app::tests::headless_renderer();
     let runtime = app.chat_runtime_mut(target).unwrap();
@@ -293,7 +300,21 @@ fn selected_child_user_image_uses_its_own_preview_despite_parent_id_collision() 
     };
     drop(app.handle_chat_ui(open));
     assert!(app.chat_ui.image_viewer.is_some());
-    drop(app.handle_chat_ui(Action::CloseImage));
+    for action in [
+        Action::ImageNext(true),
+        Action::ImageActualSize,
+        Action::ImageFit,
+        Action::CloseImage,
+    ] {
+        drop(app.handle_chat_ui(action));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert_eq!(runtime.composer.text(), "Feedback on this exact image");
+        assert_eq!(
+            runtime.attachments,
+            [chat::Attachment::file("/fixture/keep-this-attachment.txt")]
+        );
+        assert_eq!(runtime.selected_subagent.as_deref(), Some("native-child"));
+    }
     drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
     let runtime = app.chat_runtime_mut(target).unwrap();
     let (_, messages) = click_prompt(&renderer, runtime, &parent);

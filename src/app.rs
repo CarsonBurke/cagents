@@ -16833,6 +16833,26 @@ impl Application for Cagents {
                 if let keyboard::Event::ModifiersChanged(modifiers) = &event {
                     self.keyboard_modifiers = *modifiers;
                 }
+                // Device-file images remain a dialog and do not start with
+                // a focused chat canvas. Keep their original modal keyboard
+                // contract without intercepting a conversation's composer.
+                if self.chat_ui.image_viewer.as_ref().is_some_and(chat_ui::images::Gallery::is_modal) {
+                    if let keyboard::Event::KeyPressed { key, .. } = &event {
+                        match key {
+                            keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                                self.chat_ui.image_viewer = None;
+                            }
+                            keyboard::Key::Named(keyboard::key::Named::ArrowLeft) if !captured => {
+                                self.chat_ui.image_viewer.as_mut().unwrap().next(false);
+                            }
+                            keyboard::Key::Named(keyboard::key::Named::ArrowRight) if !captured => {
+                                self.chat_ui.image_viewer.as_mut().unwrap().next(true);
+                            }
+                            _ => {}
+                        }
+                    }
+                    return Task::none();
+                }
                 if !captured
                     && !self.workspace_inputs_blocked()
                     && workspace_widget::global_shortcut(
