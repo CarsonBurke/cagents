@@ -607,10 +607,43 @@ fn indexed_owners_preserve_duplicate_rows_folder_precedence_and_explicit_filing(
         session.launch.working_directory = root.join("unregistered-child");
     }
     drop(app.update(Message::WindowResized(1200.0, 800.0)));
+    assert!(app.known_worktree_roots.contains(&root));
+    assert_eq!(app.worktree_owners.get(&card), Some(&root));
     assert_eq!(
         app.sidebar_state.agent_activity(first, folder.worktree_id),
-        None,
-        "an exact folder key is not a newly discovered ancestor root"
+        Some(ActivityState::Working),
+        "a loaded Folder establishes its boundary without selection"
+    );
+    assert!(
+        app.sidebar_state
+            .has_agent_update(first, folder.worktree_id)
+    );
+    assert!(app.sidebar_state.has_card_update(card));
+    assert_eq!(app.sidebar_state.card_activity(card), Some(working));
+
+    // The boundary is still a component-aware ancestor, not a catch-all
+    // destination for a terminal outside any loaded Folder/worktree.
+    let outside = root.parent().unwrap().join(format!(
+        "{}-outside-loaded-folder",
+        root.file_name().unwrap().to_string_lossy()
+    ));
+    assert!(!outside.starts_with(&root));
+    app.worktree_owners.remove(&card);
+    if let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind {
+        session.launch.working_directory = outside.clone();
+    }
+    drop(app.update(Message::WindowResized(1200.0, 800.0)));
+    assert_eq!(
+        app.card_worktree(app.card_state(card).unwrap()),
+        Some(outside.as_path())
+    );
+    assert_eq!(
+        app.sidebar_state.agent_activity(first, folder.worktree_id),
+        None
+    );
+    assert!(
+        !app.sidebar_state
+            .has_agent_update(first, folder.worktree_id)
     );
     assert!(app.sidebar_state.has_card_update(card));
     assert_eq!(app.sidebar_state.card_activity(card), Some(working));
