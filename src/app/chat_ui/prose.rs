@@ -683,35 +683,38 @@ impl Renderer {
                         let prose_document::Node::Bullet(bullet) = renderer.node() else {
                             unreachable!("bullet path")
                         };
-                        let (marker, items): (Element<'static, Message>, _) = match (bullet, start)
-                        {
-                            (markdown::Bullet::Point { items }, Some(start))
-                            | (markdown::Bullet::Task { items, .. }, Some(start)) => (
-                                iced::widget::text(format!("{}.", index as u64 + start))
-                                    .size(settings.text_size)
-                                    .align_x(iced::alignment::Horizontal::Right)
-                                    .width(
-                                        settings.text_size
-                                            * ((digits.unwrap_or(1.0) / 2.0).ceil() + 1.0),
+                        let (items, task): (_, Option<Element<'static, Message>>) = match bullet {
+                            markdown::Bullet::Point { items } => (items, None),
+                            markdown::Bullet::Task { items, done } => (
+                                items,
+                                Some(
+                                    widget::container(
+                                        iced::widget::checkbox(*done).size(settings.text_size),
+                                    )
+                                    .center_y(
+                                        iced::widget::text::LineHeight::default()
+                                            .to_absolute(settings.text_size),
                                     )
                                     .into(),
-                                items,
+                                ),
                             ),
-                            (markdown::Bullet::Point { items }, None) => (
-                                iced::widget::text("•").size(settings.text_size).into(),
-                                items,
-                            ),
-                            (markdown::Bullet::Task { items, done }, None) => (
-                                widget::container(
-                                    iced::widget::checkbox(*done).size(settings.text_size),
+                        };
+                        let number: Option<Element<'static, Message>> = start.map(|start| {
+                            iced::widget::text(format!("{}.", index as u64 + start))
+                                .size(settings.text_size)
+                                .align_x(iced::alignment::Horizontal::Right)
+                                .width(
+                                    settings.text_size
+                                        * ((digits.unwrap_or(1.0) / 2.0).ceil() + 1.0),
                                 )
-                                .center_y(
-                                    iced::widget::text::LineHeight::default()
-                                        .to_absolute(settings.text_size),
-                                )
+                                .into()
+                        });
+                        let marker = match (number, task) {
+                            (Some(number), Some(task)) => iced::widget::row![number, task]
+                                .spacing(settings.spacing.0)
                                 .into(),
-                                items,
-                            ),
+                            (Some(marker), None) | (None, Some(marker)) => marker,
+                            (None, None) => iced::widget::text("•").size(settings.text_size).into(),
                         };
                         let mut prefix = start.map_or_else(
                             || "-".to_owned(),
@@ -1264,6 +1267,76 @@ fn alignment(column: &markdown::Column) -> iced::alignment::Horizontal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordered_tasks_keep_native_numbers_checked_state_and_copied_markers() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        use iced_accessibility::accesskit::Role;
+
+        let source = "8. [x] Finished\n9. [ ] Pending\n   1. [x] Nested finished\n   2. Ordinary nested item\n\n- [ ] Unordered pending\n- Ordinary bullet\n";
+        let cached = CachedItem::new(
+            &ItemContent::Text {
+                text: source.into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        for theme in [cosmic::Theme::dark(), cosmic::Theme::light()] {
+            for width in [360.0, 900.0] {
+                let mut element = view(
+                    &cached,
+                    design::markdown_settings(&theme, design::TEXT_PROSE),
+                    target,
+                    None,
+                );
+                let mut tree = Tree::new(element.as_widget());
+                let renderer = crate::app::tests::headless_renderer();
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 1200.0)),
+                );
+                let accessible = element.as_widget().a11y_nodes(
+                    Layout::new(&node),
+                    &tree,
+                    iced::mouse::Cursor::Unavailable,
+                );
+                let nodes: Vec<_> = accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .collect();
+                assert_eq!(
+                    nodes
+                        .iter()
+                        .filter(|node| node.node().role() == Role::CheckBox)
+                        .map(|node| node.node().is_selected())
+                        .collect::<Vec<_>>(),
+                    [Some(true), Some(false), Some(true), Some(false)],
+                    "ordered, nested and unordered tasks retain their real native checkbox states"
+                );
+                for marker in ["8.", "9.", "1.", "2.", "•"] {
+                    assert!(
+                        nodes.iter().any(|node| node.node().label() == Some(marker)),
+                        "numbering and ordinary list markers remain visible: {marker}"
+                    );
+                }
+            }
+        }
+
+        let mut builder = selection::Catalog::builder();
+        builder.markdown("checklist", &[0], cached.markdown.items());
+        let catalog = builder.finish();
+        let (start, end) = catalog.endpoints().unwrap();
+        let expected = "8. [x] Finished\n9. [ ] Pending\n   1. [x] Nested finished\n   2. Ordinary nested item\n- [ ] Unordered pending\n- Ordinary bullet";
+        assert_eq!(catalog.copy(start, end).as_deref(), Some(expected));
+        assert_eq!(catalog.copy(end, start).as_deref(), Some(expected));
+    }
 
     #[test]
     fn prepared_palette_maps_are_shared_across_views_in_both_appearances() {
