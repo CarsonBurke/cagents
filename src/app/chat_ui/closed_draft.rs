@@ -248,7 +248,7 @@ mod tests {
         result
     }
 
-    fn visible_text(app: &Cagents, card: CardId) -> Vec<String> {
+    fn visible_text(app: &mut Cagents, card: CardId) -> Vec<String> {
         use iced::advanced::{
             Layout, layout,
             widget::{Operation, Tree},
@@ -263,6 +263,14 @@ mod tests {
                 self.0.push(text.to_owned());
             }
         }
+        // These tests set the local error directly instead of dispatching a
+        // provider callback. Run the same postlude as handle_chat_ui, then
+        // settle the real asynchronous presentation before inspecting widgets.
+        app.reconcile_chat_failure_presentations();
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+            panic!("retained chat fixture");
+        };
+        preparation::drain_fixture(runtime);
         let renderer = crate::app::tests::headless_renderer();
         let mut element = app.chat_view(card);
         let mut tree = Tree::new(element.as_widget());
@@ -300,8 +308,17 @@ mod tests {
         assert!(app.card_state(target.card).unwrap().existence.is_open());
         app.chat_runtime_mut(target).unwrap().error =
             Some("Exact native chat is not hosted; explicit recovery is required".into());
-        let text = visible_text(&app, target.card).join("\n");
-        assert!(text.contains("Closed · draft retained"), "{text}");
+        let text = visible_text(&mut app, target.card).join("\n");
+        assert!(
+            text.contains("The completed report stays readable."),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Closed in another window. Your conversation and unsent draft are kept here."
+            ),
+            "{text}"
+        );
         assert!(
             text.contains("Copy draft") && text.contains("Discard draft text"),
             "{text}"
@@ -325,11 +342,14 @@ mod tests {
             "Finished with error"
         );
         assert!(!runtime(&app, target).expected_remote_close_error(error));
+        let text = visible_text(&mut app, target.card).join("\n");
+        assert!(text.contains(error), "{text}");
+        assert!(text.contains("Copy details"), "{text}");
         assert!(
-            visible_text(&app, target.card)
-                .join("\n")
-                .contains("Finished with error")
+            text.contains("The completed report stays readable."),
+            "{text}"
         );
+        assert!(!text.contains("Closed in another window."), "{text}");
         let pane = app.workspace_model.views[0].panes[0].clone();
         // A source tombstone can also be a transfer. Destination ownership wins.
         let mut destination = View::empty(crate::model::ChannelId::new());
