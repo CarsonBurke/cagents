@@ -907,6 +907,34 @@ use `--device local`; the command always addresses this physical device.
 Provider history that does not retain verifiable image data cannot reconstruct
 a trusted reference from its label alone.
 
+### Native goals
+
+Codex conversations can use the provider's native goal controls. Enter `/goal`
+or `/goal status` to open the goal panel and check its current state. Use
+`/goal set <objective>` to set an objective, or `/goal <objective>` when its
+first word is not a control name. Objectives can contain up to 4,000 Unicode
+characters. Explicit `set` also permits an objective such as `pause`.
+
+The panel shows the provider's objective, status, tokens and elapsed time.
+**Check**, **Pause**, **Resume** and **Clear** act on that same conversation;
+`/goal pause`, `/goal resume` and `/goal clear` expose the same controls.
+Pause and Clear do not interrupt an already running turn; use the ordinary
+Stop control when that is also needed. Cagents supplies no implicit goal
+budget, and does not change the selected account, model or permissions.
+
+Goal commands use Send. Queue, Steer, attachments and unfinished pastes retain
+the input and explain what needs attention. An accepted dispatch is not provider
+confirmation: a failed or uncertain request keeps the text for inspection and
+is never automatically resent as a prompt. The panel distinguishes current
+state from the last observation. Unsupported providers or versions explain the
+limitation rather than sending literal `/goal` text.
+
+Restoring a goal can start autonomous work. Cagents preserves the original
+account and directory evidence before permitting that work. Older retained
+sessions without that evidence first check their goal without resuming the
+thread; active or unknown state keeps execution blocked. Where supported,
+Check, Pause and Clear remain available to recover the original conversation.
+
 ### Messages, branches, and child agents
 
 Chat loads recent image previews first. **Load preview** gives the selected image
