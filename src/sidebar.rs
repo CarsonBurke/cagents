@@ -17351,6 +17351,7 @@ pub(crate) mod tests {
             repository: folder.repository.clone(),
         };
         let id = folder.chrome.open_id.clone();
+        let project_id = folder.id;
         let name = format!("Open project {}", folder.name);
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![folder]);
         let state = SidebarState::default();
@@ -17418,7 +17419,16 @@ pub(crate) mod tests {
             &mut Shell::new(&mut messages),
             &viewport,
         );
-        assert!(messages.is_empty());
+        // Row selection is published on press; navigation remains the
+        // original native button's release action after the cache hit.
+        assert_eq!(
+            messages,
+            vec![SidebarAction::SelectRows {
+                row: SelectionRow::Project(project_id),
+                intent: SelectionIntent::Navigate,
+            }]
+        );
+        messages.clear();
         element = make(1, false);
         tree.diff(element.as_widget_mut());
         node = element
