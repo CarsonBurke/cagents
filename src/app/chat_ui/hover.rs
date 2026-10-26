@@ -594,16 +594,18 @@ mod tests {
             &tree,
             mouse::Cursor::Unavailable,
         );
-        for (label, before) in [
-            (REPORT, native_bounds[0]),
-            ("Copy report", native_bounds[1]),
+        for (label, role, before) in [
+            (REPORT, Role::Label, native_bounds[0]),
+            ("Copy report", Role::Button, native_bounds[1]),
         ] {
             let after = translated
                 .root()
                 .iter()
                 .chain(translated.children())
                 .find(|node| {
-                    node.node().value() == Some(label) || node.node().label() == Some(label)
+                    node.node().role() == role
+                        && (node.node().value() == Some(label)
+                            || node.node().label() == Some(label))
                 })
                 .unwrap()
                 .node()
