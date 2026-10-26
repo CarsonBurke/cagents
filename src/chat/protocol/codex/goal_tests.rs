@@ -762,3 +762,68 @@ fn disabled_goal_diagnostics_cannot_cross_newer_observations_or_a_rebound_actor(
         assert!(current.writes.is_empty());
     }
 }
+
+#[test]
+fn disabled_automatic_goal_probe_is_quiet_but_explicit_check_explains_and_chat_stays_usable() {
+    let mut adapter = adapter();
+    let attached = attach(&mut adapter);
+    let reads = attached
+        .writes
+        .iter()
+        .filter(|frame| frame["method"] == "thread/goal/get")
+        .collect::<Vec<_>>();
+    assert_eq!(reads.len(), 1);
+    let automatic = adapter
+        .receive(json!({"id":reads[0]["id"], "error":{
+            "code":-32600, "message":"goals feature is disabled"
+        }}))
+        .unwrap();
+    assert!(!published(&automatic).pending);
+    assert!(published(&automatic).uncertain);
+    assert_eq!(published(&automatic).read, ReadState::Unknown);
+    assert!(
+        automatic.writes.is_empty(),
+        "optional metadata failure does not retry or start work"
+    );
+    assert!(
+        !automatic
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Error { .. }))
+    );
+    assert!(adapter.ready && adapter.attached && adapter.direct_input);
+
+    let explicit = command(&mut adapter, Operation::Get);
+    assert_eq!(explicit.writes.len(), 1);
+    assert_eq!(explicit.writes[0]["method"], "thread/goal/get");
+    let checked = adapter
+        .receive(json!({"id":explicit.writes[0]["id"], "error":{
+            "code":-32600, "message":"goals feature is disabled"
+        }}))
+        .unwrap();
+    assert!(!published(&checked).pending);
+    assert!(published(&checked).uncertain);
+    assert_eq!(published(&checked).read, ReadState::Unknown);
+    assert_eq!(checked.events.iter().filter(|event| matches!(event,
+        Event::Error { fatal: false, message } if message == "Goals are disabled in this Codex connection. Enable Goals in the selected Codex configuration before starting a new connection. Your input is kept."
+    )).count(), 1);
+    assert!(
+        !checked
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Error { fatal: true, .. }))
+    );
+    assert!(checked.writes.is_empty());
+    // This fixture has original-scope admission. The optional observation is
+    // not a global ordinary-chat policy or a synthesized absent Goal.
+    let ordinary = adapter
+        .command(Command::Prompt {
+            text: "Explicit ordinary chat remains ordinary".into(),
+            attachments: vec![],
+            mode: PromptMode::Send,
+        })
+        .unwrap();
+    assert_eq!(ordinary.writes.len(), 1);
+    assert_eq!(ordinary.writes[0]["method"], "turn/start");
+    assert_eq!(ordinary.writes[0]["params"]["threadId"], "thread-exact");
+}
