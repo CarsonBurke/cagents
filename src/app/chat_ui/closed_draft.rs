@@ -28,9 +28,15 @@ impl Cagents {
     pub(in crate::app) fn sync_closed_chat_draft(&mut self, card: CardId) {
         let closed = self.chat_closed_elsewhere(card);
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
+            if closed {
+                runtime.dictation.retire();
+            }
             runtime.closed_elsewhere = closed;
         }
         if let Some(runtime) = self.chat_ui.parked.get_mut(&card) {
+            if closed {
+                runtime.dictation.retire();
+            }
             runtime.closed_elsewhere = closed;
         }
     }
@@ -329,6 +335,30 @@ mod tests {
             .as_widget_mut()
             .operate(&mut tree, Layout::new(&node), &renderer, &mut text);
         text.0
+    }
+
+    #[test]
+    fn canonical_remote_close_retires_dictation_without_editing_retained_draft() {
+        let (mut app, target, channel, _) = fixture("unsent draft");
+        let current = app.chat_runtime_mut(target).unwrap();
+        let ticket =
+            current
+                .dictation
+                .capture_for_test(target, current.revision, &current.composer);
+        retire(&mut app, channel, target.card);
+        assert!(runtime(&app, target).closed_elsewhere);
+        assert!(runtime(&app, target).dictation.phase().is_none());
+        drop(app.handle_chat_ui(Action::Dictation(
+            target,
+            super::super::dictation::Action::Finished(super::super::dictation::Delivery::new(
+                ticket.clone(),
+                Ok(crate::speech::Transcript {
+                    ticket,
+                    text: "late transcript".into(),
+                }),
+            )),
+        )));
+        assert_eq!(runtime(&app, target).unsent_text(), "unsent draft");
     }
 
     #[test]
