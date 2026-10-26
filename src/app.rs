@@ -7444,6 +7444,12 @@ impl Cagents {
         if unchanged {
             return None;
         }
+        if self.card_state(card).is_some_and(
+            |state| matches!(&state.kind, CardKind::Chat(current) if current.id != session.id),
+        ) {
+            // An accepted identity replacement retires attribution, not journal news.
+            self.sidebar_state.forget_card_attention(card);
+        }
         let conversion = self
             .card_state(card)
             .is_some_and(|state| !matches!(state.kind, CardKind::Chat(_)));
@@ -7571,6 +7577,8 @@ impl Cagents {
     }
 
     fn agent_worktree(&self, card: CardId) -> Option<ActiveWorktreeKey> {
+        #[cfg(test)]
+        terminal_output_tests::record_owner_resolution();
         let state = self
             .card_state(card)
             .filter(|state| state.existence.is_open())?;
@@ -8375,6 +8383,9 @@ impl Cagents {
         }
         self.status = None;
         if let Some((expected_terminal_id, _)) = &terminal_replacement {
+            // A fresh actor must not inherit its predecessor's sidebar news.
+            // Retiring that attribution does not acknowledge the old journal.
+            self.sidebar_state.forget_card_attention(card);
             // The ended identity's final-screen outcome is spent.
             self.retained_outputs.remove(expected_terminal_id);
         }
@@ -9140,8 +9151,10 @@ impl Cagents {
                 // the end replays the activity it once reported, which must
                 // not bring a finished agent's row back to life.
                 TerminalEvent::AgentActivityChanged(activity) => {
-                    if ended_terminal(self.card_state(card)).is_none() {
-                        metadata_changed |= self.sidebar_state.card_activity(card) != activity;
+                    if ended_terminal(self.card_state(card)).is_none()
+                        && self.sidebar_state.card_activity(card) != activity
+                    {
+                        metadata_changed = true;
                         self.observe_agent_activity_for_card(card, activity);
                     }
                 }
@@ -9307,8 +9320,10 @@ impl Cagents {
                 CardRuntime::Terminal(handle) => handle.agent_activity(),
                 _ => None,
             });
-            metadata_changed |= self.sidebar_state.card_activity(card) != activity;
-            self.observe_agent_activity_for_card(card, activity);
+            if self.sidebar_state.card_activity(card) != activity {
+                metadata_changed = true;
+                self.observe_agent_activity_for_card(card, activity);
+            }
         }
         // Attention follows semantic agent transitions, not ordinary terminal output.
         if durable_changed {
@@ -14336,7 +14351,11 @@ impl Application for Cagents {
             Message::HostedTerminalsObserved(terminals) => {
                 self.observe_hosted_descriptors(terminals)
             }
-            Message::WorkspaceModelObserved(update) => self.apply_workspace_model_update(update),
+            Message::WorkspaceModelObserved(update) => {
+                let (task, changed) = self.apply_workspace_model_update_effect(update);
+                terminal_metadata_unchanged = !changed;
+                task
+            }
             Message::TerminalStarted {
                 card,
                 terminal,
@@ -24583,10 +24602,24 @@ mod tests {
         drop(app.initialize_runtimes());
         assert_eq!(
             app.terminal_starts_in_flight(),
-            0,
-            "ordinary offscreen lifecycle stays deferred"
+            1,
+            "the identified Omp agent already observes background metadata"
         );
+        assert!(app.terminal_start_in_flight(terminals[1].id));
+        assert!(!app.terminal_start_in_flight(terminals[0].id));
+        assert!(!app.terminal_start_in_flight(terminals[2].id));
         assert!(app.restored_agent_attaches.is_empty());
+        let CardKind::Terminal(omp) = &terminals[1].kind else {
+            unreachable!()
+        };
+        drop(app.update(Message::RestoredAgentAttached {
+            card: terminals[1].id,
+            terminal: omp.id,
+            result: Ok(None),
+        }));
+        assert_eq!(app.terminal_starts_in_flight(), 0);
+        // An unavailable original remains unqualified; the explicit startup
+        // check then uses the same serial attach-only path for every owner.
         drop(app.qualify_startup_terminals());
         assert_eq!(app.terminal_starts_in_flight(), 1);
         assert_eq!(app.restored_agent_attaches.len(), 2);
