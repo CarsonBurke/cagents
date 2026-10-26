@@ -6,6 +6,8 @@ mod installed;
 mod source;
 pub use confirmation::{Choice as UpdateChoice, Confirmation as UpdateConfirmation, decide};
 pub mod impact;
+#[cfg(feature = "ui")]
+pub mod startup;
 use std::{
     ffi::CString,
     fs::{self, File, OpenOptions},
