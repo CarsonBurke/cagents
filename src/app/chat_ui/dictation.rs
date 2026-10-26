@@ -403,6 +403,7 @@ fn insert(
 pub(super) struct SetupTicket(Uuid);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SetupPhase {
+    CheckingSaved,
     Downloading { bytes: u64 },
     Verifying,
     Extracting,
@@ -427,7 +428,7 @@ impl Setup {
         let cancel = CancellationToken::new();
         self.active = Some(SetupJob {
             ticket,
-            phase: SetupPhase::Downloading { bytes: 0 },
+            phase: SetupPhase::CheckingSaved,
             cancel: cancel.clone(),
         });
         self.error = None;
@@ -441,19 +442,22 @@ impl Setup {
             return false;
         }
         let rank = |phase| match phase {
-            SetupPhase::Downloading { .. } => 0,
-            SetupPhase::Verifying => 1,
-            SetupPhase::Extracting => 2,
+            SetupPhase::CheckingSaved => 0,
+            SetupPhase::Downloading { .. } => 1,
+            SetupPhase::Verifying => 2,
+            SetupPhase::Extracting => 3,
         };
         if rank(phase) < rank(job.phase) {
             return false;
         }
-        if let (SetupPhase::Downloading { bytes: previous }, SetupPhase::Downloading { bytes }) =
-            (job.phase, phase)
-            && (bytes < previous
-                || bytes > speech::model::RUNTIME.bytes + speech::model::PARAKEET.bytes)
-        {
-            return false;
+        if let SetupPhase::Downloading { bytes } = phase {
+            let previous = match job.phase {
+                SetupPhase::Downloading { bytes } => bytes,
+                _ => 0,
+            };
+            if bytes < previous || bytes > speech::setup::DOWNLOAD_BYTES {
+                return false;
+            }
         }
         job.phase = phase;
         true

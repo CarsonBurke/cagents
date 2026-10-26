@@ -63,6 +63,7 @@ pub struct InstalledFile {
 /// deliberate in-place writes by the same OS user. Own one per prepared session.
 pub struct Installation {
     files: BTreeMap<String, Arc<File>>,
+    _directory: tempfile::TempDir,
 }
 impl Installation {
     pub(super) fn from_extraction(
@@ -95,7 +96,10 @@ impl Installation {
                 .ok_or_else(|| invalid("Speech installation exceeds its size limit"))?;
             files.insert(name, member.file);
         }
-        Ok(Self { files })
+        Ok(Self {
+            files,
+            _directory: extraction.directory,
+        })
     }
     pub(super) fn command(&self, wav: Arc<File>) -> io::Result<CommandSpec> {
         let file_path = |file: &File| format!("/proc/self/fd/{}", file.as_raw_fd());
@@ -161,4 +165,26 @@ pub(super) fn open_beneath(root: &File, relative: &Path, directory: bool) -> io:
         parent = unsafe { File::from_raw_fd(raw) };
     }
     Ok(parent)
+}
+
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+    #[test]
+    fn private_extraction_directory_lives_until_last_session_owner() {
+        // Exercise lifetime ownership only, never prepare fake executable/model
+        // readiness. Production construction still requires VerifiedExtraction.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().to_owned();
+        std::fs::write(path.join("owned"), b"fixture").unwrap();
+        let prepared_owner = Arc::new(Installation {
+            files: BTreeMap::new(),
+            _directory: directory,
+        });
+        let session_owner = prepared_owner.clone();
+        drop(prepared_owner);
+        assert!(path.join("owned").exists());
+        drop(session_owner);
+        assert!(!path.exists());
+    }
 }

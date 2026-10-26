@@ -4,6 +4,7 @@ mod capture;
 pub mod model;
 mod provision;
 mod runner;
+pub mod setup;
 
 use crate::process::CancellationToken;
 use std::{
@@ -62,6 +63,12 @@ pub enum Error {
     Unavailable,
     #[error("Dictation was cancelled")]
     Cancelled,
+    #[error("Speech model download failed; check the connection and retry setup")]
+    SetupDownload,
+    #[error("Speech model verification failed; retry setup to fetch verified files")]
+    SetupIntegrity,
+    #[error("Speech model setup could not save files; check available disk space and access")]
+    SetupStorage,
     #[error("The microphone could not record audio; check the desktop input device and access")]
     Microphone,
     #[error("No complete microphone audio was recorded")]

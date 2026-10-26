@@ -2,7 +2,7 @@
 //! guard without weakening the ordinary remote-workspace executor contract.
 //! No result/error type here logs microphone bytes or recognition output.
 use super::*;
-use std::os::unix::process::CommandExt;
+use std::{fs::File, os::unix::process::CommandExt};
 
 type KeepAlive = Arc<dyn Send + Sync>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +91,72 @@ pub(crate) fn provision(
     run(spec, None, cancel, keep_alive, || {})
 }
 
+/// Only the two fixed public model/runtime curl commands may stream to disk.
+/// stdout has a retained bounded file sink instead of a release-sized Vec.
+pub(crate) fn download(
+    spec: &CommandSpec,
+    output: File,
+    cancel: &CancellationToken,
+    keep_alive: KeepAlive,
+    progress: impl FnMut(u64),
+) -> Result<(), Failure> {
+    let archive = [
+        crate::speech::model::RUNTIME,
+        crate::speech::model::PARAKEET,
+    ]
+    .into_iter()
+    .find(|archive| {
+        spec.arguments.last().is_some_and(|url| url == archive.url)
+            && spec.stdout_limit as u64 == archive.bytes
+    })
+    .ok_or(Failure::Spawn)?;
+    let mut arguments: Vec<OsString> = [
+        "-q",
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--location",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "--max-redirs",
+        "5",
+        "--connect-timeout",
+        "15",
+        "--max-time",
+        "900",
+        "--max-filesize",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    arguments.extend([
+        archive.bytes.to_string().into(),
+        "--url".into(),
+        archive.url.into(),
+    ]);
+    if spec.program != Path::new("/usr/bin/curl")
+        || spec.arguments != arguments
+        || spec.timeout != Some(Duration::from_secs(900))
+        || output
+            .metadata()
+            .map_or(true, |metadata| !metadata.is_file() || metadata.len() != 0)
+    {
+        return Err(Failure::Spawn);
+    }
+    run_with_sink(
+        spec,
+        None,
+        cancel,
+        keep_alive,
+        || {},
+        Some(output),
+        progress,
+    )
+    .map(|_| ())
+}
+
 struct Owner {
     waiter: GroupWaiter,
     keep_alive: KeepAlive,
@@ -137,6 +203,8 @@ impl Drop for Owner {
 struct Capture<R> {
     pipe: Option<R>,
     bytes: Vec<u8>,
+    file: Option<File>,
+    count: usize,
     limit: usize,
     failed: Option<Failure>,
 }
@@ -145,6 +213,8 @@ impl<R: Read + AsFd> Capture<R> {
         Self {
             pipe: Some(pipe),
             bytes: Vec::new(),
+            file: None,
+            count: 0,
             limit,
             failed: None,
         }
@@ -168,8 +238,18 @@ impl<R: Read + AsFd> Capture<R> {
                 }
                 Ok(read) => {
                     turn += read;
-                    let remaining = self.limit.saturating_sub(self.bytes.len());
-                    self.bytes.extend_from_slice(&buffer[..read.min(remaining)]);
+                    let remaining = self.limit.saturating_sub(self.count);
+                    let accepted = read.min(remaining);
+                    if let Some(file) = &mut self.file {
+                        if file.write_all(&buffer[..accepted]).is_err() {
+                            self.failed = Some(Failure::Io);
+                            self.pipe.take();
+                            break;
+                        }
+                    } else {
+                        self.bytes.extend_from_slice(&buffer[..accepted]);
+                    }
+                    self.count += accepted;
                     if read > remaining {
                         self.failed = Some(Failure::Limit);
                         self.pipe.take();
@@ -224,13 +304,29 @@ fn run(
     stop: Option<&CancellationToken>,
     cancel: &CancellationToken,
     keep_alive: KeepAlive,
-    mut on_pcm: impl FnMut(),
+    on_pcm: impl FnMut(),
 ) -> Result<Vec<u8>, Failure> {
+    run_with_sink(spec, stop, cancel, keep_alive, on_pcm, None, |_| {})
+}
+fn run_with_sink(
+    spec: &CommandSpec,
+    stop: Option<&CancellationToken>,
+    cancel: &CancellationToken,
+    keep_alive: KeepAlive,
+    mut on_pcm: impl FnMut(),
+    file: Option<File>,
+    mut progress: impl FnMut(u64),
+) -> Result<Vec<u8>, Failure> {
+    let download = file.is_some();
     let timeout = spec
         .timeout
-        .filter(|timeout| !timeout.is_zero() && *timeout <= Duration::from_secs(120))
+        .filter(|timeout| {
+            !timeout.is_zero() && *timeout <= Duration::from_secs(if download { 900 } else { 120 })
+        })
         .ok_or(Failure::Timeout)?;
-    let max_stdout = if stop.is_some() {
+    let max_stdout = if download {
+        512 * 1024 * 1024
+    } else if stop.is_some() {
         1_920_000
     } else {
         128 * 1024
@@ -269,6 +365,7 @@ fn run(
         return Err(Failure::Spawn);
     }
     let mut stdout = Capture::new(stdout, spec.stdout_limit);
+    stdout.file = file;
     let mut stderr = Capture::new(stderr, spec.stderr_limit);
     let deadline = Instant::now() + timeout;
     let mut failure = None;
@@ -359,7 +456,11 @@ fn run(
             break;
         }
         if watched[0].revents != 0 {
+            let before = stdout.count;
             stdout.drain();
+            if download && before != stdout.count {
+                progress(stdout.count as u64);
+            }
         }
         if watched[1].revents != 0 {
             stderr.drain();
@@ -427,6 +528,67 @@ mod tests {
             .timeout(Duration::from_secs(3))
             .output_limits(1_920_000, 16 * 1024)
     }
+    #[test]
+    fn download_sink_streams_beyond_memory_excerpt_with_exact_monotonic_progress() {
+        let mut output = tempfile::tempfile().unwrap();
+        let spec = producer("import os;os.write(1,b'x'*2097152)")
+            .output_limits(2 * 1024 * 1024, 16 * 1024);
+        let mut progress = Vec::new();
+        let bytes = run_with_sink(
+            &spec,
+            None,
+            &CancellationToken::new(),
+            Arc::new(()),
+            || {},
+            Some(output.try_clone().unwrap()),
+            |bytes| progress.push(bytes),
+        )
+        .unwrap();
+        assert!(
+            bytes.is_empty(),
+            "download bytes must never occupy the stdout Vec"
+        );
+        assert_eq!(output.metadata().unwrap().len(), 2 * 1024 * 1024);
+        assert_eq!(progress.last(), Some(&(2 * 1024 * 1024)));
+        assert!(progress.windows(2).all(|pair| pair[0] < pair[1]));
+        use std::io::{Seek, SeekFrom};
+        output.seek(SeekFrom::Start(0)).unwrap();
+        let mut excerpt = [0; 32];
+        output.read_exact(&mut excerpt).unwrap();
+        assert_eq!(excerpt, [b'x'; 32]);
+    }
+    #[test]
+    fn download_sink_cap_and_cancel_cannot_promote_partial_archive() {
+        for cancel_after_first in [false, true] {
+            let output = tempfile::tempfile().unwrap();
+            let cancellation = CancellationToken::new();
+            let spec = producer("import os,time;os.write(1,b'x'*262144);time.sleep(30)")
+                .output_limits(128 * 1024, 16 * 1024);
+            let result = run_with_sink(
+                &spec,
+                None,
+                &cancellation,
+                Arc::new(()),
+                || {},
+                Some(output.try_clone().unwrap()),
+                |_| {
+                    if cancel_after_first {
+                        cancellation.cancel();
+                    }
+                },
+            );
+            assert_eq!(
+                result.err(),
+                Some(if cancel_after_first {
+                    Failure::Cancelled
+                } else {
+                    Failure::Limit
+                })
+            );
+            assert!(output.metadata().unwrap().len() <= 128 * 1024);
+        }
+    }
+
     #[test]
     fn creator_thread_death_kills_the_direct_speech_child() {
         let mut child = thread::spawn(|| {

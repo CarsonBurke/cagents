@@ -21,7 +21,9 @@ use std::{
 
 pub(super) struct VerifiedExtraction {
     pub(super) files: BTreeMap<String, VerifiedMember>,
+    pub(super) directory: tempfile::TempDir,
 }
+pub(super) struct VerifiedArchive(Arc<File>);
 pub(super) struct VerifiedMember {
     pub(super) file: Arc<File>,
     pub(super) receipt: InstalledFile,
@@ -50,7 +52,7 @@ fn verified_archive(
     mut input: impl Read,
     archive: Archive,
     cancel: &CancellationToken,
-) -> io::Result<Arc<File>> {
+) -> io::Result<VerifiedArchive> {
     let mut file = tempfile::tempfile()?;
     let mut hash = Sha256::new();
     let mut bytes = 0u64;
@@ -74,7 +76,41 @@ fn verified_archive(
         return Err(invalid("Speech archive does not match the pinned checksum"));
     }
     file.seek(SeekFrom::Start(0))?;
-    Ok(Arc::new(file))
+    Ok(VerifiedArchive(Arc::new(file)))
+}
+/// The caller retains this already-open cache/download descriptor. Readiness
+/// derives from the pinned bytes, never a filename or editable receipt.
+pub(super) fn verify_file(
+    mut file: File,
+    archive: Archive,
+    cancel: &CancellationToken,
+) -> io::Result<VerifiedArchive> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != archive.bytes {
+        return Err(invalid("Speech archive does not match its pinned size"));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut hash = Sha256::new();
+    let mut bytes = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        check_cancel(cancel)?;
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes
+            .checked_add(read as u64)
+            .filter(|bytes| *bytes <= archive.bytes)
+            .ok_or_else(|| invalid("Speech archive exceeds its pinned size"))?;
+        hash.update(&buffer[..read]);
+    }
+    if bytes != archive.bytes || format!("{:x}", hash.finalize()) != archive.sha256 {
+        return Err(invalid("Speech archive does not match the pinned checksum"));
+    }
+    check_cancel(cancel)?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(VerifiedArchive(Arc::new(file)))
 }
 fn tar(archive: Arc<File>) -> io::Result<CommandSpec> {
     let path = format!("--file=/proc/self/fd/{}", archive.as_raw_fd());
@@ -177,6 +213,15 @@ pub(super) fn install(
     // Both inputs must be authentic before creating any executable installation.
     let runtime = verified_archive(runtime, model::RUNTIME, cancel)?;
     let model = verified_archive(model, model::PARAKEET, cancel)?;
+    install_verified(root, runtime, model, cancel, lease)
+}
+pub(super) fn install_verified(
+    root: &Path,
+    runtime: VerifiedArchive,
+    model: VerifiedArchive,
+    cancel: &CancellationToken,
+    lease: Arc<Lease>,
+) -> io::Result<VerifiedExtraction> {
     check_cancel(cancel)?;
     std::fs::create_dir_all(root)?;
     let staging = tempfile::Builder::new()
@@ -186,8 +231,15 @@ pub(super) fn install(
     let model_dir = staging.path().join("model");
     std::fs::create_dir_all(&bin)?;
     std::fs::create_dir(&model_dir)?;
-    extract(runtime, &[RUNTIME_MEMBER], &bin, "2", cancel, lease.clone())?;
-    extract(model, &MODEL_MEMBERS, &model_dir, "1", cancel, lease)?;
+    extract(
+        runtime.0,
+        &[RUNTIME_MEMBER],
+        &bin,
+        "2",
+        cancel,
+        lease.clone(),
+    )?;
+    extract(model.0, &MODEL_MEMBERS, &model_dir, "1", cancel, lease)?;
     check_cancel(cancel)?;
     let directory = std::fs::OpenOptions::new()
         .read(true)
@@ -256,12 +308,13 @@ pub(super) fn install(
     receipt.flush()?;
     receipt.sync_all()?;
     check_cancel(cancel)?;
-    let published = root.join(format!("parakeet-v3-{}", uuid::Uuid::new_v4()));
-    std::fs::rename(staging.path(), &published)?;
-    // Nothing reads this receipt back as readiness. This in-memory provenance
-    // only exists after pinned verification+extraction above. Future cache reuse
-    // needs trusted per-file pins, not accepting editable installed.json alone.
-    Ok(VerifiedExtraction { files })
+    // Publication is the returned verified owner, not a discoverable marker.
+    // Keep the private directory alive through Prepared and every Session, then
+    // remove it automatically. Cancelled setup/retries cannot accumulate copies.
+    Ok(VerifiedExtraction {
+        files,
+        directory: staging,
+    })
 }
 
 #[cfg(test)]
