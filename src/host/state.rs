@@ -651,8 +651,11 @@ impl HostState {
             .iter()
             .filter(|(_, presence)| {
                 source_session.is_some_and(|session| presence.sessions.contains(&session))
-                    || (matches!(target, crate::notifications::Target::AgentRun(_))
-                        && presence.application == Application::Cagents)
+                    || (matches!(
+                        target,
+                        crate::notifications::Target::AgentRun(_)
+                            | crate::notifications::Target::Automation { .. }
+                    ) && presence.application == Application::Cagents)
                     || preferred.is_some_and(|destination| *destination == presence.destination())
             })
             .max_by_key(|(_, presence)| {
@@ -5668,6 +5671,60 @@ mod tests {
         assert!(matches!(delivery.pop().unwrap().message,
             ServerMessage::NotificationActivated { target: actual } if actual == target));
         assert!(editor.pop().is_none());
+    }
+
+    #[test]
+    fn automation_notification_routes_to_cagents_without_a_provider_and_reconnects_once() {
+        use crate::notifications::{Application, Presence, Target};
+        let mut host = test_host();
+        let agents = host.register_client(1);
+        host.watch_notifications(
+            1,
+            Presence {
+                window: "primary".into(),
+                ..Default::default()
+            },
+        );
+        let editor = host.register_client(2);
+        host.watch_notifications(
+            2,
+            Presence {
+                window: "primary".into(),
+                application: Application::Ceditor,
+                ..Default::default()
+            },
+        );
+        let id = uuid::Uuid::new_v4();
+        let first = Target::Automation { id, sequence: 41 };
+        let destination = host.activate_notification_destination(first.clone(), None, None, None);
+        assert_eq!(destination.application, Application::Cagents);
+        assert_eq!(destination.window, "primary");
+        assert!(matches!(agents.pop().unwrap().message,
+            ServerMessage::NotificationActivated { target } if target == first));
+        drop(host.unregister_client(1));
+        let replacement = Target::Automation { id, sequence: 42 };
+        let cold = host.activate_notification_destination(replacement.clone(), None, None, None);
+        assert_eq!(cold.application, Application::Cagents);
+        assert_eq!(cold.window, "primary");
+        // A same-window editor does not receive or consume Cagents attention.
+        let editor_presence = Presence {
+            window: "primary".into(),
+            application: Application::Ceditor,
+            ..Default::default()
+        };
+        assert_eq!(host.watch_notifications(2, editor_presence), None);
+        editor.close_after_drain();
+        assert!(editor.pop().is_none());
+        host.register_client(3);
+        let returned = Presence {
+            window: "primary".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            host.watch_notifications(3, returned.clone()),
+            Some(replacement)
+        );
+        assert_eq!(host.watch_notifications(3, returned), None);
     }
 
     #[test]
