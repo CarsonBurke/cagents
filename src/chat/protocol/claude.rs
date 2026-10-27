@@ -5494,62 +5494,107 @@ mod tests {
 
     #[test]
     fn superseding_an_old_interrupt_settles_its_result_without_clearing_the_new_turn() {
-        let mut adapter = Claude {
-            busy: true,
-            ..Default::default()
+        use crate::agent_execution::ProviderEvent;
+        use crate::notifications::Kind;
+
+        let finishes = |step: &Step| {
+            step.events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Execution {
+                        run,
+                        event: ProviderEvent::Finished { outcome },
+                    } => Some((*run, *outcome)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
         };
-        let old = adapter.command(Command::Interrupt).unwrap().writes[0]["request_id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        adapter
-            .receive(json!({"type":"result","uuid":"old","subtype":"success","is_error":false}))
-            .unwrap();
-        let mut started = Step::default();
-        adapter.start_turn(&mut started);
-        adapter.busy = true;
-        let replacement = adapter.command(Command::Interrupt).unwrap();
-        assert!(replacement.events.iter().any(|event| matches!(
-            event,
-            Event::PastTurnFinished {
-                outcome: crate::notifications::Kind::Succeeded,
-                ..
-            }
-        )));
-        assert!(adapter.deferred_attention.is_empty());
-        assert!(!adapter.controls.contains_key(&old));
-        assert!(!adapter.control_deadlines.contains_key(&old));
-        let current = replacement.writes[0]["request_id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let now = std::time::Instant::now();
-        adapter
-            .control_deadlines
-            .insert(current.clone(), now + std::time::Duration::from_secs(10));
-        let expired = adapter.expire_controls(now);
-        assert_eq!(adapter.interruption, Some(false));
-        assert!(expired.events.is_empty());
-        assert!(adapter.controls.contains_key(&current));
-        let late = adapter
-            .receive(json!({"type":"control_response","response":{"subtype":"success","request_id":old,"response":{}}}))
-            .unwrap();
-        assert!(
-            late.events.is_empty(),
-            "superseded acknowledgement cannot settle twice"
-        );
-        assert_eq!(adapter.interruption, Some(false));
-        adapter
-            .receive(json!({"type":"result","uuid":"new","subtype":"success","is_error":false}))
-            .unwrap();
-        let acknowledged=adapter.receive(json!({"type":"control_response","response":{"subtype":"success","request_id":current,"response":{}}})).unwrap();
-        assert!(acknowledged.events.iter().any(|event| matches!(
-            event,
-            Event::TurnFinished {
-                outcome: crate::notifications::Kind::Cancelled,
-                ..
-            }
-        )));
+        let prompt = |text: &str| Command::Prompt {
+            text: text.into(),
+            attachments: Vec::new(),
+            mode: PromptMode::Send,
+        };
+        for (failed, outcome) in [(false, Kind::Succeeded), (true, Kind::Failed)] {
+            let mut adapter = Claude {
+                ready: true,
+                ..Default::default()
+            };
+            let first = crate::model::RunId::new();
+            let second = crate::model::RunId::new();
+            assert_ne!(first, second);
+            adapter.command_for_run(first, prompt("first prompt")).unwrap();
+            let old = adapter.command(Command::Interrupt).unwrap().writes[0]["request_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            // Preserve the original caller identity of a chained control.
+            let original_ack = "original-stop-ack";
+            adapter.controls.get_mut(&old).unwrap()["_cagents_ack"] = json!(original_ack);
+            // This case tests supersession, not scheduler-dependent expiry.
+            let future = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+            adapter.control_deadlines.insert(old.clone(), future);
+            let settled = adapter
+                .receive(json!({"type":"result","uuid":"old-result","subtype":if failed {"error_during_execution"} else {"success"},"is_error":failed}))
+                .unwrap();
+            assert_eq!(finishes(&settled), Vec::new());
+            assert_eq!(
+                settled.events.iter().filter(|event| matches!(event,
+                    Event::Execution {run,event:ProviderEvent::Settled} if *run==first)).count(),
+                1
+            );
+            adapter.command_for_run(second, prompt("second prompt")).unwrap();
+            let replacement = adapter.command(Command::Interrupt).unwrap();
+            assert_eq!(
+                replacement.events.iter().filter_map(|event| match event {
+                    Event::PastTurnFinished {key,outcome} => Some((key.clone(),*outcome)),
+                    _ => None,
+                }).collect::<Vec<_>>(),
+                vec![(Some("claude:old-result".into()), outcome)]
+            );
+            assert_eq!(finishes(&replacement), vec![(first, outcome)]);
+            assert!(!replacement.events.iter().any(|event| matches!(event,
+                Event::TurnFinished {..} | Event::Status {busy:false,..})));
+            assert_eq!(adapter.execution, Some(second));
+            assert!(adapter.busy);
+            assert!(adapter.deferred_attention.is_empty());
+            assert!(!adapter.controls.contains_key(&old));
+            assert!(!adapter.control_deadlines.contains_key(&old));
+            assert_eq!(adapter.control_replies(), vec![(original_ack.into(),
+                Err("A newer interrupt request superseded this one".into()))]);
+            let current = replacement.writes[0]["request_id"].as_str().unwrap().to_owned();
+            assert_eq!(adapter.command_ack().as_deref(), Some(current.as_str()));
+            adapter.control_deadlines.insert(current.clone(), future);
+            let expired = adapter.expire_controls(std::time::Instant::now());
+            assert_eq!(adapter.interruption, Some(false));
+            assert!(expired.events.is_empty());
+            assert!(adapter.controls.contains_key(&current));
+            let late = adapter
+                .receive(json!({"type":"control_response","response":{"subtype":"success","request_id":old,"response":{}}}))
+                .unwrap();
+            assert!(late.events.is_empty(), "superseded acknowledgement cannot settle twice");
+            assert!(adapter.control_replies().is_empty());
+            assert_eq!(adapter.interruption, Some(false));
+            assert_eq!(adapter.execution, Some(second));
+            let second_result = adapter
+                .receive(json!({"type":"result","uuid":"new-result","subtype":"success","is_error":false}))
+                .unwrap();
+            assert_eq!(finishes(&second_result), Vec::new());
+            assert!(!second_result.events.iter().any(|event| matches!(event,
+                Event::TurnFinished {..} | Event::PastTurnFinished {..})));
+            let acknowledged = adapter
+                .receive(json!({"type":"control_response","response":{"subtype":"success","request_id":current,"response":{}}}))
+                .unwrap();
+            assert_eq!(finishes(&acknowledged), vec![(second, Kind::Cancelled)]);
+            assert_eq!(
+                acknowledged.events.iter().filter_map(|event| match event {
+                    Event::TurnFinished {key,outcome} => Some((key.clone(),*outcome)),
+                    _ => None,
+                }).collect::<Vec<_>>(),
+                vec![(Some("claude:new-result".into()), Kind::Cancelled)]
+            );
+            assert_eq!(adapter.control_replies(), vec![(current, Ok(()))]);
+            assert!(adapter.deferred_attention.is_empty());
+        }
     }
 
     #[test]
