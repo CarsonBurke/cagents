@@ -1406,7 +1406,7 @@ fn tracked_palette_consumed_navigation_stays_out_of_terminal_after_review_return
             keyboard::key::Code::KeyQ,
         ),
         (
-            keyboard::Key::Named(keyboard::key::Named::Space),
+            keyboard::Key::Character(" ".into()),
             keyboard::key::Code::Space,
         ),
     ] {

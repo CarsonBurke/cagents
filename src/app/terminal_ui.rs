@@ -1433,11 +1433,7 @@ impl Cagents {
                     } = event
                     {
                         let space = modifiers.is_empty()
-                            && matches!(
-                                key.as_ref(),
-                                keyboard::Key::Named(keyboard::key::Named::Space)
-                                    | keyboard::Key::Character(" ")
-                            );
+                            && matches!(key.as_ref(), keyboard::Key::Character(" "));
                         if matches!(key, keyboard::Key::Named(keyboard::key::Named::Enter)) || space
                         {
                             if !barrier.claim_native_activation(event) {

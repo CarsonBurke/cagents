@@ -1535,11 +1535,7 @@ impl Cagents {
                             key.as_ref(),
                             keyboard::Key::Named(keyboard::key::Named::Enter)
                         ) || (modifiers.is_empty()
-                            && matches!(
-                                key.as_ref(),
-                                keyboard::Key::Named(keyboard::key::Named::Space)
-                                    | keyboard::Key::Character(" ")
-                            ));
+                            && matches!(key.as_ref(), keyboard::Key::Character(" ")));
                         if !activation {
                             return None;
                         }
@@ -1598,7 +1594,7 @@ impl Cagents {
                             ..
                         }
                     )
-                    && !matches!(event, keyboard::Event::KeyPressed { key, modifiers, .. } if modifiers.is_empty() && matches!(key.as_ref(), keyboard::Key::Named(keyboard::key::Named::Space) | keyboard::Key::Character(" ")))
+                    && !matches!(event, keyboard::Event::KeyPressed { key, modifiers, .. } if modifiers.is_empty() && matches!(key.as_ref(), keyboard::Key::Character(" ")))
                     && !matches!(event, keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::Tab), modifiers, .. } if modifiers.control() || modifiers.alt() || modifiers.logo())
                 {
                     row_barrier.capture_consumed_key(event);
@@ -2515,11 +2511,23 @@ mod tests {
     #[test]
     fn native_row_query_and_ordinary_rows_share_one_action_ticket_until_fresh_press() {
         use keyboard::key::{Code, Named, Physical};
-        for query_focus in [false, true] {
+        for (query_focus, key, code) in [
+            (false, keyboard::Key::Named(Named::Enter), Code::Enter),
+            (true, keyboard::Key::Named(Named::Enter), Code::Enter),
+            (false, keyboard::Key::Character(" ".into()), Code::Space),
+        ] {
             let mut app = branch_palette_fixture();
-            let cycle = PressCycle::new(Physical::Code(Code::Enter));
+            let cycle = PressCycle::new(Physical::Code(code));
             let source = Source::tracked(cycle.clone(), Transition::Press);
-            let press = cycle_key(Named::Enter, Code::Enter, true, false);
+            let press = keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key.clone(),
+                physical_key: Physical::Code(code),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: (code == Code::Space).then(|| " ".into()),
+                repeat: false,
+            };
             let identity = EntryIdentity::capture(&app.palette_entries()[0].2).unwrap();
             let (messages, _) = palette_native_batch(
                 &app,
@@ -2552,7 +2560,13 @@ mod tests {
             assert!(reduce_native_palette(&mut app, messages).is_empty());
             assert!(app.palette.is_open());
             cycle.release();
-            let release = cycle_key(Named::Enter, Code::Enter, false, false);
+            let release = keyboard::Event::KeyReleased {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: Physical::Code(code),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+            };
             let (messages, _) = palette_native_batch(
                 &app,
                 focus.clone(),
@@ -2560,10 +2574,7 @@ mod tests {
                 &[Source::tracked(cycle, Transition::Release)],
             );
             drop(reduce_native_palette(&mut app, messages));
-            let fresh = Source::tracked(
-                PressCycle::new(Physical::Code(Code::Enter)),
-                Transition::Press,
-            );
+            let fresh = Source::tracked(PressCycle::new(Physical::Code(code)), Transition::Press);
             let (messages, _) =
                 palette_native_batch(&app, focus, &[iced::Event::Keyboard(press)], &[fresh]);
             assert_eq!(
@@ -4274,11 +4285,6 @@ mod tests {
                         keyboard::Key::Named(keyboard::key::Named::Enter),
                         keyboard::key::Code::NumpadEnter,
                         keyboard::Modifiers::CTRL,
-                    ),
-                    (
-                        keyboard::Key::Named(keyboard::key::Named::Space),
-                        keyboard::key::Code::Space,
-                        keyboard::Modifiers::empty(),
                     ),
                     (
                         keyboard::Key::Character(" ".into()),
