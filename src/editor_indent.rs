@@ -17,7 +17,13 @@ pub struct Indentation {
 }
 
 impl Default for Indentation {
-    fn default() -> Self { Self { tabs: false, size: 4, tab_width: 4 } }
+    fn default() -> Self {
+        Self {
+            tabs: false,
+            size: 4,
+            tab_width: 4,
+        }
+    }
 }
 
 impl Indentation {
@@ -28,44 +34,100 @@ impl Indentation {
         let mut widths = [0usize; 17];
         let mut previous = 0;
         use cosmic::iced::advanced::graphics::text::cosmic_text::LineIter;
-        for line in LineIter::new(text).map(|(range, _)| &text[range]).filter(|line| !line.trim().is_empty()).take(2000) {
-            if line.starts_with('\t') { tab_lines += 1; }
+        for line in LineIter::new(text)
+            .map(|(range, _)| &text[range])
+            .filter(|line| !line.trim().is_empty())
+            .take(2000)
+        {
+            if line.starts_with('\t') {
+                tab_lines += 1;
+            }
             let spaces = line.bytes().take_while(|byte| *byte == b' ').count();
-            if spaces > 0 { space_lines += 1; }
+            if spaces > 0 {
+                space_lines += 1;
+            }
             let delta = spaces.abs_diff(previous);
-            if delta > 0 && delta <= 16 { widths[delta] += 1; }
+            if delta > 0 && delta <= 16 {
+                widths[delta] += 1;
+            }
             previous = spaces;
         }
-        let detected = (1..=8).filter(|width| widths[*width] > 0).max_by_key(|width| (widths[*width], *width));
+        let detected = (1..=8)
+            .filter(|width| widths[*width] > 0)
+            .max_by_key(|width| (widths[*width], *width));
         let tabs = config.tabs.unwrap_or(tab_lines > space_lines);
-        let tab_width = config.tab_width.or(config.size).unwrap_or(fallback).clamp(1, 16);
-        let size = if config.size_is_tab { tab_width } else { config.size.unwrap_or(detected.unwrap_or(fallback as usize) as u16) }.clamp(1, 16);
-        Self { tabs, size, tab_width }
+        let tab_width = config
+            .tab_width
+            .or(config.size)
+            .unwrap_or(fallback)
+            .clamp(1, 16);
+        let size = if config.size_is_tab {
+            tab_width
+        } else {
+            config
+                .size
+                .unwrap_or(detected.unwrap_or(fallback as usize) as u16)
+        }
+        .clamp(1, 16);
+        Self {
+            tabs,
+            size,
+            tab_width,
+        }
     }
 
     pub fn unit(self) -> String {
-        if self.tabs { "\t".into() } else { " ".repeat(self.size as usize) }
+        if self.tabs {
+            "\t".into()
+        } else {
+            " ".repeat(self.size as usize)
+        }
     }
 
     pub fn outdent_bytes(self, line: &str) -> usize {
-        if line.starts_with('\t') { 1 }
-        else { line.bytes().take(self.size as usize).take_while(|byte| *byte == b' ').count() }
+        if line.starts_with('\t') {
+            1
+        } else {
+            line.bytes()
+                .take(self.size as usize)
+                .take_while(|byte| *byte == b' ')
+                .count()
+        }
     }
 }
 
 /// Reads at most 64 KiB per directory and never follows a configuration link
 /// outside the repository. Called by the file worker, never from the UI view.
 pub fn read(worktree: &Path, path: &Path) -> Overrides {
-    let Ok(root) = crate::fs_safety::Root::open(worktree) else { return Overrides::default(); };
+    let Ok(root) = crate::fs_safety::Root::open(worktree) else {
+        return Overrides::default();
+    };
     let mut directories: Vec<_> = path.parent().unwrap_or(Path::new("")).ancestors().collect();
     directories.reverse();
     let mut result = Overrides::default();
     for directory in directories {
-        let Ok(file) = crate::fs_safety::open_beneath(&root, &directory.join(".editorconfig")) else { continue; };
+        let Ok(file) = crate::fs_safety::open_beneath(&root, &directory.join(".editorconfig"))
+        else {
+            continue;
+        };
         let mut text = String::new();
-        if file.take(64 * 1024 + 1).read_to_string(&mut text).is_err() || text.len() > 64 * 1024 { continue; }
-        if text.lines().take_while(|line| !line.trim_start().starts_with('[')).any(|line| line.trim().eq_ignore_ascii_case("root = true") || line.trim().eq_ignore_ascii_case("root=true")) { result = Overrides::default(); }
-        let relative = path.strip_prefix(directory).unwrap_or(path).to_string_lossy();
+        if file.take(64 * 1024 + 1).read_to_string(&mut text).is_err() || text.len() > 64 * 1024 {
+            continue;
+        }
+        if text
+            .lines()
+            .take_while(|line| !line.trim_start().starts_with('['))
+            .any(|line| {
+                line.trim().eq_ignore_ascii_case("root = true")
+                    || line.trim().eq_ignore_ascii_case("root=true")
+            })
+        {
+            result = Overrides::default();
+        }
+        let relative = path
+            .strip_prefix(directory)
+            .unwrap_or(path)
+            .to_string_lossy();
         parse(&text, &relative, &mut result);
     }
     result
@@ -74,97 +136,180 @@ pub fn read(worktree: &Path, path: &Path) -> Overrides {
 fn parse(text: &str, path: &str, result: &mut Overrides) {
     let mut active = false;
     let mut glob_budget = 4_000_000usize;
-    for line in text.lines().map(str::trim).filter(|line| !line.starts_with(['#', ';'])) {
+    for line in text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with(['#', ';']))
+    {
         if line.starts_with('[') && line.ends_with(']') {
-            let pattern = &line[1..line.len()-1];
-            let target = if pattern.contains('/') { path } else { path.rsplit('/').next().unwrap_or(path) };
+            let pattern = &line[1..line.len() - 1];
+            let target = if pattern.contains('/') {
+                path
+            } else {
+                path.rsplit('/').next().unwrap_or(path)
+            };
             active = glob_with_budget(pattern.trim_start_matches('/'), target, &mut glob_budget);
         } else if active && let Some((key, value)) = line.split_once('=') {
             let value = value.trim().to_ascii_lowercase();
-            let width = || value.parse::<u16>().ok().filter(|width| (1..=16).contains(width));
+            let width = || {
+                value
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|width| (1..=16).contains(width))
+            };
             match key.trim().to_ascii_lowercase().as_str() {
-                "indent_style" => result.tabs = match value.as_str() { "tab" => Some(true), "space" => Some(false), "unset" => None, _ => result.tabs },
+                "indent_style" => {
+                    result.tabs = match value.as_str() {
+                        "tab" => Some(true),
+                        "space" => Some(false),
+                        "unset" => None,
+                        _ => result.tabs,
+                    }
+                }
                 "indent_size" => match value.as_str() {
-                    "tab" => { result.size_is_tab = true; result.size = None; },
-                    "unset" => { result.size_is_tab = false; result.size = None; },
-                    _ => if let Some(size) = width() { result.size_is_tab = false; result.size = Some(size); },
+                    "tab" => {
+                        result.size_is_tab = true;
+                        result.size = None;
+                    }
+                    "unset" => {
+                        result.size_is_tab = false;
+                        result.size = None;
+                    }
+                    _ => {
+                        if let Some(size) = width() {
+                            result.size_is_tab = false;
+                            result.size = Some(size);
+                        }
+                    }
                 },
-                "tab_width" => if value == "unset" { result.tab_width = None; } else if let Some(width) = width() { result.tab_width = Some(width); },
-                _ => {},
+                "tab_width" => {
+                    if value == "unset" {
+                        result.tab_width = None;
+                    } else if let Some(width) = width() {
+                        result.tab_width = Some(width);
+                    }
+                }
+                _ => {}
             }
         }
     }
 }
 
 #[cfg(test)]
-fn glob(pattern: &str, text: &str) -> bool { glob_with_budget(pattern, text, &mut 4_000_000) }
+fn glob(pattern: &str, text: &str) -> bool {
+    glob_with_budget(pattern, text, &mut 4_000_000)
+}
 
 fn charge_glob(budget: &mut usize, steps: usize) -> bool {
     match budget.checked_sub(steps) {
-        Some(remaining) => { *budget = remaining; true },
-        None => { *budget = 0; false },
+        Some(remaining) => {
+            *budget = remaining;
+            true
+        }
+        None => {
+            *budget = 0;
+            false
+        }
     }
 }
 
 fn glob_with_budget(pattern: &str, text: &str, budget: &mut usize) -> bool {
-    if pattern.len() > 512 || pattern.bytes().filter(|byte| *byte == b'{').count() > 4 || !charge_glob(budget, pattern.len().max(1)) { return false; }
+    if pattern.len() > 512
+        || pattern.bytes().filter(|byte| *byte == b'{').count() > 4
+        || !charge_glob(budget, pattern.len().max(1))
+    {
+        return false;
+    }
     // EditorConfig brace alternatives are bounded for repository input.
     // Wildcards and ** paths are matched below without regex.
-    if let Some(start) = pattern.find('{') && let Some(end) = pattern[start..].find('}').map(|end| start + end) {
-        return pattern[start+1..end].split(',').take(64).any(|part| {
-            glob_with_budget(&format!("{}{}{}", &pattern[..start], part, &pattern[end+1..]), text, budget)
+    if let Some(start) = pattern.find('{')
+        && let Some(end) = pattern[start..].find('}').map(|end| start + end)
+    {
+        return pattern[start + 1..end].split(',').take(64).any(|part| {
+            glob_with_budget(
+                &format!("{}{}{}", &pattern[..start], part, &pattern[end + 1..]),
+                text,
+                budget,
+            )
         });
     }
     // Charge the complete dynamic-programming grid before allocating it.
     // Recursion and later sections share this budget, so individually small
     // brace groups cannot multiply into unbounded worker CPU time.
-    if !charge_glob(budget, pattern.len().saturating_mul(text.len().saturating_add(1))) { return false; }
+    if !charge_glob(
+        budget,
+        pattern.len().saturating_mul(text.len().saturating_add(1)),
+    ) {
+        return false;
+    }
     // EditorConfig wildcards consume characters, not UTF-8 code units.
     // Charge the byte-sized grid above before allocating; that remains an
     // upper bound on the smaller character grid for non-ASCII paths.
-    let (pattern, text): (Vec<char>, Vec<char>) = (pattern.chars().collect(), text.chars().collect());
-    let mut current = vec![false; text.len()+1]; current[0] = true;
+    let (pattern, text): (Vec<char>, Vec<char>) =
+        (pattern.chars().collect(), text.chars().collect());
+    let mut current = vec![false; text.len() + 1];
+    current[0] = true;
     let mut index = 0;
     while index < pattern.len() {
         let character = pattern[index];
-        let double = character == '*' && pattern.get(index+1) == Some(&'*');
-        let mut next = vec![false; text.len()+1];
+        let double = character == '*' && pattern.get(index + 1) == Some(&'*');
+        let mut next = vec![false; text.len() + 1];
         if character == '*' {
-            if double && pattern.get(index+2) == Some(&'/') {
+            if double && pattern.get(index + 2) == Some(&'/') {
                 let mut reachable = false;
                 for at in 0..=text.len() {
                     reachable |= current[at];
-                    next[at] = current[at] || (reachable && at > 0 && text[at-1] == '/');
+                    next[at] = current[at] || (reachable && at > 0 && text[at - 1] == '/');
                 }
                 index += 2;
             } else {
                 for at in 0..=text.len() {
-                    next[at] = current[at] || (at > 0 && next[at-1] && (double || text[at-1] != '/'));
+                    next[at] =
+                        current[at] || (at > 0 && next[at - 1] && (double || text[at - 1] != '/'));
                 }
-                if double { index += 1; }
+                if double {
+                    index += 1;
+                }
             }
-        } else if character == '[' && let Some(close) = pattern[index+1..].iter().position(|character| *character == ']').map(|at| index+1+at) {
-            let class = &pattern[index+1..close];
-            let negated = class.first().is_some_and(|character| matches!(*character, '!' | '^'));
+        } else if character == '['
+            && let Some(close) = pattern[index + 1..]
+                .iter()
+                .position(|character| *character == ']')
+                .map(|at| index + 1 + at)
+        {
+            let class = &pattern[index + 1..close];
+            let negated = class
+                .first()
+                .is_some_and(|character| matches!(*character, '!' | '^'));
             let class = if negated { &class[1..] } else { class };
             for at in 0..text.len() {
                 let mut found = false;
                 let mut item = 0;
                 while item < class.len() {
-                    if class.get(item+1) == Some(&'-') && item+2 < class.len() {
-                        found |= (class[item]..=class[item+2]).contains(&text[at]); item += 3;
-                    } else { found |= class[item] == text[at]; item += 1; }
+                    if class.get(item + 1) == Some(&'-') && item + 2 < class.len() {
+                        found |= (class[item]..=class[item + 2]).contains(&text[at]);
+                        item += 3;
+                    } else {
+                        found |= class[item] == text[at];
+                        item += 1;
+                    }
                 }
-                next[at+1] = current[at] && text[at] != '/' && (found != negated);
+                next[at + 1] = current[at] && text[at] != '/' && (found != negated);
             }
             index = close;
-        } else if character == '\\' && index+1 < pattern.len() {
+        } else if character == '\\' && index + 1 < pattern.len() {
             index += 1;
-            for at in 0..text.len() { next[at+1] = current[at] && pattern[index] == text[at]; }
+            for at in 0..text.len() {
+                next[at + 1] = current[at] && pattern[index] == text[at];
+            }
         } else {
-            for at in 0..text.len() { next[at+1] = current[at] && (character == text[at] || (character == '?' && text[at] != '/')); }
+            for at in 0..text.len() {
+                next[at + 1] =
+                    current[at] && (character == text[at] || (character == '?' && text[at] != '/'));
+            }
         }
-        current = next; index += 1;
+        current = next;
+        index += 1;
     }
     current[text.len()]
 }
@@ -175,16 +320,33 @@ mod tests {
     #[test]
     fn detects_tabs_and_spaces_and_honours_explicit_editorconfig() {
         assert!(Indentation::detect("fn a() {\n\tfoo();\n}", 4, Overrides::default()).tabs);
-        assert_eq!(Indentation::detect("fn a() {\n  foo();\n    bar();\n}", 4, Overrides::default()).size, 2);
+        assert_eq!(
+            Indentation::detect("fn a() {\n  foo();\n    bar();\n}", 4, Overrides::default()).size,
+            2
+        );
         let mut config = Overrides::default();
-        parse("[*.{rs,py}]\nindent_style=space\nindent_size=2\ntab_width=8\n", "a.rs", &mut config);
-        assert_eq!(Indentation::detect("\tfoo()", 4, config), Indentation { tabs: false, size: 2, tab_width: 8 });
+        parse(
+            "[*.{rs,py}]\nindent_style=space\nindent_size=2\ntab_width=8\n",
+            "a.rs",
+            &mut config,
+        );
+        assert_eq!(
+            Indentation::detect("\tfoo()", 4, config),
+            Indentation {
+                tabs: false,
+                size: 2,
+                tab_width: 8
+            }
+        );
     }
     #[test]
     fn indentation_detection_matches_native_cr_and_paired_line_endings() {
         for ending in ["\r", "\n\r", "\r\n", "\n"] {
             let text = format!("root{ending}\tchild{ending}\tchild2");
-            assert!(Indentation::detect(&text, 4, Overrides::default()).tabs, "{ending:?}");
+            assert!(
+                Indentation::detect(&text, 4, Overrides::default()).tabs,
+                "{ending:?}"
+            );
             let text = format!("root{ending}  child{ending}    child2");
             let indentation = Indentation::detect(&text, 4, Overrides::default());
             assert!(!indentation.tabs);
@@ -194,7 +356,9 @@ mod tests {
 
     #[test]
     fn editorconfig_globs_handle_directories_classes_and_alternatives() {
-        for path in ["src/a.rs", "src/deep/b.rs"] { assert!(glob("src/**/[ab].{rs,py}", path)); }
+        for path in ["src/a.rs", "src/deep/b.rs"] {
+            assert!(glob("src/**/[ab].{rs,py}", path));
+        }
         assert!(!glob("src/**/[!ab].rs", "src/a.rs"));
         assert!(glob("src/**/[!ab].rs", "src/c.rs"));
     }
@@ -203,9 +367,18 @@ mod tests {
     fn editorconfig_single_character_globs_apply_to_unicode_file_names() {
         let directory = tempfile::tempdir().unwrap();
         for (pattern, cases) in [
-            ("?.rs", [("a.rs", 2), ("é.rs", 2), ("漢.rs", 2), ("éé.rs", 4)]),
-            ("[é漢].rs", [("é.rs", 2), ("漢.rs", 2), ("a.rs", 4), ("ç.rs", 4)]),
-            ("[!é].rs", [("a.rs", 2), ("漢.rs", 2), ("é.rs", 4), ("éé.rs", 4)]),
+            (
+                "?.rs",
+                [("a.rs", 2), ("é.rs", 2), ("漢.rs", 2), ("éé.rs", 4)],
+            ),
+            (
+                "[é漢].rs",
+                [("é.rs", 2), ("漢.rs", 2), ("a.rs", 4), ("ç.rs", 4)],
+            ),
+            (
+                "[!é].rs",
+                [("a.rs", 2), ("漢.rs", 2), ("é.rs", 4), ("éé.rs", 4)],
+            ),
         ] {
             std::fs::write(
                 directory.path().join(".editorconfig"),
@@ -226,8 +399,12 @@ mod tests {
 
     #[test]
     fn brace_expansion_and_later_sections_share_one_work_budget() {
-        let alternatives = (0..32).map(|index| format!("{index:02}")).collect::<Vec<_>>().join(",");
-        let pattern = format!("{{{alternatives}}}{{{alternatives}}}{{{alternatives}}}{{{alternatives}}}");
+        let alternatives = (0..32)
+            .map(|index| format!("{index:02}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let pattern =
+            format!("{{{alternatives}}}{{{alternatives}}}{{{alternatives}}}{{{alternatives}}}");
         assert!(pattern.len() < 512);
         let mut budget = 4096;
         assert!(!glob_with_budget(&pattern, "never-matches", &mut budget));
@@ -240,11 +417,19 @@ mod tests {
     fn invalid_indent_widths_preserve_inheritance_while_unset_explicitly_clears_it() {
         let mut config = Overrides::default();
         parse("[*]\nindent_size=2\ntab_width=8\n", "a.rs", &mut config);
-        parse("[*]\nindent_size=invalid\ntab_width=0\n", "a.rs", &mut config);
+        parse(
+            "[*]\nindent_size=invalid\ntab_width=0\n",
+            "a.rs",
+            &mut config,
+        );
         assert_eq!((config.size, config.tab_width), (Some(2), Some(8)));
         parse("[*]\nindent_size=tab\n", "a.rs", &mut config);
         assert_eq!(Indentation::detect("", 4, config).size, 8);
-        parse("[*]\nindent_size=unset\ntab_width=unset\n", "a.rs", &mut config);
+        parse(
+            "[*]\nindent_size=unset\ntab_width=unset\n",
+            "a.rs",
+            &mut config,
+        );
         assert_eq!(Indentation::detect("", 4, config).size, 4);
         assert_eq!((config.size, config.tab_width), (None, None));
     }
@@ -253,9 +438,18 @@ mod tests {
     fn nested_editorconfig_overrides_parent_and_preserves_unset_properties() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("src")).unwrap();
-        std::fs::write(directory.path().join(".editorconfig"), "root=true\n[*]\nindent_style=tab\nindent_size=4\n").unwrap();
-        std::fs::write(directory.path().join("src/.editorconfig"), "[*.rs]\nindent_style=space\nindent_size=2\n").unwrap();
+        std::fs::write(
+            directory.path().join(".editorconfig"),
+            "root=true\n[*]\nindent_style=tab\nindent_size=4\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("src/.editorconfig"),
+            "[*.rs]\nindent_style=space\nindent_size=2\n",
+        )
+        .unwrap();
         let config = read(directory.path(), Path::new("src/a.rs"));
-        assert_eq!(config.tabs, Some(false)); assert_eq!(config.size, Some(2));
+        assert_eq!(config.tabs, Some(false));
+        assert_eq!(config.size, Some(2));
     }
 }
