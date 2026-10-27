@@ -7,6 +7,7 @@ use std::collections::HashSet;
 pub const MAX_TURN_ID_BYTES: usize = 4096;
 pub const MAX_TURN_ITEM_IDS: usize = 128;
 pub const MAX_TURN_REASON_BYTES: usize = 4096;
+pub const MAX_TURN_UPDATE_BYTES: usize = 64 * 1024;
 pub const MAX_PROJECTED_TURNS: usize = 128;
 pub const MAX_PROJECTION_BYTES: usize = 256 * 1024;
 
