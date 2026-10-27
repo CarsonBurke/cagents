@@ -935,12 +935,17 @@ impl Cagents {
         for (scope, card) in new_managed_panes {
             self.publish_new_managed_pane(scope, card);
         }
+        // Normalize only sidebar ranks before the existing projection writes
+        // its snapshot. The source/operation barriers and pending Inserts above
+        // stay in place; no pane or canonical view metadata is changed here.
+        if changed {
+            self.sort_durable_channels();
+        }
         // Fence canonical evidence and finish projecting authoritative pane
         // sources before reconciliation persists. Publishing earlier would mix
         // old descriptors with newly received pending-start flags.
         tasks.push(self.reconcile_shared_views());
         if changed {
-            self.sort_durable_channels();
             self.refresh_sidebar_channels();
             tasks.push(self.sync_chrome());
         }
@@ -1403,6 +1408,75 @@ impl Cagents {
     /// channels that share a rank - the unranked ones a registryless window
     /// creates - keep the order they were created in.
     pub(super) fn sort_durable_channels(&mut self) {
+        // A create echo proves existence before it supplies a rank. Pending
+        // local and folded remote creations must remain newer than a preceding
+        // acknowledgement even when the registry was far ahead of this window.
+        let has_pending = self
+            .durable
+            .channels
+            .iter()
+            .any(|channel| !channel.shared || channel.ordinal == PENDING_ORDINAL)
+            || self
+                .workspace_model
+                .channels
+                .iter()
+                .any(|channel| channel.ordinal == PENDING_ORDINAL);
+        if has_pending {
+            let ranks: std::collections::HashMap<_, _> = self
+                .workspace_model
+                .channels
+                .iter()
+                .map(|channel| (channel.id, channel.ordinal))
+                .collect();
+            let pending = |channel: &ProjectChannel| {
+                !channel.shared
+                    || channel.ordinal == PENDING_ORDINAL
+                    || ranks.get(&channel.id) == Some(&PENDING_ORDINAL)
+            };
+            let mut provisional: Vec<_> = self
+                .durable
+                .channels
+                .iter()
+                .enumerate()
+                .filter(|(_, channel)| pending(channel))
+                .map(|(index, channel)| (index, channel.ordinal))
+                .collect();
+            if !provisional.is_empty() {
+                provisional.sort_by_key(|(_, ordinal)| *ordinal);
+                let highest = self
+                    .workspace_model
+                    .channels
+                    .iter()
+                    .map(|channel| channel.ordinal)
+                    .chain(
+                        self.durable
+                            .channels
+                            .iter()
+                            .filter(|channel| !pending(channel))
+                            .map(|channel| channel.ordinal),
+                    )
+                    .filter(|ordinal| *ordinal != PENDING_ORDINAL)
+                    .max()
+                    .unwrap_or(0);
+                let mut next = Some(highest);
+                let updates: Vec<_> = provisional
+                    .into_iter()
+                    .filter_map(|(index, ordinal)| {
+                        next = next
+                            .and_then(|rank| rank.checked_add(1))
+                            .filter(|rank| *rank != PENDING_ORDINAL);
+                        let rank = next.unwrap_or(PENDING_ORDINAL);
+                        (rank != ordinal).then_some((index, rank))
+                    })
+                    .collect();
+                if !updates.is_empty() {
+                    let durable = Arc::make_mut(&mut self.durable);
+                    for (index, rank) in updates {
+                        durable.channels[index].ordinal = rank;
+                    }
+                }
+            }
+        }
         if self
             .durable
             .channels
@@ -1433,6 +1507,7 @@ impl Cagents {
                     .iter()
                     .map(|channel| channel.ordinal),
             )
+            .filter(|ordinal| *ordinal != PENDING_ORDINAL)
             .max()
             .unwrap_or(0)
             .saturating_add(1)
@@ -4018,6 +4093,273 @@ mod tests {
     /// creation started with, so the window that created a channel and the
     /// window that adopted it agree on where it sorts. The same answer is the
     /// proof the registry holds it.
+    #[test]
+    fn six_creations_stay_above_saved_mixed_rows_through_pending_echoes_rank_leap_and_reopen() {
+        use crate::sidebar::{SelectionRow, SidebarAction};
+        use crate::workspace_model::{NavigationItem, NavigationOrder};
+        fn channel_rows(app: &Cagents) -> Vec<ChannelId> {
+            crate::sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, false)
+                .into_iter()
+                .filter_map(|row| match row {
+                    SelectionRow::Channel(id) => Some(id),
+                    _ => None,
+                })
+                .collect()
+        }
+        let (mut app, project, repository) = app_with_project();
+        let main = crate::model::WorktreeId::new();
+        app.sidebar_model.projects[0].worktrees =
+            vec![crate::sidebar::SidebarWorktree::from_durable(
+                main,
+                "/repo".into(),
+                Some("main".into()),
+            )];
+        let saved: Vec<_> = (0..6)
+            .map(|index| {
+                let mut channel = local(
+                    ChannelId::new(),
+                    project,
+                    &format!("Saved {index}"),
+                    index + 20,
+                );
+                channel.shared = true;
+                channel
+            })
+            .collect();
+        Arc::make_mut(&mut app.durable).channels = saved.clone();
+        let manual: Vec<_> = std::iter::once(NavigationItem::Worktree("/repo".into()))
+            .chain(
+                saved
+                    .iter()
+                    .map(|channel| NavigationItem::Channel(channel.id)),
+            )
+            .collect();
+        app.workspace_model = registry(
+            saved
+                .iter()
+                .map(|channel| shared(channel.id, &repository, &channel.title, channel.ordinal))
+                .collect(),
+        );
+        app.workspace_model.navigation_orders.push(NavigationOrder {
+            repository: repository.clone(),
+            items: manual.clone(),
+        });
+        drop(app.reconcile_workspace_model());
+        let published = intercept_publishes(&mut app);
+        let mut created = Vec::new();
+        for _ in 0..6 {
+            drop(app.update(Message::ChannelUi(
+                super::super::channel_ui::Action::Create(project),
+            )));
+            let id = app
+                .durable
+                .active_channel
+                .expect("creation selects its exact new channel");
+            created.push(id);
+            // Inspect the real update's returned projection before any manual
+            // refresh; the reveal task must address a row already mounted next frame.
+            assert_eq!(
+                &channel_rows(&app)[..created.len()],
+                created.iter().rev().copied().collect::<Vec<_>>()
+            );
+            assert!(!app.modal_is_open());
+            assert!(
+                app.durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.id == id)
+                    .unwrap()
+                    .focused
+                    .is_some(),
+                "the new composer opens immediately"
+            );
+        }
+        let edits = drain(&published);
+        assert_eq!(
+            edits
+                .iter()
+                .filter(|edit| matches!(edit, ModelEdit::CreateChannel { .. }))
+                .count(),
+            6
+        );
+        assert!(
+            !edits.iter().any(|edit| matches!(
+                edit,
+                ModelEdit::ReorderNavigation { .. } | ModelEdit::ResetNavigation { .. }
+            )),
+            "creation must not rewrite the user's saved relative order"
+        );
+        // Folded creates prove existence but still carry the pending sentinel.
+        // They must neither poison max+1 nor turn their source order into ties.
+        for (index, id) in created.iter().enumerate() {
+            drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+                sequence: 100 + index as u64,
+                edit: ModelEdit::CreateChannel {
+                    id: *id,
+                    repository: repository.clone(),
+                    title: String::new(),
+                    title_source: Default::default(),
+                },
+            }));
+            assert_eq!(
+                &channel_rows(&app)[..6],
+                created.iter().rev().copied().collect::<Vec<_>>()
+            );
+            assert_ne!(app.next_provisional_ordinal(), PENDING_ORDINAL);
+        }
+        drop(app.apply_workspace_model_update(ModelUpdate::Ranked {
+            channel: created[0],
+            ordinal: 600,
+        }));
+        assert_eq!(
+            &channel_rows(&app)[..6],
+            created.iter().rev().copied().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == created[1])
+                .unwrap()
+                .ordinal,
+            601
+        );
+        assert_eq!(
+            app.workspace_model.channel(created[1]).unwrap().ordinal,
+            PENDING_ORDINAL,
+            "a provisional UI rank never claims a registry assignment"
+        );
+        for (index, id) in created.iter().enumerate().skip(1) {
+            drop(app.apply_workspace_model_update(ModelUpdate::Ranked {
+                channel: *id,
+                ordinal: 600 + index as u32,
+            }));
+            assert_eq!(
+                &channel_rows(&app)[..6],
+                created.iter().rev().copied().collect::<Vec<_>>(),
+                "each acknowledgement preserves the still newer pending creations"
+            );
+        }
+        let mut settled = app.workspace_model.clone();
+        settled.sequence = 200;
+        for (index, id) in created.iter().enumerate() {
+            settled
+                .channels
+                .iter_mut()
+                .find(|channel| channel.id == *id)
+                .unwrap()
+                .ordinal = 600 + index as u32;
+        }
+        drop(app.apply_workspace_model_update(ModelUpdate::Read(settled.clone())));
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence: 101,
+            edit: ModelEdit::CreateChannel {
+                id: created[0],
+                repository: repository.clone(),
+                title: "stale echo".into(),
+                title_source: Default::default(),
+            },
+        }));
+        assert_eq!(
+            &channel_rows(&app)[..6],
+            created.iter().rev().copied().collect::<Vec<_>>()
+        );
+        assert_eq!(app.sidebar_model.projects[0].navigation_order, manual);
+        for original in &saved {
+            assert_eq!(
+                app.durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.id == original.id),
+                Some(original),
+                "saved channel data survives all six creations"
+            );
+        }
+        let rows =
+            crate::sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, false);
+        assert_eq!(rows[7], SelectionRow::Worktree(project, main));
+        let encoded = serde_json::to_vec(app.durable.as_ref()).unwrap();
+        let restored: crate::model::WorkspaceState = serde_json::from_slice(&encoded).unwrap();
+        let (mut reopened, _, _) = app_with_project();
+        reopened.sidebar_model = app.sidebar_model.clone();
+        reopened.durable = Arc::new(restored);
+        reopened.workspace_model = settled.clone();
+        reopened.refresh_sidebar_channels();
+        assert_eq!(channel_rows(&reopened), channel_rows(&app));
+        assert_eq!(reopened.durable.active_channel, created.last().copied());
+        // Another window derives exactly the same order from authoritative IDs.
+        let (mut peer, _, _) = app_with_project();
+        peer.sidebar_model = app.sidebar_model.clone();
+        peer.workspace_model = settled;
+        drop(peer.reconcile_workspace_model());
+        assert_eq!(channel_rows(&peer), channel_rows(&app));
+        // Activity and ordinary reopening are not a creation or reorder intent.
+        let before = channel_rows(&app);
+        drop(app.handle_channel_ui(super::super::channel_ui::Action::Open(saved[2].id)));
+        app.refresh_sidebar_channels();
+        assert_eq!(channel_rows(&app), before);
+        assert!(
+            matches!(crate::sidebar::workspace_cycle(&app.sidebar_model, &app.sidebar_state)[0], SidebarAction::OpenChannel { channel_id } if channel_id == created[5])
+        );
+    }
+
+    #[test]
+    fn folded_remote_creations_and_pending_rank_ceiling_keep_newest_first_without_wrap() {
+        let (mut app, project, repository) = app_with_project();
+        app.workspace_model = registry(Vec::new());
+        let ids: Vec<_> = (0..6).map(|_| ChannelId::new()).collect();
+        for (index, id) in ids.iter().enumerate() {
+            drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+                sequence: index as u64 + 1,
+                edit: ModelEdit::CreateChannel {
+                    id: *id,
+                    repository: repository.clone(),
+                    title: format!("Remote {index}"),
+                    title_source: Default::default(),
+                },
+            }));
+            let rows =
+                crate::sidebar::channels_in_display_order(&app.sidebar_model.projects[0].channels);
+            assert_eq!(
+                rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+                ids[..=index].iter().rev().copied().collect::<Vec<_>>()
+            );
+        }
+        let old = ChannelId::new();
+        let mut high = local(old, project, "Last authoritative rank", PENDING_ORDINAL - 1);
+        high.shared = true;
+        Arc::make_mut(&mut app.durable).channels.insert(0, high);
+        app.workspace_model.channels.insert(
+            0,
+            shared(
+                old,
+                &repository,
+                "Last authoritative rank",
+                PENDING_ORDINAL - 1,
+            ),
+        );
+        app.sort_durable_channels();
+        app.refresh_sidebar_channels();
+        let rows =
+            crate::sidebar::channels_in_display_order(&app.sidebar_model.projects[0].channels);
+        assert_eq!(
+            rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            ids.iter().rev().copied().chain([old]).collect::<Vec<_>>()
+        );
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .filter(|channel| channel.id != old)
+                .all(|channel| channel.ordinal == PENDING_ORDINAL)
+        );
+        assert_eq!(
+            app.next_provisional_ordinal(),
+            PENDING_ORDINAL,
+            "saturation stays explicitly pending rather than wrapping into an older authoritative rank"
+        );
+    }
+
     #[test]
     fn the_registry_rank_replaces_the_provisional_one_and_records_the_sharing() {
         let (mut app, project, _repository) = app_with_project();

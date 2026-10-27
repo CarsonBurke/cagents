@@ -10717,8 +10717,9 @@ struct FilteredProject<'a> {
     state: &'a SidebarState,
 }
 
-/// Cache each visible row's rank once; terminal redraws must not scan the
-/// complete durable order for every comparison.
+/// Cache each visible row's rank once. Newly created channels precede the
+/// saved mixed order; new worktrees follow it. Neither changes the relative
+/// order the user chose for existing destinations.
 pub(crate) fn apply_navigation_order<T>(
     rows: &mut [T],
     order: &[crate::workspace_model::NavigationItem],
@@ -10732,7 +10733,14 @@ pub(crate) fn apply_navigation_order<T>(
         .enumerate()
         .map(|(rank, item)| (item, rank))
         .collect();
-    rows.sort_by_cached_key(|row| ranks.get(&item(row)).copied().unwrap_or(usize::MAX));
+    rows.sort_by_cached_key(|row| {
+        let item = item(row);
+        match ranks.get(&item) {
+            Some(rank) => (1, *rank),
+            None if matches!(item, crate::workspace_model::NavigationItem::Channel(_)) => (0, 0),
+            None => (2, 0),
+        }
+    });
 }
 
 fn navigation_item(
@@ -11045,14 +11053,21 @@ pub(crate) fn worktrees_in_display_order<'a>(
 ///
 /// A channel created here holds a provisional rank one above the highest this
 /// window knows until the registry answers, so a channel created a moment ago
-/// sorts where its real rank will put it. `sort_by_key` is stable, so two rows
-/// that do share a rank keep the order the window built them in rather than
-/// swapping between frames.
+/// sorts where its real rank will put it. Equal assigned ranks keep their
+/// source order. At the pending sentinel, the later insertion is newer until
+/// an authoritative read supplies distinct ranks.
 pub(crate) fn channels_in_display_order<'a>(
     rows: impl IntoIterator<Item = &'a SidebarChannel>,
 ) -> Vec<&'a SidebarChannel> {
+    // A folded remote create can still carry the pending sentinel. Its stable
+    // insertion position is the only creation order known until the read.
     let mut rows = rows.into_iter().collect::<Vec<_>>();
     rows.sort_by_key(|channel| std::cmp::Reverse(channel.ordinal));
+    let pending = rows
+        .iter()
+        .take_while(|channel| channel.ordinal == crate::workspace_model::PENDING_ORDINAL)
+        .count();
+    rows[..pending].reverse();
     rows
 }
 
@@ -15935,6 +15950,239 @@ pub(crate) mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn new_channels_precede_saved_mixed_navigation_without_reordering_existing_destinations() {
+        use crate::workspace_model::NavigationItem;
+        let mut entry = project();
+        entry.worktrees = vec![worktree(20, "main", false), worktree(21, "feature", false)];
+        let old = ChannelId::new();
+        let ids: Vec<_> = (0..6).map(|_| ChannelId::new()).collect();
+        for (index, id) in std::iter::once(&old).chain(&ids).enumerate() {
+            entry.channels.push(SidebarChannel::new(
+                *id,
+                format!("Conversation {index}"),
+                false,
+                None,
+                false,
+                0,
+                false,
+                index as u32,
+            ));
+        }
+        entry.navigation_order = vec![
+            NavigationItem::Worktree(entry.worktrees[1].path.clone()),
+            NavigationItem::Channel(old),
+            NavigationItem::Worktree(entry.worktrees[0].path.clone()),
+        ];
+        let owner = entry.id;
+        let worktrees = [entry.worktrees[1].id, entry.worktrees[0].id];
+        let mut other = project();
+        other.id = project_id(99);
+        let unrelated = other.clone();
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry, other]);
+        let mut state = SidebarState::default();
+        let mut expected = vec![SelectionRow::Project(owner)];
+        expected.extend(ids.iter().rev().copied().map(SelectionRow::Channel));
+        expected.extend([
+            SelectionRow::Worktree(owner, worktrees[0]),
+            SelectionRow::Channel(old),
+            SelectionRow::Worktree(owner, worktrees[1]),
+        ]);
+        let visible = visible_selection_rows(&model, &state, false);
+        assert_eq!(&visible[..expected.len()], expected.as_slice());
+        let cycle = workspace_cycle(&model, &state);
+        assert_eq!(
+            cycle[..6]
+                .iter()
+                .map(|action| match action {
+                    SidebarAction::OpenChannel { channel_id } => *channel_id,
+                    _ => panic!("a new channel must precede every saved worktree"),
+                })
+                .collect::<Vec<_>>(),
+            ids.iter().rev().copied().collect::<Vec<_>>()
+        );
+        assert_eq!(model.projects[1], unrelated);
+        let mut active = model.clone();
+        active.projects[0].channels[0].activity = Some(crate::agent::ActivityState::Working);
+        active.projects[0].channels[0].unread = true;
+        assert_eq!(
+            visible_selection_rows(&active, &state, false),
+            visible,
+            "activity and unread state do not change creation or manual order"
+        );
+        // An intentional later drag can place the new destination anywhere.
+        let mut arranged = model.clone();
+        arranged.projects[0]
+            .navigation_order
+            .push(NavigationItem::Channel(ids[5]));
+        let rows = visible_selection_rows(&arranged, &state, false);
+        assert_eq!(rows[1], SelectionRow::Channel(ids[4]));
+        assert_eq!(rows[expected.len() - 1], SelectionRow::Channel(ids[5]));
+        state.query = "feature".into();
+        assert_eq!(
+            visible_selection_rows(&model, &state, false),
+            vec![
+                SelectionRow::Project(owner),
+                SelectionRow::Worktree(owner, worktrees[0])
+            ],
+            "search relevance remains independent of manual and creation ordering"
+        );
+    }
+
+    #[test]
+    fn revealing_a_new_channel_scrolls_the_real_sidebar_without_taking_composer_focus() {
+        use cosmic::iced::runtime::{Action, UserInterface, user_interface::Cache};
+        use cosmic::iced::{
+            Rectangle, Vector,
+            advanced::widget::{Operation, operation},
+            futures::StreamExt,
+        };
+        #[derive(Default)]
+        struct Probe {
+            offset: Option<f32>,
+            viewport: Option<Rectangle>,
+            focused: Option<Id>,
+        }
+        impl Operation for Probe {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&Id>,
+                _: Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if state.is_focused() {
+                    self.focused = id.cloned();
+                }
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&Id>,
+                bounds: Rectangle,
+                _: Rectangle,
+                translation: Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                if id == Some(&stable_id("projects.scroll")) {
+                    self.offset = Some(translation.y);
+                    self.viewport = Some(bounds);
+                }
+            }
+        }
+        let mut first = project();
+        first.worktrees = (20..60)
+            .map(|id| worktree(id, &format!("branch-{id}"), false))
+            .collect();
+        let mut last = project();
+        last.id = project_id(99);
+        last.name = "Last project".into();
+        last.worktrees.clear();
+        last.channels.clear();
+        let channel = ChannelId::new();
+        last.channels.push(SidebarChannel::new(
+            channel,
+            "Newest conversation".into(),
+            true,
+            None,
+            false,
+            0,
+            true,
+            1,
+        ));
+        let label = last.channels[0].accessible_name.clone();
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![first, last]);
+        let state = SidebarState::default();
+        let foreign = Id::new("new-channel-test-composer");
+        let content = widget::column::with_children(vec![
+            widget::container(project_list(&model, &state, false, false))
+                .height(180)
+                .into(),
+            widget::text_input("Draft", "Keep editing here")
+                .id(foreign.clone())
+                .on_input(SidebarAction::SearchChanged)
+                .into(),
+        ]);
+        let mut renderer = headless_renderer();
+        let mut ui = UserInterface::build(
+            content,
+            Size::new(280.0, 240.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(foreign.clone()),
+        );
+        let mut before = Probe::default();
+        ui.operate(&renderer, &mut before);
+        assert_eq!(before.offset, Some(0.0));
+        assert_eq!(before.focused, Some(foreign.clone()));
+        let target = selection_row_focus_id(SelectionRow::Channel(channel));
+        let mut stream =
+            cosmic::iced::runtime::task::into_stream(reveal::<()>(target.clone())).unwrap();
+        cosmic::iced::futures::executor::block_on(async {
+            while let Some(action) = stream.next().await {
+                let Action::Widget(mut operation) = action else {
+                    panic!("reveal is a native widget operation only")
+                };
+                loop {
+                    ui.operate(&renderer, operation.as_mut());
+                    match operation.finish() {
+                        operation::Outcome::Chain(next) => operation = next,
+                        operation::Outcome::None => break,
+                        _ => panic!("reveal must not emit an app or provider action"),
+                    }
+                }
+            }
+        });
+        let mut after = Probe::default();
+        ui.operate(&renderer, &mut after);
+        assert!(
+            after.offset.unwrap() > 0.0,
+            "the real project scrollable moved"
+        );
+        assert_eq!(after.focused, Some(foreign));
+        let nodes = ui.a11y_nodes(cosmic::iced::mouse::Cursor::Unavailable);
+        let bounds = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| {
+                node.node().role() == iced_accessibility::accesskit::Role::Button
+                    && node.node().label() == Some(label.as_ref())
+            })
+            .expect("the actual channel button remains accessible")
+            .node()
+            .bounds()
+            .unwrap();
+        let viewport = after.viewport.unwrap();
+        assert!(
+            bounds.y0 >= f64::from(viewport.y) - 0.01
+                && bounds.y1 <= f64::from(viewport.y + viewport.height) + 0.01
+        );
+        assert!(bounds.x1 > bounds.x0 && bounds.y1 > bounds.y0);
+        // A subsequent explicit keyboard-navigation command still takes focus.
+        let mut stream =
+            cosmic::iced::runtime::task::into_stream(focus_and_reveal::<()>(target.clone()))
+                .unwrap();
+        cosmic::iced::futures::executor::block_on(async {
+            while let Some(Action::Widget(mut operation)) = stream.next().await {
+                loop {
+                    ui.operate(&renderer, operation.as_mut());
+                    match operation.finish() {
+                        operation::Outcome::Chain(next) => operation = next,
+                        _ => break,
+                    }
+                }
+            }
+        });
+        let mut focused = Probe::default();
+        ui.operate(&renderer, &mut focused);
+        assert_eq!(focused.focused, Some(target));
     }
 
     #[test]
@@ -21002,10 +21250,20 @@ pub(crate) mod tests {
 
 /// Focus a navigation row and reveal it within the Projects scroll viewport.
 pub fn focus_and_reveal<T: Send + 'static>(id: Id) -> cosmic::iced::Task<T> {
+    reveal_navigation_row(id, true)
+}
+
+/// Reveal a newly selected destination without taking focus from its composer.
+pub fn reveal<T: Send + 'static>(id: Id) -> cosmic::iced::Task<T> {
+    reveal_navigation_row(id, false)
+}
+
+fn reveal_navigation_row<T: Send + 'static>(id: Id, focus: bool) -> cosmic::iced::Task<T> {
     use cosmic::iced::advanced::widget::{Operation, operation};
     struct FocusRow {
         id: Id,
         bounds: Option<cosmic::iced::Rectangle>,
+        focus: bool,
     }
     impl<T: 'static> Operation<T> for FocusRow {
         fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) {
@@ -21018,9 +21276,11 @@ pub fn focus_and_reveal<T: Send + 'static>(id: Id) -> cosmic::iced::Task<T> {
             state: &mut dyn operation::Focusable,
         ) {
             if id == Some(&self.id) {
-                state.focus();
+                if self.focus {
+                    state.focus();
+                }
                 self.bounds = Some(bounds);
-            } else {
+            } else if self.focus {
                 state.unfocus();
             }
         }
@@ -21045,7 +21305,7 @@ pub fn focus_and_reveal<T: Send + 'static>(id: Id) -> cosmic::iced::Task<T> {
             translation: cosmic::iced::Vector,
             state: &mut dyn operation::Scrollable,
         ) {
-            if id != Some(&stable_id("sidebar.projects.scroll")) {
+            if id != Some(&stable_id("projects.scroll")) {
                 return;
             }
             let row = self.bounds - translation;
@@ -21065,5 +21325,9 @@ pub fn focus_and_reveal<T: Send + 'static>(id: Id) -> cosmic::iced::Task<T> {
             }
         }
     }
-    cosmic::iced::advanced::widget::operate(FocusRow { id, bounds: None })
+    cosmic::iced::advanced::widget::operate(FocusRow {
+        id,
+        bounds: None,
+        focus,
+    })
 }
