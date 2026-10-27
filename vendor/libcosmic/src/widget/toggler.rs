@@ -331,8 +331,9 @@ impl<'a, Message> Widget<Message, crate::Theme, crate::Renderer> for Toggler<'a,
             }) if state.is_focused
                 && modifiers.is_empty()
                 && matches!(
-                    key,
+                    key.as_ref(),
                     keyboard::Key::Named(keyboard::key::Named::Space | keyboard::key::Named::Enter)
+                        | keyboard::Key::Character(" ")
                 ) =>
             {
                 // Holding a switch key should not repeatedly flip its setting.

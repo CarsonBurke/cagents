@@ -53,11 +53,14 @@ fn switches(first_on: bool, first_enabled: bool) -> Element<'static, Message> {
     .into()
 }
 
-fn key(named: keyboard::key::Named, modifiers: keyboard::Modifiers, repeat: bool) -> Event {
+fn key(key: keyboard::Key, modifiers: keyboard::Modifiers, repeat: bool) -> Event {
     Event::Keyboard(keyboard::Event::KeyPressed {
-        key: keyboard::Key::Named(named),
-        modified_key: keyboard::Key::Named(named),
-        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Space),
+        physical_key: keyboard::key::Physical::Code(match key.as_ref() {
+            keyboard::Key::Named(keyboard::key::Named::Enter) => keyboard::key::Code::Enter,
+            _ => keyboard::key::Code::Space,
+        }),
+        key: key.clone(),
+        modified_key: key,
         location: keyboard::Location::Standard,
         modifiers,
         text: None,
@@ -173,26 +176,34 @@ fn switches_retain_native_identity_and_route_focus_activation_and_disabled_state
     }
     let ids: Vec<_> = emitted.iter().map(|node| node.id().clone()).collect();
     let targets: Vec<_> = ids.iter().cloned().map(NodeId::from).collect();
+    let activation_keys = [
+        keyboard::Key::Character(" ".into()),
+        keyboard::Key::Named(keyboard::key::Named::Space),
+        keyboard::Key::Named(keyboard::key::Named::Enter),
+    ];
     let space = || {
         key(
-            keyboard::key::Named::Space,
+            activation_keys[0].clone(),
             keyboard::Modifiers::empty(),
             false,
         )
     };
 
-    // An unfocused switch never consumes the editor's Space key.
-    assert_eq!(
-        dispatch(
-            &mut parent,
-            &mut tree,
-            &node,
-            &renderer,
-            space(),
-            mouse::Cursor::Unavailable
-        ),
-        (vec![], false)
-    );
+    // Linux emits character Space; all supported keys leave editor input alone
+    // until a switch has keyboard focus.
+    for activation in &activation_keys {
+        assert_eq!(
+            dispatch(
+                &mut parent,
+                &mut tree,
+                &node,
+                &renderer,
+                key(activation.clone(), keyboard::Modifiers::empty(), false),
+                mouse::Cursor::Unavailable
+            ),
+            (vec![], false)
+        );
+    }
     operate(
         &mut parent,
         &mut tree,
@@ -200,32 +211,38 @@ fn switches_retain_native_identity_and_route_focus_activation_and_disabled_state
         &renderer,
         Box::new(operation::focusable::focus_next::<()>()),
     );
-    assert_eq!(
-        dispatch(
-            &mut parent,
-            &mut tree,
-            &node,
-            &renderer,
-            space(),
-            mouse::Cursor::Unavailable
-        ),
-        (vec![(1, true)], true)
-    );
-    for (modifiers, repeat, captured) in [
-        (keyboard::Modifiers::CTRL, false, false),
-        (keyboard::Modifiers::empty(), true, true),
-    ] {
+    for activation in &activation_keys {
         assert_eq!(
             dispatch(
                 &mut parent,
                 &mut tree,
                 &node,
                 &renderer,
-                key(keyboard::key::Named::Space, modifiers, repeat),
+                key(activation.clone(), keyboard::Modifiers::empty(), false),
                 mouse::Cursor::Unavailable
             ),
-            (vec![], captured)
+            (vec![(1, true)], true)
         );
+        for (modifiers, repeat, captured) in [
+            (keyboard::Modifiers::CTRL, false, false),
+            (keyboard::Modifiers::SHIFT, false, false),
+            (keyboard::Modifiers::ALT, false, false),
+            (keyboard::Modifiers::LOGO, false, false),
+            (keyboard::Modifiers::empty(), true, true),
+            (keyboard::Modifiers::CTRL, true, false),
+        ] {
+            assert_eq!(
+                dispatch(
+                    &mut parent,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    key(activation.clone(), modifiers, repeat),
+                    mouse::Cursor::Unavailable
+                ),
+                (vec![], captured)
+            );
+        }
     }
 
     // Rebuild and reflow while focused: IDs and focus belong to retained state.
@@ -295,7 +312,7 @@ fn switches_retain_native_identity_and_route_focus_activation_and_disabled_state
             &node,
             &renderer,
             key(
-                keyboard::key::Named::Enter,
+                keyboard::Key::Named(keyboard::key::Named::Enter),
                 keyboard::Modifiers::empty(),
                 false
             ),
@@ -411,17 +428,25 @@ fn switches_retain_native_identity_and_route_focus_activation_and_disabled_state
     );
     parent = switches(true, false);
     tree.diff(parent.as_widget_mut());
-    assert_eq!(
-        dispatch(
-            &mut parent,
-            &mut tree,
-            &node,
-            &renderer,
-            space(),
-            mouse::Cursor::Unavailable
-        ),
-        (vec![], false)
-    );
+    for activation in &activation_keys {
+        for (modifiers, repeat) in [
+            (keyboard::Modifiers::empty(), false),
+            (keyboard::Modifiers::empty(), true),
+            (keyboard::Modifiers::CTRL, false),
+        ] {
+            assert_eq!(
+                dispatch(
+                    &mut parent,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    key(activation.clone(), modifiers, repeat),
+                    mouse::Cursor::Unavailable
+                ),
+                (vec![], false)
+            );
+        }
+    }
     assert_eq!(
         dispatch(
             &mut parent,
