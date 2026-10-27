@@ -304,13 +304,44 @@ fn actor(stage: &str, directory: &Path) {
                 // rescue can stop this held setsid leaf; the owner then reaps
                 // it before parking so descendants-first ordering is provable.
                 loop {
-                    if let Some(status) = leaf.try_wait().unwrap() {
-                        assert_eq!(status.signal(), Some(libc::SIGKILL));
+                    let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    // Keep the exact leaf unreaped while publishing its exit
+                    // proof. The guardian cannot kill this owner in that
+                    // interval because its child list is still nonempty.
+                    if unsafe {
+                        libc::waitid(
+                            libc::P_PID,
+                            leaf.id(),
+                            &mut status,
+                            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                        )
+                    } != 0
+                    {
+                        let error = io::Error::last_os_error();
+                        if error.kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        panic!("Cannot observe the controlled leaf: {error}");
+                    }
+                    if unsafe { status.si_pid() } != 0 {
+                        assert_eq!(unsafe { status.si_pid() }, leaf.id() as i32);
+                        assert_eq!(status.si_code, libc::CLD_KILLED);
+                        assert_eq!(unsafe { status.si_status() }, libc::SIGKILL);
                         fs::write(
-                            directory.join("leaf-reaped"),
+                            directory.join("leaf-exit-observed.next"),
                             format!("{} {} SIGKILL\n", identity.pid, identity.start),
                         )
                         .unwrap();
+                        fs::rename(
+                            directory.join("leaf-exit-observed.next"),
+                            directory.join("leaf-exit-observed"),
+                        )
+                        .unwrap();
+                        let reaped = leaf
+                            .try_wait()
+                            .unwrap()
+                            .expect("WNOWAIT retained the exact leaf exit status");
+                        assert_eq!(reaped.signal(), Some(libc::SIGKILL));
                         loop {
                             std::thread::park_timeout(Duration::from_secs(60));
                         }

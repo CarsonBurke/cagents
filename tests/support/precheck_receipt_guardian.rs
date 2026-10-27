@@ -412,7 +412,7 @@ fn isolated_with_rescue_control(
                 assert!(!failure.owner.present().unwrap());
                 assert!(!failure.descendant.present().unwrap());
                 assert_eq!(
-                    fs::read_to_string(root.join("rescue/leaf-reaped")).unwrap(),
+                    fs::read_to_string(root.join("rescue/leaf-exit-observed")).unwrap(),
                     format!(
                         "{} {} SIGKILL\n",
                         failure.descendant.pid, failure.descendant.start
