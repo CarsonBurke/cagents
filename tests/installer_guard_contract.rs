@@ -96,6 +96,14 @@ mod coordinator_fixture {
                 )
             });
         }
+        pub(super) fn close_after_parent(
+            self,
+            retire: impl FnOnce() -> io::Result<()>,
+        ) -> io::Result<()> {
+            retire()?;
+            self.close();
+            Ok(())
+        }
     }
     impl Drop for Root {
         fn drop(&mut self) {
@@ -302,8 +310,24 @@ mod coordinator_fixture {
             {
                 return Err(io::Error::other("mismatched or unsettled custody receipt"));
             }
+            let status = std::process::ExitStatus::from_raw(receipt.status);
+            let terminal = receipt.status >= 0
+                && receipt.status <= 0xffff
+                && match (status.code(), status.signal()) {
+                    (Some(_), None) => receipt.status & 0xff == 0,
+                    (None, Some(signal)) => {
+                        receipt.status & !0xff == 0 && signal > 0 && signal <= libc::SIGRTMAX()
+                    }
+                    _ => false,
+                };
+            if !terminal {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "nonterminal or invalid coordinator wait status",
+                ));
+            }
             let output = Output {
-                status: std::process::ExitStatus::from_raw(receipt.status),
+                status,
                 stdout: read(&self.root, "coordinator.stdout")?,
                 stderr: read(&self.root, "coordinator.stderr")?,
             };
@@ -556,35 +580,70 @@ exit 0
     }
 
     #[test]
-    fn rejected_receipt_retains_the_namespace_even_without_unwinding() {
+    fn rejected_receipt_or_parent_retirement_retains_namespace_without_unwinding() {
         let _fixture = OS_FIXTURE.lock().unwrap();
+        for invalid_status in [
+            None,
+            Some((libc::SIGSTOP << 8) | 0x7f),
+            Some(0xffff),
+            Some(0x10000),
+        ] {
+            let root = Root::new(tempfile::tempdir().unwrap());
+            let path = root.path().to_owned();
+            let mut child = Coordinator::start(Command::new("/bin/true"), &root, false);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while child.child.try_wait().unwrap().is_none() {
+                assert!(Instant::now() < deadline, "receipt control did not finish");
+                thread::sleep(Duration::from_millis(10));
+            }
+            let original = read(&path, "custody.json").unwrap();
+            let mut receipt: Receipt = serde_json::from_slice(&original).unwrap();
+            if let Some(status) = invalid_status {
+                receipt.status = status;
+            } else {
+                receipt.guardian += 1;
+            }
+            fs::write(
+                path.join("custody.json"),
+                serde_json::to_vec(&receipt).unwrap(),
+            )
+            .unwrap();
+            let error = child.settle().err().expect("invalid receipt was accepted");
+            if invalid_status.is_some() {
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            }
+            assert!(!child.settled.load(Ordering::Acquire));
+            drop(root);
+            assert!(
+                path.is_dir(),
+                "caught custody errors must not auto-delete evidence"
+            );
+            // Validate the original genuine receipt before removing this
+            // passing meta-test's own retained control namespace.
+            fs::write(path.join("custody.json"), original).unwrap();
+            child.settle().unwrap();
+            assert!(child.settled.load(Ordering::Acquire));
+            fs::remove_dir_all(path).unwrap();
+        }
         let root = Root::new(tempfile::tempdir().unwrap());
         let path = root.path().to_owned();
         let mut child = Coordinator::start(Command::new("/bin/true"), &root, false);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while child.child.try_wait().unwrap().is_none() {
-            assert!(Instant::now() < deadline, "receipt control did not finish");
-            thread::sleep(Duration::from_millis(10));
-        }
-        let original = read(&path, "custody.json").unwrap();
-        let mut receipt: Receipt = serde_json::from_slice(&original).unwrap();
-        receipt.guardian += 1;
-        fs::write(
-            path.join("custody.json"),
-            serde_json::to_vec(&receipt).unwrap(),
-        )
-        .unwrap();
-        assert!(child.settle().is_err());
-        assert!(!child.settled.load(Ordering::Acquire));
-        drop(root);
+        child
+            .wait_until(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        let mut parent_window = OwnedProcess(Command::new("/bin/sleep").arg("60").spawn().unwrap());
+        let listener = UnixListener::bind(path.join("parent.sock")).unwrap();
+        let result =
+            root.close_after_parent(|| Err(io::Error::other("injected parent retirement failure")));
+        assert!(result.is_err() && path.is_dir());
+        assert!(parent_window.0.try_wait().unwrap().is_none());
         assert!(
-            path.is_dir(),
-            "caught custody errors must not auto-delete evidence"
+            listener.local_addr().is_ok(),
+            "guardian ECHILD excludes the live parent listener"
         );
-        // Restore and validate the genuine receipt before this passing
-        // meta-test removes its own retained control namespace.
-        fs::write(path.join("custody.json"), original).unwrap();
-        child.settle().unwrap();
+        parent_window.stop_checked().unwrap();
+        drop(parent_window);
+        drop(listener);
         assert!(child.settled.load(Ordering::Acquire));
         fs::remove_dir_all(path).unwrap();
     }
@@ -592,6 +651,19 @@ exit 0
 
 struct OwnedProcess(std::process::Child);
 impl OwnedProcess {
+    fn stop_checked(&mut self) -> std::io::Result<()> {
+        if self.0.try_wait()?.is_none() {
+            if let Err(error) = self.0.kill() {
+                // An exit racing the signal is still a checked retirement;
+                // a live original child with a rejected signal is an error.
+                if self.0.try_wait()?.is_none() {
+                    return Err(error);
+                }
+            }
+        }
+        self.0.wait()?;
+        Ok(())
+    }
     fn window(executable: &Path, runtime: &Path, ready: &Path) -> Self {
         fs::copy(std::env::current_exe().unwrap(), executable).unwrap();
         let child = Command::new(executable)
@@ -617,6 +689,8 @@ impl OwnedProcess {
 }
 impl Drop for OwnedProcess {
     fn drop(&mut self) {
+        // Failure fallback only. Namespace deletion requires stop_checked;
+        // ignored errors here never establish a parent-retirement proof.
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
@@ -921,7 +995,7 @@ fn staging_never_contacts_or_reopens_live_windows_even_on_failure_or_cancel() {
             "cagents install root\n",
         )
         .unwrap();
-        let _window = OwnedProcess::window(
+        let mut window = OwnedProcess::window(
             &prefix.join("versions/old/bin/cagents-ui"),
             &runtime,
             &root.path().join("window-ready"),
@@ -1000,8 +1074,13 @@ esac
                 "versions/old"
             })
         );
-        drop(_window);
-        root.close();
+        root.close_after_parent(|| {
+            window.stop_checked()?;
+            drop(window);
+            drop(listener);
+            Ok(())
+        })
+        .unwrap();
     }
 }
 
