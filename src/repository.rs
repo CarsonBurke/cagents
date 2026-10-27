@@ -5960,8 +5960,32 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         Ok(self.git_pathspec_mutation(worktree, ["add", "-A"], paths))
     }
 
-    /// Stages the selected paths, including the deletion half of a rename the
-    /// index still has.
+    /// Unlike a directory pathspec, a Changes row names one index/worktree
+    /// entry. A deleted file can already have an unselected directory at the
+    /// same name, and literal `git add -A` would recursively stage that tree.
+    fn selected_stage_command(
+        &self,
+        worktree: &Path,
+        paths: &[RepoPath],
+    ) -> Result<CommandSpec, ValidationError> {
+        if paths.is_empty() {
+            return Err(ValidationError::EmptySelection);
+        }
+        Ok(self
+            .git_mutation(worktree, ["add", "-A"])
+            // The trusted magic below must not inherit a caller's pathspec
+            // interpretation. User path bytes are always explicitly quoted.
+            .env_remove("GIT_LITERAL_PATHSPECS")
+            .env_remove("GIT_GLOB_PATHSPECS")
+            .env_remove("GIT_NOGLOB_PATHSPECS")
+            .env_remove("GIT_ICASE_PATHSPECS")
+            .args(["--pathspec-from-file=-", "--pathspec-file-nul"])
+            .stdin(selected_stage_pathspec_input(paths)))
+    }
+
+    /// Stages exactly the selected Changes entries, including the deletion
+    /// half of a rename the index still has. Directory groups supply their
+    /// individual entries; an opaque embedded repository remains one gitlink.
     pub fn stage(
         &self,
         request: &StageRequest,
@@ -5972,7 +5996,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .map_err(|error| ValidationError::Io(error.to_string()))?;
         let paths =
             self.matchable_pathspecs(&request.worktree, &request.selection, cancellation)?;
-        let command = self.stage_command(&request.worktree, &paths)?;
+        let command = self.selected_stage_command(&request.worktree, &paths)?;
         Ok(self.run_mutation(&command, paths, MutationScope::Incremental, cancellation))
     }
 
@@ -7867,6 +7891,59 @@ fn pathspec_input(paths: &[RepoPath]) -> Vec<u8> {
     for path in paths {
         input.extend_from_slice(path.as_os_str().as_bytes());
         input.push(0);
+    }
+    input
+}
+
+/// Quote bytes inside a Git `glob` pathspec; slash remains a separator.
+fn append_pathspec_glob_literal(input: &mut Vec<u8>, bytes: &[u8]) {
+    for &byte in bytes {
+        if b"\\*?[]".contains(&byte) {
+            input.push(b'\\');
+        }
+        input.push(byte);
+    }
+}
+
+/// NUL-delimited exact Changes entries, including opaque directory/gitlinks.
+/// Keep normal `git add` semantics for ignore rules, filters and index flags.
+fn selected_stage_pathspec_input(paths: &[RepoPath]) -> Vec<u8> {
+    let mut sorted: Vec<&[u8]> = paths.iter().map(RepoPath::as_bytes).collect();
+    sorted.sort_unstable();
+    let mut input = Vec::new();
+    for path in paths {
+        let bytes = path.as_bytes();
+        let mut descendants = bytes.to_vec();
+        descendants.push(b'/');
+        let next = sorted.partition_point(|candidate| *candidate < descendants.as_slice());
+        if sorted
+            .get(next)
+            .is_some_and(|candidate| candidate.starts_with(&descendants))
+        {
+            // This selected ancestor must not exclude another selected row.
+            // A wildcard forces Git's pathname matching rather than its
+            // recursive directory-prefix shortcut. The final-byte class
+            // still matches exactly one name, including arbitrary Unix bytes.
+            input.extend_from_slice(b":(top,glob)");
+            append_pathspec_glob_literal(&mut input, &bytes[..bytes.len() - 1]);
+            input.extend_from_slice(b"[\\");
+            input.push(bytes[bytes.len() - 1]);
+            input.extend_from_slice(b"]\0");
+        } else {
+            input.extend_from_slice(b":(top,literal)");
+            input.extend_from_slice(bytes);
+            input.push(0);
+            // Neither pattern matches the root itself, unlike `path/**`
+            // which would also prune an opaque embedded-repository gitlink.
+            // Both are required: one excludes immediate entries, the other
+            // excludes entries at every greater depth, including index paths.
+            for suffix in [b"/?*".as_slice(), b"/?*/**".as_slice()] {
+                input.extend_from_slice(b":(top,glob,exclude)");
+                append_pathspec_glob_literal(&mut input, bytes);
+                input.extend_from_slice(suffix);
+                input.push(0);
+            }
+        }
     }
     input
 }
@@ -10946,6 +11023,210 @@ mod tests {
                 .stdout
         }
 
+        #[test]
+        fn staging_deleted_leaf_does_not_stage_its_replacement_directory() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            for name in ["a", "assumed", "skipped", "unselected"] {
+                fs::write(root.join(name), b"base\n").unwrap();
+            }
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-m", "base"]);
+            let head = git_output(root, &["rev-parse", "HEAD"]);
+            git(root, &["update-index", "--assume-unchanged", "assumed"]);
+            git(root, &["update-index", "--skip-worktree", "skipped"]);
+            fs::write(root.join("assumed"), b"unselected work\n").unwrap();
+            fs::write(root.join("skipped"), b"unselected work\n").unwrap();
+            fs::write(root.join("unselected"), b"already staged\n").unwrap();
+            git(root, &["add", "unselected"]);
+            let unselected = git_output(
+                root,
+                &["ls-files", "-sv", "--", "assumed", "skipped", "unselected"],
+            );
+            fs::remove_file(root.join("a")).unwrap();
+            fs::create_dir_all(root.join("a/deep/deeper")).unwrap();
+            fs::write(root.join("a/immediate"), b"unselected\n").unwrap();
+            fs::write(root.join("a/deep/deeper/file"), b"unselected\n").unwrap();
+
+            let outcome = service()
+                .stage(
+                    &StageRequest {
+                        worktree: root.into(),
+                        selection: vec![PathSelection::new(path("a"))],
+                    },
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+
+            assert!(matches!(outcome, MutationOutcome::Applied { .. }));
+            assert_eq!(git_output(root, &["rev-parse", "HEAD"]), head);
+            assert_eq!(
+                git_output(root, &["diff", "--cached", "--name-status", "-z"]),
+                b"D\0a\0M\0unselected\0"
+            );
+            assert_eq!(
+                git_output(
+                    root,
+                    &["ls-files", "-sv", "--", "assumed", "skipped", "unselected"]
+                ),
+                unselected
+            );
+            assert_eq!(fs::read(root.join("a/immediate")).unwrap(), b"unselected\n");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn staging_explicit_children_and_rename_keeps_unselected_siblings() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            let mut parents: Vec<_> = [b'a', b'[', b']', b'-', b'^', b'!', b'\\', 0xff, b'\n']
+                .into_iter()
+                .map(|byte| RepoPath::from_bytes(&[b'p', byte]).unwrap())
+                .collect();
+            parents.extend([
+                path(":(glob)*"),
+                RepoPath::from_bytes(b"bracket[\\]*?\n\xff").unwrap(),
+            ]);
+            for parent in &parents {
+                fs::write(root.join(parent.as_os_str()), b"base\n").unwrap();
+            }
+            fs::write(root.join("old"), b"rename contents\n").unwrap();
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-m", "base"]);
+            fs::rename(root.join("old"), root.join("new")).unwrap();
+            let mut selection = vec![PathSelection {
+                path: path("new"),
+                old_path: Some(path("old")),
+            }];
+            for parent in &parents {
+                let directory = root.join(parent.as_os_str());
+                fs::remove_file(&directory).unwrap();
+                fs::create_dir(&directory).unwrap();
+                fs::write(directory.join("selected"), b"selected\n").unwrap();
+                fs::write(directory.join("unselected"), b"unselected\n").unwrap();
+                selection.push(PathSelection::new(parent.clone()));
+                let mut child = parent.as_bytes().to_vec();
+                child.extend_from_slice(b"/selected");
+                selection.push(PathSelection::new(RepoPath::from_bytes(&child).unwrap()));
+            }
+
+            let outcome = service()
+                .stage(
+                    &StageRequest {
+                        worktree: root.into(),
+                        selection,
+                    },
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+            assert!(matches!(outcome, MutationOutcome::Applied { .. }));
+            let indexed = git_output(root, &["ls-files", "-z"]);
+            let mut expected = vec![b"new".to_vec()];
+            for parent in &parents {
+                let mut child = parent.as_bytes().to_vec();
+                child.extend_from_slice(b"/selected");
+                expected.push(child);
+            }
+            expected.sort();
+            assert_eq!(
+                indexed,
+                expected
+                    .into_iter()
+                    .flat_map(|mut p| {
+                        p.push(0);
+                        p
+                    })
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(git_output(root, &["show", ":new"]), b"rename contents\n");
+        }
+
+        #[test]
+        fn staging_opaque_gitlink_and_explicit_directory_keep_their_semantics() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            let nested = root.join("nested[repo]");
+            fs::create_dir(&nested).unwrap();
+            git(&nested, &["init", "-b", "main"]);
+            fs::write(nested.join("payload"), b"base\n").unwrap();
+            git(&nested, &["add", "-A"]);
+            git(&nested, &["commit", "-m", "base"]);
+            let nested_head = git_output(&nested, &["rev-parse", "HEAD"]);
+            let outcome = service()
+                .stage(
+                    &StageRequest {
+                        worktree: root.into(),
+                        selection: vec![PathSelection::new(path("nested[repo]"))],
+                    },
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+            assert!(matches!(outcome, MutationOutcome::Applied { .. }));
+            let mut expected = b"160000 ".to_vec();
+            expected.extend_from_slice(nested_head.strip_suffix(b"\n").unwrap());
+            expected.extend_from_slice(b" 0\tnested[repo]\0");
+            assert_eq!(git_output(root, &["ls-files", "-s", "-z"]), expected);
+
+            // The public generic pathspec builder still supports intentional
+            // recursive directory staging; Changes rows use a separate route.
+            fs::create_dir_all(root.join("ordinary/deep")).unwrap();
+            fs::write(root.join("ordinary/first"), b"one\n").unwrap();
+            fs::write(root.join("ordinary/deep/second"), b"two\n").unwrap();
+            let service = service();
+            let command = service.stage_command(root, &[path("ordinary")]).unwrap();
+            service
+                .run_checked(&command, &CancellationToken::new())
+                .unwrap();
+            assert_eq!(
+                git_output(root, &["ls-files", "-z", "--", "ordinary"]),
+                b"ordinary/deep/second\0ordinary/first\0"
+            );
+        }
+
+        #[test]
+        fn exact_staging_respects_index_lock_and_ignore_rules() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            fs::write(root.join(".gitignore"), b"ignored\n").unwrap();
+            fs::write(root.join("selected"), b"base\n").unwrap();
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-m", "base"]);
+            let index = fs::read(root.join(".git/index")).unwrap();
+            fs::write(root.join("selected"), b"new work\n").unwrap();
+            fs::write(root.join(".git/index.lock"), b"another writer").unwrap();
+            let request = StageRequest {
+                worktree: root.into(),
+                selection: vec![PathSelection::new(path("selected"))],
+            };
+            let outcome = service()
+                .stage(&request, &CancellationToken::new())
+                .unwrap();
+            assert!(matches!(outcome, MutationOutcome::OutcomeUnknown { .. }));
+            assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+            assert_eq!(
+                fs::read(root.join(".git/index.lock")).unwrap(),
+                b"another writer"
+            );
+            fs::remove_file(root.join(".git/index.lock")).unwrap();
+            fs::write(root.join("ignored"), b"ignored work\n").unwrap();
+            let outcome = service()
+                .stage(
+                    &StageRequest {
+                        worktree: root.into(),
+                        selection: vec![PathSelection::new(path("ignored"))],
+                    },
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+            assert!(matches!(outcome, MutationOutcome::OutcomeUnknown { .. }));
+            assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+            assert_eq!(fs::read(root.join("selected")).unwrap(), b"new work\n");
+        }
+
         #[cfg(unix)]
         #[test]
         fn unstage_preserves_worktree_head_and_unselected_index_entries() {
@@ -12252,13 +12533,32 @@ mod tests {
         let commands = service.executor.commands.lock().unwrap();
         assert_eq!(
             commands[1].stdin.as_deref(),
-            Some(b"new name.txt\0".as_slice())
+            Some(
+                b":(top,literal)new name.txt\0:(top,glob,exclude)new name.txt/?*\0:(top,glob,exclude)new name.txt/?*/**\0".as_slice()
+            )
         );
         assert!(
             !commands[1]
                 .arguments
                 .contains(&OsString::from("old name.txt"))
         );
+        assert!(
+            !commands[1]
+                .arguments
+                .contains(&OsString::from("--literal-pathspecs"))
+        );
+        for variable in [
+            "GIT_LITERAL_PATHSPECS",
+            "GIT_GLOB_PATHSPECS",
+            "GIT_NOGLOB_PATHSPECS",
+            "GIT_ICASE_PATHSPECS",
+        ] {
+            assert!(
+                commands[1]
+                    .removed_environment
+                    .contains(&OsString::from(variable))
+            );
+        }
         drop(commands);
 
         // The index still has it, which is the unstaged rename this
