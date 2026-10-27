@@ -814,6 +814,9 @@ impl Store {
                 self.db
                     .execute("DELETE FROM items", [])
                     .map_err(|e| e.to_string())?;
+                // Reset ends the original-source lifetime even when the same
+                // provider session and source IDs are published again.
+                self.source_incarnation = uuid::Uuid::new_v4();
                 self.end = None;
                 self.first = None;
                 self.newest = None;

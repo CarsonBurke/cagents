@@ -42,7 +42,8 @@ impl Store {
         let visible:Vec<_>=state.subagents.iter().flat_map(|agent|agent.items.iter().filter_map(move |item|{
             if let ItemContent::Text{text,..}=&item.content {Some((SourceKey{agent_id:Some(agent.id.clone()),source_id:item.id.clone()},text.len()))} else {None}
         })).collect();
-        let changed=self.source_revision!=state.source_revision;
+        let changed=self.source_revision!=state.source_revision
+            || state.source_incarnation!=Some(self.source_incarnation);
         let wanted:Vec<_>=visible.iter().filter(|(key,_)|changed || !cached.contains_key(key)).map(|(key,_)|key).collect();
         if !wanted.is_empty(){self.flush_child_source()?;}
         let mut lengths=std::collections::HashMap::new();
@@ -65,6 +66,7 @@ impl Store {
         state.source_parts.retain(|part|part.source.agent_id.is_none());
         state.source_parts.extend(parts);
         state.source_revision=self.source_revision;
+        state.source_incarnation=Some(self.source_incarnation);
         Ok(())
     }
     pub(crate) fn source_page(&mut self, query: SourceQuery) -> Result<SourcePage, SourceError> {
@@ -258,6 +260,91 @@ mod tests {
         assert_eq!(page.metadata,part.metadata);assert_eq!(page.text,text);
         let before=state.source_parts.clone();
         store.publish_source_parts(&mut state).unwrap();assert_eq!(state.source_parts,before);
+    }
+
+    #[test]
+    fn published_source_identity_survives_append_but_rotates_on_reset_and_store_replacement() {
+        let mut store = Store::new().unwrap();
+        let mut state = crate::chat::Snapshot {
+            session_id: Some("same-session".into()),
+            subagents: vec![crate::chat::Subagent {
+                id: "child".into(),
+                items: vec![std::sync::Arc::new(item("root", "[placeholder]"))],
+                kind: String::new(),
+                description: String::new(),
+                status: crate::chat::ToolStatus::Running,
+                background: false,
+                model: None,
+                waiting: false,
+                detail: String::new(),
+            }],
+            ..Default::default()
+        };
+        store
+            .apply(Event::SubagentItem {
+                id: "child".into(),
+                item: item("root", "original source body"),
+            })
+            .unwrap();
+        store.publish_source_parts(&mut state).unwrap();
+        let first = state
+            .source_incarnation
+            .expect("real Store publication includes its source identity");
+        assert_eq!(state.source_parts[0].epoch.incarnation, first);
+        let epoch = state.source_parts[0].epoch;
+        store
+            .apply(Event::SubagentTextDelta {
+                id: "child".into(),
+                item_id: "root".into(),
+                role: Role::Assistant,
+                thinking: false,
+                delta: " appended".into(),
+            })
+            .unwrap();
+        store.publish_source_parts(&mut state).unwrap();
+        assert_eq!(state.source_incarnation, Some(first));
+        assert_eq!(
+            state.source_parts[0].epoch, epoch,
+            "appending keeps prefix proof"
+        );
+
+        store
+            .apply(Event::Reset {
+                reason: "same-session replay".into(),
+            })
+            .unwrap();
+        store
+            .apply(Event::SubagentItem {
+                id: "child".into(),
+                item: item("root", "rewritten source body"),
+            })
+            .unwrap();
+        store.publish_source_parts(&mut state).unwrap();
+        let reset = state.source_incarnation.unwrap();
+        assert_ne!(
+            reset, first,
+            "Reset must invalidate already-loaded UI sources"
+        );
+        assert_eq!(state.source_parts[0].epoch.incarnation, reset);
+        assert_eq!(state.session_id.as_deref(), Some("same-session"));
+
+        let mut replacement = Store::new().unwrap();
+        replacement
+            .apply(Event::SubagentItem {
+                id: "child".into(),
+                item: item("root", "new store"),
+            })
+            .unwrap();
+        // A replacement process can restart the scalar revision counter at the
+        // same value. Old cached child metadata must not cross that lifetime.
+        state.source_revision = replacement.source_revision;
+        replacement.publish_source_parts(&mut state).unwrap();
+        assert_ne!(state.source_incarnation, Some(reset));
+        assert_eq!(
+            state.source_parts[0].epoch.incarnation,
+            state.source_incarnation.unwrap()
+        );
+        assert_eq!(state.source_parts[0].source_len, "new store".len());
     }
 
     #[test]
