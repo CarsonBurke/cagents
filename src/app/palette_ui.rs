@@ -2010,6 +2010,17 @@ mod tests {
 
     use super::*;
 
+    // App focus/visibility postludes construct Tokio timers even when a test
+    // drops their tasks. A worker also drives timers while the synchronous
+    // native clipboard fixture polls a returned task with futures::block_on.
+    fn native_palette_test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
     /// Run a real scroll operation against the retained native widget tree.
     fn scroll_fixture_step(
         app: &Cagents,
@@ -2352,6 +2363,8 @@ mod tests {
 
     #[test]
     fn native_query_quick_press_release_submits_once_and_old_copy_cannot_act_after_reopen() {
+        let runtime = native_palette_test_runtime();
+        let _runtime = runtime.enter();
         use keyboard::key::{Code, Named, Physical};
         let mut app = branch_palette_fixture();
         let press = cycle_key(Named::Enter, Code::Enter, true, false);
@@ -2396,6 +2409,8 @@ mod tests {
 
     #[test]
     fn native_query_arrow_repeat_then_enter_resolves_the_ordered_selection_in_both_directions() {
+        let runtime = native_palette_test_runtime();
+        let _runtime = runtime.enter();
         use keyboard::key::{Code, Named, Physical};
         for backwards in [false, true] {
             let mut app = branch_palette_fixture();
@@ -2453,6 +2468,8 @@ mod tests {
 
     #[test]
     fn native_query_edit_then_enter_does_not_run_the_old_hidden_contextual_result() {
+        let runtime = native_palette_test_runtime();
+        let _runtime = runtime.enter();
         use keyboard::key::{Code, Named, Physical};
         let mut app = branch_palette_fixture();
         let select = keyboard::Event::KeyPressed {
@@ -2501,6 +2518,8 @@ mod tests {
 
     #[test]
     fn native_query_post_submit_edit_and_old_scope_cannot_reopen_or_mutate_palette() {
+        let runtime = native_palette_test_runtime();
+        let _runtime = runtime.enter();
         use keyboard::key::{Code, Named, Physical};
         let mut app = branch_palette_fixture();
         let scope = app.palette.native_scope;
@@ -2542,6 +2561,8 @@ mod tests {
 
     #[test]
     fn native_row_query_and_ordinary_rows_share_one_action_ticket_until_fresh_press() {
+        let runtime = native_palette_test_runtime();
+        let _runtime = runtime.enter();
         use keyboard::key::{Code, Named, Physical};
         for (query_focus, key, code) in [
             (false, keyboard::Key::Named(Named::Enter), Code::Enter),
@@ -2618,6 +2639,8 @@ mod tests {
 
     #[test]
     fn native_p1_r1_p2_batch_and_delayed_app_r1_preserve_exact_new_press_ownership() {
+        let runtime = native_palette_test_runtime();
+        let _runtime = runtime.enter();
         use keyboard::key::{Code, Named, Physical};
         for query in [false, true] {
             let mut app = branch_palette_fixture();
@@ -2665,6 +2688,8 @@ mod tests {
 
     #[test]
     fn native_query_and_row_preserve_ordinary_settings_command_and_tab_forwarding() {
+        let runtime = native_palette_test_runtime();
+        let _runtime = runtime.enter();
         use keyboard::key::{Code, Named, Physical};
         for query_focus in [false, true] {
             let mut app = crate::app::tests::context_inspector_test_app(true);
@@ -2733,6 +2758,8 @@ mod tests {
 
     #[test]
     fn native_row_arrows_then_enter_activate_ordered_target_in_both_directions_and_categories() {
+        let runtime = native_palette_test_runtime();
+        let _runtime = runtime.enter();
         use keyboard::key::{Code, Named, Physical};
         for target_contextual in [false, true] {
             let mut app = branch_palette_fixture();
@@ -2810,6 +2837,8 @@ mod tests {
 
     #[test]
     fn native_query_can_navigate_from_contextual_to_generic_before_enter() {
+        let runtime = native_palette_test_runtime();
+        let _runtime = runtime.enter();
         use keyboard::key::{Code, Named, Physical};
         let mut app = branch_palette_fixture();
         drop(app.update_palette(Action::Query(">".into())));
@@ -2854,6 +2883,8 @@ mod tests {
 
     #[test]
     fn native_palette_intents_refuse_a_new_cover_without_mutating_or_closing_the_palette() {
+        let runtime = native_palette_test_runtime();
+        let _runtime = runtime.enter();
         use keyboard::key::{Code, Named, Physical};
         for row in [false, true] {
             for cover in ["approval", "image", "unfocused", "freeze"] {
@@ -2926,6 +2957,8 @@ mod tests {
 
     #[test]
     fn native_row_focus_survives_rebuild_and_later_tab_or_accessibility_focus_return() {
+        let runtime = native_palette_test_runtime();
+        let _runtime = runtime.enter();
         use iced::{
             Size,
             advanced::{clipboard, widget::operation},
@@ -3411,6 +3444,8 @@ mod tests {
 
     #[test]
     fn native_pointer_and_advertised_accessibility_runs_refuse_cover_then_fresh_run_succeeds() {
+        let runtime = native_palette_test_runtime();
+        let _runtime = runtime.enter();
         use iced::advanced::widget::Tree;
         use iced::mouse::{Button, Event};
         for accessibility in [false, true] {
@@ -3463,9 +3498,22 @@ mod tests {
                 let focused = app.workspace.focused();
                 for message in messages {
                     let task = app.update(message);
+                    // Task::batch retains a stream even when every task is
+                    // empty. Check actual effects, including the App postlude.
+                    use iced::futures::StreamExt;
+                    let effects = runtime.block_on(async {
+                        tokio::time::timeout(Duration::from_secs(1), async {
+                            match iced::runtime::task::into_stream(task) {
+                                Some(stream) => stream.collect::<Vec<_>>().await,
+                                None => Vec::new(),
+                            }
+                        })
+                        .await
+                        .expect("covered palette effects settle within the fixture deadline")
+                    });
                     assert!(
-                        iced::runtime::task::into_stream(task).is_none(),
-                        "cover refusal emits no focus/dispatch effect"
+                        effects.is_empty(),
+                        "cover refusal emits no focus/dispatch effect: {effects:?}"
                     );
                 }
                 assert_eq!(app.palette.query, query);
@@ -3490,6 +3538,8 @@ mod tests {
 
     #[test]
     fn native_tab_then_enter_activates_newly_focused_pane_in_one_batch_in_both_directions() {
+        let runtime = native_palette_test_runtime();
+        let _runtime = runtime.enter();
         use keyboard::key::{Code, Named, Physical};
         for backwards in [false, true] {
             let mut app = branch_palette_fixture();
@@ -3727,6 +3777,8 @@ mod tests {
 
     #[test]
     fn contextual_branch_copy_is_a_named_native_row_and_submit_copies_exact_branch() {
+        let runtime = native_palette_test_runtime();
+        let _runtime = runtime.enter();
         let mut app = branch_palette_fixture();
         let entries = app.palette_entries();
         assert_eq!(entries.len(), 1);
@@ -3798,6 +3850,8 @@ mod tests {
 
     #[test]
     fn current_contextual_palette_accessibility_click_runs_its_captured_branch_copy() {
+        let runtime = native_palette_test_runtime();
+        let _runtime = runtime.enter();
         let mut app = branch_palette_fixture();
         let entry = app.palette_entries().pop().unwrap();
         let identity = EntryIdentity::capture(&entry.2).unwrap();
@@ -3855,7 +3909,8 @@ mod tests {
             expected.insert(index + 1, 'x');
             assert!(
                 messages.iter().any(|message| matches!(
-                    message, Message::Palette(Action::Query(actual)) if actual == &expected
+                    message, Message::Palette(Action::QueryFromNative(scope, actual))
+                        if *scope == app.palette.native_scope && actual == &expected
                 )),
                 "native query focus and its advanced caret survive result-kind transition {index}"
             );
@@ -3937,6 +3992,8 @@ mod tests {
 
     #[test]
     fn closed_copy_palette_retires_activation_without_a_terminal_before_fresh_terminal_input() {
+        let runtime = native_palette_test_runtime();
+        let _runtime = runtime.enter();
         use iced::advanced::{
             Layout, Shell, clipboard, layout,
             widget::{Tree, operation},
@@ -5729,6 +5786,8 @@ mod tests {
 
     #[test]
     fn native_long_palette_rows_reveal_the_entire_focus_ring_before_batched_activation() {
+        let runtime = native_palette_test_runtime();
+        let _runtime = runtime.enter();
         use iced::{
             Size,
             advanced::{clipboard, widget::operation},
@@ -6353,6 +6412,8 @@ mod tests {
     }
     #[test]
     fn actual_retained_context_menu_ignored_pass_allows_one_palette_tab_per_original_event() {
+        let runtime = native_palette_test_runtime();
+        let _runtime = runtime.enter();
         use iced::{
             Point, Size,
             advanced::{clipboard, widget::operation},
