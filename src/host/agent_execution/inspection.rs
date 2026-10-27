@@ -106,6 +106,8 @@ impl Write for CursorBytes {
 pub(in crate::host) struct PreparedInspection {
     authorization: ReadAuthorization,
     page: Page,
+    #[cfg(test)]
+    final_registry_contended: Option<std::sync::mpsc::SyncSender<()>>,
 }
 
 /// Placement permission was observed coherently and explicitly released.
@@ -213,6 +215,21 @@ impl PreparedInspection {
         self.page
             .validate_for(self.authorization.sources.target.id)?;
         let current = {
+            #[cfg(test)]
+            if let Some(contended) = &self.final_registry_contended {
+                // Report observed contention in the actual admit path, rather
+                // than mere thread entry. The test still owns this real mutex
+                // until its independent HostState probe completes.
+                if !matches!(
+                    self.authorization.registry.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ) {
+                    return Err("Expected the final registry read to be blocked".into());
+                }
+                contended
+                    .send(())
+                    .map_err(|_| "Final registry contention observer closed")?;
+            }
             let registry = self
                 .authorization
                 .registry
@@ -360,6 +377,8 @@ impl ReadAuthorization {
         Ok(PreparedInspection {
             authorization: self,
             page,
+            #[cfg(test)]
+            final_registry_contended: None,
         })
     }
 }
@@ -1124,30 +1143,56 @@ mod tests {
 
     #[test]
     fn blocked_final_registry_read_does_not_hold_host_state() {
-        let f = policy_fixture(None);
-        let page = staged(&f);
-        let registry = f.registry.lock().unwrap();
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let pending = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            page.check_context()
-        });
-        started_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap();
-        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
-        let host = f.host.clone();
-        let unrelated = std::thread::spawn(move || {
-            let state = host.lock().unwrap();
-            progress_tx.send(state.chats.len()).unwrap();
-        });
-        let progress = progress_rx.recv_timeout(std::time::Duration::from_secs(1));
-        // Always unblock/reap the exact authored threads before asserting.
-        drop(registry);
-        unrelated.join().unwrap();
-        let checked = pending.join().unwrap().unwrap();
-        assert_eq!(progress.unwrap(), 2);
-        checked.enqueue_current(&f.host, |_, _| Ok(())).unwrap();
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for revoke in [false, true] {
+            let f = policy_fixture(None);
+            let mut page = staged(&f);
+            let registry = f.registry.lock().unwrap();
+            let (contended_tx, contended_rx) = std::sync::mpsc::sync_channel(0);
+            page.final_registry_contended = Some(contended_tx);
+            let admitted = Arc::new(AtomicUsize::new(0));
+            let published = admitted.clone();
+            let host = f.host.clone();
+            let pending = std::thread::spawn(move || {
+                page.admit(&host, |_, _| {
+                    published.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            });
+            let contended = contended_rx.recv_timeout(std::time::Duration::from_secs(1));
+            // A delayed observer must not strand its zero-capacity send after
+            // the bounded receive timed out.
+            drop(contended_rx);
+            let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+            let host = f.host.clone();
+            let unrelated = std::thread::spawn(move || {
+                let state = host.lock().unwrap();
+                let _ = progress_tx.send(state.chats.len());
+            });
+            let progress = progress_rx.recv_timeout(std::time::Duration::from_secs(1));
+            let revoked = if revoke {
+                registry.retire_agent_authority(&f.caller)
+            } else {
+                Ok(())
+            };
+            // Always unblock/reap the exact authored threads before asserting,
+            // including timeout, observer or final authorization failures.
+            drop(registry);
+            let progressed = unrelated.join();
+            let result = pending.join();
+            assert!(contended.is_ok());
+            assert_eq!(progress.unwrap(), 2);
+            progressed.unwrap();
+            revoked.unwrap();
+            let result = result.unwrap();
+            if revoke {
+                assert!(result.is_err());
+                assert_eq!(admitted.load(Ordering::SeqCst), 0);
+            } else {
+                result.unwrap();
+                assert_eq!(admitted.load(Ordering::SeqCst), 1);
+            }
+        }
     }
 
     #[test]
