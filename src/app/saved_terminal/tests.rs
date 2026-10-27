@@ -384,3 +384,19 @@ fn a_missing_or_unverified_directory_has_no_enabled_relaunch_callback() {
         assert!(app.saved_terminal_view(card).is_some());
     }
 }
+
+#[test]
+fn remote_user_keeps_its_existing_route_but_scoped_callers_cannot_fall_back_to_user() {
+    let user = crate::agent_execution::Authority::default();
+    let scoped = crate::agent_execution::Authority::session("synthetic-scoped-capability".into());
+    assert!(owns_context(false, &user));
+    assert!(
+        !owns_context(true, &user),
+        "ordinary remote users keep the existing device route"
+    );
+    assert!(owns_context(false, &scoped));
+    assert!(
+        owns_context(true, &scoped),
+        "inherited remote scope must be captured and refused before bridge resolution"
+    );
+}

@@ -72,6 +72,12 @@ impl Action {
     }
 }
 
+/// Preserve the existing remote User route. A scoped caller must instead be
+/// refused by this captured-scope path before any endpoint/bridge resolution.
+fn owns_context(remote: bool, authority: &crate::agent_execution::Authority) -> bool {
+    !remote || authority.token().is_some()
+}
+
 fn candidate(session: &TerminalSession) -> bool {
     matches!(
         session.continuity,
@@ -213,8 +219,9 @@ impl Cagents {
         card: CardId,
         source: &TerminalSession,
     ) -> bool {
+        let authority = crate::agent_execution::Authority::from_environment();
         if !candidate(source)
-            || crate::device::is_remote()
+            || !owns_context(crate::device::is_remote(), &authority)
             || self.shared_views.defaults.contains_key(&card)
             || self.shared_views.attached.contains(&card)
             || self.durable.pending_terminal_creations.contains(&card)
@@ -223,7 +230,6 @@ impl Cagents {
         {
             return false;
         }
-        let authority = crate::agent_execution::Authority::from_environment();
         let socket = if authority.token().is_some() || crate::device::is_remote() {
             Ok(None)
         } else {
