@@ -1459,8 +1459,44 @@ mod tests {
                         Some("Show application notice details" | "Hide application notice details")
                     )
             })
-            .expect("actual enabled Details control");
+            .unwrap_or_else(|| {
+                let actual = nodes
+                    .root()
+                    .iter()
+                    .chain(nodes.children())
+                    .map(|node| {
+                        (
+                            node.node().role(),
+                            node.node().label(),
+                            node.node().value(),
+                            node.node().is_disabled(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                panic!("missing actual Details control; rendered AX nodes: {actual:?}");
+            });
+        assert!(
+            !button.node().is_disabled(),
+            "actual Details control is enabled"
+        );
         let b = button.node().bounds().unwrap();
+        let dismiss = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| {
+                node.node().role() == iced_accessibility::accesskit::Role::Button
+                    && node.node().label() == Some("Dismiss")
+            })
+            .expect("actual adjacent Dismiss control")
+            .node()
+            .bounds()
+            .unwrap();
+        assert_eq!(
+            b.y1 - b.y0,
+            dismiss.y1 - dismiss.y0,
+            "Details preserves the text-builder height of adjacent Dismiss"
+        );
         assert!(
             b.x0 >= 0.0 && b.x1 <= 300.0 && b.x1 > b.x0,
             "narrow button geometry {b:?}"
@@ -2800,17 +2836,40 @@ impl Cagents {
                     "Diagnostic shortened to the first 32 KiB.",
                 ));
             }
-            actions.push(super::notice_surface_action(
-                severity,
-                if expanded { "Hide details" } else { "Details" },
-                if expanded {
+            // COSMIC's text-button builder drops its custom accessible name
+            // when converting to the native Button. Use the native API here so
+            // the action is announced with its notice context, not just "Details".
+            let theme = cosmic::theme::active();
+            let metrics = theme.cosmic();
+            actions.push(
+                widget::button::custom(
+                    widget::row::with_children(vec![
+                        widget::text(if expanded { "Hide details" } else { "Details" })
+                            .size(14)
+                            .line_height(iced::advanced::text::LineHeight::Absolute(20.0.into()))
+                            .font(cosmic::font::Font {
+                                weight: iced::font::Weight::Normal,
+                                ..cosmic::font::default()
+                            })
+                            .into(),
+                    ])
+                    .padding(iced::Padding::from([0, metrics.space_s()]))
+                    .width(Length::Shrink)
+                    .height(Length::Fixed(metrics.space_l().into()))
+                    .spacing(metrics.space_xxxs())
+                    .align_y(Alignment::Center),
+                )
+                .padding(0)
+                .class(super::notice_surface_button(severity))
+                .id(widget::Id::new(notice_details_id(entry.id)))
+                .name(if expanded {
                     "Hide application notice details"
                 } else {
                     "Show application notice details"
-                },
-                widget::Id::new(notice_details_id(entry.id)),
-                Message::ChromeUi(Action::ToggleNoticeDetails(entry.id)),
-            ));
+                })
+                .on_press(Message::ChromeUi(Action::ToggleNoticeDetails(entry.id)))
+                .into(),
+            );
         }
         if entry.repeats > 1 {
             lines.push(super::notice_surface_detail(
