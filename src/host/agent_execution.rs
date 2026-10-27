@@ -19,6 +19,7 @@ use std::{
 
 mod account_info;
 mod directory;
+pub(super) mod inspection;
 pub(super) use directory::{live_sessions, named};
 pub(super) mod mailbox;
 mod ownership;
@@ -843,6 +844,11 @@ pub(super) fn process(
 ) -> Result<crate::agent_execution::Reply, String> {
     use crate::agent_execution::{Operation, Reply, Summary};
     match operation {
+        // The client must retain staged page custody through final queue
+        // admission. An ordinary handler reply cannot carry that proof.
+        Operation::InspectChat { .. } => {
+            Err("Peer inspection requires the checked delivery path".into())
+        }
         Operation::Console { agent, command } => console(host, &authority, agent, command),
         Operation::Submit(request) => submit(host, &authority, request).map(Reply::Accepted),
         Operation::Status(id) => {
