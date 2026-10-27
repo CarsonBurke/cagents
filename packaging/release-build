@@ -134,7 +134,13 @@ export RUST_TEST_THREADS=${CARGO_BUILD_JOBS:-2}
 # Each command resolves its own feature graph; never use --workspace or combine
 # these features. All native artifacts are produced inside this Ubuntu rootfs.
 cargo test --locked --release --no-default-features --all-targets
-cargo test --locked --release --no-default-features --features host --all-targets
+# Retained-actor fixtures require the same-source daemon. Use Cargo's reported
+# executable, including configured target layouts, and fail before HOST tests
+# if its build or artifact validation fails.
+retained_actor_helper=$(python3 scripts/build-ceditor-product cagentsd \
+    --locked --release --no-default-features --features host --bin cagentsd)
+CAGENTS_TEST_RETAINED_ACTOR_HELPER="$retained_actor_helper" \
+    cargo test --locked --release --no-default-features --features host --all-targets
 cargo test --locked --release --no-default-features --features ui --all-targets
 cargo test --locked --release --package ceditor --all-targets
 cargo test --locked --release --features integrated-browser --all-targets
