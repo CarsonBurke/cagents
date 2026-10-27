@@ -755,6 +755,9 @@ pub enum RepositoryAction {
         card: CardId,
         focused: bool,
     },
+    ReplaceInputFocus {
+        card: CardId,
+    },
     FindLoaded {
         card: CardId,
         ticket: uuid::Uuid,
@@ -862,6 +865,7 @@ impl RepositoryAction {
             | Self::FindNext { card }
             | Self::FindPrevious { card }
             | Self::FindInputFocus { card, .. }
+            | Self::ReplaceInputFocus { card }
             | Self::FindLoaded { card, .. }
             | Self::FindReplacementLoaded { card, .. }
             | Self::ReplaceQueryChanged { card, .. }
@@ -1806,6 +1810,15 @@ enum FileListState {
     Failed(String),
 }
 
+/// The last input inside this editor, independent of toolbar-click blur.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum EditorInput {
+    #[default]
+    Source,
+    Find,
+    Replace,
+}
+
 enum DocumentState {
     None,
     Loading {
@@ -2248,6 +2261,8 @@ pub struct RepositoryRuntime {
     find_index: usize,
     find_total: usize,
     find_input_focused: bool,
+    last_editor_input: EditorInput,
+    reload_input: Option<EditorInput>,
     replace_open: bool,
     replace_query: String,
     toolbar_overflow_open: bool,
@@ -2446,6 +2461,8 @@ impl RepositoryRuntime {
             find_index: 0,
             find_total: 0,
             find_input_focused: false,
+            last_editor_input: EditorInput::Source,
+            reload_input: None,
             replace_open: false,
             replace_query: String::new(),
             toolbar_overflow_open: false,
@@ -3783,13 +3800,14 @@ impl RepositoryRuntime {
     /// The control a completed read restores when no other control owns input.
     /// A retained Reload keeps a focused Find field with its predecessor.
     pub fn loaded_focus_target(&self, card: CardId) -> Option<widget::Id> {
-        self.editor_focus_target(card).map(|editor| {
-            if self.find_input_is_focused() {
-                find_focus_id(card)
-            } else {
-                editor
-            }
-        })
+        self.editor_focus_target(card)
+            .map(|editor| match self.last_editor_input {
+                EditorInput::Replace if self.find_open && self.replace_open => {
+                    replace_focus_id(card)
+                }
+                EditorInput::Find | EditorInput::Replace if self.find_open => find_focus_id(card),
+                _ => editor,
+            })
     }
 
     /// Whether the editable buffer is the surface actually on screen.
@@ -3850,6 +3868,7 @@ impl RepositoryRuntime {
         if !self.editable_surface_visible() {
             return Task::none();
         }
+        self.last_editor_input = EditorInput::Find;
         if self.find_open {
             return iced::widget::operation::focus(find_focus_id(card));
         }
@@ -3895,6 +3914,8 @@ impl RepositoryRuntime {
         self.find_index = 0;
         self.find_total = 0;
         self.find_input_focused = false;
+        self.last_editor_input = EditorInput::Source;
+        self.reload_input = None;
         self.find_matches.clear();
         self.find_cache = None;
         self.find_snapshot = None;
@@ -6162,6 +6183,9 @@ impl RepositoryRuntime {
                 if !self.accepts_selected(&identity) {
                     return Task::none();
                 }
+                if let Some(input) = self.reload_input.take() {
+                    self.last_editor_input = input;
+                }
                 self.original_read_attested = false;
                 if self.rejects_reload_replacement(&result) {
                     let detail = match &result {
@@ -6566,6 +6590,12 @@ impl RepositoryRuntime {
                 // that has already been replaced.
                 if !self.editable_surface_visible() {
                     return Task::none();
+                }
+                if !matches!(
+                    action,
+                    text_editor::Action::Scroll { .. } | text_editor::Action::ClearSelection
+                ) {
+                    self.last_editor_input = EditorInput::Source;
                 }
                 if !matches!(action, text_editor::Action::Scroll { .. }) {
                     self.dismiss_editor_results();
@@ -7239,6 +7269,7 @@ impl RepositoryRuntime {
             RepositoryAction::OpenFind { card } => self.open_find(card),
             RepositoryAction::CloseFind { card } => self.close_find(card),
             RepositoryAction::FindQueryChanged { query, .. } => {
+                self.last_editor_input = EditorInput::Find;
                 self.find_query = query;
                 self.find_origin = None;
                 // A new query knows nothing of where the last one had got
@@ -7294,6 +7325,13 @@ impl RepositoryRuntime {
             }
             RepositoryAction::FindInputFocus { focused, .. } => {
                 self.find_input_focused = focused;
+                if focused {
+                    self.last_editor_input = EditorInput::Find;
+                }
+                Task::none()
+            }
+            RepositoryAction::ReplaceInputFocus { .. } => {
+                self.last_editor_input = EditorInput::Replace;
                 Task::none()
             }
             RepositoryAction::FindLoaded { ticket, result, .. } => {
@@ -7301,6 +7339,7 @@ impl RepositoryRuntime {
                 Task::none()
             }
             RepositoryAction::ReplaceQueryChanged { query, .. } => {
+                self.last_editor_input = EditorInput::Replace;
                 self.replace_query = query;
                 Task::none()
             }
@@ -7595,6 +7634,7 @@ impl RepositoryRuntime {
         self.committed_selection = None;
         self.selected = Some(file.clone());
         self.original_read_attested = false;
+        self.reload_input = retain_buffer.then_some(self.last_editor_input);
         let predecessor = match std::mem::replace(&mut self.document, DocumentState::None) {
             DocumentState::Editable(mut document) if retain_buffer => {
                 // Its old-generation callback can never be admitted after
@@ -8994,6 +9034,10 @@ pub fn find_focus_id(card: CardId) -> widget::Id {
     widget::Id::new(format!("repository.{card}.find"))
 }
 
+fn replace_focus_id(card: CardId) -> widget::Id {
+    widget::Id::new(format!("repository.{card}.replace"))
+}
+
 pub fn focus_restore_id(card: CardId) -> widget::Id {
     widget::Id::new(format!("repository.{card}.view"))
 }
@@ -9605,6 +9649,8 @@ fn find_strip<'a>(
             widget::row::with_children(vec![
                 crate::interaction::focused_escape(
                     crate::ui_controls::field::text("Replace with", &runtime.replace_query)
+                        .id(replace_focus_id(card))
+                        .on_focus(RepositoryAction::ReplaceInputFocus { card })
                         .on_input(move |query| RepositoryAction::ReplaceQueryChanged {
                             card,
                             query,
@@ -20920,6 +20966,326 @@ mod tests {
                 }]
             );
             assert!(runtime.take_lsp_edits().is_empty());
+        }
+    }
+
+    #[test]
+    fn retained_reload_restores_input_after_real_toolbar_blur() {
+        use cosmic::iced::advanced::{clipboard, widget::operation};
+        use cosmic::iced::futures::{StreamExt, executor::block_on};
+
+        fn controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
+            let Some(find) = find_strip(card, runtime) else {
+                return editor_surface(card, runtime);
+            };
+            widget::column::with_children(vec![
+                icon_button(Icon::Refresh, "Reload file from disk")
+                    .on_press(RepositoryAction::Reload { card })
+                    .into(),
+                find,
+                editor_surface(card, runtime),
+            ])
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .into()
+        }
+
+        fn apply(
+            card: CardId,
+            runtime: &RepositoryRuntime,
+            tree: &mut Tree,
+            renderer: &cosmic::Renderer,
+            task: Task<RepositoryAction>,
+        ) {
+            let mut element = controls(card, runtime);
+            tree.diff(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                tree,
+                renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(640.0, 480.0)),
+            );
+            block_on(async {
+                if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                    while let Some(action) = stream.next().await {
+                        let iced::runtime::Action::Widget(mut operation) = action else {
+                            panic!("the focus handoff must only operate on widgets");
+                        };
+                        loop {
+                            element.as_widget_mut().operate(
+                                tree,
+                                Layout::new(&node),
+                                renderer,
+                                operation.as_mut(),
+                            );
+                            match operation.finish() {
+                                operation::Outcome::Chain(next) => operation = next,
+                                _ => break,
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        fn event(
+            card: CardId,
+            runtime: &RepositoryRuntime,
+            tree: &mut Tree,
+            renderer: &cosmic::Renderer,
+            event: iced::Event,
+            hit: Option<usize>,
+        ) -> Vec<RepositoryAction> {
+            let mut element = controls(card, runtime);
+            tree.diff(element.as_widget());
+            let bounds = iced::Rectangle::with_size(iced::Size::new(640.0, 480.0));
+            let node = element.as_widget_mut().layout(
+                tree,
+                renderer,
+                &layout::Limits::new(iced::Size::ZERO, bounds.size()),
+            );
+            struct Bounds(widget::Id, Option<iced::Rectangle>);
+            impl Operation for Bounds {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn focusable(
+                    &mut self,
+                    id: Option<&widget::Id>,
+                    bounds: iced::Rectangle,
+                    _: &mut dyn operation::Focusable,
+                ) {
+                    if id.is_some_and(|id| iced::core::id::IdEq::eq(&id.0, &self.0.0)) {
+                        self.1 = Some(bounds);
+                    }
+                }
+            }
+            let replace = if hit == Some(3) {
+                let mut probe = Bounds(replace_focus_id(card), None);
+                element
+                    .as_widget_mut()
+                    .operate(tree, Layout::new(&node), renderer, &mut probe);
+                Some(probe.1.expect("the real replacement input must be mounted"))
+            } else {
+                None
+            };
+            let cursor = hit.map_or(iced::mouse::Cursor::Unavailable, |index| {
+                let child = replace.unwrap_or_else(|| node.children()[index].bounds());
+                iced::mouse::Cursor::Available(iced::Point::new(
+                    child.x + child.width.min(60.0) / 2.0,
+                    child.y + 12.0,
+                ))
+            });
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                tree,
+                &event,
+                Layout::new(&node),
+                cursor,
+                renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+            messages
+        }
+
+        fn key(value: &str) -> iced::Event {
+            iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character(value.into()),
+                modified_key: keyboard::Key::Character(value.into()),
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: Some(value.into()),
+                repeat: false,
+            })
+        }
+
+        let renderer = headless_renderer();
+        for owner in [EditorInput::Find, EditorInput::Source, EditorInput::Replace] {
+            let card = CardId::new();
+            let (directory, mut runtime, _) = reload_read_fixture(card);
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+            }));
+            let focus = runtime.update(RepositoryAction::OpenFind { card });
+            drop(runtime.update(RepositoryAction::FindQueryChanged {
+                card,
+                query: "line".into(),
+            }));
+            if owner == EditorInput::Replace {
+                drop(runtime.update(RepositoryAction::ToggleReplace { card }));
+            }
+            let mut tree = Tree::new(controls(card, &runtime).as_widget());
+            apply(card, &runtime, &mut tree, &renderer, focus);
+            assert!(
+                !runtime.find_input_is_focused(),
+                "programmatic focus has no model callback"
+            );
+            let messages = event(
+                card,
+                &runtime,
+                &mut tree,
+                &renderer,
+                iced::Event::Window(iced::window::Event::RedrawRequested(Instant::now())),
+                None,
+            );
+            for message in messages {
+                drop(runtime.update(message));
+            }
+            drop(runtime.update(RepositoryAction::FindQueryChanged {
+                card,
+                query: "line".into(),
+            }));
+            if owner == EditorInput::Source {
+                for mouse in [
+                    iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left),
+                    iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+                ] {
+                    let messages = event(
+                        card,
+                        &runtime,
+                        &mut tree,
+                        &renderer,
+                        iced::Event::Mouse(mouse),
+                        Some(2),
+                    );
+                    for message in messages {
+                        drop(runtime.update(message));
+                    }
+                }
+            } else if owner == EditorInput::Replace {
+                for mouse in [
+                    iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left),
+                    iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+                ] {
+                    let messages = event(
+                        card,
+                        &runtime,
+                        &mut tree,
+                        &renderer,
+                        iced::Event::Mouse(mouse),
+                        Some(3),
+                    );
+                    for message in messages {
+                        drop(runtime.update(message));
+                    }
+                }
+                let messages = event(card, &runtime, &mut tree, &renderer, key("r"), None);
+                for message in messages {
+                    drop(runtime.update(message));
+                }
+                assert_eq!(runtime.replace_query, "r");
+            }
+            assert_eq!(runtime.last_editor_input, owner);
+            let edited = runtime.editor_text().unwrap();
+            let DocumentState::Editable(document) = &runtime.document else {
+                panic!()
+            };
+            let cursor = document.content.cursor();
+            if owner != EditorInput::Source {
+                assert!(cursor.selection.is_some());
+            }
+            std::fs::remove_file(directory.path().join("notes.txt")).unwrap();
+            let pressed = event(
+                card,
+                &runtime,
+                &mut tree,
+                &renderer,
+                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+                Some(0),
+            );
+            if owner == EditorInput::Find {
+                assert!(
+                    pressed.iter().any(|message| matches!(
+                        message,
+                        RepositoryAction::FindInputFocus { focused: false, .. }
+                    )),
+                    "the real outside press must blur Find before Reload"
+                );
+            }
+            for message in pressed {
+                drop(runtime.update(message));
+            }
+            let released = event(
+                card,
+                &runtime,
+                &mut tree,
+                &renderer,
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )),
+                Some(0),
+            );
+            assert!(
+                released
+                    .iter()
+                    .any(|message| matches!(message, RepositoryAction::Reload { .. }))
+            );
+            for message in released {
+                drop(runtime.update(message));
+            }
+            assert!(runtime.retains_reload_buffer());
+            assert_eq!(runtime.reload_input, Some(owner));
+            // Mount the actual Loading surface, retiring the focused field.
+            apply(card, &runtime, &mut tree, &renderer, Task::none());
+            let identity = runtime.current_identity(card, "notes.txt".into());
+            finish_reload_read(&mut runtime, identity);
+            let target = runtime.loaded_focus_target(card).unwrap();
+            let expected = match owner {
+                EditorInput::Find => find_focus_id(card),
+                EditorInput::Source => editor_focus_id(card),
+                EditorInput::Replace => replace_focus_id(card),
+            };
+            assert_eq!(target, expected);
+            apply(
+                card,
+                &runtime,
+                &mut tree,
+                &renderer,
+                crate::workspace_widget::focus_after_loading(editor_focus_id(card), target),
+            );
+            // Drain passive native callbacks before checking retained selection.
+            let messages = event(
+                card,
+                &runtime,
+                &mut tree,
+                &renderer,
+                iced::Event::Window(iced::window::Event::RedrawRequested(Instant::now())),
+                None,
+            );
+            for message in messages {
+                drop(runtime.update(message));
+            }
+            let DocumentState::Editable(document) = &runtime.document else {
+                panic!()
+            };
+            assert_eq!(
+                document.content.cursor(),
+                cursor,
+                "restoring {owner:?} changed source selection"
+            );
+            let messages = event(card, &runtime, &mut tree, &renderer, key("q"), None);
+            for message in messages {
+                drop(runtime.update(message));
+            }
+            match owner {
+                EditorInput::Find => {
+                    assert_eq!(runtime.find_query, "lineq");
+                    assert_eq!(runtime.editor_text().as_deref(), Some(edited.as_str()));
+                }
+                EditorInput::Replace => {
+                    assert_eq!(runtime.replace_query, "rq");
+                    assert_eq!(runtime.editor_text().as_deref(), Some(edited.as_str()));
+                }
+                EditorInput::Source => {
+                    assert_eq!(runtime.find_query, "line");
+                    assert_ne!(runtime.editor_text().as_deref(), Some(edited.as_str()));
+                }
+            }
         }
     }
 
