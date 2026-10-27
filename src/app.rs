@@ -3018,13 +3018,14 @@ pub enum SettingsField {
     ShortcutFocusPane7,
     ShortcutFocusPane8,
     ShortcutFocusPane9,
+    ShortcutFocusLastPane,
     ShortcutToggleProjects,
     ShortcutRenamePane,
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 38] = [
+    const SHORTCUTS: [Self; 39] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -3061,6 +3062,7 @@ impl SettingsField {
         Self::ShortcutFocusPane7,
         Self::ShortcutFocusPane8,
         Self::ShortcutFocusPane9,
+        Self::ShortcutFocusLastPane,
         Self::ShortcutToggleProjects,
         Self::ShortcutRenamePane,
     ];
@@ -3129,6 +3131,7 @@ impl SettingsField {
             Self::ShortcutFocusPane7 => "Focus pane 7",
             Self::ShortcutFocusPane8 => "Focus pane 8",
             Self::ShortcutFocusPane9 => "Focus pane 9",
+            Self::ShortcutFocusLastPane => "Focus last pane",
             Self::ChatExpandToolGroups => "Expand tool groups by default",
             Self::ChatContentFraction => "Chat content width",
             Self::DefaultNativePaneFraction => "Native pane minimum width",
@@ -3234,6 +3237,7 @@ impl SettingsField {
             | Self::ShortcutFocusPane7
             | Self::ShortcutFocusPane8
             | Self::ShortcutFocusPane9
+            | Self::ShortcutFocusLastPane
             | Self::ShortcutNewChannel
             | Self::ShortcutClonePane
             | Self::ShortcutCloseFocusedColumn
@@ -3292,6 +3296,7 @@ struct ShortcutDraft {
     focus_pane_7: String,
     focus_pane_8: String,
     focus_pane_9: String,
+    focus_last_pane: String,
     new_terminal: String,
     new_channel: String,
     clone_pane: String,
@@ -3335,6 +3340,7 @@ impl ShortcutDraft {
             focus_pane_7: settings::format_chords(&shortcuts.focus_pane_7),
             focus_pane_8: settings::format_chords(&shortcuts.focus_pane_8),
             focus_pane_9: settings::format_chords(&shortcuts.focus_pane_9),
+            focus_last_pane: settings::format_chords(&shortcuts.focus_last_pane),
             new_terminal: settings::format_chords(&shortcuts.new_terminal),
             new_channel: settings::format_chords(&shortcuts.new_channel),
             clone_pane: settings::format_chords(&shortcuts.clone_pane),
@@ -3587,6 +3593,7 @@ impl SettingsDraft {
             SettingsField::ShortcutFocusPane7 => self.keyboard_shortcuts.focus_pane_7 = value,
             SettingsField::ShortcutFocusPane8 => self.keyboard_shortcuts.focus_pane_8 = value,
             SettingsField::ShortcutFocusPane9 => self.keyboard_shortcuts.focus_pane_9 = value,
+            SettingsField::ShortcutFocusLastPane => self.keyboard_shortcuts.focus_last_pane = value,
             SettingsField::ShortcutNewChannel => self.keyboard_shortcuts.new_channel = value,
             SettingsField::ShortcutClonePane => self.keyboard_shortcuts.clone_pane = value,
             SettingsField::ShortcutCloseFocusedColumn => {
@@ -3753,6 +3760,10 @@ fn settings_update(
         }
         SettingsField::ShortcutFocusPane9 => {
             next.keyboard_shortcuts.focus_pane_9 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusLastPane => {
+            next.keyboard_shortcuts.focus_last_pane = settings::parse_chords(value);
             Ok(())
         }
         SettingsField::Notifications(field) => value

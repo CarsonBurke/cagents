@@ -206,6 +206,124 @@ mod tests {
         }
     }
 
+    #[test]
+    fn overflow_keeps_new_pane_and_named_pane_counter_outside_the_scrolling_strip() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation},
+        };
+        use iced::{Rectangle, Size, Vector};
+        #[derive(Default)]
+        struct Bounds {
+            controls: HashMap<String, Rectangle>,
+            strip: Option<(Rectangle, Vector)>,
+        }
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn operation::Focusable,
+            ) {
+                if let Some(id) = id {
+                    self.controls.insert(id.to_string(), bounds);
+                }
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: Rectangle,
+                offset: Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                if id == Some(&widget::Id::new("workspace.tabs")) {
+                    self.strip = Some((bounds, offset));
+                }
+            }
+        }
+        let _typography = design::typography_test_guard();
+        let renderer = super::super::tests::headless_renderer();
+        for size in [13.0, 24.0] {
+            for width in [640.0, 900.0, 1600.0] {
+                let mut app = tab_fixture(30, width);
+                app.settings.interface_font_size = size;
+                drop(app.sync_chrome());
+                let mut header =
+                    app.workspace_chrome(widget::Space::new().height(Length::Fill).into());
+                let mut tree = Tree::new(header.as_widget());
+                let extent = Size::new(width, 600.0);
+                let node = header.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(extent, extent),
+                );
+                let mut before = Bounds::default();
+                header.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut before,
+                );
+                let strip = before.strip.expect("actual horizontal tab viewport").0;
+                for id in [TOOLBAR_FOCUS_ID, "workspace.pane-list"] {
+                    let control = before.controls[id];
+                    assert!(
+                        control.x >= strip.x + strip.width - 0.1,
+                        "{id} is pinned outside {strip:?}"
+                    );
+                    assert!(
+                        control.x >= -0.1 && control.x + control.width <= width + 0.1,
+                        "{id} clipped at width{width}/size{size}: {control:?}"
+                    );
+                }
+                header.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut operation::scrollable::snap_to::<()>(
+                        widget::Id::new("workspace.tabs"),
+                        operation::scrollable::RelativeOffset {
+                            x: Some(1.0),
+                            y: None,
+                        },
+                    ),
+                );
+                let mut after = Bounds::default();
+                header.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut after,
+                );
+                assert!(
+                    after.strip.unwrap().1.x.abs() > 1.0,
+                    "exercise actual overflowing scroll state"
+                );
+                for id in [TOOLBAR_FOCUS_ID, "workspace.pane-list"] {
+                    assert_eq!(
+                        after.controls[id], before.controls[id],
+                        "scroll moved pinned {id}"
+                    );
+                }
+                let ax = header.as_widget().a11y_nodes(
+                    Layout::new(&node),
+                    &tree,
+                    iced::mouse::Cursor::Unavailable,
+                );
+                assert!(ax.root().iter().chain(ax.children()).any(|node| {
+                    node.node().label() == Some("Show open panes · 1 of 30")
+                        && node
+                            .node()
+                            .supports_action(iced_accessibility::accesskit::Action::Click)
+                }));
+            }
+        }
+    }
+
     fn tab_fixture(count: usize, width: f32) -> Cagents {
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.context_inspector_open = false;
@@ -2802,9 +2920,39 @@ impl Cagents {
         .into()
     }
 
+    fn pane_counter_width(&self) -> f32 {
+        let total = self.workspace.cards().len();
+        let current = self
+            .workspace
+            .focused()
+            .and_then(|id| self.workspace.order().position(|candidate| candidate == id))
+            .map_or(0, |index| index + 1);
+        thread_local! {
+            // One bounded UI-thread cache: ordinary redraws never reshape the
+            // counter while unrelated agents update or a spinner animates.
+            static WIDTH: std::cell::Cell<Option<(u64, usize, usize, f32)>> = const { std::cell::Cell::new(None) };
+        }
+        WIDTH.with(|cache| {
+            let revision = design::typography_revision();
+            if let Some((old_revision, old_current, old_total, width)) = cache.get()
+                && (old_revision, old_current, old_total) == (revision, current, total)
+            {
+                return width;
+            }
+            // The count is an actual caption at the active interface scale.
+            let width = (measure_tab_title(&format!("{current} / {total}"))
+                * (design::TEXT_CAPTION / design::TEXT_BODY)
+                + 16.0)
+                .max(design::PANE_NAVIGATOR_MIN_WIDTH);
+            cache.set(Some((revision, current, total, width)));
+            width
+        })
+    }
+
     fn workspace_header_width(&self) -> f32 {
         let navigator = if should_show_card_navigator(self.workspace.cards().len()) {
             design::PANE_NAVIGATOR_RESERVED_WIDTH
+                + (self.pane_counter_width() - design::PANE_NAVIGATOR_MIN_WIDTH)
         } else {
             0.0
         };
@@ -2904,12 +3052,10 @@ impl Cagents {
         if available <= 0.0 {
             return Task::none();
         }
-        // The trailing "new tab" control shares the scrollable row, so a tab
-        // revealed flush against the viewport edge would sit underneath it.
+        // New-pane and pane-list controls stay outside the scrolling strip.
         let pitch = width + crate::tab_strip::SPACING;
-        let content = self.workspace.order().count() as f32 * pitch
-            + design::PRIMARY_CONTROL_SIZE
-            + 2.0 * crate::tab_strip::EDGE_INSET;
+        let content =
+            self.workspace.order().count() as f32 * pitch + 2.0 * crate::tab_strip::EDGE_INSET;
         let max_offset = (content - available).max(0.0);
         if max_offset <= 0.0 {
             // Everything fits; any offset at all would be wrong.
@@ -2955,7 +3101,6 @@ impl Cagents {
                 .workspace
                 .order()
                 .map(|id| self.column_header(id, self.workspace.focused() == Some(id), tab_width))
-                .chain(std::iter::once(self.new_tab_control()))
                 .collect();
             let generation = self.workspace_view_generation;
             let tabs = crate::tab_strip::reorderable(
@@ -2980,6 +3125,13 @@ impl Cagents {
             let actions = widget::row::with_children(self.workflow_header())
                 .spacing(space::XXS)
                 .align_y(Alignment::Center);
+            let tabs = widget::row::with_children(vec![
+                widget::container(tabs).width(Length::Fill).into(),
+                self.new_tab_control(),
+            ])
+            .spacing(space::XXS)
+            .align_y(Alignment::Center)
+            .width(Length::Fill);
             self.native_header(
                 tabs.into(),
                 Some(actions.into()),
@@ -3098,12 +3250,16 @@ impl Cagents {
                 )),
             ));
             actions.push(
-                iced::widget::container(crate::design::caption(format!("{current} / {total}")))
-                    .center_y(ICON_CONTROL_SIZE)
-                    .align_x(Alignment::Center)
-                    .width(
-                        (format!("{current} / {total}").len() as f32 * 7.0 + 16.0)
-                            .max(design::PANE_NAVIGATOR_MIN_WIDTH),
+                widget::button::custom(crate::design::caption(format!("{current} / {total}")))
+                    .name(format!("Show open panes · {current} of {total}"))
+                    .id(widget::Id::new("workspace.pane-list"))
+                    .class(cosmic::theme::Button::Text)
+                    .padding([0, 8])
+                    .height(ICON_CONTROL_SIZE)
+                    .width(self.pane_counter_width())
+                    .on_press_maybe(
+                        (!self.workspace_inputs_blocked())
+                            .then_some(Message::Palette(palette_ui::Action::OpenPanes)),
                     )
                     .into(),
             );

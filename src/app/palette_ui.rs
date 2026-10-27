@@ -9,16 +9,35 @@ pub(super) struct State {
     query: Option<String>,
     selected: Option<EntryIdentity>,
     move_pane: Option<CardId>,
+    pane_list: Option<PaneListScope>,
+    pane_list_presentation: u64,
 }
 impl State {
     pub(super) fn is_open(&self) -> bool {
         self.query.is_some() || self.recording.is_some()
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaneListScope {
+    workspace: u64,
+    presentation: u64,
+}
+
+/// A row belongs to one visible list and one current workspace projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneListTarget {
+    scope: PaneListScope,
+    card: CardId,
+    generation: u64,
+}
+
 #[derive(Debug, Clone)]
 pub enum Action {
     Record(SettingsField),
     Open,
+    OpenPanes,
+    FocusListedPane(PaneListTarget),
+    CloseListedPane(PaneListTarget),
     MovePane(CardId),
     Close,
     Query(String),
@@ -35,6 +54,7 @@ pub struct MessageBox(pub Box<Message>);
 enum EntryIdentity {
     Command(Command),
     Pane(CardId),
+    ListedPane(PaneListTarget),
     Worktree(ProjectId, crate::model::WorktreeId, PathBuf),
     Channel(crate::model::ChannelId),
     Repository(ProjectId, PathBuf),
@@ -53,6 +73,7 @@ impl EntryIdentity {
         Some(match message {
             Message::RunCommand(command) => Self::Command(*command),
             Message::Palette(Action::FocusPane(card)) => Self::Pane(*card),
+            Message::Palette(Action::FocusListedPane(target)) => Self::ListedPane(*target),
             Message::Sidebar(SidebarAction::OpenWorktree {
                 project_id,
                 worktree_id,
@@ -79,6 +100,9 @@ impl EntryIdentity {
     fn matches(&self, message: &Message) -> bool {
         match (self, message) {
             (Self::Command(expected), Message::RunCommand(actual)) => expected == actual,
+            (Self::ListedPane(expected), Message::Palette(Action::FocusListedPane(actual))) => {
+                expected == actual
+            }
             (Self::Pane(expected), Message::Palette(Action::FocusPane(actual))) => {
                 expected == actual
             }
@@ -232,7 +256,10 @@ fn highlighted_label(label: &str, query: &str, moving: bool) -> Element<'static,
     }
     widget::container(
         iced::widget::rich_text(spans)
-            .size(design::TEXT_BODY)
+            .size(design::interface_size())
+            .line_height(iced::widget::text::LineHeight::Absolute(
+                (design::interface_size() + 5.0).into(),
+            ))
             .font(font)
             .wrapping(iced::widget::text::Wrapping::None)
             .ellipsize(iced::widget::text::Ellipsize::End(
@@ -282,10 +309,40 @@ impl Cagents {
                 self.chrome_ui.close();
                 self.palette.query = Some(String::new());
                 self.palette.move_pane = None;
+                self.palette.pane_list = None;
                 self.capture_first_palette_entry();
                 iced::widget::operation::focus(widget::Id::new("palette.query"))
                     .map(cosmic::Action::App)
                     .chain(self.reveal_palette_selection())
+            }
+            Action::OpenPanes => {
+                if self.workspace_inputs_blocked() {
+                    return Task::none();
+                }
+                self.chrome_ui.close();
+                self.palette.query = Some(String::new());
+                self.palette.move_pane = None;
+                self.palette.pane_list_presentation =
+                    self.palette.pane_list_presentation.wrapping_add(1);
+                self.palette.pane_list = Some(PaneListScope {
+                    workspace: self.workspace_view_generation,
+                    presentation: self.palette.pane_list_presentation,
+                });
+                self.capture_first_palette_entry();
+                iced::widget::operation::focus(widget::Id::new("palette.query"))
+                    .map(cosmic::Action::App)
+                    .chain(self.reveal_palette_selection())
+            }
+            Action::FocusListedPane(target) => {
+                self.run_palette_command(Message::Palette(Action::FocusListedPane(target)))
+            }
+            Action::CloseListedPane(target) => {
+                if !self.pane_list_target_is_current(target) {
+                    return Task::none();
+                }
+                // Keep the ordinary close/dirty-editor/terminal confirmation
+                // path authoritative. Its dialog replaces the list.
+                self.run_palette_command(Message::CloseCard(target.card))
             }
             Action::MovePane(card) => {
                 if self.workspace_inputs_blocked() || !self.pane_has_move_destination(card) {
@@ -300,6 +357,7 @@ impl Cagents {
                 self.palette.recording = None;
                 self.palette.query = None;
                 self.palette.move_pane = None;
+                self.palette.pane_list = None;
                 self.palette.selected = None;
                 self.workspace.focused().map_or_else(Task::none, |card| {
                     iced::widget::operation::focus(self.card_keyboard_focus(card))
@@ -382,7 +440,31 @@ impl Cagents {
         }
     }
 
+    fn pane_list_target_is_current(&self, target: PaneListTarget) -> bool {
+        !self.update_prepared
+            && self.exit.is_none()
+            && !self.modal_is_open()
+            && self.workspace_surfaces_visible()
+            && self.palette.query.is_some()
+            && self.palette.pane_list == Some(target.scope)
+            && self.workspace_view_generation == target.scope.workspace
+            && self.workspace.order().any(|card| card == target.card)
+            && self.card_state(target.card).is_some_and(|card| {
+                card.existence.is_open() && card.generation == target.generation
+            })
+    }
+
     fn run_palette_command(&mut self, message: Message) -> Task<Message> {
+        let message = match message {
+            Message::Palette(Action::FocusListedPane(target)) => {
+                if !self.pane_list_target_is_current(target) || self.focused_repository_is_saving()
+                {
+                    return Task::none();
+                }
+                Message::FocusCard(target.card)
+            }
+            message => message,
+        };
         if let Some(key) = entry_key(&message) {
             self.settings
                 .palette_recents
@@ -392,6 +474,7 @@ impl Cagents {
         }
         self.palette.query = None;
         self.palette.move_pane = None;
+        self.palette.pane_list = None;
         self.palette.selected = None;
         let command = self.update(message);
         let save = if self.settings_path.is_some() {
@@ -688,7 +771,69 @@ impl Cagents {
         }
     }
 
+    fn listed_pane_status(&self, card: CardId) -> String {
+        let attention = self.sidebar_state.card_attention(card);
+        let mut parts = Vec::new();
+        if attention.waiting != 0 {
+            parts.push("Waiting for input");
+        } else if attention.working != 0 {
+            parts.push("Working");
+        } else {
+            match self.cards.get(&card) {
+                Some(CardRuntime::Loading) => parts.push("Starting"),
+                Some(CardRuntime::Failed(_)) => parts.push("Unavailable"),
+                _ => {}
+            }
+        }
+        if attention.failed != 0 {
+            parts.push("Unread failed update");
+        } else if attention.unread != 0 {
+            parts.push("Unread");
+        }
+        if parts.is_empty() {
+            parts.push("Idle");
+        }
+        parts.join(" · ")
+    }
+
+    fn workspace_pane_list_entries(&self, scope: PaneListScope) -> Vec<(String, String, Message)> {
+        if scope.workspace != self.workspace_view_generation || !self.workspace_surfaces_visible() {
+            return Vec::new();
+        }
+        let query = self.palette.query.as_deref().unwrap_or("").trim();
+        let mut entries: Vec<_> = self
+            .workspace
+            .order()
+            .filter_map(|id| {
+                let card = self
+                    .card_state(id)
+                    .filter(|card| card.existence.is_open())?;
+                let label = self.card_chrome.get(&id).map_or_else(
+                    || self.card_display_title(card).to_owned(),
+                    |chrome| chrome.title.clone(),
+                );
+                match_score(&label, query)?;
+                Some((
+                    label,
+                    self.listed_pane_status(id),
+                    Message::Palette(Action::FocusListedPane(PaneListTarget {
+                        scope,
+                        card: id,
+                        generation: card.generation,
+                    })),
+                ))
+            })
+            .collect();
+        // Equal matches keep strip order; global palette recents/ranking stay
+        // separate. Prefix characters are ordinary text in this scoped list.
+        entries.sort_by_cached_key(|(label, _, _)| match_score(label, query).unwrap_or(usize::MAX));
+        entries
+    }
+
     fn palette_entries(&self) -> Vec<(String, String, Message)> {
+        if let Some(scope) = self.palette.pane_list {
+            return self.workspace_pane_list_entries(scope);
+        }
         if let Some(card) = self.palette.move_pane {
             return self.filter_palette_entries(self.pane_move_palette_entries(card));
         }
@@ -843,7 +988,9 @@ impl Cagents {
         }
         let query = self.palette.query.as_ref()?;
         let input = crate::ui_controls::field::search(
-            if self.palette.move_pane.is_some() {
+            if self.palette.pane_list.is_some() {
+                "Search panes in this workspace"
+            } else if self.palette.move_pane.is_some() {
                 "Move pane to channel…"
             } else {
                 "Search commands, @ panes, # workspaces, > commands"
@@ -859,34 +1006,85 @@ impl Cagents {
             .enumerate()
             .filter_map(|(index, (label, chord, message))| {
                 let identity = EntryIdentity::capture(&message)?;
-                let (_, needle) = palette_mode_query(query, self.palette.move_pane.is_some());
-                let row = widget::row::with_children(vec![
-                    highlighted_label(&label, needle, self.palette.move_pane.is_some()),
-                    design::caption(chord)
+                let (_, needle) = palette_mode_query(
+                    query,
+                    self.palette.move_pane.is_some() || self.palette.pane_list.is_some(),
+                );
+                let listed = match &message {
+                    Message::Palette(Action::FocusListedPane(target)) => Some(*target),
+                    _ => None,
+                };
+                let mut children = Vec::new();
+                if let Some(target) = listed {
+                    children.push(
+                        self.card_icon(target.card)
+                            .icon()
+                            .size(design::ROW_ICON_SIZE)
+                            .into(),
+                    );
+                    if let Some(indicator) = sidebar::attention_indicator(
+                        self.sidebar_state.card_attention(target.card),
+                        false,
+                    ) {
+                        children.push(indicator);
+                    }
+                }
+                children.push(highlighted_label(
+                    &label,
+                    needle,
+                    self.palette.move_pane.is_some(),
+                ));
+                children.push(
+                    design::caption(chord.clone())
                         .wrapping(iced::widget::text::Wrapping::None)
                         .into(),
-                ])
-                .spacing(space::M)
-                .align_y(Alignment::Center);
-                let button = widget::button::custom(
+                );
+                let close_name = format!("Close pane: {label}");
+                let name = if listed.is_some() {
+                    format!("{label} · {chord}")
+                } else {
+                    label
+                };
+                let row = widget::row::with_children(children)
+                    .spacing(space::M)
+                    .align_y(Alignment::Center);
+                let button: Element<'_, Message> = widget::button::custom(
                     widget::container(row)
                         .height(Length::Fill)
                         .align_y(Alignment::Center),
                 )
                 .id(identity.widget_id())
-                .name(label)
+                .name(name)
                 .class(palette_row_style(selected == Some(index)))
                 .padding([0, 12])
                 .width(Length::Fill)
                 .height(ROW_HEIGHT)
                 .on_press(Message::Palette(Action::Run(MessageBox(Box::new(message)))))
                 .into();
-                Some(row::owned(identity, button))
+                let content = if let Some(target) = listed {
+                    widget::row::with_children(vec![
+                        button,
+                        super::chrome_ui::command(
+                            Icon::Close,
+                            close_name,
+                            widget::Id::new(format!("pane-list.close.{target:?}")),
+                            Some(Message::Palette(Action::CloseListedPane(target))),
+                        ),
+                    ])
+                    .spacing(space::XXS)
+                    .align_y(Alignment::Center)
+                    .into()
+                } else {
+                    button
+                };
+                Some(row::owned(identity, content))
             })
             .collect();
         let rows = if rows.is_empty() {
             widget::column::with_children(vec![
-                design::caption(if self.palette.move_pane.is_some() {
+                design::caption(if self.palette.pane_list.is_some() {
+                    "No matching panes"
+                } else if self.palette.move_pane.is_some() {
                     "No matching channels"
                 } else {
                     "No matching commands"
@@ -909,7 +1107,12 @@ impl Cagents {
                     )
                     .max_height(360)
                     .into(),
-                    design::caption("↑ ↓ choose · Enter run · Escape close").into(),
+                    design::caption(if self.palette.pane_list.is_some() {
+                        "↑ ↓ choose · Enter focus · Escape close"
+                    } else {
+                        "↑ ↓ choose · Enter run · Escape close"
+                    })
+                    .into(),
                 ])
                 .spacing(space::S),
             )
@@ -1039,6 +1242,10 @@ impl Cagents {
                     self.duplicate_pane_in_scope(card, owner)
                 }
             }
+            Command::FocusLastPane => {
+                let card = self.workspace.order().last();
+                card.map_or_else(Task::none, |id| self.update(Message::FocusCard(id)))
+            }
             Command::FocusPane1
             | Command::FocusPane2
             | Command::FocusPane3
@@ -1142,6 +1349,7 @@ impl SettingsField {
             Self::ShortcutFocusPane7 => Some(Command::FocusPane7),
             Self::ShortcutFocusPane8 => Some(Command::FocusPane8),
             Self::ShortcutFocusPane9 => Some(Command::FocusPane9),
+            Self::ShortcutFocusLastPane => Some(Command::FocusLastPane),
             _ => None,
         }
     }
@@ -1214,6 +1422,7 @@ impl ShortcutDraft {
             (Command::FocusPane7, self.focus_pane_7.as_str()),
             (Command::FocusPane8, self.focus_pane_8.as_str()),
             (Command::FocusPane9, self.focus_pane_9.as_str()),
+            (Command::FocusLastPane, self.focus_last_pane.as_str()),
         ]
     }
 }
@@ -2693,5 +2902,349 @@ mod tests {
         let entries = app.palette_entries();
         assert!(EntryIdentity::Workboard.matches(&entries[0].2));
         assert_eq!(app.palette.selected, Some(EntryIdentity::Workboard));
+    }
+    fn pane_list_fixture(count: usize) -> Cagents {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        let cards: Vec<_> = (1..=count)
+            .map(|_| super::super::tests::terminal_card_state())
+            .collect();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.focused = cards.first().map(|card| card.id);
+        durable.cards = cards;
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(900.0);
+        let order: Vec<_> = app.workspace.order().collect();
+        for (index, card) in order.into_iter().enumerate() {
+            app.chrome_ui
+                .user_titles
+                .insert(card, format!("Pane {}", index + 1));
+            app.cards.insert(card, CardRuntime::Loading);
+        }
+        drop(app.sync_chrome());
+        app
+    }
+
+    fn first_list_target(app: &Cagents) -> PaneListTarget {
+        let Message::Palette(Action::FocusListedPane(target)) = app.palette_entries()[0].2 else {
+            panic!("actual list entry uses its captured presentation and workspace");
+        };
+        target
+    }
+
+    #[test]
+    fn pane_list_is_workspace_only_and_global_palette_remains_all_workspace() {
+        let mut app = pane_list_fixture(20);
+        let mut outside = super::super::tests::terminal_card_state();
+        outside.title = "Outside-only target".into();
+        let outside_id = outside.id;
+        Arc::make_mut(&mut app.durable).cards.push(outside);
+        app.sidebar_state
+            .observe_card_update(app.workspace.order().nth(13).unwrap());
+        drop(app.update_palette(Action::OpenPanes));
+        let order: Vec<_> = app.workspace.order().collect();
+        assert_eq!(app.palette_entries().len(), 20);
+        assert!(
+            app.palette_entries()
+                .iter()
+                .all(|(_, _, message)| matches!(message,
+            Message::Palette(Action::FocusListedPane(target)) if order.contains(&target.card)))
+        );
+        let selected = order[13];
+        let attention = app.sidebar_state.card_attention(selected);
+        drop(app.update_palette(Action::Query("Pane 14".into())));
+        assert_eq!(first_list_target(&app).card, selected);
+        assert_eq!(
+            app.sidebar_state.card_attention(selected),
+            attention,
+            "searching never marks a pane read"
+        );
+        for query in ["@outside", "#outside", ">outside"] {
+            drop(app.update_palette(Action::Query(query.into())));
+            assert!(
+                app.palette_entries().is_empty(),
+                "prefix cannot escape workspace-only scope"
+            );
+        }
+        drop(app.update_palette(Action::Query("Pane 14".into())));
+        drop(app.update_palette(Action::Submit));
+        assert_eq!(
+            app.workspace.focused(),
+            Some(selected),
+            "activate the actual fourteenth strip pane"
+        );
+        assert!(!app.palette.is_open());
+        drop(app.update_palette(Action::Open));
+        drop(app.update_palette(Action::Query("@outside".into())));
+        assert!(
+            app.palette_entries()
+                .iter()
+                .any(|(_, _, message)| matches!(message,
+            Message::Palette(Action::FocusPane(card)) if *card == outside_id))
+        );
+        assert!(app.palette.pane_list.is_none());
+    }
+
+    #[test]
+    fn pane_list_keeps_live_activity_and_unread_failed_news_separate() {
+        let mut app = pane_list_fixture(2);
+        let card = app.workspace.order().nth(1).unwrap();
+        app.sidebar_state.observe_card_update(card);
+        app.sidebar_state
+            .set_failed_updates([card].into_iter().collect());
+        app.sidebar_state.set_card_activity(
+            card,
+            crate::agent::Activity {
+                provider: crate::agent::Provider::Claude,
+                state: crate::agent::ActivityState::Working,
+            },
+        );
+        let before = app.sidebar_state.card_attention(card);
+        drop(app.update_palette(Action::OpenPanes));
+        drop(app.update_palette(Action::Query("Pane 2".into())));
+        assert_eq!(app.palette_entries()[0].1, "Working · Unread failed update");
+        assert_eq!(app.sidebar_state.card_attention(card), before);
+        app.sidebar_state.set_card_activity(
+            card,
+            crate::agent::Activity {
+                provider: crate::agent::Provider::Claude,
+                state: crate::agent::ActivityState::Waiting,
+            },
+        );
+        assert_eq!(
+            app.palette_entries()[0].1,
+            "Waiting for input · Unread failed update"
+        );
+    }
+
+    #[test]
+    fn pane_list_delayed_actions_refuse_new_presentations_and_workspace_views() {
+        let mut app = pane_list_fixture(3);
+        drop(app.update_palette(Action::OpenPanes));
+        let stale = first_list_target(&app);
+        drop(app.update_palette(Action::Close));
+        drop(app.update_palette(Action::OpenPanes));
+        let current = first_list_target(&app);
+        assert_ne!(current.scope, stale.scope);
+        let before = app.workspace.focused();
+        for action in [
+            Action::FocusListedPane(stale),
+            Action::CloseListedPane(stale),
+        ] {
+            drop(app.update_palette(action));
+            assert_eq!(app.workspace.focused(), before);
+            assert!(app.card_state(stale.card).unwrap().existence.is_open());
+            assert!(app.palette.is_open());
+        }
+        app.device_ui.open = true;
+        for action in [
+            Action::FocusListedPane(current),
+            Action::CloseListedPane(current),
+        ] {
+            drop(app.update_palette(action));
+            assert_eq!(app.workspace.focused(), before);
+            assert!(app.card_state(current.card).unwrap().existence.is_open());
+            assert!(app.palette.is_open());
+        }
+        app.device_ui.open = false;
+        app.card_state_mut(current.card).unwrap().generation += 1;
+        for action in [
+            Action::FocusListedPane(current),
+            Action::CloseListedPane(current),
+        ] {
+            drop(app.update_palette(action));
+            assert_eq!(app.workspace.focused(), before);
+            assert!(app.card_state(current.card).unwrap().existence.is_open());
+        }
+        let current = first_list_target(&app);
+        assert!(app.pane_list_target_is_current(current));
+        app.workspace_view_generation = app.workspace_view_generation.wrapping_add(1);
+        for action in [
+            Action::FocusListedPane(current),
+            Action::CloseListedPane(current),
+        ] {
+            drop(app.update_palette(action));
+            assert_eq!(app.workspace.focused(), before);
+            assert!(app.card_state(current.card).unwrap().existence.is_open());
+        }
+    }
+
+    #[test]
+    fn pane_list_native_press_does_not_transfer_across_presentations() {
+        use iced::advanced::widget::Tree;
+        use iced::mouse::{Button, Event};
+        let mut app = pane_list_fixture(3);
+        drop(app.update_palette(Action::OpenPanes));
+        let old = first_list_target(&app);
+        let renderer = super::super::tests::headless_renderer();
+        let mut tree = Tree::new(app.palette_surface().unwrap().as_widget());
+        let (point, messages) = palette_pointer_step(
+            &app,
+            &mut tree,
+            &renderer,
+            &EntryIdentity::ListedPane(old),
+            Event::ButtonPressed(Button::Left),
+            None,
+        );
+        assert!(messages.is_empty());
+        drop(app.update_palette(Action::Close));
+        drop(app.update_palette(Action::OpenPanes));
+        let current = first_list_target(&app);
+        let (_, messages) = palette_pointer_step(
+            &app,
+            &mut tree,
+            &renderer,
+            &EntryIdentity::ListedPane(current),
+            Event::ButtonReleased(Button::Left),
+            Some(point),
+        );
+        assert!(
+            messages.is_empty(),
+            "old native press cannot activate the reopened list"
+        );
+        let (_, _) = palette_pointer_step(
+            &app,
+            &mut tree,
+            &renderer,
+            &EntryIdentity::ListedPane(current),
+            Event::ButtonPressed(Button::Left),
+            None,
+        );
+        let (_, messages) = palette_pointer_step(
+            &app,
+            &mut tree,
+            &renderer,
+            &EntryIdentity::ListedPane(current),
+            Event::ButtonReleased(Button::Left),
+            None,
+        );
+        assert_eq!(messages.len(), 1);
+        assert!(
+            matches!(&messages[0], Message::Palette(Action::Run(MessageBox(message)))
+            if matches!(message.as_ref(), Message::Palette(Action::FocusListedPane(target)) if *target == current))
+        );
+    }
+
+    #[test]
+    fn pane_list_native_close_is_named_and_uses_normal_terminal_confirmation() {
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+        use iced::{Event, Rectangle, Size, mouse};
+        use iced_accessibility::accesskit::{
+            Action as AxAction, ActionRequest, NodeId, Role, TreeId,
+        };
+        let mut app = pane_list_fixture(2);
+        let card = app.workspace.order().nth(1).unwrap();
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        session.continuity = crate::model::TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("pane-list-host"),
+            boot_id: crate::model::BootId::new("pane-list-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("pane-list-incarnation"),
+        };
+        app.settings.confirm_terminal_close = true;
+        drop(app.update_palette(Action::OpenPanes));
+        let renderer = super::super::tests::headless_renderer();
+        let mut element = app.palette_surface().unwrap();
+        let mut tree = Tree::new(element.as_widget());
+        let viewport = Rectangle::with_size(Size::new(900.0, 650.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let ax =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let named = |name| {
+            ax.root()
+                .iter()
+                .chain(ax.children())
+                .find(|node| node.node().label() == Some(name))
+                .unwrap()
+        };
+        let close = named("Close pane: Pane 2");
+        assert_eq!(close.node().role(), Role::Button);
+        assert!(close.node().supports_action(AxAction::Click));
+        let focus = named("Pane 2 · Starting");
+        assert_ne!(
+            close.id(),
+            focus.id(),
+            "focus and close are distinct actual nodes"
+        );
+        let target = NodeId::from(close.id().clone());
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::A11y(
+                widget::Id::from(target.0),
+                ActionRequest {
+                    action: AxAction::Click,
+                    target_tree: TreeId::ROOT,
+                    target_node: target,
+                    data: None,
+                },
+            ),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &viewport,
+        );
+        drop(element);
+        assert_eq!(messages.len(), 1);
+        assert!(
+            matches!(messages[0], Message::Palette(Action::CloseListedPane(target)) if target.card == card)
+        );
+        drop(app.update(messages.pop().unwrap()));
+        assert!(!app.palette.is_open());
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        let intent = app
+            .terminal_close
+            .as_ref()
+            .expect("normal close owns the terminal")
+            .clone();
+        assert_eq!(intent.card, card);
+        // The private fixture supplies the daemon's ordinary Active receipt.
+        // No task is polled and no daemon/provider is launched.
+        drop(app.update(Message::TerminalCloseFinished {
+            card,
+            terminal: intent.terminal,
+            proof: intent.proof,
+            generation: intent.generation,
+            outcome: terminal_close::CloseOutcome::Active,
+        }));
+        assert!(app.terminal_close_dialog_visible());
+        drop(app.update(Message::CancelTerminalClose));
+        assert!(app.terminal_close.is_none());
+        assert!(app.card_state(card).unwrap().existence.is_open());
+    }
+
+    #[test]
+    fn focus_last_pane_targets_last_strip_entry_and_respects_modal_and_palette_ownership() {
+        let mut app = pane_list_fixture(20);
+        let last = app.workspace.order().last().unwrap();
+        let inactive = super::super::tests::terminal_card_state();
+        let inactive_id = inactive.id;
+        Arc::make_mut(&mut app.durable).cards.push(inactive);
+        drop(app.run_workspace_command(Command::FocusLastPane, keyboard::Modifiers::ALT));
+        assert_eq!(app.workspace.focused(), Some(last));
+        assert_ne!(last, inactive_id);
+        let first = app.workspace.order().next().unwrap();
+        drop(app.update(Message::FocusCard(first)));
+        app.device_ui.open = true;
+        drop(app.run_workspace_command(Command::FocusLastPane, keyboard::Modifiers::ALT));
+        assert_eq!(app.workspace.focused(), Some(first));
+        app.device_ui.open = false;
+        drop(app.update_palette(Action::OpenPanes));
+        drop(app.run_workspace_command(Command::FocusLastPane, keyboard::Modifiers::ALT));
+        assert_eq!(
+            app.workspace.focused(),
+            Some(first),
+            "list owns its keys until activation/dismissal"
+        );
+        assert!(app.palette.is_open());
     }
 }

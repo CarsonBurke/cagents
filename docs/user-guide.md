@@ -1239,3 +1239,5 @@ scripts/run-ceditor-development /path/to/project   # isolated development identi
   remotes (`origin` first) through `gh`, with the same viewed marks and
   **Alt+V**, **Alt+Down**, and **Alt+Up** shortcuts, configurable in Editor
   settings.
+
+Use the pane counter beside the tab strip to search the current workspace’s open panes, inspect their activity and unread updates, focus a result, or close a named pane. The new-pane control stays beside the scrolling tabs. **Alt+0** focuses the last pane in the current strip; change or unbind **Focus last pane** in Settings → Keyboard. Existing custom shortcuts keep their bindings.

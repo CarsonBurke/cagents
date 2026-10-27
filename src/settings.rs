@@ -279,6 +279,7 @@ pub struct KeyboardShortcuts {
     pub focus_pane_7: Vec<String>,
     pub focus_pane_8: Vec<String>,
     pub focus_pane_9: Vec<String>,
+    pub focus_last_pane: Vec<String>,
     pub toggle_projects: Vec<String>,
     pub rename_pane: Vec<String>,
 }
@@ -322,6 +323,7 @@ impl Default for KeyboardShortcuts {
             focus_pane_7: vec!["Alt+7".to_owned()],
             focus_pane_8: vec!["Alt+8".to_owned()],
             focus_pane_9: vec!["Alt+9".to_owned()],
+            focus_last_pane: vec!["Alt+0".to_owned()],
             toggle_projects: vec!["Ctrl+Shift+B".to_owned()],
             rename_pane: vec!["F2".to_owned()],
         }
@@ -337,7 +339,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 38] {
+    pub fn actions(&self) -> [&Vec<String>; 39] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -375,6 +377,7 @@ impl KeyboardShortcuts {
             &self.focus_pane_7,
             &self.focus_pane_8,
             &self.focus_pane_9,
+            &self.focus_last_pane,
             &self.toggle_projects,
             &self.rename_pane,
         ]
@@ -422,7 +425,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 38] = [
+const SHORTCUT_ACTIONS: [&str; 39] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -459,6 +462,7 @@ const SHORTCUT_ACTIONS: [&str; 38] = [
     "focus_pane_7",
     "focus_pane_8",
     "focus_pane_9",
+    "focus_last_pane",
     "toggle_projects",
     "rename_pane",
 ];
@@ -1460,7 +1464,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 33] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 34] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -1483,6 +1487,7 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 33] = [
     "focus_pane_7",
     "focus_pane_8",
     "focus_pane_9",
+    "focus_last_pane",
     "cycle_pane_width",
     "new_channel",
     "clone_pane",
@@ -5338,5 +5343,35 @@ new_thread = "Alt+Shift+G"
             Err(SettingsError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied
         ));
         assert!(!target.join("settings.toml").exists());
+    }
+    #[test]
+    fn focus_last_pane_migration_preserves_custom_zero_and_explicit_unbinding() {
+        for (custom_zero, explicit_unbind) in [(false, false), (true, false), (false, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = path_in(&directory);
+            let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
+            let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+            shortcuts.remove("focus_last_pane");
+            if custom_zero {
+                shortcuts.insert("new_terminal".into(), vec!["Alt+0"].into());
+            }
+            if explicit_unbind {
+                shortcuts.insert("focus_last_pane".into(), Vec::<String>::new().into());
+            }
+            fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+            let loaded = load(&path).unwrap();
+            assert_eq!(
+                loaded.keyboard_shortcuts.focus_last_pane,
+                if custom_zero || explicit_unbind {
+                    Vec::<String>::new()
+                } else {
+                    vec!["Alt+0".into()]
+                }
+            );
+            if custom_zero {
+                assert_eq!(loaded.keyboard_shortcuts.new_terminal, ["Alt+0"]);
+            }
+            assert!(loaded.keyboard_shortcuts.validate().is_ok());
+        }
     }
 }
