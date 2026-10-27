@@ -75,11 +75,14 @@ pub(super) fn perform(
     let layout = locate(&std::env::current_exe()?)?;
     let (source_protocol, source_proof) = source::inspect_identity(None)?;
     // Retain the existing exact installation boundary even for a legacy peer.
-    let _source_owner = installed_daemon_owner(&layout)?;
-    let legacy_source = source_proof.is_some()
-        && matches!(source_protocol, 77 | 119)
-        && crate::terminal_ipc::PROTOCOL_VERSION > 77;
-    if served_version_root(&layout)? != root || (root == layout.version_root && !legacy_source) {
+    let source_owner = installed_daemon_owner(&layout)?;
+    let candidate_source = candidate_can_upgrade_source(
+        root,
+        source_owner.as_ref(),
+        source_protocol,
+        source_proof.as_ref(),
+    );
+    if served_version_root(&layout)? != root || (root == layout.version_root && !candidate_source) {
         return Err(invalid(
             "the installed candidate changed; inspect the installation again",
         ));

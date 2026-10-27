@@ -423,8 +423,8 @@ pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
         ));
     }
     // A newly opened UI may already be current while an older daemon still
-    // owns the sessions. Ordinary skew uses that owner's CLI; the qualified
-    // protocol-77 adapter keeps the new matched coordinator in control.
+    // owns the sessions. Ordinary skew uses that owner's CLI; an authenticated
+    // supported source also permits bootstrap from the staged coordinator.
     installation.version = installed_entry_worker(&layout, &served)?;
     let version = served
         .file_name()
@@ -478,28 +478,47 @@ fn installed_update_worker(
     source_protocol: u16,
     source_proof: Option<&crate::model::HostSessionProof>,
 ) -> Result<String, UpdateError> {
-    let replaces_daemon =
-        source_proof.is_some() && source_protocol != crate::terminal_ipc::PROTOCOL_VERSION;
+    let replaces_daemon = source_proof.is_some()
+        && (source_protocol != crate::terminal_ipc::PROTOCOL_VERSION
+            || daemon.is_some_and(|owner| owner.version_root != served));
     if served == window.version_root && !replaces_daemon {
         return Err(invalid("the installed application is already running"));
     }
     let legacy_source = source_proof.is_some()
         && matches!(source_protocol, 77 | 119)
         && crate::terminal_ipc::PROTOCOL_VERSION > 77;
-    let worker = installation_worker_version(window, served, daemon, legacy_source);
-    if !legacy_source && served == window.prefix.join("versions").join(&worker) {
+    // The staged CLI can speak an older build of its exact current protocol.
+    // Its source was authenticated above; a version-root difference is not a
+    // reason to delegate the update back to that older build's updater.
+    let candidate_source = legacy_source
+        || (window.version_root == served
+            && candidate_can_upgrade_source(served, daemon, source_protocol, source_proof));
+    let worker = installation_worker_version(window, served, daemon, candidate_source);
+    if !candidate_source && served == window.prefix.join("versions").join(&worker) {
         return Err(invalid("the installed application is already running"));
     }
     Ok(worker)
+}
+
+fn candidate_can_upgrade_source(
+    served: &Path,
+    daemon: Option<&InstallLayout>,
+    protocol: u16,
+    proof: Option<&crate::model::HostSessionProof>,
+) -> bool {
+    proof.is_some_and(crate::model::HostSessionProof::is_complete)
+        && ((matches!(protocol, 77 | 119) && crate::terminal_ipc::PROTOCOL_VERSION > 77)
+            || (protocol == crate::terminal_ipc::PROTOCOL_VERSION
+                && daemon.is_some_and(|owner| owner.version_root != served)))
 }
 
 fn installation_worker_version(
     window: &InstallLayout,
     served: &Path,
     daemon: Option<&InstallLayout>,
-    legacy_source: bool,
+    use_window_worker: bool,
 ) -> String {
-    if legacy_source {
+    if use_window_worker {
         return window.version.clone();
     }
     // Once the candidate already owns the daemon, the old window's worker
@@ -2791,6 +2810,43 @@ finally:
             installation_worker_version(&new, &new.version_root, Some(&old), true),
             "new"
         );
+        // Bootstrap from the staged CLI also works when the installed daemon
+        // has the current wire protocol but an older executable/version root.
+        // Reusing its old updater would preserve the very bug being repaired.
+        let proof = crate::model::HostSessionProof {
+            host_session_id: "current-source".into(),
+            boot_id: "current-boot".into(),
+            host_incarnation: "current-incarnation".into(),
+        };
+        assert_eq!(
+            installed_update_worker(
+                &new,
+                &new.version_root,
+                Some(&old),
+                crate::terminal_ipc::PROTOCOL_VERSION,
+                Some(&proof),
+            )
+            .unwrap(),
+            "new"
+        );
+        assert!(candidate_can_upgrade_source(
+            &new.version_root,
+            Some(&old),
+            crate::terminal_ipc::PROTOCOL_VERSION,
+            Some(&proof)
+        ));
+        assert!(!candidate_can_upgrade_source(
+            &new.version_root,
+            Some(&new),
+            crate::terminal_ipc::PROTOCOL_VERSION,
+            Some(&proof)
+        ));
+        assert!(!candidate_can_upgrade_source(
+            &new.version_root,
+            Some(&old),
+            crate::terminal_ipc::PROTOCOL_VERSION,
+            None
+        ));
         // The real entry decision must not mistake an already-served window
         // for a completed daemon migration. No-daemon/current observations keep
         // the old already-running refusal instead of granting a legacy route.
