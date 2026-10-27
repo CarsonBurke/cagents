@@ -96,18 +96,24 @@ struct PipeCapture<R> {
     captured: PipeRead,
     error: Option<String>,
     limit: usize,
+    prefix: Option<NulPrefixCapture>,
 }
 
 impl<R: Read + AsFd> PipeCapture<R> {
-    fn new(pipe: R, limit: usize) -> Self {
+    fn new(pipe: R, limit: usize, prefix_records: Option<usize>) -> Self {
         Self {
             pipe: Some(pipe),
             captured: PipeRead {
-                output: Vec::with_capacity(limit.min(8192)),
+                output: if prefix_records.is_some() {
+                    Vec::new()
+                } else {
+                    Vec::with_capacity(limit.min(8192))
+                },
                 limit_exceeded: false,
             },
             error: None,
             limit,
+            prefix: prefix_records.map(|records| NulPrefixCapture::new(records, limit)),
         }
     }
 
@@ -131,6 +137,10 @@ impl<R: Read + AsFd> PipeCapture<R> {
                 }
                 Ok(read) => {
                     drained += read;
+                    if let Some(prefix) = &mut self.prefix {
+                        prefix.push(&buffer[..read]);
+                        continue;
+                    }
                     let remaining = self.limit.saturating_sub(self.captured.output.len());
                     self.captured
                         .output
@@ -206,6 +216,22 @@ pub(super) fn execute(
     spec: &CommandSpec,
     cancellation: &CancellationToken,
 ) -> Result<ProcessOutput, ProcessFailure> {
+    execute_captured(spec, cancellation, None).map(|result| result.output)
+}
+
+pub(super) fn execute_nul_prefix(
+    spec: &CommandSpec,
+    cancellation: &CancellationToken,
+    record_limit: usize,
+) -> Result<PrefixOutput, ProcessFailure> {
+    execute_captured(spec, cancellation, Some(record_limit))
+}
+
+fn execute_captured(
+    spec: &CommandSpec,
+    cancellation: &CancellationToken,
+    prefix_records: Option<usize>,
+) -> Result<PrefixOutput, ProcessFailure> {
     let mut child = spec.to_command().spawn().map_err(|error| {
         process_failure(spec, ProcessFailureKind::Spawn, &error.to_string(), false)
     })?;
@@ -258,8 +284,8 @@ pub(super) fn execute(
     let mut child = PolledChild::new(child, identity);
     let _registration =
         cancellation.register_notifier(CancellationNotifier::Descriptor(Arc::clone(&wake)));
-    let mut stdout = PipeCapture::new(stdout, spec.stdout_limit);
-    let mut stderr = PipeCapture::new(stderr, spec.stderr_limit);
+    let mut stdout = PipeCapture::new(stdout, spec.stdout_limit, prefix_records);
+    let mut stderr = PipeCapture::new(stderr, spec.stderr_limit, None);
     let input = spec.stdin.as_deref().unwrap_or_default();
     let mut written = 0;
     if input.is_empty() {
@@ -388,6 +414,13 @@ pub(super) fn execute(
         wait_error = Some(error);
         terminal_kind.get_or_insert(ProcessFailureKind::Io);
     }
+    let truncated = if let Some(prefix) = stdout.prefix.take() {
+        let (bytes, truncated) = prefix.finish();
+        stdout.captured.output = bytes;
+        truncated
+    } else {
+        false
+    };
     let pipe_error = match (stdout.error, stderr.error) {
         (Some(out), Some(err)) => Some(format!("stdout: {out}; stderr: {err}")),
         (Some(error), None) => Some(format!("stdout: {error}")),
@@ -447,17 +480,213 @@ pub(super) fn execute(
             started: true,
         });
     }
-    Ok(ProcessOutput::from_parts(
-        status,
-        stdout_read.output,
-        stderr_read.output,
-    ))
+    Ok(PrefixOutput {
+        output: ProcessOutput::from_parts(status, stdout_read.output, stderr_read.output),
+        truncated,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn prefix_capture_drains_real_pipes_and_large_input_before_reaping_the_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("completed");
+        let leader = directory.path().join("leader");
+        let input = vec![b'x'; 2 * 1024 * 1024];
+        let command = CommandSpec::new("/bin/sh")
+            .args([
+                "-c",
+                "cat /proc/$$/stat > \"$LEADER\"; head -c 524288 /dev/zero; \
+                 head -c 262144 /dev/zero >&2; cat; printf done > \"$MARKER\"",
+            ])
+            .env("MARKER", marker.as_os_str())
+            .env("LEADER", leader.as_os_str())
+            .stdin(input)
+            .output_limits(32, 512 * 1024)
+            .timeout(Duration::from_secs(10));
+        let cancellation = CancellationToken::new();
+        let result = SystemProcessExecutor
+            .execute_nul_prefix(&command, &cancellation, 16)
+            .unwrap();
+        assert!(result.output.success);
+        assert_eq!(result.output.exit_code, Some(0));
+        assert!(result.truncated);
+        assert_eq!(result.output.stdout, vec![0; 16]);
+        assert_eq!(result.output.stderr, vec![0; 262144]);
+        assert_eq!(fs::read(marker).unwrap(), b"done");
+        assert!(lock_wakers(&cancellation.0).is_empty());
+        let original = fs::read_to_string(leader).unwrap();
+        let pid = original.split_once(' ').unwrap().0;
+        let original_start = original
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(19)
+            .unwrap();
+        match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(current) => {
+                let fields = current
+                    .rsplit_once(')')
+                    .unwrap()
+                    .1
+                    .split_whitespace()
+                    .collect::<Vec<_>>();
+                assert_ne!(
+                    fields[19], original_start,
+                    "the original process identity remains after completion, including a zombie"
+                );
+            }
+            Err(error) => assert_eq!(error.kind(), io::ErrorKind::NotFound),
+        }
+    }
+
+    #[test]
+    fn prefix_capture_distinguishes_actual_byte_caps_from_malformed_natural_eof() {
+        for (limit, expected, truncated) in [
+            (64, b"ok\0tail".as_slice(), false),
+            (4, b"ok\0".as_slice(), true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let marker = directory.path().join("completed");
+            let command = CommandSpec::new("/bin/sh")
+                .args(["-c", "printf 'ok\\000tail'; printf done > \"$MARKER\""])
+                .env("MARKER", marker.as_os_str())
+                .output_limits(limit, 32)
+                .timeout(Duration::from_secs(5));
+            let result = SystemProcessExecutor
+                .execute_nul_prefix(&command, &CancellationToken::new(), 10)
+                .unwrap();
+            assert!(result.output.success);
+            assert_eq!(result.output.stdout, expected);
+            assert_eq!(result.truncated, truncated);
+            assert_eq!(fs::read(marker).unwrap(), b"done");
+        }
+    }
+
+    #[test]
+    fn capped_always_readable_stdout_returns_after_one_fair_io_turn() {
+        struct AlwaysReady {
+            descriptor: fs::File,
+            reads: usize,
+        }
+        impl AsFd for AlwaysReady {
+            fn as_fd(&self) -> BorrowedFd<'_> {
+                self.descriptor.as_fd()
+            }
+        }
+        impl Read for AlwaysReady {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                assert!(
+                    self.reads <= IO_TURN_BYTES / buffer.len(),
+                    "one ready stream monopolized the caller past its I/O turn"
+                );
+                self.descriptor.read(buffer)
+            }
+        }
+        let pipe = AlwaysReady {
+            descriptor: fs::File::open("/dev/zero").unwrap(),
+            reads: 0,
+        };
+        let mut capture = PipeCapture::new(pipe, 32, Some(1));
+        capture.drain_ready();
+        assert!(
+            capture.pipe.is_some(),
+            "capping capture must not close the source pipe"
+        );
+        assert!(!capture.captured.limit_exceeded);
+        assert_eq!(capture.pipe.as_ref().unwrap().reads, IO_TURN_BYTES / 8192);
+        assert_eq!(capture.prefix.take().unwrap().finish(), (vec![0], true));
+    }
+
+    #[test]
+    fn prefix_capture_cancellation_and_timeout_interrupt_continuous_stdout() {
+        for cancel in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let ready = directory.path().join("prefix-capped");
+            let cancellation = CancellationToken::new();
+            let canceller = cancellation.clone();
+            let observed = ready.clone();
+            let worker = cancel.then(|| {
+                thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !observed.exists() {
+                        assert!(
+                            Instant::now() < deadline,
+                            "child never drained its first capped output"
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    canceller.cancel();
+                })
+            });
+            let command = CommandSpec::new("/bin/sh")
+                .args([
+                    "-c",
+                    "head -c 524288 /dev/zero; printf ready > \"$READY\"; exec yes",
+                ])
+                .env("READY", ready.as_os_str())
+                .output_limits(32, 1024)
+                .timeout(if cancel {
+                    Duration::from_secs(10)
+                } else {
+                    Duration::from_millis(500)
+                });
+            let started = Instant::now();
+            let failure = SystemProcessExecutor
+                .execute_nul_prefix(&command, &cancellation, 16)
+                .unwrap_err();
+            if let Some(worker) = worker {
+                worker.join().unwrap();
+            }
+            assert_eq!(
+                failure.kind,
+                if cancel {
+                    ProcessFailureKind::Cancelled
+                } else {
+                    ProcessFailureKind::TimedOut
+                }
+            );
+            assert!(failure.started);
+            assert_eq!(failure.stdout, vec![0; 16]);
+            assert!(started.elapsed() < Duration::from_secs(3));
+            assert!(lock_wakers(&cancellation.0).is_empty());
+        }
+    }
+
+    #[test]
+    fn prefix_capture_keeps_stderr_hard_limits_and_prelaunch_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("must-not-start");
+        let command = CommandSpec::new("/bin/sh")
+            .args(["-c", "printf started > \"$MARKER\""])
+            .env("MARKER", marker.as_os_str());
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let failure = SystemProcessExecutor
+            .execute_nul_prefix(&command, &cancellation, 1)
+            .unwrap_err();
+        assert_eq!(failure.kind, ProcessFailureKind::Cancelled);
+        assert!(!failure.started);
+        assert!(!marker.exists());
+        let command = CommandSpec::new("/bin/sh")
+            .args(["-c", "head -c 4096 /dev/zero; head -c 4096 /dev/zero >&2"])
+            .output_limits(32, 32)
+            .timeout(Duration::from_secs(5));
+        let failure = SystemProcessExecutor
+            .execute_nul_prefix(&command, &CancellationToken::new(), 1)
+            .unwrap_err();
+        assert_eq!(failure.kind, ProcessFailureKind::OutputLimit);
+        assert!(failure.message.contains("stderr exceeded"));
+        assert!(!failure.message.contains("stdout exceeded"));
+        assert_eq!(failure.stdout, [0]);
+        assert_eq!(failure.stderr, vec![0; 32]);
+    }
 
     #[test]
     fn polled_io_uses_the_retained_directory_after_its_path_is_replaced() {

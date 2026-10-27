@@ -330,6 +330,66 @@ pub struct ProcessOutput {
     pub stderr: Vec<u8>,
 }
 
+/// Bounded stdout capture from an explicitly opt-in NUL-delimited listing.
+/// `truncated` means bytes were discarded; callers must not treat this as a
+/// complete observation or use it to certify an unchanged cached listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefixOutput {
+    pub output: ProcessOutput,
+    pub truncated: bool,
+}
+
+/// Track complete record boundaries while continuing to drain the original
+/// pipe. Uncapped output stays verbatim: an unterminated natural EOF must reach
+/// the owning format parser as an error, not be disguised as a capped listing.
+struct NulPrefixCapture {
+    bytes: Vec<u8>,
+    records: usize,
+    record_limit: usize,
+    byte_limit: usize,
+    complete_bytes: usize,
+    truncated: bool,
+}
+
+impl NulPrefixCapture {
+    fn new(record_limit: usize, byte_limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            records: 0,
+            record_limit,
+            byte_limit,
+            complete_bytes: 0,
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, mut chunk: &[u8]) {
+        while !chunk.is_empty() && !self.truncated {
+            if self.records >= self.record_limit || self.bytes.len() >= self.byte_limit {
+                self.truncated = true;
+                self.bytes.truncate(self.complete_bytes);
+                break;
+            }
+            let available = self.byte_limit - self.bytes.len();
+            let end = chunk
+                .iter()
+                .position(|byte| *byte == 0)
+                .map_or(chunk.len(), |index| index + 1);
+            let take = end.min(available);
+            self.bytes.extend_from_slice(&chunk[..take]);
+            if chunk[take - 1] == 0 {
+                self.records += 1;
+                self.complete_bytes = self.bytes.len();
+            }
+            chunk = &chunk[take..];
+        }
+    }
+
+    fn finish(self) -> (Vec<u8>, bool) {
+        (self.bytes, self.truncated)
+    }
+}
+
 impl ProcessOutput {
     fn from_parts(status: ExitStatus, stdout: Vec<u8>, stderr: Vec<u8>) -> Self {
         Self {
@@ -498,6 +558,27 @@ pub trait ProcessExecutor: Send + Sync {
         command: &CommandSpec,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessFailure>;
+
+    /// Retain up to `record_limit` NUL records within `command.stdout_limit`
+    /// bytes. Excess stdout is drained; an actually capped partial record is
+    /// discarded. Uncapped output remains verbatim, including malformed trailing
+    /// bytes that the format parser must reject. stderr, cancellation, timeout
+    /// and exit semantics stay unchanged.
+    /// Implementations using full output remain compatible through this default;
+    /// the system executor bounds capture while reading the actual pipe.
+    fn execute_nul_prefix(
+        &self,
+        command: &CommandSpec,
+        cancellation: &CancellationToken,
+        record_limit: usize,
+    ) -> Result<PrefixOutput, ProcessFailure> {
+        let mut output = self.execute(command, cancellation)?;
+        let mut capture = NulPrefixCapture::new(record_limit, command.stdout_limit);
+        capture.push(&output.stdout);
+        let (stdout, truncated) = capture.finish();
+        output.stdout = stdout;
+        Ok(PrefixOutput { output, truncated })
+    }
 }
 
 /// Runs commands as real child processes.
@@ -509,12 +590,11 @@ pub trait ProcessExecutor: Send + Sync {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemProcessExecutor;
 
-impl ProcessExecutor for SystemProcessExecutor {
-    fn execute(
-        &self,
+impl SystemProcessExecutor {
+    fn check_launch(
         spec: &CommandSpec,
         cancellation: &CancellationToken,
-    ) -> Result<ProcessOutput, ProcessFailure> {
+    ) -> Result<(), ProcessFailure> {
         #[cfg(feature = "ui")]
         if crate::device::is_remote() {
             return Err(process_failure(
@@ -533,7 +613,28 @@ impl ProcessExecutor for SystemProcessExecutor {
             ));
         }
 
+        Ok(())
+    }
+}
+
+impl ProcessExecutor for SystemProcessExecutor {
+    fn execute(
+        &self,
+        spec: &CommandSpec,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, ProcessFailure> {
+        Self::check_launch(spec, cancellation)?;
         poll::execute(spec, cancellation)
+    }
+
+    fn execute_nul_prefix(
+        &self,
+        spec: &CommandSpec,
+        cancellation: &CancellationToken,
+        record_limit: usize,
+    ) -> Result<PrefixOutput, ProcessFailure> {
+        Self::check_launch(spec, cancellation)?;
+        poll::execute_nul_prefix(spec, cancellation, record_limit)
     }
 }
 
@@ -878,6 +979,66 @@ fn failure_excerpt(mut output: Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nul_prefix_reports_complete_records_across_every_capture_boundary() {
+        for split in 0..=b"one\0two\0three\0".len() {
+            let bytes = b"one\0two\0three\0";
+            let mut capture = NulPrefixCapture::new(2, 100);
+            capture.push(&bytes[..split]);
+            capture.push(&bytes[split..]);
+            assert_eq!(capture.finish(), (b"one\0two\0".to_vec(), true));
+        }
+        for (records, limit, bytes, expected, truncated) in [
+            (1, 4, b"one\0".as_slice(), b"one\0".as_slice(), false),
+            (1, 4, b"one\0x".as_slice(), b"one\0".as_slice(), true),
+            (10, 5, b"ok\0tail\0".as_slice(), b"ok\0".as_slice(), true),
+            (10, 7, b"ok\0tail".as_slice(), b"ok\0tail".as_slice(), false),
+            (0, 4, b"".as_slice(), b"".as_slice(), false),
+            (0, 4, b"x\0".as_slice(), b"".as_slice(), true),
+            (10, 0, b"x\0".as_slice(), b"".as_slice(), true),
+            (1, 2, b"\xff\0".as_slice(), b"\xff\0".as_slice(), false),
+        ] {
+            for split in 0..=bytes.len() {
+                let mut capture = NulPrefixCapture::new(records, limit);
+                capture.push(&bytes[..split]);
+                capture.push(&bytes[split..]);
+                assert!(capture.bytes.len() <= limit);
+                assert_eq!(capture.finish(), (expected.to_vec(), truncated));
+            }
+        }
+    }
+
+    #[test]
+    fn executor_default_prefix_preserves_literal_outputs_and_failure_status() {
+        struct Fixed(ProcessOutput);
+        impl ProcessExecutor for Fixed {
+            fn execute(
+                &self,
+                _: &CommandSpec,
+                _: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                Ok(self.0.clone())
+            }
+        }
+        let executor: &dyn ProcessExecutor = &Fixed(ProcessOutput {
+            exit_code: Some(7),
+            signal: None,
+            success: false,
+            stdout: b"first\0second\0partial".to_vec(),
+            stderr: b"original error".to_vec(),
+        });
+        let command = CommandSpec::new("fixture").output_limits(8, 100);
+        let result = executor
+            .execute_nul_prefix(&command, &CancellationToken::new(), 2)
+            .unwrap();
+        assert!(result.truncated);
+        assert_eq!(result.output.stdout, b"first\0");
+        assert_eq!(result.output.stderr, b"original error");
+        let failure = result.output.require_success(&command.program).unwrap_err();
+        assert_eq!(failure.kind, ProcessFailureKind::Exit);
+        assert_eq!(failure.exit_code, Some(7));
+    }
 
     #[test]
     #[cfg(target_os = "linux")]
