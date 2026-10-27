@@ -10,6 +10,10 @@ impl Store {
         previous: &Arc<Item>,
         current: &Item,
     ) -> Option<crate::chat::TextBody> {
+        #[cfg(test)]
+        if self.publication_work.disable_reuse.get() {
+            return None;
+        }
         let (ItemContent::Text { text, .. }, ItemContent::Text { .. }) =
             (&previous.content, &current.content)
         else {

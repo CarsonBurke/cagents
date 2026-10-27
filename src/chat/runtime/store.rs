@@ -79,6 +79,8 @@ pub(crate) struct Store {
     appended: append::Changes,
     #[cfg(test)]
     field_bytes: std::cell::Cell<usize>,
+    #[cfg(test)]
+    publication_work: append::Work,
     pub presented_generation: Option<u64>,
     pub presentation: Option<crate::chat::presentation::Presentation>,
     pub presented_children: std::collections::HashMap<String, Vec<std::sync::Arc<Item>>>,
@@ -275,6 +277,8 @@ impl Store {
                 appended: Default::default(),
                 #[cfg(test)]
                 field_bytes: std::cell::Cell::new(0),
+                #[cfg(test)]
+                publication_work: Default::default(),
                 presented_generation: None,
                 presentation: None,
                 presented_children: Default::default(),
@@ -1328,6 +1332,16 @@ impl Store {
                         })
                     })
                     .flatten();
+                #[cfg(test)]
+                if let Some(shared) = &shared_text {
+                    self.publication_work.completed_reused.set(
+                        self.publication_work
+                            .completed_reused
+                            .get()
+                            .checked_add(shared.len())
+                            .expect("shared payload byte counter overflow"),
+                    );
+                }
                 let (body0, prefix0) = if shared_text.is_some() {
                     (String::new(), true)
                 } else {
@@ -1355,6 +1369,16 @@ impl Store {
                 let attached = attachment.as_ref().map_or(0, String::len);
                 match &mut item.content {
                     ItemContent::Text { text, .. } => {
+                        #[cfg(test)]
+                        if shared_text.is_none() {
+                            self.publication_work.materialized.set(
+                                self.publication_work
+                                    .materialized
+                                    .get()
+                                    .checked_add(body0.len())
+                                    .expect("materialized prose byte counter overflow"),
+                            );
+                        }
                         *text = shared_text.unwrap_or_else(|| body0.into())
                     }
                     ItemContent::Delivery { body, .. } => *body = body0,
@@ -1954,6 +1978,243 @@ mod tests {
         assert!(
             matches!(&store.window().unwrap().items[0].content, ItemContent::Tool { output, .. } if output == "final replacement")
         );
+    }
+
+    /// Original PR1298 200-update producer workload, with canonical metadata
+    /// and serialized presentation replay verified outside the producer spans.
+    #[test]
+    #[ignore = "explicit HOST dev-runtime benchmark; actual owning Cargo opt_level must be 2"]
+    fn append_publication_cost_breakdown() {
+        use crate::chat::{
+            Snapshot,
+            presentation::{ItemChange, Presentation},
+        };
+        const UPDATES: usize = 200;
+        const DELTA: &str = " measured stream delta ";
+        struct Frame {
+            wire: Vec<u8>,
+            order: Vec<String>,
+            canonical: Item,
+        }
+        struct Sample {
+            micros: u128,
+            including_capture_micros: u128,
+            sql: usize,
+            prefix: usize,
+            bodies: usize,
+            reused: usize,
+            wire: usize,
+            body_sha256: String,
+            normalized_wire_sha256: String,
+        }
+        fn current_metadata(item: &Item, canonical: &Item) {
+            assert_eq!(item.role, canonical.role);
+            assert_eq!(item.at, canonical.at);
+            assert_eq!(item.started_at, canonical.started_at);
+            assert!(item.at.is_some() && item.started_at.is_some());
+            assert!(matches!((&item.content, &canonical.content),
+                (ItemContent::Text { thinking: a, phase: b, .. },
+                 ItemContent::Text { thinking: c, phase: d, .. }) if a == c && b == d));
+        }
+        fn prose(items: &[std::sync::Arc<Item>]) -> String {
+            items
+                .iter()
+                .map(|item| {
+                    let ItemContent::Text { text, .. } = &item.content else {
+                        panic!("prose part")
+                    };
+                    text.as_str()
+                })
+                .collect()
+        }
+        fn sample(bytes: usize, reuse: bool) -> Sample {
+            let mut store = Store::at(std::env::temp_dir()).unwrap();
+            store
+                .apply(Event::Item(history_item("measured", &"x".repeat(bytes))))
+                .unwrap();
+            let mut previous = store.window().unwrap().items;
+            let initial = previous.clone();
+            store.field_bytes.set(0);
+            store.publication_work = append::Work::default();
+            store.publication_work.disable_reuse.set(!reuse);
+            let mut frames = Vec::with_capacity(UPDATES);
+            let started = std::time::Instant::now();
+            let mut producer_elapsed = std::time::Duration::ZERO;
+            let mut wire = 0;
+            for _ in 0..UPDATES {
+                let producer_started = std::time::Instant::now();
+                store
+                    .apply(Event::TextDelta {
+                        id: "measured".into(),
+                        role: Role::Assistant,
+                        thinking: false,
+                        delta: DELTA.into(),
+                    })
+                    .unwrap();
+                let next = store.window_reusing(&mut previous).unwrap();
+                let encoded = postcard::to_stdvec(&next.changes).unwrap();
+                wire += encoded.len();
+                previous = next.items;
+                drop(next.changes);
+                producer_elapsed += producer_started.elapsed();
+                // Actual SQL metadata is read after every committed publication,
+                // outside its producer span. Keep only serialized wire/IDs and
+                // empty-body metadata; never retain 200 resident body windows.
+                let metadata: Vec<u8> = store
+                    .db
+                    .query_row(
+                        "SELECT metadata FROM items WHERE id='measured'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let canonical: Item = postcard::from_bytes(&metadata).unwrap();
+                for item in &previous {
+                    current_metadata(item, &canonical);
+                }
+                frames.push(Frame {
+                    wire: encoded,
+                    order: previous.iter().map(|item| item.id.clone()).collect(),
+                    canonical,
+                });
+            }
+            let micros = producer_elapsed.as_micros();
+            let including_capture_micros = started.elapsed().as_micros();
+            let sql = store.field_bytes.get();
+            let prefix = store.publication_work.prefix_copied.get();
+            let bodies = store.publication_work.materialized.get();
+            let reused = store.publication_work.completed_reused.get();
+            let cumulative = UPDATES * bytes + DELTA.len() * UPDATES * (UPDATES + 1) / 2;
+            assert_eq!(
+                bodies + reused,
+                cumulative,
+                "each resident prose byte is materialized or shares an existing inner allocation"
+            );
+            if !reuse {
+                assert_eq!(prefix, 0);
+                assert_eq!(reused, 0);
+                assert_eq!(bodies, cumulative);
+                assert!(
+                    sql >= cumulative,
+                    "reference reads all prose plus boundary probes"
+                );
+            }
+            // Replay unmodified actual wire after timing. Normalize ONLY the two
+            // clocks, and only after checking each against that publication's
+            // canonical SQL metadata. Do not compare real wall-clock values or
+            // pretend the raw wire bytes of separate samples are identical.
+            let mut replay = Snapshot {
+                items: initial,
+                ..Default::default()
+            };
+            let mut expected = "x".repeat(bytes);
+            let mut normalized_wire = Sha256::new();
+            for (index, frame) in frames.into_iter().enumerate() {
+                let changes: Vec<ItemChange> = postcard::from_bytes(&frame.wire).unwrap();
+                let mut normalized = changes.clone();
+                for change in &mut normalized {
+                    let (ItemChange::Replace(item) | ItemChange::Append { item, .. }) = change;
+                    current_metadata(item, &frame.canonical);
+                    item.at = item.at.map(|_| 0);
+                    item.started_at = item.started_at.map(|_| 0);
+                }
+                let normalized = postcard::to_stdvec(&(frame.order.clone(), normalized)).unwrap();
+                normalized_wire.update((normalized.len() as u64).to_le_bytes());
+                normalized_wire.update(normalized);
+                replay = Presentation {
+                    base_generation: index as u64,
+                    file_changes_unchanged: false,
+                    retained_catalogs: Default::default(),
+                    metadata: Snapshot {
+                        generation: index as u64 + 1,
+                        ..Default::default()
+                    },
+                    order: frame.order,
+                    changes,
+                    children: Vec::new(),
+                }
+                .apply(&replay)
+                .unwrap();
+                for item in &replay.items {
+                    current_metadata(item, &frame.canonical);
+                }
+                expected.push_str(DELTA);
+                assert_eq!(prose(&replay.items), expected);
+            }
+            assert_eq!(
+                replay.items, previous,
+                "actual final wire retains full current Items"
+            );
+            let actual = prose(&previous);
+            assert_eq!(actual, expected);
+            Sample {
+                micros,
+                including_capture_micros,
+                sql,
+                prefix,
+                bodies,
+                reused,
+                wire,
+                body_sha256: format!("{:x}", Sha256::digest(actual.as_bytes())),
+                normalized_wire_sha256: format!("{:x}", normalized_wire.finalize()),
+            }
+        }
+        eprintln!(
+            "source_bytes,reuse,updates,elapsed_us,sqlite_read_bytes,prefix_copy_bytes,materialized_resident_prose_bytes,reused_completed_inner_arc_payload_bytes,change_wire_bytes"
+        );
+        for bytes in [64 * 1024, 300 * 1024, 1024 * 1024 + 2000] {
+            let reference = sample(bytes, false);
+            let optimized = sample(bytes, true);
+            assert_eq!(reference.body_sha256, optimized.body_sha256);
+            assert_eq!(
+                reference.normalized_wire_sha256,
+                optimized.normalized_wire_sha256
+            );
+            for (enabled, sample) in [(false, &reference), (true, &optimized)] {
+                eprintln!(
+                    "{bytes},{enabled},200,{},{},{},{},{},{}",
+                    sample.micros,
+                    sample.sql,
+                    sample.prefix,
+                    sample.bodies,
+                    sample.reused,
+                    sample.wire
+                );
+                eprintln!(
+                    "APPEND_PUBLICATION_SAMPLE {}",
+                    serde_json::json!({
+                        "source_bytes": bytes, "reuse": enabled, "updates": UPDATES,
+                        "elapsed_us": sample.micros,
+                        "elapsed_including_validation_capture_us": sample.including_capture_micros,
+                        "sqlite_read_bytes": sample.sql, "prefix_copy_bytes": sample.prefix,
+                        "materialized_resident_prose_bytes": sample.bodies,
+                        "completed_inner_arc_reused_payload_bytes": sample.reused,
+                        "change_wire_bytes": sample.wire, "body_sha256": sample.body_sha256,
+                        "normalized_wire_sha256": sample.normalized_wire_sha256,
+                        "normalization": "only canonical-checked at/started_at clock values; presence and all other data retained",
+                        "timing": "sum of 200 apply/window/serialize/handoff spans; excludes canonical capture and deferred wire replay; total capture-inclusive loop also recorded",
+                    })
+                );
+            }
+            assert!(
+                optimized.sql < reference.sql / 4,
+                "validated appends must avoid reading the resident source from SQLite"
+            );
+            assert!(
+                optimized.prefix > 0,
+                "the root exercises actual prefix copies"
+            );
+            if bytes > PART_BYTES * 2 {
+                assert!(
+                    optimized.bodies < reference.bodies * 3 / 4,
+                    "completed fragments must avoid materializing immutable prose"
+                );
+                assert!(
+                    optimized.reused > 0,
+                    "actual completed inner payloads must share storage"
+                );
+            }
+        }
     }
 
     #[test]

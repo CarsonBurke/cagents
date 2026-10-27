@@ -6,6 +6,15 @@ use std::{
     sync::{Arc, Weak},
 };
 
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct Work {
+    pub(super) disable_reuse: std::cell::Cell<bool>,
+    pub(super) prefix_copied: std::cell::Cell<usize>,
+    pub(super) materialized: std::cell::Cell<usize>,
+    pub(super) completed_reused: std::cell::Cell<usize>,
+}
+
 struct Resident {
     item: Weak<Item>,
     root: String,
@@ -121,6 +130,8 @@ impl Store {
         end: usize,
         previous: Option<&Arc<Item>>,
     ) -> Result<(String, bool), String> {
+        #[cfg(test)]
+        let previous = previous.filter(|_| !self.publication_work.disable_reuse.get());
         if let Some(previous) = previous
             && self
                 .appended
@@ -134,6 +145,14 @@ impl Store {
             let suffix = self.field(id, field as i64, old_end, end)?;
             let mut body = String::with_capacity(end - start);
             body.push_str(old);
+            #[cfg(test)]
+            self.publication_work.prefix_copied.set(
+                self.publication_work
+                    .prefix_copied
+                    .get()
+                    .checked_add(old.len())
+                    .expect("prefix byte counter overflow"),
+            );
             body.push_str(&String::from_utf8(suffix).map_err(|error| error.to_string())?);
             return Ok((body, true));
         }
