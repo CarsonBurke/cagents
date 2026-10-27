@@ -52,9 +52,13 @@ mod import;
 mod table;
 
 fn remote_lifecycle<T: serde::de::DeserializeOwned>(
+    authority: crate::agent_execution::Authority,
     operation: account::remote::Operation,
 ) -> Result<T, String> {
-    match connection::request(crate::device_service::Operation::AccountLifecycle { operation })? {
+    match connection::request(
+        authority.clone(),
+        crate::device_service::Operation::AccountLifecycle { operation },
+    )? {
         crate::device_service::Reply::AccountLifecycle(value) => {
             serde_json::from_value(value).map_err(|error| error.to_string())
         }
@@ -92,6 +96,7 @@ const POPOVER_WIDTH: f32 = 320.0;
 const COMPACT_WIDTH: f32 = design::OVERLAY_DOCK_BREAKPOINT;
 
 pub(super) struct State {
+    authority: crate::agent_execution::Authority,
     accounts: Vec<AccountState>,
     installed: BTreeMap<Provider, bool>,
     /// Local metadata reads are superseded independently of usage probes.
@@ -210,8 +215,9 @@ impl State {
     /// of this installation through the cache in its state directory, and
     /// accounts through the registry in its configuration directory.
     pub(super) fn installation() -> Self {
+        let authority = crate::agent_execution::Authority::from_environment();
         if crate::device::is_remote() {
-            let mut state = Self::new(None, None, None);
+            let mut state = Self::new_as(None, None, None, authority);
             // Device preparation captures daemon environment before the UI
             // starts. Seed system paths immediately: the async registry read
             // must not leave startup drafts or terminals using desktop homes.
@@ -228,18 +234,35 @@ impl State {
             state.sync_accounts();
             return state;
         }
-        let mut state = Self::new(
+        let mut state = Self::new_as(
             Cache::installation(),
             Store::installation(),
             Homes::installation(),
+            authority,
         );
         state.omp.database = omp::database(&|name| std::env::var(name).ok());
         state
     }
 
+    #[cfg(test)]
     fn new(cache: Option<Cache>, store: Option<Store>, homes: Option<Homes>) -> Self {
+        Self::new_as(
+            cache,
+            store,
+            homes,
+            crate::agent_execution::Authority::default(),
+        )
+    }
+
+    fn new_as(
+        cache: Option<Cache>,
+        store: Option<Store>,
+        homes: Option<Homes>,
+        authority: crate::agent_execution::Authority,
+    ) -> Self {
         let registry = Registry::default();
         let mut state = Self {
+            authority: authority.clone(),
             accounts: Vec::new(),
             installed: BTreeMap::new(),
             discovery_generation: 0,
@@ -259,7 +282,7 @@ impl State {
             next_host_check: 0,
             table: table::Table::default(),
             check: check::State::default(),
-            import: import::State::default(),
+            import: import::State::with_authority(authority),
             removing: BTreeSet::new(),
             live_unsaved: BTreeSet::new(),
             login_changes_reported: BTreeMap::new(),
@@ -665,6 +688,7 @@ impl State {
 
 /// A window with no cache and no registry: nothing it learns outlives it or
 /// reaches another window, which is what a test fixture wants.
+#[cfg(test)]
 impl Default for State {
     fn default() -> Self {
         Self::new(None, None, None)
@@ -1706,12 +1730,16 @@ impl Cagents {
     /// Omp's usage record is read beside it, on its own: a read that waits
     /// on Omp writing holds back no other account.
     pub(super) fn load_accounts(&mut self) -> Task<Message> {
+        let authority = self.account_ui.authority.clone();
         self.account_ui.discovery_generation = self.account_ui.discovery_generation.wrapping_add(1);
         let generation = self.account_ui.discovery_generation;
         if crate::device::is_remote() {
             return cosmic::task::future(async move {
-                let result = tokio::task::spawn_blocking(|| {
-                    match connection::request(crate::device_service::Operation::AccountsRead)? {
+                let result = tokio::task::spawn_blocking(move || {
+                    match connection::request(
+                        authority.clone(),
+                        crate::device_service::Operation::AccountsRead,
+                    )? {
                         crate::device_service::Reply::Accounts(value) => {
                             serde_json::from_value(value).map_err(|error| error.to_string())
                         }
@@ -1727,15 +1755,16 @@ impl Cagents {
         let store = self.account_ui.store.clone();
         let homes = self.account_ui.homes.clone();
         let cache = self.account_ui.cache.clone();
+        let may_write = connection::require_user(&authority).is_ok();
         let load = cosmic::task::future(async move {
             let provisional = !probe::shell_asked();
             let search_path = probe::current_search_path();
             let loaded = tokio::task::spawn_blocking(move || {
                 let registry = match (&store, &homes) {
-                    (Some(store), Some(homes)) => store
+                    (Some(store), Some(homes)) if may_write => store
                         .load_and_sweep(homes)
                         .map_err(|error| error.to_string()),
-                    (Some(store), None) => store.load().map_err(|error| error.to_string()),
+                    (Some(store), _) => store.load().map_err(|error| error.to_string()),
                     _ => Ok(Registry::default()),
                 };
                 let accounts = registry
@@ -1752,7 +1781,7 @@ impl Cagents {
                 // Not while the registry cannot be read, or its accounts' homes
                 // cannot be found, which would take every added account for
                 // one since removed.
-                if let (Some(cache), Ok(_), Some(_)) = (&cache, &registry, &homes) {
+                if may_write && let (Some(cache), Ok(_), Some(_)) = (&cache, &registry, &homes) {
                     let keep = accounts.iter().filter_map(Account::cache_key).collect();
                     if let Err(error) = cache.prune(&keep, now) {
                         tracing::debug!(%error, "the account usage cache could not be pruned");
@@ -1828,13 +1857,17 @@ impl Cagents {
 
     /// Reads the registry again, for what another window changed.
     pub(super) fn reload_registry(&mut self) -> Task<Message> {
+        let authority = self.account_ui.authority.clone();
         if crate::device::is_remote() {
             self.account_ui.discovery_generation =
                 self.account_ui.discovery_generation.wrapping_add(1);
             let generation = self.account_ui.discovery_generation;
             return cosmic::task::future(async move {
-                let result = tokio::task::spawn_blocking(|| {
-                    match connection::request(crate::device_service::Operation::AccountsRead)? {
+                let result = tokio::task::spawn_blocking(move || {
+                    match connection::request(
+                        authority.clone(),
+                        crate::device_service::Operation::AccountsRead,
+                    )? {
                         crate::device_service::Reply::Accounts(value) => {
                             serde_json::from_value(value).map_err(|error| error.to_string())
                         }
@@ -1865,6 +1898,12 @@ impl Cagents {
         &mut self,
         change: impl FnOnce(&mut Registry) + Send + 'static,
     ) -> Task<Message> {
+        let authority = self.account_ui.authority.clone();
+        if let Err(error) = connection::require_user(&authority) {
+            return cosmic::task::future(
+                async move { Message::AccountUi(Action::Saved(Err(error))) },
+            );
+        }
         if crate::device::is_remote() {
             let expected_revision = self.account_ui.registry.revision();
             let mut registry = self.account_ui.registry.clone();
@@ -1873,10 +1912,13 @@ impl Cagents {
                 let result = tokio::task::spawn_blocking(move || {
                     let registry =
                         serde_json::to_value(registry).map_err(|error| error.to_string())?;
-                    match connection::request(crate::device_service::Operation::AccountsUpdate {
-                        expected_revision,
-                        registry,
-                    })? {
+                    match connection::request(
+                        authority.clone(),
+                        crate::device_service::Operation::AccountsUpdate {
+                            expected_revision,
+                            registry,
+                        },
+                    )? {
                         crate::device_service::Reply::AccountRegistry(value) => {
                             serde_json::from_value(value).map_err(|error| error.to_string())
                         }
@@ -2008,6 +2050,7 @@ impl Cagents {
         trigger: Trigger,
         now: Millis,
     ) -> Option<Task<Message>> {
+        let authority = self.account_ui.authority.clone();
         self.refresh_login_watch(id, now);
         let focused = self.refresh_ui.focused;
         let cache = self.account_ui.cache.clone();
@@ -2066,10 +2109,10 @@ impl Cagents {
         let probe = cosmic::task::future(async move {
             let outcome = if crate::device::is_remote() {
                 tokio::task::spawn_blocking(move || {
-                    match connection::request(crate::device_service::Operation::AccountProbe {
-                        account,
-                        force,
-                    })? {
+                    match connection::request(
+                        authority.clone(),
+                        crate::device_service::Operation::AccountProbe { account, force },
+                    )? {
                         crate::device_service::Reply::AccountProbe(value) => {
                             serde_json::from_value(value).map_err(|error| error.to_string())
                         }
@@ -2081,7 +2124,7 @@ impl Cagents {
                 .and_then(|result| result)
                 .unwrap_or_else(Outcome::Failed)
             } else {
-                probe::run(account, cache, force).await
+                connection::probe(authority, probe::run(account, cache, force)).await
             };
             Message::AccountUi(Action::Probed { owner, id, outcome })
         });
@@ -2530,6 +2573,7 @@ impl Cagents {
                 Task::none()
             }
             Action::SaveLive => {
+                let authority = self.account_ui.authority.clone();
                 self.account_ui.saving_live = false;
                 let entries = self.account_ui.take_live_entries();
                 let catalogs = self.account_ui.take_live_catalogs();
@@ -2538,13 +2582,17 @@ impl Cagents {
                         let _ = tokio::task::spawn_blocking(move || {
                             let reports = serde_json::to_value((entries, catalogs))
                                 .map_err(|error| error.to_string())?;
-                            connection::request(crate::device_service::Operation::AccountsCache {
-                                reports,
-                            })
+                            connection::request(
+                                authority.clone(),
+                                crate::device_service::Operation::AccountsCache { reports },
+                            )
                         })
                         .await;
                     })
                     .discard();
+                }
+                if connection::require_user(&authority).is_err() {
+                    return Task::none();
                 }
                 let Some(cache) = self
                     .account_ui
@@ -3267,6 +3315,7 @@ impl Cagents {
 
     /// Finds the CLI to sign in with off the interface thread, as probes do.
     fn sign_in(&mut self, id: AccountId, device: bool) -> Task<Message> {
+        let authority = self.account_ui.authority.clone();
         let Some(account) = self
             .account_ui
             .account(&id)
@@ -3298,9 +3347,10 @@ impl Cagents {
             self.account_ui.table.close_popups();
             return cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    match connection::request(crate::device_service::Operation::AccountLogin {
-                        account,
-                    })? {
+                    match connection::request(
+                        authority.clone(),
+                        crate::device_service::Operation::AccountLogin { account },
+                    )? {
                         crate::device_service::Reply::Login(recipe) => Ok(recipe),
                         _ => Err("The device did not prepare its provider login".into()),
                     }
@@ -3315,10 +3365,19 @@ impl Cagents {
         self.account_ui.table.close_popups();
         let provider = account.provider;
         cosmic::task::future(async move {
+            if let Err(error) = connection::require_user(&authority) {
+                return Message::AccountUi(Action::LoginReady {
+                    owner,
+                    id,
+                    provider,
+                    device,
+                    program: Err(error),
+                });
+            }
             let search_path = probe::search_path().await;
             let program = tokio::task::spawn_blocking(move || {
                 if account.provider == Provider::Codex && !device {
-                    browser_login_available()?;
+                    browser_login_available(authority.clone())?;
                 }
                 probe::find_executable(account.provider.executable(), search_path.as_deref())
                     .map(|program| (program, search_path))
@@ -3595,6 +3654,7 @@ impl Cagents {
     /// taking ownership of any files in it. Validation and the registry write
     /// run off the interface thread.
     fn link_account_home(&mut self) -> Task<Message> {
+        let authority = self.account_ui.authority.clone();
         let Some((provider, raw_path)) = self.account_ui.table.link.clone() else {
             return Task::none();
         };
@@ -3606,11 +3666,14 @@ impl Cagents {
         if crate::device::is_remote() {
             return cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    remote_lifecycle::<(Registry, uuid::Uuid)>(account::remote::Operation::Link {
-                        provider,
-                        key,
-                        path: raw_path,
-                    })
+                    remote_lifecycle::<(Registry, uuid::Uuid)>(
+                        authority,
+                        account::remote::Operation::Link {
+                            provider,
+                            key,
+                            path: raw_path,
+                        },
+                    )
                 })
                 .await
                 .map_err(|error| error.to_string())
@@ -3628,6 +3691,7 @@ impl Cagents {
         let system_home = Account::system(provider).resolved_home();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
+                connection::require_user(&authority)?;
                 let raw_path = raw_path.trim();
                 let _lifecycle = homes
                     .as_ref()
@@ -3676,16 +3740,20 @@ impl Cagents {
     /// Creates the new account's home off the interface thread, with the
     /// reader's shared entries linked in, and finds its CLI.
     fn add_account(&mut self, provider: Provider, device: bool) -> Task<Message> {
+        let authority = self.account_ui.authority.clone();
         if crate::device::is_remote() {
             let copy_codex_config = self.account_ui.table.own_codex_config;
             self.account_ui.table.close_popups();
             self.account_ui.popover = None;
             return cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    remote_lifecycle(account::remote::Operation::Create {
-                        provider,
-                        copy_codex_config,
-                    })
+                    remote_lifecycle(
+                        authority,
+                        account::remote::Operation::Create {
+                            provider,
+                            copy_codex_config,
+                        },
+                    )
                 })
                 .await
                 .map_err(|error| error.to_string())
@@ -3718,10 +3786,17 @@ impl Cagents {
         }
         let store = self.account_ui.store.clone();
         cosmic::task::future(async move {
+            if let Err(error) = connection::require_user(&authority) {
+                return Message::AccountUi(Action::HomeReady {
+                    provider,
+                    device,
+                    result: Err(error),
+                });
+            }
             let search_path = probe::search_path().await;
             let result = tokio::task::spawn_blocking(move || {
                 if provider == Provider::Codex && !device {
-                    browser_login_available()?;
+                    browser_login_available(authority.clone())?;
                 }
                 let program = probe::find_executable(provider.executable(), search_path.as_deref())
                     .ok_or_else(|| format!("{} is not installed", probe::cli_name(provider)))?;
@@ -3810,7 +3885,10 @@ impl Cagents {
     /// Forgets a pending sign-in through the selected daemon. Its home and
     /// any interrupted-removal history remain available for explicit recovery.
     fn discard_home(&self, key: uuid::Uuid, provider: Provider) -> Task<Message> {
-        self.discard_home_via(key, provider, remote_lifecycle::<Settled>)
+        self.discard_home_via(key, provider, {
+            let authority = self.account_ui.authority.clone();
+            move |operation| remote_lifecycle::<Settled>(authority, operation)
+        })
     }
 
     fn discard_home_via(
@@ -3833,6 +3911,7 @@ impl Cagents {
     /// Asks the home of every sign-in whose terminal has ended - or whose
     /// card was closed - who it is signed in as.
     fn check_logins(&mut self) -> Task<Message> {
+        let authority = self.account_ui.authority.clone();
         let now = now_ms();
         let mut ended = Vec::new();
         let mut unwatched = Vec::new();
@@ -3883,10 +3962,11 @@ impl Cagents {
             self.account_ui.asking_host = true;
             self.account_ui.next_host_check = now + HOST_CHECK;
             cosmic::task::future(async move {
-                let result = tokio::task::spawn_blocking(move || ended_on_host(&unwatched))
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result);
+                let result =
+                    tokio::task::spawn_blocking(move || ended_on_host(&unwatched, authority))
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result);
                 Message::AccountUi(Action::LoginsEnded(result))
             })
         };
@@ -3901,6 +3981,7 @@ impl Cagents {
     /// no card close to run: the daemon closes its terminal - a no-op for
     /// one that has ended - and the card is then retired.
     fn close_offstrip_sign_in(&mut self, card: CardId) -> Task<Message> {
+        let authority = self.account_ui.authority.clone();
         let hosted = match self.card_state(card) {
             Some(CardState {
                 kind: CardKind::Terminal(session),
@@ -3917,10 +3998,11 @@ impl Cagents {
         };
         let terminal = source.id;
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || stop_hosted(terminal, &proof))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
+            let result =
+                tokio::task::spawn_blocking(move || stop_hosted(terminal, &proof, authority))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
             Message::AccountUi(Action::OffstripClosed {
                 card,
                 source,
@@ -3947,6 +4029,7 @@ impl Cagents {
     }
 
     fn verify_login(&mut self, key: uuid::Uuid) -> Task<Message> {
+        let authority = self.account_ui.authority.clone();
         let browser_terminal = self.account_ui.logins.iter()
             .find(|login| login.key == key)
             .and_then(|login| self.sign_in_card(login.provider, &login.home))
@@ -3977,11 +4060,13 @@ impl Cagents {
             // that cannot answer leaves that unread; the home is still asked.
             let mut unread = None;
             if let Some((terminal, _)) = browser_terminal {
-                let blocked =
-                    tokio::task::spawn_blocking(move || callback_failed_on_host(terminal))
-                        .await
-                        .map_err(|error| error.to_string())
-                        .and_then(|result| result);
+                let callback_authority = authority.clone();
+                let blocked = tokio::task::spawn_blocking(move || {
+                    callback_failed_on_host(terminal, callback_authority)
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
                 match blocked {
                     Ok(true) => return Message::AccountUi(Action::LoginCallbackBlocked(key)),
                     Ok(false) => {}
@@ -3991,10 +4076,13 @@ impl Cagents {
             // No cache: the answer is about a home no other window knows.
             let outcome = if crate::device::is_remote() {
                 tokio::task::spawn_blocking(move || {
-                    match connection::request(crate::device_service::Operation::AccountProbe {
-                        account,
-                        force: true,
-                    })? {
+                    match connection::request(
+                        authority.clone(),
+                        crate::device_service::Operation::AccountProbe {
+                            account,
+                            force: true,
+                        },
+                    )? {
                         crate::device_service::Reply::AccountProbe(value) => {
                             serde_json::from_value(value).map_err(|error| error.to_string())
                         }
@@ -4006,7 +4094,7 @@ impl Cagents {
                 .and_then(|result| result)
                 .unwrap_or_else(Outcome::Failed)
             } else {
-                probe::run(account, None, true).await
+                connection::probe(authority, probe::run(account, None, true)).await
             };
             Message::AccountUi(Action::LoginVerified {
                 key,
@@ -4016,6 +4104,7 @@ impl Cagents {
     }
 
     fn login_verified(&mut self, key: uuid::Uuid, outcome: Outcome) -> Task<Message> {
+        let authority = self.account_ui.authority.clone();
         let outcome = match outcome {
             Outcome::Answered {
                 ref identity,
@@ -4090,7 +4179,10 @@ impl Cagents {
         if crate::device::is_remote() {
             return cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    remote_lifecycle(account::remote::Operation::Register { provider, key })
+                    remote_lifecycle(
+                        authority,
+                        account::remote::Operation::Register { provider, key },
+                    )
                 })
                 .await
                 .map_err(|error| error.to_string())
@@ -4116,6 +4208,12 @@ impl Cagents {
         let homes = self.account_ui.homes.clone();
         let fallback = self.account_ui.registry.clone();
         cosmic::task::future(async move {
+            if let Err(error) = connection::require_user(&authority) {
+                return Message::AccountUi(Action::LoginSettled {
+                    key,
+                    result: Err(error),
+                });
+            }
             let registration_homes = homes.clone();
             let registered = match store.clone() {
                 Some(store) => tokio::task::spawn_blocking(move || match registration_homes {
@@ -4144,7 +4242,9 @@ impl Cagents {
                     tokio::task::spawn_blocking(move || -> Result<Settled, String> {
                         Ok(Settled::Duplicate {
                             existing,
-                            registry: abandon_home(provider, key, remote_lifecycle::<Settled>)?,
+                            registry: abandon_home(provider, key, move |operation| {
+                                remote_lifecycle::<Settled>(authority, operation)
+                            })?,
                         })
                     })
                     .await
@@ -4257,7 +4357,10 @@ impl Cagents {
     /// remote devices. Managed deletion is unsupported; linked forget keeps
     /// all files and still requires the daemon's live-owner reservation.
     fn remove_account(&mut self, id: AccountId) -> Task<Message> {
-        self.remove_account_via(id, remote_lifecycle::<(Registry, Option<String>)>)
+        self.remove_account_via(id, {
+            let authority = self.account_ui.authority.clone();
+            move |operation| remote_lifecycle::<(Registry, Option<String>)>(authority, operation)
+        })
     }
 
     fn remove_account_via(
@@ -5177,16 +5280,19 @@ pub(super) fn pane_message(message: Message) -> Message {
     Message::UtilityPaneUi(Box::new(message))
 }
 
-fn browser_login_available() -> Result<(), String> {
-    let path = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-    check_browser_login_host(&path)?;
+fn browser_login_available(authority: crate::agent_execution::Authority) -> Result<(), String> {
+    let path = connection::selected_socket(&authority)?;
+    check_browser_login_host(&path, authority)?;
     account::login::check_callback_port()
 }
 
-fn check_browser_login_host(path: &Path) -> Result<(), String> {
+fn check_browser_login_host(
+    path: &Path,
+    authority: crate::agent_execution::Authority,
+) -> Result<(), String> {
     // The daemon may not have started yet. Its atomic spawn reservation is
     // authoritative; this earlier check avoids creating a needless home.
-    let mut client = match connection::at(path) {
+    let mut client = match connection::at(path, authority) {
         Ok(client) => client,
         Err(crate::control::ControlError::Connect(error))
             if matches!(
@@ -5232,9 +5338,12 @@ fn with_callback_unread(unread: Option<String>, outcome: Outcome) -> Outcome {
     }
 }
 
-fn callback_failed_on_host(terminal: TerminalId) -> Result<bool, String> {
-    let path = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-    let mut client = connection::at(&path).map_err(|error| error.to_string())?;
+fn callback_failed_on_host(
+    terminal: TerminalId,
+    authority: crate::agent_execution::Authority,
+) -> Result<bool, String> {
+    let path = connection::selected_socket(&authority)?;
+    let mut client = connection::at(&path, authority).map_err(|error| error.to_string())?;
     let hosted = client.list().map_err(|error| error.to_string())?;
     // A cancelled and already removed terminal has no failure left to read.
     if !hosted
@@ -5264,9 +5373,10 @@ fn sign_in_terminal(state: Option<&CardState>) -> Option<TerminalId> {
 /// since may not have restored it yet.
 fn ended_on_host(
     watched: &[(uuid::Uuid, TerminalId, HostSessionProof)],
+    authority: crate::agent_execution::Authority,
 ) -> Result<Vec<(uuid::Uuid, TerminalId)>, String> {
-    let path = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-    let mut client = connection::at(&path).map_err(|error| error.to_string())?;
+    let path = connection::selected_socket(&authority)?;
+    let mut client = connection::at(&path, authority).map_err(|error| error.to_string())?;
     let hosted = client.list().map_err(|error| error.to_string())?;
     let session = client.proof().clone();
     Ok(watched
@@ -5303,16 +5413,17 @@ fn offstrip_close_matches(state: Option<&CardState>, source: &TerminalSession) -
 /// Closes the hosted `terminal` for good. A daemon that restored it under
 /// a session of its own is asked again with that session, so a close is
 /// only reported done once the terminal has ended or is gone.
-fn stop_hosted(terminal: TerminalId, proof: &HostSessionProof) -> Result<(), String> {
-    let authority = crate::agent_execution::Authority::from_environment();
+fn stop_hosted(
+    terminal: TerminalId,
+    proof: &HostSessionProof,
+    authority: crate::agent_execution::Authority,
+) -> Result<(), String> {
     connection::require_user(&authority)?;
     use super::terminal_close::{CloseOutcome, close_hosted_terminal};
     let outcome = match close_hosted_terminal(terminal, proof, true) {
         CloseOutcome::Stale => {
-            let path =
-                crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-            let mut client =
-                connection::at_as(&path, authority).map_err(|error| error.to_string())?;
+            let path = connection::selected_socket(&authority)?;
+            let mut client = connection::at(&path, authority).map_err(|error| error.to_string())?;
             let hosted = client.list().map_err(|error| error.to_string())?;
             match hosted
                 .iter()
@@ -5582,11 +5693,15 @@ mod tests {
     fn browser_login_preflight_allows_normal_startup_after_a_stale_socket() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("daemon.sock");
-        assert!(check_browser_login_host(&path).is_ok());
+        assert!(
+            check_browser_login_host(&path, crate::agent_execution::Authority::default()).is_ok()
+        );
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         drop(listener);
         assert!(path.exists());
-        assert!(check_browser_login_host(&path).is_ok());
+        assert!(
+            check_browser_login_host(&path, crate::agent_execution::Authority::default()).is_ok()
+        );
     }
 
     fn state_with(snapshot: Option<UsageSnapshot>) -> AccountState {
@@ -9440,6 +9555,102 @@ mod app_tests {
         })
         .await
         .expect("finite synthetic lifecycle reply")
+    }
+
+    #[tokio::test]
+    async fn scoped_account_preferences_refuse_before_persistent_or_fixture_mutation() {
+        use crate::agent_execution::Authority;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("registry"));
+        store.update(|_| ()).unwrap();
+        let before = std::fs::read(directory.path().join("registry/accounts.toml")).unwrap();
+        for durable in [false, true] {
+            for authority in [
+                Authority::session("fixture-scope".into()),
+                Authority::session(String::new()),
+            ] {
+                let mut app = context_inspector_test_app(false);
+                app.account_ui =
+                    State::new_as(None, durable.then(|| store.clone()), None, authority);
+                let original = app.account_ui.registry.clone();
+                let changed = Arc::new(AtomicBool::new(false));
+                let write = changed.clone();
+                let task = app.save_registry(move |_| {
+                    write.store(true, Ordering::SeqCst);
+                });
+                assert!(matches!(
+                    lifecycle_message(task).await,
+                    Message::AccountUi(Action::Saved(Err(_)))
+                ));
+                assert!(!changed.load(Ordering::SeqCst));
+                assert_eq!(app.account_ui.registry, original);
+                assert_eq!(
+                    std::fs::read(directory.path().join("registry/accounts.toml")).unwrap(),
+                    before
+                );
+            }
+        }
+        // Synthetic User fixtures keep the established no-store in-memory path.
+        let mut app = context_inspector_test_app(false);
+        let account = Account::system(Provider::Codex);
+        let expected = account.clone();
+        let changed = Arc::new(AtomicBool::new(false));
+        let write = changed.clone();
+        drop(app.save_registry(move |registry| {
+            write.store(true, Ordering::SeqCst);
+            registry.set_default(&account);
+        }));
+        assert!(changed.load(Ordering::SeqCst));
+        assert_eq!(
+            app.account_ui
+                .registry
+                .default_account(Provider::Codex, None),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_link_and_home_creation_settle_without_touching_private_storage() {
+        use crate::agent_execution::Authority;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("registry"));
+        let homes = Homes::at(directory.path().join("homes"));
+        let mut app = context_inspector_test_app(false);
+        app.account_ui = State::new_as(
+            None,
+            Some(store),
+            Some(homes),
+            Authority::session("fixture-scope".into()),
+        );
+        app.account_ui.table.link =
+            Some((Provider::Codex, "/must-not-resolve-fixture-home".into()));
+        let task = app.link_account_home();
+        assert!(app.account_ui.table.linking);
+        let message = lifecycle_message(task).await;
+        assert!(matches!(
+            &message,
+            Message::AccountUi(Action::LinkReady { result: Err(_), .. })
+        ));
+        drop(app.update(message));
+        assert!(!app.account_ui.table.linking);
+        let task = app.add_account(Provider::Codex, true);
+        let message = lifecycle_message(task).await;
+        assert!(matches!(
+            &message,
+            Message::AccountUi(Action::HomeReady { result: Err(_), .. })
+        ));
+        drop(app.update(message));
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        assert!(app.account_ui.registry.registered().is_empty());
     }
 
     #[tokio::test]

@@ -26,6 +26,7 @@ impl Profile {
 }
 #[derive(Clone, Debug)]
 pub struct Target {
+    authority: crate::agent_execution::Authority,
     socket: PathBuf,
     proof: HostSessionProof,
     profile: Profile,
@@ -128,12 +129,14 @@ enum RequestKind {
 }
 #[derive(Debug, Clone)]
 struct Request {
+    authority: crate::agent_execution::Authority,
     sequence: u64,
     profile: Profile,
     kind: RequestKind,
 }
 #[derive(Default)]
 pub(super) struct State {
+    authority: crate::agent_execution::Authority,
     next: u64,
     owner: u64,
     visible: bool,
@@ -156,6 +159,13 @@ pub(super) struct State {
     problem: Option<&'static str>,
 }
 impl State {
+    pub(super) fn with_authority(authority: crate::agent_execution::Authority) -> Self {
+        Self {
+            authority,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn is_open(&self) -> bool {
         self.visible
     }
@@ -227,51 +237,62 @@ impl State {
         };
         let kind = request.kind.clone();
         let profile = request.profile.clone();
+        let authority = request.authority.clone();
         self.pending = None;
         match result {
-            Ok(response) if response.target.profile == profile => match (&kind, response.reply) {
-                (RequestKind::List, ImportReply::Listed(statuses))
-                    if valid_list(&statuses, &response.target.proof) =>
-                {
-                    self.retained = statuses;
-                    self.discovery = sequence;
-                    self.problem = if self.plan.as_ref().is_some_and(|plan| {
-                        !self.retained.iter().any(|status| &status.plan == plan)
-                    }) {
-                        Some(
-                            "The list did not confirm your local operation. Preserve its UUID and use Status; do not prepare it again.",
-                        )
-                    } else {
-                        None
-                    };
+            Ok(response)
+                if response.target.profile == profile && response.target.authority == authority =>
+            {
+                match (&kind, response.reply) {
+                    (RequestKind::List, ImportReply::Listed(statuses))
+                        if valid_list(&statuses, &response.target.proof) =>
+                    {
+                        self.retained = statuses;
+                        self.discovery = sequence;
+                        self.problem = if self.plan.as_ref().is_some_and(|plan| {
+                            !self.retained.iter().any(|status| &status.plan == plan)
+                        }) {
+                            Some(
+                                "The list did not confirm your local operation. Preserve its UUID and use Status; do not prepare it again.",
+                            )
+                        } else {
+                            None
+                        };
+                    }
+                    (RequestKind::Inspect(path), ImportReply::Inspected(inspection))
+                        if inspection.destination == response.target.proof
+                            && inspection.observation.validate().is_ok()
+                            && (!path.is_absolute()
+                                || inspection.observation.path() == path.as_path()) =>
+                    {
+                        self.inspection = Some((response.target, inspection));
+                        self.problem = None;
+                    }
+                    (
+                        RequestKind::Prepare(plan, _)
+                        | RequestKind::Status(plan)
+                        | RequestKind::Verify(plan),
+                        ImportReply::Status(status),
+                    ) if valid_status(
+                        &status,
+                        plan,
+                        &response.target.proof,
+                        self.status.as_ref(),
+                    ) =>
+                    {
+                        let reload =
+                            matches!(kind, RequestKind::Verify(_)) && status.registered.is_some();
+                        // A validated terminal ACK resolves local dispatch custody;
+                        // the retained journal still records any earlier uncertainty.
+                        self.local_uncertain =
+                            status.uncertain && status.stage != ImportStage::Registered;
+                        self.status = Some(status);
+                        self.problem = None;
+                        return reload;
+                    }
+                    _ => self.problem = Some(Failure::Invalid.description()),
                 }
-                (RequestKind::Inspect(path), ImportReply::Inspected(inspection))
-                    if inspection.destination == response.target.proof
-                        && inspection.observation.validate().is_ok()
-                        && (!path.is_absolute()
-                            || inspection.observation.path() == path.as_path()) =>
-                {
-                    self.inspection = Some((response.target, inspection));
-                    self.problem = None;
-                }
-                (
-                    RequestKind::Prepare(plan, _)
-                    | RequestKind::Status(plan)
-                    | RequestKind::Verify(plan),
-                    ImportReply::Status(status),
-                ) if valid_status(&status, plan, &response.target.proof, self.status.as_ref()) => {
-                    let reload =
-                        matches!(kind, RequestKind::Verify(_)) && status.registered.is_some();
-                    // A validated terminal ACK resolves local dispatch custody;
-                    // the retained journal still records any earlier uncertainty.
-                    self.local_uncertain =
-                        status.uncertain && status.stage != ImportStage::Registered;
-                    self.status = Some(status);
-                    self.problem = None;
-                    return reload;
-                }
-                _ => self.problem = Some(Failure::Invalid.description()),
-            },
+            }
             Ok(_) => self.problem = Some(Failure::Changed.description()),
             Err(Failure::Unavailable) if matches!(kind, RequestKind::List) => {
                 self.problem = Some(
@@ -462,6 +483,7 @@ impl State {
         };
         self.next = self.next.saturating_add(1);
         let request = Request {
+            authority: self.authority.clone(),
             sequence: self.next,
             profile,
             kind,
@@ -511,6 +533,7 @@ fn wire_operation(request: &Request, proof: &HostSessionProof) -> Result<ImportO
             if *proof != target.proof
                 || *proof != plan.destination
                 || target.profile != request.profile
+                || target.authority != request.authority
             {
                 return Err(Failure::PrepareNotSent);
             }
@@ -533,9 +556,11 @@ fn perform(request: Request) -> Result<Response, Failure> {
     let (socket, mut client) = match &request.kind {
         RequestKind::Prepare(_, target) => (
             target.socket.clone(),
-            super::connection::at(&target.socket).map_err(|_| Failure::Unavailable)?,
+            super::connection::at(&target.socket, request.authority.clone())
+                .map_err(|_| Failure::Unavailable)?,
         ),
-        _ => super::connection::current().map_err(|_| Failure::Unavailable)?,
+        _ => super::connection::current(request.authority.clone())
+            .map_err(|_| Failure::Unavailable)?,
     };
     let proof = client.proof().clone();
     let operation = wire_operation(&request, &proof)?;
@@ -545,6 +570,7 @@ fn perform(request: Request) -> Result<Response, Failure> {
     match reply {
         crate::device_service::Reply::AccountImport(reply) => Ok(Response {
             target: Target {
+                authority: request.authority,
                 socket,
                 proof,
                 profile: request.profile,

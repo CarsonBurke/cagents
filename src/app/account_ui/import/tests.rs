@@ -12,6 +12,7 @@ fn proof(name: &str) -> HostSessionProof {
 }
 fn target() -> Target {
     Target {
+        authority: crate::agent_execution::Authority::default(),
         socket: "/private-fixture/import.sock".into(),
         proof: proof("initial"),
         profile: Profile::current(),
@@ -1726,4 +1727,114 @@ fn only_a_matching_fresh_prepare_not_sent_result_can_release_local_custody() {
         assert_eq!(state.problem, Some(Failure::Invalid.description()));
         assert_eq!(state.owner, owner);
     }
+}
+
+#[test]
+fn import_requests_retain_scope_through_reconnect_and_reject_rebased_replies() {
+    use crate::agent_execution::Authority;
+    let scope = Authority::session("fixture-original-scope".into());
+    let mut state = State::with_authority(scope.clone());
+    act(&mut state, Action::Open);
+    let owner = state.owner;
+    for action in [
+        Action::Path(owner, "/fixture/auth.json".into()),
+        Action::Email(owner, "fixture@example.test".into()),
+        Action::CopyConsent(owner, true),
+        Action::SessionConsent(owner, true),
+    ] {
+        act(&mut state, action);
+    }
+    let inspect = act(&mut state, Action::Inspect(owner)).unwrap();
+    assert_eq!(inspect.authority, scope);
+    let scoped_target = Target {
+        authority: scope.clone(),
+        ..target()
+    };
+    act(
+        &mut state,
+        Action::Finished {
+            sequence: inspect.sequence,
+            result: Ok(Response {
+                target: scoped_target.clone(),
+                reply: ImportReply::Inspected(ImportInspection {
+                    destination: scoped_target.proof.clone(),
+                    observation: observation(),
+                }),
+            }),
+        },
+    );
+    let prepare = act(&mut state, Action::Prepare(owner)).unwrap();
+    assert_eq!(prepare.authority, scope);
+    let plan = state.plan.clone().unwrap();
+    assert!(wire_operation(&prepare, &scoped_target.proof).is_ok());
+    let mut rebased = prepare.clone();
+    rebased.authority = Authority::default();
+    assert!(matches!(
+        wire_operation(&rebased, &scoped_target.proof),
+        Err(Failure::PrepareNotSent)
+    ));
+    act(
+        &mut state,
+        Action::Finished {
+            sequence: prepare.sequence,
+            result: Err(Failure::Unavailable),
+        },
+    );
+    act(&mut state, Action::Close(owner));
+    act(&mut state, Action::Open);
+    let owner = state.owner;
+    let status_request = act(&mut state, Action::Status(owner)).unwrap();
+    assert_eq!(status_request.authority, scope);
+    act(
+        &mut state,
+        Action::Finished {
+            sequence: status_request.sequence,
+            result: Ok(Response {
+                target: target(),
+                reply: ImportReply::Status(status(&plan, ImportStage::Published)),
+            }),
+        },
+    );
+    assert!(
+        state.status.is_none(),
+        "a User-scoped reply cannot settle the original request"
+    );
+    assert_eq!(state.plan.as_ref(), Some(&plan));
+    let retry_status = act(&mut state, Action::Status(owner)).unwrap();
+    assert_eq!(retry_status.authority, scope);
+    act(
+        &mut state,
+        Action::Finished {
+            sequence: retry_status.sequence,
+            result: Ok(Response {
+                target: scoped_target,
+                reply: ImportReply::Status(status(&plan, ImportStage::Published)),
+            }),
+        },
+    );
+    let verify = act(&mut state, Action::Verify(owner)).unwrap();
+    assert_eq!(verify.authority, scope);
+    assert!(
+        matches!(wire_operation(&verify, &proof("reconnected")), Ok(ImportOperation::Verify { operation, .. }) if operation == plan.operation)
+    );
+    act(
+        &mut state,
+        Action::Finished {
+            sequence: verify.sequence,
+            result: Ok(Response {
+                target: Target {
+                    authority: scope.clone(),
+                    proof: proof("reconnected"),
+                    ..target()
+                },
+                reply: ImportReply::Status({
+                    let mut value = status(&plan, ImportStage::Published);
+                    value.observed_destination = proof("reconnected");
+                    value
+                }),
+            }),
+        },
+    );
+    assert_eq!(state.status.as_ref().unwrap().stage, ImportStage::Published);
+    assert_eq!(state.authority, scope);
 }

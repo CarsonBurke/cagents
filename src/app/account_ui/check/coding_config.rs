@@ -59,6 +59,7 @@ impl Context {
                 && current.request == self.request
                 && current.target.proof == self.target.proof
                 && current.target.socket == self.target.socket
+                && current.target.authority == self.target.authority
                 && self.fence.matches(&app.account_ui)
         })
     }
@@ -101,6 +102,7 @@ impl Completion {
             || form.fence.account != self.context.fence.account
             || target.proof != self.context.target.proof
             || target.socket != self.context.target.socket
+            || target.authority != self.context.target.authority
         {
             return false;
         }
@@ -133,8 +135,9 @@ fn message(action: Action) -> Message {
     super::message(super::Action::CodingConfig(action))
 }
 fn inspect(context: Context) -> Result<Observation, Failure> {
-    let mut client = super::super::connection::at(&context.target.socket)
-        .map_err(|_| Failure::DeviceUnavailable)?;
+    let mut client =
+        super::super::connection::at(&context.target.socket, context.target.authority.clone())
+            .map_err(|_| Failure::DeviceUnavailable)?;
     if client.proof() != &context.target.proof {
         return Err(Failure::DeviceChanged);
     }
@@ -151,8 +154,9 @@ fn inspect(context: Context) -> Result<Observation, Failure> {
     }
 }
 fn create(context: Context, request: CreateRequest) -> Result<CreateReport, Failure> {
-    let mut client = super::super::connection::at(&context.target.socket)
-        .map_err(|_| Failure::DeviceUnavailable)?;
+    let mut client =
+        super::super::connection::at(&context.target.socket, context.target.authority.clone())
+            .map_err(|_| Failure::DeviceUnavailable)?;
     if client.proof() != &context.target.proof {
         return Err(Failure::DeviceChanged);
     }
@@ -466,6 +470,30 @@ mod tests {
             panic!("missing real creation intent")
         };
         (pending.sequence, request.clone())
+    }
+
+    #[test]
+    fn coding_defaults_context_and_completion_reject_changed_connection_scope() {
+        let (mut app, _, _) = ready();
+        let context = Context::capture(&app).unwrap();
+        let completion = Completion {
+            context: context.clone(),
+            text: "fixture report".into(),
+        };
+        assert!(context.current(&app));
+        assert!(completion.current(&app));
+        app.account_ui
+            .check
+            .form
+            .as_mut()
+            .unwrap()
+            .target
+            .as_mut()
+            .unwrap()
+            .authority =
+            crate::agent_execution::Authority::session("different-fixture-scope".into());
+        assert!(!context.current(&app));
+        assert!(!completion.current(&app));
     }
 
     #[test]

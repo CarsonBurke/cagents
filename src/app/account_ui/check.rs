@@ -57,10 +57,12 @@ impl Fence {
 
 #[derive(Debug, Clone)]
 pub struct Target {
+    authority: crate::agent_execution::Authority,
     socket: PathBuf,
     proof: HostSessionProof,
 }
 struct Form {
+    authority: crate::agent_execution::Authority,
     sequence: u64,
     fence: Fence,
     name: String,
@@ -181,9 +183,11 @@ impl Action {
 fn message(action: Action) -> Message {
     Message::AccountUi(super::Action::Check(action))
 }
-fn prepare() -> Result<Target, Failure> {
-    let (socket, client) = super::connection::current().map_err(|_| Failure::DeviceUnavailable)?;
+fn prepare(authority: crate::agent_execution::Authority) -> Result<Target, Failure> {
+    let (socket, client) =
+        super::connection::current(authority.clone()).map_err(|_| Failure::DeviceUnavailable)?;
     Ok(Target {
+        authority,
         socket,
         proof: client.proof().clone(),
     })
@@ -210,8 +214,8 @@ fn exchange(
 }
 fn run(target: Target, request: CheckRequest) -> Result<CheckReport, Failure> {
     request.validate().map_err(|_| Failure::InvalidResponse)?;
-    let mut client =
-        super::connection::at(&target.socket).map_err(|_| Failure::DeviceUnavailable)?;
+    let mut client = super::connection::at(&target.socket, target.authority.clone())
+        .map_err(|_| Failure::DeviceUnavailable)?;
     exchange(&mut client, &target, &request)
 }
 
@@ -251,10 +255,12 @@ impl Cagents {
                     .filter(|key| key.host.eq_ignore_ascii_case("github.com") && key.port.is_none())
                     .map(|key| format!("{}/{}", key.owner, key.name))
                     .unwrap_or_default();
+                let authority = self.account_ui.authority.clone();
                 let state = &mut self.account_ui.check;
                 state.next = state.next.saturating_add(1);
                 let sequence = state.next;
                 state.form = Some(Form {
+                    authority: authority.clone(),
                     sequence,
                     fence,
                     name,
@@ -280,7 +286,7 @@ impl Cagents {
                 self.account_ui.table.close_popups();
                 Task::perform(
                     async move {
-                        let result = tokio::task::spawn_blocking(prepare)
+                        let result = tokio::task::spawn_blocking(move || prepare(authority))
                             .await
                             .unwrap_or(Err(Failure::DeviceUnavailable));
                         Action::Prepared {
@@ -305,7 +311,10 @@ impl Cagents {
                 {
                     current.preparing = false;
                     match result {
-                        Ok(target) => current.target = Some(target),
+                        Ok(target) if target.authority == current.authority => {
+                            current.target = Some(target)
+                        }
+                        Ok(_) => current.problem = Some(Failure::DeviceChanged.description()),
                         Err(error) => current.problem = Some(error.description()),
                     }
                 }
@@ -671,6 +680,7 @@ mod tests {
     }
     fn target() -> Target {
         Target {
+            authority: crate::agent_execution::Authority::default(),
             socket: "/task-owned-fixture.sock".into(),
             proof: proof("device-a"),
         }
@@ -803,6 +813,50 @@ mod tests {
             &mut messages,
         );
         messages
+    }
+
+    #[test]
+    fn prepared_checks_keep_original_scope_and_refuse_a_rebased_target() {
+        use crate::agent_execution::Authority;
+        let scope = Authority::session("fixture-original-scope".into());
+        let mut app = context_inspector_test_app(false);
+        app.account_ui = super::super::State::new_as(None, None, None, scope.clone());
+        let first = app.account_ui.add_managed_fixture(Provider::Codex, 145903);
+        app.active_workspace = Some("~/selected-worktree".into());
+        drop(app.update_account_check(Action::Open(first.clone())));
+        let sequence = app.account_ui.check.form.as_ref().unwrap().sequence;
+        assert_eq!(app.account_ui.check.form.as_ref().unwrap().authority, scope);
+        drop(app.update_account_check(Action::Prepared {
+            form: sequence,
+            result: Ok(target()),
+        }));
+        assert!(app.account_ui.check.form.as_ref().unwrap().target.is_none());
+        let scoped = Target {
+            authority: scope.clone(),
+            ..target()
+        };
+        drop(app.update_account_check(Action::Prepared {
+            form: sequence,
+            result: Ok(scoped),
+        }));
+        let form = app.account_ui.check.form.as_mut().unwrap();
+        form.email = "fixture@example.test".into();
+        drop(app.update_account_check(Action::Run(sequence)));
+        let pending = app.account_ui.check.pending.as_ref().unwrap();
+        assert_eq!(pending.target.authority, scope);
+        assert_eq!(pending.target.socket, target().socket);
+        assert_eq!(pending.target.proof, target().proof);
+        drop(app.update_account_check(Action::Close(sequence)));
+        assert_eq!(
+            app.account_ui
+                .check
+                .pending
+                .as_ref()
+                .unwrap()
+                .target
+                .authority,
+            scope
+        );
     }
 
     #[test]
