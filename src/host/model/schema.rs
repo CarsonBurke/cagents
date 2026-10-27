@@ -275,6 +275,9 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static SEVENTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static EIGHTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static NINETEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY_ONE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY_TWO: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -284,6 +287,9 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         17 => &SEVENTEEN,
         18 => &EIGHTEEN,
         19 => &NINETEEN,
+        20 => &TWENTY,
+        21 => &TWENTY_ONE,
+        22 => &TWENTY_TWO,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -765,6 +771,13 @@ mod tests {
             (15, "DROP TABLE native_actor_retirements;"),
             (16, "DROP TABLE automation_lifecycle;"),
             (16, "DROP INDEX automation_lifecycle_scoped;"),
+            (22, "DROP TABLE automation_precheck_history_cleanup;"),
+            (22, "DROP TABLE automation_retired_manual_requests;"),
+            (22, "DROP INDEX automation_removed_history;"),
+            (
+                22,
+                "ALTER TABLE automation_firings DROP COLUMN previous_firing;",
+            ),
             (17, "DROP TABLE channel_work_operations;"),
             (17, "DROP TABLE channel_work_entries;"),
             (17, "DROP TABLE channel_work_homes;"),
@@ -791,6 +804,21 @@ mod tests {
             (
                 17,
                 "ALTER TABLE channel_work_entries RENAME COLUMN bucket TO wrong_bucket;",
+            ),
+            (21, "DROP TABLE automation_run_attention;"),
+            (
+                21,
+                "ALTER TABLE automation_run_attention ADD COLUMN unexpected_payload TEXT;",
+            ),
+            (
+                21,
+                "DROP TABLE automation_run_attention;
+                  CREATE TABLE automation_run_attention(ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
+                      run TEXT NOT NULL,revision TEXT NOT NULL,event TEXT NOT NULL) STRICT;",
+            ),
+            (
+                21,
+                "ALTER TABLE automation_run_attention RENAME COLUMN revision TO changed_revision;",
             ),
             (
                 15,
@@ -832,7 +860,7 @@ mod tests {
 
     #[test]
     fn native_actor_schema_generations_preserve_existing_receipts_on_upgrade_and_reopen() {
-        for version in [13, 14, 15, 16, 17] {
+        for version in [13, 14, 15, 16, 17, 18] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("native-actor-generations.sqlite3");
             legacy(&path, version);
@@ -1004,7 +1032,7 @@ mod tests {
         for _ in 0..2 {
             let registry = Registry::at(&path).unwrap();
             require_current(&registry.db).unwrap();
-            assert_eq!(inspect(&registry.db).unwrap().version, 19);
+            assert_eq!(inspect(&registry.db).unwrap().version, SCHEMA_VERSION);
             let mut inventory = inspect(&registry.db).unwrap().objects;
             let outbox = inventory
                 .iter()
@@ -1019,7 +1047,55 @@ mod tests {
                     tokens(super::super::automation_notifications::SCHEMA_SQL).unwrap(),
                 )
             );
-            assert_eq!(inventory, old_layout, "only the outbox table may be added");
+            // This current opener also applies retention20 and run-attention21.
+            // Admit only those known objects here; every predecessor object
+            // and the exact lifecycle outbox assertion stay intact.
+            let retention_names = [
+                "terminal_retention_pins",
+                "shared_terminal_retention_pins",
+                "shared_terminal_retention_by_terminal",
+                "automation_run_attention",
+                "automation_precheck_history_cleanup",
+                "automation_retired_manual_requests",
+                "automation_removed_history",
+            ];
+            for name in retention_names {
+                let index = inventory
+                    .iter()
+                    .position(|object| object.1 == name)
+                    .unwrap();
+                inventory.remove(index);
+            }
+            for table in [
+                "terminal_retention_pins",
+                "shared_terminal_retention_pins",
+                "automation_run_attention",
+                "automation_precheck_history_cleanup",
+                "automation_retired_manual_requests",
+            ] {
+                assert_eq!(
+                    registry
+                        .db
+                        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                            .get::<_, u32>(0))
+                        .unwrap(),
+                    0
+                );
+            }
+            // History22 appends only this column to an existing table. Compare
+            // the exact original published DDL after removing that known suffix.
+            let firing = inventory
+                .iter_mut()
+                .find(|object| object.1 == "automation_firings")
+                .unwrap();
+            let suffix = tokens(", previous_firing TEXT").unwrap();
+            let close = firing.3.len() - 2; // final ')' then STRICT
+            assert_eq!(&firing.3[close - suffix.len()..close], &suffix);
+            firing.3.drain(close - suffix.len()..close);
+            assert_eq!(
+                inventory, old_layout,
+                "only lifecycle/run outboxes, retention objects and the exact history suffix may be added"
+            );
             assert!(
                 registry
                     .pending_automation_notifications(100)
@@ -1286,10 +1362,67 @@ mod tests {
     }
 
     #[test]
+    fn published_twenty_run_attention_failure_rolls_back_before_retry() {
+        let _clear = Clear;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention21-rollback.sqlite3");
+        let (identity, channel) = legacy(&path, 20);
+        let before = bytes(&path);
+        FAIL_STEP.with(|step| step.set(Some(21)));
+        let error = Registry::at(&path)
+            .err()
+            .expect("injected21 failure must refuse");
+        FAIL_STEP.with(|step| step.set(None));
+        assert!(
+            error.contains("injected migration failure at 21"),
+            "{error}"
+        );
+        assert_eq!(bytes(&path), before);
+        assert!(!wal(&path).exists());
+        let db = Connection::open(&path).unwrap();
+        assert_eq!(
+            db.pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            20
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name='automation_run_attention'",
+                [],
+                |row| row.get::<_, u64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        drop(db);
+        let registry = Registry::at(&path).unwrap();
+        assert_eq!(registry.model().unwrap().identity.to_string(), identity);
+        assert_eq!(
+            registry.model().unwrap().channel(channel).unwrap().ordinal,
+            5
+        );
+        assert!(
+            registry
+                .pending_automation_attention(100)
+                .unwrap()
+                .is_empty()
+        );
+        require_current(&registry.db).unwrap();
+        drop(registry);
+        assert!(
+            Registry::at(&path)
+                .unwrap()
+                .pending_automation_attention(100)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn each_actual_migration_failure_rolls_back_all_prior_steps_and_header() {
         let _clear = Clear;
         for step in [
-            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("rollback.sqlite3");

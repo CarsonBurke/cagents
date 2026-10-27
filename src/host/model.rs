@@ -24,7 +24,9 @@ use crate::{
     workspace_model::{ModelChannel, ModelEdit, ModelProject, WorkspaceModel},
 };
 
+mod automation_attention;
 mod automation_audit;
+pub(super) use automation_attention::{AutomationAttentionReceipt, PendingAutomationAttention};
 pub(super) mod automation_notifications;
 mod automation_proposals;
 mod automations;
@@ -43,9 +45,10 @@ pub(super) use native_actor_retirement::{NativeActorOwnership, NativeActorRetire
 mod navigation;
 mod schema;
 mod terminal_owners;
+mod terminal_retention;
 mod views;
 
-const SCHEMA_VERSION: u32 = 19;
+const SCHEMA_VERSION: u32 = 22;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -636,6 +639,18 @@ fn migrate_through(
         automation_notifications::migrate(tx)?;
         schema::migration_checkpoint(19)?;
     }
+    if version < 20 && target >= 20 {
+        terminal_retention::migrate(tx)?;
+        schema::migration_checkpoint(20)?;
+    }
+    if version < 21 && target >= 21 {
+        automation_attention::migrate(tx)?;
+        schema::migration_checkpoint(21)?;
+    }
+    if version < 22 && target >= 22 {
+        automations::migrate_history(tx)?;
+        schema::migration_checkpoint(22)?;
+    }
     Ok(())
 }
 
@@ -1085,7 +1100,14 @@ mod tests {
         registry
             .db
             .execute_batch(
-                "DROP TABLE automation_notifications;
+                "DROP TABLE automation_precheck_history_cleanup;
+                 DROP TABLE automation_retired_manual_requests;
+                 DROP INDEX automation_removed_history;
+                 ALTER TABLE automation_firings DROP COLUMN previous_firing;
+                 DROP TABLE automation_run_attention;
+                 DROP TABLE shared_terminal_retention_pins;
+                 DROP TABLE terminal_retention_pins;
+                 DROP TABLE automation_notifications;
                  DROP TABLE channel_work_placement_epochs;
                  DROP TABLE channel_work_placement_clock;
                  DROP TABLE channel_work_operations;

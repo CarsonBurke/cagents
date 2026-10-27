@@ -538,6 +538,14 @@ fn changed_for_instance(
     let Some(record) = chats.get_mut(&id) else {
         return;
     };
+    // This is a request to reevaluate lifecycle state, not a cleanup receipt.
+    // Check the exact current producer under HostState; a failed/retained owner
+    // must not masquerade as released work. Remote proxies publish Resident
+    // metadata before this callback, so this reads no helper or transcript.
+    let wake_completed = instance.is_some()
+        && matches!(update, Update::Observed { .. })
+        && record.handle.is_completed()
+        && !record.handle.owns_work();
     for (&client, &visible) in &record.subscribers {
         let message = match &update {
             &Update::Activity { state, generation } => ServerMessage::ChatActivity {
@@ -593,6 +601,10 @@ fn changed_for_instance(
         })
     {
         record.handle.observe_next_update();
+    }
+    drop(state);
+    if wake_completed {
+        crate::daemon::wake();
     }
 }
 /// Hydration may contact a retained helper and must run outside HostState.
@@ -864,6 +876,52 @@ pub(super) fn has_native_owner(session: &Session) -> Result<bool, ProtocolError>
         .map_err(unavailable)
 }
 
+pub(super) fn require_unreserved_terminals(
+    state: &HostState,
+    session: &Session,
+) -> Result<(), ProtocolError> {
+    state.ensure_retention_available(&[session.id])?;
+    if let Some(terminal) = &session.terminal {
+        state.ensure_retention_available(&[terminal.id])?;
+    }
+    // Failed retirement remains readable/retryable, but it is not permission
+    // to install a new native writer over unconfirmed original cleanup.
+    for id in std::iter::once(session.id).chain(session.terminal.as_ref().map(|source| source.id)) {
+        if state.terminal_retirements.get(&id).is_some_and(|entry| {
+            state
+                .terminals
+                .get(&id)
+                .is_some_and(|record| record.handle.same_worker(&entry.handle))
+        }) {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::TerminalUnavailable,
+                "Terminal retirement remains unconfirmed; explicitly retry its close before starting a native writer",
+                true,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Starts admitted before explicit close reserved its probe may still own an
+/// unpublished actor. Keep the original terminal until that claim settles.
+pub(super) fn terminal_claim_pending(state: &HostState, terminal: TerminalId) -> bool {
+    let claims = |session: &Session| {
+        session.id == terminal
+            || session
+                .terminal
+                .as_ref()
+                .is_some_and(|source| source.id == terminal)
+    };
+    state.chat_spawning.values().any(claims)
+        || state
+            .native_actor_startups
+            .values()
+            .any(|startup| claims(&startup.source) || claims(&startup.requested))
+        || state.native_closing.contains_key(&terminal)
+        || state.chat_handoffs.contains_key(&terminal)
+}
+
 fn start_with_execution(
     host: &SharedHost,
     client: ClientId,
@@ -880,6 +938,7 @@ fn start_with_execution(
     // an unexposed startup guard to retire it without a semantic consumer.
     let pending = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        require_unreserved_terminals(&state, &session)?;
         state
             .native_actor_startups
             .get(&session.id)
@@ -1281,6 +1340,7 @@ fn start_with_execution(
     }
     let source_handle = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        require_unreserved_terminals(&state, &session)?;
         if state.shutting_down {
             return Err(unavailable("Daemon is shutting down"));
         }
@@ -1562,6 +1622,7 @@ fn start_with_execution(
                 .clone()
                 .ok_or_else(|| unavailable("Retained startup lost its pinned execution context"))?;
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            require_unreserved_terminals(&state, &session)?;
             if state.native_actor_startups.contains_key(&id) {
                 return Err(unavailable(
                     "An exact retained startup still owns cleanup; no second helper was started",
@@ -1664,7 +1725,7 @@ fn start_with_execution(
             .map_or(execution_instance, |identity| identity.instance);
         let _ = owner_instance.set(execution_instance);
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if state.shutting_down {
+        if state.shutting_down || require_unreserved_terminals(&state, &session).is_err() {
             drop(state);
             let _ = handle.close();
             return Err(unavailable("Daemon shutdown cancelled chat start"));
@@ -1701,6 +1762,7 @@ fn start_with_execution(
 
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down
+            || require_unreserved_terminals(&state, &record.session).is_err()
             || state.proof() != &proof
             || state.chat_spawning.get(&reservation_id) != Some(&reservation)
             || state
@@ -1749,6 +1811,7 @@ fn codex_terminal_view(
     let handle = owners.target.handle.clone();
     let completed = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        require_unreserved_terminals(&state, &session)?;
         owners.require_locked(&state, closing)?;
         let record = attached(&state, client, chat_id)?;
         if !owners.target.matches(record) {
@@ -1921,6 +1984,8 @@ fn codex_terminal_view(
         {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             owners.require_locked(&state, closing)?;
+            require_unreserved_terminals(&state, &session)?;
+            state.ensure_retention_available(&[descriptor.session.id])?;
             if !state
                 .terminals
                 .get(&chat_id)
@@ -1946,6 +2011,8 @@ fn codex_terminal_view(
             .map_err(unavailable)?;
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         owners.require_locked(&state, closing)?;
+        require_unreserved_terminals(&state, &session)?;
+        state.ensure_retention_available(&[descriptor.session.id])?;
         if !state
             .terminals
             .get(&chat_id)
@@ -3740,6 +3807,498 @@ mod tests {
         model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe},
     };
     use serde_json::{Value, json};
+
+    // Each case owns the process-global daemon wake pipe in an exact child;
+    // unrelated tests cannot supply the wake this regression is waiting for.
+    fn isolated_completion_wake_case(marker: &str) -> bool {
+        const AUTH_PRESENT: &str = "CAGENTS_COMPLETION_WAKE_AUTH_PRESENT";
+        if std::env::var_os(marker).is_some() {
+            assert_eq!(
+                std::env::var(AUTH_PRESENT).unwrap(),
+                std::env::var_os(crate::agent_execution::AUTHORITY_ENV)
+                    .is_some()
+                    .to_string()
+            );
+            return false;
+        }
+        let directory = tempfile::Builder::new().prefix("cw-").tempdir().unwrap();
+        let stdout_path = directory.path().join("stdout.log");
+        let stderr_path = directory.path().join("stderr.log");
+        let name = thread::current().name().unwrap().to_owned();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+            .env(marker, "1")
+            .env(
+                AUTH_PRESENT,
+                std::env::var_os(crate::agent_execution::AUTHORITY_ENV)
+                    .is_some()
+                    .to_string(),
+            )
+            .env("XDG_RUNTIME_DIR", directory.path())
+            .env("XDG_DATA_HOME", directory.path().join("data"))
+            .env("XDG_CONFIG_HOME", directory.path().join("config"))
+            .env("XDG_CACHE_HOME", directory.path().join("cache"))
+            .env("HOME", directory.path().join("home"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::fs::File::create(&stdout_path).unwrap())
+            .stderr(std::fs::File::create(&stderr_path).unwrap())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                break child.wait().unwrap();
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let stdout = std::fs::read_to_string(&stdout_path).unwrap();
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap();
+        print!("{stdout}");
+        eprint!("{stderr}");
+        if !status.success() {
+            eprintln!(
+                "saved completion-wake child logs: {}",
+                directory.keep().display()
+            );
+        }
+        assert!(status.success(), "completion wake child failed");
+        true
+    }
+
+    fn completion_wake_host() -> SharedHost {
+        Arc::new(HostLock::new(HostState::new(HostSessionProof {
+            host_session_id: HostSessionId::new(uuid::Uuid::new_v4().to_string()),
+            host_incarnation: HostIncarnation::new(uuid::Uuid::new_v4().to_string()),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+        })))
+    }
+
+    fn completion_wake_record(
+        host: &SharedHost,
+        id: TerminalId,
+        instance: uuid::Uuid,
+        handle: Handle,
+        launch: chat::Launch,
+    ) -> Session {
+        let mut state = host.lock().unwrap();
+        let session = Session {
+            id,
+            launch,
+            proof: Some(state.proof().clone()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        state.chats.insert(
+            id,
+            Record {
+                execution_instance: instance,
+                console_recipe: None,
+                paired_terminal: None,
+                session: session.clone(),
+                handle,
+                source_process: None,
+                subscribers: BTreeMap::new(),
+                observations: BTreeMap::new(),
+                completion_observed: false,
+                returning_terminal: false,
+            },
+        );
+        session
+    }
+
+    fn direct_completion_actor(
+        script: &str,
+        cwd: &std::path::Path,
+        notify: impl Fn(Update) + Send + Sync + 'static,
+    ) -> (Handle, chat::Launch) {
+        let recipe = LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), script.into()],
+            working_directory: cwd.into(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        let spec = ProcessSpec::from(&recipe);
+        let mut initial = Step::default();
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let handle =
+            Handle::start(spec, Box::new(Echo(false)), initial, store, None, notify).unwrap();
+        (
+            handle,
+            chat::Launch {
+                provider: Provider::Claude,
+                recipe,
+                session_id: None,
+            },
+        )
+    }
+
+    fn completion_wait_until(mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(
+                Instant::now() < deadline,
+                "completion fixture did not advance"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn hidden_completion_wakes_parked_daemon_after_rearm_is_consumed_and_fences_old_owners() {
+        if isolated_completion_wake_case("CAGENTS_LOCAL_COMPLETION_WAKE_CASE") {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let listener_path = directory.path().join("idle.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&listener_path).unwrap();
+        let host = completion_wake_host();
+        let id = TerminalId::new();
+        let instance = uuid::Uuid::new_v4();
+        let weak = Arc::downgrade(&host);
+        let (updates, received) = std::sync::mpsc::channel();
+        let (handle, launch) = direct_completion_actor(
+            "printf '{}\\n'; IFS= read -r line; printf '{}\\n'",
+            directory.path(),
+            move |update| {
+                let completed = weak.upgrade().is_some_and(|host| {
+                    host.lock()
+                        .unwrap()
+                        .chats
+                        .get(&id)
+                        .is_some_and(|record| record.handle.is_completed())
+                });
+                let observed = matches!(update, Update::Observed { .. });
+                changed_owned(&weak, id, instance, update);
+                if observed {
+                    let _ = updates.send(completed);
+                }
+            },
+        );
+        completion_wake_record(&host, id, instance, handle.clone(), launch);
+        handle.set_visible(false);
+        // A real provider frame consumed the initial one-shot observation.
+        assert!(!received.recv_timeout(Duration::from_secs(5)).unwrap());
+        assert!(!handle.is_completed() && handle.owns_work());
+        assert!(host.lock().unwrap().chats[&id].subscribers.is_empty());
+        crate::daemon::wake();
+        crate::daemon::wait_for_activity(&listener).unwrap(); // drain setup only
+        let parked = listener.try_clone().unwrap();
+        let (done, returned) = std::sync::mpsc::channel();
+        let waiter = thread::spawn(move || {
+            done.send(crate::daemon::wait_for_activity(&parked))
+                .unwrap();
+        });
+        assert!(matches!(
+            returned.recv_timeout(Duration::from_millis(40)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        changed_owned(
+            &Arc::downgrade(&host),
+            id,
+            instance,
+            Update::Observed { generation: 0 },
+        );
+        assert!(
+            matches!(
+                returned.recv_timeout(Duration::from_millis(40)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "a still-owned actor is not completion"
+        );
+        // This wakes only the actor's own command pipe, not the daemon listener.
+        handle.command(Command::Refresh).unwrap();
+        let result = returned.recv_timeout(Duration::from_secs(5));
+        if result.is_err() {
+            // Bounded fixture cleanup must not disguise the missing product wake.
+            let _ = std::os::unix::net::UnixStream::connect(&listener_path);
+        }
+        waiter.join().unwrap();
+        result
+            .expect("completion did not wake parked daemon")
+            .unwrap();
+        completion_wait_until(|| handle.is_completed());
+        handle.close().unwrap();
+        let post = received.try_iter().filter(|completed| *completed).count();
+        assert_eq!(
+            post, 1,
+            "exactly one local post-completion observation is forced"
+        );
+        assert!(!handle.owns_work());
+
+        // A genuinely different, completed actor reuses this pane ID. Without
+        // the instance fence, the retired callback would wake on its state.
+        let (replacement, launch) =
+            direct_completion_actor("printf '{}\\n'", directory.path(), |_| {});
+        completion_wait_until(|| replacement.is_completed());
+        replacement.close().unwrap();
+        let replacement_instance = uuid::Uuid::new_v4();
+        completion_wake_record(&host, id, replacement_instance, replacement.clone(), launch);
+        crate::daemon::wake();
+        crate::daemon::wait_for_activity(&listener).unwrap();
+        let parked = listener.try_clone().unwrap();
+        let (done, returned) = std::sync::mpsc::channel();
+        let waiter = thread::spawn(move || {
+            done.send(crate::daemon::wait_for_activity(&parked))
+                .unwrap();
+        });
+        changed_owned(
+            &Arc::downgrade(&host),
+            id,
+            instance,
+            Update::Observed {
+                generation: u64::MAX,
+            },
+        );
+        assert!(
+            matches!(
+                returned.recv_timeout(Duration::from_millis(40)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "retired instance woke for replacement"
+        );
+        let (failed, launch) =
+            direct_completion_actor("printf 'not-json\\n'", directory.path(), |_| {});
+        completion_wait_until(|| failed.is_completed());
+        assert!(failed.failure().is_some() && failed.owns_work());
+        let failed_instance = uuid::Uuid::new_v4();
+        completion_wake_record(&host, id, failed_instance, failed.clone(), launch);
+        changed_owned(
+            &Arc::downgrade(&host),
+            id,
+            failed_instance,
+            Update::Observed {
+                generation: u64::MAX,
+            },
+        );
+        assert!(
+            matches!(
+                returned.recv_timeout(Duration::from_millis(40)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "failed owner announced released work"
+        );
+        let _client = std::os::unix::net::UnixStream::connect(&listener_path).unwrap();
+        returned
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        waiter.join().unwrap();
+        failed.close().unwrap();
+        host.lock().unwrap().chats.clear();
+    }
+
+    #[test]
+    fn retained_hidden_completion_forwards_final_metadata_and_wakes_parked_daemon() {
+        if isolated_completion_wake_case("CAGENTS_RETAINED_COMPLETION_WAKE_CASE") {
+            return;
+        }
+        use std::io::Write;
+        use std::os::unix::{
+            ffi::OsStrExt,
+            fs::{OpenOptionsExt, PermissionsExt},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("claude");
+        std::fs::create_dir(&home).unwrap();
+        let gate = directory.path().join("finish");
+        let gate_path = std::ffi::CString::new(gate.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(gate_path.as_ptr(), 0o600) }, 0);
+        let provider = directory.path().join("claude-fixture");
+        std::fs::write(&provider, r#"#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in --session-id=*) session=${arg#--session-id=} ;; esac
+done
+IFS= read -r frame || exit 2
+id=${frame#*\"request_id\":\"}
+id=${id%%\"*}
+printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"current_permission_mode":"default"}}}\n' "$id"
+printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$session"
+IFS= read -r finish < finish
+"#).unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let host = completion_wake_host();
+        // Semantic close commits the genuine helper journal and retirement;
+        // the wake-only bare Host fixture does not install that durable store.
+        host.lock().unwrap().install_model(
+            super::super::model::Registry::at(&directory.path().join("registry.sqlite3")).unwrap(),
+        );
+        let proof = host.lock().unwrap().proof().clone();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let id = TerminalId::new();
+        let source = Session {
+            id,
+            proof: Some(proof),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+            launch: chat::Launch {
+                provider: Provider::Claude,
+                session_id: None,
+                recipe: LaunchRecipe {
+                    program: provider.to_string_lossy().into_owned(),
+                    arguments: Vec::new(),
+                    working_directory: directory.path().into(),
+                    environment: BTreeMap::from([
+                        (
+                            "HOME".into(),
+                            directory.path().to_string_lossy().into_owned(),
+                        ),
+                        (
+                            "CLAUDE_CONFIG_DIR".into(),
+                            home.to_string_lossy().into_owned(),
+                        ),
+                    ]),
+                    unset_environment: Default::default(),
+                },
+            },
+        };
+        let (spec, adapter) = chat::protocol::create(&source.launch).unwrap();
+        let prepared = adapter.prepared_launch_identity().unwrap();
+        let weak = Arc::downgrade(&host);
+        let owner = Arc::new(std::sync::OnceLock::new());
+        let callback_owner = owner.clone();
+        let handle = Handle::start_remote_owned(
+            spec,
+            source.clone(),
+            prepared,
+            BTreeMap::new(),
+            move |update| {
+                if let Some(instance) = callback_owner.get() {
+                    changed_owned(&weak, id, *instance, update);
+                }
+            },
+        )
+        .unwrap();
+        // Use the production authenticated publication boundary: it records
+        // pending ownership before installation starts the provider, then
+        // promotes the exact confirmed helper/source before exposing input.
+        let retained = [crate::agent_execution::HostedSession::Chat(source.clone())];
+        let source = retained_actor::publish_authenticated_source(
+            &host,
+            &handle,
+            source,
+            &retained,
+            None,
+            None,
+            retained_actor::Publication::Install,
+        )
+        .unwrap();
+        let identity = handle.actor_identity().unwrap();
+        let registry = super::super::agent_execution::registry(&host).unwrap();
+        let registered = registry
+            .lock()
+            .unwrap()
+            .native_actor_ownership(identity.instance)
+            .unwrap()
+            .expect("production publication must retain exact durable ownership");
+        assert!(!registered.is_pending());
+        assert_eq!(registered.owner(), &identity.record);
+        assert_eq!(registered.source(), &source);
+        assert_eq!(registered.scope(), handle.launch_account_scope());
+        owner.set(identity.instance).unwrap();
+        host.lock().unwrap().chats.insert(
+            id,
+            Record {
+                execution_instance: identity.instance,
+                console_recipe: None,
+                paired_terminal: None,
+                session: source.clone(),
+                handle: handle.clone(),
+                source_process: None,
+                subscribers: BTreeMap::new(),
+                observations: BTreeMap::new(),
+                completion_observed: false,
+                returning_terminal: false,
+            },
+        );
+        handle.set_visible(false);
+        completion_wait_until(|| handle.snapshot(None).is_some_and(|snapshot| snapshot.ready));
+        // No subscriber acknowledges/rearms this initial observation. The real
+        // helper proxy must still publish final completed/owns_work metadata.
+        assert!(!handle.is_completed() && handle.owns_work());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut finish = loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(&gate)
+            {
+                Ok(file) => break file,
+                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                    assert!(Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        };
+        let listener_path = directory.path().join("idle.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&listener_path).unwrap();
+        crate::daemon::wake();
+        crate::daemon::wait_for_activity(&listener).unwrap();
+        let parked = listener.try_clone().unwrap();
+        let (done, returned) = std::sync::mpsc::channel();
+        let waiter = thread::spawn(move || {
+            done.send(crate::daemon::wait_for_activity(&parked))
+                .unwrap();
+        });
+        changed_owned(
+            &Arc::downgrade(&host),
+            id,
+            identity.instance,
+            Update::Observed { generation: 0 },
+        );
+        assert!(
+            matches!(
+                returned.recv_timeout(Duration::from_millis(60)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "live retained owner woke as completion"
+        );
+        finish.write_all(b"finish\n").unwrap();
+        drop(finish);
+        let result = returned.recv_timeout(Duration::from_secs(5));
+        if result.is_err() {
+            let _ = std::os::unix::net::UnixStream::connect(&listener_path);
+        }
+        waiter.join().unwrap();
+        result
+            .expect("real retained completion did not wake daemon")
+            .unwrap();
+        assert!(handle.is_completed() && !handle.owns_work());
+        assert!(
+            !identity.record.root.is_current(),
+            "original provider cleanup must precede wake"
+        );
+        handle.close().unwrap();
+        // Use the existing semantic commit-before-retirement path, never ACK
+        // discarded outcomes merely to make this fixture exit.
+        retained_actor::finish_close(&host, &handle, &source).unwrap();
+        let registry = super::super::agent_execution::registry(&host).unwrap();
+        let retired = registry
+            .lock()
+            .unwrap()
+            .native_actor_retirement(identity.instance)
+            .unwrap()
+            .expect("exact helper semantic retirement must be durably committed");
+        assert_eq!(retired.actor(), identity.instance);
+        assert_eq!(retired.owner(), &identity.record);
+        assert_eq!(retired.source().id, source.id);
+        // The retirement receipt can precede the startup reaper consuming the
+        // original helper's zombie. Observe that exact incarnation disappearing.
+        completion_wait_until(|| !identity.record.holder.is_current());
+        assert!(
+            !identity.record.holder.is_current(),
+            "real helper was not retired"
+        );
+        host.lock().unwrap().chats.clear();
+    }
 
     #[test]
     fn chat_read_reports_remote_endpoint_failure_without_retiring_owned_chat() {
