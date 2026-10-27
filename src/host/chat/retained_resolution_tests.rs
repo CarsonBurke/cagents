@@ -424,6 +424,97 @@ fn real_helper_resolution_adopts_an_unregistered_retained_owner_without_launchin
 }
 
 #[test]
+fn real_retained_claude_update_preview_preserves_pre_id_and_active_turns() {
+    let Some(root) = isolated() else { return };
+    let mut fixture = Fixture::new(root);
+    let inspect = |host: &SharedHost| {
+        super::super::state::update::inspect(host, crate::update::impact::Policy::WhenIdle, true)
+            .unwrap()
+    };
+    // The actual installed helper is ready before its first provider UUID.
+    // Keeping its reducer and pipes requires no launch/resume recipe.
+    assert!(fixture.original.launch.session_id.is_none());
+    // Simulate a lagging presentation cache only. The actual helper, its
+    // acknowledged capability, proof and source receipts are untouched.
+    fixture
+        .host
+        .lock()
+        .unwrap()
+        .chats
+        .get_mut(&fixture.original.id)
+        .unwrap()
+        .session
+        .native_continuity = chat::NativeContinuity::ReconnectOnly;
+    let unnamed = inspect(&fixture.host);
+    assert!(unnamed.ready(), "pre-ID retained owner: {unnamed:?}");
+    assert!(
+        unnamed
+            .sessions
+            .iter()
+            .any(|session| session.id == fixture.original.id
+                && session.disposition == crate::update::impact::Disposition::Continues)
+    );
+    fixture.no_prompt();
+    fs::write(
+        fixture.root.join("lease-third-frame-gate"),
+        b"hold actual turn",
+    )
+    .unwrap();
+    fixture
+        .handle()
+        .command(chat::Command::Prompt {
+            text: "One explicit turn survives the application reconnecting".into(),
+            attachments: Vec::new(),
+            mode: chat::PromptMode::Send,
+        })
+        .unwrap();
+    wait(
+        || {
+            fs::read_to_string(fixture.root.join("produced"))
+                .is_ok_and(|text| text.lines().count() >= 3)
+                && fixture.handle().attachment_snapshot().busy
+        },
+        "actual provider did not reach its busy gate",
+    );
+    assert_eq!(
+        fixture.handle().check_update_readiness().unwrap(),
+        chat::runtime::UpdateReadiness::Busy
+    );
+    let active = inspect(&fixture.host);
+    assert!(
+        active.ready(),
+        "retained active turn must continue: {active:?}"
+    );
+    assert!(active.sessions.iter().all(|session| session.disposition
+        == crate::update::impact::Disposition::Continues
+        && session.interrupted_subagents.is_empty()));
+    assert!(fixture.identity.record.root.is_current());
+    fixture.rotate_host();
+    let reconnected = inspect(&fixture.host);
+    assert!(reconnected.ready());
+    assert_eq!(
+        fixture.handle().actor_identity(),
+        Some(fixture.identity.clone())
+    );
+    assert!(fixture.handle().attachment_snapshot().busy);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("prompts")).unwrap(),
+        "prompt\n"
+    );
+    // Let the genuine fixture provider finish normally; inspection/recovery
+    // sent no interruption, replay or replacement launch.
+    fs::write(fixture.root.join("lease-third-frame-release"), b"finish").unwrap();
+    wait(
+        || fixture.root.join("provider-done").exists(),
+        "retained turn did not finish after reconnecting",
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("prompts")).unwrap(),
+        "prompt\n"
+    );
+}
+
+#[test]
 fn real_helper_resolution_grant_is_single_use_and_connection_scoped() {
     let Some(root) = isolated() else { return };
     let mut fixture = Fixture::new(root);
