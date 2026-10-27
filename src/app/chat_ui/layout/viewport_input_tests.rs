@@ -121,7 +121,7 @@ fn fixture(target: Target, width: f32) -> Element<'static, Message> {
         widget::Space::new().width(180.0).height(24.0).into(),
         widget::Space::new().width(120.0).height(24.0).into(),
     ])
-    .spacing(8.0)
+    .spacing(8)
     .into();
     let edge = Splitter::new(
         card_control_id(target.card, "resize"),
