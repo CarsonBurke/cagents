@@ -778,27 +778,19 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
     let (target, attempt, result) = checkpoint(save);
     assert!(result.is_ok());
     drop(app.handle_chat_ui(Action::DraftStartCheckpointed(target, attempt, result)));
-    let attempt = app.chat_ui.attempt(card).unwrap();
-    let target = attempt.target;
-    let mut session = attempt.session.clone();
-    session.proof = Some(crate::model::HostSessionProof {
-        host_session_id: "first-send-host".into(),
-        boot_id: "first-send-boot".into(),
-        host_incarnation: "first-send-incarnation".into(),
-    });
-    let actor = session.id;
-    let handle = Arc::new(ClientHandle::fixture(
-        session,
+    let actor = app.chat_ui.attempt(card).unwrap().session.id;
+    let ready = super::ready_message_for_pending_switch(
+        &app,
+        card,
         Snapshot {
             ready: true,
             session_id: Some("first-send-native-thread".into()),
             ..Snapshot::default()
         },
-    ));
-    drop(app.handle_chat_ui(Action::Ready(
-        target,
-        Ready(Arc::new(Mutex::new(Some(Ok(handle.clone()))))),
-    )));
+    );
+    drop(app.update(ready));
+    let target = runtime(&app, card).target;
+    let handle = runtime(&app, card).handle().unwrap().clone();
     let pending = runtime(&app, card).pending.as_ref().unwrap();
     assert_eq!(pending.queued, Some(QueuedStep::Prompt));
     assert_eq!(pending.sent.as_deref(), Some("one original prompt"));
