@@ -174,3 +174,92 @@ fn durable_browser_urls_keep_navigation_authority_across_store_reopen() {
     );
     store.shutdown().unwrap();
 }
+
+#[test]
+fn durable_browser_same_location_navigation_rewrites_hidden_url_components() {
+    let original = "https://fixture-user:fixture-password@example.test:8443/path?fixture=first#first";
+    for changed in [
+        "https://fixture-user:fixture-password@example.test:8443/path?fixture=second#first",
+        "https://fixture-user:fixture-password@example.test:8443/path?fixture=first#second",
+        "https://other-user:other-password@example.test:8443/path?fixture=first#first",
+    ] {
+        let original = Url::parse(original).unwrap();
+        let changed = Url::parse(changed).unwrap();
+        assert_ne!(original, changed);
+        assert_eq!(
+            SanitizedLocation::from(&original),
+            SanitizedLocation::from(&changed),
+            "this navigation changes authority without changing the displayed location"
+        );
+        let card = CardId::new();
+        let mut workspace = WorkspaceState {
+            cards: vec![CardState {
+                id: card,
+                generation: 0,
+                title: "Same-location navigation fixture".into(),
+                width_fraction: 1.0,
+                existence: Existence::Open,
+                exposure: Exposure::Visible,
+                residency: Residency::Cold,
+                kind: CardKind::Browser(BrowserSession {
+                    id: BrowserId::new(),
+                    current_url: original.clone(),
+                    history: vec![original],
+                    history_index: 0,
+                    scroll_x: 0.0,
+                    scroll_y: 0.0,
+                    fidelity: BrowserRestoreFidelity::HistoryAndScroll,
+                }),
+            }],
+            focused: Some(card),
+            ..WorkspaceState::default()
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("session.sqlite3");
+        let boot = BootId::new("browser-same-location-persistence");
+        {
+            let store = StateStore::open(&database, boot.clone()).unwrap();
+            let first = store
+                .save_workspace(
+                    &workspace,
+                    SnapshotBase {
+                        workspace: 0,
+                        cards: &BTreeMap::new(),
+                    },
+                )
+                .unwrap();
+            let CardKind::Browser(browser) = &mut workspace.cards[0].kind else {
+                unreachable!();
+            };
+            // Replace the current entry in place. No title, scroll, index,
+            // or visible location change can accidentally force the write.
+            browser.current_url = changed.clone();
+            browser.history[0] = changed.clone();
+            store
+                .save_workspace(
+                    &workspace,
+                    SnapshotBase {
+                        workspace: first.generation,
+                        cards: &first.card_generations,
+                    },
+                )
+                .unwrap();
+            store.shutdown().unwrap();
+        }
+        let store = StateStore::open(&database, boot).unwrap();
+        let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(restored.cards.len(), 1);
+        assert_eq!(restored.cards[0].id, card);
+        let CardKind::Browser(browser) = &restored.cards[0].kind else {
+            panic!("the restored card must remain a browser");
+        };
+        assert_eq!(browser.current_url, changed);
+        assert_eq!(browser.history, vec![changed.clone()]);
+        #[cfg(not(feature = "integrated-browser"))]
+        assert_eq!(
+            browser_restore_action(browser),
+            BrowserRestoreAction::OfferExternal(&changed)
+        );
+        store.shutdown().unwrap();
+    }
+}
