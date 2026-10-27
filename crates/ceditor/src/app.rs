@@ -3612,9 +3612,13 @@ impl Application for Editor {
                     let basis_resolved =
                         matches!(action, RepositoryAction::DiffBasisResolved { .. });
                     let loaded = matches!(action, RepositoryAction::FilesLoaded { .. });
+                    let background_loaded =
+                        matches!(action, RepositoryAction::DocumentReloaded { .. });
                     let focus_loaded = matches!(
                         action,
-                        RepositoryAction::FileLoaded { .. } | RepositoryAction::FileLoadedAt { .. }
+                        RepositoryAction::FileLoaded { .. }
+                            | RepositoryAction::FileLoadedAt { .. }
+                            | RepositoryAction::DocumentReloaded { .. }
                     ) && self.active == Some(id)
                         && !self.modal_open();
                     let saved = matches!(
@@ -3627,6 +3631,9 @@ impl Application for Editor {
                         return Task::none();
                     };
                     let restoring_reload = tab.runtime.retains_reload_buffer();
+                    // A watched retry can finish a provisional explicit Reload.
+                    // Ordinary automatic reloads never request foreground focus.
+                    let focus_loaded = focus_loaded && (!background_loaded || restoring_reload);
                     let listing_changed = matches!(
                         &action,
                         RepositoryAction::FilesLoaded { result: Ok(_), .. }
