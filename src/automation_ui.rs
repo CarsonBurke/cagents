@@ -1450,7 +1450,16 @@ impl State {
                         }
                     }
                     self.notice = Some(format!("Run requested: {}", state_label(firing.state)));
-                    self.history.insert(0, firing);
+                    if let Some(current) = self.history.iter_mut().find(|row| row.id == firing.id) {
+                        // An idempotent retry can return a firing already read
+                        // by polling. Refresh its receipt without moving it.
+                        *current = firing;
+                    } else {
+                        let index = self
+                            .history
+                            .partition_point(|row| history_key(row) > history_key(&firing));
+                        self.history.insert(index, firing);
+                    }
                 }
                 Ok(Response::Removed) => {
                     self.lifecycle = None;
