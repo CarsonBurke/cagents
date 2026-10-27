@@ -300,7 +300,9 @@ impl WorkspaceModel {
             }
             // Requires canonical work and pane evidence; an optimistic client
             // cannot infer whether retirement was accepted.
-            ModelEdit::RetireEmptyChannel { .. } | ModelEdit::ChannelWorkChanged { .. } => {}
+            ModelEdit::RetireEmptyChannel { .. }
+            | ModelEdit::ChannelWorkChanged { .. }
+            | ModelEdit::WorktreesChanged { .. } => {}
             ModelEdit::DeleteChannel { id } => {
                 self.channels.retain(|channel| channel.id != *id);
             }
@@ -392,6 +394,9 @@ pub enum ModelEdit {
         home: crate::channel_work::Home,
         expected_view_revision: u64,
     },
+    /// Daemon-only inventory invalidation after an owned Git worktree effect.
+    /// This edge does not change shared model membership or its sequence.
+    WorktreesChanged { repository: PathBuf },
 }
 
 impl ModelEdit {
@@ -473,6 +478,9 @@ impl ModelEdit {
                     change,
                 }
             }
+            Self::WorktreesChanged { repository } => Self::WorktreesChanged {
+                repository: canonical_repository(&repository)?,
+            },
             edit @ (Self::RetitleChannel { .. }
             | Self::SuggestChannelTitle { .. }
             | Self::SuggestConversationTitle { .. }

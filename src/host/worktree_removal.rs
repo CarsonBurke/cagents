@@ -323,10 +323,15 @@ pub(super) fn admit(
             | ClientRequest::PrepareConfirmedUpgrade { .. }
             | ClientRequest::Shutdown
             | ClientRequest::ShutdownV1 { .. }
-    ) && !scopes(host).is_empty()
+    ) && (!scopes(host).is_empty()
+        || host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .worktree_mutations
+            != 0)
     {
         return Err(refusal(
-            "A worktree removal is still finishing. Wait for it before shutting down or upgrading this daemon.",
+            "A worktree operation is still finishing. Wait for it before shutting down or upgrading this daemon.",
         ));
     }
     Ok(())

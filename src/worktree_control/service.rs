@@ -1,4 +1,5 @@
 //! Blocking service work; no HostState borrow or control writer may be held.
+mod recovery;
 mod removal;
 mod setup;
 use super::*;
@@ -29,7 +30,8 @@ pub(crate) enum Execution {
     Remove(PreparedRemoval),
 }
 
-pub(crate) fn execute(
+pub(crate) fn execute<E: ProcessExecutor>(
+    service: &RepositoryService<E>,
     operation: Operation,
     store: &StateStore,
     live_sessions: impl FnMut(&Path) -> Result<Vec<crate::model::TerminalId>, String>,
@@ -40,13 +42,7 @@ pub(crate) fn execute(
     } else {
         None
     };
-    execute_with(
-        &RepositoryService::system("git"),
-        operation,
-        store,
-        live_sessions,
-        settings,
-    )
+    execute_with(service, operation, store, live_sessions, settings)
 }
 
 fn execute_with<E: ProcessExecutor>(
@@ -203,7 +199,38 @@ fn execute_with<E: ProcessExecutor>(
                             .collect(),
                     )
                 }
-                _ => return Err(report.detail),
+                outcome => {
+                    let residual = match outcome {
+                        Some(WorktreeCreationOutcome::OutcomeUnknown { residual, .. }) => {
+                            serde_json::to_value(residual).ok()
+                        }
+                        Some(WorktreeCreationOutcome::Created { worktree, .. }) => {
+                            Some(serde_json::json!({"registered_worktree":worktree}))
+                        }
+                        _ => None,
+                    };
+                    let may_have_effects = residual.is_some()
+                        || !matches!(
+                            report.state,
+                            WorktreeOperationState::NotCreated
+                                | WorktreeOperationState::MalformedPayload
+                                | WorktreeOperationState::LeaseConflict
+                        );
+                    return Ok(Execution::Reply {
+                        reply: Reply::CreationFailed(CreationFailure {
+                            operation_id: request.operation_id,
+                            path: request.destination.clone(),
+                            state: serde_json::to_value(report.state)
+                                .ok()
+                                .and_then(|state| state.as_str().map(str::to_owned))
+                                .unwrap_or_else(|| "unknown".into()),
+                            residual,
+                            error: report.detail,
+                            may_have_effects,
+                        }),
+                        setup: None,
+                    });
+                }
             };
             let mut created = Created {
                 operation_id: request.operation_id,
@@ -242,6 +269,7 @@ fn execute_with<E: ProcessExecutor>(
                                     .and_then(|intent| intent.run_id)
                                     .expect("new retained run"),
                                 terminal: None,
+                                attempted_terminal: None,
                                 error: Some(error),
                             });
                             None
@@ -252,6 +280,35 @@ fn execute_with<E: ProcessExecutor>(
             };
             (Reply::Created(created), prepared)
         }
+        Operation::SetupIntents { repository } => (
+            recovery::inventory(service, store, &repository, &cancellation)?,
+            None,
+        ),
+        Operation::ReviewSetup { repository, path } => (
+            recovery::review(service, store, &repository, &path, &cancellation)?,
+            None,
+        ),
+        Operation::ResumeSetup {
+            repository,
+            path,
+            creation_id,
+            expected_run,
+            expected_fingerprint,
+            trust,
+            skip,
+        } => recovery::resume(
+            service,
+            store,
+            &repository,
+            &path,
+            creation_id,
+            expected_run,
+            expected_fingerprint,
+            trust,
+            skip,
+            &mut live_sessions,
+            &cancellation,
+        )?,
         Operation::Remove {
             repository,
             target,

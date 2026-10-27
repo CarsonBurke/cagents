@@ -69,6 +69,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::Agent { .. }
         | R::Automation { .. }
         | R::ChannelWork { .. }
+        | R::Worktree { .. }
         | R::Shutdown
         | R::ShutdownV1 { .. }
         | R::PrepareUpgrade { .. }
@@ -167,6 +168,24 @@ pub(in crate::host) fn admit(
             }
         }
     }
+}
+
+/// A first-class worktree request carries its own authority. A bound socket
+/// cannot downgrade that authority to User or change its issuing lineage.
+pub(in crate::host) fn worktree_caller(
+    host: &SharedHost,
+    client_id: ClientId,
+    authority: &Authority,
+) -> Result<(Origin, Option<TerminalId>), ProtocolError> {
+    let caller = super::caller(host, authority).map_err(denied)?;
+    if let Some(bound) = acting_for(host, client_id) {
+        if caller.0 != (Origin::Child { parent: bound }) {
+            return Err(denied(
+                "This connection cannot change its authenticated worktree caller",
+            ));
+        }
+    }
+    Ok(caller)
 }
 
 /// Records that the agent session a connection acts for starts `terminal`,

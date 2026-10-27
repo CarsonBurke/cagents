@@ -59,7 +59,7 @@ use crate::terminal::{
 /// word a test filter or a person would type.
 const ARGUMENT: &str = "--cagents-terminal-holder";
 /// Protocol 1 holders could not be detached.
-const PROTOCOL: u32 = 5;
+const PROTOCOL: u32 = 6;
 /// The holders a daemon can adopt: any that speak detaching.
 const ADOPTABLE: std::ops::RangeInclusive<u32> = 2..=PROTOCOL;
 /// A spawn request carries the root's whole environment; nothing legitimate
@@ -96,6 +96,10 @@ enum Request {
         size: PtySize,
         #[serde(default)]
         recovery: Option<Recovery>,
+        /// Setup-only Spawn authority; descriptor slots are admin, lease,
+        /// then the bounded retained directory protections, in that order.
+        #[serde(default)]
+        setup: Option<crate::terminal::holder::setup::Binding>,
     },
     /// The daemon no longer needs the terminal. The holder exits, closing its
     /// master; any process still on the terminal is hung up.
@@ -136,6 +140,10 @@ enum Report {
         pid: libc::pid_t,
         #[serde(default)]
         launch_directory: Option<crate::agent_execution::DirectoryIdentity>,
+        /// Protocol6 explicit setup capability, independent of protocol5's
+        /// launch-directory proof. Response FD order remains exactly3slots.
+        #[serde(default)]
+        setup: Option<crate::terminal::holder::setup::Binding>,
     },
     Failed(String),
     /// The root's raw wait status, reported once, after the holder reaps it.
@@ -164,6 +172,10 @@ enum Report {
         screen_lost: bool,
         #[serde(default)]
         launch_directory: Option<crate::agent_execution::DirectoryIdentity>,
+        /// Protocol6 explicit setup capability, independent of protocol5's
+        /// launch-directory proof. Response FD order remains exactly3slots.
+        #[serde(default)]
+        setup: Option<crate::terminal::holder::setup::Binding>,
     },
 }
 
@@ -273,9 +285,19 @@ pub(super) fn spawn_recoverable(
     exits: Sender<ChildExit>,
     recovery: Option<Recovery>,
 ) -> Result<Held, String> {
+    spawn_with_setup(command, size, exits, recovery, None)
+}
+
+pub(super) fn spawn_with_setup(
+    command: CommandBuilder,
+    size: PtySize,
+    exits: Sender<ChildExit>,
+    recovery: Option<Recovery>,
+    setup: Option<crate::terminal::holder::setup::Authority>,
+) -> Result<Held, String> {
     let reservation = crate::daemon::child_reaper::reserve()
         .map_err(|error| format!("reserve terminal holder child custody: {error}"))?;
-    spawn_reserved(command, size, exits, recovery, reservation)
+    spawn_reserved(command, size, exits, recovery, setup, reservation)
 }
 
 fn spawn_reserved(
@@ -283,6 +305,7 @@ fn spawn_reserved(
     size: PtySize,
     exits: Sender<ChildExit>,
     recovery: Option<Recovery>,
+    setup: Option<crate::terminal::holder::setup::Authority>,
     reservation: crate::daemon::child_reaper::Reservation,
 ) -> Result<Held, String> {
     // Every image that can start a holder has to be able to serve as one.
@@ -323,6 +346,9 @@ fn spawn_reserved(
     // The holder is this daemon's unreaped child until `Holder` reaps it.
     let pidfd = open_pidfd(process.child.id() as libc::pid_t);
     let mut holder = Holder::new(control, Some(process));
+    // Record setup custody before any fallible handshake. Uncertain startup
+    // never acquires ordinary500ms holder-kill authority.
+    holder.setup = setup.is_some();
     // Preserve the captured descriptor in the cleanup owner before any other
     // fallible setup step can return through Holder::drop.
     holder.pidfd = Some(pidfd.map_err(|error| format!("watch terminal holder: {error}"))?);
@@ -335,17 +361,33 @@ fn spawn_reserved(
         .map(|command| STANDARD.encode(command))
         .map_err(|error| format!("encode terminal command: {error}"))?;
     let deadline = Instant::now() + START_TIMEOUT;
+    let setup_binding = setup.as_ref().map(|setup| setup.binding.clone());
+    let setup_files: Vec<_> = setup
+        .iter()
+        .flat_map(|setup| setup.files())
+        .map(|file| file.as_fd())
+        .collect();
+    if setup_files.len() > crate::terminal::holder::setup::MAX_FILES {
+        return Err("Setup descriptor authority exceeds holder bound".into());
+    }
+    // The original canonical startup guard can permanently cancel delivery
+    // after a pre-start error/timeout. Claim immediately before the first send;
+    // once claimed, only the exact holder's family proof can settle the run.
+    if let Some(authority) = &setup {
+        authority.claim_delivery()?;
+    }
     let started = crate::descriptor_frame::send_json_with_fds_until(
         &holder.control,
         &Request::Spawn {
             command,
             size,
             recovery,
+            setup: setup_binding.clone(),
         },
-        &[],
+        &setup_files,
         deadline,
         MAX_FRAME as usize,
-        3,
+        crate::terminal::holder::setup::MAX_FILES,
         crate::descriptor_frame::FrameByteOrder::LittleEndian,
     )
     .and_then(|()| {
@@ -364,7 +406,8 @@ fn spawn_reserved(
             protocol,
             pid,
             launch_directory,
-        } if protocol == PROTOCOL => (pid, launch_directory),
+            setup: returned,
+        } if protocol == PROTOCOL && returned == setup_binding => (pid, launch_directory),
         Report::Started { protocol, .. } => {
             return Err(format!(
                 "terminal holder speaks protocol {protocol}, expected {PROTOCOL}"
@@ -446,6 +489,7 @@ pub(super) fn adopt_recoverable(
             &proof,
         )?;
     }
+    let expected_setup_source = recovery.as_ref().map(|recovery| recovery.source.clone());
     let failed =
         |error: io::Error| format!("adopt terminal holder at {}: {error}", socket.display());
     let control = crate::daemon::holder_registry::connect(socket).map_err(failed)?;
@@ -498,6 +542,7 @@ pub(super) fn adopt_recoverable(
         output,
         screen_lost,
         launch_directory,
+        setup,
     } = report
     else {
         return Err(format!(
@@ -505,6 +550,20 @@ pub(super) fn adopt_recoverable(
             socket.display()
         ));
     };
+    let is_setup = expected_setup_source
+        .as_ref()
+        .is_some_and(|source| crate::upgrade::is_worktree_setup_recipe(&source.launch));
+    if is_setup != setup.is_some()
+        || setup.as_ref().is_some_and(|binding| {
+            protocol < 6
+                || !expected_setup_source
+                    .as_ref()
+                    .is_some_and(|source| binding.matches_source(source))
+        })
+    {
+        return Err("Setup adoption has no matching original family capability; its holder remains retained".into());
+    }
+    holder.setup = is_setup;
     if !ADOPTABLE.contains(&protocol) {
         return Err(format!(
             "terminal holder at {} speaks protocol {protocol}, which this daemon cannot adopt",
@@ -702,6 +761,7 @@ pub(super) struct Holder {
     registered: bool,
     screen_lost: bool,
     cleanup_proved: bool,
+    setup: bool,
     record: Option<Record>,
     original_role: Option<crate::daemon::holder_registry::OriginalRole>,
 }
@@ -806,6 +866,7 @@ impl Holder {
             registered: false,
             screen_lost: false,
             cleanup_proved: false,
+            setup: false,
             record: None,
             original_role: None,
         }
@@ -880,7 +941,7 @@ impl Drop for Holder {
                 .pidfd
                 .as_ref()
                 .is_some_and(|pidfd| exits_within(pidfd, RELEASE_GRACE).unwrap_or(false));
-            if !exited && self.cleanup_proved && self.protocol >= 4 {
+            if !exited && (self.setup || (self.cleanup_proved && self.protocol >= 4)) {
                 // A proved release may still be fsyncing its receipt. Keep
                 // that exact owner alive; killing it would erase the only
                 // authority for a retry after the daemon exits.
@@ -1221,17 +1282,27 @@ fn serve(control: UnixStream) -> i32 {
         let _ = send(&control, &Report::Failed(message), &[]);
         1
     };
-    let (command, size, mut recovery) = match receive::<Request>(&control) {
-        Ok(Some((
-            Request::Spawn {
-                command,
-                size,
-                recovery,
-            },
-            _,
-        ))) => (command, size, recovery),
-        _ => return 1,
-    };
+    let (command, size, mut recovery, setup_binding, descriptors) =
+        match crate::descriptor_frame::receive_json_with_fds_until::<Request>(
+            &control,
+            Instant::now() + START_TIMEOUT,
+            MAX_FRAME as usize,
+            crate::terminal::holder::setup::MAX_FILES,
+            crate::descriptor_frame::FrameByteOrder::LittleEndian,
+        )
+        .map(Some)
+        {
+            Ok(Some((
+                Request::Spawn {
+                    command,
+                    size,
+                    recovery,
+                    setup,
+                },
+                descriptors,
+            ))) => (command, size, recovery, setup, descriptors),
+            _ => return 1,
+        };
     if let Some(recovery) = &recovery {
         let authority = (|| {
             let boot = crate::daemon::read_boot_id()?;
@@ -1255,6 +1326,27 @@ fn serve(control: UnixStream) -> i32 {
             return fail(format!("authorize terminal holder: {error}"));
         }
     }
+    let mut setup = match setup_binding {
+        Some(binding) => match crate::terminal::holder::setup::Execution::receive(
+            binding,
+            descriptors,
+            recovery.as_ref(),
+        ) {
+            Ok(setup) => Some(setup),
+            Err(error) => return fail(error),
+        },
+        None if descriptors.is_empty()
+            && !recovery.as_ref().is_some_and(|recovery| {
+                crate::upgrade::is_worktree_setup_recipe(&recovery.source.launch)
+            }) =>
+        {
+            None
+        }
+        None => return fail(
+            "Setup spawn lacks explicit original authority, or ordinary Spawn carried descriptors"
+                .into(),
+        ),
+    };
     let mut command = match STANDARD
         .decode(command)
         .map_err(|error| error.to_string())
@@ -1291,6 +1383,9 @@ fn serve(control: UnixStream) -> i32 {
     let Some(pid) = child.process_id().map(|pid| pid as libc::pid_t) else {
         return fail(format!("spawn {program}: no process id"));
     };
+    if let Some(setup) = &mut setup {
+        setup.set_root(pid);
+    }
     // The root is this holder's unreaped child, so its pid is its own.
     let pidfd = match open_pidfd(pid) {
         Ok(pidfd) => pidfd,
@@ -1329,6 +1424,7 @@ fn serve(control: UnixStream) -> i32 {
         protocol: PROTOCOL,
         pid,
         launch_directory: Some(launch_directory.0),
+        setup: setup.as_ref().map(|setup| setup.binding().clone()),
     };
     // SAFETY: pair.master owns this exact live descriptor through the send.
     let master_fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(master) };
@@ -1359,6 +1455,7 @@ fn serve(control: UnixStream) -> i32 {
                 &mut exit,
                 &mut cached_screen,
                 &mut pending_replay,
+                &mut setup,
             )
         };
         let (socket, screen, output, screen_lost) = match disposition {
@@ -1429,6 +1526,7 @@ fn serve(control: UnixStream) -> i32 {
             screen_lost,
             output,
             &launch_directory,
+            &mut setup,
         );
         if residence.is_none() {
             let _ = std::fs::remove_file(&socket);
@@ -1444,8 +1542,14 @@ fn serve(control: UnixStream) -> i32 {
             None => break,
         }
     }
+    if let Some(setup) = &mut setup {
+        if let Some(status) = setup.finish() {
+            exit.get_or_insert(status);
+        }
+    }
     drop(child);
-    // The master closes with the holder, hanging up whatever is left on it.
+    // Setup has independently reaped its entire family before these original
+    // resources retire. Ordinary terminal behavior retains its existing path.
     drop(pair.master);
     if cleanup_proved && let (Some(residence), Some(recovery)) = (&residence, &recovery) {
         // The checked worker has already stopped its exact process family;
@@ -1485,6 +1589,7 @@ fn attend(
     exit: &mut Option<libc::c_int>,
     cached_screen: &mut Option<(String, bool)>,
     pending_replay: &mut Option<(String, Vec<u8>, bool)>,
+    setup: &mut Option<crate::terminal::holder::setup::Execution>,
 ) -> Attendance {
     loop {
         let mut targets = [
@@ -1518,6 +1623,9 @@ fn attend(
             let Some(wait_status) = reap(pid) else {
                 return Attendance::Release;
             };
+            if let Some(setup) = setup {
+                setup.finish();
+            }
             *exit = Some(wait_status);
             let _ = send(control, &Report::Exited { wait_status }, &[]);
         }
@@ -1583,6 +1691,7 @@ fn await_successor(
     screen_lost: bool,
     mut output: Vec<u8>,
     launch_directory: &LaunchDirectoryPin,
+    setup: &mut Option<crate::terminal::holder::setup::Execution>,
 ) -> Option<(UnixStream, Vec<u8>)> {
     let deadline = orphan_deadline(record.is_some(), Instant::now());
     let mut buffer = vec![0u8; 64 << 10];
@@ -1627,7 +1736,11 @@ fn await_successor(
         }
         if targets[1].revents != 0 {
             // As when attended: nothing to hand over is better than a spin.
-            *exit = Some(reap(pid)?);
+            let status = reap(pid)?;
+            if let Some(setup) = setup.as_mut() {
+                setup.finish();
+            }
+            *exit = Some(status);
         }
         if targets[2].revents != 0 {
             let room = (DETACHED_OUTPUT - output.len()).min(buffer.len());
@@ -1655,6 +1768,7 @@ fn await_successor(
                 recovery,
                 screen_lost,
                 launch_directory,
+                setup.as_ref().map(|setup| setup.binding()),
             )
             .is_ok_and(|attached| attached)
         {
@@ -1681,6 +1795,7 @@ fn hand_over(
     recovery: &mut Option<Recovery>,
     screen_lost: bool,
     launch_directory: &LaunchDirectoryPin,
+    setup: Option<&crate::terminal::holder::setup::Binding>,
 ) -> io::Result<bool> {
     // SAFETY: getuid cannot fail.
     let peer = peer_credentials(successor)?;
@@ -1784,6 +1899,7 @@ fn hand_over(
         output: STANDARD.encode(output),
         screen_lost,
         launch_directory: Some(launch_directory.0),
+        setup: setup.cloned(),
     };
     // SAFETY: the caller owns this live master for the whole bounded send.
     let master = unsafe { std::os::fd::BorrowedFd::borrow_raw(master) };
@@ -2032,6 +2148,7 @@ mod tests {
             &mut Some(0),
             &mut None,
             &mut replay,
+            &mut None,
         );
         assert!(matches!(result, Attendance::Lost));
         assert_eq!(replay, expected);
@@ -2046,6 +2163,7 @@ mod tests {
             &mut Some(0),
             &mut None,
             &mut replay,
+            &mut None,
         );
         assert!(matches!(result, Attendance::Release));
         assert!(matches!(
@@ -2103,6 +2221,7 @@ mod tests {
             &mut None,
             false,
             &pin_launch_directory(&command("true")).unwrap(),
+            None,
         )
         .unwrap_err();
         assert_eq!(error.to_string(), "descriptor frame deadline expired");
@@ -2208,6 +2327,7 @@ mod tests {
                 protocol: PROTOCOL,
                 pid: 7,
                 launch_directory: None,
+                setup: None,
             },
             &[write.as_raw_fd()],
         )
@@ -2487,6 +2607,7 @@ mod tests {
                     output: String::new(),
                     screen_lost: false,
                     launch_directory: Some(expected),
+                    setup: None,
                 },
                 &[master.as_fd(), pidfd.as_fd(), invalid_directory.as_fd()],
                 Instant::now() + Duration::from_secs(5),
@@ -2742,6 +2863,7 @@ mod tests {
             size(),
             exits,
             None,
+            None,
             reaper.reserve().unwrap(),
         )
         .unwrap();
@@ -2798,6 +2920,7 @@ mod tests {
             command("echo ready; read line"),
             size(),
             exits,
+            None,
             None,
             reaper.reserve().unwrap(),
         )
@@ -2872,6 +2995,7 @@ mod tests {
             command("echo ready; read line"),
             size(),
             exits,
+            None,
             None,
             reaper.reserve().unwrap(),
         )

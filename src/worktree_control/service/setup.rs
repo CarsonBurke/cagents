@@ -19,7 +19,19 @@ pub(super) fn prepare<E: ProcessExecutor>(
         .setup_intent
         .as_ref()
         .ok_or("Setup has no retained reviewed intent")?;
-    let mut custody = service.worktree_setup_custody(store, request.operation_id, intent)?;
+    let custody = service.worktree_setup_custody(store, request.operation_id, intent)?;
+    prepare_with_custody(service, store, request, primary, plan, custody, cancel)
+}
+
+pub(super) fn prepare_with_custody<E: ProcessExecutor>(
+    service: &Service<E>,
+    store: &StateStore,
+    request: &crate::repository::CreateWorktreeRequest,
+    primary: &Path,
+    plan: &crate::worktree_setup::SetupPlan,
+    mut custody: crate::repository::SetupCustody,
+    cancel: &CancellationToken,
+) -> Result<PreparedSetup, String> {
     let prepared = crate::worktree_setup::prepare_for_creation(
         primary,
         &request.destination,
@@ -54,6 +66,7 @@ pub(super) fn prepare<E: ProcessExecutor>(
         command: recipe.arguments[1].clone(),
         run_id: custody.run,
         terminal: None,
+        attempted_terminal: None,
         error: None,
     });
     Ok(PreparedSetup {

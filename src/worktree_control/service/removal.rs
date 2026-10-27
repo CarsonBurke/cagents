@@ -11,6 +11,7 @@ use std::os::unix::fs::MetadataExt;
 pub(crate) struct PreparedRemoval {
     target: FencedTarget,
     common: fs_safety::Root,
+    admin: fs_safety::Root,
     repository_root: fs_safety::Root,
     request: worktree_content::Request,
     inspection: Inspection,
@@ -79,6 +80,9 @@ impl PreparedRemoval {
         }
         let target = FencedTarget::capture(&repository, &record.path, short_branch(record))?;
         let common = fs_safety::Root::open(&target.common_dir).map_err(|e| e.to_string())?;
+        let admin = fs_safety::Root::open(&target.admin_dir).map_err(|error| error.to_string())?;
+        crate::repository::worktree_setup_removal_is_quiescent(&admin)
+            .map_err(|error| error.to_string())?;
         let request = worktree_content::Request {
             path: record.path.clone(),
             targets: Vec::new(),
@@ -96,6 +100,7 @@ impl PreparedRemoval {
         Ok(Self {
             target,
             common,
+            admin,
             repository_root,
             request,
             inspection,
@@ -116,9 +121,34 @@ impl PreparedRemoval {
         admit: impl FnOnce(&[crate::instance::VerifiedWindow]) -> Result<(), String>,
         final_check: impl FnOnce() -> Result<(), String>,
     ) -> Result<Removed, RemovalFailure> {
+        self.remove_with_post_git_checkpoint(store, admit, final_check, || {})
+    }
+
+    pub(super) fn remove_with_post_git_checkpoint(
+        self,
+        store: &StateStore,
+        admit: impl FnOnce(&[crate::instance::VerifiedWindow]) -> Result<(), String>,
+        final_check: impl FnOnce() -> Result<(), String>,
+        post_git: impl FnOnce(),
+    ) -> Result<Removed, RemovalFailure> {
+        // A known retained setup cannot become a legacy checkout when both
+        // administrative files disappear. Consult canonical durable intent
+        // before removing anything, then repeat its generation check at commit.
+        let expected_creation = (|| -> Result<Option<OperationId>, String> {
+            let service = RepositoryService::system("git");
+            for row in store.journaled_worktree_operations().map_err(|error| error.to_string())? {
+                let Ok((_, report)) = service.worktree_setup_creation_from_row(&row) else { continue };
+                if report.request.as_ref().is_some_and(|request| request.destination == self.target.path && request.setup_intent.is_some()) {
+                    if crate::repository::worktree_creation_marker(&self.admin).map_err(|error| error.to_string())? != report.operation_id { return Err("Original setup generation evidence is missing or changed; retain this checkout for recovery".into()); }
+                    return Ok(Some(report.operation_id));
+                }
+            }
+            Ok(None)
+        })().map_err(|error| RemovalFailure { path: self.target.path.clone(), rescue_branch: None, error, outcome_unknown: false })?;
         let Self {
             target,
             common,
+            admin,
             repository_root,
             request,
             inspection,
@@ -137,7 +167,17 @@ impl PreparedRemoval {
             admit,
             || {
                 same_named_root(&common)?;
+                if let Some(expected) = expected_creation
+                    && crate::repository::worktree_creation_marker(&admin)
+                        .map_err(|error| error.to_string())?
+                        != expected
+                {
+                    return Err("Original setup generation changed before removal".into());
+                }
+                same_named_root(&admin)?;
                 same_named_root(&repository_root)?;
+                crate::repository::worktree_setup_removal_is_quiescent(&admin)
+                    .map_err(|error| error.to_string())?;
                 let current = worktree_content::inspect(&request, &cancellation)
                     .map_err(|e| e.to_string())?;
                 if current.token.is_none()
@@ -169,7 +209,7 @@ impl PreparedRemoval {
                         .as_deref()
                         .ok_or("Detached history has no exact commit")?;
                     let name = format!("cagents-rescue/{}", uuid::Uuid::new_v4());
-                    let command = crate::worktree_branch::git_command(repository_root.path())
+                    let command = crate::worktree_branch::git_command(&common.process_path())
                         .args([
                             "update-ref",
                             &format!("refs/heads/{name}"),
@@ -199,6 +239,7 @@ impl PreparedRemoval {
                 });
             }
         };
+        post_git();
         // A successful remove_fenced result proves Git registration and exact
         // directory removal even if the original Git return was nonzero.
         // A failure above never certifies rollback or permits automatic retry.

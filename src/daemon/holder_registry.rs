@@ -319,7 +319,7 @@ impl Record {
 
     fn supported_version(&self) -> bool {
         match self.kind {
-            Kind::Terminal => matches!(self.version, 3 | 4 | 5),
+            Kind::Terminal => matches!(self.version, 3 | 4 | 5 | 6),
             Kind::Native => matches!(self.version, 2 | 3 | 4),
         }
     }
@@ -938,7 +938,7 @@ mod tests {
     #[test]
     fn terminal_directory_pin_protocol_is_discovered_but_future_evidence_is_preserved() {
         let directory = tempfile::tempdir().unwrap();
-        for version in [3, 4, 5] {
+        for version in [3, 4, 5, 6] {
             let mut terminal = record();
             terminal.version = version;
             terminal.create(directory.path()).unwrap();

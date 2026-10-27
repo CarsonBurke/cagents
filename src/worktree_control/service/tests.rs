@@ -162,23 +162,39 @@ fn shared_journal_creation_and_listing_retain_configured_path_and_ticket() {
     assert_eq!((row.ahead, row.behind), (None, None));
 }
 
+#[derive(Default)]
+struct CreatedStatusCounts {
+    adds: std::sync::atomic::AtomicUsize,
+    injected_status_failures: std::sync::atomic::AtomicUsize,
+}
 #[derive(Clone)]
-struct FailedCreatedStatus;
+struct FailedCreatedStatus {
+    counts: std::sync::Arc<CreatedStatusCounts>,
+}
 impl ProcessExecutor for FailedCreatedStatus {
     fn execute(
         &self,
         command: &CommandSpec,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessFailure> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if command
+            .arguments
+            .windows(2)
+            .any(|pair| pair[0] == OsStr::new("worktree") && pair[1] == OsStr::new("add"))
+        {
+            self.counts.adds.fetch_add(1, SeqCst);
+        }
         let status = command
             .arguments
             .iter()
             .any(|value| value == OsStr::new("status"));
-        let settled = command
+        let linked_checkout = command
             .current_dir
             .as_ref()
             .is_some_and(|path| path.join(".git").is_file());
-        if status && settled {
+        if status && linked_checkout {
+            self.counts.injected_status_failures.fetch_add(1, SeqCst);
             return Err(crate::process::process_failure(
                 command,
                 crate::process::ProcessFailureKind::Io,
@@ -197,8 +213,15 @@ fn status_failure_after_real_commit_returns_created_receipt_without_a_retry() {
     )) {
         return;
     }
+    use std::sync::atomic::Ordering::SeqCst;
     let fixture = Fixture::new();
-    let service = RepositoryService::new("git", std::sync::Arc::new(FailedCreatedStatus));
+    let counts = std::sync::Arc::new(CreatedStatusCounts::default());
+    let service = RepositoryService::new(
+        "git",
+        std::sync::Arc::new(FailedCreatedStatus {
+            counts: counts.clone(),
+        }),
+    );
     let result = execute_with(
         &service,
         fixture.operation("topic", true),
@@ -214,6 +237,16 @@ fn status_failure_after_real_commit_returns_created_receipt_without_a_retry() {
     else {
         panic!("committed creation was lost");
     };
+    assert_eq!(
+        counts.adds.load(SeqCst),
+        1,
+        "real creation must not retry Git effects"
+    );
+    assert_eq!(
+        counts.injected_status_failures.load(SeqCst),
+        1,
+        "the intended post-creation enrichment boundary must actually fail"
+    );
     assert!(created.path.join("tracked").is_file());
     assert_eq!(created.branch.as_deref(), Some("topic"));
     assert!(created.worktree.is_none());
@@ -227,13 +260,14 @@ fn status_failure_after_real_commit_returns_created_receipt_without_a_retry() {
         .worktree_setup_creation(&fixture.store, created.operation_id)
         .unwrap()
         .unwrap();
+    assert_eq!(report.operation_id, created.operation_id);
     assert_eq!(report.state, WorktreeOperationState::Created);
-    assert_eq!(
-        git(&fixture.repository, &["worktree", "list", "--porcelain"])
-            .matches("branch refs/heads/topic")
-            .count(),
-        1
-    );
+    let WorktreeCreationOutcome::Created { worktree, .. } = report.outcome.unwrap() else {
+        panic!("durable committed outcome was lost");
+    };
+    assert_eq!(worktree.path, created.path);
+    let inventory = git(&fixture.repository, &["worktree", "list", "--porcelain"]);
+    assert_eq!(inventory.matches("branch refs/heads/topic").count(), 1);
 }
 
 #[test]
@@ -381,6 +415,23 @@ fn trusted_setup_binds_exact_recipe_and_a_free_lease_does_not_erase_execution() 
         fs::read_to_string(created.path.join(".env")).unwrap(),
         "PRIVATE_FIXTURE_VALUE=preserved\n"
     );
+    let removal = PreparedRemoval::prepare(
+        &RepositoryService::system("git"),
+        fixture.repository.clone(),
+        "setup".into(),
+        None,
+        true,
+        false,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert!(
+        removal
+            .remove(&fixture.store, |_| Ok(()), || Ok(()))
+            .is_err(),
+        "prepared setup must retain directory protection before publication"
+    );
+    assert!(created.path.exists());
     let recipe = prepared.recipe.as_ref().unwrap();
     assert!(prepared.custody.matches_recipe(recipe));
     for change in 0..4 {
@@ -418,7 +469,22 @@ fn trusted_setup_binds_exact_recipe_and_a_free_lease_does_not_erase_execution() 
             )
             .is_err()
     );
+    let admin = service
+        .git_dir(&created.path, &CancellationToken::new())
+        .unwrap();
+    let admin_root = crate::fs_safety::Root::open(&admin).unwrap();
+    assert!(crate::repository::worktree_setup_removal_is_quiescent(&admin_root).is_err());
     drop(prepared);
+    let marker = admin.join("cagents-setup-creation");
+    let marker_bytes = fs::read(&marker).unwrap();
+    fs::remove_file(&marker).unwrap();
+    assert!(
+        crate::repository::worktree_setup_removal_is_quiescent(&admin_root).is_err(),
+        "missing generation must not erase retained Reserved authority"
+    );
+    fs::write(&marker, marker_bytes).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
     let report = service
         .worktree_setup_creation(&fixture.store, created.operation_id)
         .unwrap()
@@ -434,4 +500,342 @@ fn trusted_setup_binds_exact_recipe_and_a_free_lease_does_not_erase_execution() 
         !created.path.join("ready").exists(),
         "component fixture never executed a shell recipe"
     );
+}
+
+#[test]
+fn branch_cleanup_cannot_follow_a_rewritten_repository_gitfile() {
+    if isolated(concat!(
+        module_path!(),
+        "::branch_cleanup_cannot_follow_a_rewritten_repository_gitfile"
+    )) {
+        return;
+    }
+    let fixture = Fixture::new();
+    let root = fixture._root.path();
+    let original = root.join("original-checkout");
+    let original_admin = root.join("original-admin");
+    let replacement = root.join("replacement-checkout");
+    let victim = root.join("original-topic");
+    git(
+        root,
+        &[
+            "clone",
+            "-q",
+            "--separate-git-dir",
+            original_admin.to_str().unwrap(),
+            fixture.repository.to_str().unwrap(),
+            original.to_str().unwrap(),
+        ],
+    );
+    git(
+        root,
+        &[
+            "clone",
+            "-q",
+            fixture.repository.to_str().unwrap(),
+            replacement.to_str().unwrap(),
+        ],
+    );
+    git(
+        &original,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "topic",
+            victim.to_str().unwrap(),
+            "main",
+        ],
+    );
+    git(&replacement, &["branch", "topic", "main"]);
+    let replacement_before = git(&replacement, &["rev-parse", "refs/heads/topic"]);
+    assert_eq!(
+        git(&original, &["rev-parse", "refs/heads/topic"]),
+        replacement_before
+    );
+    let gitfile = original.join(".git");
+    let old_gitfile = fs::read(&gitfile).unwrap();
+    let prepared = PreparedRemoval::prepare(
+        &RepositoryService::system("git"),
+        original.clone(),
+        "topic".into(),
+        None,
+        false,
+        true,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let result = prepared.remove_with_post_git_checkpoint(
+        &fixture.store,
+        |_| Ok(()),
+        || Ok(()),
+        || {
+            // Exact causal boundary: successful real removal, then mutable checkout
+            // discovery changes before optional safe-d. Neither held directory moves.
+            assert!(!victim.exists());
+            let temporary = original.join(".git-redirect-proposal");
+            fs::write(
+                &temporary,
+                format!("gitdir: {}\n", replacement.join(".git").display()),
+            )
+            .unwrap();
+            fs::rename(temporary, &gitfile).unwrap();
+        },
+    );
+    fs::write(&gitfile, old_gitfile).unwrap();
+    let removed = result.unwrap();
+    assert_eq!(removed.path, victim);
+    assert_eq!(removed.branch_deleted.as_deref(), Some("topic"));
+    assert!(removed.branch_error.is_none());
+    assert_eq!(
+        git(&replacement, &["rev-parse", "refs/heads/topic"]),
+        replacement_before,
+        "unreviewed replacement repository branch was mutated"
+    );
+    assert!(
+        !git(
+            &original,
+            &["for-each-ref", "--format=%(refname)", "refs/heads/topic"]
+        )
+        .contains("refs/heads/topic")
+    );
+}
+
+#[test]
+fn list_keeps_healthy_and_unavailable_checkout_evidence() {
+    if isolated(concat!(
+        module_path!(),
+        "::list_keeps_healthy_and_unavailable_checkout_evidence"
+    )) {
+        return;
+    }
+    let fixture = Fixture::new();
+    let healthy = fixture.create("healthy");
+    let missing = fixture.create("missing");
+    fs::rename(
+        &missing.path,
+        fixture._root.path().join("parked-missing-checkout"),
+    )
+    .unwrap();
+    let result = execute_with(
+        &RepositoryService::system("git"),
+        Operation::List {
+            repository: fixture.repository.clone(),
+        },
+        &fixture.store,
+        |path| {
+            if path == missing.path {
+                Err("injected unavailable session census".into())
+            } else {
+                Ok(Vec::new())
+            }
+        },
+        None,
+    )
+    .unwrap();
+    let Execution::Reply {
+        reply: Reply::Listed { worktrees },
+        setup: None,
+    } = result
+    else {
+        panic!("inventory was lost");
+    };
+    assert_eq!(worktrees.len(), 3);
+    let healthy = worktrees
+        .iter()
+        .find(|row| row.path == healthy.path)
+        .unwrap();
+    assert_eq!(healthy.dirty, Some(false));
+    assert!(healthy.status_error.is_none());
+    assert_eq!(healthy.live_sessions.as_deref(), Some([].as_slice()));
+    let unavailable = worktrees
+        .iter()
+        .find(|row| row.path == missing.path)
+        .unwrap();
+    assert_eq!(unavailable.branch.as_deref(), Some("missing"));
+    assert_eq!(unavailable.dirty, None, "unavailable must not appear clean");
+    assert!(
+        unavailable
+            .status_error
+            .as_deref()
+            .is_some_and(|text| !text.is_empty())
+    );
+    assert_eq!((unavailable.ahead, unavailable.behind), (None, None));
+    assert!(unavailable.live_sessions.is_none());
+    assert_eq!(
+        unavailable.session_error.as_deref(),
+        Some("injected unavailable session census")
+    );
+    let json = serde_json::to_value(unavailable).unwrap();
+    assert!(json["dirty"].is_null() && json["live_sessions"].is_null());
+}
+
+#[test]
+fn separate_git_metadata_uses_real_primary_setup_sources() {
+    if isolated(concat!(
+        module_path!(),
+        "::separate_git_metadata_uses_real_primary_setup_sources"
+    )) {
+        return;
+    }
+    let fixture = Fixture::new();
+    let root = fixture._root.path();
+    let primary = root.join("separate-primary");
+    let metadata = root.join("separate-admin");
+    git(
+        root,
+        &[
+            "clone",
+            "-q",
+            "--separate-git-dir",
+            metadata.to_str().unwrap(),
+            fixture.repository.to_str().unwrap(),
+            primary.to_str().unwrap(),
+        ],
+    );
+    fs::create_dir(primary.join(".cagents")).unwrap();
+    fs::write(
+        primary.join(".cagents/worktree.toml"),
+        "copy=['.env']\nsetup=['printf reviewed']\n",
+    )
+    .unwrap();
+    fs::write(primary.join(".env"), "FIXTURE_ONLY=source-checkout\n").unwrap();
+    let operation = Operation::Create {
+        repository: metadata.clone(),
+        branch: "setup-topic".into(),
+        base: Some("main".into()),
+        linear: None,
+        no_setup: false,
+    };
+    let service = RepositoryService::system("git");
+    let untrusted = execute_with(
+        &service,
+        operation.clone(),
+        &fixture.store,
+        |_| Ok(Vec::new()),
+        Some(fixture.settings.clone()),
+    );
+    assert!(
+        untrusted.is_err(),
+        "real primary setup must not be silently skipped"
+    );
+    let plan = crate::worktree_setup::load(&primary).unwrap().unwrap();
+    crate::worktree_setup::trust(&primary, &plan, &CancellationToken::new()).unwrap();
+    let result = execute_with(
+        &service,
+        operation,
+        &fixture.store,
+        |_| Ok(Vec::new()),
+        Some(fixture.settings.clone()),
+    )
+    .unwrap();
+    let Execution::Reply {
+        reply: Reply::Created(created),
+        setup: Some(prepared),
+    } = result
+    else {
+        panic!("real primary plan was not retained");
+    };
+    assert!(created.error.is_none(), "{created:?}");
+    assert_eq!(
+        fs::read_to_string(created.path.join(".env")).unwrap(),
+        "FIXTURE_ONLY=source-checkout\n"
+    );
+    assert!(
+        prepared
+            .custody
+            .matches_recipe(prepared.recipe.as_ref().unwrap())
+    );
+    let receipt = service
+        .worktree_setup_creation(&fixture.store, created.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        receipt
+            .request
+            .unwrap()
+            .setup_intent
+            .unwrap()
+            .primary
+            .as_deref(),
+        Some(primary.as_path())
+    );
+    assert!(!metadata.join(".env").exists());
+    // No holder, shell or provider executes in this component contract.
+}
+
+#[test]
+fn explicit_skip_can_recover_an_unreadable_current_plan_without_replay() {
+    if isolated(concat!(
+        module_path!(),
+        "::explicit_skip_can_recover_an_unreadable_current_plan_without_replay"
+    )) {
+        return;
+    }
+    let fixture = Fixture::new();
+    fs::create_dir(fixture.repository.join(".cagents")).unwrap();
+    let configuration = fixture.repository.join(".cagents/worktree.toml");
+    fs::write(&configuration, "setup=['printf must-not-run']\n").unwrap();
+    let original = crate::worktree_setup::load(&fixture.repository)
+        .unwrap()
+        .unwrap();
+    crate::worktree_setup::trust(&fixture.repository, &original, &CancellationToken::new())
+        .unwrap();
+    let Execution::Reply {
+        reply: Reply::Created(created),
+        setup: Some(prepared),
+    } = fixture.execute(fixture.operation("recover-skip", false))
+    else {
+        panic!("setup was not prepared");
+    };
+    let old_run = Some(prepared.custody.run);
+    drop(prepared); // no reservation or shell execution has occurred
+    let invalid = "setup = [invalid, unfinished\n";
+    fs::write(&configuration, invalid).unwrap();
+    let Execution::Reply {
+        reply: Reply::SetupReview(review),
+        setup: None,
+    } = fixture.execute(Operation::ReviewSetup {
+        repository: fixture.repository.clone(),
+        path: created.path.clone(),
+    })
+    else {
+        panic!("missing explicit review");
+    };
+    assert!(review.current_error.is_some());
+    assert!(review.current_plan.is_none());
+    assert_eq!(review.intent.creation_id, created.operation_id);
+    let result = fixture.execute(Operation::ResumeSetup {
+        repository: fixture.repository.clone(),
+        path: created.path.clone(),
+        creation_id: created.operation_id,
+        expected_run: old_run,
+        expected_fingerprint: None,
+        trust: false,
+        skip: true,
+    });
+    let Execution::Reply {
+        reply:
+            Reply::SetupPrepared {
+                skip: true,
+                run_id,
+                error: None,
+                ..
+            },
+        setup: None,
+    } = result
+    else {
+        panic!("explicit skip was stranded by invalid nonexecuting config");
+    };
+    assert_ne!(Some(run_id), old_run);
+    let service = RepositoryService::system("git");
+    let receipt = service
+        .worktree_setup_creation(&fixture.store, created.operation_id)
+        .unwrap()
+        .unwrap();
+    let updated = receipt.request.unwrap().setup_intent.unwrap();
+    assert!(updated.skip && updated.copy_done);
+    assert_eq!(updated.run_id, Some(run_id));
+    assert_eq!(fs::read_to_string(configuration).unwrap(), invalid);
 }

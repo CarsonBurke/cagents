@@ -553,6 +553,29 @@ pub(super) fn process_request(
     ensure_request_open(host, &request)?;
     ensure_startup_recovery_request(host, &request)?;
     let gate = control_gate(host);
+    if let ClientRequest::Worktree {
+        authority,
+        operation,
+    } = &request
+    {
+        let active = {
+            let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
+            ensure_request_open(host, &request)?;
+            ensure_startup_recovery_request(host, &request)?;
+            super::agent_execution::terminals::worktree_caller(host, client_id, authority)?;
+            super::account_lifecycle::admit(host, &request)?;
+            super::worktree_removal::admit(host, &request)?;
+            super::worktree_control::admit(host, operation.mutates())?
+        };
+        let reply = super::worktree_control::process(
+            host,
+            client_id,
+            authority.clone(),
+            operation.clone(),
+            active,
+        )?;
+        return Ok((ServerResponse::Worktree(reply), Vec::new(), false));
+    }
     // The GitHub read must not monopolize the exclusive admission fence. All
     // authorizing local state is checked again only after that fence is held.
     if let ClientRequest::DeviceOperation {
@@ -649,6 +672,11 @@ pub(super) fn process_request(
     }
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
+        ClientRequest::Worktree { .. } => Err(ProtocolError::new(
+            ProtocolErrorCode::InvalidRequest,
+            "Worktree operations require their original scoped admission",
+            false,
+        )),
         ClientRequest::DeviceOperation { operation } => {
             match &operation {
                 crate::device_service::Operation::AccountLifecycle { .. } => {

@@ -20,6 +20,22 @@ pub enum Operation {
     List {
         repository: PathBuf,
     },
+    SetupIntents {
+        repository: PathBuf,
+    },
+    ReviewSetup {
+        repository: PathBuf,
+        path: PathBuf,
+    },
+    ResumeSetup {
+        repository: PathBuf,
+        path: PathBuf,
+        creation_id: crate::model::OperationId,
+        expected_run: Option<crate::model::OperationId>,
+        expected_fingerprint: Option<String>,
+        trust: bool,
+        skip: bool,
+    },
     Remove {
         repository: PathBuf,
         target: String,
@@ -30,7 +46,10 @@ pub enum Operation {
 }
 impl Operation {
     pub fn mutates(&self) -> bool {
-        matches!(self, Self::Create { .. } | Self::Remove { .. })
+        matches!(
+            self,
+            Self::Create { .. } | Self::Remove { .. } | Self::ResumeSetup { .. }
+        )
     }
 }
 
@@ -56,6 +75,8 @@ pub struct Setup {
     pub command: String,
     pub run_id: crate::model::OperationId,
     pub terminal: Option<crate::model::TerminalSession>,
+    /// Exact attempted actor, retained even if startup/publication is uncertain.
+    pub attempted_terminal: Option<crate::model::TerminalId>,
     pub error: Option<String>,
 }
 
@@ -70,6 +91,16 @@ pub struct Created {
     pub warnings: Vec<String>,
     pub setup: Option<Setup>,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreationFailure {
+    pub operation_id: crate::model::OperationId,
+    pub path: PathBuf,
+    pub state: String,
+    pub residual: Option<serde_json::Value>,
+    pub error: String,
+    pub may_have_effects: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,10 +122,51 @@ pub struct RemovalFailure {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Plan {
+    pub copy: Vec<String>,
+    pub commands: Vec<String>,
+    pub fingerprint: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupIntent {
+    pub creation_id: crate::model::OperationId,
+    pub run_id: Option<crate::model::OperationId>,
+    pub path: PathBuf,
+    pub primary: PathBuf,
+    pub retained_plan: Option<Plan>,
+    pub skip: bool,
+    pub copy_done: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupReview {
+    pub intent: SetupIntent,
+    pub current_plan: Option<Plan>,
+    pub trusted: bool,
+    pub current_error: Option<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reply {
-    ResolvedRepository { repository: PathBuf },
+    ResolvedRepository {
+        repository: PathBuf,
+    },
     Created(Created),
-    Listed { worktrees: Vec<Entry> },
+    CreationFailed(CreationFailure),
+    Listed {
+        worktrees: Vec<Entry>,
+    },
+    SetupIntents {
+        intents: Vec<SetupIntent>,
+        warnings: Vec<String>,
+    },
+    SetupReview(SetupReview),
+    SetupPrepared {
+        path: PathBuf,
+        creation_id: crate::model::OperationId,
+        run_id: crate::model::OperationId,
+        skip: bool,
+        setup: Option<Setup>,
+        error: Option<String>,
+    },
     Removed(Removed),
     RemovalFailed(RemovalFailure),
 }

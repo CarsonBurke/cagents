@@ -38,6 +38,11 @@ pub enum WorktreeCommand {
         #[arg(long)]
         project: Option<PathBuf>,
     },
+    /// Inspect retained setup or explicitly review a fresh run.
+    Setup {
+        #[command(subcommand)]
+        command: SetupCommand,
+    },
     /// Remove a linked checkout after checking files, commits and live owners.
     Remove {
         target: String,
@@ -52,6 +57,58 @@ pub enum WorktreeCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum SetupCommand {
+    List {
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+    Review {
+        path: PathBuf,
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+    /// Start a fresh reviewed run; an uncertain previous run cannot be replayed.
+    Resume {
+        path: PathBuf,
+        #[arg(long)]
+        project: Option<PathBuf>,
+        #[arg(long)]
+        creation: crate::model::OperationId,
+        #[arg(long)]
+        expected_run: Option<crate::model::OperationId>,
+        #[arg(long)]
+        fingerprint: Option<String>,
+        #[arg(long)]
+        trust: bool,
+    },
+    /// Explicitly skip setup after reviewing this exact retained creation.
+    Skip {
+        path: PathBuf,
+        #[arg(long)]
+        project: Option<PathBuf>,
+        #[arg(long)]
+        creation: crate::model::OperationId,
+        #[arg(long)]
+        expected_run: Option<crate::model::OperationId>,
+        #[arg(long)]
+        fingerprint: Option<String>,
+    },
+}
+fn checkout_path(path: PathBuf) -> Result<PathBuf, AppError> {
+    if crate::device::is_remote() {
+        if !path.is_absolute() {
+            return Err(AppError::new(
+                "project",
+                "Use an absolute path on the selected device",
+            ));
+        }
+        Ok(path)
+    } else {
+        path.canonicalize()
+            .map_err(|error| AppError::new("project", error))
+    }
+}
 fn request(client: &mut ControlClient, operation: Operation) -> Result<Reply, AppError> {
     // This uses the dedicated finite deadline in the CLI activation seam.
     // A lost response never triggers a mutation retry.
@@ -159,6 +216,12 @@ pub(super) fn execute(command: WorktreeCommand) -> Result<CommandOutput, AppErro
         WorktreeCommand::Create { project, .. }
         | WorktreeCommand::List { project }
         | WorktreeCommand::Remove { project, .. } => project.clone(),
+        WorktreeCommand::Setup { command } => match command {
+            SetupCommand::List { project }
+            | SetupCommand::Review { project, .. }
+            | SetupCommand::Resume { project, .. }
+            | SetupCommand::Skip { project, .. } => project.clone(),
+        },
     };
     let repository = repository(&mut client, selector, &model)?;
     let (operation, spawn) = match command {
@@ -185,6 +248,49 @@ pub(super) fn execute(command: WorktreeCommand) -> Result<CommandOutput, AppErro
         WorktreeCommand::List { .. } => (
             Operation::List {
                 repository: repository.clone(),
+            },
+            None,
+        ),
+        WorktreeCommand::Setup { command } => (
+            match command {
+                SetupCommand::List { .. } => Operation::SetupIntents {
+                    repository: repository.clone(),
+                },
+                SetupCommand::Review { path, .. } => Operation::ReviewSetup {
+                    repository: repository.clone(),
+                    path: checkout_path(path)?,
+                },
+                SetupCommand::Resume {
+                    path,
+                    creation,
+                    expected_run,
+                    fingerprint,
+                    trust,
+                    ..
+                } => Operation::ResumeSetup {
+                    repository: repository.clone(),
+                    path: checkout_path(path)?,
+                    creation_id: creation,
+                    expected_run,
+                    expected_fingerprint: fingerprint,
+                    trust,
+                    skip: false,
+                },
+                SetupCommand::Skip {
+                    path,
+                    creation,
+                    expected_run,
+                    fingerprint,
+                    ..
+                } => Operation::ResumeSetup {
+                    repository: repository.clone(),
+                    path: checkout_path(path)?,
+                    creation_id: creation,
+                    expected_run,
+                    expected_fingerprint: fingerprint,
+                    trust: false,
+                    skip: true,
+                },
             },
             None,
         ),
@@ -224,6 +330,19 @@ pub(super) fn execute(command: WorktreeCommand) -> Result<CommandOutput, AppErro
         }
     };
     match request(&mut client, operation)? {
+        Reply::CreationFailed(failure) => Err(AppError {
+            kind: "worktree_create",
+            message: format!(
+                "Creation {} needs review at {} ({}): {}. Inspect this operation and checkout before any retry",
+                failure.operation_id,
+                failure.path.display(),
+                failure.state,
+                failure.error
+            ),
+            details: Some(
+                json!({"schema_version":1,"operation_id":failure.operation_id,"path":failure.path,"state":failure.state,"residual":failure.residual,"error":failure.error,"may_have_effects":failure.may_have_effects}),
+            ),
+        }),
         Reply::Created(created) => {
             let mut data = json!({"schema_version":1,"operation_id":created.operation_id,"path":created.path,"branch":created.branch,"worktree":created.worktree,"warnings":created.warnings,"setup":created.setup,"error":created.error});
             let failure = created.error.as_ref().or_else(|| {
@@ -313,6 +432,103 @@ pub(super) fn execute(command: WorktreeCommand) -> Result<CommandOutput, AppErro
                 command: "worktree.create",
                 data,
                 human,
+            })
+        }
+        Reply::SetupIntents { intents, warnings } => {
+            let mut human = intents
+                .iter()
+                .map(|intent| {
+                    format!(
+                        "{}  creation={} run={} {}",
+                        intent.path.display(),
+                        intent.creation_id,
+                        intent
+                            .run_id
+                            .map(|run| run.to_string())
+                            .unwrap_or_else(|| "-".into()),
+                        if intent.skip { "skipped" } else { "retained" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if human.is_empty() {
+                human = "No retained setup intents".into();
+            }
+            for warning in &warnings {
+                human.push_str(&format!("\nWarning: {warning}"));
+            }
+            Ok(CommandOutput {
+                command: "worktree.setup.list",
+                data: json!({"schema_version":1,"intents":intents,"warnings":warnings}),
+                human,
+            })
+        }
+        Reply::SetupReview(review) => {
+            let mut human = format!(
+                "{}\nCreation: {}\nRun: {}\n",
+                review.intent.path.display(),
+                review.intent.creation_id,
+                review
+                    .intent
+                    .run_id
+                    .map(|run| run.to_string())
+                    .unwrap_or_else(|| "-".into())
+            );
+            if let Some(plan) = &review.current_plan {
+                human.push_str(&format!(
+                    "Fingerprint: {}\nTrusted: {}\n",
+                    plan.fingerprint, review.trusted
+                ));
+                for pattern in &plan.copy {
+                    human.push_str(&format!("Copy: {pattern}\n"));
+                }
+                for command in &plan.commands {
+                    human.push_str(&format!("Command: {command}\n"));
+                }
+            } else {
+                human.push_str("No current setup plan\n");
+            }
+            if let Some(error) = &review.current_error {
+                human.push_str(&format!("Review unavailable: {error}\n"));
+            }
+            human.push_str("Use setup resume or setup skip with this creation, expected run and current fingerprint. An uncertain previous execution remains blocked.");
+            Ok(CommandOutput {
+                command: "worktree.setup.review",
+                data: json!({"schema_version":1,"review":review}),
+                human,
+            })
+        }
+        Reply::SetupPrepared {
+            path,
+            creation_id,
+            run_id,
+            skip,
+            setup,
+            error,
+        } => {
+            let data = json!({"schema_version":1,"path":path,"creation_id":creation_id,"run_id":run_id,"skip":skip,"setup":setup,"error":error});
+            if let Some(error) = error
+                .as_ref()
+                .or_else(|| setup.as_ref().and_then(|setup| setup.error.as_ref()))
+            {
+                return Err(AppError {
+                    kind: "worktree_setup",
+                    message: format!(
+                        "Checkout retained at {}: {error}. Review setup again before retrying",
+                        path.display()
+                    ),
+                    details: Some(data),
+                });
+            }
+            Ok(CommandOutput {
+                command: "worktree.setup.resume",
+                data,
+                human: format!(
+                    "{} setup for {} (run {})",
+                    if skip { "Skipped" } else { "Prepared" },
+                    path.display(),
+                    run_id
+                ),
             })
         }
         Reply::Listed { worktrees } => {

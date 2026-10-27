@@ -10,7 +10,11 @@ mod managed_worktrees;
 pub(crate) use managed_worktrees::{isolated_git_test, retained_managed_fixture_directory};
 mod worktree_control;
 mod worktree_setup_intent;
-pub(crate) use worktree_control::SetupCustody;
+#[cfg(feature = "host")]
+pub(crate) use worktree_control::{
+    SetupCustody, creation_marker as worktree_creation_marker, publish_setup_family_reaped,
+    removal_is_quiescent as worktree_setup_removal_is_quiescent, verify_reserved_setup_holder,
+};
 pub use worktree_setup_intent::{WorktreeSetupIntent, WorktreeSetupPlan};
 
 use std::{

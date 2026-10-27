@@ -2825,11 +2825,12 @@ impl Worker {
                     command.env("PATH", path);
                 }
                 (
-                    holder::spawn_recoverable(
+                    holder::spawn_with_setup(
                         command,
                         pty_size(current_size),
                         child_exit_tx,
                         config.holder_recovery.clone(),
+                        config.setup_authority.clone(),
                     )?,
                     Vec::new(),
                 )

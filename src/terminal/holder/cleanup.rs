@@ -173,7 +173,7 @@ fn confirmed_receipt(
     let receipt: Receipt = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     Ok(receipt.record == *expected
         && receipt.record.kind == Kind::Terminal
-        && matches!(receipt.record.version, 4 | 5)
+        && matches!(receipt.record.version, 4 | 5 | 6)
         && (receipt.record.application == crate::instance::APPLICATION_ID
             || role.is_some_and(|role| role.matches(&receipt.record, proof)))
         && receipt.record.boot == proof.boot_id
@@ -359,7 +359,7 @@ mod tests {
             "a receipt cannot certify a live holder"
         );
         holder.finish();
-        for (version, accepted) in [(4, true), (5, true), (3, false), (6, false)] {
+        for (version, accepted) in [(4, true), (5, true), (6, true), (3, false), (7, false)] {
             record.version = version;
             publish(&record, &recovery).unwrap();
             assert_eq!(
