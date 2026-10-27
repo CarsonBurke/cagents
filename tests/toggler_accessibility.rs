@@ -16,6 +16,19 @@ use iced_accessibility::{
 
 type Message = (u8, bool);
 
+fn headless_renderer() -> Renderer {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(Renderer::new(
+            Font::DEFAULT,
+            Pixels::from(16),
+            Some("tiny-skia"),
+        ))
+        .expect("create a headless renderer")
+}
+
 #[test]
 fn disabled_switch_style_preserves_the_stored_on_and_off_colors() {
     use cosmic::widget::toggler::{Catalog, Status};
@@ -124,16 +137,7 @@ fn operate(
 
 #[test]
 fn switches_retain_native_identity_and_route_focus_activation_and_disabled_state() {
-    let renderer = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(Renderer::new(
-            Font::DEFAULT,
-            Pixels::from(16),
-            Some("tiny-skia"),
-        ))
-        .expect("create a headless renderer");
+    let renderer = headless_renderer();
     let mut parent = switches(false, true);
     let mut tree = Tree::new(parent.as_widget());
     let mut node = parent.as_widget_mut().layout(
@@ -456,5 +460,122 @@ fn switches_retain_native_identity_and_route_focus_activation_and_disabled_state
             mouse::Cursor::Unavailable
         ),
         (vec![], false)
+    );
+}
+
+#[test]
+fn filtered_settings_switch_refuses_the_replaced_controls_native_identity() {
+    fn notifications(query: &str) -> Element<'static, Message> {
+        use cagents::settings_widgets::{field, group, toggle_enabled};
+
+        group(
+            "Agent notifications",
+            "Choose when agents need your attention.",
+            vec![
+                field(
+                    "System notifications",
+                    "Show desktop alerts.",
+                    toggle_enabled("System notifications", true, true, |value| (1, value)),
+                )
+                .label_in_control(),
+                field(
+                    "Successful completion",
+                    "Notify when a turn finishes.",
+                    toggle_enabled("Successful completion", false, true, |value| (2, value)),
+                )
+                .label_in_control(),
+            ],
+        )
+        .view("Notifications", query)
+        .expect("at least one matching notification switch")
+    }
+
+    fn target(
+        parent: &Element<'_, Message>,
+        tree: &Tree,
+        node: &layout::Node,
+        label: &str,
+    ) -> NodeId {
+        let nodes =
+            parent
+                .as_widget()
+                .a11y_nodes(Layout::new(node), tree, mouse::Cursor::Unavailable);
+        let found = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| node.node().role() == Role::Switch && node.node().label() == Some(label))
+            .expect("the actual labelled switch is advertised");
+        NodeId::from(found.id().clone())
+    }
+
+    let renderer = headless_renderer();
+    let mut parent = notifications("");
+    let mut tree = Tree::new(parent.as_widget());
+    let limits = layout::Limits::new(Size::ZERO, Size::new(480.0, 500.0));
+    let mut node = parent.as_widget_mut().layout(&mut tree, &renderer, &limits);
+    let old_master = target(&parent, &tree, &node, "System notifications");
+    assert_eq!(
+        dispatch(
+            &mut parent,
+            &mut tree,
+            &node,
+            &renderer,
+            native(old_master, Action::Focus),
+            mouse::Cursor::Unavailable,
+        ),
+        (vec![], true)
+    );
+
+    // The real Settings filter puts Success into the previous master's slot.
+    parent = notifications("successful");
+    tree.diff(parent.as_widget_mut());
+    node = parent.as_widget_mut().layout(&mut tree, &renderer, &limits);
+    let current_success = target(&parent, &tree, &node, "Successful completion");
+    assert_ne!(old_master, current_success);
+    for event in [
+        native(old_master, Action::Focus),
+        native(old_master, Action::Click),
+        key(
+            keyboard::Key::Character(" ".into()),
+            keyboard::Modifiers::empty(),
+            false,
+        ),
+    ] {
+        assert_eq!(
+            dispatch(
+                &mut parent,
+                &mut tree,
+                &node,
+                &renderer,
+                event,
+                mouse::Cursor::Unavailable,
+            ),
+            (vec![], false),
+            "retired identity and focus cannot activate the replacement setting"
+        );
+    }
+    assert_eq!(
+        dispatch(
+            &mut parent,
+            &mut tree,
+            &node,
+            &renderer,
+            native(current_success, Action::Focus),
+            mouse::Cursor::Unavailable,
+        ),
+        (vec![], true)
+    );
+    assert_eq!(
+        dispatch(
+            &mut parent,
+            &mut tree,
+            &node,
+            &renderer,
+            native(current_success, Action::Click),
+            mouse::Cursor::Unavailable,
+        ),
+        (vec![(2, true)], true),
+        "the freshly advertised replacement remains usable"
     );
 }

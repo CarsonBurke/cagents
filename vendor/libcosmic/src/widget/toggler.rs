@@ -21,6 +21,7 @@ pub fn toggler<'a, Message>(is_checked: bool) -> Toggler<'a, Message> {
 #[allow(missing_debug_implementations)]
 pub struct Toggler<'a, Message> {
     id: Id,
+    implicit_id: bool,
     is_toggled: bool,
     on_toggle: Option<Box<dyn Fn(bool) -> Message + 'a>>,
     label: Option<String>,
@@ -51,6 +52,7 @@ impl<'a, Message> Toggler<'a, Message> {
     pub fn new(is_toggled: bool) -> Self {
         Toggler {
             id: Id::unique(),
+            implicit_id: true,
             is_toggled,
             on_toggle: None,
             label: None,
@@ -125,6 +127,7 @@ impl<'a, Message> Toggler<'a, Message> {
 
     pub fn id(mut self, id: Id) -> Self {
         self.id = id;
+        self.implicit_id = false;
         self
     }
 
@@ -162,6 +165,7 @@ impl<'a, Message> Widget<Message, crate::Theme, crate::Renderer> for Toggler<'a,
     fn state(&self) -> tree::State {
         tree::State::new(State {
             prev_toggled: self.is_toggled,
+            label: self.label.clone(),
             ..State::default()
         })
     }
@@ -175,8 +179,22 @@ impl<'a, Message> Widget<Message, crate::Theme, crate::Renderer> for Toggler<'a,
     }
 
     fn diff(&mut self, tree: &mut Tree) {
+        let state = tree.state.downcast_mut::<State>();
+        if self.implicit_id && state.label != self.label {
+            // Filtered Settings rows can put another switch at this position.
+            // A retained ID/focus must not retarget the previous label's action.
+            self.id = Id::unique();
+            tree.id = Some(self.id.clone());
+            *state = State {
+                prev_toggled: self.is_toggled,
+                label: self.label.clone(),
+                ..State::default()
+            };
+        } else {
+            state.label = self.label.clone();
+        }
         if self.on_toggle.is_none() {
-            tree.state.downcast_mut::<State>().is_focused = false;
+            state.is_focused = false;
         }
     }
 
@@ -565,6 +583,7 @@ pub fn next_to_each_other(
 
 #[derive(Debug, Default)]
 pub struct State {
+    label: Option<String>,
     text: widget::text::State<<crate::Renderer as iced_core::text::Renderer>::Paragraph>,
     anim: anim::State,
     prev_toggled: bool,
