@@ -700,7 +700,14 @@ mod tests {
     fn published_twenty_upgrade_preserves_all_rows_without_replaying_run_history() {
         fn rows(db: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
             let table = table.replace('"', "\"\"");
-            let mut query = db.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+            let selected = if table == "automation_firings" {
+                "id,automation,revision,occurrence_key,record,created_ms,state,run_id"
+            } else {
+                "*"
+            };
+            let mut query = db
+                .prepare(&format!("SELECT {selected} FROM \"{table}\""))
+                .unwrap();
             let columns = query.column_count();
             let mut rows = query
                 .query_map([], |row| {
@@ -782,6 +789,12 @@ mod tests {
                 .iter()
                 .any(|table| table == "automation_run_attention")
         );
+        // The new history column has an exact insertion-order backfill;
+        // original payload projection must not hide its value or lineage.
+        let expected_previous = db.prepare(
+            "SELECT id,lag(id) OVER(PARTITION BY automation ORDER BY rowid) FROM automation_firings ORDER BY rowid"
+        ).unwrap().query_map([], |row| Ok((row.get::<_,String>(0)?, row.get::<_,Option<String>>(1)?)))
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
         let before = tables
             .iter()
             .map(|table| (table.clone(), rows(&db, table)))
@@ -801,13 +814,37 @@ mod tests {
         drop(db);
         for _ in 0..2 {
             let registry = Registry::at(&legacy).unwrap();
+            let previous = registry
+                .db
+                .prepare("SELECT id,previous_firing FROM automation_firings ORDER BY rowid")
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(previous, expected_previous);
+            for table in [
+                "automation_precheck_history_cleanup",
+                "automation_retired_manual_requests",
+            ] {
+                assert_eq!(
+                    registry
+                        .db
+                        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                            .get::<_, u64>(0))
+                        .unwrap(),
+                    0
+                );
+            }
             assert_eq!(registry.model().unwrap(), expected_model);
             assert_eq!(
                 registry
                     .db
                     .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
                     .unwrap(),
-                21
+                super::super::SCHEMA_VERSION
             );
             assert!(
                 registry

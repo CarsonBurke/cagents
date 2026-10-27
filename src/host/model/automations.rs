@@ -6,6 +6,12 @@ use serde::{Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
 use super::{Registry, automation_audit, automation_notifications};
+
+mod history;
+
+pub(super) fn migrate_history(tx: &Transaction<'_>) -> Result<(), String> {
+    history::migrate(tx)
+}
 use crate::automations::LifecycleCause;
 use crate::automations::{
     Automation, Definition, Firing, FiringState, HistoryCursor, HistoryPage, MAX_HISTORY_PAGE,
@@ -124,6 +130,7 @@ impl Registry {
             &self.db,
             id,
             &occurrence_key(revision, &crate::automations::Trigger::Manual { request }),
+            revision,
         )?;
         if previous
             .as_ref()
@@ -321,6 +328,12 @@ impl Registry {
         }
         tx.execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
             .map_err(|e| e.to_string())?;
+        history::prune(
+            &tx,
+            Some(firing.automation),
+            now_ms,
+            crate::automations::HISTORY_RETAINED_ROWS,
+        )?;
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -535,6 +548,12 @@ impl Registry {
                 Some(firing.id),
             )?;
         }
+        history::prune(
+            &tx,
+            Some(automation.id),
+            now_ms,
+            crate::automations::HISTORY_RETAINED_ROWS,
+        )?;
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -650,6 +669,12 @@ impl Registry {
             write_automation(tx, &automation)?;
             tx.execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
                 .map_err(|error| error.to_string())?;
+            history::prune(
+                tx,
+                Some(firing.automation),
+                now_ms,
+                crate::automations::HISTORY_RETAINED_ROWS,
+            )?;
             return Ok(false);
         }
         Ok(true)
@@ -732,11 +757,18 @@ impl Registry {
                 "Older scheduled occurrences were skipped. Next eligible occurrence: {} ({})",
                 next.local, automation.definition.schedule.timezone
             )),
+            skipped_occurrences: None,
         };
         insert_firing(&tx, &firing, &key)?;
         automation.next = Some(next);
         automation.updated_ms = now_ms;
         write_automation(&tx, &automation)?;
+        history::prune(
+            &tx,
+            Some(id),
+            now_ms,
+            crate::automations::HISTORY_RETAINED_ROWS,
+        )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(firing)
     }
@@ -1001,6 +1033,12 @@ impl Registry {
             },
             None,
         )?;
+        history::prune(
+            &tx,
+            Some(automation.id),
+            now_ms,
+            crate::automations::HISTORY_RETAINED_ROWS,
+        )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(automation)
     }
@@ -1039,6 +1077,12 @@ impl Registry {
             params![id.to_string(), now_ms],
         )
         .map_err(|error| error.to_string())?;
+        history::prune(
+            &tx,
+            Some(automation.id),
+            now_ms,
+            crate::automations::HISTORY_RETAINED_ROWS,
+        )?;
         tx.commit().map_err(|error| error.to_string())
     }
 
@@ -1272,7 +1316,7 @@ impl Registry {
             .map_err(|error| error.to_string())?;
         let mut automation = read_automation(&tx, id)?;
         let key = occurrence_key(expected_execution_revision, &trigger);
-        if let Some(firing) = read_firing_key(&tx, id, &key)? {
+        if let Some(firing) = read_firing_key(&tx, id, &key, expected_execution_revision)? {
             if firing.revision != expected_execution_revision {
                 return Err(
                     "This request ID already belongs to another automation revision".into(),
@@ -1348,6 +1392,7 @@ impl Registry {
             run: None,
             skip: None,
             diagnostic: None,
+            skipped_occurrences: None,
         };
         let definition = automation.definition.clone();
         if !project_open {
@@ -1371,7 +1416,11 @@ impl Registry {
         } else {
             automation.active_firing = Some(firing.id);
         }
-        insert_firing(&tx, &firing, &key)?;
+        history::insert_or_coalesce(&tx, &mut firing, &key)?;
+        if !project_open && definition.precheck.is_some() {
+            // Project refusal is terminal before any Worker could launch.
+            history::record_never_launched(&tx, &firing)?;
+        }
         let accepted = if firing.state == FiringState::Prechecking && definition.precheck.is_none()
         {
             accept_firing(&tx, &mut automation, &mut firing, &definition, &key, now_ms)?
@@ -1395,6 +1444,12 @@ impl Registry {
                 Some(firing.id),
             )?;
         }
+        history::prune(
+            &tx,
+            Some(id),
+            now_ms,
+            crate::automations::HISTORY_RETAINED_ROWS,
+        )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(Claimed {
             firing,
@@ -1445,6 +1500,12 @@ impl Registry {
             // The exact cleanup receipt settles only this precheck's stale
             // pending attention, never a newer pause or another firing.
             automation_notifications::suppress_precheck(&tx, automation.id, firing.id)?;
+            history::prune(
+                &tx,
+                Some(automation.id),
+                now_ms,
+                crate::automations::HISTORY_RETAINED_ROWS,
+            )?;
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(None);
         }
@@ -1501,6 +1562,12 @@ impl Registry {
                 Some(firing.id),
             )?;
         }
+        history::prune(
+            &tx,
+            Some(automation.id),
+            now_ms,
+            crate::automations::HISTORY_RETAINED_ROWS,
+        )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(accepted)
     }
@@ -1641,7 +1708,13 @@ fn read_firing(db: &Connection, id: Uuid) -> Result<Firing, String> {
         .map_err(|error| error.to_string())?;
     decode(&record)
 }
-fn read_firing_key(db: &Connection, id: Uuid, key: &str) -> Result<Option<Firing>, String> {
+fn read_firing_key(
+    db: &Connection,
+    id: Uuid,
+    key: &str,
+    revision: u64,
+) -> Result<Option<Firing>, String> {
+    history::require_unretired_manual_key(db, id, key, revision)?;
     db.query_row(
         "SELECT record FROM automation_firings WHERE automation=?1 AND occurrence_key=?2",
         params![id.to_string(), key],
@@ -1653,7 +1726,7 @@ fn read_firing_key(db: &Connection, id: Uuid, key: &str) -> Result<Option<Firing
     .transpose()
 }
 fn insert_firing(tx: &Transaction<'_>, firing: &Firing, key: &str) -> Result<(), String> {
-    tx.execute("INSERT INTO automation_firings(id,automation,revision,occurrence_key,record,created_ms,state,run_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+    tx.execute("INSERT INTO automation_firings(id,automation,revision,occurrence_key,record,created_ms,state,run_id,previous_firing) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,(SELECT id FROM automation_firings WHERE automation=?2 ORDER BY rowid DESC LIMIT 1))",
         params![firing.id.to_string(), firing.automation.to_string(), firing.revision, key, encode(firing)?, firing.created_ms, encode(&firing.state)?, firing.run.map(|id| id.to_string())])
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -4410,4 +4483,5 @@ mod tests {
         );
         assert!(!registry.automation(created.id).unwrap().enabled);
     }
+    include!("automations/history_tests.rs");
 }

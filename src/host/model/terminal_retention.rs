@@ -683,6 +683,12 @@ mod tests {
                 .unwrap(),
             19
         );
+        // The new history column has an exact insertion-order backfill;
+        // original payload projection must not hide its value or lineage.
+        let expected_previous = db.prepare(
+            "SELECT id,lag(id) OVER(PARTITION BY automation ORDER BY rowid) FROM automation_firings ORDER BY rowid"
+        ).unwrap().query_map([], |row| Ok((row.get::<_,String>(0)?, row.get::<_,Option<String>>(1)?)))
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
         let before = table_rows(&db);
         assert!(!before.contains_key("terminal_retention_pins"));
         assert!(!before.contains_key("shared_terminal_retention_pins"));
@@ -696,6 +702,17 @@ mod tests {
         drop(db);
         for _ in 0..2 {
             let registry = Registry::at(&path).unwrap();
+            let previous = registry
+                .db
+                .prepare("SELECT id,previous_firing FROM automation_firings ORDER BY rowid")
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(previous, expected_previous);
             assert_eq!(
                 registry
                     .db
@@ -708,6 +725,24 @@ mod tests {
                 after.remove("automation_run_attention").unwrap().is_empty(),
                 "the added run-attention table must not replay historical runs"
             );
+            assert!(
+                after
+                    .remove("automation_precheck_history_cleanup")
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                after
+                    .remove("automation_retired_manual_requests")
+                    .unwrap()
+                    .is_empty()
+            );
+            // History22 appends one nullable column; preserve every original
+            // firing payload in this published19 comparison.
+            for row in after.get_mut("automation_firings").unwrap() {
+                assert_eq!(row.len(), 9);
+                row.pop().unwrap();
+            }
             assert!(after.remove("terminal_retention_pins").unwrap().is_empty());
             assert_eq!(
                 after.remove("shared_terminal_retention_pins").unwrap(),
