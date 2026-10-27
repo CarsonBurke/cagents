@@ -2528,13 +2528,16 @@ impl State {
             }
         }
         if matches!(self.list, ListState::Ready(_)) && !has_matching_rows {
-            let message = if self.list_loaded_query.as_deref() != Some(self.browser_query.trim()) {
+            let message = if self.list_loading
+                || self.list_loaded_query.as_deref() != Some(self.browser_query.trim())
+            {
                 if query.is_empty() {
                     "Pull request refresh pending."
                 } else {
                     "Search results pending."
                 }
             } else if query.is_empty()
+                && self.browser_filter == BrowserFilter::All
                 && matches!(&self.list, ListState::Ready(prs) if prs.is_empty())
             {
                 "No open pull requests."
