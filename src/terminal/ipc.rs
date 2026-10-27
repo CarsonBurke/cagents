@@ -195,7 +195,11 @@ use crate::{
 /// compatibility: replace the matched daemon before sending the new budgets.
 /// Version 127 combines both contracts in the matched set. Version 126 is
 /// reserved for the separate native Goal integration and is not adopted here.
-pub const PROTOCOL_VERSION: u16 = 127;
+/// Version 136 adds revision-fenced catalog retention to transcript updates.
+/// Its positional Presentation field requires a matched CLI, daemon and UI.
+/// Retained protocol-2 helpers separately negotiate catalog-aware JSON reads;
+/// legacy reads keep full catalog arrays. The worktree-135 family is separate.
+pub const PROTOCOL_VERSION: u16 = 136;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
