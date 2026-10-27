@@ -833,6 +833,7 @@ struct EditorDocument {
     external_deleted: bool,
     recreate_missing: bool,
     error: Option<String>,
+    error_from_disk_observer: bool,
     durability_warning: Option<String>,
     /// Undo and redo for this buffer. It lives exactly as long as the buffer:
     /// a document loaded afresh starts a history of its own.
@@ -893,10 +894,28 @@ impl EditorDocument {
             external_deleted: false,
             recreate_missing: false,
             error: None,
+            error_from_disk_observer: false,
             durability_warning: None,
             history: History::default(),
             #[cfg(test)]
             history_time: None,
+        }
+    }
+
+    // Background observations must not replace or clear a newer save failure.
+    fn note_disk_error(&mut self, error: String) {
+        self.conflict = true;
+        if self.error.is_none() || self.error_from_disk_observer {
+            self.error = Some(error);
+            self.error_from_disk_observer = true;
+        }
+    }
+
+    fn clear_disk_error(&mut self) {
+        if self.error_from_disk_observer {
+            self.conflict = false;
+            self.error = None;
+            self.error_from_disk_observer = false;
         }
     }
 
@@ -1054,6 +1073,7 @@ impl EditorDocument {
         debug_assert!(self.active_save.is_none());
         self.conflict = false;
         self.error = None;
+        self.error_from_disk_observer = false;
         edits
     }
 
@@ -4927,6 +4947,7 @@ impl RepositoryRuntime {
         if let DocumentState::Editable(document) = &mut self.document {
             document.active_save = Some(ticket.clone());
             document.error = None;
+            document.error_from_disk_observer = false;
         }
         // Keep diff review mounted while saving. Only a real save failure or
         // conflict reveals recovery; explicit saves may still leave preview.
@@ -4991,8 +5012,7 @@ impl RepositoryRuntime {
                         self.disk_poll = None;
                         self.disk_retry_after = Some(Instant::now() + self.disk_retry_delay);
                         self.disk_retry_delay = self.disk_retry_delay.saturating_mul(2).min(Duration::from_secs(30));
-                        document.conflict = true;
-                        document.error = Some(format!("Could not check the file on disk: {error}"));
+                        document.note_disk_error(format!("Could not check the file on disk: {error}"));
                         return Task::none();
                     }
                 };
@@ -5011,8 +5031,8 @@ impl RepositoryRuntime {
                     self.disk_poll = None; self.disk_stamp = Some(None);
                     self.disk_retry_after = None;
                     self.disk_retry_delay = Duration::from_secs(1);
-                    document.external_deleted = true; document.external_version = None; document.conflict = true;
-                    document.error = Some("File deleted or renamed on disk. Your buffer has been kept.".into());
+                    document.external_deleted = true; document.external_version = None;
+                    document.note_disk_error("File deleted or renamed on disk. Your buffer has been kept.".into());
                     return Task::none();
                 };
                 document.external_check_pending = true;
@@ -5032,8 +5052,7 @@ impl RepositoryRuntime {
                 let version = match result {
                     Ok(version) => version,
                     Err(error) => {
-                        document.conflict = true;
-                        document.error = Some(error);
+                        document.note_disk_error(error);
                         self.disk_stamp = Some(Some(stamp));
                         self.disk_retry_after = Some(Instant::now() + self.disk_retry_delay);
                         self.disk_retry_delay = self.disk_retry_delay.saturating_mul(2).min(Duration::from_secs(30));
@@ -5041,19 +5060,20 @@ impl RepositoryRuntime {
                     }
                 };
                 self.disk_stamp = Some(Some(stamp));
-                let recovered_read = self.disk_retry_after.take().is_some();
+                self.disk_retry_after = None;
                 self.disk_retry_delay = Duration::from_secs(1);
                 match crate::editor_reload::decide(document.disk_hash, Some(version.content_hash), document.dirty) {
                     crate::editor_reload::Decision::Unchanged => {
-                        if recovered_read || document.external_version.is_some() || document.external_deleted {
-                            document.external_version = None; document.external_deleted = false; document.conflict = false; document.error = None; self.disk_comparison = None;
+                        if document.external_version.is_some() || document.external_deleted {
+                            document.external_version = None; document.external_deleted = false; self.disk_comparison = None;
                         }
+                        document.clear_disk_error();
                         Task::none()
                     },
                     crate::editor_reload::Decision::Reload => self.reload_disk_version(identity.card, version),
                     crate::editor_reload::Decision::Conflict => {
                         document.external_version = Some(version); document.external_deleted = false;
-                        document.conflict = true; document.error = Some("File changed on disk".into());
+                        document.note_disk_error("File changed on disk".into());
                         if self.disk_comparison.is_some() { self.compare_disk(identity.card) } else { Task::none() }
                     }
                     crate::editor_reload::Decision::Deleted => unreachable!(),
@@ -5080,6 +5100,7 @@ impl RepositoryRuntime {
                 } else if document.external_deleted { document.recreate_missing = true; document.dirty = true; }
                 else { return self.request_save(card, true); }
                 document.conflict = false; document.error = None;
+                document.error_from_disk_observer = false;
                 self.disk_comparison = None;
                 self.request_save(card, false)
             }
@@ -5686,6 +5707,7 @@ impl RepositoryRuntime {
                         document.active_save = None;
                         document.dirty = true;
                         document.conflict = true;
+                        document.error_from_disk_observer = false;
                         document.error = Some(
                             "The save result did not match the active document snapshot; the disk state is unknown. Reload or overwrite before leaving."
                                 .into(),
@@ -5696,6 +5718,7 @@ impl RepositoryRuntime {
                 let mut saved = false;
                 if let DocumentState::Editable(document) = &mut self.document {
                     document.active_save = None;
+                    document.error_from_disk_observer = false;
                     match result {
                         Ok(SaveOutcome::Saved {
                             content_hash,
@@ -12688,6 +12711,98 @@ mod tests {
                     assert_eq!(runtime.disk_retry_delay, Duration::from_secs(1));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn recovered_disk_read_preserves_a_newer_failed_save() {
+        let before = "before\n";
+        for metadata_failure in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = Path::new("file.rs");
+            std::fs::write(root.path().join(path), before).unwrap();
+            let card = CardId::new();
+            let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "file.rs", before);
+            runtime.descriptor.worktree = root.path().to_path_buf();
+            runtime.set_auto_save(false);
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+            }));
+            let identity = runtime.current_identity(card, path.to_path_buf());
+            let stamp = crate::editor_reload::stamp(root.path(), path, path)
+                .unwrap()
+                .unwrap();
+            runtime.disk_stamp = Some(Some(stamp));
+            let failure = |ticket| {
+                if metadata_failure {
+                    RepositoryAction::DiskMetadata {
+                        identity: identity.clone(),
+                        ticket,
+                        result: Err("temporary stat failure".into()),
+                    }
+                } else {
+                    RepositoryAction::DiskLoaded {
+                        identity: identity.clone(),
+                        ticket,
+                        stamp,
+                        baseline: blake3::hash(before.as_bytes()),
+                        result: Err("temporary content failure".into()),
+                    }
+                }
+            };
+            runtime.disk_poll = Some((1, Instant::now()));
+            drop(runtime.update(failure(1)));
+            assert!(
+                matches!(&runtime.document, DocumentState::Editable(document) if document.error_from_disk_observer)
+            );
+            // Submit through the actual save reducer, then inject its matching
+            // failure without executing a filesystem write.
+            drop(runtime.update(RepositoryAction::Save {
+                card,
+                overwrite: false,
+            }));
+            let DocumentState::Editable(document) = &runtime.document else {
+                panic!("buffer");
+            };
+            let save = document.active_save.clone().unwrap();
+            let edited = document.content.text();
+            drop(runtime.update(RepositoryAction::SaveFinished {
+                identity: save.identity,
+                ticket: save.id,
+                revision: save.revision,
+                saved_text: save.snapshot,
+                result: Err(FileIoError::Io("newer save failed".into())),
+            }));
+            let save_error = runtime.save_error().unwrap().to_owned();
+            assert!(save_error.contains("newer save failed"));
+            assert!(
+                matches!(&runtime.document, DocumentState::Editable(document) if !document.error_from_disk_observer)
+            );
+            // Neither another failed observation nor its eventual successful
+            // equal-baseline read may hide the later save failure.
+            runtime.disk_poll = Some((2, Instant::now()));
+            drop(runtime.update(failure(2)));
+            assert_eq!(runtime.save_error(), Some(save_error.as_str()));
+            runtime.disk_retry_after =
+                Some(Instant::now().checked_sub(Duration::from_secs(1)).unwrap());
+            runtime.disk_poll = Some((3, Instant::now()));
+            let retry = runtime.update(RepositoryAction::DiskMetadata {
+                identity: identity.clone(),
+                ticket: 3,
+                result: Ok(Some(stamp)),
+            });
+            let loaded = find_output(retry);
+            assert!(matches!(
+                &loaded,
+                RepositoryAction::DiskLoaded { result: Ok(_), .. }
+            ));
+            drop(runtime.update(loaded));
+            assert_eq!(runtime.save_error(), Some(save_error.as_str()));
+            assert!(
+                matches!(&runtime.document, DocumentState::Editable(document) if document.dirty && document.content.text() == edited && !document.error_from_disk_observer)
+            );
+            assert!(runtime.disk_retry_after.is_none());
         }
     }
 
