@@ -145,6 +145,90 @@ pub(crate) async fn open_system_url_with_opener(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn native_opener_deadline_closes_the_owned_child() {
+        use std::{
+            io::{ErrorKind, Read},
+            os::{fd::AsRawFd, unix::net::UnixStream},
+            time::Instant,
+        };
+
+        async fn next_byte(stream: &mut UnixStream, budget: Duration) -> Result<Option<u8>, ()> {
+            let deadline = Instant::now() + budget;
+            loop {
+                let mut byte = [0];
+                match stream.read(&mut byte) {
+                    Ok(0) => return Ok(None),
+                    Ok(_) => return Ok(Some(byte[0])),
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return Err(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("owned opener lifetime stream: {error}"),
+                }
+            }
+        }
+
+        let (mut lifetime, child_lifetime) = UnixStream::pair().unwrap();
+        lifetime.set_nonblocking(true).unwrap();
+        let mut opener = tokio::process::Command::new("/bin/sh");
+        opener.args([
+            "-c",
+            "printf . >&3; exec /bin/sleep 7",
+            "owned-opener-deadline-fixture",
+        ]);
+        // The socket belongs to this original child, avoiding PID polling or
+        // signals to a process that might have reused a numeric identifier.
+        // SAFETY: only async-signal-safe descriptor syscalls run between fork
+        // and exec; the captured socket stays open through command spawning.
+        unsafe {
+            opener.pre_exec(move || {
+                if libc::dup2(child_lifetime.as_raw_fd(), 3) == -1
+                    || libc::fcntl(3, libc::F_SETFD, 0) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let url = Url::parse("https://example.test/private?token=secret#private").unwrap();
+        let opening =
+            tokio::spawn(async move { open_macos_url_with_opener(&url, false, opener).await });
+        assert_eq!(
+            next_byte(&mut lifetime, Duration::from_secs(2)).await,
+            Ok(Some(b'.')),
+            "the owned child must actually start before claiming cancellation"
+        );
+        let outcome = opening.await.unwrap();
+        // Without kill_on_drop the child would hold this socket for another
+        // two seconds after the five-second deadline. Readiness plus early EOF
+        // distinguishes cancellation from a timeout message with a live child.
+        let closed_after_timeout = next_byte(&mut lifetime, Duration::from_secs(1)).await;
+        if closed_after_timeout.is_err() {
+            // A broken cancellation guard must fail without leaving a sleeping
+            // fixture behind: the deliberately finite child exits naturally.
+            assert_eq!(
+                next_byte(&mut lifetime, Duration::from_secs(3)).await,
+                Ok(None)
+            );
+        }
+        assert_eq!(
+            closed_after_timeout,
+            Ok(None),
+            "opener outlived its deadline"
+        );
+        let error = outcome.unwrap_err();
+        assert!(
+            error.starts_with("System opener did not respond"),
+            "{error}"
+        );
+        for sensitive in ["private", "token", "secret", "?", "#"] {
+            assert!(!error.contains(sensitive), "leaked {sensitive:?}: {error}");
+        }
+    }
     #[tokio::test]
     async fn native_opener_keeps_uri_and_reveal_arguments_out_of_diagnostics() {
         for (reveal, raw) in [
