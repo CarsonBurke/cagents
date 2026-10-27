@@ -20,7 +20,11 @@ fn physical_image_assets_refuse_hosted_and_remote_routes_without_creating_state(
     ] {
         for hosted in [false, true] {
             let device = if hosted { "local" } else { "does-not-exist" };
-            let route = if hosted { "hosted/local" } else { "remote device" };
+            let route = if hosted {
+                "hosted/local"
+            } else {
+                "remote device"
+            };
             let context = format!("{} ({route}, device={device})", arguments[0]);
             let mut command = CommandSpec::new(Path::new(env!("CARGO_BIN_EXE_cagents")))
                 .args(["--json", "--device", device, "chat", "image-assets"])
