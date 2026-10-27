@@ -133,6 +133,40 @@ fn attachment(
     Ok(None)
 }
 
+/// A saved proof can select a current descriptor directly only on the same
+/// authenticated host. Changed-host lineage remains the recovery wrapper's job.
+fn current_host_attachment(
+    source: &TerminalSession,
+    terminals: &[crate::terminal::ipc::TerminalDescriptor],
+    proof: &HostSessionProof,
+) -> Result<Option<TerminalSession>, String> {
+    if source.continuity.live_proof().as_ref() != Some(proof)
+        || !terminals.iter().any(|entry| entry.session.id == source.id)
+    {
+        return Ok(None);
+    }
+    attachment(source, terminals, proof)
+}
+
+/// The current surface reducer has no read-only completion witness apart from
+/// an actual exit record. Attaching unknown-exit completion would promote it to
+/// Live on the first host-proof wake. Preserve it as actionable uncertainty
+/// until that separate readable-completion contract exists; never invent exit 0.
+fn surface_attachment_allowed(session: &TerminalSession) -> Result<(), String> {
+    if matches!(
+        session.continuity,
+        TerminalContinuity::RelaunchAvailable {
+            last_exit: None,
+            ..
+        }
+    ) {
+        return Err(
+            "This terminal has finished, but its final state cannot be restored safely yet".into(),
+        );
+    }
+    Ok(())
+}
+
 /// An exact issued attachment is inspectable while other startup recovery is
 /// blocked. Only absence needs positive admission readiness; a failed check
 /// must never turn a partial inventory into disconnected-pane success.
@@ -159,6 +193,7 @@ fn attach_existing(
     proof: HostSessionProof,
     sender: async_channel::Sender<TerminalWakeup>,
 ) -> Result<StartedTerminal, String> {
+    surface_attachment_allowed(&recovered.session)?;
     let handle = crate::terminal::HostedTerminalHandle::connect_at(
         socket,
         recovered.session.id,
@@ -238,6 +273,17 @@ impl Cagents {
                                 == Some(expected)
                     })
         })
+    }
+
+    pub(super) fn saved_terminal_transcript_context(
+        &self,
+        card: CardId,
+    ) -> Option<(uuid::Uuid, PathBuf)> {
+        if !self.saved_terminal_diagnostics_allowed(card) {
+            return None;
+        }
+        let entry = self.saved_terminal_current(card)?;
+        Some((entry.request, entry.socket.as_ref().ok()?.clone()?))
     }
 
     /// Called only from restoration, never a new terminal/clone/user launch.
@@ -378,6 +424,22 @@ impl Cagents {
                     let mut client = crate::control::ControlClient::connect(&socket)
                         .map_err(|error| error.to_string())?;
                     let proof = client.proof().clone();
+                    let terminals = client.list().map_err(|error| error.to_string())?;
+                    if let Some(session) = current_host_attachment(&source, &terminals, &proof)? {
+                        return attach_existing(
+                            card,
+                            daemon_recovery::RecoveredTerminal {
+                                attach_completed: terminal_ended(&session),
+                                session,
+                                expected_host: Some(proof.clone()),
+                                recovery_lease: None,
+                            },
+                            socket,
+                            proof,
+                            sender,
+                        )
+                        .map(Some);
+                    }
                     if source.continuity.live_proof().is_some() {
                         let recovered = daemon_recovery::inspect_saved_at(source.clone(), &socket)?;
                         if recovered.expected_host.as_ref() != Some(&proof) {
@@ -404,7 +466,6 @@ impl Cagents {
                         drop(recovered);
                         return Ok(None);
                     }
-                    let terminals = client.list().map_err(|error| error.to_string())?;
                     let selected = inspect_inventory(&source, &terminals, &proof, || {
                         client
                             .daemon_version()

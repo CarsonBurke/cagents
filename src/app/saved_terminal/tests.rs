@@ -426,7 +426,7 @@ fn retained_startup_blocks_absence_but_keeps_exact_live_attachments_inspectable(
 }
 
 #[test]
-fn an_issued_completed_descriptor_is_readable_without_inventing_an_exit() {
+fn an_issued_unknown_exit_is_not_promoted_to_a_live_surface() {
     let (_, _, source) = fixture();
     let result = inspect_inventory(&source, &[descriptor(source.clone())], &proof(), || {
         panic!("the exact completed descriptor still permits an inspection attachment")
@@ -443,8 +443,9 @@ fn an_issued_completed_descriptor_is_readable_without_inventing_an_exit() {
     ));
     assert!(
         !terminal_ended(&result),
-        "readable completion evidence does not manufacture an exit record"
+        "issued completion evidence does not manufacture an exit record"
     );
+    assert!(surface_attachment_allowed(&result).is_err());
 }
 
 #[test]
@@ -517,4 +518,84 @@ fn scoped_saved_controls_cannot_dispatch_user_commands_but_user_recovery_remains
         app.card_state(card).unwrap().kind,
         CardKind::Terminal(source)
     );
+}
+
+#[test]
+fn same_host_completed_source_uses_exact_inventory_before_replay_recovery() {
+    let (_, _, source) = fixture();
+    let saved = exact_live(&source);
+    let mut completed = source.clone();
+    completed.continuity = TerminalContinuity::RelaunchAvailable {
+        recipe: completed.launch.clone(),
+        last_exit: Some(crate::model::TerminalExit {
+            code: Some(7),
+            signal: None,
+            occurred_at_unix_ms: 123,
+        }),
+    };
+    let selected = current_host_attachment(&saved, &[descriptor(completed.clone())], &proof())
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected, completed);
+    assert!(surface_attachment_allowed(&selected).is_ok());
+    assert_eq!(
+        saved,
+        exact_live(&source),
+        "the saved descriptor is unchanged"
+    );
+    let unknown = current_host_attachment(&saved, &[descriptor(source.clone())], &proof())
+        .unwrap()
+        .unwrap();
+    assert_eq!(unknown, source);
+    assert!(surface_attachment_allowed(&unknown).is_err());
+    let live = current_host_attachment(&saved, &[descriptor(saved.clone())], &proof())
+        .unwrap()
+        .unwrap();
+    assert!(surface_attachment_allowed(&live).is_ok());
+}
+
+#[test]
+fn direct_inventory_cannot_bypass_changed_host_lineage_or_replace_source_evidence() {
+    let (_, _, source) = fixture();
+    let saved = exact_live(&source);
+    let mut changed = proof();
+    changed.host_incarnation = crate::model::HostIncarnation::new("replacement-host");
+    assert_eq!(
+        current_host_attachment(&saved, &[descriptor(source.clone())], &changed).unwrap(),
+        None
+    );
+    assert_eq!(
+        current_host_attachment(&saved, &[], &proof()).unwrap(),
+        None
+    );
+    let mut wrong = source;
+    wrong.launch.working_directory = PathBuf::from("/wrong-recipe");
+    assert!(current_host_attachment(&saved, &[descriptor(wrong)], &proof()).is_err());
+}
+
+#[test]
+fn transcript_context_is_bound_to_the_saved_nonce_source_and_selected_endpoint() {
+    let (mut app, card, source) = fixture();
+    let request = pending(&mut app, card, &source);
+    drop(app.update_saved_terminal(complete(card, source.clone(), request, Ok(None))));
+    let context = app.saved_terminal_transcript_context(card).unwrap();
+    assert_eq!(context.0, request);
+    assert_eq!(
+        Some(context.1.clone()),
+        crate::terminal::ipc::daemon_socket_path().ok()
+    );
+    app.saved_terminals.entries.get_mut(&card).unwrap().socket =
+        Ok(Some(PathBuf::from("/different-selected-service")));
+    assert!(app.saved_terminal_transcript_context(card).is_none());
+    app.saved_terminals.entries.get_mut(&card).unwrap().socket = Ok(Some(context.1));
+    let replacement = uuid::Uuid::new_v4();
+    app.saved_terminals.entries.get_mut(&card).unwrap().request = replacement;
+    assert_eq!(
+        app.saved_terminal_transcript_context(card).unwrap().0,
+        replacement
+    );
+    if let CardKind::Terminal(current) = &mut Arc::make_mut(&mut app.durable).cards[0].kind {
+        current.resume_hint = Some("new-source".into());
+    }
+    assert!(app.saved_terminal_transcript_context(card).is_none());
 }
