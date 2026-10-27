@@ -6116,6 +6116,12 @@ impl RepositoryRuntime {
                 if !self.accepts_selected(&identity) {
                     return Task::none();
                 }
+                // Captured coordinates belong to the old buffer, even when
+                // both documents have revision zero. Keep an active scope so
+                // Find reports its existing stale-selection refusal until the
+                // user deliberately captures a range in the replacement.
+                self.find_selection_revision = None;
+                self.find_selection_candidate = None;
                 self.original_read_attested = false;
                 let restored_focus = self
                     .restores_editor_navigation(&identity)

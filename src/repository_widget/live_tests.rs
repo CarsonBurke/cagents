@@ -297,6 +297,59 @@ async fn clean_reload_invalidates_revision_zero_find_cache() {
     assert!(old_key != runtime.find_cache);
     assert_eq!(runtime.find_total, 1);
     assert!(runtime.take_restored_editor_focus(card).is_none());
+
+    let task = runtime.update(RepositoryAction::CloseFind { card });
+    settle(&mut runtime, task).await;
+    let task = runtime.update(RepositoryAction::EditorAction {
+        card,
+        action: text_editor::Action::SelectAll,
+    });
+    settle(&mut runtime, task).await;
+    let task = runtime.update(RepositoryAction::OpenFind { card });
+    settle(&mut runtime, task).await;
+    let task = runtime.update(RepositoryAction::FindQueryChanged {
+        card,
+        query: "needle".into(),
+    });
+    settle(&mut runtime, task).await;
+    let task = runtime.update(RepositoryAction::FindSelectionChanged {
+        card,
+        enabled: true,
+    });
+    settle(&mut runtime, task).await;
+    assert_eq!(runtime.find_total, 1);
+    assert!(runtime.find_selection_candidate.is_some());
+    std::fs::write(&path, "erased needle").unwrap();
+    text(card, &mut runtime, "erased needle").await;
+    assert_eq!(runtime.find_total, 0);
+    assert!(runtime.find_selection_candidate.is_none());
+    assert!(runtime.find_selection.is_some());
+    assert!(
+        runtime
+            .find_error
+            .as_deref()
+            .unwrap()
+            .contains("captured selection changed")
+    );
+    let task = runtime.update(RepositoryAction::ReplaceQueryChanged {
+        card,
+        query: "changed".into(),
+    });
+    settle(&mut runtime, task).await;
+    let task = runtime.update(RepositoryAction::ReplaceMatch { card, all: true });
+    settle(&mut runtime, task).await;
+    assert_eq!(runtime.editor_text().as_deref(), Some("erased needle"));
+    let task = runtime.update(RepositoryAction::EditorAction {
+        card,
+        action: text_editor::Action::SelectAll,
+    });
+    settle(&mut runtime, task).await;
+    for enabled in [false, true] {
+        let task = runtime.update(RepositoryAction::FindSelectionChanged { card, enabled });
+        settle(&mut runtime, task).await;
+    }
+    assert_eq!(runtime.find_total, 1);
+    assert!(runtime.find_error.is_none());
 }
 
 #[test]
