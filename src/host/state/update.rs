@@ -29,6 +29,9 @@ pub(in crate::host) fn inspect(
                     }
                     let mut source = record.session.clone();
                     source.native_continuity = record.handle.native_continuity();
+                    if source.native_continuity.retains_provider() {
+                        source.launch.session_id = record.handle.confirmed_session_id();
+                    }
                     let mut launch = source.launch.clone();
                     launch.session_id = record.handle.confirmed_session_id();
                     crate::chat::protocol::align_resume_identity(&mut launch).ok()?;
