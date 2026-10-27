@@ -1340,7 +1340,8 @@ mod tests {
 
     #[test]
     fn ordered_wrapped_tasks_align_markers_with_first_line_and_keep_authored_state() {
-        use iced::advanced::{Layout, layout, widget::Tree};
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+        use iced::{Event, Point, Rectangle, Size, mouse};
         use iced_accessibility::accesskit::Role;
 
         let label = "Pending wrapped follow-up: review the wide conversation transcript, then resize to the narrow window and confirm that this deliberately long checklist label wraps onto multiple lines while its number and unchecked box stay aligned with the first line; nested completed tasks and ordinary numbered items must remain readable and unchanged.";
