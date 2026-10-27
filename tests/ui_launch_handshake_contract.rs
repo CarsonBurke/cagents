@@ -41,7 +41,10 @@ fn protocol_output(path: &Path) -> String {
         .take((PROTOCOL_LIMIT + 1) as u64)
         .read_to_end(&mut bytes)
         .unwrap();
-    assert!(bytes.len() <= PROTOCOL_LIMIT, "startup protocol is oversized");
+    assert!(
+        bytes.len() <= PROTOCOL_LIMIT,
+        "startup protocol is oversized"
+    );
     String::from_utf8(bytes).unwrap()
 }
 
@@ -60,7 +63,10 @@ fn startup_report_fixture() {
         rlim_max: 0,
     };
     // SAFETY: getrlimit writes this valid child-local struct.
-    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut limit) }, 0);
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut limit) },
+        0
+    );
     limit.rlim_max = limit.rlim_max.min(PROTOCOL_LIMIT as libc::rlim_t);
     limit.rlim_cur = limit.rlim_cur.min(limit.rlim_max);
     // SAFETY: setrlimit reads this valid struct and changes only this child.
