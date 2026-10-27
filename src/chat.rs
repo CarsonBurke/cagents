@@ -1060,7 +1060,9 @@ pub struct Snapshot {
     pub text_copy_sources: TextCopySources,
     pub requests: Vec<Request>,
     pub capabilities: Capabilities,
-    pub models: Vec<Model>,
+    /// Provider catalogs are immutable between explicit catalog events.
+    /// Snapshot cloning and revision-fenced publications retain their payloads.
+    pub models: std::sync::Arc<Vec<Model>>,
     pub selected_model: Option<String>,
     pub reasoning: Option<String>,
     #[serde(default)]
@@ -1071,8 +1073,8 @@ pub struct Snapshot {
     pub permissions: Option<PermissionSettings>,
     #[serde(default)]
     pub permission_denials: Vec<PermissionDenial>,
-    pub commands: Vec<SlashCommand>,
-    pub skills: Vec<Skill>,
+    pub commands: std::sync::Arc<Vec<SlashCommand>>,
+    pub skills: std::sync::Arc<Vec<Skill>>,
     pub usage: Usage,
     pub busy: bool,
     pub detail: String,

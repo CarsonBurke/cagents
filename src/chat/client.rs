@@ -1398,6 +1398,7 @@ impl ClientHandle {
         self.publish_presentation_for_test(Presentation {
             base_generation: previous.generation,
             file_changes_unchanged: false,
+            retained_catalogs: Default::default(),
             metadata: next,
             order,
             changes: parent,
@@ -4563,6 +4564,7 @@ mod tests {
                         update: Presentation {
                             base_generation: 99,
                             file_changes_unchanged: true,
+                            retained_catalogs: Default::default(),
                             metadata: Snapshot {
                                 generation: 100,
                                 ready: true,
@@ -4624,6 +4626,7 @@ mod tests {
                         update: Presentation {
                             base_generation: 1,
                             file_changes_unchanged: true,
+                            retained_catalogs: Default::default(),
                             metadata: Snapshot {
                                 generation: 2,
                                 ready: true,
@@ -4842,6 +4845,7 @@ mod tests {
         };
         let update = Presentation {
             file_changes_unchanged: false,
+            retained_catalogs: Default::default(),
             base_generation: 1,
             metadata: Snapshot {
                 sampled_at: Some(50_000),
@@ -5358,6 +5362,7 @@ mod tests {
         };
         let update = Presentation {
             file_changes_unchanged: false,
+            retained_catalogs: Default::default(),
             base_generation: 1,
             metadata: Snapshot {
                 sampled_at: Some(2000),
@@ -5445,6 +5450,7 @@ mod tests {
             advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let malformed = Presentation {
                 file_changes_unchanged: false,
+                retained_catalogs: Default::default(),
                 base_generation: 2,
                 metadata: Snapshot {
                     sampled_at: Some(999_999),
@@ -6546,6 +6552,7 @@ mod tests {
             changes: vec![ItemChange::between(Some(&before), &after)],
             children: vec![],
             file_changes_unchanged: false,
+            retained_catalogs: Default::default(),
         };
         let (callback, callbacks) = std::sync::mpsc::channel();
         let (mut client, server, eof) = retirement_wire(
@@ -6994,6 +7001,7 @@ mod tests {
             changes: vec![ItemChange::between(Some(&before), &after)],
             children: vec![],
             file_changes_unchanged: false,
+            retained_catalogs: Default::default(),
         };
         let (client, server, eof) = retirement_wire(
             omp_card(None, None),

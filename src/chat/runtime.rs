@@ -31,6 +31,7 @@ pub(crate) use handle::RetainedInputOutcome;
 pub(crate) use retained_actor::transport::{
     ActorIdentity, RetirementInspection, VerifiedRetirement,
 };
+mod metadata;
 mod retained_actor;
 mod store;
 mod websocket;
@@ -503,6 +504,7 @@ impl LocalHandle {
                     stderr: VecDeque::new(),
                     indices: BTreeMap::new(),
                     retained: 0,
+                    metadata_budget: Default::default(),
                     history_error: None,
                     login_recovery: None,
                     dirty: false,
@@ -1045,6 +1047,7 @@ impl LocalHandle {
         if refresh_publication {
             store.publish_copy_sources(&mut state);
             store.presented_generation = Some(state.generation);
+            store.presented_catalogs = Some(crate::chat::presentation::Catalogs::of(&state));
             store.presented_file_changes = Some((
                 state.file_changes.revision,
                 state.file_changes.coverage.clone(),
@@ -1066,6 +1069,21 @@ impl LocalHandle {
         &self,
         chat_id: crate::model::TerminalId,
         after: Option<u64>,
+    ) -> Option<crate::terminal_ipc::ServerResponse> {
+        self.presentation_catalog_mode(chat_id, after, true)
+    }
+    pub(super) fn presentation_full_catalogs(
+        &self,
+        chat_id: crate::model::TerminalId,
+        after: Option<u64>,
+    ) -> Option<crate::terminal_ipc::ServerResponse> {
+        self.presentation_catalog_mode(chat_id, after, false)
+    }
+    fn presentation_catalog_mode(
+        &self,
+        chat_id: crate::model::TerminalId,
+        after: Option<u64>,
+        retain_catalogs: bool,
     ) -> Option<crate::terminal_ipc::ServerResponse> {
         let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -1146,7 +1164,12 @@ impl LocalHandle {
                     } else {
                         None
                     };
-                    let metadata = state.clone();
+                    let mut metadata = state.clone();
+                    let retained_catalogs = store
+                        .presented_catalogs
+                        .as_ref()
+                        .map(|catalogs| catalogs.retain(&mut metadata))
+                        .unwrap_or_default();
                     if let Some(files) = retained_files {
                         state.file_changes = files;
                     }
@@ -1156,6 +1179,7 @@ impl LocalHandle {
                     }
                     crate::chat::presentation::Presentation {
                         file_changes_unchanged,
+                        retained_catalogs,
                         base_generation,
                         metadata,
                         order: state.items.iter().map(|item| item.id.clone()).collect(),
@@ -1164,6 +1188,7 @@ impl LocalHandle {
                     }
                 });
             store.presented_generation = Some(state.generation);
+            store.presented_catalogs = Some(crate::chat::presentation::Catalogs::of(&state));
             store.presented_file_changes = Some((
                 state.file_changes.revision,
                 state.file_changes.coverage.clone(),
@@ -1180,6 +1205,16 @@ impl LocalHandle {
             .filter(|update| after == Some(update.base_generation))
         {
             let mut update = presentation.clone();
+            if !retain_catalogs && update.full_catalogs_for(&state).is_err() {
+                // Never mix a cached update with another generation. Keep the
+                // ordinary full resync boundary if this internal invariant fails.
+                let mut snapshot = state.clone();
+                snapshot.sampled_at = observed_at();
+                return Some(crate::terminal_ipc::ServerResponse::ChatSnapshot {
+                    chat_id,
+                    snapshot: Some(snapshot),
+                });
+            }
             update.metadata.sampled_at = observed_at();
             Some(crate::terminal_ipc::ServerResponse::ChatUpdate { chat_id, update })
         } else {
@@ -1906,6 +1941,7 @@ struct Actor {
     stderr: VecDeque<u8>,
     indices: BTreeMap<String, usize>,
     retained: usize,
+    metadata_budget: metadata::Budget,
     /// Only the active error published by the most recent history failure.
     /// Recovery must not erase an unrelated provider/cache error.
     history_error: Option<String>,
@@ -2929,14 +2965,13 @@ impl Actor {
         // Owned edit summaries have their own item/byte budgets; they do not
         // count toward the provider's request/model identity budget.
         let file_changes = std::mem::take(&mut state.file_changes);
-        let mut counter = ByteCounter(0);
-        let _ = serde_json::to_writer(&mut counter, &*state);
+        let retained = self.metadata_budget.count(&mut state);
         state.file_changes = file_changes;
         state.items = items;
         for (agent, items) in state.subagents.iter_mut().zip(child_items) {
             agent.items = items;
         }
-        self.retained = counter.0;
+        self.retained = retained;
         state.generation = state.generation.saturating_add(1);
         self.dirty = true;
     }
@@ -3271,7 +3306,7 @@ fn apply_projected_event(
             reasoning,
         } => {
             if !models.is_empty() {
-                state.models = models;
+                state.models = models.into();
             }
             if selected.is_some() {
                 state.selected_model = selected;
@@ -3281,8 +3316,8 @@ fn apply_projected_event(
             }
         }
         Event::FastMode(value) => state.fast_mode = Some(value),
-        Event::Commands(value) => state.commands = value,
-        Event::Skills(value) => state.skills = value,
+        Event::Commands(value) => state.commands = value.into(),
+        Event::Skills(value) => state.skills = value.into(),
         Event::Item(mut item) => {
             // The adapters do not know wall-clock time, so the item is stamped
             // here, where the daemon actually observes the change.

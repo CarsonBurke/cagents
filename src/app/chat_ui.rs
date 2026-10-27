@@ -2110,9 +2110,9 @@ pub(super) struct Runtime {
     pending: Option<PendingCommand>,
     next_command: u64,
     disconnected: bool,
-    /// A fingerprint of the models this conversation last listed to the
-    /// catalog, which takes each list once rather than on every change.
-    listed_models: u64,
+    /// The immutable model catalog this conversation last listed. A weak
+    /// identity avoids rescanning text updates or retaining obsolete rows.
+    listed_models: std::sync::Weak<Vec<chat::Model>>,
     visible: AtomicBool,
     error: Option<String>,
     /// A typed admission refusal, independent of provider/account failures.
@@ -3005,7 +3005,7 @@ impl Runtime {
             pending: None,
             next_command: 0,
             disconnected: false,
-            listed_models: 0,
+            listed_models: Default::default(),
             visible: AtomicBool::new(visible),
             error: None,
             capacity_refused: false,
@@ -3071,7 +3071,7 @@ impl Runtime {
         self.failures.clear();
         self.failure_ui = failure::State::default();
         self.child_picker = None;
-        self.listed_models = 0;
+        self.listed_models = Default::default();
         self.earlier_asked = None;
         self.later_asked = None;
     }
@@ -4884,7 +4884,7 @@ fn draft_snapshot(
             },
             ..chat::Capabilities::default()
         },
-        models,
+        models: models.into(),
         selected_model,
         reasoning,
         ..Snapshot::default()
@@ -5530,7 +5530,7 @@ impl Cagents {
             return Task::none();
         }
         runtime.session = session.clone();
-        Arc::make_mut(&mut runtime.snapshot).skills.clear();
+        Arc::make_mut(&mut runtime.snapshot).skills = Default::default();
         Arc::make_mut(&mut runtime.snapshot).permission_mode =
             draft_permission_mode(&session.launch.recipe, account.provider);
         runtime.completion.restart(true);
@@ -5806,8 +5806,8 @@ impl Cagents {
             let Some(catalog) = catalogs.catalog(provider) else {
                 continue;
             };
-            if runtime.snapshot.models != catalog.models {
-                Arc::make_mut(&mut runtime.snapshot).models = catalog.models.clone();
+            if runtime.snapshot.models.as_slice() != catalog.models.as_slice() {
+                Arc::make_mut(&mut runtime.snapshot).models = catalog.models.clone().into();
             }
         }
     }
@@ -7108,19 +7108,16 @@ impl Cagents {
         let Some(snapshot) = runtime.handle().map(|handle| handle.snapshot()) else {
             return Task::none();
         };
-        let fingerprint = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            snapshot.models.hash(&mut hasher);
-            hasher.finish()
-        };
-        if snapshot.models.is_empty()
-            || std::mem::replace(&mut runtime.listed_models, fingerprint) == fingerprint
-        {
+        if snapshot.models.is_empty() {
             return Task::none();
         }
+        let catalog = Arc::downgrade(&snapshot.models);
+        if runtime.listed_models.ptr_eq(&catalog) {
+            return Task::none();
+        }
+        runtime.listed_models = catalog;
         let provider = runtime.session.launch.provider;
-        self.observe_listed_models(provider, snapshot.models.clone())
+        self.observe_listed_models(provider, snapshot.models.to_vec())
     }
 
     pub(super) fn start_chat(
@@ -8248,7 +8245,7 @@ impl Cagents {
                     && runtime.is_draft()
                     && runtime.session.launch == launch
                 {
-                    Arc::make_mut(&mut runtime.snapshot).skills = skills;
+                    Arc::make_mut(&mut runtime.snapshot).skills = skills.into();
                     runtime.completion.restart(true);
                 }
             }
@@ -11663,7 +11660,7 @@ mod tests {
         let snapshot = Arc::make_mut(&mut runtime.snapshot);
         snapshot.busy = true;
         snapshot.capabilities.permission_modes = vec!["manual".into(), "auto".into()];
-        snapshot.commands.push(chat::SlashCommand {
+        Arc::make_mut(&mut snapshot.commands).push(chat::SlashCommand {
             name: "permissions".into(),
             description: "Provider dialog".into(),
         });
@@ -16307,7 +16304,8 @@ mod tests {
             commands: vec![chat::SlashCommand {
                 name: "review".into(),
                 description: String::new(),
-            }],
+            }]
+            .into(),
             ..Snapshot::default()
         };
         assert_eq!(queued.submission_text(&provider), "/review this change");
@@ -16357,8 +16355,8 @@ mod tests {
             vec![skill.clone()],
         )));
         assert_eq!(
-            chat_runtime(&app, card).snapshot.skills,
-            vec![skill.clone()]
+            chat_runtime(&app, card).snapshot.skills.as_slice(),
+            &[skill.clone()]
         );
         let _ = app.update(Message::ChatUi(Action::DraftModel(
             target,
@@ -16366,8 +16364,8 @@ mod tests {
             None,
         )));
         assert_eq!(
-            chat_runtime(&app, card).snapshot.skills,
-            vec![skill.clone()]
+            chat_runtime(&app, card).snapshot.skills.as_slice(),
+            &[skill.clone()]
         );
         let _ = app.update(Message::ChatUi(Action::DraftModel(
             target,
@@ -21412,7 +21410,7 @@ mod tests {
         let target = chat_runtime_attempt(app, card);
         let handle = fixture_handle(app, card, None);
         handle.replace_snapshot_for_test(Snapshot {
-            models: listed,
+            models: listed.into(),
             ready: true,
             ..Snapshot::default()
         });
@@ -21477,7 +21475,7 @@ mod tests {
         let handle = runtime.handle().unwrap().clone();
         let target = runtime.target;
         handle.replace_snapshot_for_test(Snapshot {
-            models: vec![fixture_model("gpt-b", &[])],
+            models: vec![fixture_model("gpt-b", &[])].into(),
             ready: true,
             ..Snapshot::default()
         });
@@ -21791,7 +21789,7 @@ mod tests {
             card,
             Snapshot {
                 generation: 1,
-                models: vec![fixture_model("gpt-b", &[])],
+                models: vec![fixture_model("gpt-b", &[])].into(),
                 ready: true,
                 ..Snapshot::default()
             },
@@ -23001,7 +22999,7 @@ mod tests {
             other => panic!("sent as {other:?}, not a message"),
         };
         let codex = Snapshot {
-            skills: vec![skill("commits", '$'), skill("pr-review", '$')],
+            skills: vec![skill("commits", '$'), skill("pr-review", '$')].into(),
             capabilities: chat::Capabilities {
                 compact: true,
                 ..chat::Capabilities::default()
@@ -23029,8 +23027,9 @@ mod tests {
             commands: vec![chat::SlashCommand {
                 name: "clear".into(),
                 description: String::new(),
-            }],
-            skills: vec![skill("alpha", '/'), skill("beta", '/')],
+            }]
+            .into(),
+            skills: vec![skill("alpha", '/'), skill("beta", '/')].into(),
             ..Snapshot::default()
         };
         let attachment = [Attachment {

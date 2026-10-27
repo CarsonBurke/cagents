@@ -37,6 +37,23 @@ use std::{
 const ARGUMENT: &str = "--cagents-native-actor";
 pub(super) const PROTOCOL: u32 = 2;
 const CAPABILITY: &str = registry::RETAINED_CLAUDE_CAPABILITY;
+// Optional behavior advertised by this exact helper Record. The legacy
+// protocol2 attachment remains valid and never receives an unknown-method probe.
+const CATALOG_PRESENTATION_CAPABILITY: &str = "retained-presentation-catalogs";
+const CATALOG_PRESENTATION_METHOD: &str = "presentation_catalogs";
+fn presentation_method(build: Option<&registry::BuildIdentity>) -> &'static str {
+    if build.is_some_and(|build| {
+        build
+            .capabilities
+            .iter()
+            .any(|capability| capability == CATALOG_PRESENTATION_CAPABILITY)
+    }) {
+        CATALOG_PRESENTATION_METHOD
+    } else {
+        "presentation"
+    }
+}
+
 const TIMEOUT: Duration = Duration::from_secs(5);
 // The request contains only a fixed-size reader/cursor plus existing issued
 // attachment proof. Refuse oversized proofs rather than widening this read.
@@ -1337,6 +1354,19 @@ impl RemoteActor {
         reader.accept_returned(returned, &page)?;
         Ok(page)
     }
+    pub(in crate::chat::runtime) fn presentation(
+        &self,
+        chat_id: crate::model::TerminalId,
+        after: Option<u64>,
+    ) -> Result<Option<crate::terminal_ipc::ServerResponse>, String> {
+        // Select from the captured holder identity before sending anything.
+        // Authentication, peer/epoch checks and all errors remain call's; no
+        // unsupported-method probe, fallback retry or provider restart occurs.
+        self.call(
+            presentation_method(self.0.identity.record.build.as_ref()),
+            serde_json::json!([chat_id, after]),
+        )
+    }
     pub fn call<T: DeserializeOwned>(&self, method: &str, args: Value) -> Result<T, String> {
         self.call_until(method, args, Instant::now() + TIMEOUT)
     }
@@ -1805,6 +1835,7 @@ fn close_only_method(method: &str) -> bool {
             | "recognize_sources"
             | "snapshot"
             | "presentation"
+            | CATALOG_PRESENTATION_METHOD
             | "visible"
             | "observe"
             | "readiness"
@@ -2031,6 +2062,9 @@ impl Server {
             .map_err(|error| error.to_string())?;
         let mut build = registry::BuildIdentity::current(Kind::Native);
         build.capabilities.push(CAPABILITY.into());
+        build
+            .capabilities
+            .push(CATALOG_PRESENTATION_CAPABILITY.into());
         let identity = ActorIdentity {
             instance: uuid::Uuid::new_v4(),
             record: Record {
@@ -2672,7 +2706,8 @@ impl Server {
                 }
                 value!(snapshot)
             }
-            "presentation" => {
+            "presentation" | CATALOG_PRESENTATION_METHOD => {
+                let retain_catalogs = request.method == CATALOG_PRESENTATION_METHOD;
                 let (id, after) = decode!((crate::model::TerminalId, Option<u64>));
                 if id != self.source.id {
                     return Err("Retained presentation names another chat".into());
@@ -2688,7 +2723,11 @@ impl Server {
                 {
                     return Err(loss.reason);
                 }
-                let response = self.actor.presentation(id, after);
+                let response = if retain_catalogs {
+                    self.actor.presentation(id, after)
+                } else {
+                    self.actor.presentation_full_catalogs(id, after)
+                };
                 let snapshot = match &response {
                     Some(crate::terminal_ipc::ServerResponse::ChatSnapshot {
                         snapshot: Some(snapshot),
@@ -3622,6 +3661,203 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
             _root: root,
         }
     }
+    #[test]
+    fn catalog_route_uses_captured_capability_without_probing_or_retrying_old_helpers() {
+        for scenario in 0..4 {
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            let socket = root.path().join("catalog.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut remote = RemoteActor::fixture();
+            let inner = Arc::get_mut(&mut remote.0).unwrap();
+            inner.socket = socket;
+            let build = inner.identity.record.build.as_mut().unwrap();
+            build.version = "unrelated-version".into();
+            build.commit = Some("unrelated-commit".into());
+            build.capabilities.push(CAPABILITY.into());
+            if scenario != 0 {
+                build
+                    .capabilities
+                    .push(CATALOG_PRESENTATION_CAPABILITY.into());
+            }
+            let expected_method = if scenario == 0 {
+                "presentation"
+            } else {
+                CATALOG_PRESENTATION_METHOD
+            };
+            let proof = remote.0.proof.clone();
+            let epoch = remote.0.epoch;
+            let id = remote.0.source.id;
+            let expected_proof = proof.clone();
+            let worker = thread::spawn(move || {
+                let deadline = Instant::now() + TIMEOUT;
+                let control = loop {
+                    match listener.accept() {
+                        Ok((control, _)) => break control,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "presentation request did not arrive"
+                            );
+                            thread::yield_now();
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                let request: Invocation = receive(&control, TIMEOUT).unwrap();
+                assert_eq!(request.method, expected_method);
+                assert_eq!(request.proof, expected_proof);
+                assert_eq!(request.epoch, Some(epoch));
+                assert_eq!(request.args, json!([id, null]));
+                let response: Result<Value, String> = match scenario {
+                    0 => Ok(Value::Null),
+                    1 => Err("Unknown retained actor method/version".into()),
+                    2 => Err("Retained actor attachment was superseded; stale input and ACKs are refused".into()),
+                    _ => Ok(json!("malformed publication")),
+                };
+                send(&control, &response, TIMEOUT).unwrap();
+                request.method
+            });
+            let result = remote.presentation(id, None);
+            let method = worker.join().unwrap();
+            assert_eq!(method, expected_method);
+            match scenario {
+                0 => assert!(result.unwrap().is_none()),
+                1 => assert_eq!(result.unwrap_err(), "Unknown retained actor method/version"),
+                2 => assert_eq!(
+                    result.unwrap_err(),
+                    "Retained actor attachment was superseded; stale input and ACKs are refused"
+                ),
+                _ => assert!(result.is_err()),
+            }
+            // A retry would fail on the now-closed listener and replace the
+            // original error above. Reads never mutate or restart attachment.
+            assert_eq!(remote.0.proof, proof);
+            assert_eq!(remote.0.epoch, epoch);
+            assert!(remote.0.installed.load(Ordering::Acquire));
+            assert!(!remote.0.stop.load(Ordering::Acquire));
+        }
+        assert_eq!(presentation_method(None), "presentation");
+        let old = registry::BuildIdentity::current(Kind::Native);
+        assert_eq!(
+            presentation_method(Some(&old)),
+            "presentation",
+            "new attachment/default identity must not inherit catalog opt-in"
+        );
+    }
+
+    #[test]
+    fn legacy_helper_presentation_keeps_full_catalogs_after_opted_in_cached_update() {
+        #[derive(Deserialize)]
+        struct LegacyCatalogs {
+            models: Vec<chat::Model>,
+            commands: Vec<chat::SlashCommand>,
+            skills: Vec<chat::Skill>,
+        }
+        let mut fixture = resident_fixture();
+        let server = &mut fixture.server;
+        {
+            let mut state = server.actor.0.state.lock().unwrap();
+            state.models = vec![chat::Model {
+                id: "model".into(),
+                label: "Model".into(),
+                reasoning: vec!["low".into()],
+            }]
+            .into();
+            state.commands = vec![chat::SlashCommand {
+                name: "review".into(),
+                description: "Review".into(),
+            }]
+            .into();
+            state.skills = vec![chat::Skill {
+                name: "lint".into(),
+                description: "Lint".into(),
+                invocation: "$lint".into(),
+            }]
+            .into();
+            state.generation += 1;
+        }
+        let before = server.actor.snapshot(None).unwrap();
+        {
+            let mut state = server.actor.0.state.lock().unwrap();
+            state.detail = "updated metadata".into();
+            state.generation += 1;
+        }
+        let id = server.source.id;
+        let proof = server.proof.clone();
+        let epoch = server.epoch;
+        let request = |method: &str| Invocation {
+            proof: proof.clone(),
+            epoch: Some(epoch),
+            method: method.into(),
+            args: json!([id, before.generation]),
+        };
+        let opted: Option<crate::terminal_ipc::ServerResponse> =
+            serde_json::from_value(server.invoke(request(CATALOG_PRESENTATION_METHOD)).unwrap())
+                .unwrap();
+        let Some(crate::terminal_ipc::ServerResponse::ChatUpdate { update: opted, .. }) = opted
+        else {
+            panic!("expected opted-in update")
+        };
+        assert!(
+            opted.retained_catalogs.models
+                && opted.retained_catalogs.commands
+                && opted.retained_catalogs.skills
+        );
+        assert!(
+            opted.metadata.models.is_empty()
+                && opted.metadata.commands.is_empty()
+                && opted.metadata.skills.is_empty()
+        );
+        let legacy: Option<crate::terminal_ipc::ServerResponse> =
+            serde_json::from_value(server.invoke(request("presentation")).unwrap()).unwrap();
+        let Some(crate::terminal_ipc::ServerResponse::ChatUpdate { update: legacy, .. }) = legacy
+        else {
+            panic!("expected legacy update")
+        };
+        assert_eq!(legacy.retained_catalogs, Default::default());
+        // An old daemon ignores the new flag field and decodes ordinary Vec
+        // catalog arrays. It must not clear any catalog from this cached delta.
+        let old: LegacyCatalogs =
+            serde_json::from_value(serde_json::to_value(&legacy.metadata).unwrap()).unwrap();
+        assert_eq!(old.models.as_slice(), before.models.as_slice());
+        assert_eq!(old.commands.as_slice(), before.commands.as_slice());
+        assert_eq!(old.skills.as_slice(), before.skills.as_slice());
+        assert!(!old.models.is_empty() && !old.commands.is_empty() && !old.skills.is_empty());
+        assert_eq!(
+            legacy.metadata.text_copy_sources,
+            opted.metadata.text_copy_sources
+        );
+        assert_eq!(legacy.metadata.generation, opted.metadata.generation);
+        // Close-only attachments retain both readonly display routes. Every
+        // request still authenticates proof/epoch before reaching expansion.
+        server.close_only = true;
+        for method in ["presentation", CATALOG_PRESENTATION_METHOD] {
+            assert!(close_only_method(method));
+            let mut stale = request(method);
+            stale.epoch = Some(uuid::Uuid::new_v4());
+            assert!(server.invoke(stale).unwrap_err().contains("superseded"));
+            let mut wrong_proof = request(method);
+            wrong_proof.proof.host_incarnation = crate::model::HostIncarnation::new("wrong");
+            assert!(
+                server
+                    .invoke(wrong_proof)
+                    .unwrap_err()
+                    .contains("superseded")
+            );
+            assert!(server.invoke(request(method)).is_ok());
+        }
+        let loss = "fixture continuity loss";
+        server.journal.lock().unwrap().record_loss(loss).unwrap();
+        for method in ["presentation", CATALOG_PRESENTATION_METHOD] {
+            assert_eq!(server.invoke(request(method)).unwrap_err(), loss);
+        }
+        assert_eq!(server.proof, proof);
+        assert_eq!(server.epoch, epoch);
+        assert!(!server.session_stopping);
+        assert!(server.installed);
+    }
+
     #[test]
     fn continuity_loss_refuses_unchanged_presentation_without_mutating_source_or_copy() {
         let body = "Retained answer λ\n  preserve source and copy";

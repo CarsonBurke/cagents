@@ -7532,6 +7532,7 @@ mod tests {
                             handle.publish_presentation_for_test(Presentation {
                                 base_generation: previous.generation,
                                 file_changes_unchanged: false,
+                                retained_catalogs: Default::default(),
                                 metadata,
                                 order: vec![item.id.clone()],
                                 changes: vec![change],
@@ -10251,7 +10252,8 @@ mod tests {
                 reasoning: vec!["low".into(), "high".into()],
             },
             model("model-b", "Fixture model B"),
-        ];
+        ]
+        .into();
         snapshot.selected_model = Some("model-a".into());
         snapshot.reasoning = Some("low".into());
         app.card_state_mut(target.card).unwrap().kind = CardKind::Chat(live.session.clone());
