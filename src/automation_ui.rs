@@ -7510,15 +7510,29 @@ mod tests {
         ui
     }
 
+    fn announced_button<'a>(
+        nodes: &'a iced_accessibility::A11yTree,
+        label: &str,
+    ) -> &'a iced_accessibility::A11yNode {
+        let mut controls = nodes.root().iter().chain(nodes.children()).filter(|node| {
+            node.node().role() == iced_accessibility::accesskit::Role::Button
+                && node.node().label() == Some(label)
+        });
+        let control = controls
+            .next()
+            .unwrap_or_else(|| panic!("the actual {label} button is mounted"));
+        assert!(controls.next().is_none(), "exactly one {label} button");
+        assert!(
+            matches!(control.id(), iced_accessibility::A11yId::Widget(_)),
+            "the actual {label} button has a widget identity"
+        );
+        control
+    }
+
     fn cancel_bounds(ui: &CancelUi<'_>) -> cosmic::iced::Rectangle {
         use cosmic::iced::{Point, Rectangle, Size, mouse};
         let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
-        let rect = nodes
-            .root()
-            .iter()
-            .chain(nodes.children())
-            .find(|node| node.node().label() == Some("Cancel run"))
-            .expect("the actual Details cancellation control is mounted")
+        let rect = announced_button(&nodes, "Cancel run")
             .node()
             .bounds()
             .unwrap();
@@ -7622,12 +7636,14 @@ mod tests {
                 cursor,
             );
             let nodes = ui.a11y_nodes(cursor);
-            let control = nodes
-                .root()
-                .iter()
-                .chain(nodes.children())
-                .find(|node| node.node().label() == Some("Cancel run"))
-                .expect("the scrolled cancellation control remains accessible");
+            // The text and its parent button share the visible label. The
+            // scroll owner's AX flattening may place that text first; it is
+            // not the focusable control whose ID/bounds this oracle needs.
+            assert!(nodes.root().iter().chain(nodes.children()).any(|node| {
+                node.node().role() == iced_accessibility::accesskit::Role::Paragraph
+                    && node.node().label() == Some("Cancel run")
+            }));
+            let control = announced_button(&nodes, "Cancel run");
             let iced_accessibility::A11yId::Widget(id) = control.id() else {
                 panic!("a cancellation control has a widget identity");
             };
@@ -7906,15 +7922,7 @@ mod tests {
     fn pause_bounds(ui: &CancelUi<'_>) -> cosmic::iced::Rectangle {
         use cosmic::iced::{Point, Rectangle, Size, mouse};
         let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
-        let rect = nodes
-            .root()
-            .iter()
-            .chain(nodes.children())
-            .find(|node| node.node().label() == Some("Pause"))
-            .expect("actual selected definition's Pause control is mounted")
-            .node()
-            .bounds()
-            .unwrap();
+        let rect = announced_button(&nodes, "Pause").node().bounds().unwrap();
         let bounds = Rectangle::new(
             Point::new(rect.x0 as f32, rect.y0 as f32),
             Size::new((rect.x1 - rect.x0) as f32, (rect.y1 - rect.y0) as f32),
