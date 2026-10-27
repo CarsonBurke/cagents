@@ -430,7 +430,12 @@ fn selected(operation: &mut Operation) -> Option<&mut PathBuf> {
         | Operation::Remove { repository, .. }
         | Operation::SetupIntents { repository }
         | Operation::ReviewSetup { repository, .. }
-        | Operation::ResumeSetup { repository, .. } => Some(repository),
+        | Operation::ResumeSetup { repository, .. }
+        | Operation::Inspect { repository, .. }
+        | Operation::StaleLock { repository, .. }
+        | Operation::GetDisposableIgnoredDirectories { repository, .. }
+        | Operation::SetDisposableIgnoredDirectories { repository, .. }
+        | Operation::DeleteBranch { repository, .. } => Some(repository),
     }
 }
 fn journal() -> Result<StateStore, String> {

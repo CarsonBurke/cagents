@@ -2,7 +2,7 @@
 //! PTY cases. No application, UI or provider is launched.
 use super::*;
 use crate::process::{CommandSpec, ProcessExecutor, ProcessFailure, ProcessOutput};
-use std::{ffi::OsStr, fs};
+use std::{ffi::OsStr, fs, io::Write};
 
 struct Fixture {
     _root: tempfile::TempDir,
@@ -104,6 +104,353 @@ fn git(directory: &Path, arguments: &[&str]) -> String {
 }
 fn isolated(name: &str) -> bool {
     crate::repository::test_fixture::isolated_fixture_case(name)
+}
+
+#[test]
+fn original_policy_routes_remain_available_with_a_broken_worktree_index() {
+    if isolated(concat!(
+        module_path!(),
+        "::original_policy_routes_remain_available_with_a_broken_worktree_index"
+    )) {
+        return;
+    }
+    let fixture = Fixture::new();
+    let created = fixture.create("policy");
+    let service = RepositoryService::system("git");
+    let admin = service
+        .git_dir(&created.path, &CancellationToken::new())
+        .unwrap();
+    fs::write(admin.join("index"), b"broken index").unwrap();
+    let get = || Operation::GetDisposableIgnoredDirectories {
+        repository: fixture.repository.clone(),
+        path: created.path.clone(),
+    };
+    let Execution::Reply {
+        reply: Reply::DisposableIgnoredDirectories { directories },
+        ..
+    } = fixture.execute(get())
+    else {
+        panic!("wrong policy reply");
+    };
+    assert_eq!(
+        directories,
+        crate::repository::default_disposable_ignored_directories()
+    );
+    let set = |directories| Operation::SetDisposableIgnoredDirectories {
+        repository: fixture.repository.clone(),
+        path: created.path.clone(),
+        directories,
+    };
+    let Execution::Reply {
+        reply: Reply::DisposableIgnoredDirectories { directories },
+        ..
+    } = fixture.execute(set(vec!["cache".into(), "cache ü".into()]))
+    else {
+        panic!("wrong policy reply");
+    };
+    assert_eq!(directories, ["cache", "cache ü"]);
+    assert!(
+        execute_with(
+            &service,
+            set(vec!["../escape".into()]),
+            &fixture.store,
+            |_| Ok(Vec::new()),
+            None
+        )
+        .is_err()
+    );
+    let Execution::Reply {
+        reply: Reply::DisposableIgnoredDirectories { directories },
+        ..
+    } = fixture.execute(get())
+    else {
+        panic!("wrong policy reply");
+    };
+    assert_eq!(directories, ["cache", "cache ü"]);
+    let Execution::Reply {
+        reply: Reply::DisposableIgnoredDirectories { directories },
+        ..
+    } = fixture.execute(set(Vec::new()))
+    else {
+        panic!("wrong policy reply");
+    };
+    assert!(
+        directories.is_empty(),
+        "explicit empty policy must not become defaults"
+    );
+}
+
+#[test]
+fn original_disposable_directory_policy_is_used_by_actual_guarded_removal() {
+    if isolated(concat!(
+        module_path!(),
+        "::original_disposable_directory_policy_is_used_by_actual_guarded_removal"
+    )) {
+        return;
+    }
+    let fixture = Fixture::new();
+    let service = RepositoryService::system("git");
+    let cancel = CancellationToken::new();
+    let created = fixture.create("disposable");
+    let common = service.common_dir(&created.path, &cancel).unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(common.join("info/exclude"))
+        .unwrap()
+        .write_all(b"\nnode_modules/\ncache\n")
+        .unwrap();
+    fs::create_dir(created.path.join("node_modules")).unwrap();
+    fs::write(created.path.join("node_modules/generated"), b"build output").unwrap();
+    let prepared = PreparedRemoval::prepare(
+        &service,
+        fixture.repository.clone(),
+        created.path.to_str().unwrap().into(),
+        None,
+        false,
+        false,
+        &cancel,
+    )
+    .unwrap();
+    assert_eq!(
+        prepared
+            .remove(&fixture.store, |_| Ok(()), || Ok(()))
+            .unwrap()
+            .path,
+        created.path
+    );
+    assert!(!created.path.exists());
+    let created = fixture.create("same-named-file");
+    fixture.execute(Operation::SetDisposableIgnoredDirectories {
+        repository: fixture.repository.clone(),
+        path: created.path.clone(),
+        directories: vec!["cache".into()],
+    });
+    fs::write(created.path.join("cache"), b"user data").unwrap();
+    assert!(
+        PreparedRemoval::prepare(
+            &service,
+            fixture.repository.clone(),
+            created.path.to_str().unwrap().into(),
+            None,
+            false,
+            false,
+            &cancel
+        )
+        .is_err()
+    );
+    assert_eq!(fs::read(created.path.join("cache")).unwrap(), b"user data");
+}
+
+#[test]
+fn changed_policy_or_notable_file_invalidates_original_confirmation_before_removal() {
+    if isolated(concat!(
+        module_path!(),
+        "::changed_policy_or_notable_file_invalidates_original_confirmation_before_removal"
+    )) {
+        return;
+    }
+    let fixture = Fixture::new();
+    let service = RepositoryService::system("git");
+    let cancel = CancellationToken::new();
+    let created = fixture.create("policy-race");
+    let common = service.common_dir(&created.path, &cancel).unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(common.join("info/exclude"))
+        .unwrap()
+        .write_all(b"\ntarget/\n.env\n")
+        .unwrap();
+    fs::create_dir(created.path.join("target")).unwrap();
+    fs::write(created.path.join("target/output"), b"generated").unwrap();
+    let prepared = PreparedRemoval::prepare(
+        &service,
+        fixture.repository.clone(),
+        created.path.to_str().unwrap().into(),
+        None,
+        false,
+        false,
+        &cancel,
+    )
+    .unwrap();
+    fixture.execute(Operation::SetDisposableIgnoredDirectories {
+        repository: fixture.repository.clone(),
+        path: created.path.clone(),
+        directories: Vec::new(),
+    });
+    assert!(
+        prepared
+            .remove(&fixture.store, |_| Ok(()), || Ok(()))
+            .is_err()
+    );
+    assert!(created.path.exists());
+    fs::write(created.path.join(".env"), b"before").unwrap();
+    let Execution::Reply {
+        reply: Reply::Inspected { snapshot, .. },
+        ..
+    } = fixture.execute(Operation::Inspect {
+        repository: fixture.repository.clone(),
+        path: created.path.clone(),
+    })
+    else {
+        panic!("wrong inspect reply");
+    };
+    let snapshot: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+    let fingerprint = snapshot["fingerprint"].as_str().unwrap();
+    fs::write(
+        created.path.join(".env"),
+        b"later user data with same path count",
+    )
+    .unwrap();
+    assert!(
+        PreparedRemoval::prepare_confirmed(
+            &service,
+            fixture.repository.clone(),
+            created.path.to_str().unwrap().into(),
+            None,
+            true,
+            false,
+            Some(fingerprint),
+            &cancel
+        )
+        .is_err()
+    );
+    assert!(created.path.join(".env").exists());
+}
+
+#[test]
+fn restored_inspect_and_policy_refuse_another_physical_repository() {
+    if isolated(concat!(
+        module_path!(),
+        "::restored_inspect_and_policy_refuse_another_physical_repository"
+    )) {
+        return;
+    }
+    let fixture = Fixture::new();
+    let other = Fixture::new();
+    let created = fixture.create("original");
+    let replacement = other.create("foreign");
+    for operation in [
+        Operation::Inspect {
+            repository: fixture.repository.clone(),
+            path: replacement.path.clone(),
+        },
+        Operation::SetDisposableIgnoredDirectories {
+            repository: fixture.repository.clone(),
+            path: replacement.path.clone(),
+            directories: vec!["private".into()],
+        },
+    ] {
+        assert!(
+            execute_with(
+                &RepositoryService::system("git"),
+                operation,
+                &fixture.store,
+                |_| Ok(Vec::new()),
+                None
+            )
+            .is_err()
+        );
+    }
+    let original_marker = fs::read(created.path.join(".git")).unwrap();
+    fs::write(
+        created.path.join(".git"),
+        fs::read(replacement.path.join(".git")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        execute_with(
+            &RepositoryService::system("git"),
+            Operation::SetDisposableIgnoredDirectories {
+                repository: fixture.repository.clone(),
+                path: created.path.clone(),
+                directories: vec!["private".into()]
+            },
+            &fixture.store,
+            |_| Ok(Vec::new()),
+            None
+        )
+        .is_err()
+    );
+    fs::write(created.path.join(".git"), original_marker).unwrap();
+    let Execution::Reply {
+        reply: Reply::DisposableIgnoredDirectories { directories },
+        ..
+    } = other.execute(Operation::GetDisposableIgnoredDirectories {
+        repository: other.repository.clone(),
+        path: replacement.path,
+    })
+    else {
+        panic!("wrong policy reply");
+    };
+    assert_eq!(
+        directories,
+        crate::repository::default_disposable_ignored_directories()
+    );
+}
+
+#[test]
+fn original_standalone_branch_route_retains_safe_and_exact_force_consent() {
+    if isolated(concat!(
+        module_path!(),
+        "::original_standalone_branch_route_retains_safe_and_exact_force_consent"
+    )) {
+        return;
+    }
+    let fixture = Fixture::new();
+    git(&fixture.repository, &["branch", "merged"]);
+    let remove = |branch: &str, force, expected_oid| Operation::DeleteBranch {
+        repository: fixture.repository.clone(),
+        branch: branch.into(),
+        force,
+        expected_oid,
+    };
+    assert!(matches!(
+        fixture.execute(remove("merged", false, None)),
+        Execution::Reply {
+            reply: Reply::BranchDeleted { .. },
+            ..
+        }
+    ));
+    let created = fixture.create("checked-out");
+    assert!(matches!(
+        fixture.execute(remove("checked-out", true, None)),
+        Execution::Reply {
+            reply: Reply::BranchDeleteFailed {
+                outcome_unknown: false,
+                ..
+            },
+            ..
+        }
+    ));
+    let head = git(&created.path, &["rev-parse", "HEAD"]);
+    assert!(matches!(
+        fixture.execute(remove("checked-out", true, Some(head.clone()))),
+        Execution::Reply {
+            reply: Reply::BranchDeleteFailed {
+                failure: crate::worktree_branch::BranchDeleteFailure {
+                    kind: crate::worktree_branch::BranchDeleteFailureKind::CheckedOutElsewhere,
+                    ..
+                },
+                ..
+            },
+            ..
+        }
+    ));
+    git(&created.path, &["checkout", "--detach", "-q"]);
+    assert!(matches!(
+        fixture.execute(remove("checked-out", true, Some("0".repeat(head.len())))),
+        Execution::Reply {
+            reply: Reply::BranchDeleteFailed { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        fixture.execute(remove("checked-out", true, Some(head))),
+        Execution::Reply {
+            reply: Reply::BranchDeleted { .. },
+            ..
+        }
+    ));
 }
 
 #[test]

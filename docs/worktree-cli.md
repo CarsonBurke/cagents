@@ -42,6 +42,47 @@ An optional `--spawn-agent PROVIDER` starts an agent in the created worktree onl
 
 ## Removal
 
+Read fresh safety evidence before deciding what to remove:
+
+```sh
+cagents worktree inspect /path/to/worktree --project /path/to/project
+cagents worktree ignored-directories /path/to/worktree --project /path/to/project
+cagents worktree ignored-directories /path/to/worktree --project /path/to/project --set node_modules target
+```
+
+The ignored-directory policy is local to the clone and shared by its linked
+worktrees. It names directories at any depth; a file with the same name remains
+user data. `--set` with no names makes every ignored file notable. Policy access
+does not require a working index or a successful safety census. Removal repeats
+the current policy and notable-file inventory; changing either invalidates the
+previous confirmation. The inspect fingerprint can be supplied to `remove
+--fingerprint FINGERPRINT` to bind commit-loss consent to that exact evidence.
+Discarding local files still requires `--force`.
+
+An inactive lock from a settled cagents creation has an explicit recovery path:
+
+```sh
+cagents worktree lock /path/to/worktree --project /path/to/project
+cagents worktree lock /path/to/worktree --project /path/to/project --unlock
+```
+
+The daemon must prove the original creation, current physical checkout and Git
+metadata, held creation lease and positive setup-cleanup disposition. A foreign,
+active, replaced or uncertain lock is retained. An error after the unlock may
+mean its directory sync could not be confirmed; inspect before another request.
+
+Independent branch deletion uses separate consent:
+
+```sh
+cagents worktree delete-branch feature/completed --project /path/to/project
+cagents worktree delete-branch feature/abandoned --project /path/to/project --force --expected-oid FULL_COMMIT_ID
+```
+
+Safe deletion retains Git's merge checks. Force consent is bound to the exact
+shown commit and cannot delete a branch checked out in another worktree. A
+failure after deletion started can follow a committed ref change and failed
+cleanup; it is reported as uncertain and is never automatically retried.
+
 ```sh
 cagents worktree remove feature/my-change --project /path/to/project
 cagents worktree remove /path/to/worktree --project /path/to/project --force

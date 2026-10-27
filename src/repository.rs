@@ -9,7 +9,10 @@ mod managed_worktrees;
 #[cfg(test)]
 pub(crate) use managed_worktrees::{isolated_git_test, retained_managed_fixture_directory};
 mod worktree_control;
+mod worktree_policy;
 mod worktree_setup_intent;
+#[cfg(feature = "host")]
+mod worktree_unlock;
 #[cfg(all(test, feature = "host"))]
 pub(crate) use worktree_control::fail_next_setup_publication_sync_for_test;
 #[cfg(feature = "host")]
@@ -18,6 +21,7 @@ pub(crate) use worktree_control::{
     removal_is_quiescent as worktree_setup_removal_is_quiescent, reserve_setup_holder,
     verify_prepared_setup_holder,
 };
+pub use worktree_policy::default_disposable_ignored_directories;
 pub use worktree_setup_intent::{WorktreeSetupIntent, WorktreeSetupPlan};
 
 use std::{

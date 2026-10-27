@@ -38,6 +38,38 @@ pub enum WorktreeCommand {
         #[arg(long)]
         project: Option<PathBuf>,
     },
+    /// Read fresh deletion counts, ignored-file policy and a confirmation fingerprint.
+    Inspect {
+        path: PathBuf,
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+    /// Check a leftover cagents creation lock, or explicitly unlock its proved owner.
+    Lock {
+        path: PathBuf,
+        #[arg(long)]
+        project: Option<PathBuf>,
+        #[arg(long)]
+        unlock: bool,
+    },
+    /// Show the clone-local policy; --set replaces it (an empty list is allowed).
+    IgnoredDirectories {
+        path: PathBuf,
+        #[arg(long)]
+        project: Option<PathBuf>,
+        #[arg(long, num_args = 0..)]
+        set: Option<Vec<String>>,
+    },
+    /// Delete an exact local branch; force requires separate commit-bound consent.
+    DeleteBranch {
+        branch: String,
+        #[arg(long)]
+        project: Option<PathBuf>,
+        #[arg(long)]
+        force: bool,
+        #[arg(long, requires = "force")]
+        expected_oid: Option<String>,
+    },
     /// Inspect retained setup or explicitly review a fresh run.
     Setup {
         #[command(subcommand)]
@@ -54,6 +86,9 @@ pub enum WorktreeCommand {
         /// Separately request Git's safe branch -d, never force branch deletion.
         #[arg(long)]
         delete_branch: bool,
+        /// Bind commit-loss consent to fresh inspect output; file loss still needs --force.
+        #[arg(long)]
+        fingerprint: Option<String>,
     },
 }
 
@@ -122,6 +157,25 @@ fn request(client: &mut ControlClient, operation: Operation) -> Result<Reply, Ap
             | (Operation::Remove { .. }, Reply::Removed(_) | Reply::RemovalFailed(_))
             | (Operation::SetupIntents { .. }, Reply::SetupIntents { .. })
             | (Operation::ReviewSetup { .. }, Reply::SetupReview(_)) => true,
+            (Operation::Inspect { .. }, Reply::Inspected { .. })
+            | (
+                Operation::GetDisposableIgnoredDirectories { .. }
+                | Operation::SetDisposableIgnoredDirectories { .. },
+                Reply::DisposableIgnoredDirectories { .. },
+            ) => true,
+            (
+                Operation::DeleteBranch {
+                    branch: requested, ..
+                },
+                Reply::BranchDeleted { branch: actual }
+                | Reply::BranchDeleteFailed { branch: actual, .. },
+            ) => requested == actual,
+            (
+                Operation::StaleLock {
+                    unlock: requested, ..
+                },
+                Reply::StaleLock { unlocked: actual },
+            ) => requested == actual,
             (
                 Operation::ResumeSetup {
                     skip: requested, ..
@@ -151,12 +205,21 @@ fn request(client: &mut ControlClient, operation: Operation) -> Result<Reply, Ap
             Operation::Remove { .. } => "worktree.remove",
             Operation::ResumeSetup { skip: true, .. } => "worktree.setup.skip",
             Operation::ResumeSetup { .. } => "worktree.setup.resume",
+            Operation::StaleLock { unlock: true, .. } => "worktree.lock.unlock",
+            Operation::SetDisposableIgnoredDirectories { .. } => "worktree.ignored-directories.set",
+            Operation::DeleteBranch { .. } => "worktree.delete-branch",
             _ => unreachable!("mutating operation"),
+        };
+        let recovery = match &known {
+            Operation::SetDisposableIgnoredDirectories { .. } => vec!["worktree ignored-directories", "worktree inspect"],
+            Operation::StaleLock { .. } => vec!["worktree list", "worktree lock"],
+            Operation::DeleteBranch { .. } => vec!["Inspect the exact local branch and any partial Git cleanup", "worktree list"],
+            _ => vec!["worktree list", "worktree setup list", "worktree setup review"],
         };
         AppError {
             kind: "worktree_outcome_unknown",
-            message: format!("{verb} did not return a confirmed outcome; effects may have committed: {}. Do not retry the mutation. Inspect `worktree list` and `worktree setup list` for the same project, then `worktree setup review` for any retained checkout", cause.message),
-            details: Some(json!({"schema_version":1,"outcome_unknown":true,"may_have_effects":true,"retryable":false,"verb":verb,"request":known,"cause":{"kind":cause.kind,"message":cause.message,"details":cause.details},"recovery":["worktree list","worktree setup list","worktree setup review"]})),
+            message: format!("{verb} did not return a confirmed outcome; effects may have committed: {}. Do not retry the mutation. Inspect current state for the same project first: {}", cause.message, recovery.join("; ")),
+            details: Some(json!({"schema_version":1,"outcome_unknown":true,"may_have_effects":true,"retryable":false,"verb":verb,"request":known,"cause":{"kind":cause.kind,"message":cause.message,"details":cause.details},"recovery":recovery})),
         }
     })
 }
@@ -262,7 +325,11 @@ pub(super) fn execute(command: WorktreeCommand) -> Result<CommandOutput, AppErro
     let selector = match &command {
         WorktreeCommand::Create { project, .. }
         | WorktreeCommand::List { project }
-        | WorktreeCommand::Remove { project, .. } => project.clone(),
+        | WorktreeCommand::Remove { project, .. }
+        | WorktreeCommand::Inspect { project, .. }
+        | WorktreeCommand::Lock { project, .. }
+        | WorktreeCommand::IgnoredDirectories { project, .. }
+        | WorktreeCommand::DeleteBranch { project, .. } => project.clone(),
         WorktreeCommand::Setup { command } => match command {
             SetupCommand::List { project }
             | SetupCommand::Review { project, .. }
@@ -295,6 +362,52 @@ pub(super) fn execute(command: WorktreeCommand) -> Result<CommandOutput, AppErro
         WorktreeCommand::List { .. } => (
             Operation::List {
                 repository: repository.clone(),
+            },
+            None,
+        ),
+        WorktreeCommand::Inspect { path, .. } => (
+            Operation::Inspect {
+                repository: repository.clone(),
+                path: checkout_path(path)?,
+            },
+            None,
+        ),
+        WorktreeCommand::Lock { path, unlock, .. } => (
+            Operation::StaleLock {
+                repository: repository.clone(),
+                path: checkout_path(path)?,
+                unlock,
+            },
+            None,
+        ),
+        WorktreeCommand::IgnoredDirectories { path, set, .. } => {
+            let path = checkout_path(path)?;
+            (
+                match set {
+                    Some(directories) => Operation::SetDisposableIgnoredDirectories {
+                        repository: repository.clone(),
+                        path,
+                        directories,
+                    },
+                    None => Operation::GetDisposableIgnoredDirectories {
+                        repository: repository.clone(),
+                        path,
+                    },
+                },
+                None,
+            )
+        }
+        WorktreeCommand::DeleteBranch {
+            branch,
+            force,
+            expected_oid,
+            ..
+        } => (
+            Operation::DeleteBranch {
+                repository: repository.clone(),
+                branch,
+                force,
+                expected_oid,
             },
             None,
         ),
@@ -345,6 +458,7 @@ pub(super) fn execute(command: WorktreeCommand) -> Result<CommandOutput, AppErro
             target,
             force,
             delete_branch,
+            fingerprint,
             ..
         } => {
             let resolved_path = if crate::device::is_remote() {
@@ -371,6 +485,7 @@ pub(super) fn execute(command: WorktreeCommand) -> Result<CommandOutput, AppErro
                     force,
                     delete_branch,
                     resolved_path,
+                    expected_fingerprint: fingerprint,
                 },
                 None,
             )
@@ -702,6 +817,75 @@ fn finish_reply(
         Reply::ResolvedRepository { .. } => {
             Err(AppError::new("protocol", "Unexpected worktree result"))
         }
+        Reply::Inspected {
+            snapshot,
+            disposable_ignored_directories,
+        } => {
+            let snapshot: Value = serde_json::from_str(&snapshot)
+                .map_err(|error| AppError::new("protocol", error))?;
+            Ok(CommandOutput {
+                command: "worktree.inspect",
+                human: format!(
+                    "{} modified, {} untracked, {} notable ignored file(s), {} unpushed and {} detached-only commit(s)\nConfirmation: {}",
+                    snapshot["modified"],
+                    snapshot["untracked"],
+                    snapshot["notable_ignored"].as_array().map_or(0, Vec::len),
+                    snapshot["unpushed_commits"],
+                    snapshot["detached_only_commits"],
+                    snapshot["fingerprint"].as_str().unwrap_or("unavailable")
+                ),
+                data: json!({"schema_version":1,"snapshot":snapshot,"disposable_ignored_directories":disposable_ignored_directories}),
+            })
+        }
+        Reply::StaleLock { unlocked } => Ok(CommandOutput {
+            command: "worktree.lock",
+            human: if unlocked {
+                "Unlocked the proved inactive cagents creation lock".into()
+            } else {
+                "The cagents creation lock is eligible for explicit recovery".into()
+            },
+            data: json!({"schema_version":1,"unlocked":unlocked}),
+        }),
+        Reply::DisposableIgnoredDirectories { directories } => Ok(CommandOutput {
+            command: "worktree.ignored-directories",
+            human: format!(
+                "Disposable ignored directories: {}",
+                if directories.is_empty() {
+                    "none".into()
+                } else {
+                    directories.join(", ")
+                }
+            ),
+            data: json!({"schema_version":1,"directories":directories}),
+        }),
+        Reply::BranchDeleted { branch } => Ok(CommandOutput {
+            command: "worktree.delete-branch",
+            human: format!("Deleted branch {branch}"),
+            data: json!({"schema_version":1,"branch":branch,"deleted":true}),
+        }),
+        Reply::BranchDeleteFailed {
+            branch,
+            failure,
+            outcome_unknown,
+        } => Err(AppError {
+            kind: if outcome_unknown {
+                "worktree_branch_unknown"
+            } else {
+                "worktree_branch_refused"
+            },
+            message: format!(
+                "Branch {branch}: {}{}",
+                failure.detail,
+                if outcome_unknown {
+                    ". Inspect the exact branch and repository before any retry; deletion may have committed"
+                } else {
+                    ""
+                }
+            ),
+            details: Some(
+                json!({"schema_version":1,"branch":branch,"failure":failure,"outcome_unknown":outcome_unknown,"may_have_effects":outcome_unknown,"retryable":false}),
+            ),
+        }),
     }
 }
 
@@ -1103,6 +1287,102 @@ mod tests {
             }
             drop(client);
             server.join().unwrap();
+        }
+    }
+    #[test]
+    fn restored_mutations_preserve_unknown_outcomes_and_exact_branch_reply_correlation() {
+        let path = PathBuf::from("/fixture/checkout");
+        let operations = vec![
+            Operation::SetDisposableIgnoredDirectories {
+                repository: path.clone(),
+                path: path.clone(),
+                directories: vec!["cache".into()],
+            },
+            Operation::StaleLock {
+                repository: path.clone(),
+                path: path.clone(),
+                unlock: true,
+            },
+            Operation::DeleteBranch {
+                repository: path.clone(),
+                branch: "topic".into(),
+                force: true,
+                expected_oid: Some("a".repeat(40)),
+            },
+        ];
+        for operation in operations {
+            assert!(operation.mutates());
+            for known_no_start in [false, true] {
+                let expected = operation.clone();
+                let (mut client, server) = connected_client(move |peer, proof| {
+                    let received: ClientEnvelope = read_frame(peer).unwrap().unwrap();
+                    let ClientRequest::Worktree { operation, .. } = received.request else {
+                        panic!("wrong request");
+                    };
+                    assert_eq!(operation, expected);
+                    let message = if known_no_start {
+                        ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
+                            ProtocolErrorCode::WorktreeNotStarted,
+                            "pre-service refusal",
+                            false,
+                        ))
+                    } else {
+                        // An unrelated branch cannot confirm this operation,
+                        // even though its inner result has a valid wire shape.
+                        ServerMessage::Response {
+                            response: ServerResponse::Worktree(Reply::BranchDeleted {
+                                branch: "another-branch".into(),
+                            }),
+                        }
+                    };
+                    write_frame(
+                        peer,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(received.request_id),
+                            proof: proof.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+                    assert!(
+                        read_frame::<ClientEnvelope>(peer).unwrap().is_none(),
+                        "no automatic mutation retry"
+                    );
+                });
+                let error = request(&mut client, operation.clone()).unwrap_err();
+                if known_no_start {
+                    assert_ne!(error.kind, "worktree_outcome_unknown");
+                } else {
+                    assert_eq!(error.kind, "worktree_outcome_unknown");
+                    let details = error.details.unwrap();
+                    assert_eq!(
+                        details["request"],
+                        serde_json::to_value(&operation).unwrap()
+                    );
+                    assert_eq!(details["retryable"], false);
+                    assert_eq!(details["may_have_effects"], true);
+                }
+                drop(client);
+                server.join().unwrap();
+            }
+        }
+        for operation in [
+            Operation::Inspect {
+                repository: path.clone(),
+                path: path.clone(),
+            },
+            Operation::GetDisposableIgnoredDirectories {
+                repository: path.clone(),
+                path: path.clone(),
+            },
+            Operation::StaleLock {
+                repository: path.clone(),
+                path,
+                unlock: false,
+            },
+        ] {
+            assert!(!operation.mutates());
         }
     }
 }

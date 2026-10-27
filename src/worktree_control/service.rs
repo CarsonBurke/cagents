@@ -1,4 +1,6 @@
 //! Blocking service work; no HostState borrow or control writer may be held.
+mod branch;
+mod inspection;
 mod recovery;
 mod removal;
 mod setup;
@@ -328,18 +330,99 @@ fn execute_with<E: ProcessExecutor>(
             force,
             delete_branch,
             resolved_path,
+            expected_fingerprint,
         } => {
-            return PreparedRemoval::prepare(
+            return PreparedRemoval::prepare_confirmed(
                 service,
                 repository,
                 target,
                 resolved_path,
                 force,
                 delete_branch,
+                expected_fingerprint.as_deref(),
                 &cancellation,
             )
             .map(Execution::Remove);
         }
+        Operation::Inspect { repository, path } => (
+            inspection::inspect(service, &repository, &path, &cancellation)?,
+            None,
+        ),
+        Operation::GetDisposableIgnoredDirectories { repository, path } => {
+            let selected =
+                inspection::Selection::capture(service, &repository, &path, &cancellation)?;
+            let directories = selected.policy(&cancellation)?;
+            selected.verify(&cancellation)?;
+            (Reply::DisposableIgnoredDirectories { directories }, None)
+        }
+        Operation::SetDisposableIgnoredDirectories {
+            repository,
+            path,
+            directories,
+        } => {
+            let selected =
+                inspection::Selection::capture(service, &repository, &path, &cancellation)?;
+            selected
+                .service()
+                .set_disposable_ignored_directories_at(
+                    &selected.common,
+                    &selected.admin,
+                    &selected.checkout,
+                    &directories,
+                    &cancellation,
+                )
+                .map_err(|error| error.to_string())?;
+            selected.verify(&cancellation)?;
+            (
+                Reply::DisposableIgnoredDirectories {
+                    directories: selected.policy(&cancellation)?,
+                },
+                None,
+            )
+        }
+        Operation::StaleLock {
+            repository,
+            path,
+            unlock,
+        } => {
+            let selected =
+                inspection::Selection::capture(service, &repository, &path, &cancellation)?;
+            if unlock {
+                selected.service().unlock_stale_worktree_at(
+                    store,
+                    &selected.common,
+                    &selected.admin,
+                    &selected.checkout,
+                    &cancellation,
+                )?;
+            } else {
+                selected.service().stale_worktree_lock_at(
+                    store,
+                    &selected.common,
+                    &selected.admin,
+                    &selected.checkout,
+                    &cancellation,
+                )?;
+            }
+            selected.verify(&cancellation)?;
+            (Reply::StaleLock { unlocked: unlock }, None)
+        }
+        Operation::DeleteBranch {
+            repository,
+            branch,
+            force,
+            expected_oid,
+        } => (
+            branch::delete(
+                service,
+                &repository,
+                branch,
+                force,
+                expected_oid,
+                &cancellation,
+            )?,
+            None,
+        ),
     };
     Ok(Execution::Reply { reply, setup })
 }

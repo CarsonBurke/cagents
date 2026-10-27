@@ -42,13 +42,45 @@ pub enum Operation {
         force: bool,
         delete_branch: bool,
         resolved_path: Option<PathBuf>,
+        expected_fingerprint: Option<String>,
+    },
+    /// Fresh deletion evidence; inspecting never authorizes a later mutation.
+    Inspect {
+        repository: PathBuf,
+        path: PathBuf,
+    },
+    StaleLock {
+        repository: PathBuf,
+        path: PathBuf,
+        unlock: bool,
+    },
+    GetDisposableIgnoredDirectories {
+        repository: PathBuf,
+        path: PathBuf,
+    },
+    SetDisposableIgnoredDirectories {
+        repository: PathBuf,
+        path: PathBuf,
+        directories: Vec<String>,
+    },
+    /// Independent branch consent, separate from discarding worktree files.
+    DeleteBranch {
+        repository: PathBuf,
+        branch: String,
+        force: bool,
+        expected_oid: Option<String>,
     },
 }
 impl Operation {
     pub fn mutates(&self) -> bool {
         matches!(
             self,
-            Self::Create { .. } | Self::Remove { .. } | Self::ResumeSetup { .. }
+            Self::Create { .. }
+                | Self::Remove { .. }
+                | Self::ResumeSetup { .. }
+                | Self::StaleLock { unlock: true, .. }
+                | Self::SetDisposableIgnoredDirectories { .. }
+                | Self::DeleteBranch { .. }
         )
     }
 }
@@ -169,6 +201,25 @@ pub enum Reply {
     },
     Removed(Removed),
     RemovalFailed(RemovalFailure),
+    Inspected {
+        snapshot: String,
+        disposable_ignored_directories: Vec<String>,
+    },
+    StaleLock {
+        unlocked: bool,
+    },
+    DisposableIgnoredDirectories {
+        directories: Vec<String>,
+    },
+    BranchDeleted {
+        branch: String,
+    },
+    BranchDeleteFailed {
+        branch: String,
+        failure: crate::worktree_branch::BranchDeleteFailure,
+        /// Checked Git deletion can commit before later cleanup fails.
+        outcome_unknown: bool,
+    },
 }
 
 #[cfg(feature = "host")]

@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     fs_safety,
-    process::{CommandSpec, ProcessExecutor},
+    process::ProcessExecutor,
     worktree_cleanup::{FencedTarget, WindowPolicy, remove_fenced},
     worktree_content::{self, Inspection, Verdict},
 };
@@ -19,6 +19,11 @@ pub(crate) struct PreparedRemoval {
     detached_only: u64,
     force: bool,
     delete_branch: bool,
+    selected: super::inspection::Selection,
+    policy: Vec<String>,
+    notable: Vec<crate::repository::RepoPath>,
+    fingerprint: String,
+    confirmed: bool,
 }
 
 impl PreparedRemoval {
@@ -26,6 +31,7 @@ impl PreparedRemoval {
         &self.target.path
     }
 
+    #[cfg(test)]
     pub(super) fn prepare<E: ProcessExecutor>(
         service: &Service<E>,
         repository: PathBuf,
@@ -33,6 +39,28 @@ impl PreparedRemoval {
         resolved_path: Option<PathBuf>,
         force: bool,
         delete_branch: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, String> {
+        Self::prepare_confirmed(
+            service,
+            repository,
+            target,
+            resolved_path,
+            force,
+            delete_branch,
+            None,
+            cancellation,
+        )
+    }
+
+    pub(super) fn prepare_confirmed<E: ProcessExecutor>(
+        service: &Service<E>,
+        repository: PathBuf,
+        target: String,
+        resolved_path: Option<PathBuf>,
+        force: bool,
+        delete_branch: bool,
+        expected_fingerprint: Option<&str>,
         cancellation: &CancellationToken,
     ) -> Result<Self, String> {
         let repository = repository.canonicalize().map_err(|e| e.to_string())?;
@@ -90,6 +118,12 @@ impl PreparedRemoval {
         let target = FencedTarget::capture(&repository, &record.path, short_branch(record))?;
         let common = fs_safety::Root::open(&target.common_dir).map_err(|e| e.to_string())?;
         let admin = fs_safety::Root::open(&target.admin_dir).map_err(|error| error.to_string())?;
+        let selected = super::inspection::Selection::capture(
+            service,
+            &repository,
+            &record.path,
+            cancellation,
+        )?;
         crate::repository::worktree_setup_removal_is_quiescent(&admin)
             .map_err(|error| error.to_string())?;
         let request = worktree_content::Request {
@@ -99,13 +133,31 @@ impl PreparedRemoval {
         };
         let inspection =
             worktree_content::inspect(&request, cancellation).map_err(|e| e.to_string())?;
-        let unpushed = commit_count(&record.path, false, cancellation)?;
+        let policy = selected.policy(cancellation)?;
+        let notable = selected.notable(&policy, cancellation)?;
+        let unpushed = selected.commit_count(false, cancellation)?;
         let detached_only = if record.detached {
-            commit_count(&record.path, true, cancellation)?
+            selected.commit_count(true, cancellation)?
         } else {
             0
         };
-        permits(&inspection, unpushed, detached_only, force)?;
+        let fingerprint =
+            selected.fingerprint(&inspection, &policy, &notable, unpushed, detached_only)?;
+        if expected_fingerprint.is_some_and(|expected| expected != fingerprint) {
+            return Err(
+                "The worktree or its deletion policy changed after confirmation; review it again"
+                    .into(),
+            );
+        }
+        selected.verify(cancellation)?;
+        permits(
+            &inspection,
+            notable.len(),
+            unpushed,
+            detached_only,
+            force,
+            expected_fingerprint.is_some(),
+        )?;
         Ok(Self {
             target,
             common,
@@ -117,6 +169,11 @@ impl PreparedRemoval {
             detached_only,
             force,
             delete_branch,
+            selected,
+            policy,
+            notable,
+            fingerprint,
+            confirmed: expected_fingerprint.is_some(),
         })
     }
 
@@ -173,6 +230,11 @@ impl PreparedRemoval {
             detached_only,
             force,
             delete_branch,
+            selected,
+            policy,
+            notable,
+            fingerprint,
+            confirmed,
         } = self;
         let cancellation = CancellationToken::new();
         let path = target.path.clone();
@@ -207,9 +269,18 @@ impl PreparedRemoval {
                             .into(),
                     );
                 }
-                let current_unpushed = commit_count(&path, false, &cancellation)?;
+                selected.verify(&cancellation)?;
+                let current_policy = selected.policy(&cancellation)?;
+                let current_notable = selected.notable(&current_policy, &cancellation)?;
+                if current_policy != policy || current_notable != notable {
+                    return Err(
+                        "The worktree's ignored-file policy or inventory changed; review it again"
+                            .into(),
+                    );
+                }
+                let current_unpushed = selected.commit_count(false, &cancellation)?;
                 let current_detached = if branch.is_none() {
-                    commit_count(&path, true, &cancellation)?
+                    selected.commit_count(true, &cancellation)?
                 } else {
                     0
                 };
@@ -218,7 +289,25 @@ impl PreparedRemoval {
                         "Worktree reachability changed; inspect it again before retrying".into(),
                     );
                 }
-                permits(&current, current_unpushed, current_detached, force)?;
+                if selected.fingerprint(
+                    &current,
+                    &current_policy,
+                    &current_notable,
+                    current_unpushed,
+                    current_detached,
+                )? != fingerprint
+                {
+                    return Err("The worktree's ignored-file evidence changed after confirmation; review it again".into());
+                }
+                permits(
+                    &current,
+                    current_notable.len(),
+                    current_unpushed,
+                    current_detached,
+                    force,
+                    confirmed,
+                )?;
+                selected.verify(&cancellation)?;
                 final_check()?;
                 if current_detached != 0 {
                     let head = current
@@ -317,38 +406,13 @@ fn same_named_root(root: &fs_safety::Root) -> Result<(), String> {
     }
     Ok(())
 }
-fn commit_count(
-    path: &Path,
-    detached: bool,
-    cancellation: &CancellationToken,
-) -> Result<u64, String> {
-    let mut command = crate::worktree_branch::git_command(path).args([
-        "rev-list",
-        "--count",
-        "HEAD",
-        "--not",
-        "--remotes",
-    ]);
-    if detached {
-        command = command.args(["--branches", "--tags"]);
-    }
-    let command: CommandSpec = command
-        .timeout(std::time::Duration::from_secs(30))
-        .output_limits(4096, 64 * 1024);
-    let output = SystemProcessExecutor
-        .execute(&command, cancellation)
-        .and_then(|output| output.require_success(&command.program))
-        .map_err(|e| e.reported_detail())?;
-    std::str::from_utf8(&output.stdout)
-        .ok()
-        .and_then(|text| text.trim().parse().ok())
-        .ok_or_else(|| "Git did not return a bounded commit count".into())
-}
 fn permits(
     inspection: &Inspection,
+    notable_ignored: usize,
     unpushed: u64,
     detached: u64,
     force: bool,
+    confirmed: bool,
 ) -> Result<(), String> {
     if let Verdict::Blocked(reason) = &inspection.verdict {
         return Err(format!("Worktree removal refused: {reason}"));
@@ -360,17 +424,28 @@ fn permits(
         && (inspection.staged != 0
             || inspection.modified != 0
             || inspection.untracked != 0
-            || inspection.ignored_total != 0
-            || unpushed != 0
-            || detached != 0
-            || matches!(inspection.verdict, Verdict::Unsaved { .. }))
+            || notable_ignored != 0
+            || matches!(
+                inspection.verdict,
+                Verdict::Unsaved {
+                    uncommitted: true,
+                    ..
+                } | Verdict::Unsaved {
+                    beyond_snapshot: true,
+                    ..
+                }
+            )
+            || (!confirmed
+                && (unpushed != 0
+                    || detached != 0
+                    || matches!(inspection.verdict, Verdict::Unsaved { .. }))))
     {
         return Err(format!(
-            "Worktree contains {} staged, {} modified, {} untracked, {} ignored entries, {} unpushed and {} detached-only commits; pass --force to confirm discarding this work",
+            "Worktree contains {} staged, {} modified, {} untracked, {} notable ignored files, {} unpushed and {} detached-only commits; pass --force to confirm discarding this work",
             inspection.staged,
             inspection.modified,
             inspection.untracked,
-            inspection.ignored_total,
+            notable_ignored,
             unpushed,
             detached
         ));
