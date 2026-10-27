@@ -2071,13 +2071,12 @@ impl Runtime {
                 );
             }
         }
-        // The symmetric inset already exceeds the scrollbar rail. Reserving
-        // the rail a second time would make transcript rows narrower than the
-        // composer even though their outer column is shared.
-        let transcript =
-            widget::container(virtualized::column(transcript.children, Default::default()))
-                .padding(iced::Padding::new(step::GAP_M))
-                .width(Length::Fill);
+        // Readability belongs inside the pane-wide native scroll viewport.
+        // Keep the same padded virtual-column child and row identities.
+        let transcript = super::layout::transcript_column(virtualized::column(
+            transcript.children,
+            Default::default(),
+        ));
         let transcript_index = content.len();
         let transcript_layer = if self.visible.load(Ordering::Relaxed) {
             let (catalog, bookmark) = self.selection_document();
@@ -2482,16 +2481,18 @@ impl Runtime {
         let mut content = vec![
             widget::column::with_children(content.into_iter().enumerate().map(|(index, child)| {
                 if index == transcript_index {
-                    child
+                    super::layout::transcript_viewport(child)
                 } else {
-                    widget::container(child)
-                        .padding(iced::Padding::from([0.0, step::GAP_M]).top(if index == 0 {
-                            step::GAP_M
-                        } else {
-                            0.0
-                        }))
-                        .width(Length::Fill)
-                        .into()
+                    super::layout::reading_column(
+                        widget::container(child)
+                            .padding(iced::Padding::from([0.0, step::GAP_M]).top(if index == 0 {
+                                step::GAP_M
+                            } else {
+                                0.0
+                            }))
+                            .width(Length::Fill)
+                            .into(),
+                    )
                 }
             }))
             .spacing(space::S)
@@ -3072,10 +3073,12 @@ impl Runtime {
                 if index == 0 {
                     child
                 } else {
-                    widget::container(child)
-                        .padding([0.0, step::GAP_M])
-                        .width(Length::Fill)
-                        .into()
+                    super::layout::reading_column(
+                        widget::container(child)
+                            .padding([0.0, step::GAP_M])
+                            .width(Length::Fill)
+                            .into(),
+                    )
                 }
             }))
             .spacing(step::GAP_S)
@@ -10498,11 +10501,20 @@ mod tests {
                 }
                 let column_width = width.min(design::READABLE_MEASURE + 2.0 * step::GAP_M);
                 let geometry = (viewport.x, viewport.width, editor.x, editor.width);
-                assert_eq!(viewport.width, column_width, "state {state}");
-                assert_eq!(editor.x, viewport.x + step::GAP_M, "state {state}");
+                assert_eq!(viewport.x, 0.0, "state {state}");
+                assert_eq!(
+                    viewport.width,
+                    width - super::super::layout::TRANSCRIPT_RESIZE_INSET,
+                    "state {state}"
+                );
+                assert_eq!(
+                    editor.x,
+                    (width - column_width) / 2.0 + step::GAP_M,
+                    "state {state}"
+                );
                 assert_eq!(
                     editor.width,
-                    viewport.width - 2.0 * step::GAP_M,
+                    column_width - 2.0 * step::GAP_M,
                     "state {state}"
                 );
                 assert_eq!(*baseline.get_or_insert(geometry), geometry, "state {state}");
