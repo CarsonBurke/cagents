@@ -2735,22 +2735,18 @@ fn classify_bytes(bytes: Vec<u8>) -> DiffSide {
 /// size comes from the same descriptor the bytes come from, and the read is
 /// bounded — so a classification and the read that acts on it cannot describe
 /// different objects.
-fn read_worktree_side(worktree: &Path, path: &RepoPath) -> DiffSide {
+fn read_worktree_side(root: &fs_safety::Root, path: &RepoPath) -> DiffSide {
     let unreadable = |error: &dyn fmt::Display| DiffSide::Unreadable {
         reason: error.to_string(),
     };
-    let root = match fs_safety::Root::open(worktree) {
-        Ok(root) => root,
-        Err(error) => return unreadable(&error),
-    };
     let relative = path.as_path();
-    let metadata = match fs_safety::metadata_beneath(&root, relative) {
+    let metadata = match fs_safety::metadata_beneath(root, relative) {
         Ok(metadata) => metadata,
         Err(error) if error.is_not_found() => return DiffSide::Absent,
         Err(error) => return unreadable(&error),
     };
     if metadata.file_type().is_symlink() {
-        return match fs_safety::read_link_beneath(&root, relative) {
+        return match fs_safety::read_link_beneath(root, relative) {
             Ok(target) => DiffSide::Symlink { target },
             Err(error) => unreadable(&error),
         };
@@ -2759,7 +2755,7 @@ fn read_worktree_side(worktree: &Path, path: &RepoPath) -> DiffSide {
         return DiffSide::NotRegularFile;
     }
 
-    let mut file = match fs_safety::open_beneath(&root, relative) {
+    let mut file = match fs_safety::open_beneath(root, relative) {
         Ok(file) => file,
         Err(error) if error.is_not_found() => return DiffSide::Absent,
         Err(error) => return unreadable(&error),
@@ -4287,8 +4283,16 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let old_path = request.old_path.as_ref().unwrap_or(&request.path);
         match &request.basis {
             DiffBasis::IndexToWorktree => {
+                // Keep the filesystem side on the root observed before Git's
+                // index read, even if that pathname is replaced afterward.
+                let root = fs_safety::Root::open(worktree);
                 let stages = self.index_entries(worktree, old_path, cancellation)?;
-                let worktree_side = read_worktree_side(worktree, &request.path);
+                let worktree_side = match root {
+                    Ok(root) => read_worktree_side(&root, &request.path),
+                    Err(error) => DiffSide::Unreadable {
+                        reason: error.to_string(),
+                    },
+                };
                 let stage = |number: u8| stages.iter().find(|entry| entry.stage == number);
                 if stage(0).is_none() && (1..=3).any(|number| stage(number).is_some()) {
                     // An unmerged path has no stage 0. Treating that absence as
@@ -7370,6 +7374,72 @@ mod tests {
             assert!(matches!(outcome, MutationOutcome::NotApplied { .. }));
             assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
             assert_eq!(fs::read(root.join("file.txt")).unwrap(), b"staged\n");
+        }
+
+        #[test]
+        fn index_to_worktree_diff_keeps_original_root_after_index_read() {
+            struct ReplaceAfterIndex {
+                root: PathBuf,
+                parked: PathBuf,
+            }
+
+            impl ProcessExecutor for ReplaceAfterIndex {
+                fn execute(
+                    &self,
+                    command: &CommandSpec,
+                    cancellation: &CancellationToken,
+                ) -> Result<ProcessOutput, ProcessFailure> {
+                    let output = IsolatedExecutor.execute(command, cancellation)?;
+                    if command
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "ls-files")
+                    {
+                        assert!(output.success);
+                        assert!(output.stdout.is_empty(), "the original index is empty");
+                        fs::rename(&self.root, &self.parked).unwrap();
+                        fs::create_dir(&self.root).unwrap();
+                        git(&self.root, &["init", "-b", "main"]);
+                        fs::write(self.root.join("file"), b"foreign work\n").unwrap();
+                    }
+                    Ok(output)
+                }
+            }
+
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("worktree");
+            let parked = directory.path().join("original");
+            fs::create_dir(&root).unwrap();
+            git(&root, &["init", "-b", "main"]);
+            fs::write(root.join("file"), b"original work\n").unwrap();
+            let service = RepositoryService::new(
+                "git",
+                Arc::new(ReplaceAfterIndex {
+                    root: root.clone(),
+                    parked: parked.clone(),
+                }),
+            );
+            let content = service
+                .diff(
+                    &DiffRequest {
+                        worktree: root.clone(),
+                        path: path("file"),
+                        old_path: None,
+                        basis: DiffBasis::IndexToWorktree,
+                    },
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+            assert!(matches!(
+                content,
+                DiffContent::Comparison {
+                    old: DiffSide::Absent,
+                    new: DiffSide::Text { ref text, .. },
+                    ..
+                } if text == "original work\n"
+            ));
+            assert_eq!(fs::read(root.join("file")).unwrap(), b"foreign work\n");
+            assert_eq!(fs::read(parked.join("file")).unwrap(), b"original work\n");
         }
 
         #[test]
@@ -10528,7 +10598,8 @@ mod tests {
         let index = parse_index_paths(index.as_bytes()).unwrap();
         assert_eq!(
             index.paths,
-            ["conflict.rs", "src/main.rs", "vendor/library"].map(|path| RepoPath::from_bytes(path.as_bytes()).unwrap())
+            ["conflict.rs", "src/main.rs", "vendor/library"]
+                .map(|path| RepoPath::from_bytes(path.as_bytes()).unwrap())
         );
         assert!(index.gitlinks);
         assert!(!parse_index_paths(b"").unwrap().gitlinks);

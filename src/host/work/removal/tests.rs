@@ -47,7 +47,14 @@ impl Fixture {
         for (name, branch) in [("feature", "feature"), ("landed", "landed")] {
             git(
                 &repository,
-                &["worktree", "add", "-q", "-b", branch, &format!(".worktrees/{name}")],
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    branch,
+                    &format!(".worktrees/{name}"),
+                ],
             );
         }
         let feature = repository.join(".worktrees/feature");
@@ -93,7 +100,13 @@ impl Fixture {
         }
     }
 
-    fn remove(&self, item: &str, token: &str, keep: Keep, delete_branch: bool) -> Result<Removed, String> {
+    fn remove(
+        &self,
+        item: &str,
+        token: &str,
+        keep: Keep,
+        delete_branch: bool,
+    ) -> Result<Removed, String> {
         self.process(Request::Remove(Box::new(Removal {
             scope: Scope::All,
             item: item.into(),
@@ -122,7 +135,9 @@ const CHILD: &str = "CAGENTS_WORK_REMOVAL_TEST";
 /// fixture's.
 fn isolated(name: &str) -> Option<PathBuf> {
     if std::env::var(CHILD).as_deref() == Ok(name) {
-        return Some(PathBuf::from(std::env::var_os("CAGENTS_WORK_REMOVAL_ROOT").unwrap()));
+        return Some(PathBuf::from(
+            std::env::var_os("CAGENTS_WORK_REMOVAL_ROOT").unwrap(),
+        ));
     }
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
@@ -131,13 +146,26 @@ fn isolated(name: &str) -> Option<PathBuf> {
     }
     std::fs::set_permissions(root.join("run"), std::fs::Permissions::from_mode(0o700)).unwrap();
     let namespaced = Command::new("unshare")
-        .args(["--user", "--map-root-user", "--pid", "--fork", "--mount-proc", "true"])
+        .args([
+            "--user",
+            "--map-root-user",
+            "--pid",
+            "--fork",
+            "--mount-proc",
+            "true",
+        ])
         .output()
         .is_ok_and(|output| output.status.success());
     let mut command = if namespaced {
         let mut command = Command::new("unshare");
         command
-            .args(["--user", "--map-root-user", "--pid", "--fork", "--mount-proc"])
+            .args([
+                "--user",
+                "--map-root-user",
+                "--pid",
+                "--fork",
+                "--mount-proc",
+            ])
             .arg(std::env::current_exe().unwrap());
         command
     } else {
@@ -190,18 +218,33 @@ fn unsaved_work_is_kept_as_a_snapshot_before_its_worktree_goes() {
 
     // Neither leaving the work behind nor deleting an unlanded branch is
     // allowed, and a stale token is refused.
-    let error = fixture.remove("feature", &token, Keep::Nothing, false).unwrap_err();
+    let error = fixture
+        .remove("feature", &token, Keep::Nothing, false)
+        .unwrap_err();
     assert!(error.contains("unsaved work"), "{error}");
-    let error = fixture.remove("feature", &token, Keep::Snapshot, true).unwrap_err();
+    let error = fixture
+        .remove("feature", &token, Keep::Snapshot, true)
+        .unwrap_err();
     assert!(error.contains("Only a branch whose work landed"), "{error}");
-    let error = fixture.remove("feature", "stale", Keep::Snapshot, false).unwrap_err();
+    let error = fixture
+        .remove("feature", "stale", Keep::Snapshot, false)
+        .unwrap_err();
     assert_eq!(error, CHANGED);
     assert!(feature.exists());
 
     // A process inside the worktree refuses the removal.
-    let mut resident = Command::new("sleep").arg("30").current_dir(&feature).spawn().unwrap();
-    let error = fixture.remove("feature", &token, Keep::Snapshot, false).unwrap_err();
-    assert!(error.contains(&format!("process {}", resident.id())), "{error}");
+    let mut resident = Command::new("sleep")
+        .arg("30")
+        .current_dir(&feature)
+        .spawn()
+        .unwrap();
+    let error = fixture
+        .remove("feature", &token, Keep::Snapshot, false)
+        .unwrap_err();
+    assert!(
+        error.contains(&format!("process {}", resident.id())),
+        "{error}"
+    );
     resident.kill().unwrap();
     resident.wait().unwrap();
     assert!(feature.exists());
@@ -210,20 +253,29 @@ fn unsaved_work_is_kept_as_a_snapshot_before_its_worktree_goes() {
         "a refused removal keeps no snapshot"
     );
 
-    let removed = fixture.remove("feature", &token, Keep::Snapshot, false).unwrap();
+    let removed = fixture
+        .remove("feature", &token, Keep::Snapshot, false)
+        .unwrap();
     assert_eq!(removed.path, feature);
     assert!(removed.deleted_branch.is_none());
     let snapshot = removed.snapshot.unwrap();
     assert!(!feature.exists());
     assert!(!fixture.worktrees().contains(".worktrees/feature"));
     // The branch stays, and the snapshot restores the unsaved file.
-    git(&fixture.repository, &["rev-parse", "--verify", "refs/heads/feature"]);
+    git(
+        &fixture.repository,
+        &["rev-parse", "--verify", "refs/heads/feature"],
+    );
     assert_eq!(
-        git(&fixture.repository, &["show", &format!("{}^3:draft", snapshot.oid)]),
+        git(
+            &fixture.repository,
+            &["show", &format!("{}^3:draft", snapshot.oid)]
+        ),
         "unsaved"
     );
 
-    let Ok(Response::Snapshots(snapshots)) = fixture.process(Request::Snapshots { scope: Scope::All })
+    let Ok(Response::Snapshots(snapshots)) =
+        fixture.process(Request::Snapshots { scope: Scope::All })
     else {
         panic!("no snapshot listing");
     };
@@ -258,11 +310,15 @@ fn a_landed_worktree_goes_with_its_branch() {
 
     // Content changed after the plan: the removal is refused.
     std::fs::write(landed.join("late"), "arrived after the plan\n").unwrap();
-    let error = fixture.remove("team/landed", &token, Keep::Nothing, true).unwrap_err();
+    let error = fixture
+        .remove("team/landed", &token, Keep::Nothing, true)
+        .unwrap_err();
     assert_eq!(error, CHANGED);
     std::fs::remove_file(landed.join("late")).unwrap();
 
-    let removed = fixture.remove("team/landed", &token, Keep::Nothing, true).unwrap();
+    let removed = fixture
+        .remove("team/landed", &token, Keep::Nothing, true)
+        .unwrap();
     assert_eq!(removed.deleted_branch.as_deref(), Some("team/landed"));
     assert_eq!(removed.branch_error, None);
     assert!(removed.snapshot.is_none());

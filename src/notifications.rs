@@ -24,6 +24,11 @@ pub enum Target {
     AgentRun(RunId),
     /// Pending terminal mailbox attention survives recipient process replacement.
     SessionInbox(crate::agent_execution::Lineage),
+    /// An exact recorded lifecycle edge; the storage group remains the automation.
+    Automation {
+        id: uuid::Uuid,
+        sequence: u64,
+    },
 }
 
 impl Target {
@@ -33,6 +38,7 @@ impl Target {
             Self::PullRequest(request) => request.storage_key(),
             Self::AgentRun(id) => format!("run:{id}"),
             Self::SessionInbox(lineage) => format!("inbox:{lineage}"),
+            Self::Automation { id, .. } => format!("automation:{id}"),
         }
     }
 }
@@ -68,6 +74,8 @@ pub enum Kind {
     ReviewRequested,
     Interrupted,
     MessageReceived,
+    AutomationPaused,
+    AutomationBlocked,
 }
 
 impl Kind {
@@ -80,6 +88,8 @@ impl Kind {
             Self::ReviewRequested => "Your review was requested",
             Self::Interrupted => "Agent outcome unknown",
             Self::MessageReceived => "Session messages waiting",
+            Self::AutomationPaused => "Automation pause recorded",
+            Self::AutomationBlocked => "Automation block recorded",
         }
     }
 }
@@ -196,6 +206,31 @@ impl Event {
             }
         } else if self.evidence.kind == Kind::ReviewRequested {
             return Err("Review alerts require a pull-request target".into());
+        }
+        if let Target::Automation { id, sequence } = &self.target {
+            if id.is_nil()
+                || *sequence == 0
+                || *sequence > i64::MAX as u64
+                || !matches!(
+                    self.evidence.kind,
+                    Kind::AutomationPaused | Kind::AutomationBlocked
+                )
+                || self.evidence.key != format!("automation:{id}:lifecycle:{sequence}")
+                || self.source_session.is_some()
+                || self.provider.is_some()
+                || self.directory.is_some()
+                || self.destination.is_some()
+            {
+                return Err(
+                    "Automation alerts require exact lifecycle identity without actor metadata"
+                        .into(),
+                );
+            }
+        } else if matches!(
+            self.evidence.kind,
+            Kind::AutomationPaused | Kind::AutomationBlocked
+        ) {
+            return Err("Automation attention requires an automation target".into());
         }
         Ok(())
     }
@@ -385,7 +420,11 @@ impl Preferences {
             && match kind {
                 Kind::Succeeded => self.success,
                 Kind::Failed | Kind::Cancelled => self.failure,
-                Kind::Waiting | Kind::Interrupted | Kind::MessageReceived => self.waiting,
+                Kind::Waiting
+                | Kind::Interrupted
+                | Kind::MessageReceived
+                | Kind::AutomationPaused
+                | Kind::AutomationBlocked => self.waiting,
                 Kind::ReviewRequested => self.review_requests,
             }
     }
@@ -393,6 +432,9 @@ impl Preferences {
 
 /// Private metadata-only context. Rich excerpts are a separate explicit opt-in.
 pub fn context(event: &Event) -> String {
+    if matches!(event.target, Target::Automation { .. }) {
+        return String::new(); // User-authored automation context belongs only in opt-in Content.
+    }
     if matches!(event.target, Target::SessionInbox(_)) {
         return "Open the terminal and run cagents inbox to read messages.".into();
     }
@@ -606,5 +648,184 @@ mod tests {
         assert!(!body.contains("private"));
         assert!(!body.contains('\n'));
         assert!(body.chars().count() < 140);
+    }
+
+    fn automation_event(id: uuid::Uuid, sequence: u64, kind: Kind) -> Event {
+        Event {
+            target: Target::Automation { id, sequence },
+            source_session: None,
+            provider: None,
+            directory: None,
+            destination: None,
+            evidence: Evidence {
+                key: format!("automation:{id}:lifecycle:{sequence}"),
+                kind,
+            },
+            content: Some(Content {
+                conversation: "PRIVATE_AUTOMATION".into(),
+                preview: "Project closed".into(),
+                request: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn automation_attention_requires_exact_lifecycle_identity_and_no_actor_authority() {
+        let id = uuid::Uuid::new_v4();
+        for kind in [Kind::AutomationPaused, Kind::AutomationBlocked] {
+            let valid = automation_event(id, 17, kind);
+            valid.validate().unwrap();
+            for sequence in [0, i64::MAX as u64 + 1, u64::MAX] {
+                assert!(automation_event(id, sequence, kind).validate().is_err());
+            }
+            assert!(
+                automation_event(uuid::Uuid::nil(), 17, kind)
+                    .validate()
+                    .is_err()
+            );
+            automation_event(id, i64::MAX as u64, kind)
+                .validate()
+                .unwrap();
+            for evidence in [
+                "automation:another:lifecycle:17".to_owned(),
+                format!("automation:{id}:lifecycle:18"),
+                format!("automation:{id}:lifecycle:017"),
+            ] {
+                let mut invalid = valid.clone();
+                invalid.evidence.key = evidence;
+                assert!(invalid.validate().is_err());
+            }
+            let mut invalids = Vec::new();
+            let mut event = valid.clone();
+            event.source_session = Some(TerminalId::new());
+            invalids.push(event);
+            let mut event = valid.clone();
+            event.provider = Some(Provider::Codex);
+            invalids.push(event);
+            let mut event = valid.clone();
+            event.directory = Some("/private/project".into());
+            invalids.push(event);
+            let mut event = valid.clone();
+            event.destination = Some(Destination {
+                application: Application::Cagents,
+                window: crate::instance::PRIMARY_WINDOW.into(),
+            });
+            invalids.push(event);
+            let mut event = valid.clone();
+            event.content.as_mut().unwrap().request = Some(RequestType::Question);
+            invalids.push(event);
+            let mut event = valid.clone();
+            event.content.as_mut().unwrap().conversation =
+                "x".repeat(presentation::TITLE_LIMIT + 1);
+            invalids.push(event);
+            let mut event = valid.clone();
+            event.content.as_mut().unwrap().preview = "private\ncontrol".into();
+            invalids.push(event);
+            let mut event = valid.clone();
+            event.target = Target::AgentRun(RunId::new());
+            invalids.push(event);
+            for invalid in invalids {
+                assert!(invalid.validate().is_err(), "{invalid:?}");
+            }
+            for other in [
+                Kind::Succeeded,
+                Kind::Failed,
+                Kind::Waiting,
+                Kind::ReviewRequested,
+                Kind::MessageReceived,
+            ] {
+                let mut invalid = valid.clone();
+                invalid.evidence.kind = other;
+                assert!(invalid.validate().is_err());
+            }
+            // Uses the ordinary shared codec: no internally-tagged JSON-only wire type.
+            assert_eq!(
+                postcard::from_bytes::<Event>(&postcard::to_stdvec(&valid).unwrap()).unwrap(),
+                valid
+            );
+            assert_eq!(
+                Event::from_journal(&serde_json::to_string(&valid).unwrap()).unwrap(),
+                valid
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_automation_sequence_keeps_its_own_focus_ack_and_waiting_preference() {
+        let id = uuid::Uuid::new_v4();
+        let old = automation_event(id, 17, Kind::AutomationPaused);
+        let current = automation_event(id, 18, Kind::AutomationBlocked);
+        assert_ne!(old.target, current.target);
+        assert_eq!(old.target.storage_key(), current.target.storage_key());
+        assert_eq!(
+            [old.target.clone(), current.target.clone()]
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            2
+        );
+        let make = |event| Notice {
+            id: uuid::Uuid::new_v4(),
+            event,
+            delivered: false,
+            acknowledged: false,
+            window: None,
+        };
+        let old_notice = make(old.clone());
+        let current_notice = make(current.clone());
+        let snapshot = Snapshot {
+            notices: vec![old_notice.clone(), current_notice.clone()],
+            diagnostic: None,
+        };
+        assert_eq!(
+            focused_notice_ids(&snapshot, Some(&old.target), None, true, false),
+            vec![old_notice.id]
+        );
+        assert_eq!(
+            focused_notice_ids(&snapshot, Some(&current.target), None, true, false),
+            vec![current_notice.id]
+        );
+        // GUI Update is not a wire type. Exercise the actual unsolicited
+        // activation carrier shared by the matched CLI, daemon and UI.
+        let activation = crate::terminal_ipc::ServerEnvelope {
+            version: crate::terminal_ipc::PROTOCOL_VERSION,
+            request_id: None,
+            proof: crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("automation-codec-fixture"),
+                boot_id: crate::model::BootId::new("automation-codec-fixture"),
+                host_incarnation: crate::model::HostIncarnation::new("automation-codec-fixture"),
+            },
+            message: crate::terminal_ipc::ServerMessage::NotificationActivated {
+                target: current.target.clone(),
+            },
+        };
+        assert!(activation.proof.is_complete());
+        assert_eq!(
+            postcard::from_bytes::<crate::terminal_ipc::ServerEnvelope>(
+                &postcard::to_stdvec(&activation).unwrap()
+            )
+            .unwrap(),
+            activation
+        );
+        assert_eq!(
+            postcard::from_bytes::<Snapshot>(&postcard::to_stdvec(&snapshot).unwrap()).unwrap(),
+            snapshot
+        );
+        let mut policy = Preferences {
+            success: false,
+            failure: false,
+            ..Default::default()
+        };
+        for kind in [Kind::AutomationPaused, Kind::AutomationBlocked] {
+            assert!(policy.allows(kind, false));
+            assert!(!policy.allows(kind, true));
+        }
+        policy.waiting = false;
+        assert!(!policy.allows(Kind::AutomationPaused, false));
+        assert!(!policy.allows(Kind::AutomationBlocked, false));
+        assert!(
+            context(&current).is_empty(),
+            "private context never falls outside Content"
+        );
     }
 }

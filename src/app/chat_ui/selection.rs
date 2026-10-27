@@ -11,10 +11,16 @@ use iced::{Event, Point, Rectangle, Size, Vector};
 use std::any::Any;
 use std::ops::Range;
 use std::sync::atomic::AtomicU64;
+use std::{cell::RefCell, rc::Rc};
 use unicode_segmentation::UnicodeSegmentation;
 
 mod boundary;
+mod document;
 pub(super) use boundary::{Kind, wrap};
+pub(super) use document::CatalogData;
+pub(super) use document::{
+    Bookmark, Builder as DocumentBuilder, Catalog, identity as logical_identity,
+};
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 static ACTIVE: AtomicU64 = AtomicU64::new(0);
@@ -25,20 +31,40 @@ pub(super) fn transcript<'a>(
     subagent: Option<&'a str>,
 ) -> Element<'a, Message> {
     Element::new(Selection {
+        catalog: None,
+        bookmark: None,
         content: content.into(),
         context: Some((target, subagent)),
         click_clock: iced::time::Instant::now,
     })
 }
 
+pub(super) fn transcript_virtualized<'a>(
+    content: impl Into<Element<'a, Message>>,
+    target: Target,
+    subagent: Option<&'a str>,
+    catalog: Arc<Catalog>,
+    bookmark: Rc<RefCell<Bookmark>>,
+) -> Element<'a, Message> {
+    Element::new(Selection {
+        content: content.into(),
+        context: Some((target, subagent)),
+        catalog: Some(catalog),
+        bookmark: Some(bookmark),
+        click_clock: iced::time::Instant::now,
+    })
+}
+
 struct Selection<'a> {
+    catalog: Option<Arc<Catalog>>,
+    bookmark: Option<Rc<RefCell<Bookmark>>>,
     content: Element<'a, Message>,
     context: Option<(Target, Option<&'a str>)>,
     click_clock: fn() -> iced::time::Instant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Endpoint {
+pub(super) struct Endpoint {
     identity: u64,
     byte: usize,
 }
@@ -51,7 +77,7 @@ struct State {
     end: Option<Endpoint>,
     dragging: bool,
     focused: bool,
-    link: Option<(Target, String)>,
+    link: Option<(Target, markdown::Uri)>,
     pointer: Option<Point>,
     origin: Option<Point>,
     moved: bool,
@@ -110,10 +136,16 @@ impl State {
         };
         if let Some((start, end)) = self.initial {
             let index = |point: Endpoint| {
-                read.blocks
-                    .iter()
-                    .position(|block| block.identity == point.identity)
-                    .map(|index| (index, point.byte))
+                if let Some(catalog) = &read.catalog {
+                    catalog
+                        .position(point.identity)
+                        .map(|index| (index, point.byte))
+                } else {
+                    read.blocks
+                        .iter()
+                        .position(|block| block.identity == point.identity)
+                        .map(|index| (index, point.byte))
+                }
             };
             if index(low) < index(start) {
                 self.anchor = Some(end);
@@ -197,6 +229,7 @@ struct Ranges {
     blocks: Vec<Range<usize>>,
     lo: (usize, usize),
     hi: (usize, usize),
+    logical: Option<(Endpoint, Endpoint)>,
 }
 impl std::ops::Deref for Ranges {
     type Target = [Range<usize>];
@@ -211,17 +244,107 @@ struct Block {
     bounds: Rectangle,
     visible: Option<Rectangle>,
     hit: usize,
-    link: Option<(Target, String)>,
+    link: Option<(Target, markdown::Uri)>,
     lists: Vec<ListMarker>,
     cell: Option<Cell>,
 }
 
+struct LogicalText {
+    identity: u64,
+    plain: Arc<str>,
+}
+
+// Native row positions and clip extents can round on opposite sides of one
+// f32 addition. Admit only the adjacent representable boundary, never a pixel
+// tolerance or a genuinely clipped/offscreen caret row.
+fn enclosed_caret_row(bounds: Rectangle, clip: Rectangle, translation: Vector) -> bool {
+    let bottom = bounds.y + bounds.height;
+    // Compare in the original native layout frame. At a large scroll offset,
+    // one representable layout step is larger than a screen-coordinate step.
+    let clip_top = clip.y + translation.y;
+    let clip_bottom = (clip.y + clip.height) + translation.y;
+    bounds.x.is_finite()
+        && translation.x.is_finite()
+        && translation.y.is_finite()
+        && bounds.width.is_finite()
+        && bounds.width >= 0.0
+        && bounds.y.is_finite()
+        && bounds.height.is_finite()
+        && bottom.is_finite()
+        && clip.x.is_finite()
+        && clip.y.is_finite()
+        && clip.height.is_finite()
+        && clip_top.is_finite()
+        && clip_bottom.is_finite()
+        && clip.width.is_finite()
+        && clip.width > 0.0
+        && bounds.height > 0.0
+        && clip.height > 0.0
+        && bottom > clip_top
+        && bounds.y < clip_bottom
+        && bounds.y >= clip_top.next_down()
+        && bottom <= clip_bottom.next_up()
+}
+
+// A native scrollable rounds its rendered translation to a whole pixel.
+// The final rendered bucket owns its terminal caret even if that rounding
+// leaves a fraction of the source row below the viewport. This is not an
+// assertion about the opaque unrounded scroll offset.
+#[derive(Clone, Copy)]
+struct RenderedEnd {
+    viewport: Rectangle,
+    content: Rectangle,
+    offset: Vector,
+}
+impl RenderedEnd {
+    fn contains_caret(self, row: Rectangle, clip: Rectangle, translation: Vector) -> bool {
+        let travel = (self.content.height - self.viewport.height).max(0.0);
+        let content_bottom = self.content.y + self.content.height;
+        let row_bottom = row.y + row.height;
+        let clip_top = clip.y + translation.y;
+        let clip_bottom = (clip.y + clip.height) + translation.y;
+        // The viewport is before this scrollable's own translation. Bring its
+        // end into the same original layout frame as the current content row.
+        let viewport_bottom = (self.viewport.y + self.viewport.height) + self.offset.y;
+        travel.is_finite()
+            && travel > 0.0
+            && self.offset.x.is_finite()
+            && self.offset.y.is_finite()
+            && self.offset.y > 0.0
+            && self.offset.y == travel.round()
+            && translation.x.is_finite()
+            && translation.y.is_finite()
+            && enclosed_caret_row(self.viewport, self.viewport, Vector::ZERO)
+            && enclosed_caret_row(row, self.content, Vector::ZERO)
+            && enclosed_caret_row(clip, clip, Vector::ZERO)
+            && clip_top.is_finite()
+            && clip_bottom.is_finite()
+            && viewport_bottom.is_finite()
+            && row_bottom >= content_bottom.next_down()
+            && row_bottom <= content_bottom.next_up()
+            && row.y >= clip_top.next_down()
+            && row_bottom > clip_top
+            && row.y < clip_bottom
+            // An ancestor must preserve this scrollable's native end edge;
+            // an outer viewport hiding that edge cannot grant an endpoint.
+            && viewport_bottom <= clip_bottom.next_up()
+    }
+}
+
 struct Read {
+    catalog: Option<Arc<Catalog>>,
     blocks: Vec<Block>,
     pointer: Option<Point>,
+    // Only an active drag supplies raw boundary intent. Ordinary hit testing
+    // and endpoint candidate choice keep their clipped pointer.
+    drag_pointer: Option<Point>,
     translation: Vector,
-    pending: Option<(Vector, Rectangle)>,
+    pending: Option<(Vector, Rectangle, Rectangle)>,
     clip: Option<Rectangle>,
+    // The host viewport constrains only the terminal exception, preserving
+    // ordinary clipped hit testing and endpoint candidate behavior.
+    host_clip: Option<Rectangle>,
+    rendered_end: Option<RenderedEnd>,
     frames: Vec<Frame>,
     tables: HashMap<u64, Table>,
     table_order: Vec<u64>,
@@ -230,15 +353,51 @@ struct Read {
 impl Read {
     fn new(pointer: Option<Point>) -> Self {
         Self {
+            catalog: None,
             blocks: Vec::new(),
             pointer,
+            drag_pointer: None,
             translation: Vector::ZERO,
             pending: None,
             clip: None,
+            host_clip: None,
+            rendered_end: None,
             frames: Vec::new(),
             tables: HashMap::new(),
             table_order: Vec::new(),
         }
+    }
+
+    fn with_catalog(pointer: Option<Point>, catalog: Option<Arc<Catalog>>) -> Self {
+        Self {
+            catalog,
+            ..Self::new(pointer)
+        }
+    }
+    fn terminal_caret_end(&self, prose: &Prose, bounds: Rectangle) -> Option<usize> {
+        let logical = prose.logical.as_ref().filter(|_| prose.logical_active)?;
+        let pointer = self.drag_pointer?;
+        let pointer_y = pointer.y + self.translation.y;
+        let clip = match self.host_clip {
+            Some(host) => self.clip?.intersection(&host)?,
+            None => self.clip?,
+        };
+        if !prose.empty_line_caret()
+            || !matches!(prose.plain.as_ref(), "\n" | "\r\n")
+            || !pointer.x.is_finite()
+            || !pointer_y.is_finite()
+            || pointer_y < bounds.y + bounds.height
+            || !(enclosed_caret_row(bounds, clip, self.translation)
+                || self
+                    .rendered_end
+                    .is_some_and(|end| end.contains_caret(bounds, clip, self.translation)))
+        {
+            return None;
+        }
+        let source = self.catalog.as_ref()?.text(logical.identity)?;
+        let end = logical.start.checked_add(prose.plain.len())?;
+        (end == source.len() && source.get(logical.start..end) == Some(prose.plain.as_ref()))
+            .then_some(prose.plain.len())
     }
 
     fn list_markers(&self) -> Vec<ListMarker> {
@@ -279,6 +438,19 @@ impl Read {
     }
 
     fn ranges(&self, anchor: Endpoint, end: Endpoint) -> Option<Ranges> {
+        if let Some(catalog) = &self.catalog {
+            catalog.bounds(anchor, end)?;
+            return Some(Ranges {
+                lo: (0, 0),
+                hi: (self.blocks.len().saturating_sub(1), 0),
+                blocks: self
+                    .blocks
+                    .iter()
+                    .map(|block| catalog.range(anchor, end, block.identity))
+                    .collect(),
+                logical: Some((anchor, end)),
+            });
+        }
         let locate = |point: Endpoint| {
             self.blocks
                 .iter()
@@ -297,6 +469,7 @@ impl Read {
         Some(Ranges {
             lo,
             hi,
+            logical: None,
             blocks: self
                 .blocks
                 .iter()
@@ -391,6 +564,12 @@ impl Read {
     }
 
     fn copy(&self, ranges: &Ranges) -> String {
+        if let Some(catalog) = &self.catalog {
+            return ranges
+                .logical
+                .and_then(|(anchor, end)| catalog.copy(anchor, end))
+                .unwrap_or_default();
+        }
         let values = self.table_values(ranges);
         let mut result = String::new();
         let mut emitted = false;
@@ -521,7 +700,15 @@ impl Operation for Read {
     fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
         let previous = self.translation;
         let clip = self.clip;
-        if let Some((translation, bounds)) = self.pending.take() {
+        let rendered_end = self.rendered_end;
+        if let Some((translation, bounds, content)) = self.pending.take() {
+            // Replace even when the nested scrollable is not at its end, so
+            // an enclosing scrollable can never authorize a nested row.
+            self.rendered_end = Some(RenderedEnd {
+                viewport: bounds,
+                content,
+                offset: translation,
+            });
             let bounds = Rectangle {
                 x: bounds.x - self.translation.x,
                 y: bounds.y - self.translation.y,
@@ -535,20 +722,25 @@ impl Operation for Read {
         operate(self);
         self.translation = previous;
         self.clip = clip;
+        self.rendered_end = rendered_end;
     }
 
     fn scrollable(
         &mut self,
         _: Option<&Id>,
         bounds: Rectangle,
-        _: Rectangle,
+        content: Rectangle,
         translation: Vector,
         _: &mut dyn operation::Scrollable,
     ) {
-        self.pending = Some((translation, bounds));
+        self.pending = Some((translation, bounds, content));
     }
 
     fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn Any) {
+        if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
+            policy.visit = false;
+            return;
+        }
         if let Some(enter) = state.downcast_ref::<boundary::Enter>() {
             if let Kind::Table { columns, rows } = &enter.kind {
                 self.table_order.push(enter.identity);
@@ -594,19 +786,49 @@ impl Operation for Read {
             }
             return;
         }
-        let Some(prose) = state.downcast_mut::<Prose>() else {
-            return;
-        };
-        prose.managed = true;
+        let native_bounds = bounds;
         let bounds = Rectangle {
             x: bounds.x - self.translation.x,
             y: bounds.y - self.translation.y,
             ..bounds
         };
-        let position = self
-            .clip
-            .map_or(self.pointer, |clip| clipped_pointer(self.pointer, clip))
-            .map(|point| point - Vector::new(bounds.x, bounds.y));
+        let (identity, plain, hit, link, mounted, empty_caret) =
+            if let Some(prose) = state.downcast_mut::<Prose>() {
+                prose.managed = true;
+                prose.logical_active = self.catalog.is_some() && prose.logical.is_some();
+                let logical = prose.logical.as_ref().filter(|_| prose.logical_active);
+                let position = self
+                    .clip
+                    .map_or(self.pointer, |clip| clipped_pointer(self.pointer, clip))
+                    .map(|point| point - Vector::new(bounds.x, bounds.y));
+                (
+                    logical.map_or(prose.identity, |logical| logical.identity),
+                    logical
+                        .and_then(|logical| self.catalog.as_ref()?.text(logical.identity))
+                        .unwrap_or_else(|| prose.plain.clone()),
+                    position.map_or(0, |point| {
+                        self.terminal_caret_end(prose, native_bounds)
+                            .unwrap_or_else(|| prose.hit(point))
+                            + logical.map_or(0, |logical| logical.start)
+                    }),
+                    position
+                        .filter(|_| self.pointer.is_some_and(|point| bounds.contains(point)))
+                        .and_then(|point| prose.target.zip(prose.link(point))),
+                    true,
+                    prose.empty_line_caret(),
+                )
+            } else if let Some(logical) = state.downcast_ref::<LogicalText>() {
+                (
+                    logical.identity,
+                    logical.plain.clone(),
+                    0,
+                    None,
+                    false,
+                    false,
+                )
+            } else {
+                return;
+            };
         let lists = self.list_markers();
         let mut table = None;
         let mut cell = None;
@@ -626,26 +848,45 @@ impl Operation for Read {
                 }
             }
         }
-        if !prose.plain.is_empty() {
+        if !plain.is_empty() {
             for frame in &self.frames {
                 if let Some(table) = self.tables.get_mut(&frame.identity) {
                     table.has_text = true;
                 }
             }
         }
+        // An empty physical line has zero natural horizontal extent, but
+        // its logical caret can be selected throughout the clipped row band.
+        // This changes hit geometry only, never native scroll content width.
+        let hit_bounds = if empty_caret {
+            self.clip.map_or(
+                Rectangle {
+                    width: 1.0,
+                    ..bounds
+                },
+                |clip| Rectangle {
+                    x: clip.x,
+                    width: clip.width,
+                    ..bounds
+                },
+            )
+        } else {
+            bounds
+        };
         self.blocks.push(Block {
-            identity: prose.identity,
+            identity,
             lists,
             cell,
-            plain: prose.plain.clone(),
+            plain,
             bounds,
-            visible: self
-                .clip
-                .map_or(Some(bounds), |clip| bounds.intersection(&clip)),
-            hit: position.map_or(0, |point| prose.hit(point)),
-            link: position
-                .filter(|_| self.pointer.is_some_and(|point| bounds.contains(point)))
-                .and_then(|point| prose.target.zip(prose.link(point))),
+            visible: mounted
+                .then(|| {
+                    self.clip
+                        .map_or(Some(hit_bounds), |clip| hit_bounds.intersection(&clip))
+                })
+                .flatten(),
+            hit,
+            link,
         });
     }
 }
@@ -664,6 +905,11 @@ struct DragScroll {
     bottom_id: Option<Id>,
 }
 impl Operation for DragScroll {
+    fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn Any) {
+        if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
+            policy.visit = false;
+        }
+    }
     fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
         if !self.visited {
             visit(self);
@@ -727,6 +973,10 @@ impl Operation for Apply<'_> {
         operate(self);
     }
     fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn Any) {
+        if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
+            policy.visit = false;
+            return;
+        }
         if let Some(invalidation) = state.downcast_mut::<retained::LayoutInvalidation>() {
             match invalidation {
                 retained::LayoutInvalidation::Enter => self.exchanges.push(self.changed),
@@ -742,7 +992,17 @@ impl Operation for Apply<'_> {
         let Some(prose) = state.downcast_mut::<Prose>() else {
             return;
         };
-        let range = self.ranges.get(self.index).cloned().unwrap_or(0..0);
+        let mut range = self.ranges.get(self.index).cloned().unwrap_or(0..0);
+        if let Some(logical) = prose.logical.as_ref().filter(|_| prose.logical_active) {
+            range = range
+                .start
+                .saturating_sub(logical.start)
+                .min(prose.plain.len())
+                ..range
+                    .end
+                    .saturating_sub(logical.start)
+                    .min(prose.plain.len());
+        }
         self.index += 1;
         if (prose.anchor, prose.end) != (range.start, range.end) {
             prose.anchor = range.start;
@@ -771,7 +1031,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
         tree::Tag::of::<State>()
     }
     fn state(&self) -> tree::State {
+        let bookmark = self
+            .bookmark
+            .as_ref()
+            .map(|bookmark| *bookmark.borrow())
+            .unwrap_or_default();
         tree::State::new(State {
+            anchor: bookmark.anchor,
+            end: bookmark.end,
             context: self
                 .context
                 .map(|(target, subagent)| (target, subagent.map(str::to_owned))),
@@ -794,6 +1061,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                     .context
                     .map(|(target, subagent)| (target, subagent.map(str::to_owned))),
                 reset: true,
+                anchor: self
+                    .bookmark
+                    .as_ref()
+                    .and_then(|bookmark| bookmark.borrow().anchor),
+                end: self
+                    .bookmark
+                    .as_ref()
+                    .and_then(|bookmark| bookmark.borrow().end),
                 ..State::default()
             };
         }
@@ -816,8 +1091,28 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
             .as_widget_mut()
             .layout(&mut tree.children[0], renderer, limits);
         let state = tree.state.downcast_mut::<State>();
+        if let (Some(catalog), Some(bookmark)) = (&self.catalog, &self.bookmark) {
+            let saved = *bookmark.borrow();
+            let changed = saved
+                .anchor
+                .zip(saved.anchor_prefix)
+                .is_some_and(|(point, hash)| {
+                    catalog.fingerprint(point).is_some_and(|now| now != hash)
+                })
+                || saved
+                    .end
+                    .zip(saved.end_prefix)
+                    .is_some_and(|(point, hash)| {
+                        catalog.fingerprint(point).is_some_and(|now| now != hash)
+                    });
+            if changed {
+                state.anchor = None;
+                state.end = None;
+                *bookmark.borrow_mut() = Bookmark::default();
+            }
+        }
         if state.anchor.is_some() || std::mem::take(&mut state.reset) {
-            let mut read = Read::new(None);
+            let mut read = Read::with_catalog(None, self.catalog.clone());
             self.content.as_widget_mut().operate(
                 &mut tree.children[0],
                 Layout::new(&node),
@@ -828,7 +1123,12 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                 .anchor
                 .zip(state.end)
                 .and_then(|(anchor, end)| read.ranges(anchor, end));
-            if ranges.is_none() {
+            if ranges.is_none()
+                && !self
+                    .catalog
+                    .as_ref()
+                    .is_some_and(|catalog| catalog.is_empty())
+            {
                 state.anchor = None;
                 state.end = None;
                 state.dragging = false;
@@ -959,11 +1259,18 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
             }
         }
         if press || (state.dragging && (motion || release)) || command.is_some() {
-            let mut read = Read::new(if state.dragging && !press {
-                clipped_pointer(cursor.position(), visible)
-            } else {
-                cursor.position()
-            });
+            let mut read = Read::with_catalog(
+                if state.dragging && !press {
+                    clipped_pointer(cursor.position(), visible)
+                } else {
+                    cursor.position()
+                },
+                self.catalog.clone(),
+            );
+            read.host_clip = Some(visible);
+            read.drag_pointer = (state.dragging && !press)
+                .then(|| cursor.position())
+                .flatten();
             self.content.as_widget_mut().operate(
                 &mut tree.children[0],
                 layout,
@@ -1041,29 +1348,50 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                         && state.anchor == state.end
                         && let Some((target, link)) = state.link.take()
                         && read.endpoint(true).is_some_and(|block| {
-                            block.link.as_ref() == Some(&(target, link.clone()))
+                            // A worker reparse may republish the same URI in
+                            // another allocation during this gesture. Compare
+                            // destination bytes only at explicit activation.
+                            block
+                                .link
+                                .as_ref()
+                                .is_some_and(|(current_target, current)| {
+                                    *current_target == target
+                                        && (Arc::ptr_eq(current, &link)
+                                            || current.as_ref() == link.as_ref())
+                                })
                         })
                     {
-                        shell.publish(action(Action::OpenDocument(target, link)));
+                        shell.publish(action(Action::OpenSharedDocument(target, link)));
                     }
                 }
                 captured = true;
             } else if command.is_some_and(|key| key.eq_ignore_ascii_case("a")) {
-                state.anchor = read.blocks.first().map(|block| Endpoint {
-                    identity: block.identity,
-                    byte: 0,
-                });
-                state.end = read.blocks.last().map(|block| Endpoint {
-                    identity: block.identity,
-                    byte: block.plain.len(),
-                });
+                if let Some(catalog) = &self.catalog {
+                    let endpoints = catalog.endpoints();
+                    state.anchor = endpoints.map(|(anchor, _)| anchor);
+                    state.end = endpoints.map(|(_, end)| end);
+                } else {
+                    state.anchor = read.blocks.first().map(|block| Endpoint {
+                        identity: block.identity,
+                        byte: 0,
+                    });
+                    state.end = read.blocks.last().map(|block| Endpoint {
+                        identity: block.identity,
+                        byte: block.plain.len(),
+                    });
+                }
                 captured = state.anchor.is_some();
             }
             let ranges = state
                 .anchor
                 .zip(state.end)
                 .and_then(|(anchor, end)| read.ranges(anchor, end));
-            if ranges.is_none() {
+            if ranges.is_none()
+                && !self
+                    .catalog
+                    .as_ref()
+                    .is_some_and(|catalog| catalog.is_empty())
+            {
                 state.anchor = None;
                 state.end = None;
                 state.dragging = false;
@@ -1112,10 +1440,12 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
         {
             // Scrollables update their native offsets above. Hit-test again
             // in that coordinate space even when the pointer stayed still.
-            let mut read = Read::new(clipped_pointer(
-                tree.state.downcast_ref::<State>().pointer,
-                visible,
-            ));
+            let mut read = Read::with_catalog(
+                clipped_pointer(tree.state.downcast_ref::<State>().pointer, visible),
+                self.catalog.clone(),
+            );
+            read.host_clip = Some(visible);
+            read.drag_pointer = tree.state.downcast_ref::<State>().pointer;
             self.content.as_widget_mut().operate(
                 &mut tree.children[0],
                 layout,
@@ -1147,6 +1477,19 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                 shell.invalidate_layout();
                 shell.request_redraw();
             }
+        }
+        if let Some(bookmark) = &self.bookmark {
+            let state = tree.state.downcast_ref::<State>();
+            *bookmark.borrow_mut() = Bookmark {
+                anchor: state.anchor,
+                end: state.end,
+                anchor_prefix: state
+                    .anchor
+                    .and_then(|point| self.catalog.as_ref()?.fingerprint(point)),
+                end_prefix: state
+                    .end
+                    .and_then(|point| self.catalog.as_ref()?.fingerprint(point)),
+            };
         }
         if captured {
             shell.capture_event();
@@ -1219,6 +1562,699 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_caret_enclosure_allows_one_float_step_and_refuses_clipped_or_invalid_rows() {
+        let clip = Rectangle::new(Point::ORIGIN, Size::new(600.0, 10920.0));
+        let actual = Rectangle::new(
+            Point::new(0.0, 10901.80078125),
+            Size::new(0.0, 18.19999885559082),
+        );
+        assert_eq!(
+            (actual.y + actual.height).to_bits(),
+            clip.height.to_bits() + 1
+        );
+        assert!(enclosed_caret_row(actual, clip, Vector::ZERO));
+        assert!(!enclosed_caret_row(
+            actual,
+            Rectangle {
+                height: clip.height.next_down(),
+                ..clip
+            },
+            Vector::ZERO
+        ));
+        let clip = Rectangle::new(Point::new(0.0, 10.0), Size::new(100.0, 5.0));
+        let row = |top| Rectangle::new(Point::new(0.0, top), Size::new(0.0, 15.0 - top));
+        assert!(enclosed_caret_row(
+            row(clip.y.next_down()),
+            clip,
+            Vector::ZERO
+        ));
+        assert!(!enclosed_caret_row(
+            row(clip.y.next_down().next_down()),
+            clip,
+            Vector::ZERO
+        ));
+        assert!(!enclosed_caret_row(row(9.0), clip, Vector::ZERO));
+        assert!(!enclosed_caret_row(
+            Rectangle {
+                y: 15.0,
+                height: 1.0,
+                ..row(10.0)
+            },
+            clip,
+            Vector::ZERO
+        ));
+        assert!(!enclosed_caret_row(
+            Rectangle {
+                y: 8.0,
+                height: 1.0,
+                ..row(10.0)
+            },
+            clip,
+            Vector::ZERO
+        ));
+        for bad in [0.0, -1.0, f32::INFINITY, f32::NAN] {
+            assert!(!enclosed_caret_row(
+                Rectangle {
+                    height: bad,
+                    ..row(10.0)
+                },
+                clip,
+                Vector::ZERO
+            ));
+            assert!(!enclosed_caret_row(
+                row(10.0),
+                Rectangle {
+                    height: bad,
+                    ..clip
+                },
+                Vector::ZERO
+            ));
+            assert!(!enclosed_caret_row(
+                row(10.0),
+                Rectangle { width: bad, ..clip },
+                Vector::ZERO
+            ));
+        }
+        for bad in [f32::NEG_INFINITY, f32::INFINITY, f32::NAN] {
+            assert!(!enclosed_caret_row(row(10.0), clip, Vector::new(0.0, bad)));
+            assert!(!enclosed_caret_row(row(10.0), clip, Vector::new(bad, 0.0)));
+            assert!(!enclosed_caret_row(
+                Rectangle {
+                    y: bad,
+                    ..row(10.0)
+                },
+                clip,
+                Vector::ZERO
+            ));
+            assert!(!enclosed_caret_row(
+                row(10.0),
+                Rectangle { y: bad, ..clip },
+                Vector::ZERO
+            ));
+        }
+        // Exact failing CRLF native geometry: the actual current end offset
+        // renders at12575 although max travel is12575.189. Strict enclosure
+        // must remain false; only the current rendered-end witness may own it.
+        let native = RenderedEnd {
+            viewport: Rectangle::with_size(Size::new(400.0, 400.0)),
+            content: Rectangle::with_size(Size::new(400.0, 12975.189)),
+            offset: Vector::new(0.0, 12575.0),
+        };
+        let row = Rectangle::new(Point::new(0.0, 12955.59), Size::new(0.0, 19.6));
+        let clip = native.viewport;
+        assert!(!enclosed_caret_row(row, clip, native.offset));
+        assert!(native.contains_caret(row, clip, native.offset));
+        let tiny = RenderedEnd {
+            viewport: Rectangle {
+                height: 400.0_f32.next_down().next_down(),
+                ..native.viewport
+            },
+            content: native.viewport,
+            offset: Vector::ZERO,
+        };
+        let tiny_row = Rectangle::new(Point::new(0.0, 380.0), Size::new(0.0, 20.0));
+        assert!(tiny.content.height - tiny.viewport.height > 0.0);
+        assert_eq!((tiny.content.height - tiny.viewport.height).round(), 0.0);
+        assert!(!enclosed_caret_row(tiny_row, tiny.viewport, Vector::ZERO));
+        assert!(!tiny.contains_caret(tiny_row, tiny.viewport, Vector::ZERO));
+        for trim in [1.0, 2.0, 40.0] {
+            let offset = Vector::new(0.0, native.offset.y - trim);
+            assert!(!RenderedEnd { offset, ..native }.contains_caret(row, clip, offset));
+        }
+        assert!(!native.contains_caret(
+            row,
+            Rectangle {
+                height: 399.0,
+                ..clip
+            },
+            native.offset,
+        ));
+        assert!(!native.contains_caret(
+            Rectangle {
+                y: row.y - 1.0,
+                ..row
+            },
+            clip,
+            native.offset,
+        ));
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for offset in [Vector::new(bad, native.offset.y), Vector::new(0.0, bad)] {
+                assert!(!RenderedEnd { offset, ..native }.contains_caret(row, clip, offset));
+            }
+        }
+    }
+
+    #[test]
+    fn native_terminal_newline_drag_keeps_source_end_and_rejects_hidden_or_stale_rows() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let identity = logical_identity("terminal-pointer", &[0]);
+        let prefix = "head\n";
+        #[derive(Default)]
+        struct Rows(Vec<(Rectangle, usize, String, bool)>);
+        impl Operation for Rows {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn Any) {
+                if let Some(prose) = state.downcast_ref::<Prose>() {
+                    self.0.push((
+                        bounds,
+                        prose.logical.as_ref().unwrap().start,
+                        prose.plain.to_string(),
+                        prose.empty_line_caret(),
+                    ));
+                }
+            }
+        }
+        for ending in ["\n", "\r\n"] {
+            let source = format!("{prefix}{ending}");
+            let make = |inner_height: f32, outer_height: f32, current_source: &str| {
+                let leaf = |text: &str, start| {
+                    selectable_prose::logical_text(
+                        vec![iced::widget::text::Span::new(text.to_owned())].into(),
+                        14.0.into(),
+                        iced::Font::MONOSPACE,
+                        target,
+                        None,
+                        selectable_prose::Logical { identity, start },
+                    )
+                };
+                let inner = widget::scrollable(widget::column::with_children(vec![
+                    leaf(prefix, 0),
+                    leaf(ending, prefix.len()),
+                ]))
+                .height(Length::Fixed(inner_height))
+                .width(Length::Fill);
+                let content = scroll::transcript(inner, target, None, vec![], true, vec![]);
+                let mut catalog = Catalog::builder();
+                catalog.plain("terminal-pointer", &[0], Arc::from(current_source));
+                let element = transcript_virtualized(
+                    content,
+                    target,
+                    None,
+                    catalog.finish(),
+                    Default::default(),
+                );
+                (
+                    element,
+                    layout::Limits::new(Size::ZERO, Size::new(300.0, outer_height)),
+                )
+            };
+            // Derive the real native row boundary from its actual laid-out
+            // Tree, then use native scrollable heights to expose or clip it.
+            let (mut calibration, limits) = make(100.0, 400.0, &source);
+            let mut calibration_tree = Tree::new(&calibration);
+            let calibration_node =
+                calibration
+                    .as_widget_mut()
+                    .layout(&mut calibration_tree, &renderer, &limits);
+            let mut rows = Rows::default();
+            calibration.as_widget_mut().operate(
+                &mut calibration_tree,
+                Layout::new(&calibration_node),
+                &renderer,
+                &mut rows,
+            );
+            assert_eq!(rows.0.len(), 2);
+            let first = rows.0[0].0;
+            let last = rows.0[1].0;
+            assert_eq!(
+                (rows.0[1].1, rows.0[1].2.as_str(), rows.0[1].3),
+                (prefix.len(), ending, true)
+            );
+            let bottom = last.y + last.height;
+            let wrong_tail = format!("{prefix}{}", "X".repeat(ending.len()));
+            let wrong_length = format!("{source}x");
+            for (case, inner_height, outer_height, current_source, reaches_end) in [
+                ("full inner row", bottom, 400.0, source.as_str(), true),
+                (
+                    "outer viewport boundary",
+                    bottom,
+                    bottom,
+                    source.as_str(),
+                    true,
+                ),
+                (
+                    "one float step",
+                    bottom.next_down(),
+                    400.0,
+                    source.as_str(),
+                    true,
+                ),
+                (
+                    "two float steps clipped",
+                    bottom.next_down().next_down(),
+                    400.0,
+                    source.as_str(),
+                    false,
+                ),
+                (
+                    "partially clipped",
+                    bottom - last.height / 2.0,
+                    400.0,
+                    source.as_str(),
+                    false,
+                ),
+                ("fully hidden", last.y - 1.0, 400.0, source.as_str(), false),
+                (
+                    "changed terminal bytes",
+                    bottom,
+                    400.0,
+                    wrong_tail.as_str(),
+                    false,
+                ),
+                (
+                    "changed source length",
+                    bottom,
+                    400.0,
+                    wrong_length.as_str(),
+                    false,
+                ),
+            ] {
+                let (mut element, limits) = make(inner_height, outer_height, current_source);
+                let mut tree = Tree::new(&element);
+                let mut node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let viewport = Rectangle::with_size(Size::new(300.0, outer_height));
+                let start = Point::new(first.x, first.y + 3.0);
+                let end = Point::new(last.x + 5.0, bottom + 1.0);
+                let mut clipboard = ClipboardText::default();
+                for (event, pointer) in [
+                    (
+                        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                        start,
+                    ),
+                    (
+                        Event::Mouse(mouse::Event::CursorMoved { position: end }),
+                        end,
+                    ),
+                    (
+                        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                        end,
+                    ),
+                    (command("c"), end),
+                ] {
+                    let mut messages = Vec::new();
+                    let mut shell = Shell::new(&mut messages);
+                    element.as_widget_mut().update(
+                        &mut tree,
+                        &event,
+                        Layout::new(&node),
+                        mouse::Cursor::Available(pointer),
+                        &renderer,
+                        &mut clipboard,
+                        &mut shell,
+                        &viewport,
+                    );
+                    assert!(
+                        shell.is_event_captured(),
+                        "actual pointer/copy ownership: {case}"
+                    );
+                    if shell.is_layout_invalid() {
+                        node = element
+                            .as_widget_mut()
+                            .layout(&mut tree, &renderer, &limits);
+                    }
+                }
+                let end = tree
+                    .state
+                    .downcast_ref::<State>()
+                    .end
+                    .expect("actual selected endpoint");
+                if reaches_end {
+                    assert_eq!(
+                        end.byte,
+                        source.len(),
+                        "current visible terminal endpoint: {case}"
+                    );
+                    assert_eq!(
+                        clipboard.0, source,
+                        "LF/CRLF copied without normalization: {case}"
+                    );
+                } else {
+                    assert!(
+                        end.byte < current_source.len(),
+                        "clipped or stale source cannot claim terminal end: {case}"
+                    );
+                }
+            }
+            // A press INSIDE a blank row still begins before its newline;
+            // only a real drag past the fully visible boundary owns its end.
+            let (mut element, limits) = make(bottom, 400.0, &source);
+            let mut tree = Tree::new(&element);
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let point = Point::new(last.x + 5.0, last.y + last.height / 2.0);
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &renderer,
+                &mut ClipboardText::default(),
+                &mut Shell::new(&mut messages),
+                &Rectangle::with_size(Size::new(300.0, 400.0)),
+            );
+            assert_eq!(
+                tree.state.downcast_ref::<State>().anchor.unwrap().byte,
+                prefix.len()
+            );
+        }
+    }
+
+    #[test]
+    fn native_scrolled_terminal_drag_uses_layout_frame_and_preserves_outer_clip_intent() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let identity = logical_identity("scrolled-terminal", &[0]);
+        let inner_id = Id::new("terminal-pointer-inner");
+        struct ScrollEnd {
+            id: Id,
+            trim: f32,
+            travel: f32,
+        }
+        impl Operation for ScrollEnd {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&Id>,
+                viewport: Rectangle,
+                content: Rectangle,
+                _: Vector,
+                state: &mut dyn operation::Scrollable,
+            ) {
+                if id == Some(&self.id) {
+                    self.travel = (content.height - viewport.height).max(0.0);
+                    state.scroll_to(operation::scrollable::AbsoluteOffset {
+                        x: None,
+                        y: Some((self.travel - self.trim).max(0.0)),
+                    });
+                }
+            }
+        }
+        #[derive(Default)]
+        struct Rows {
+            translation: Vector,
+            pending: Option<Vector>,
+            max_translation: f32,
+            scrollables: Vec<(Rectangle, Rectangle, Vector)>,
+            rows: Vec<(Rectangle, Rectangle, usize, usize, bool)>,
+        }
+        impl Operation for Rows {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                let before = self.translation;
+                if let Some(offset) = self.pending.take() {
+                    self.translation += offset;
+                }
+                self.max_translation = self.max_translation.max(self.translation.y);
+                visit(self);
+                self.translation = before;
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&Id>,
+                viewport: Rectangle,
+                content: Rectangle,
+                translation: Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                self.scrollables.push((viewport, content, translation));
+                self.pending = Some(translation);
+            }
+            fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn Any) {
+                if let Some(prose) = state.downcast_ref::<Prose>() {
+                    let logical = prose.logical.as_ref().unwrap();
+                    let screen = Rectangle {
+                        x: bounds.x - self.translation.x,
+                        y: bounds.y - self.translation.y,
+                        ..bounds
+                    };
+                    self.rows.push((
+                        bounds,
+                        screen,
+                        logical.start,
+                        prose.plain.len(),
+                        prose.empty_line_caret(),
+                    ));
+                }
+            }
+        }
+        for ending in ["\n", "\r\n"] {
+            // Real physical source rows include ordinary and Bidi text. Their
+            // native hit/selection path remains the ordinary clipped path.
+            let source: Arc<str> = format!("αβ item שלום line{ending}{ending}")
+                .repeat(300)
+                .into();
+            for (case, trim, host_height, reaches_end) in [
+                ("visible", 0.0, 400.0, true),
+                ("preceding rendered bucket", 1.0, 400.0, false),
+                ("partial terminal", 2.0, 400.0, false),
+                ("hidden terminal", 40.0, 400.0, false),
+                ("ancestor clips native end", 0.0, 399.0, false),
+                ("changed catalog tail", 0.0, 400.0, false),
+                ("nonterminal catalog row", 0.0, 400.0, false),
+            ] {
+                let code = prose::code_text(
+                    source.clone(),
+                    Arc::from([]),
+                    14.0.into(),
+                    iced::Font::MONOSPACE,
+                    target,
+                    None,
+                    Some(selectable_prose::Logical { identity, start: 0 }),
+                    None,
+                    None,
+                );
+                let inner = widget::scrollable(code)
+                    .id(inner_id.clone())
+                    .height(Length::Fixed(400.0))
+                    .width(Length::Fill);
+                let content = scroll::transcript(inner, target, None, vec![], true, vec![]);
+                let current_source: Arc<str> = match case {
+                    "changed catalog tail" => format!(
+                        "{}{}",
+                        &source[..source.len() - ending.len()],
+                        "x".repeat(ending.len())
+                    )
+                    .into(),
+                    "nonterminal catalog row" => format!("{source}new").into(),
+                    _ => source.clone(),
+                };
+                let mut catalog = Catalog::builder();
+                catalog.plain("scrolled-terminal", &[0], current_source.clone());
+                let catalog = catalog.finish();
+                let mut element = transcript_virtualized(
+                    content,
+                    target,
+                    None,
+                    catalog.clone(),
+                    Default::default(),
+                );
+                let mut tree = Tree::new(&element);
+                let viewport = Rectangle::with_size(Size::new(400.0, 400.0));
+                let host_viewport = Rectangle {
+                    height: host_height,
+                    ..viewport
+                };
+                let limits = layout::Limits::new(Size::ZERO, viewport.size());
+                let mut node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let mut scroll = ScrollEnd {
+                    id: inner_id.clone(),
+                    trim,
+                    travel: 0.0,
+                };
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut scroll,
+                );
+                assert!(
+                    scroll.travel > 10_000.0,
+                    "real long-source native scroll travel"
+                );
+                node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let mut converged = false;
+                for _ in 0..8 {
+                    let mut observed = virtualized::UpdateViewport::default();
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut observed,
+                    );
+                    if !observed.changed {
+                        converged = true;
+                        break;
+                    }
+                    node = element
+                        .as_widget_mut()
+                        .layout(&mut tree, &renderer, &limits);
+                }
+                assert!(converged, "actual scrolled virtual windows converge");
+                let mut rows = Rows::default();
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut rows,
+                );
+                assert!(rows.max_translation > 10_000.0);
+                let terminal = rows
+                    .rows
+                    .iter()
+                    .find(|row| row.2 + row.3 == source.len())
+                    .unwrap();
+                assert!(terminal.4);
+                assert!(
+                    terminal.0.y > 10_000.0,
+                    "guard must use native layout precision"
+                );
+                let (native_viewport, content, offset) = rows
+                    .scrollables
+                    .iter()
+                    .find(|(_, content, _)| content.height > 10_000.0)
+                    .unwrap();
+                if reaches_end {
+                    // Native translation is a rendered pixel bucket, not the
+                    // hidden unrounded offset. Keep the actual fixed400
+                    // viewport and prove current native END without calibration.
+                    assert_eq!(offset.y, (content.height - native_viewport.height).round());
+                    let row_bottom = terminal.0.y + terminal.0.height;
+                    let content_bottom = content.y + content.height;
+                    assert!(
+                        row_bottom >= content_bottom.next_down()
+                            && row_bottom <= content_bottom.next_up()
+                    );
+                }
+                let first = rows
+                    .rows
+                    .iter()
+                    .find(|row| {
+                        !row.4 && row.1.y >= 0.0 && row.1.y + row.1.height <= viewport.height
+                    })
+                    .unwrap();
+                let first_byte = first.2;
+                let start = Point::new(first.1.x, first.1.y + 3.0);
+                let end = Point::new(terminal.1.x + 5.0, terminal.1.y + terminal.1.height + 1.0);
+                assert!(
+                    end.y > viewport.height,
+                    "raw drag intent really crosses outer clip"
+                );
+                // Real nested operation traversal restores its witness rather
+                // than leaking the inner end to a later sibling or caller.
+                let mut inactive = Read::with_catalog(Some(end), Some(catalog.clone()));
+                inactive.host_clip = Some(host_viewport);
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut inactive,
+                );
+                assert!(inactive.rendered_end.is_none());
+                assert!(inactive.clip.is_none());
+                assert_eq!(inactive.translation, Vector::ZERO);
+                assert!(
+                    inactive.blocks.last().unwrap().hit < source.len(),
+                    "without active drag native END cannot claim terminal bytes"
+                );
+                let mut clipboard = ClipboardText::default();
+                for (event, pointer) in [
+                    (
+                        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                        start,
+                    ),
+                    (
+                        Event::Mouse(mouse::Event::CursorMoved { position: end }),
+                        end,
+                    ),
+                    (
+                        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                        end,
+                    ),
+                    (command("c"), end),
+                ] {
+                    let mut messages = Vec::new();
+                    let mut shell = Shell::new(&mut messages);
+                    element.as_widget_mut().update(
+                        &mut tree,
+                        &event,
+                        Layout::new(&node),
+                        mouse::Cursor::Available(pointer),
+                        &renderer,
+                        &mut clipboard,
+                        &mut shell,
+                        &host_viewport,
+                    );
+                    assert!(shell.is_event_captured(), "real scrolled drag/copy: {case}");
+                    if shell.is_layout_invalid() {
+                        node = element
+                            .as_widget_mut()
+                            .layout(&mut tree, &renderer, &limits);
+                    }
+                }
+                let state = tree.state.downcast_ref::<State>();
+                assert_eq!(
+                    state.anchor.unwrap().byte,
+                    first_byte,
+                    "ordinary/Bidi source row keeps native clipped hit origin"
+                );
+                if reaches_end {
+                    assert_eq!(
+                        state.end.unwrap().byte,
+                        source.len(),
+                        "visible translated terminal: {case}"
+                    );
+                    assert_eq!(
+                        clipboard.0,
+                        &source[first_byte..],
+                        "actual source suffix retains LF/CRLF and Bidi bytes"
+                    );
+                    let point =
+                        Point::new(terminal.1.x + 5.0, terminal.1.y + terminal.1.height / 2.0);
+                    let mut messages = Vec::new();
+                    element.as_widget_mut().update(
+                        &mut tree,
+                        &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                        Layout::new(&node),
+                        mouse::Cursor::Available(point),
+                        &renderer,
+                        &mut clipboard,
+                        &mut Shell::new(&mut messages),
+                        &host_viewport,
+                    );
+                    assert_eq!(
+                        tree.state.downcast_ref::<State>().anchor.unwrap().byte,
+                        source.len() - ending.len(),
+                        "translated inband blank press remains start"
+                    );
+                } else {
+                    assert!(
+                        state.end.unwrap().byte < source.len(),
+                        "translated clipped source cannot jump to EOF: {case}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn idle_selection_schedules_frames_before_painting_managed_and_standalone_text() {
@@ -1492,7 +2528,7 @@ mod tests {
         body: &str,
         change: impl FnOnce(&mut Vec<markdown::Item>),
     ) -> Element<'static, Message> {
-        let cached = CachedItem::new(
+        let mut cached = CachedItem::new(
             &ItemContent::Text {
                 text: body.to_owned(),
                 thinking: false,
@@ -1500,6 +2536,17 @@ mod tests {
             },
             crate::settings::EditorSyntaxTheme::Auto,
         );
+        cached.item = Some(Arc::new(chat::Item {
+            id: "selection-fixture".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: body.into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            started_at: None,
+            at: None,
+        }));
         let mut items = cached.markdown.items().to_vec();
         change(&mut items);
         prose::items_for_test(
@@ -1617,7 +2664,9 @@ mod tests {
             };
             rows[0].cells[1] = vec![markdown::Item::CodeBlock {
                 language: None,
-                code: content.into(),
+                code: Arc::from(content),
+                source: Arc::from(content),
+                reader_source: super::reader_source::Source::new(content),
                 lines: Vec::new(),
             }];
         });
@@ -1640,7 +2689,9 @@ mod tests {
                 .into_iter()
                 .map(|code| markdown::Item::CodeBlock {
                     language: None,
-                    code: code.into(),
+                    code: Arc::from(code),
+                    source: Arc::from(code),
+                    reader_source: super::reader_source::Source::new(code),
                     lines: Vec::new(),
                 })
                 .collect();
@@ -1678,28 +2729,129 @@ mod tests {
         let body = (0..128)
             .map(|index| format!("| H{index} | B |\n|---|---|\n| V{index} | W |\n\n"))
             .collect::<String>();
-        let mut element = rendered_markdown(&body, |_| {});
-        let mut tree = Tree::new(element.as_widget());
-        let read = read_rendered(&mut element, &mut tree);
-        let last = read.blocks.len() - 1;
-        let ranges = read
-            .ranges(
-                Endpoint {
-                    identity: read.blocks[0].identity,
-                    byte: 0,
-                },
-                Endpoint {
-                    identity: read.blocks[last].identity,
-                    byte: 1,
-                },
-            )
-            .unwrap();
-        // The clipboard formatter receives one index shared by all table chunks.
-        let values = read.table_values(&ranges);
-        assert_eq!(values.len(), 128);
-        assert_eq!(values.values().map(HashMap::len).sum::<usize>(), 512);
+        let content = markdown::Content::parse(&body);
+        let mut builder = Catalog::builder();
+        builder.markdown("selection-fixture", &[0], content.items());
+        let catalog = builder.finish();
         assert_eq!(
-            read.copy(&ranges),
+            catalog.search_blocks().len(),
+            512,
+            "all128 tables retain all four logical cells"
+        );
+        let mut element = Element::new(Selection {
+            content: cosmic::widget::scrollable(rendered_markdown(&body, |_| {}))
+                .height(Length::Fixed(2000.0))
+                .into(),
+            catalog: Some(catalog),
+            bookmark: None,
+            context: None,
+            click_clock: iced::time::Instant::now,
+        });
+        let mut tree = Tree::new(element.as_widget());
+        let mounted = read_rendered(&mut element, &mut tree);
+        assert!(
+            !mounted.tables.is_empty() && mounted.tables.len() < 128,
+            "copy must not require constructing every offscreen table"
+        );
+        let renderer = crate::app::tests::headless_renderer();
+        let viewport = Rectangle::with_size(Size::new(600.0, 2000.0));
+        let limits = layout::Limits::new(Size::ZERO, viewport.size());
+        let mut node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        // The real native viewport supplies geometry to the sparse columns.
+        // Without this reconciliation their default tail band is deliberately
+        // outside this fixture's top viewport. Mount only the visible cells.
+        for pass in 0..8 {
+            let mut observation = virtualized::UpdateViewport::default();
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut observation,
+            );
+            if !observation.changed {
+                break;
+            }
+            assert!(pass < 7, "native viewport realization must converge");
+            node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+        }
+        // Focus through actual pointer input. Setting ACTIVE alone does not
+        // make a transcript focused, so it never exercises the copy command.
+        let mut visible = Read::new(None);
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut visible);
+        assert!(
+            !visible.tables.is_empty() && visible.tables.len() < 128,
+            "real pointer focus must preserve sparse table mounting"
+        );
+        let first = visible
+            .blocks
+            .iter()
+            .find_map(|block| {
+                block
+                    .visible
+                    .and_then(|bounds| bounds.intersection(&viewport))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "mounted={} bounds={:?} must include a cell in the real viewport",
+                    visible.blocks.len(),
+                    visible
+                        .blocks
+                        .iter()
+                        .take(4)
+                        .map(|block| (block.bounds, block.visible))
+                        .collect::<Vec<_>>()
+                )
+            });
+        let point = Point::new(
+            first.x + first.width.min(8.0) / 2.0,
+            first.y + first.height / 2.0,
+        );
+        let mut clipboard = ClipboardText::default();
+        for event in [
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        ] {
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(event),
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &renderer,
+                &mut clipboard,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+        }
+        assert!(
+            tree.state.downcast_ref::<State>().focused,
+            "native pointer focus must precede Ctrl+A/C"
+        );
+        assert_eq!(
+            ACTIVE.load(Ordering::Relaxed),
+            tree.state.downcast_ref::<State>().identity
+        );
+        for key in ["a", "c"] {
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &command(key),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+        }
+        assert_eq!(
+            clipboard.0,
             (0..128)
                 .map(|index| format!("H{index}\tB\nV{index}\tW"))
                 .collect::<Vec<_>>()
@@ -1794,6 +2946,8 @@ mod tests {
     }
     fn surface<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
         Element::new(Selection {
+            catalog: None,
+            bookmark: None,
             content: content.into(),
             context: None,
             click_clock: iced::time::Instant::now,
@@ -1864,6 +3018,98 @@ mod tests {
     }
 
     #[test]
+    fn native_link_release_accepts_equal_reparsed_uri_and_refuses_changed_destination_or_target() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 3,
+        };
+        let uri: markdown::Uri =
+            format!("https://example.test/{}#L22", "destination".repeat(100_000)).into();
+        let linked = |target, uri: markdown::Uri| {
+            surface(super::super::selectable_prose::text(
+                vec![iced::widget::text::Span::new("x").link(uri)].into(),
+                16.0.into(),
+                iced::Font::default(),
+                target,
+                None,
+            ))
+        };
+        let limits = layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0));
+        let viewport = Rectangle::with_size(Size::new(300.0, 100.0));
+        let cursor = mouse::Cursor::Available(Point::new(2.0, 10.0));
+        for (changed_uri, changed_target) in [(false, false), (true, false), (false, true)] {
+            let mut element = linked(target, uri.clone());
+            let mut tree = Tree::new(&element);
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut ClipboardText::default(),
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            let captured = tree
+                .state
+                .downcast_ref::<State>()
+                .link
+                .as_ref()
+                .expect("actual native glyph press captures link provenance");
+            assert_eq!(captured.0, target);
+            assert!(Arc::ptr_eq(&captured.1, &uri));
+            let next_uri: markdown::Uri = if changed_uri {
+                Arc::from("https://example.test/changed#L22")
+            } else {
+                Arc::from(uri.as_ref())
+            };
+            assert!(
+                !Arc::ptr_eq(&next_uri, &uri),
+                "a real fresh URI allocation replaces the pressed reader source"
+            );
+            let next_target = if changed_target {
+                Target {
+                    generation: target.generation + 1,
+                    ..target
+                }
+            } else {
+                target
+            };
+            let mut rebuilt = linked(next_target, next_uri);
+            tree.diff(&mut rebuilt);
+            let node = rebuilt
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            rebuilt.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut ClipboardText::default(),
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            if changed_uri || changed_target {
+                assert!(
+                    messages.is_empty(),
+                    "a different destination or stale Target refuses activation across the same native gesture"
+                );
+            } else {
+                assert!(
+                    matches!(messages.as_slice(),[Message::ChatUi(Action::OpenSharedDocument(found,source))] if *found==target && Arc::ptr_eq(source,&uri)),
+                    "equal destination bytes in a reparsed allocation preserve the actual native click and original shared payload"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn click_units_shift_extension_and_returned_link_drags_use_the_shared_selection() {
         thread_local! {
             static CLICK_TIME: std::cell::Cell<iced::time::Instant> =
@@ -1884,7 +3130,7 @@ mod tests {
         let content = super::super::selectable_prose::text(
             vec![
                 iced::widget::text::Span::new("one two three")
-                    .link("https://example.com".to_owned()),
+                    .link(Arc::from("https://example.com")),
             ]
             .into(),
             16.0.into(),
@@ -1895,6 +3141,8 @@ mod tests {
         // Renderer/font work may exceed the real double-click deadline under
         // parallel tests. Keep the actual event path with explicit click times.
         let mut element = Element::new(Selection {
+            catalog: None,
+            bookmark: None,
             content: content.into(),
             context: None,
             click_clock: next_click_time,
@@ -2699,6 +3947,22 @@ mod tests {
             ),
             "selected"
         );
+        block = tool_text::ToolText::update(
+            Some(block),
+            "different source with an unrelated selection",
+            tool_text::Language::Plain,
+        );
+        element = surface(block.view(theme, None, target, None));
+        tree.diff(&mut element);
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let state = tree.state.downcast_ref::<State>();
+        assert_eq!(
+            (state.anchor, state.end),
+            (None, None),
+            "an unproven rewrite must not carry source byte endpoints"
+        );
     }
 
     #[test]
@@ -2750,5 +4014,82 @@ mod tests {
         );
         read.pointer = Some(Point::new(30.0, 25.0));
         assert!(read.endpoint(true).is_some());
+    }
+    #[test]
+    fn logical_search_data_can_leave_the_ui_thread_without_presentation_state() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<Catalog>();
+        send_sync::<Vec<(u64, Arc<str>)>>();
+        let content = markdown::Content::parse("Search **rendered** text.");
+        let mut builder = Catalog::builder();
+        builder.markdown("item", &[0], content.items());
+        let catalog = builder.finish();
+        let blocks = catalog.search_blocks();
+        assert_eq!(blocks[0].1.as_ref(), "Search rendered text.");
+        assert_eq!(
+            catalog.retained_plain_bytes(),
+            blocks.iter().map(|(_, text)| text.len()).sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn logical_catalog_uses_the_existing_structure_aware_copy_oracle() {
+        for body in [
+            "A **bold** paragraph.\n\n```rust\nlet value = 42;\n```\n",
+            "7. α first\n8. β second\n\n- [x] done\n  - nested\n- [ ] pending\n",
+            "| α | β |\n| --- | --- |\n| first | second |\n| | |\n",
+            "> A quoted paragraph.\n>\n> - one\n> - two\n",
+        ] {
+            let content = markdown::Content::parse(body);
+            let mut builder = Catalog::builder();
+            builder.markdown("message", &[0], content.items());
+            let catalog = builder.finish();
+            let (start, end) = catalog.endpoints().unwrap();
+            let mut element = rendered_markdown(body, |_| {});
+            let mut tree = Tree::new(&element);
+            let read = read_rendered(&mut element, &mut tree);
+            let last = read.blocks.len() - 1;
+            let expected = copy_between(&read, 0, 0, last, read.blocks[last].plain.len());
+            assert_eq!(catalog.copy(start, end).unwrap(), expected, "{body:?}");
+            assert_eq!(catalog.copy(end, start).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn logical_endpoints_survive_offscreen_eviction_and_catalog_rehydration() {
+        let body = format!(
+            "α first\n\n{}\n\nβ last",
+            "offscreen paragraph\n\n".repeat(10000)
+        );
+        let build = || {
+            let content = markdown::Content::parse(&body);
+            let mut builder = Catalog::builder();
+            builder.markdown("stable-item", &[0], content.items());
+            builder.finish()
+        };
+        let first = build();
+        let (start, end) = first.endpoints().unwrap();
+        let bookmark = Bookmark {
+            anchor: Some(start),
+            end: Some(end),
+            ..Default::default()
+        };
+        let expected = first.copy(start, end).unwrap();
+        drop(first);
+        let rehydrated = build();
+        assert_eq!(
+            rehydrated
+                .copy(bookmark.anchor.unwrap(), bookmark.end.unwrap())
+                .unwrap(),
+            expected
+        );
+        // A sparse pointer frame has no widget for either endpoint. It can
+        // still resolve the logical range without traversing hidden widgets.
+        let sparse = Read::with_catalog(None, Some(rehydrated));
+        let ranges = sparse
+            .ranges(start, end)
+            .expect("offscreen logical endpoints");
+        assert!(ranges.blocks.is_empty());
+        assert_eq!(sparse.copy(&ranges), expected);
     }
 }

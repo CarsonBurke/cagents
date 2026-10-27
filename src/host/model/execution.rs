@@ -939,6 +939,7 @@ impl Registry {
                             "INSERT INTO channels(id, repository, title, ordinal, title_source) VALUES (?1, ?2, ?3, ?4, 0)",
                             params![channel.to_string(), repository, crate::workspace_model::channel_title_from_prompt(&request.prompt).unwrap_or_else(|| format!("{} agent", spec.provider.label())), ordinal],
                         ).map_err(|error| error.to_string())?;
+                        super::channel_work::created_in(tx, channel)?;
                         Placement::Channel(channel)
                     }
                 };
@@ -2016,7 +2017,13 @@ mod tests {
                 registry
                     .db
                     .execute_batch(
-                        "DROP TABLE automation_lifecycle;
+                        "DROP TABLE automation_notifications;
+                         DROP TABLE channel_work_placement_epochs;
+                         DROP TABLE channel_work_placement_clock;
+                         DROP TABLE channel_work_operations;
+                         DROP TABLE channel_work_entries;
+                         DROP TABLE channel_work_homes;
+                         DROP TABLE automation_lifecycle;
                          DROP TABLE native_actor_retirements;
                          DROP TABLE native_actor_ownerships;
                          DROP TABLE native_actor_cursors;
@@ -2781,6 +2788,105 @@ mod tests {
     }
 
     #[test]
+    fn implicit_agent_channel_keeps_one_work_home_through_retry_and_project_close() {
+        use crate::channel_work::{Home, HomeLifecycle};
+
+        let (mut registry, directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let model = registry.model().unwrap();
+        let channel = model.channel(accepted.agent.channel().unwrap()).unwrap();
+        let home = Home {
+            registry: model.identity,
+            channel: channel.id,
+            creation_ordinal: channel.ordinal,
+        };
+        assert_eq!(
+            registry.read_channel_work_home(&home).unwrap().lifecycle,
+            HomeLifecycle::Active
+        );
+        let retried = registry.submit_agent(&Origin::User, &request, 2).unwrap();
+        assert!(!retried.created);
+        assert_eq!(retried.agent.id, accepted.agent.id);
+        assert_eq!(retried.run.id, accepted.run.id);
+        assert_eq!(
+            registry
+                .db
+                .query_row("SELECT count(*) FROM channel_work_homes", [], |row| row
+                    .get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+        registry
+            .apply(&ModelEdit::CloseProject {
+                repository: directory.path().into(),
+            })
+            .unwrap();
+        assert!(registry.model().unwrap().channels.is_empty());
+        assert_eq!(
+            registry.read_channel_work_home(&home).unwrap().lifecycle,
+            HomeLifecycle::Deleted
+        );
+        drop(registry);
+        let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert_eq!(
+            registry.read_channel_work_home(&home).unwrap().lifecycle,
+            HomeLifecycle::Deleted,
+            "reopening must retain the deleted incarnation without recreating its channel"
+        );
+        let retained: (String, String) = registry.db.query_row(
+            "SELECT repository,title FROM channel_work_homes WHERE channel=?1 AND incarnation=?2",
+            params![home.channel.to_string(), home.creation_ordinal],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(
+            retained,
+            (
+                directory.path().to_str().unwrap().into(),
+                channel.title.clone()
+            )
+        );
+    }
+
+    #[test]
+    fn failed_implicit_work_home_creation_rolls_back_agent_channel_and_run() {
+        let (mut registry, _directory, request) = fixture();
+        let before = registry.model().unwrap();
+        registry
+            .db
+            .execute_batch(
+                "CREATE TEMP TRIGGER refuse_implicit_home BEFORE INSERT ON main.channel_work_homes
+             BEGIN SELECT RAISE(ABORT, 'fixture work home failure'); END;",
+            )
+            .unwrap();
+        let error = registry
+            .submit_agent(&Origin::User, &request, 1)
+            .unwrap_err();
+        assert!(error.contains("fixture work home failure"));
+        let after = registry.model().unwrap();
+        assert_eq!(after.sequence, before.sequence);
+        assert!(after.channels.is_empty() && after.agents.is_empty());
+        for table in ["channel_work_homes", "agent_runs"] {
+            let count: u64 = registry
+                .db
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} must roll back with implicit creation");
+        }
+        registry
+            .db
+            .execute_batch("DROP TRIGGER temp.refuse_implicit_home;")
+            .unwrap();
+        assert!(
+            registry
+                .submit_agent(&Origin::User, &request, 2)
+                .unwrap()
+                .created
+        );
+    }
+
+    #[test]
     fn worktree_placement_requires_the_exact_open_view_without_creating_a_channel() {
         let (mut registry, directory, mut request) = fixture();
         let scope = Placement::Worktree {
@@ -2883,7 +2989,13 @@ mod tests {
         registry
             .db
             .execute_batch(
-                "DROP TABLE automation_lifecycle;
+                "DROP TABLE automation_notifications;
+                 DROP TABLE channel_work_placement_epochs;
+                 DROP TABLE channel_work_placement_clock;
+                 DROP TABLE channel_work_operations;
+                 DROP TABLE channel_work_entries;
+                 DROP TABLE channel_work_homes;
+                 DROP TABLE automation_lifecycle;
                  DROP INDEX agents_by_name; PRAGMA user_version=9;",
             )
             .unwrap();

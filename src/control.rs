@@ -20,6 +20,7 @@ use thiserror::Error;
 mod accounts;
 pub use accounts::AccountCommand;
 mod agents;
+mod channel_work;
 mod channels;
 mod chat;
 pub use chat::ChatCommand;
@@ -388,6 +389,11 @@ pub enum ProjectCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ChannelCommand {
+    /// Inspect and declare the work this channel is progressing.
+    Work {
+        #[command(subcommand)]
+        command: channel_work::WorkCommand,
+    },
     /// Move a live pane, hosted session or agent into another channel.
     Move {
         /// Full pane/session ID, agent ID or unique prefix, or unique agent name.
@@ -547,6 +553,10 @@ pub struct ControlClient {
     /// Attaching is only how this client earns the right to close a chat; it
     /// reads nothing from the chat's notifications, so they are dropped.
     attached_chats: BTreeSet<TerminalId>,
+    /// Terminal streams this connection successfully requested. Their payloads
+    /// are not retained, but queued notifications can outlive a Detach reply,
+    /// so remember their IDs for this connection's lifetime.
+    terminal_streams: BTreeSet<TerminalId>,
 }
 
 /// Linux AF_UNIX backlog pressure returns EAGAIN without connecting. Retry
@@ -673,6 +683,7 @@ impl ControlClient {
             observed_notifications: VecDeque::new(),
             observed_work: None,
             attached_chats: BTreeSet::new(),
+            terminal_streams: BTreeSet::new(),
         })
     }
 
@@ -1054,6 +1065,7 @@ impl ControlClient {
             }
             response => return Err(unexpected_response("a spawned terminal", &response)),
         };
+        self.terminal_streams.insert(expected);
         self.read_attachment_replay(expected)?;
         Ok(terminal)
     }
@@ -1082,6 +1094,7 @@ impl ControlClient {
             }
             response => return Err(unexpected_response("a reserved terminal", &response)),
         };
+        self.terminal_streams.insert(terminal_id);
         self.read_attachment_replay(terminal_id)?;
         Ok(terminal)
     }
@@ -1405,6 +1418,7 @@ impl ControlClient {
             }
             response => return Err(unexpected_response("a terminal attachment", &response)),
         };
+        self.terminal_streams.insert(terminal_id);
         self.read_attachment_replay(terminal_id)?;
         Ok(terminal)
     }
@@ -1529,6 +1543,21 @@ impl ControlClient {
         request: ClientRequest,
     ) -> Result<ServerResponse, ControlError> {
         self.request_strict(request)
+    }
+
+    pub(crate) fn channel_work(
+        &mut self,
+        authority: Authority,
+        request: crate::channel_work_api::Request,
+        timeout: Duration,
+    ) -> Result<crate::channel_work_api::Response, ControlError> {
+        match self.request_with_deadline(
+            ClientRequest::ChannelWork { authority, request },
+            Instant::now() + timeout,
+        )? {
+            ServerResponse::ChannelWork(response) => Ok(response),
+            response => Err(unexpected_response("channel_work", &response)),
+        }
     }
 
     fn request_strict(&mut self, request: ClientRequest) -> Result<ServerResponse, ControlError> {
@@ -1695,6 +1724,12 @@ impl ControlClient {
             | ServerMessage::ChatObserved { chat_id, .. }
             | ServerMessage::ChatActivity { chat_id, .. }
                 if self.attached_chats.contains(&chat_id) => {}
+            ServerMessage::Redraw { terminal_id, .. }
+            | ServerMessage::Snapshot { terminal_id, .. }
+            | ServerMessage::TerminalObserved { terminal_id, .. }
+            | ServerMessage::Event { terminal_id, .. }
+            | ServerMessage::Synchronized { terminal_id, .. }
+                if self.terminal_streams.contains(&terminal_id) => {}
             message => return Err(message),
         }
         Ok(())
@@ -1973,6 +2008,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatFileChangePatches { .. } => "chat_file_change_patches",
         ServerResponse::ChatTextCopy { .. } => "chat_text_copy",
         ServerResponse::Work(_) => "work",
+        ServerResponse::ChannelWork(_) => "channel_work",
         ServerResponse::DeviceOperation { .. } => "device_operation",
     }
 }
@@ -2178,6 +2214,33 @@ where
     if let TopCommand::Completions { shell } = cli.command {
         emit_success(cli.json, completions::execute(shell));
         return ExitCode::SUCCESS;
+    }
+
+    // These operations govern the whole daemon, not a hosted session's own
+    // actors. Refuse before staged-owner routing, SSH preparation, autostart or
+    // local installer effects. Presence is enough: malformed/non-Unicode
+    // authority must never silently become a User connection.
+    if matches!(
+        &cli.command,
+        TopCommand::Daemon {
+            command: DaemonCommand::Start
+                | DaemonCommand::Stop { .. }
+                | DaemonCommand::Preflight
+                | DaemonCommand::PrepareUpgrade { .. }
+                | DaemonCommand::Upgrade { .. }
+                | DaemonCommand::AbandonUpgrade { .. }
+                | DaemonCommand::StopForRebuild { .. },
+        }
+    ) && std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_some()
+    {
+        emit_error(
+            cli.json,
+            &AppError::new(
+                "permission_denied",
+                "Daemon lifecycle commands require your own terminal; hosted sessions cannot start, stop or upgrade the daemon",
+            ),
+        );
+        return ExitCode::FAILURE;
     }
 
     // Physical-device image receipts are user-managed local files. Refuse
@@ -3598,6 +3661,10 @@ fn project_line(project: &ModelProject) -> String {
 /// point of the shared model is that a channel exists whether or not a window
 /// is running to show it.
 fn execute_channel(command: ChannelCommand) -> Result<CommandOutput, AppError> {
+    let command = match command {
+        ChannelCommand::Work { command } => return channel_work::execute(command),
+        command => command,
+    };
     // Reject invalid filesystem paths before starting a daemon. The shared
     // registry then takes precedence over fresh Git discovery for open folders.
     let selected = match &command {
@@ -3651,6 +3718,9 @@ impl ChannelCommand {
         model: Option<&WorkspaceModel>,
     ) -> Result<ResolvedChannel, AppError> {
         Ok(match self {
+            Self::Work { .. } => {
+                unreachable!("channel work is dispatched before legacy channel resolution")
+            }
             Self::Move { target, to } => ResolvedChannel::Move { target, to },
             Self::Spawn { repository, title } => {
                 let location = resolve_project_location(repository, model)?;
@@ -3976,6 +4046,288 @@ fn emit_error(json_output: bool, error: &AppError) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hosted_daemon_lifecycle_refuses_before_routing_and_user_framing_stays_usable() {
+        use std::os::unix::{
+            ffi::OsStringExt,
+            fs::{MetadataExt, PermissionsExt},
+            net::UnixListener,
+        };
+        const CHILD: &str = "CAGENTS_TEST_DAEMON_LIFECYCLE_ORIGIN";
+        let name = thread::current().name().unwrap().to_owned();
+        let Some(case) = std::env::var_os(CHILD) else {
+            for case in ["hosted", "empty", "non-unicode", "user"] {
+                let directory = tempfile::Builder::new().prefix("da-").tempdir().unwrap();
+                for leaf in ["home", "runtime", "config", "data", "cache"] {
+                    let path = directory.path().join(leaf);
+                    std::fs::create_dir(&path).unwrap();
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                }
+                let out = directory.path().join("stdout");
+                let err = directory.path().join("stderr");
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                // Predetermined roles against a fake peer only. Never inspect
+                // or copy the invoking session's real opaque capability.
+                command
+                    .env_clear()
+                    .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                    .current_dir(directory.path())
+                    .env(CHILD, case)
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("HOME", directory.path().join("home"))
+                    .env("XDG_RUNTIME_DIR", directory.path().join("runtime"))
+                    .env("XDG_CONFIG_HOME", directory.path().join("config"))
+                    .env("XDG_DATA_HOME", directory.path().join("data"))
+                    .env("XDG_CACHE_HOME", directory.path().join("cache"))
+                    .stdin(Stdio::null())
+                    .stdout(std::fs::File::create(&out).unwrap())
+                    .stderr(std::fs::File::create(&err).unwrap());
+                match case {
+                    "hosted" => {
+                        command.env(crate::agent_execution::AUTHORITY_ENV, "inert-fixture-role");
+                    }
+                    "empty" => {
+                        command.env(crate::agent_execution::AUTHORITY_ENV, "");
+                    }
+                    "non-unicode" => {
+                        command.env(
+                            crate::agent_execution::AUTHORITY_ENV,
+                            OsString::from_vec(vec![0xff]),
+                        );
+                    }
+                    "user" => {}
+                    _ => unreachable!(),
+                }
+                let mut child = command.spawn().unwrap();
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let status = loop {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        break status;
+                    }
+                    if Instant::now() >= deadline {
+                        child.kill().unwrap();
+                        child.wait().unwrap();
+                        panic!("isolated daemon-origin fixture timed out: {case}");
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                };
+                let stdout = std::fs::read_to_string(out).unwrap();
+                let stderr = std::fs::read_to_string(err).unwrap();
+                assert!(status.success(), "{case}: {stdout}\n{stderr}");
+                assert!(stdout.contains(&format!("test {name} ...")));
+                assert!(stdout.contains("1 passed; 0 failed; 0 ignored;"));
+                assert!(!stdout.contains("inert-fixture-role"));
+                assert!(!stderr.contains("inert-fixture-role"));
+                let errors = stderr
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .collect::<Vec<_>>();
+                assert_eq!(errors.len(), if case == "user" { 0 } else { 14 });
+                assert!(errors.iter().all(|error| {
+                    error["ok"] == false && error["error"]["kind"] == "permission_denied"
+                }));
+            }
+            return;
+        };
+        let case = case.to_str().unwrap();
+        let socket = daemon_socket_path().unwrap();
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let before = std::fs::symlink_metadata(&socket).unwrap();
+        let pinned = proof("fixture-host", "fixture-boot", "fixture-incarnation");
+
+        fn accept(listener: &UnixListener) -> UnixStream {
+            let mut event = libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(unsafe { libc::poll(&mut event, 1, 5000) }, 1);
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            assert_eq!(request.version, PROTOCOL_VERSION);
+            assert_eq!(request.request_id, 1);
+            assert_eq!(request.proof, None);
+            assert!(matches!(request.request, ClientRequest::Connect { .. }));
+            stream
+        }
+        fn response(
+            stream: &mut UnixStream,
+            pinned: &HostSessionProof,
+            request_id: u64,
+            response: ServerResponse,
+        ) {
+            write_frame(
+                stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request_id),
+                    proof: pinned.clone(),
+                    message: ServerMessage::Response { response },
+                },
+            )
+            .unwrap();
+        }
+
+        if case != "user" {
+            let commands: [&[&str]; 7] = [
+                &["start"],
+                &["stop", "--require-empty"],
+                &["preflight"],
+                &["prepare-upgrade", "--yes", "--no-relaunch-agents"],
+                &["upgrade", "--yes"],
+                &["abandon-upgrade", "--yes"],
+                &["stop-for-rebuild", "--including-subagents"],
+            ];
+            for device in ["local", "fixture-device-must-not-be-selected"] {
+                for command in commands {
+                    let mut argv = vec!["cagents", "--json", "--device", device, "daemon"];
+                    argv.extend_from_slice(command);
+                    assert_eq!(run_from(argv), ExitCode::FAILURE);
+                }
+            }
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+            );
+            let after = std::fs::symlink_metadata(&socket).unwrap();
+            assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+            for variable in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"] {
+                assert_eq!(
+                    std::fs::read_dir(std::env::var_os(variable).unwrap())
+                        .unwrap()
+                        .count(),
+                    0
+                );
+            }
+            assert_eq!(
+                run_from(["cagents", "--json", "daemon", "protocol-version"]),
+                ExitCode::SUCCESS
+            );
+            // Reads remain available to hosted callers through the same real
+            // CLI and framed connection; this fake peer never owns a process.
+            let server = thread::spawn(move || {
+                let mut stream = accept(&listener);
+                write_frame(
+                    &mut stream,
+                    &connected_envelope(1, pinned.clone(), pinned.clone()),
+                )
+                .unwrap();
+                let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                assert!(matches!(request.request, ClientRequest::BuildInfo));
+                assert_eq!(request.proof, Some(pinned.clone()));
+                response(
+                    &mut stream,
+                    &pinned,
+                    request.request_id,
+                    ServerResponse::BuildInfo {
+                        version: "fixture".into(),
+                    },
+                );
+                assert!(read_frame::<ClientEnvelope>(&mut stream).unwrap().is_none());
+            });
+            assert_eq!(
+                run_from(["cagents", "--json", "--no-start", "daemon", "status"]),
+                ExitCode::SUCCESS
+            );
+            server.join().unwrap();
+            return;
+        }
+
+        let server = thread::spawn(move || {
+            for operation in ["preflight", "prepare", "stop"] {
+                let mut stream = accept(&listener);
+                write_frame(
+                    &mut stream,
+                    &connected_envelope(1, pinned.clone(), pinned.clone()),
+                )
+                .unwrap();
+                let capability = ShutdownCapability {
+                    proof: pinned.clone(),
+                    token: "fake-counted-consent".into(),
+                    inventory_generation: 7,
+                    live_terminals: 0,
+                    background_subagents: 0,
+                    background_identity: "fixture-empty".into(),
+                    expires_at_unix_ms: i64::MAX,
+                };
+                let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                assert_eq!(request.proof, Some(pinned.clone()));
+                if operation == "stop" {
+                    assert!(matches!(
+                        request.request,
+                        ClientRequest::ShutdownV1 {
+                            version: SHUTDOWN_VERSION,
+                            operation: ShutdownOperation::Stop {
+                                require_empty: true,
+                                expected_generation: None
+                            }
+                        }
+                    ));
+                    response(
+                        &mut stream,
+                        &pinned,
+                        request.request_id,
+                        ServerResponse::ShutdownOutcome(ShutdownOutcome::Accepted {
+                            live_terminals_before: 0,
+                            termination_requested: true,
+                        }),
+                    );
+                } else {
+                    assert!(matches!(
+                        request.request,
+                        ClientRequest::ShutdownV1 {
+                            version: SHUTDOWN_VERSION,
+                            operation: ShutdownOperation::Preflight
+                        }
+                    ));
+                    response(
+                        &mut stream,
+                        &pinned,
+                        request.request_id,
+                        ServerResponse::ShutdownPreflight(ShutdownPreflight {
+                            capability: capability.clone(),
+                        }),
+                    );
+                    if operation == "prepare" {
+                        let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                        assert_eq!(request.proof, Some(pinned.clone()));
+                        assert!(
+                            matches!(request.request, ClientRequest::PrepareUpgrade { capability: actual, relaunch_agents: false } if actual == capability)
+                        );
+                        response(
+                            &mut stream,
+                            &pinned,
+                            request.request_id,
+                            ServerResponse::UpgradePrepared {
+                                terminals: 0,
+                                chats: 0,
+                            },
+                        );
+                    }
+                }
+                assert!(read_frame::<ClientEnvelope>(&mut stream).unwrap().is_none());
+            }
+        });
+        for command in [
+            vec!["preflight"],
+            vec!["prepare-upgrade", "--yes", "--no-relaunch-agents"],
+            vec!["stop", "--require-empty"],
+        ] {
+            let mut argv = vec!["cagents", "--json", "--no-start", "daemon"];
+            argv.extend(command);
+            assert_eq!(run_from(argv), ExitCode::SUCCESS);
+        }
+        server.join().unwrap();
+    }
+
     #[test]
     fn readable_channel_list_has_headers_and_a_plain_empty_state() {
         assert_eq!(channel_list_human(&[]), "No channels");
@@ -5356,6 +5708,164 @@ mod tests {
         );
         server.join().unwrap();
     }
+    #[test]
+    fn requested_terminal_streams_do_not_break_later_rpc_or_accept_foreign_frames() {
+        for invalid in ["unknown", "proof", "request-id"] {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            server_stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            server_stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let pinned = proof("terminal-stream", "boot", "incarnation");
+            let recipe = LaunchRecipe {
+                program: "/bin/sh".into(),
+                arguments: Vec::new(),
+                working_directory: "/".into(),
+                environment: BTreeMap::new(),
+                unset_environment: Default::default(),
+            };
+            let terminal = TerminalDescriptor::relaunchable(TerminalId::new(), recipe, None);
+            let session = terminal.session.clone();
+            let expected = session.id;
+            let server = thread::spawn(move || {
+                let connect: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                write_frame(
+                    &mut server_stream,
+                    &connected_envelope(connect.request_id, pinned.clone(), pinned.clone()),
+                )
+                .unwrap();
+                let spawn: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert!(
+                    matches!(spawn.request, ClientRequest::Spawn { session, .. } if session.id == expected)
+                );
+                for (request_id, message) in [
+                    (
+                        Some(spawn.request_id),
+                        ServerMessage::Response {
+                            response: ServerResponse::Spawned {
+                                terminal: terminal.clone(),
+                            },
+                        },
+                    ),
+                    (
+                        None,
+                        ServerMessage::Synchronized {
+                            terminal_id: expected,
+                            generation: 0,
+                            event_sequence: 0,
+                        },
+                    ),
+                ] {
+                    write_frame(
+                        &mut server_stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: pinned.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+                }
+                let list: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert!(matches!(list.request, ClientRequest::List));
+                // These genuine terminal-stream message kinds remain legal
+                // after the first attachment replay and during a later RPC.
+                for message in [
+                    ServerMessage::Redraw {
+                        terminal_id: expected,
+                        generation: 1,
+                    },
+                    ServerMessage::Snapshot {
+                        terminal_id: expected,
+                        snapshot: TerminalSnapshot::full(&crate::terminal::RenderSnapshot::empty()),
+                    },
+                    ServerMessage::TerminalObserved {
+                        terminal_id: expected,
+                        epoch: 1,
+                    },
+                    ServerMessage::Event {
+                        terminal_id: expected,
+                        sequence: 1,
+                        event: crate::terminal::ipc::WireTerminalEvent::Bell,
+                    },
+                    ServerMessage::Synchronized {
+                        terminal_id: expected,
+                        generation: 1,
+                        event_sequence: 1,
+                    },
+                    ServerMessage::Response {
+                        response: ServerResponse::Listed {
+                            terminals: vec![terminal],
+                        },
+                    },
+                ] {
+                    let request_id = matches!(message, ServerMessage::Response { .. })
+                        .then_some(list.request_id);
+                    write_frame(
+                        &mut server_stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: pinned.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+                }
+                let list: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert!(matches!(list.request, ClientRequest::List));
+                let mut envelope = ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: None,
+                    proof: pinned,
+                    message: ServerMessage::Snapshot {
+                        terminal_id: if invalid == "unknown" {
+                            TerminalId::new()
+                        } else {
+                            expected
+                        },
+                        snapshot: TerminalSnapshot::full(&crate::terminal::RenderSnapshot::empty()),
+                    },
+                };
+                if invalid == "proof" {
+                    envelope.proof = proof("different", "boot", "incarnation");
+                }
+                if invalid == "request-id" {
+                    envelope.request_id = Some(list.request_id + 1);
+                }
+                write_frame(&mut server_stream, &envelope).unwrap();
+            });
+            let mut client = ControlClient::from_stream(client_stream).unwrap();
+            assert_eq!(
+                client
+                    .spawn(session, Default::default())
+                    .unwrap()
+                    .session
+                    .id,
+                expected
+            );
+            assert_eq!(client.list().unwrap()[0].session.id, expected);
+            let result = client.list();
+            assert!(match invalid {
+                "unknown" => matches!(
+                    result,
+                    Err(ControlError::UnexpectedMessage {
+                        actual: "snapshot",
+                        ..
+                    })
+                ),
+                "proof" => matches!(result, Err(ControlError::ProofMismatch)),
+                "request-id" => matches!(result, Err(ControlError::RequestIdMismatch { .. })),
+                _ => unreachable!(),
+            });
+            drop(client);
+            server.join().unwrap();
+        }
+    }
+
     /// Closing a chat attaches this connection to it, and the interrupt the
     /// close delivers is reported to every attached client before the answer.
     /// Neither the close nor the requests after it may mistake that report for

@@ -513,11 +513,16 @@ const DEGRADED_TEST: &str = "host::state::native_upgrade_tests::upgrade_restore_
 /// all, although every carried terminal was adoptable.
 #[test]
 fn upgrade_restore_isolates_a_retained_conversation_whose_rollout_is_missing() {
-    match std::env::var(MODE).as_deref() {
+    let retained_failure = match std::env::var(MODE).as_deref() {
         Ok("provider") => return provider(),
-        Ok("degraded") => {}
-        _ => return run_isolated(DEGRADED_TEST, "degraded"),
-    }
+        Ok("degraded-retained") => true,
+        Ok("degraded") => false,
+        _ => {
+            run_isolated(DEGRADED_TEST, "degraded-retained");
+            run_isolated(DEGRADED_TEST, "degraded");
+            return;
+        }
+    };
     let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_UPGRADE_ROOT").unwrap());
     let program = install_provider(&root);
     let launches = || {
@@ -608,6 +613,10 @@ fn upgrade_restore_isolates_a_retained_conversation_whose_rollout_is_missing() {
         cleanup.0.push(pid.unwrap());
         terminals.push((source.id, pid.unwrap()));
     }
+    let original_roots = terminals
+        .iter()
+        .map(|&(terminal, pid)| (terminal, registry::Process::read(pid).unwrap()))
+        .collect::<std::collections::BTreeMap<_, _>>();
     let source = provider_session(&root, &program, &proof);
     let id = source.id;
     super::super::chat::start_execution(
@@ -681,36 +690,228 @@ fn upgrade_restore_isolates_a_retained_conversation_whose_rollout_is_missing() {
             .is_ok_and(|command| command.trim() == "sleep")
     };
 
-    // A genuinely fatal failure still retains the whole checkpoint for a
-    // rollback, and records nothing as unattached: a session the candidate
-    // could not start stands in for anything its predecessor might restore.
-    let mut failing = checkpoint.clone();
-    failing.terminals.push(relaunch(
-        TerminalId::new(),
-        // No terminal can start at this size.
-        TerminalSpawnOptions {
-            columns: 0,
-            ..TerminalSpawnOptions::default()
-        },
-    ));
-    store().save(&failing).unwrap();
-    let candidate = replace_daemon("candidate");
-    let failure =
-        restore_upgrade_from(&candidate, store(), &empty_proc, Some(&holders)).unwrap_err();
-    assert!(failure.starts_with("Upgrade restore failed"), "{failure}");
-    let retained = store().load().unwrap().unwrap();
-    assert_eq!(retained.phase, Phase::Ready);
-    assert_eq!(retained.chats.len(), 1);
-    assert!(store().unattached().unwrap().is_empty());
-    assert!(!store().unattached_path().exists());
-    assert!(record.root.is_current());
-    for &(_, pid) in &terminals {
-        assert!(alive(pid), "a failed restore ended a carried terminal");
-    }
-    drop(candidate);
+    if retained_failure {
+        // A fatal failure after original adoption retains that exact ownership
+        // and the whole Restoring checkpoint for explicit recovery. It records
+        // nothing as unattached and never makes an automatic replay safe.
+        let mut failing = checkpoint.clone();
+        failing.terminals.push(relaunch(
+            TerminalId::new(),
+            // No terminal can start at this size.
+            TerminalSpawnOptions {
+                columns: 0,
+                ..TerminalSpawnOptions::default()
+            },
+        ));
+        store().save(&failing).unwrap();
+        let mut expected_retained: serde_json::Value =
+            serde_json::from_slice(&fs::read(store().path).unwrap()).unwrap();
+        let candidate = replace_daemon("candidate");
+        let failure =
+            restore_upgrade_from(&candidate, store(), &empty_proc, Some(&holders)).unwrap_err();
+        assert!(
+            failure.starts_with("Upgrade restore retained original ownership:"),
+            "{failure}"
+        );
+        assert!(
+            failure.contains("terminal dimensions or scrollback are outside supported bounds"),
+            "the invalid-dimensions negative must remain the failure: {failure}"
+        );
+        let retained = store().load().unwrap().unwrap();
+        assert_eq!(retained.phase, Phase::Restoring);
+        expected_retained["phase"] = serde_json::to_value(Phase::Restoring).unwrap();
+        let actual_retained: serde_json::Value =
+            serde_json::from_slice(&fs::read(store().path).unwrap()).unwrap();
+        assert_eq!(
+            actual_retained, expected_retained,
+            "the entire checkpoint payload changes only to Restoring"
+        );
+        {
+            let state = candidate.lock().unwrap();
+            assert!(
+                state
+                    .startup_recovery()
+                    .is_some_and(|detail| detail == failure.as_str()),
+                "the failed candidate retains reachable recovery-only ownership"
+            );
+            assert_eq!(state.terminals.len(), terminals.len());
+            for &(terminal, pid) in &terminals {
+                let handle = &state.terminals[&terminal].handle;
+                // Legacy carries have no registered-holder Record. Observe the
+                // worker's already-held original root pidfd instead of requiring
+                // optional registry metadata or reopening a reusable PID.
+                let root_pin = handle.original_root_pidfd_for_test().unwrap();
+                let descriptor = std::os::fd::AsRawFd::as_raw_fd(&root_pin);
+                let info = fs::read_to_string(format!("/proc/self/fdinfo/{descriptor}")).unwrap();
+                let captured_pid = info
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Pid:").map(str::trim))
+                    .unwrap()
+                    .parse::<i32>()
+                    .unwrap();
+                assert_eq!(captured_pid, pid, "the candidate owns the same original");
+                let mut original = libc::pollfd {
+                    fd: descriptor,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                assert_eq!(unsafe { libc::poll(&mut original, 1, 0) }, 0);
+                assert!(original_roots[&terminal].is_current());
+                assert!(!handle.is_completed());
+            }
+        }
+        assert_eq!(retained.chats.len(), 1);
+        assert!(store().unattached().unwrap().is_empty());
+        assert!(!store().unattached_path().exists());
+        assert!(record.root.is_current());
+        for &(_, pid) in &terminals {
+            assert!(alive(pid), "a failed restore ended a carried terminal");
+        }
+        // This failed owner cannot donate its originals to another restore by
+        // being dropped. Explicitly close each exact retained original instead.
+        assert_eq!(launches(), 1, "no replacement provider was started");
+        assert_eq!(requests("thread/start"), 1, "no replacement conversation");
+        assert_eq!(requests("turn/start"), 0, "no prompt was resent");
+        // Recovery inventory and exact retained Close remain available to the
+        // user, while the same routes stay forbidden to an agent connection.
+        let user_client = 0;
+        candidate.lock().unwrap().register_client(user_client);
+        let crate::terminal::ipc::ServerResponse::Listed { terminals: listed } =
+            super::super::client::process_request(
+                &candidate,
+                user_client,
+                crate::terminal::ipc::ClientRequest::List,
+            )
+            .unwrap()
+            .0
+        else {
+            panic!("recovery List did not return its live originals");
+        };
+        for &(terminal, _) in &terminals {
+            assert!(listed.iter().any(|entry| entry.session.id == terminal));
+        }
+        assert!(matches!(
+            super::super::client::process_request(
+                &candidate,
+                user_client,
+                crate::terminal::ipc::ClientRequest::ChatList,
+            )
+            .unwrap()
+            .0,
+            crate::terminal::ipc::ServerResponse::ChatListed { .. }
+        ));
 
-    // The predecessor replays that checkpoint: every carried terminal and the
-    // daemon come back, and the conversation that cannot reattach is reported
+        let mut wrong_source = saved.source.clone();
+        wrong_source
+            .launch
+            .recipe
+            .arguments
+            .push("--unissued-recovery-source".into());
+        let refusal = super::super::client::process_request(
+            &candidate,
+            user_client,
+            crate::terminal::ipc::ClientRequest::ChatCloseRetained {
+                session: wrong_source,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            refusal.code,
+            crate::terminal::ipc::ProtocolErrorCode::TerminalUnavailable
+        );
+        assert!(record.root.is_current() && record.holder.is_current());
+        assert_eq!(
+            registry::evidence(&socket, Kind::Native).unwrap(),
+            Some(record.clone())
+        );
+
+        // Issue genuine authority for the exact still-live adopted terminal;
+        // Authenticate must perform its normal descriptor and lineage checks.
+        let agent_client = 7;
+        candidate.lock().unwrap().register_client(agent_client);
+        let agent_source = listed
+            .iter()
+            .find(|entry| entry.session.id == terminals[0].0)
+            .unwrap()
+            .session
+            .clone();
+        let authority = super::super::agent_execution::registry(&candidate)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .fresh_agent_authority(&crate::agent_execution::HostedSession::Terminal(
+                agent_source,
+            ))
+            .unwrap();
+        assert!(matches!(
+            super::super::client::process_request(
+                &candidate,
+                agent_client,
+                crate::terminal::ipc::ClientRequest::Authenticate { authority },
+            )
+            .unwrap()
+            .0,
+            crate::terminal::ipc::ServerResponse::Accepted
+        ));
+        for request in [
+            crate::terminal::ipc::ClientRequest::ChatList,
+            crate::terminal::ipc::ClientRequest::ChatCloseRetained {
+                session: saved.source.clone(),
+            },
+        ] {
+            let refusal = super::super::client::process_request(&candidate, agent_client, request)
+                .unwrap_err();
+            assert_eq!(
+                refusal.code,
+                crate::terminal::ipc::ProtocolErrorCode::PermissionDenied
+            );
+            assert!(record.root.is_current() && record.holder.is_current());
+            assert_eq!(
+                registry::evidence(&socket, Kind::Native).unwrap(),
+                Some(record.clone())
+            );
+        }
+        assert!(matches!(
+            super::super::client::process_request(
+                &candidate,
+                user_client,
+                crate::terminal::ipc::ClientRequest::ChatCloseRetained {
+                    session: saved.source.clone(),
+                },
+            )
+            .unwrap()
+            .0,
+            crate::terminal::ipc::ServerResponse::Accepted
+        ));
+        wait_until(
+            || !record.root.is_current() && !record.holder.is_current(),
+            "exact retained native Close did not reap its original family",
+        );
+        assert!(registry::evidence(&socket, Kind::Native).unwrap().is_none());
+        cleanup.1 = None;
+        assert_eq!(launches(), 1, "no replacement provider was started");
+        assert_eq!(requests("thread/start"), 1, "no replacement conversation");
+        assert_eq!(requests("turn/start"), 0, "no prompt was resent");
+        for &(terminal, pid) in &terminals {
+            let handle = candidate.lock().unwrap().terminals[&terminal]
+                .handle
+                .clone();
+            assert_eq!(
+                handle.close_checked(true),
+                crate::terminal_ipc::TerminalCloseResult::Closed
+            );
+            wait_until(
+                || !original_roots[&terminal].is_current(),
+                "explicit Close did not reap the retained original terminal",
+            );
+            cleanup.0.retain(|owned| *owned != pid);
+        }
+        return;
+    }
+
+    // On independent fresh originals, the predecessor restores the successful
+    // handoff: every carried terminal and the daemon come back, and the
+    // conversation that cannot reattach is reported
     // with its exact evidence instead of taking them all down with it.
     // Had the conversation's paired view fallen back to a relaunch, as when
     // its holder cannot be carried, relaunching it would attach a new client
@@ -919,6 +1120,7 @@ fn upgrade_restore_isolates_a_retained_conversation_whose_rollout_is_missing() {
         );
         wait_until(|| !alive(pid), "closing a terminal did not end it");
     }
+    cleanup.0.clear();
 }
 
 /// Runs `test` again in a private runtime, data and provider home, in `mode`.

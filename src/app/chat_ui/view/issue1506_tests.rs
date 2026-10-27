@@ -1459,11 +1459,16 @@ fn report_details_and_late_find_prepare_original_markdown_and_restore_disclosure
             .clone();
         for temporary_find in [false, true] {
             if temporary_find {
-                drop(app.handle_chat_ui(Action::Find(target, needle.into())));
+                drop(find_navigation::find_for_test(
+                    &mut app,
+                    target,
+                    needle.into(),
+                ));
             } else {
                 drop(app.handle_chat_ui(Action::Toggle(target, "disclosed-report".into())));
             }
             let live = app.chat_runtime_mut(target).unwrap();
+            preparation::drain_fixture(live);
             assert!(
                 live.item_expanded("disclosed-report"),
                 "child={selected_child}, Find={temporary_find}"
@@ -1527,8 +1532,13 @@ fn report_details_and_late_find_prepare_original_markdown_and_restore_disclosure
         // from the compact/full heading and the report body.
         let sender_suffix = "report-sender";
         assert!(!heading.contains(sender_suffix) && !body.contains(sender_suffix));
-        drop(app.handle_chat_ui(Action::Find(target, sender_suffix.into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            sender_suffix.into(),
+        ));
         let live = app.chat_runtime_mut(target).unwrap();
+        preparation::drain_fixture(live);
         assert!(!live.find_matches.is_empty());
         assert!(
             live.item_expanded("disclosed-report"),
@@ -1565,9 +1575,14 @@ fn report_details_and_late_find_prepare_original_markdown_and_restore_disclosure
         // Search restores its own temporary disclosure, never a reader's
         // explicit Details choice, even when no publication arrives.
         drop(app.handle_chat_ui(Action::Toggle(target, "disclosed-report".into())));
-        drop(app.handle_chat_ui(Action::Find(target, needle.into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            needle.into(),
+        ));
         drop(app.handle_chat_ui(Action::CloseFind(target)));
         let live = app.chat_runtime_mut(target).unwrap();
+        preparation::drain_fixture(live);
         assert!(live.item_expanded("disclosed-report"));
         assert!(
             !live.presentation_cache()["disclosed-report"]
@@ -1580,4 +1595,339 @@ fn report_details_and_late_find_prepare_original_markdown_and_restore_disclosure
             live.active_item("disclosed-report").unwrap()
         ));
     }
+}
+
+#[test]
+fn report_async_disclosure_closes_without_resurrection_from_queued_preparation() {
+    let report = task_report(
+        "queued-report",
+        "Agent review finished".into(),
+        format!(
+            "# Full report\n\n{}\n```rust\nlet ready = true;\n```",
+            "body paragraph\n\n".repeat(512)
+        ),
+    );
+    let (mut runtime, handle) = frame_cost::live_runtime(std::slice::from_ref(&report));
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.busy = true;
+    handle.publish_snapshot_for_test(snapshot);
+    runtime.refresh();
+    let target = runtime.target;
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.cards
+        .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+    {
+        let live = app.chat_runtime_mut(target).unwrap();
+        assert!(!live.preparation.contains("queued-report"));
+        assert!(
+            live.presentation_cache()["queued-report"]
+                .markdown
+                .items()
+                .is_empty()
+        );
+    }
+    drop(app.handle_chat_ui(Action::Toggle(target, "queued-report".into())));
+    {
+        let live = app.chat_runtime_mut(target).unwrap();
+        assert!(live.item_expanded("queued-report"));
+        assert!(live.preparation.contains("queued-report"));
+        let cached = &live.presentation_cache()["queued-report"];
+        assert!(cached.preparing && cached.placeholder);
+        assert!(
+            cached.markdown.items().is_empty(),
+            "opening only admits work; UI must not parse it"
+        );
+    }
+    drop(app.handle_chat_ui(Action::Toggle(target, "queued-report".into())));
+    {
+        let live = app.chat_runtime_mut(target).unwrap();
+        assert!(!live.item_expanded("queued-report"));
+        // Complete the already admitted original job after the reader closed
+        // it. The actual Ready handler must discard this now-unwanted body.
+        preparation::drain_fixture(live);
+        let cached = &live.presentation_cache()["queued-report"];
+        assert!(cached.markdown.items().is_empty());
+        assert!(cached.blocks.is_empty());
+        assert_eq!(cached.report_expanded, Some(false));
+        assert!(!live.preparation.contains("queued-report"));
+    }
+    drop(app.handle_chat_ui(Action::Toggle(target, "queued-report".into())));
+    let live = app.chat_runtime_mut(target).unwrap();
+    preparation::drain_fixture(live);
+    let cached = &live.presentation_cache()["queued-report"];
+    assert!(!cached.placeholder && !cached.markdown.items().is_empty());
+    assert!(!cached.blocks.is_empty());
+    assert_eq!(cached.report_expanded, Some(true));
+    assert_eq!(
+        copy_text(CopyPart::Text, &report.content),
+        copy_text(
+            CopyPart::Text,
+            &live.active_item("queued-report").unwrap().content
+        )
+    );
+}
+
+#[test]
+fn busy_report_ready_and_collapse_release_actual_worker_canonical_and_palette() {
+    for selected_child in [false, true] {
+        let report = task_report(
+            "busy-report",
+            "Completed delivery while another operation is working".into(),
+            format!(
+                "{}\n```rust\nlet actual = true;\n```",
+                "Report body\n\n".repeat(512)
+            ),
+        );
+        let (mut runtime, handle) = frame_cost::live_runtime(std::slice::from_ref(&report));
+        let target = runtime.target;
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.busy = !selected_child;
+        if selected_child {
+            let mut agent = child("running-report-owner", ToolStatus::Running, false);
+            agent.items = vec![Arc::new(report.clone())];
+            snapshot.subagents = vec![agent];
+        }
+        handle.publish_snapshot_for_test(snapshot);
+        runtime.refresh();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        if selected_child {
+            drop(app.handle_chat_ui(Action::SelectSubagent(
+                target,
+                Some("running-report-owner".into()),
+            )));
+        }
+        drop(app.handle_chat_ui(Action::Toggle(target, "busy-report".into())));
+        let palette = {
+            let live = app.chat_runtime_mut(target).unwrap();
+            preparation::drain_fixture(live);
+            assert!(live.item_expanded("busy-report"));
+            let cached = &live.presentation_cache()["busy-report"];
+            assert!(!cached.placeholder && !cached.markdown.items().is_empty());
+            let palette = Arc::downgrade(cached.blocks.values().next().unwrap().spans(false));
+            assert!(palette.upgrade().is_some());
+            assert!(
+                !live.preparation.contains("busy-report"),
+                "a finite Report Ready removes the Shared/canonical owner even while busy"
+            );
+            palette
+        };
+        drop(app.handle_chat_ui(Action::Toggle(target, "busy-report".into())));
+        preparation::retirement_barrier();
+        let live = app.chat_runtime_mut(target).unwrap();
+        assert!(!live.item_expanded("busy-report"));
+        assert!(
+            live.presentation_cache()["busy-report"]
+                .markdown
+                .items()
+                .is_empty()
+        );
+        assert!(live.presentation_cache()["busy-report"].blocks.is_empty());
+        assert!(!live.preparation.contains("busy-report"));
+        assert!(
+            palette.upgrade().is_none(),
+            "actual shared syntax spans must be released"
+        );
+        assert_eq!(
+            copy_text(CopyPart::Text, &report.content),
+            copy_text(
+                CopyPart::Text,
+                &live.active_item("busy-report").unwrap().content
+            ),
+        );
+        // A closed same-ID replacement remains unparsed until disclosure;
+        // reopening must admit the new original, never the retired canonical.
+        let replacement = task_report(
+            "busy-report",
+            "Replacement delivery".into(),
+            "NEW_REPORT_SOURCE_AFTER_CLOSE".into(),
+        );
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        if selected_child {
+            snapshot.subagents[0].items = vec![Arc::new(replacement.clone())];
+        } else {
+            snapshot.items = vec![Arc::new(replacement.clone())];
+        }
+        handle.publish_snapshot_for_test(snapshot);
+        live.refresh();
+        assert!(
+            live.presentation_cache()["busy-report"]
+                .markdown
+                .items()
+                .is_empty()
+        );
+        assert!(!live.preparation.contains("busy-report"));
+        drop(app.handle_chat_ui(Action::Toggle(target, "busy-report".into())));
+        let live = app.chat_runtime_mut(target).unwrap();
+        preparation::drain_fixture(live);
+        assert!(!live.preparation.contains("busy-report"));
+        assert!(
+            report_surface(live, "busy-report")
+                .text
+                .iter()
+                .any(|text| text.contains("NEW_REPORT_SOURCE_AFTER_CLOSE"))
+        );
+        assert_eq!(
+            copy_text(
+                CopyPart::Text,
+                &live.active_item("busy-report").unwrap().content
+            ),
+            copy_text(CopyPart::Text, &replacement.content)
+        );
+    }
+}
+
+#[test]
+fn diagnostic_preview_widget_and_catalog_share_bounded_text_but_copy_keeps_full_original() {
+    use iced::advanced::{
+        Layout, layout,
+        widget::{Operation, Tree},
+    };
+    use iced::futures::StreamExt;
+    let raw = format!(
+        "{}\n{}\nFULL_ORIGINAL_END",
+        quota("1:30pm", "bounded-selection"),
+        "raw diagnostic ".repeat(8192)
+    );
+    let (runtime, _handle) =
+        frame_cost::live_runtime(&[provider_error("bounded-error", Provider::Claude, &raw)]);
+    let target = runtime.target;
+    let key = runtime.failure_ui.incidents[0].key.clone();
+    assert!(runtime.selection_document().0.is_empty());
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.cards
+        .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+    drop(app.handle_chat_ui(Action::ToggleFailure(target, key.clone())));
+    let preview_owner = {
+        let live = app.chat_runtime_mut(target).unwrap();
+        let preview = live.failure_preview(&key).unwrap().0.to_owned();
+        assert_eq!(preview.len(), 8192);
+        assert!(!preview.contains("FULL_ORIGINAL_END"));
+        let (catalog, bookmark) = live.selection_document();
+        assert_eq!(catalog.search_blocks().len(), 1);
+        let identity = failure::diagnostic_preview_identity(&key);
+        let text = catalog
+            .text(identity)
+            .expect("actual visible preview catalog entry");
+        assert_eq!(text.as_ref(), preview);
+        let weak = Arc::downgrade(&text);
+        let (start, end) = catalog.endpoints().unwrap();
+        assert_eq!(catalog.copy(start, end).as_deref(), Some(preview.as_str()));
+        let incident = &live.failure_ui.incidents[0];
+        let mut element = selection::transcript_virtualized(
+            live.failure_view(incident),
+            target,
+            None,
+            catalog,
+            bookmark,
+        );
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(480.0, 900.0)),
+        );
+        #[derive(Default)]
+        struct PreviewNodes(Vec<(u64, String)>);
+        impl Operation for PreviewNodes {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn custom(
+                &mut self,
+                _: Option<&iced::advanced::widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                if let Some(prose) = state.downcast_ref::<selectable_prose::State>()
+                    && let Some(logical) = &prose.logical
+                {
+                    self.0.push((logical.identity, prose.plain.to_string()));
+                }
+            }
+        }
+        let mut actual = PreviewNodes::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut actual);
+        assert_eq!(actual.0, vec![(identity, preview)]);
+        weak
+    };
+    let task = app.handle_chat_ui(Action::CopyFailure(target, key.clone()));
+    let copied = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut effects =
+                iced::runtime::task::into_stream(task).expect("actual CopyFailure action");
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while let Some(effect) = effects.next().await {
+                    if let iced::runtime::Action::Clipboard(
+                        iced::runtime::clipboard::Action::Write { contents, .. },
+                    ) = effect
+                    {
+                        return contents;
+                    }
+                }
+                panic!("CopyFailure must publish complete originals");
+            })
+            .await
+            .expect("bounded clipboard action")
+        });
+    assert_eq!(copied, raw);
+    drop(app.handle_chat_ui(Action::ToggleFailure(target, key)));
+    let live = app.chat_runtime_mut(target).unwrap();
+    assert!(live.selection_document().0.is_empty());
+    preparation::retirement_barrier();
+    assert!(
+        preview_owner.upgrade().is_none(),
+        "closed preview must leave no catalog plaintext owner"
+    );
+}
+
+#[test]
+fn hidden_diagnostic_metadata_releases_exact_source_and_restores_disclosure_on_rehydrate() {
+    let raw = format!(
+        "{}\n{}",
+        quota("1:30pm", "hidden-metadata"),
+        "original-diagnostic ".repeat(8192)
+    );
+    let (mut runtime, handle) =
+        frame_cost::live_runtime(&[provider_error("hidden-error", Provider::Claude, &raw)]);
+    let original = runtime.snapshot.items[0].clone();
+    let weak = Arc::downgrade(&original);
+    let key = runtime.failure_ui.incidents[0].key.clone();
+    runtime.failure_ui.expanded.insert(key.clone());
+    runtime.cache_failure_preview(&key);
+    assert!(runtime.failure_preview(&key).is_some());
+    drop(original);
+    runtime.set_visible(false).unwrap();
+    preparation::retirement_barrier();
+    assert!(runtime.failure_ui.incidents.is_empty());
+    assert!(runtime.failure_preview(&key).is_none());
+    assert!(runtime.failure_ui.expanded.contains(&key));
+    assert!(
+        weak.upgrade().is_none(),
+        "diagnostic metadata must not retain the hidden original item"
+    );
+    runtime.set_visible(true).unwrap();
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.items = vec![Arc::new(provider_error(
+        "hidden-error",
+        Provider::Claude,
+        &raw,
+    ))];
+    handle.publish_snapshot_for_test(snapshot);
+    runtime.refresh();
+    assert_eq!(runtime.failure_ui.incidents[0].key, key);
+    assert!(runtime.failure_ui.expanded.contains(&key));
+    assert_eq!(runtime.failure_details(&key).as_deref(), Some(raw.as_str()));
+    assert!(runtime.failure_preview(&key).is_some());
 }
