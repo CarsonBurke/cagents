@@ -1,5 +1,7 @@
 #![cfg(target_os = "linux")]
 //! CLI-only behavior: reads can refuse startup even when a launchable sibling exists.
+#[path = "support/user_fixture.rs"]
+mod user_fixture;
 use cagents::process::{
     CancellationToken, CommandSpec, ProcessExecutor, ProcessOutput, SystemProcessExecutor,
 };
@@ -88,6 +90,9 @@ impl Fixture {
 
 #[test]
 fn every_read_can_skip_daemon_start_through_flag_or_environment() {
+    if !user_fixture::enter() {
+        return;
+    }
     let fixture = Fixture::new();
     for environment in [false, true] {
         for args in [
@@ -119,6 +124,9 @@ fn every_read_can_skip_daemon_start_through_flag_or_environment() {
 
 #[test]
 fn stopping_an_absent_daemon_twice_succeeds_and_has_a_stable_shape() {
+    if !user_fixture::enter() {
+        return;
+    }
     let fixture = Fixture::new();
     for _ in 0..2 {
         let output = fixture.output(&["daemon", "stop"], false);
@@ -147,6 +155,9 @@ fn configure_remote_fixture(fixture: &Fixture, failing_ssh: bool) {
 
 #[test]
 fn remote_stop_is_idempotent_and_no_start_reads_report_remote_absence() {
+    if !user_fixture::enter() {
+        return;
+    }
     let fixture = Fixture::new();
     configure_remote_fixture(&fixture, false);
     let path = format!(
@@ -190,6 +201,9 @@ fn remote_stop_is_idempotent_and_no_start_reads_report_remote_absence() {
 
 #[test]
 fn a_genuine_ssh_failure_is_not_an_already_stopped_remote_daemon() {
+    if !user_fixture::enter() {
+        return;
+    }
     let fixture = Fixture::new();
     configure_remote_fixture(&fixture, true);
     let path = format!(
@@ -210,6 +224,9 @@ fn a_genuine_ssh_failure_is_not_an_already_stopped_remote_daemon() {
 
 #[test]
 fn unresolved_runtime_is_an_error_rather_than_an_already_stopped_daemon() {
+    if !user_fixture::enter() {
+        return;
+    }
     let fixture = Fixture::new();
     for runtime in [None, Some("relative-runtime")] {
         let mut command = fixture
@@ -232,6 +249,9 @@ fn unresolved_runtime_is_an_error_rather_than_an_already_stopped_daemon() {
 
 #[test]
 fn a_closed_listener_with_a_held_inventory_lease_is_not_daemon_absence() {
+    if !user_fixture::enter() {
+        return;
+    }
     use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
     let fixture = Fixture::new();
     let runtime = fixture
@@ -277,6 +297,9 @@ fn a_closed_listener_with_a_held_inventory_lease_is_not_daemon_absence() {
 
 #[test]
 fn no_start_daemon_start_still_requires_a_protocol_handshake() {
+    if !user_fixture::enter() {
+        return;
+    }
     use std::{
         os::unix::net::UnixListener,
         sync::{

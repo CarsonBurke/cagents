@@ -6401,7 +6401,8 @@ impl Cagents {
         snapshot.permission_mode =
             draft_permission_mode(&session.launch.recipe, session.launch.provider);
         let target = self.chat_ui.next_target(card);
-        let visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible);
+        let visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible)
+            && self.workspace_surfaces_visible();
         let mut runtime = Runtime::draft(
             target,
             session,
@@ -17850,6 +17851,355 @@ mod tests {
         );
     }
 
+    // Tasks are deliberately dropped: these fixtures only cross the actual
+    // app reducers and never connect to a daemon or start a provider.
+    fn open_work_over_chat(app: &mut Cagents) {
+        let channel = crate::model::ChannelId::new();
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        app.workspace_model
+            .channels
+            .push(crate::workspace_model::ModelChannel {
+                id: channel,
+                repository: FIXTURE_DIRECTORY.into(),
+                title: "Chat input fixture".into(),
+                title_source: Default::default(),
+                ordinal: 1,
+            });
+        drop(app.open_channel_work(channel));
+        assert!(app.channel_work_is_main());
+        assert!(!app.workspace_surfaces_visible());
+    }
+
+    fn return_to_chat(app: &mut Cagents) {
+        let owner = app.channel_work.view.owner().unwrap();
+        drop(app.update_channel_work(crate::channel_work_ui::Action::Close(owner)));
+        assert!(!app.channel_work_is_main());
+        assert!(app.workspace_surfaces_visible());
+    }
+
+    /// Retain a real composer callback before switching away from its pane.
+    fn queued_composer_key(
+        app: &Cagents,
+        card: CardId,
+        event: keyboard::Event,
+        renderer: &cosmic::Renderer,
+    ) -> Vec<Message> {
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+        let viewport = iced::Rectangle::with_size(iced::Size::new(760.0, 720.0));
+        let mut element = app.chat_view(card);
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            renderer,
+            &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+        );
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            renderer,
+            &mut iced::advanced::widget::operation::focusable::focus::<()>(card_control_id(
+                card,
+                "chat-composer",
+            )),
+        );
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &iced::Event::Keyboard(event),
+            Layout::new(&node),
+            iced::mouse::Cursor::Unavailable,
+            renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &viewport,
+        );
+        messages
+    }
+
+    #[test]
+    fn main_work_refuses_queued_native_composer_edits_and_submit_but_conversations_accepts_them() {
+        let renderer = crate::app::tests::headless_renderer();
+        for started in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = if started {
+                live_chat(&mut app, Some(KNOWN_THREAD))
+            } else {
+                draft_chat(&mut app)
+            };
+            write(&mut app, card, "unsent");
+            let character = || keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character("x".into()),
+                modified_key: keyboard::Key::Character("x".into()),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyX),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: Some("x".into()),
+                repeat: false,
+            };
+            let enter =
+                || permission_key(keyboard::key::Named::Enter, keyboard::Modifiers::empty());
+            let queued_edit = queued_composer_key(&app, card, character(), &renderer);
+            let queued_submit = queued_composer_key(&app, card, enter(), &renderer);
+            assert!(queued_edit.iter().any(|message| matches!(
+                message,
+                Message::ChatUi(Action::Composer(_, action)) if action.is_edit()
+            )));
+            assert!(queued_submit.iter().any(|message| matches!(
+                message,
+                Message::ChatUi(Action::Submit(_, PromptMode::Send))
+            )));
+            let revision = chat_runtime(&app, card).revision;
+
+            open_work_over_chat(&mut app);
+            for message in queued_edit.into_iter().chain(queued_submit) {
+                drop(app.update(message));
+            }
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.composer.text(), "unsent");
+            assert_eq!(runtime.revision, revision);
+            assert!(runtime.pending.is_none() && runtime.queued.is_none());
+            assert!(!app.chat_start_pending(card));
+
+            return_to_chat(&mut app);
+            for message in queued_composer_key(&app, card, character(), &renderer) {
+                drop(app.update(message));
+            }
+            assert_eq!(chat_runtime(&app, card).composer.text(), "unsentx");
+            for message in queued_composer_key(&app, card, enter(), &renderer) {
+                drop(app.update(message));
+            }
+            if started {
+                assert!(
+                    chat_runtime(&app, card).pending.is_some(),
+                    "the visible chat can send"
+                );
+            } else {
+                assert!(app.chat_start_pending(card), "the visible draft can start");
+                assert!(chat_runtime(&app, card).queued.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn main_work_keeps_accepted_paste_bookmarks_and_submission_completions_live() {
+        let _admission = attachment_draft::test_admission();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1_600.0),
+        }));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        let target = chat_runtime(&app, card).target;
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        write(&mut app, card, "accepted ");
+        let bookmark = app
+            .chat_runtime_mut(target)
+            .unwrap()
+            .begin_attachment_insert();
+        submit(&mut app, card);
+        assert_eq!(
+            chat_runtime(&app, card).submit_after_paste,
+            Some(PromptMode::Send)
+        );
+        assert!(chat_runtime(&app, card).pending.is_none());
+
+        open_work_over_chat(&mut app);
+        drop(app.update(Message::ChatUi(Action::PastedText(
+            target,
+            bookmark,
+            Some("paste".into()),
+        ))));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.pastes_pending, 0);
+        assert!(runtime.attachment_bookmarks.is_empty());
+        assert_eq!(runtime.submit_after_paste, None);
+        assert_eq!(runtime.composer.text(), "accepted paste");
+        assert!(
+            runtime.pending.is_some(),
+            "the previously accepted send continues"
+        );
+        assert!(!runtime.visible.load(Ordering::Relaxed));
+        assert_eq!(
+            runtime.pending.as_ref().unwrap().sent.as_deref(),
+            Some("accepted paste")
+        );
+
+        settle(&mut app, card, Ok(()));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.pending.is_none());
+        assert_eq!(runtime.composer.text(), "");
+        assert!(!runtime.visible.load(Ordering::Relaxed));
+        assert!(app.channel_work_is_main());
+
+        // Hidden transcript-derived history is disposable. The daemon hydrates
+        // it again only after the reader returns to the actual visible pane.
+        return_to_chat(&mut app);
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.visible.load(Ordering::Relaxed));
+        assert_eq!(runtime.target, target);
+        assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
+        let mut hydrated = (*handle.snapshot()).clone();
+        hydrated.generation = hydrated.generation.checked_add(1).unwrap();
+        hydrated.items = vec![Arc::new(chat::Item {
+            id: "accepted-paste".into(),
+            role: chat::Role::User,
+            content: text("accepted paste"),
+            started_at: None,
+            at: None,
+        })];
+        handle.replace_snapshot_for_test(hydrated);
+        drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Changed))));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        preparation::drain_fixture(runtime);
+        assert_eq!(
+            runtime.history.last().map(String::as_str),
+            Some("accepted paste")
+        );
+    }
+
+    #[test]
+    fn late_ready_attaches_behind_main_work_then_returns_to_visible_conversations() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = starting_chat(&mut app);
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1_600.0),
+        }));
+        open_work_over_chat(&mut app);
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+
+        answer_start(&mut app, target, Ok(handle.clone()));
+        assert!(app.chat_ui.attempt(card).is_none(), "Ready is consumed");
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.target, target);
+        assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
+        assert!(!runtime.visible.load(Ordering::Relaxed));
+        assert!(
+            runtime.pending.is_some(),
+            "the accepted first prompt continues"
+        );
+        // Accepted work can retain client updates while hidden. Once its
+        // original send settles, presentation must remain hidden too.
+        settle(&mut app, card, Ok(()));
+        assert!(chat_runtime(&app, card).queued.is_none());
+        assert!(!handle.is_visible_for_test());
+
+        return_to_chat(&mut app);
+        assert!(chat_runtime(&app, card).visible.load(Ordering::Relaxed));
+        assert!(handle.is_visible_for_test());
+        assert!(Arc::ptr_eq(
+            chat_runtime(&app, card).handle().unwrap(),
+            &handle
+        ));
+    }
+
+    #[test]
+    fn a_draft_opened_by_late_recovery_stays_hidden_under_main_work() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, None);
+        let session = chat_runtime(&app, card).session.clone();
+        app.chat_forget(card);
+        app.cards.insert(card, CardRuntime::Loading);
+        drop(app.open_chat(card, session, chat::Intent::Restore));
+        let target = chat_runtime_attempt(&app, card);
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1_600.0),
+        }));
+        open_work_over_chat(&mut app);
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+
+        answer_start(
+            &mut app,
+            target,
+            Err(chat::StartFailure::fresh("fixture: no prior conversation")),
+        );
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.is_draft());
+        assert!(!runtime.visible.load(Ordering::Relaxed));
+        assert!(!app.chat_start_pending(card));
+
+        return_to_chat(&mut app);
+        assert!(chat_runtime(&app, card).visible.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn offscreen_late_ready_stays_hidden_when_main_work_returns_to_conversations() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = starting_chat(&mut app);
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1_600.0),
+        }));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        for _ in 0..5 {
+            draft_chat(&mut app);
+        }
+        // Advance ordinary frames so native scrolling observes settled pane
+        // geometry, rather than guessing a width or changing exposure flags.
+        let frame = Instant::now();
+        for step in 0..=4 {
+            drop(app.update(Message::Frame(frame + Duration::from_millis(step * 250))));
+        }
+        let width = app.workspace.viewport_width();
+        let offset = app.workspace.geometry().max_offset(width);
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Scrolled(workspace_widget::ViewportSample {
+                offset,
+                width,
+                user_input: true,
+            }),
+        }));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Offscreen)
+        );
+        assert_eq!(app.card_state(card).unwrap().exposure, Exposure::Offscreen);
+
+        open_work_over_chat(&mut app);
+        answer_start(&mut app, target, Ok(handle.clone()));
+        assert!(app.chat_ui.attempt(card).is_none(), "Ready is consumed");
+        assert!(Arc::ptr_eq(
+            chat_runtime(&app, card).handle().unwrap(),
+            &handle
+        ));
+        assert!(chat_runtime(&app, card).pending.is_some());
+        assert!(!chat_runtime(&app, card).visible.load(Ordering::Relaxed));
+        settle(&mut app, card, Ok(()));
+
+        return_to_chat(&mut app);
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Offscreen)
+        );
+        assert!(!chat_runtime(&app, card).visible.load(Ordering::Relaxed));
+        assert!(!handle.is_visible_for_test());
+        assert!(Arc::ptr_eq(
+            chat_runtime(&app, card).handle().unwrap(),
+            &handle
+        ));
+    }
+
     /// A new conversation whose start, for its first message, is still in
     /// flight.
     fn starting_chat(app: &mut Cagents) -> (CardId, Target) {
@@ -20556,6 +20906,12 @@ mod tests {
     /// either order, including when its chat never got as far as starting.
     #[test]
     fn a_channel_closes_when_its_last_pane_does() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        use crate::workspace_model::{
+            ModelChannel, ModelEdit, ModelProject,
+            views::{Pane, Scope, View},
+        };
+
         for (chat_first, chat_state) in [(true, 0), (true, 1), (true, 2), (false, 0), (false, 2)] {
             let mut app = crate::app::tests::context_inspector_test_app(true);
             let terminal = app.workspace.focused().unwrap();
@@ -20563,14 +20919,24 @@ mod tests {
             app.cards
                 .insert(terminal, CardRuntime::Failed("fixture".into()));
             let channel = crate::model::ChannelId::new();
+            let project = ProjectId::new();
+            let repository = PathBuf::from(FIXTURE_DIRECTORY);
+            app.sidebar_model.projects.push(SidebarProject::new(
+                project,
+                RepositoryId::new(),
+                "Fixture project".into(),
+                repository.clone(),
+                Vec::new(),
+                Vec::new(),
+            ));
             let durable = Arc::make_mut(&mut app.durable);
             durable.channels.push(crate::model::ProjectChannel {
                 title_source: Default::default(),
                 id: channel,
-                project_id: crate::model::ProjectId::new(),
+                project_id: project,
                 title: String::new(),
-                ordinal: 0,
-                shared: false,
+                ordinal: 4,
+                shared: true,
                 cards: vec![terminal],
                 focused: Some(terminal),
             });
@@ -20582,6 +20948,47 @@ mod tests {
                 1 => failed_chat(&mut app),
                 _ => live_chat(&mut app, Some("thread")),
             };
+            // A confirmed canonical Home, rather than an unregistered local
+            // channel: only its authoritative disappearance permits retirement.
+            let home = crate::channel_work::Home {
+                registry: uuid::Uuid::new_v4(),
+                channel,
+                creation_ordinal: 4,
+            };
+            let scope = Scope::Channel(channel);
+            app.workspace_model.identity = home.registry;
+            app.workspace_model.sequence = 10;
+            app.workspace_model.projects.push(ModelProject {
+                repository: repository.clone(),
+                name: "Fixture project".into(),
+                kind: ProjectKind::Folder,
+                ordinal: 1,
+            });
+            app.workspace_model.channels.push(ModelChannel {
+                id: channel,
+                repository,
+                title: String::new(),
+                title_source: Default::default(),
+                ordinal: home.creation_ordinal,
+            });
+            let panes = [terminal, chat]
+                .into_iter()
+                .map(|card| Pane::from_card(app.card_state(card).unwrap(), None).unwrap())
+                .collect();
+            app.workspace_model.views.push(View {
+                scope: scope.clone(),
+                revision: 7,
+                panes,
+                retired: Vec::new(),
+            });
+            let (publish, published) = async_channel::unbounded();
+            app.workspace_model_tx = publish;
+            let occupied = app.workspace_model.clone();
+            drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+                scope: scope.clone(),
+                operation: None,
+                model: occupied,
+            }));
             let channel_exists = |app: &Cagents| {
                 app.durable
                     .channels
@@ -20593,7 +21000,7 @@ mod tests {
             } else {
                 (terminal, chat)
             };
-            for (index, card) in [first, second].into_iter().enumerate() {
+            for card in [first, second] {
                 if card == chat {
                     close_chat(&mut app, card);
                 } else {
@@ -20601,12 +21008,71 @@ mod tests {
                     let _ = app.update(Message::CommitClose(card));
                     assert!(!app.workspace.order().any(|id| id == card));
                 }
-                assert_eq!(
+                assert!(
                     channel_exists(&app),
-                    index == 0,
-                    "chat first: {chat_first}, chat state: {chat_state}"
+                    "no eager deletion before canonical empty-view proof: chat first: {chat_first}, chat state: {chat_state}"
                 );
             }
+            assert!(!app.channel_ui.was_deleted(channel));
+            assert!(app.channel_work.retire_candidates.contains(&home));
+            let mut before_ack = Vec::new();
+            while let Ok(edit) = published.try_recv() {
+                before_ack.push(edit);
+            }
+            assert!(
+                !before_ack
+                    .iter()
+                    .any(|edit| matches!(edit, ModelEdit::RetireEmptyChannel { .. })),
+                "the occupied canonical view cannot authorize retirement: {before_ack:?}"
+            );
+
+            let mut settled = app.workspace_model.clone();
+            settled.sequence = 11;
+            let view = settled
+                .views
+                .iter_mut()
+                .find(|view| view.scope == scope)
+                .unwrap();
+            view.panes.clear();
+            view.retired = vec![terminal, chat];
+            view.revision = 8;
+            drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+                scope,
+                operation: None,
+                model: settled.clone(),
+            }));
+            let mut after_ack = Vec::new();
+            while let Ok(edit) = published.try_recv() {
+                after_ack.push(edit);
+            }
+            let retire_requests = after_ack
+                .iter()
+                .filter_map(|edit| match edit {
+                    ModelEdit::RetireEmptyChannel {
+                        home,
+                        expected_view_revision,
+                    } => Some((*home, *expected_view_revision)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(retire_requests, vec![(home, 8)], "{after_ack:?}");
+
+            // These are explicit App model-reply fixtures, not an executed
+            // daemon or Work DB. HOST integration owns the actual ledger check.
+            // A retained-Work reply preserves the confirmed empty Home.
+            settled.sequence = 12;
+            drop(app.apply_workspace_model_update(ModelUpdate::Read(settled.clone())));
+            assert!(channel_exists(&app));
+            assert!(!app.channel_ui.was_deleted(channel));
+            assert!(!app.channel_has_open_card(channel));
+            // An authoritative no-work retirement reply removes that same Home.
+            settled.sequence = 13;
+            settled.channels.retain(|entry| entry.id != channel);
+            settled
+                .views
+                .retain(|view| view.scope != Scope::Channel(channel));
+            drop(app.apply_workspace_model_update(ModelUpdate::Read(settled)));
+            assert!(!channel_exists(&app));
             assert!(app.channel_ui.was_deleted(channel));
         }
     }
@@ -21809,6 +22275,212 @@ mod tests {
             );
             assert!(!app.chat_ui.removed_accounts.contains(&card));
         }
+    }
+
+    #[test]
+    fn confirmed_account_replacement_retires_only_predecessor_attention_without_acknowledging_it() {
+        use crate::agent::ActivityState;
+
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        app.refresh_ui.focused = false;
+        let old_target = chat_runtime(&app, card).target;
+        let old_handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let mut source = chat_runtime(&app, card).session.clone();
+        source
+            .launch
+            .recipe
+            .environment
+            .insert("CODEX_HOME".into(), "/removed-account".into());
+        app.install_chat_session(card, source.clone());
+        let other = crate::app::tests::terminal_card_state();
+        let unrelated = other.id;
+        Arc::make_mut(&mut app.durable).cards.push(other);
+        app.sidebar_state.observe_card_update(unrelated);
+        let old_notice = uuid::Uuid::new_v4();
+        let journal = |id, session| crate::notifications::Snapshot {
+            diagnostic: None,
+            notices: vec![crate::notifications::Notice {
+                id,
+                delivered: true,
+                acknowledged: false,
+                window: None,
+                event: crate::notifications::Event {
+                    content: None,
+                    target: crate::notifications::Target::Session(session),
+                    source_session: Some(session),
+                    provider: Some(Provider::Codex),
+                    directory: Some(source.launch.recipe.working_directory.clone()),
+                    destination: None,
+                    evidence: crate::notifications::Evidence {
+                        key: "account-replacement-unread".into(),
+                        kind: crate::notifications::Kind::Succeeded,
+                    },
+                },
+            }],
+        };
+        let old_journal = journal(old_notice, source.id);
+        drop(
+            app.update(Message::NotificationUi(notification_ui::Action::Snapshot(
+                old_journal.clone(),
+            ))),
+        );
+        assert!(old_handle.observe_activity_for_test(ActivityState::Waiting));
+        drop(app.update(Message::ChatUi(Action::Wake(old_target, Wake::Activity))));
+        let waiting = Activity {
+            provider: Provider::Codex,
+            state: ActivityState::Waiting,
+        };
+        assert_eq!(app.sidebar_state.card_activity(card), Some(waiting));
+        assert!(app.sidebar_state.has_card_update(card));
+        // Metadata on the same UUID must not spend that actor's attention.
+        let mut metadata = source.clone();
+        metadata.proof = None;
+        app.install_chat_session(card, metadata);
+        assert_eq!(app.sidebar_state.card_activity(card), Some(waiting));
+        assert!(app.sidebar_state.has_card_update(card));
+        app.install_chat_session(card, source.clone());
+
+        let directory = tempfile::tempdir().unwrap();
+        let (writer, _) = crate::session::SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("account-attention"),
+        )
+        .unwrap();
+        app.session = Some(writer);
+        app.persist();
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(10))
+            .unwrap();
+        app.chat_forget(card);
+        app.cards.insert(card, CardRuntime::Loading);
+        drop(app.open_chat(card, source.clone(), chat::Intent::Restore));
+        let target = chat_runtime_attempt(&app, card);
+        answer_start(
+            &mut app,
+            target,
+            Err(chat::StartFailure {
+                message: "The saved account was removed".into(),
+                recovery: chat::Recovery::Account,
+            }),
+        );
+        assert!(app.chat_ui.removed_accounts.contains(&card));
+        assert!(app.sidebar_state.has_card_update(card));
+        let activity_before = app.sidebar_state.card_activity(card);
+        let system = Account::system(Provider::Codex).id();
+        // Failed and wrong-conversation candidates never install a new source.
+        for wrong_thread in [false, true] {
+            drop(app.update(Message::ChatUi(Action::RecoverAccount(
+                card,
+                system.clone(),
+            ))));
+            let target = chat_runtime_attempt(&app, card);
+            assert_ne!(app.chat_ui.attempt(card).unwrap().session.id, source.id);
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(source.clone())
+            );
+            assert_eq!(app.sidebar_state.card_activity(card), activity_before);
+            assert!(app.sidebar_state.has_card_update(card));
+            if wrong_thread {
+                let handle = fixture_handle(&app, card, Some("different-conversation"));
+                answer_start(&mut app, target, Ok(handle));
+            } else {
+                answer_start(
+                    &mut app,
+                    target,
+                    Err(chat::StartFailure::retry("fixture refusal")),
+                );
+            }
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(source.clone())
+            );
+            assert_eq!(app.sidebar_state.card_activity(card), activity_before);
+            assert!(app.sidebar_state.has_card_update(card));
+            assert!(!app.notification_ui.acknowledged_for_test(old_notice));
+            let retirement = retired(&mut app, card);
+            drop(app.update(Message::ChatUi(Action::Retired(retirement, Ok(())))));
+        }
+        let focused = app.workspace.focused();
+        let durable_focused = app.durable.focused;
+        drop(app.update(Message::ChatUi(Action::RecoverAccount(card, system))));
+        let target = chat_runtime_attempt(&app, card);
+        // The existing handle fixture supplies the confirmed session; the
+        // ordered writer and AccountCommitted path are real, not a forged ACK.
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        let replacement = handle.session();
+        assert_ne!(replacement.id, source.id);
+        let task = app.update(Message::ChatUi(Action::Ready(
+            target,
+            Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+        )));
+        assert!(app.chat_start_pending(card));
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(source.clone())
+        );
+        assert_eq!(app.sidebar_state.card_activity(card), activity_before);
+        assert!(app.sidebar_state.has_card_update(card));
+        let reply = account_commit_reply(task);
+        assert!(matches!(
+            &reply,
+            Message::ChatUi(Action::AccountCommitted(_, _, Ok(())))
+        ));
+        let store = app.session.as_ref().unwrap().operation_store();
+        assert_eq!(
+            store.load_card(card, None).unwrap().unwrap().kind,
+            CardKind::Chat(replacement.clone())
+        );
+        // Even a genuinely committed receipt has not installed the UI identity
+        // until the normal reducer accepts that exact completion.
+        assert!(app.sidebar_state.has_card_update(card));
+        drop(app.update(reply));
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(replacement.clone())
+        );
+        assert_eq!(replacement.launch.session_id, source.launch.session_id);
+        assert!(!app.chat_start_pending(card));
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert_eq!(
+            app.sidebar_state.card_activity(card),
+            Some(Activity {
+                provider: Provider::Codex,
+                state: ActivityState::Idle,
+            })
+        );
+        assert!(app.sidebar_state.has_card_update(unrelated));
+        assert_eq!(app.workspace.focused(), focused);
+        assert_eq!(app.durable.focused, durable_focused);
+        assert!(!app.notification_ui.acknowledged_for_test(old_notice));
+        let current_target = chat_runtime(&app, card).target;
+        drop(app.update(Message::ChatUi(Action::Wake(old_target, Wake::Activity))));
+        assert_eq!(chat_runtime(&app, card).target, current_target);
+        drop(
+            app.update(Message::NotificationUi(notification_ui::Action::Snapshot(
+                old_journal,
+            ))),
+        );
+        assert!(
+            !app.sidebar_state.has_card_update(card),
+            "late predecessor news cannot rebind"
+        );
+        assert!(!app.notification_ui.acknowledged_for_test(old_notice));
+        let fresh_notice = uuid::Uuid::new_v4();
+        drop(
+            app.update(Message::NotificationUi(notification_ui::Action::Snapshot(
+                journal(fresh_notice, replacement.id),
+            ))),
+        );
+        assert!(
+            app.sidebar_state.has_card_update(card),
+            "current actor news remains usable"
+        );
+        assert!(app.sidebar_state.has_card_update(unrelated));
+        assert!(!app.notification_ui.acknowledged_for_test(fresh_notice));
     }
 
     /// A conversation an earlier version started for a chat nobody wrote in
@@ -26079,6 +26751,7 @@ mod tests {
         show_chat_snapshot_for_test(&mut app, card, first);
         let runtime = app.chat_runtime_mut(target).unwrap();
         let handle = runtime.handle().unwrap().clone();
+        let client_retired = handle.observe_snapshot_retirement_for_test();
         runtime.replace_draft(text_editor::Content::with_text("Unsent draft"));
         runtime.selected_subagent = Some("child".into());
         let plain: Arc<str> = Arc::from("Rendered selected child words\n".repeat(4096));
@@ -26115,6 +26788,11 @@ mod tests {
         assert!(!runtime.cache.is_empty());
         runtime.set_visible(false).unwrap();
         preparation::retirement_barrier();
+        // Client publications retire on a separate worker. Waiting for UI
+        // presentation disposal alone does not establish body reclamation.
+        client_retired
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the hidden client's exact publication must retire");
         assert!(runtime.cache.is_empty());
         assert!(runtime.selection_document.borrow().is_none());
         assert!(

@@ -180,10 +180,16 @@ impl Reservation {
                 }
             }
             for session in state.chat_spawning.values() {
-                hosted.push(("A starting chat", session.launch.recipe.working_directory.clone()));
+                hosted.push((
+                    "A starting chat",
+                    session.launch.recipe.working_directory.clone(),
+                ));
             }
             for binding in state.chat_bindings.values() {
-                hosted.push(("An agent being adopted", binding.working_directory().to_owned()));
+                hosted.push((
+                    "An agent being adopted",
+                    binding.working_directory().to_owned(),
+                ));
             }
             for handoff in state.chat_handoffs.values() {
                 for directory in handoff.working_directories() {
@@ -248,7 +254,9 @@ impl Reservation {
             Ok(Some((pid, name))) => Err(format!(
                 "{name} (process {pid}) is using this worktree; close it and retry"
             )),
-            Err(error) => Err(format!("Cannot check processes using the worktree: {error}")),
+            Err(error) => Err(format!(
+                "Cannot check processes using the worktree: {error}"
+            )),
         }
     }
 
@@ -324,8 +332,7 @@ pub(super) fn admit(
     Ok(())
 }
 
-const STARTING_INSIDE: &str =
-    "This worktree is being removed. Start the session somewhere else, or wait for the removal to finish.";
+const STARTING_INSIDE: &str = "This worktree is being removed. Start the session somewhere else, or wait for the removal to finish.";
 
 /// Refuses a launch whose working directory lies in a worktree being removed.
 /// Caller holds shared control admission through the launch it checks.

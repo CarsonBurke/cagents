@@ -11,6 +11,7 @@ use std::{
 use uuid::Uuid;
 
 use super::{
+    notification_event, notifications,
     precheck::worker::{Request, Status, Worker},
     schedule::Compiled,
     service,
@@ -67,6 +68,8 @@ struct Inner {
     // The journal is bounded. Polling must not resurrect a blocked run after
     // newer unrelated events evict its durable replay identity.
     attention: Mutex<BTreeMap<crate::model::RunId, crate::notifications::Evidence>>,
+    // Only the scheduler advances the one in-flight durable journal transfer.
+    notifications: Mutex<notifications::Transfer>,
 }
 
 #[derive(Clone)]
@@ -106,6 +109,7 @@ impl Broker {
             launching: Mutex::default(),
             cleanup: Mutex::new(Some(cleanup)),
             attention: Mutex::new(attention),
+            notifications: Mutex::default(),
         }));
         let owner = handle.clone();
         let thread = std::thread::Builder::new()
@@ -370,6 +374,38 @@ impl Handle {
     }
 
     fn tick(&self, host: &SharedHost) -> Result<Duration, String> {
+        // Receipt polling must remain possible while shutdown owns control.
+        // Neither the HostState guard nor the control gate reaches advance().
+        let notification_delay = self.advance_notifications(host);
+        self.tick_under_control(host)
+            .map(|delay| delay.min(notification_delay))
+    }
+
+    fn advance_notifications(&self, host: &SharedHost) -> Duration {
+        let notifications = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .notifications
+            .clone();
+        let Some(notifications) = notifications else {
+            return notifications::RETRY;
+        };
+        match self
+            .0
+            .notifications
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .advance(&self.0.registry, &notifications, notification_event::build)
+        {
+            Ok(delay) => delay,
+            Err(error) => {
+                tracing::warn!(%error, "automation attention transfer is temporarily unavailable");
+                notifications::RETRY
+            }
+        }
+    }
+
+    fn tick_under_control(&self, host: &SharedHost) -> Result<Duration, String> {
         let control = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1082,6 +1118,7 @@ mod tests {
             launching: Mutex::default(),
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
+            notifications: Mutex::default(),
         }));
         host.lock().unwrap().automations = Some(handle.clone());
         let control = host.lock().unwrap().control_gate.clone();
@@ -1291,6 +1328,7 @@ mod tests {
             launching: Mutex::default(),
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
+            notifications: Mutex::default(),
         }));
         // Exercise both retire-on-idle and retain-for-reuse policies. Each uses
         // a real offline native actor held busy beyond the cleanup grace.
@@ -1529,6 +1567,7 @@ mod tests {
             launching: Mutex::default(),
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
+            notifications: Mutex::default(),
         }));
         let (reported, received) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
@@ -1613,6 +1652,7 @@ mod tests {
             launching: Mutex::default(),
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
+            notifications: Mutex::default(),
         }));
         let gate = host.lock().unwrap().control_gate.clone();
         let exclusive = gate.write().unwrap();
@@ -1743,6 +1783,113 @@ mod tests {
         assert_eq!(
             initial_attention(&registry).unwrap()[&run.id],
             finished.evidence
+        );
+    }
+
+    #[test]
+    fn stopped_notification_journal_keeps_no_run_receipt_and_scheduler_control_progress() {
+        use crate::{
+            automations::DirectoryIdentity, host::model::Registry, model::ProjectKind,
+            workspace_model::ModelEdit,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().to_owned();
+        let mut model = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        model
+            .apply(&ModelEdit::OpenProject {
+                repository: repository.clone(),
+                name: "Fixture".into(),
+                kind: ProjectKind::Folder,
+            })
+            .unwrap();
+        let definition = serde_json::from_value(serde_json::json!({
+            "name":"Private fixture", "prompt":"Private fixture prompt",
+            "agent":{"provider":"Codex","account":null,"target":{"repository":repository,"directory":repository,"placement":null},"surface":"Chat","model":null,"permission_mode":null,"reasoning_effort":null},
+            "schedule":{"pattern":{"daily":{"hour":9,"minute":0}},"timezone":"UTC"},
+            "session_mode":"fresh","precheck":null
+        })).unwrap();
+        let automation = model
+            .create_automation(
+                definition,
+                100,
+                DirectoryIdentity {
+                    device: 1,
+                    inode: 1,
+                },
+            )
+            .unwrap();
+        model
+            .set_automation_enabled(
+                automation.id,
+                automation.revision,
+                Some(crate::automations::Occurrence {
+                    due_ms: 60_000,
+                    local: "fixture".into(),
+                }),
+                true,
+                200,
+            )
+            .unwrap();
+        model
+            .apply(&ModelEdit::CloseProject { repository })
+            .unwrap();
+        let before = model.pending_automation_notifications(100).unwrap();
+        assert_eq!(before.len(), 1);
+        let host = crate::host::service::test_host();
+        // This is the actual stopped-enqueue behavior, not a fake successful
+        // journal receipt. No notification thread/portal/provider is started.
+        let (notifications, _) = crate::host::notifications::Handle::inert_for_test();
+        host.lock().unwrap().notifications = Some(notifications);
+        let registry = Arc::new(Mutex::new(model));
+        let handle = Handle(Arc::new(Inner {
+            host: Arc::downgrade(&host),
+            registry: registry.clone(),
+            root: directory.path().join("prechecks"),
+            wake: Wake::default(),
+            workers: Mutex::default(),
+            cleanup: Mutex::new(None),
+            attention: Mutex::default(),
+            notifications: Mutex::default(),
+        }));
+        let control = host.lock().unwrap().control_gate.clone();
+        let exclusive = control.write().unwrap();
+        assert_eq!(handle.tick(&host).unwrap(), Duration::from_millis(250));
+        drop(exclusive);
+        let delay = handle.tick(&host).unwrap();
+        assert!(delay > Duration::ZERO && delay <= notifications::RETRY);
+        assert_eq!(
+            registry
+                .lock()
+                .unwrap()
+                .pending_automation_notifications(100)
+                .unwrap(),
+            before
+        );
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .active_automation_firings()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .due_automations(service::now().unwrap(), 4)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(handle.0.workers.lock().unwrap().is_empty());
+        assert_eq!(
+            handle.0.wake.state.lock().unwrap().generation,
+            0,
+            "journal progress uses the existing finite wait, not read-triggered wakes"
+        );
+        assert!(
+            handle.0.attention.lock().unwrap().is_empty(),
+            "a no-run event cannot invent AgentRun attention"
         );
     }
 }

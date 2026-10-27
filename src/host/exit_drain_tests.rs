@@ -48,8 +48,14 @@ impl Drop for EvidenceDirectory {
 }
 
 fn private_runtime(name: &str) -> Option<PathBuf> {
+    private_runtime_case(name, None)
+}
+
+pub(super) fn private_runtime_case(name: &str, case: Option<&str>) -> Option<PathBuf> {
+    const CASE: &str = "CAGENTS_EXIT_DRAIN_TEST_CASE";
     if let Some(root) = std::env::var_os(ROOT) {
         assert_eq!(std::env::var(TEST).as_deref(), Ok(name));
+        assert_eq!(std::env::var(CASE).ok().as_deref(), case);
         let expected = match std::env::var(SCOPE).as_deref() {
             Ok("present") => true,
             Ok("absent") => false,
@@ -107,6 +113,9 @@ fn private_runtime(name: &str) -> Option<PathBuf> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(File::create(&stdout).unwrap()))
         .stderr(Stdio::from(File::create(&stderr).unwrap()));
+    if let Some(case) = case {
+        command.env(CASE, case);
+    }
     let mut child = TestChild(command.spawn().unwrap());
     let deadline = Instant::now() + Duration::from_secs(60);
     let status = loop {

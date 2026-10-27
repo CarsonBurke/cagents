@@ -1,5 +1,8 @@
 #![cfg(target_os = "linux")]
 
+#[path = "support/user_fixture.rs"]
+mod user_fixture;
+
 use std::{
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
@@ -622,6 +625,9 @@ fn staged_candidate_startup_authenticates_the_inherited_coordinator_fence() {
 
 #[test]
 fn staged_cli_routes_new_windows_and_control_to_kernel_verified_matched_owner() {
+    if !user_fixture::enter() {
+        return;
+    }
     let _fixture = OS_FIXTURE.lock().unwrap();
     let root = tempfile::tempdir_in("/var/tmp").unwrap();
     let prefix = root.path().join("install");
