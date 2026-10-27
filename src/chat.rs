@@ -838,7 +838,7 @@ impl Session {
             && self
                 .proof
                 .as_ref()
-                .is_some_and(HostSessionProof::is_complete)
+                .is_some_and(crate::model::HostSessionProof::is_complete)
             && self
                 .launch
                 .session_id
