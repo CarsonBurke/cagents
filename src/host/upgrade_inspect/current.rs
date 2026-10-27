@@ -1166,7 +1166,15 @@ mod tests {
             drop(client);
             let joined = worker.join();
             joined.unwrap();
-            assert!(result.unwrap_err().contains("identity changed"));
+            assert_eq!(
+                result.unwrap_err(),
+                if mismatch == 1 {
+                    "Source inspection request or event identity changed"
+                } else {
+                    "Source inspection ownership or protocol changed"
+                },
+                "mismatch case {mismatch}"
+            );
         }
     }
 
