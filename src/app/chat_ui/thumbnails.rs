@@ -5,6 +5,7 @@ const RECENT: usize = 8;
 
 struct Entry {
     source: Arc<PathBuf>,
+    attachment: Attachment,
     loaded: Option<images::Loaded>,
 }
 #[derive(Default)]
@@ -15,23 +16,33 @@ impl Cache {
             .iter()
             .rev()
             .filter(|attachment| {
-                attachment
-                    .path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| {
-                        chat::IMAGE_EXTENSIONS
-                            .iter()
-                            .any(|known| extension.eq_ignore_ascii_case(known))
-                    })
+                attachment.reference.is_some()
+                    || attachment
+                        .path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| {
+                            chat::IMAGE_EXTENSIONS
+                                .iter()
+                                .any(|known| extension.eq_ignore_ascii_case(known))
+                        })
             })
             .take(RECENT)
-            .map(|attachment| &attachment.path)
             .collect();
-        self.0.retain(|path, _| paths.contains(&path));
-        for path in paths {
+        self.0
+            .retain(|path, _| paths.iter().any(|a| a.path == *path));
+        for attachment in paths {
+            let path = &attachment.path;
+            if self
+                .0
+                .get(path)
+                .is_some_and(|entry| entry.attachment != *attachment)
+            {
+                self.0.remove(path);
+            }
             self.0.entry(path.clone()).or_insert_with(|| Entry {
                 source: Arc::new(path.clone()),
+                attachment: attachment.clone(),
                 loaded: None,
             });
         }
@@ -70,6 +81,7 @@ impl Cache {
                     Source {
                         target,
                         path: entry.source.clone(),
+                        attachment: entry.attachment.clone(),
                     },
                     stream,
                 )
@@ -96,6 +108,7 @@ impl Cache {
 struct Source {
     target: Target,
     path: Arc<PathBuf>,
+    attachment: Attachment,
 }
 impl PartialEq for Source {
     fn eq(&self, other: &Self) -> bool {
@@ -114,7 +127,22 @@ fn stream(source: &Source) -> Pin<Box<dyn iced::futures::Stream<Item = Message> 
     let source = source.clone();
     Box::pin(iced::futures::stream::once(async move {
         let path = source.path.clone();
-        let loaded = images::worker(move || images::thumbnail(&path)).await;
+        let attachment = source.attachment;
+        let loaded = images::worker(move || {
+            if let Some(reference) = &attachment.reference {
+                return images::managed_thumbnail(reference);
+            }
+            if crate::device::is_remote() {
+                return images::Loaded::Failed(
+                    "Image belongs to another device; local transfer is unavailable.".into(),
+                );
+            }
+            if let Err(error) = chat::attachment_assets::validate(&attachment) {
+                return images::Loaded::Failed(error);
+            }
+            images::thumbnail(&path)
+        })
+        .await;
         action(Action::ThumbnailLoaded(source.target, source.path, loaded))
     }))
 }
@@ -123,7 +151,10 @@ fn stream(source: &Source) -> Pin<Box<dyn iced::futures::Stream<Item = Message> 
 mod tests {
     use super::*;
     fn attachment(path: &str) -> Attachment {
-        Attachment { path: path.into() }
+        Attachment {
+            path: path.into(),
+            reference: None,
+        }
     }
     #[test]
     fn removed_and_readded_paths_reject_the_previous_worker() {

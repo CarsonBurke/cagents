@@ -36,6 +36,7 @@ pub mod info;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod login;
 pub mod omp;
+pub mod preferences;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod probe;
 #[cfg(any(feature = "ui", feature = "host"))]
@@ -43,6 +44,8 @@ pub mod registry;
 pub mod remote;
 pub mod routing;
 pub mod schedule;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub(crate) mod scope;
 
 /// A used fraction past which an account is reported as approaching its
 /// limit. It is the same point past which the shell draws a budget in its

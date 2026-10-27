@@ -238,6 +238,11 @@ fn settings_category_controls<'a>(
                     "Notify while focused",
                     "Also notify while you are watching that agent. Off by default.",
                 ),
+                (
+                    Field::MessagePreviews,
+                    "Show message previews",
+                    "Include conversation names and response or request excerpts on the desktop. These may be visible on a shared or locked screen. Off by default.",
+                ),
             ];
             let mut controls: Vec<_> = fields
                 .into_iter()
@@ -248,7 +253,8 @@ fn settings_category_controls<'a>(
                         crate::settings_widgets::toggle_enabled(
                             label,
                             draft.notifications.get(field),
-                            field == Field::Enabled || draft.notifications.get(Field::Enabled),
+                            matches!(field, Field::Enabled | Field::MessagePreviews)
+                                || draft.notifications.get(Field::Enabled),
                             move |enabled| Message::SettingsChanged {
                                 field: SettingsField::Notifications(field),
                                 value: enabled.to_string(),
@@ -275,7 +281,7 @@ fn settings_category_controls<'a>(
             ));
             vec![settings_group(
                 "Agent notifications",
-                "Alerts contain the provider and folder name, never prompts or output.",
+                "Private alerts show the provider and folder. Message previews are available when you choose to enable them.",
                 controls,
             )]
         }
@@ -388,7 +394,7 @@ fn settings_category_controls<'a>(
                     .into(),
             );
             let directory = setting_input(
-                "Absolute path, or relative to the repository root. Defaults to worktrees/. Each new worktree gets its own subdirectory.",
+                "Absolute path, or relative to the repository root. Defaults to .worktrees/. Each new worktree gets its own subdirectory.",
                 &draft.managed_worktree_directory,
                 SettingsField::ManagedWorktreeDirectory,
                 invalid,
@@ -462,11 +468,22 @@ fn settings_category_controls<'a>(
                 SettingsField::HibernationDelayMs,
                 invalid,
             );
+            let stale = setting_input(
+                "A card with no commits, file changes or agent work for this many days moves to Stale.",
+                &draft.work_stale_after_days,
+                SettingsField::WorkStaleAfterDays,
+                invalid,
+            );
             vec![
                 settings_group(
                     "Worktrees",
                     "Locations, ordering and the first pane in a worktree.",
                     vec![directory, worktree_pane, cleanup, order],
+                ),
+                settings_group(
+                    "Work board",
+                    "How the board sorts work that has gone quiet.",
+                    vec![stale],
                 ),
                 settings_group(
                     "Workspace",
@@ -759,9 +776,9 @@ fn settings_category_controls<'a>(
                 "History",
                 "Keep enough output to investigate a task without retaining unlimited terminal history.",
                 vec![setting_input(
-                    "0–1,000,000 lines per newly started terminal. Existing history is preserved.",
-                    &draft.terminal_scrollback_lines,
-                    SettingsField::TerminalScrollbackLines,
+                    "0–1,024 MiB per newly started terminal, allocated as needed. Existing history is preserved.",
+                    &draft.terminal_scrollback_mib,
+                    SettingsField::TerminalScrollbackMib,
                     invalid,
                 )],
             ),
@@ -988,10 +1005,11 @@ pub(super) fn settings_pane<'a>(
     query: &'a str,
     context: SettingsContext<'a>,
 ) -> Element<'a, Message> {
-    crate::ui_controls::responsive(move |size| {
+    let pane: Element<'a, Message> = crate::ui_controls::responsive(move |size| {
         settings_layout(category, draft, query, &context, size.width)
     })
-    .into()
+    .into();
+    pane.map(account_ui::pane_message)
 }
 
 fn settings_layout<'a>(
@@ -1427,14 +1445,22 @@ fn shortcut_input<'a>(
         }
     }
     let row = widget::row::with_children(vec![
-        design::body(format!("{label}{required}"))
-            .width(Length::FillPortion(3))
-            .into(),
-        widget::row::with_children(controls)
-            .spacing(2)
-            .align_y(Alignment::Center)
-            .width(Length::FillPortion(4))
-            .into(),
+        // Reserve Source first. Keep Record and Reset at their natural width
+        // within the remaining space, allowing the action label to wrap.
+        widget::row::with_children(vec![
+            design::body(format!("{label}{required}"))
+                .width(Length::Fill)
+                .into(),
+            widget::row::with_children(controls)
+                .spacing(2)
+                .align_y(Alignment::Center)
+                .width(Length::Shrink)
+                .into(),
+        ])
+        .spacing(space::S)
+        .align_y(Alignment::Center)
+        .width(Length::Fill)
+        .into(),
         design::caption(source).width(64).into(),
     ])
     .spacing(space::S)
@@ -1470,46 +1496,114 @@ mod keyboard_table_tests {
     #[test]
     fn default_shortcut_rows_keep_chips_and_controls_on_one_line() {
         use iced::{
-            Size,
-            advanced::{layout, widget::Tree},
+            Rectangle, Size,
+            advanced::{
+                Layout, layout,
+                widget::{Operation, Tree, operation::Focusable},
+            },
         };
+        #[derive(Default)]
+        struct Controls {
+            buttons: Vec<Rectangle>,
+            source: Option<Rectangle>,
+        }
+        impl Operation for Controls {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                self.buttons.push(bounds);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: Rectangle, text: &str) {
+                if matches!(text, "Default" | "User") {
+                    self.source = Some(bounds);
+                }
+            }
+        }
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let draft = SettingsDraft::from_settings(&AppSettings::default());
         let invalid = HashMap::new();
-        for field in SettingsField::SHORTCUTS {
-            let action = field.shortcut_action().unwrap();
-            let value = draft
-                .keyboard_shortcuts
-                .shortcut_values()
-                .into_iter()
-                .find(|(candidate, _)| *candidate == action)
-                .unwrap()
-                .1;
-            let row = shortcut_input(
-                field.label(),
-                value,
-                field,
-                &draft.keyboard_shortcuts,
-                &invalid,
-            );
-            let mut element = settings_group("Keyboard", "", vec![row])
-                .compact()
-                .view("Keyboard", "")
-                .unwrap();
-            let mut tree = Tree::new(element.as_widget());
-            let height = element
-                .as_widget_mut()
-                .layout(
+        for width in [360.0, 560.0] {
+            for field in SettingsField::SHORTCUTS {
+                let action = field.shortcut_action().unwrap();
+                let value = draft
+                    .keyboard_shortcuts
+                    .shortcut_values()
+                    .into_iter()
+                    .find(|(candidate, _)| *candidate == action)
+                    .unwrap()
+                    .1;
+                let row = shortcut_input(
+                    field.label(),
+                    value,
+                    field,
+                    &draft.keyboard_shortcuts,
+                    &invalid,
+                );
+                let mut element = settings_group("Keyboard", "", vec![row])
+                    .compact()
+                    .view("Keyboard", "")
+                    .unwrap();
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(
                     &mut tree,
                     &renderer,
-                    &layout::Limits::new(Size::new(560.0, 0.0), Size::new(560.0, 1000.0)),
-                )
-                .size()
-                .height;
-            assert!(
-                height <= 64.0,
-                "{field:?} must keep its key chip, Record and Reset on one line; group height was {height}"
-            );
+                    &layout::Limits::new(Size::new(width, 0.0), Size::new(width, 1000.0)),
+                );
+                let mut controls = Controls::default();
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut controls,
+                );
+                assert_eq!(
+                    controls.buttons.len(),
+                    settings::parse_chords(value).len() + 2
+                );
+                let center = controls.buttons[0].center_y();
+                for bounds in &controls.buttons {
+                    assert!(
+                        bounds.width > 0.0 && bounds.height > 0.0,
+                        "{field:?} at{width}: empty native control {bounds:?}"
+                    );
+                    assert!(
+                        (bounds.center_y() - center).abs() < 0.1,
+                        "{field:?} at{width}: controls wrapped {:?}",
+                        controls.buttons
+                    );
+                    assert!(
+                        bounds.x >= 0.0 && bounds.x + bounds.width <= width + 0.1,
+                        "{field:?} at{width}: clipped native control {bounds:?}"
+                    );
+                }
+                for pair in controls.buttons.windows(2) {
+                    assert!(
+                        pair[0].x + pair[0].width <= pair[1].x + 0.1,
+                        "{field:?} at{width}: controls overlap {:?}",
+                        controls.buttons
+                    );
+                }
+                let source = controls.source.expect("Source remains visible");
+                assert!(source.width > 0.0 && source.height > 0.0);
+                assert!(source.x >= 0.0 && source.x + source.width <= width + 0.1);
+                assert!(
+                    controls.buttons.last().unwrap().x + controls.buttons.last().unwrap().width
+                        <= source.x + 0.1
+                );
+                if width == 560.0 {
+                    assert!(
+                        node.size().height <= 64.0,
+                        "{field:?} atwide table must stay compact: {:?}",
+                        node.size()
+                    );
+                }
+            }
         }
     }
 

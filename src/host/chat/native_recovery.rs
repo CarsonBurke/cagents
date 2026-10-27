@@ -79,10 +79,21 @@ pub(super) fn restore(
     client: ClientId,
     source: &Session,
 ) -> Result<ServerResponse, String> {
+    restore_with_admission(host, client, source, None)
+}
+
+pub(super) fn restore_with_admission(
+    host: &SharedHost,
+    client: ClientId,
+    source: &Session,
+    mut admission: Option<capacity::Reservation>,
+) -> Result<ServerResponse, String> {
+    // Main's durable holder format has no immutable account-home proof.
+    super::super::account_lifecycle::ensure_idle(host).map_err(|error| error.message)?;
     let proof = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down
-            || state.chat_spawning.contains_key(&source.id)
+            || (state.chat_spawning.contains_key(&source.id) && admission.is_none())
             || state.native_closing.contains_key(&source.id)
         {
             return Err(
@@ -101,23 +112,22 @@ pub(super) fn restore(
                 record.handle.owns_work()
                     && same_conversation(&record.session.launch, &source.launch)
             })
-            || state
-                .chat_spawning
-                .values()
-                .any(|pending| same_conversation(&pending.launch, &source.launch))
-            || (!state.chats.contains_key(&source.id)
-                && state.chats.len() + state.chat_spawning.len() >= 128)
+            || state.chat_spawning.iter().any(|(id, pending)| {
+                *id != source.id && same_conversation(&pending.launch, &source.launch)
+            })
         {
             return Err("Native conversation ownership or capacity prevents adoption".into());
         }
-        state.chat_spawning.insert(source.id, source.clone());
+        if !state.chats.contains_key(&source.id) && admission.is_none() {
+            capacity::require_available(&state).map_err(|error| error.message)?;
+        }
+        capacity::Reservation::install(&mut admission, host, &mut state, source)
+            .map_err(|error| error.message)?;
         state.inventory_generation += 1;
         state.proof().clone()
     };
     let result = restore_reserved(host, client, source, &proof);
-    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-    state.chat_spawning.remove(&source.id);
-    state.inventory_generation += 1;
+    drop(admission);
     result
 }
 
@@ -128,8 +138,19 @@ fn restore_reserved(
     proof: &HostSessionProof,
 ) -> Result<ServerResponse, String> {
     let directory = registry::directory(Kind::Native)?;
-    let record = registry::evidence(&registry::socket(&directory, source.id), Kind::Native)?
-        .ok_or("The durable native holder is unavailable; this conversation was not restarted or resent")?;
+    let record = registry::recovery_candidate(
+        &registry::socket(&directory, source.id),
+        Kind::Native,
+    )?
+    .ok_or(
+        "The durable native holder is unavailable; this conversation was not restarted or resent",
+    )?;
+    if Handle::is_remote_record(&record) {
+        return super::retained_actor::restore(host, client, source, proof, record);
+    }
+    if source.launch.provider == Provider::Claude {
+        return Err("The retained Claude owner uses an unsupported private protocol; its owner and evidence were preserved".into());
+    }
     let (recovery, exited) = chat::native_holder::inspect(&record, proof)?;
     if exited {
         return Err("The retained native server exited; explicitly resume the conversation to start another server".into());
@@ -188,7 +209,8 @@ fn restore_authenticated(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .mailbox_seal
-        .clone();
+        .as_ref()
+        .map(|seal| Arc::new(seal.recognizer()));
     let execution_context = spec.execution.clone();
     let mut initial = adapter.initialize()?;
     let store = chat::runtime::preflight_retained(&spec, &mut initial)?;
@@ -327,7 +349,7 @@ fn restore_authenticated(
         let _ = handle.close();
         return Err(error);
     }
-    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
     let pair_unchanged = match (&session.terminal, &paired) {
         (None, None) => true,
         (Some(terminal), Some(handle)) => {
@@ -369,8 +391,28 @@ fn restore_authenticated(
         completion_observed: false,
         returning_terminal: false,
     };
-    let response = session_snapshot(&record);
-    record.handle.commit_native_installation();
+    let expected_pair = record.session.terminal.clone();
+    drop(state);
+    let response = session_snapshot(&record.session, &record.handle)?;
+    record.handle.commit_native_installation()?;
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if state.shutting_down
+        || state.proof() != proof
+        || state
+            .chats
+            .get(&id)
+            .is_some_and(|current| current.handle.owns_work())
+        || expected_pair.as_ref().is_some_and(|terminal| {
+            state
+                .terminals
+                .get(&terminal.id)
+                .is_none_or(|current| current.session != *terminal)
+        })
+    {
+        drop(state);
+        let _ = record.handle.close();
+        return Err("Native adoption changed before attachment publication".into());
+    }
     let retired = state.chats.insert(id, record);
     if let Some(context) = execution_context {
         context.installed();
@@ -382,7 +424,7 @@ fn restore_authenticated(
     Ok(response)
 }
 
-fn retained_upgrade_sources(
+pub(super) fn retained_upgrade_sources(
     sources: Vec<Session>,
     successor: &Session,
 ) -> Vec<crate::upgrade::handoff::ChatSource> {
@@ -413,7 +455,7 @@ pub(in crate::host) fn restore_orphaned_native(
         .proof()
         .clone();
     let directory = registry::directory(Kind::Native)?;
-    for record in registry::discover(&directory, &proof.boot_id, Kind::Native)? {
+    for record in registry::recovery_candidates(&directory, &proof.boot_id, Kind::Native)? {
         if refused.contains(&record.terminal) {
             continue;
         }
@@ -425,8 +467,13 @@ pub(in crate::host) fn restore_orphaned_native(
         {
             continue;
         }
-        let result = chat::native_holder::inspect(&record, &proof)
-            .and_then(|(recovery, _)| restore(host, 0, &recovery.source));
+        let result = if Handle::is_remote_record(&record) {
+            Handle::inspect_remote(&record, proof.clone())
+                .and_then(|inspection| restore(host, 0, &inspection.source))
+        } else {
+            chat::native_holder::inspect(&record, &proof)
+                .and_then(|(recovery, _)| restore(host, 0, &recovery.source))
+        };
         if let Err(error) = result {
             tracing::warn!(session = %record.terminal, %error, "retained native conversation could not be reattached; holder evidence preserved");
         }

@@ -1,5 +1,7 @@
 #[cfg(target_os = "linux")]
 mod owned_late_decision;
+#[cfg(target_os = "linux")]
+mod retained_automation;
 
 use super::*;
 use crate::{
@@ -13,9 +15,24 @@ use std::{os::unix::fs::PermissionsExt, path::Path};
 
 // Environment isolation also proves the service does not depend on any user's
 // account, project, provider installation, or running daemon.
-fn isolated(name: &str) -> Option<tempfile::TempDir> {
+pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
     const CHILD: &str = "CAGENTS_EXECUTION_SERVICE_TEST";
+    const INHERITED_SCOPE: &str = "CAGENTS_EXECUTION_TEST_AUTHORITY_PRESENCE";
     if std::env::var(CHILD).as_deref() == Ok(name) {
+        // Only this helper sets the presence marker. The separate owned-late-
+        // decision controller also uses CHILD, without this helper's spawn.
+        if let Ok(expected) = std::env::var(INHERITED_SCOPE) {
+            let expected = match expected.as_str() {
+                "present" => true,
+                "absent" => false,
+                _ => panic!("invalid fixture authority presence marker"),
+            };
+            assert_eq!(
+                Authority::from_environment() != Authority::default(),
+                expected,
+                "isolated child lost its inherited authority scope"
+            );
+        }
         return None;
     }
     let directory = tempfile::tempdir().unwrap();
@@ -34,14 +51,33 @@ fn isolated(name: &str) -> Option<tempfile::TempDir> {
         std::fs::create_dir_all(root.join(path)).unwrap();
     }
     install_claude(&root.join("bin/claude"));
-    let result = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    // Keep the caller's delegation inherited unchanged, without inspecting or
+    // copying its value. Every other environment input is fixture-owned.
+    for (name, _) in std::env::vars_os() {
+        if name != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV) {
+            command.env_remove(name);
+        }
+    }
+    let result = command
         .args([
             "--exact",
-            &format!("host::agent_execution::tests::{name}"),
+            &if name.contains("::") {
+                name.to_owned()
+            } else {
+                format!("host::agent_execution::tests::{name}")
+            },
             "--nocapture",
         ])
-        .env_clear()
         .env(CHILD, name)
+        .env(
+            INHERITED_SCOPE,
+            if Authority::from_environment() != Authority::default() {
+                "present"
+            } else {
+                "absent"
+            },
+        )
         .env("CAGENTS_EXECUTION_FIXTURE", root)
         .env("HOME", root.join("home"))
         .env("XDG_DATA_HOME", root.join("data"))
@@ -103,6 +139,29 @@ while IFS= read -r frame; do
       n=$((n + 1))
       printf 'prompt\n' >> "$HOME/../prompts"
       case "$frame" in
+        *HOLD_CLEANUP_BUSY*)
+          : > "$HOME/../cleanup-busy"
+          attempts=0
+          while [ ! -e "$HOME/../cleanup-release" ]; do
+            attempts=$((attempts + 1))
+            [ "$attempts" -lt 1000 ] || exit 1
+            sleep 0.01
+          done
+          ;;
+        *COURIER_BACKGROUND*)
+          printf '{"type":"assistant","uuid":"launch-child","message":{"id":"launch-child","role":"assistant","content":[{"type":"tool_use","id":"courier-child","name":"Agent","input":{"run_in_background":true}}]}}\n'
+          printf '{"type":"user","uuid":"child-launch-result","tool_use_result":{"status":"async_launched","agentId":"courier-agent"},"message":{"content":[{"type":"tool_result","tool_use_id":"courier-child","content":"Launched"}]}}\n'
+          printf '{"type":"system","subtype":"task_started","task_id":"courier-agent","tool_use_id":"courier-child","task_type":"local_agent"}\n'
+          : > "$HOME/../courier-busy"
+          attempts=0
+          while [ ! -e "$HOME/../courier-release" ]; do
+            attempts=$((attempts + 1))
+            [ "$attempts" -lt 500 ] || exit 1
+            sleep 0.01
+          done
+          ;;
+      esac
+      case "$frame" in
         *BACKGROUND_PERMISSION*)
           # A background subagent asks, then the main turn ends without it.
           printf '{"type":"control_request","request_id":"background-%s","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-%s","input":{"command":"true"}}}\n' "$n" "$n"
@@ -121,6 +180,440 @@ while IFS= read -r frame; do
 done
 "#).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn owning_close_retires_a_restored_chat_without_a_ui_subscriber() {
+    if isolated("owning_close_retires_a_restored_chat_without_a_ui_subscriber").is_some() {
+        return;
+    }
+    let (host, request, _) = fixture();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let agent = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap();
+    let HostedSession::Chat(model_source) = agent.session.unwrap() else {
+        panic!("fixture did not create a native chat");
+    };
+    // The fake provider confirms its selected UUID only after the first user
+    // frame, after the fresh launch descriptor has been bound in the model.
+    assert_eq!(model_source.launch.session_id, None);
+    let id = model_source.id;
+    let handle = {
+        let mut state = host.lock().unwrap();
+        let record = state.chats.get_mut(&id).unwrap();
+        // Startup restoration has no UI attachment. In particular, execution
+        // ownership is not represented by a synthetic client-zero subscriber.
+        record.subscribers.clear();
+        let confirmed = record
+            .handle
+            .confirmed_session_id()
+            .expect("settled provider UUID");
+        record.session.launch.session_id = Some(confirmed);
+        assert_ne!(
+            record.session.launch.session_id,
+            model_source.launch.session_id
+        );
+        assert!(crate::agent_execution::same_chat_process(
+            &record.session,
+            &model_source
+        ));
+        record.handle.clone()
+    };
+    let refusal = super::super::chat::process(&host, 0, ClientRequest::ChatClose { chat_id: id })
+        .expect_err("unattached UI close unexpectedly succeeded");
+    assert_eq!(
+        refusal.code,
+        crate::terminal_ipc::ProtocolErrorCode::PermissionDenied
+    );
+    assert!(refusal.message.contains("not attached"), "{refusal:?}");
+    assert!(!handle.is_completed());
+    assert!(host.lock().unwrap().chats[&id].subscribers.is_empty());
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+
+    let reply = process(
+        &host,
+        Authority::default(),
+        Operation::Close(accepted.agent.id),
+    )
+    .expect("authenticated owning Close must not require UI subscription");
+    let Reply::Closed(closed) = reply else {
+        panic!("unexpected close reply: {reply:?}")
+    };
+    assert!(closed.closed);
+    assert!(
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    assert!(!host.lock().unwrap().chats.contains_key(&id));
+    assert!(
+        handle.is_completed(),
+        "owning Close did not retire the exact provider"
+    );
+}
+
+#[test]
+fn owning_close_refuses_a_current_chat_outside_the_model_process_identity() {
+    if isolated("owning_close_refuses_a_current_chat_outside_the_model_process_identity").is_some()
+    {
+        return;
+    }
+    let (host, request, _) = fixture();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let agent = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap();
+    let id = agent.session.unwrap().id();
+    let (original, handle) = {
+        let mut state = host.lock().unwrap();
+        let record = state.chats.get_mut(&id).unwrap();
+        record.subscribers.clear();
+        let original = record.session.clone();
+        record
+            .session
+            .launch
+            .recipe
+            .environment
+            .insert("CAGENTS_FIXTURE_CHANGED_OWNER".into(), "different".into());
+        (original, record.handle.clone())
+    };
+    let error = process(
+        &host,
+        Authority::default(),
+        Operation::Close(accepted.agent.id),
+    )
+    .unwrap_err();
+    assert!(error.contains("ownership changed"), "{error}");
+    assert!(!handle.is_completed());
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    assert!(host.lock().unwrap().chats.contains_key(&id));
+    handle.command(Command::Refresh).unwrap();
+    host.lock().unwrap().chats.get_mut(&id).unwrap().session = original;
+    assert!(
+        matches!(process(&host, Authority::default(), Operation::Close(accepted.agent.id)).unwrap(), Reply::Closed(agent) if agent.closed)
+    );
+}
+
+#[test]
+fn captured_owning_close_refuses_a_distinct_proxy_for_the_same_retained_actor() {
+    if isolated("captured_owning_close_refuses_a_distinct_proxy_for_the_same_retained_actor")
+        .is_some()
+    {
+        return;
+    }
+    let (host, request, _) = fixture();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let agent = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap();
+    let HostedSession::Chat(source) = agent.session.unwrap() else {
+        panic!("not a chat")
+    };
+    let (first, second) = chat::runtime::Handle::fixture_remote_attachment_pair();
+    assert!(first.same_actor(&second));
+    assert_eq!(first.actor_identity(), second.actor_identity());
+    assert!(!first.same_attachment(&second));
+    let (target, real_handle, session, instance) = {
+        let mut state = host.lock().unwrap();
+        let record = state.chats.get_mut(&source.id).unwrap();
+        let real_handle = std::mem::replace(&mut record.handle, first);
+        let session = record.session.clone();
+        let instance = record.execution_instance;
+        let target = super::super::chat::CloseTarget::for_execution(
+            &state,
+            &state.chats[&source.id],
+            &source,
+        )
+        .unwrap();
+        (target, real_handle, session, instance)
+    };
+    // This is an owning-entry counterfactual, not an actual helper adoption:
+    // replacing only Arc allocation must revoke the captured close capability.
+    host.lock()
+        .unwrap()
+        .chats
+        .get_mut(&source.id)
+        .unwrap()
+        .handle = second.clone();
+    let error = super::super::chat::close_captured(&host, target).unwrap_err();
+    assert_eq!(
+        error.code,
+        crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable,
+        "{error:?}"
+    );
+    {
+        let state = host.lock().unwrap();
+        let record = &state.chats[&source.id];
+        assert_eq!(record.session, session);
+        assert_eq!(record.execution_instance, instance);
+        assert!(record.handle.same_attachment(&second));
+    }
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    assert!(!real_handle.is_completed());
+    real_handle.command(Command::Refresh).unwrap();
+    host.lock()
+        .unwrap()
+        .chats
+        .get_mut(&source.id)
+        .unwrap()
+        .handle = real_handle.clone();
+    assert!(
+        matches!(process(&host, Authority::default(), Operation::Close(accepted.agent.id)).unwrap(), Reply::Closed(agent) if agent.closed)
+    );
+    assert!(real_handle.is_completed());
+}
+
+#[test]
+fn blocking_owning_close_preserves_a_replacement_installed_during_provider_join() {
+    if isolated("blocking_owning_close_preserves_a_replacement_installed_during_provider_join")
+        .is_some()
+    {
+        return;
+    }
+    use chat::protocol::{Adapter, ProcessSpec, Step, TransportSpec};
+    struct BlockingDrop {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+    impl Adapter for BlockingDrop {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+        fn command(&mut self, _: Command) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+        fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+    }
+    impl Drop for BlockingDrop {
+        fn drop(&mut self) {
+            // A disconnected test owner cancels this barrier. The deadline
+            // also bounds cleanup if an assertion unwinds inside thread::scope.
+            if self.entered.send(()).is_ok() {
+                let _ = self.release.recv_timeout(Duration::from_secs(10));
+            }
+        }
+    }
+    struct ReleaseOnDrop(Option<std::sync::mpsc::SyncSender<()>>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.try_send(());
+            }
+        }
+    }
+    let (host, request, path) = fixture();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let agent = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap();
+    let HostedSession::Chat(source) = agent.session.unwrap() else {
+        panic!("not a chat")
+    };
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let spec = ProcessSpec {
+        execution: None,
+        messages: None,
+        transport: TransportSpec::JsonLines,
+        program: "/bin/cat".into(),
+        arguments: Vec::new(),
+        working_directory: path.parent().unwrap().join("project"),
+        environment: Default::default(),
+        unset_environment: Default::default(),
+    };
+    let mut initial = Step::default();
+    let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+    let blocking = chat::runtime::Handle::start(
+        spec,
+        Box::new(BlockingDrop {
+            entered: entered_tx,
+            release: release_rx,
+        }),
+        initial,
+        store,
+        None,
+        |_| {},
+    )
+    .unwrap();
+    let (target, successor, original_source, original_instance) = {
+        let mut state = host.lock().unwrap();
+        let record = state.chats.get_mut(&source.id).unwrap();
+        let successor = std::mem::replace(&mut record.handle, blocking.clone());
+        let original_source = record.session.clone();
+        let original_instance = record.execution_instance;
+        let target = super::super::chat::CloseTarget::for_execution(
+            &state,
+            &state.chats[&source.id],
+            &source,
+        )
+        .unwrap();
+        (target, successor, original_source, original_instance)
+    };
+    let replacement_instance = uuid::Uuid::new_v4();
+    std::thread::scope(|scope| {
+        // This guard drops on every assertion/receive failure before scope
+        // joins its worker, so teardown need not wait for the fallback timeout.
+        let mut release = ReleaseOnDrop(Some(release_tx));
+        let worker = scope.spawn(|| super::super::chat::close_captured(&host, target));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("actor worker never entered adapter Drop during close join");
+        assert!(
+            !worker.is_finished(),
+            "close returned before its actor worker joined"
+        );
+        assert!(
+            blocking.is_completed(),
+            "old actor did not finish its actual process teardown"
+        );
+        {
+            let mut state = host.lock().unwrap();
+            let record = state.chats.get_mut(&source.id).unwrap();
+            record.handle = successor.clone();
+            record.execution_instance = replacement_instance;
+        }
+        release.0.take().unwrap().send(()).unwrap();
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.message.contains("thread changed"), "{error:?}");
+    });
+    {
+        let state = host.lock().unwrap();
+        let record = &state.chats[&source.id];
+        assert_eq!(record.session, original_source);
+        assert_eq!(record.execution_instance, replacement_instance);
+        assert!(record.handle.same_attachment(&successor));
+    }
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    assert!(!successor.is_completed());
+    successor.command(Command::Refresh).unwrap();
+    // Restore the fixture generation solely for its normal authenticated cleanup.
+    host.lock()
+        .unwrap()
+        .chats
+        .get_mut(&source.id)
+        .unwrap()
+        .execution_instance = original_instance;
+    assert!(
+        matches!(process(&host, Authority::default(), Operation::Close(accepted.agent.id)).unwrap(), Reply::Closed(agent) if agent.closed)
+    );
+    assert!(successor.is_completed());
+}
+
+#[test]
+fn captured_owning_close_refuses_a_replaced_host_execution_instance() {
+    if isolated("captured_owning_close_refuses_a_replaced_host_execution_instance").is_some() {
+        return;
+    }
+    let (host, request, _) = fixture();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let agent = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap();
+    let HostedSession::Chat(source) = agent.session.unwrap() else {
+        panic!("not a chat")
+    };
+    let (target, handle, original_instance) = {
+        let state = host.lock().unwrap();
+        let record = &state.chats[&source.id];
+        (
+            super::super::chat::CloseTarget::for_execution(&state, record, &source).unwrap(),
+            record.handle.clone(),
+            record.execution_instance,
+        )
+    };
+    // A deterministic generation cutpoint: keep the same ID and attachment so
+    // the execution-instance fence, independently, must reject this capability.
+    host.lock()
+        .unwrap()
+        .chats
+        .get_mut(&source.id)
+        .unwrap()
+        .execution_instance = uuid::Uuid::new_v4();
+    let error = super::super::chat::close_captured(&host, target).unwrap_err();
+    assert_eq!(
+        error.code,
+        crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable,
+        "{error:?}"
+    );
+    assert!(!handle.is_completed());
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    handle.command(Command::Refresh).unwrap();
+    host.lock()
+        .unwrap()
+        .chats
+        .get_mut(&source.id)
+        .unwrap()
+        .execution_instance = original_instance;
+    assert!(
+        matches!(process(&host, Authority::default(), Operation::Close(accepted.agent.id)).unwrap(), Reply::Closed(agent) if agent.closed)
+    );
 }
 
 #[test]
@@ -407,7 +900,22 @@ fn automatic_cleanup_is_exact_run_fenced_and_confirms_provider_retirement() {
     {
         return;
     }
-    let (host, request, _) = fixture();
+    let (host, request, path) = fixture();
+    // Observe consumption of the actual refresh response, not just command
+    // admission: pending transport must still refuse an idle close.
+    let provider = path.parent().unwrap().join("bin/claude");
+    let script = std::fs::read_to_string(&provider).unwrap();
+    let original = r#"      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id""#;
+    let refreshed = r#"      case "$frame" in
+        *'"subtype":"get_context_usage"'*)
+          printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"totalTokens":424242,"maxTokens":1000000}}}\n' "$id"
+          ;;
+        *)
+          printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+          ;;
+      esac"#;
+    assert_eq!(script.matches(original).count(), 1);
+    std::fs::write(provider, script.replace(original, refreshed)).unwrap();
     let automation = automation_fixture(&host, &request);
     let accepted = claim_fixture(&host, &automation);
     dispatch_accepted(&host, accepted.clone()).unwrap();
@@ -423,12 +931,22 @@ fn automatic_cleanup_is_exact_run_fenced_and_confirms_provider_retirement() {
         .id();
     let handle = host.lock().unwrap().chats[&session_id].handle.clone();
     let stale = handle.snapshot(None).unwrap().generation;
+    assert_ne!(handle.usage().context_tokens, 424242);
     handle.command(Command::Refresh).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if handle.usage().context_tokens == 424242
+            && handle.check_update_readiness().unwrap()
+                == crate::chat::runtime::UpdateReadiness::Idle
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "fixture refresh did not settle");
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert!(
-        handle
-            .close_if_idle(stale)
-            .unwrap_err()
-            .contains("state changed")
+        !handle.try_close_if_idle(stale).unwrap(),
+        "idle metadata drift must defer without stopping the actor"
     );
     assert!(!handle.is_completed());
     assert_eq!(
@@ -824,7 +1342,7 @@ fn release_fixture(host: &SharedHost, run: &Run) {
         .unwrap();
 }
 
-fn fixture() -> (SharedHost, Submit, std::path::PathBuf) {
+pub(in crate::host) fn fixture() -> (SharedHost, Submit, std::path::PathBuf) {
     let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_EXECUTION_FIXTURE").unwrap());
     let path = root.join("registry.sqlite3");
     let mut registry = Registry::at(&path).unwrap();
@@ -881,6 +1399,406 @@ fn settled(host: &SharedHost, run: RunId) -> Run {
         assert!(Instant::now() < deadline, "run never settled: {run:?}");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn legacy_open_console_preflight_refuses_before_provider_stop_and_keeps_followup_usable() {
+    if isolated(
+        "legacy_open_console_preflight_refuses_before_provider_stop_and_keeps_followup_usable",
+    )
+    .is_some()
+    {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    let run = settled(&host, accepted.run.id);
+    assert_eq!(run.state, State::Succeeded);
+    let store = registry(&host).unwrap();
+    let (agent, pane, scope) = {
+        let mut store = store.lock().unwrap();
+        let agent = store.agent(accepted.agent.id).unwrap();
+        let HostedSession::Chat(source) = agent.session.as_ref().unwrap() else {
+            unreachable!()
+        };
+        // Persist the old UI's ended-console projection directly, as an old
+        // store would contain it after console /quit or EOF (neither closes
+        // the provider). The provider below is an actual running fixture.
+        let mut console_recipe = source.launch.recipe.clone();
+        console_recipe.program = "/bin/cat".into();
+        console_recipe.arguments.clear();
+        let terminal = crate::model::TerminalSession {
+            id: source.id,
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            launch: console_recipe,
+            transcript_path: None,
+            resume_hint: None,
+            continuity: crate::model::TerminalContinuity::Exited {
+                last_exit: crate::model::TerminalExit {
+                    code: Some(0),
+                    signal: None,
+                    occurred_at_unix_ms: 1,
+                },
+            },
+        };
+        let agent = store
+            .bind_agent_console(agent.id, agent.session.as_ref().unwrap(), terminal.clone())
+            .unwrap();
+        let scope = agent.placement.clone();
+        let pane = crate::workspace_model::views::Pane {
+            id: crate::model::CardId::from_uuid(agent.id.as_uuid()),
+            title: "Legacy ended console".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 1.0,
+            kind: crate::model::CardKind::Terminal(terminal),
+            scope: None,
+        };
+        store
+            .apply(&ModelEdit::SeedView {
+                scope: scope.clone(),
+                panes: vec![pane.clone()],
+                closed: vec![],
+            })
+            .unwrap();
+        (agent, pane, scope)
+    };
+    let source = agent.session.as_ref().unwrap().id();
+    let handle = host.lock().unwrap().chats[&source].handle.clone();
+    let authority = store
+        .lock()
+        .unwrap()
+        .retained_agent_authority_source(source)
+        .unwrap();
+    assert!(matches!(authority, Some(HostedSession::Chat(_))));
+    // Exercise the public checked-close dispatcher with a real live PTY,
+    // rather than only calling the actor helper after terminal teardown.
+    let console = agent.console.as_ref().unwrap().clone();
+    {
+        let mut state = host.lock().unwrap();
+        state.register_client(29);
+        assert_eq!(
+            state.reserve_spawn(source).unwrap_err().code,
+            crate::terminal_ipc::ProtocolErrorCode::TerminalAlreadyExists
+        );
+        let record = state.chats.get_mut(&source).unwrap();
+        record.console_recipe = Some(console.launch.clone());
+    }
+    // Follow the execution service's private recipe admission. An unpaired
+    // spawn must still refuse while the native provider owns this session.
+    let (descriptor, terminal) = super::super::state::spawn_terminal_view_owned(
+        &host,
+        29,
+        console,
+        Default::default(),
+        None,
+        true,
+    )
+    .unwrap();
+    {
+        let mut state = host.lock().unwrap();
+        let record = state.chats.get_mut(&source).unwrap();
+        record.session.terminal = Some(descriptor.session);
+        record.paired_terminal = Some(terminal.clone());
+    }
+    assert!(!terminal.is_completed());
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .retained_agent_authority_source(source)
+            .unwrap(),
+        authority,
+        "a paired console must retain the native provider's authority"
+    );
+    let before = store.lock().unwrap().model().unwrap();
+    let prompts = std::fs::read(path.parent().unwrap().join("prompts")).unwrap();
+    assert!(
+        close(&host, &Authority::default(), agent.id)
+            .unwrap_err()
+            .contains("historical generation proof")
+    );
+    assert!(
+        crate::host::chat::process(
+            &host,
+            EXECUTION_CLIENT,
+            ClientRequest::ChatClose { chat_id: source }
+        )
+        .unwrap_err()
+        .message
+        .contains("historical generation proof")
+    );
+    assert!(
+        crate::host::chat::close_terminal_actor(&host, source, &handle)
+            .unwrap_err()
+            .message
+            .contains("historical generation proof")
+    );
+    let HostedSession::Chat(retained) = agent.session.as_ref().unwrap() else {
+        unreachable!()
+    };
+    assert!(
+        crate::host::chat::close_retained_native(&host, retained)
+            .unwrap_err()
+            .contains("historical generation proof")
+    );
+    let checked = crate::host::client::process_request(
+        &host,
+        29,
+        ClientRequest::CloseTerminalChecked {
+            terminal_id: source,
+            allow_active: true,
+        },
+    );
+    assert!(
+        checked
+            .unwrap_err()
+            .message
+            .contains("historical generation proof")
+    );
+    assert!(
+        !terminal.is_completed(),
+        "checked-close refusal must precede PTY teardown"
+    );
+    assert!(
+        host.lock().unwrap().terminals[&source]
+            .handle
+            .same_worker(&terminal)
+    );
+    assert!(
+        !handle.is_completed(),
+        "refusal must precede provider freeze/stop"
+    );
+    assert!(
+        host.lock().unwrap().chats[&source]
+            .handle
+            .same_actor(&handle)
+    );
+    assert_eq!(store.lock().unwrap().model().unwrap(), before);
+    assert_eq!(store.lock().unwrap().agent(agent.id).unwrap(), agent);
+    assert_eq!(store.lock().unwrap().agent_run(run.id).unwrap(), run);
+    assert_eq!(
+        std::fs::read(path.parent().unwrap().join("prompts")).unwrap(),
+        prompts
+    );
+    let followup = submit(
+        &host,
+        &Authority::default(),
+        Submit {
+            name: None,
+            destination: Destination::Existing(agent.id),
+            prompt: "Still usable after refused close".into(),
+            idempotency_key: "after-refusal".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        settled(&host, followup.run.id).result.text,
+        "SERVICE_RESULT_2"
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.parent().unwrap().join("spawns")).unwrap(),
+        "spawn\n"
+    );
+    // Test-owned cleanup after proving refusal had no teardown side effect.
+    {
+        let mut store = store.lock().unwrap();
+        let revision = store.view_revision(&scope).unwrap();
+        store
+            .apply(&ModelEdit::ChangeView {
+                scope,
+                expected_revision: revision,
+                operation: uuid::Uuid::new_v4(),
+                change: crate::workspace_model::views::Change::Remove { id: pane.id },
+            })
+            .unwrap();
+    }
+    terminal.shutdown().unwrap();
+    close(&host, &Authority::default(), agent.id).unwrap();
+}
+
+#[test]
+fn retained_old_alias_preflights_current_agent_before_real_holder_release() {
+    if isolated("retained_old_alias_preflights_current_agent_before_real_holder_release").is_some()
+    {
+        return;
+    }
+    use crate::daemon::holder_registry::{self as holders, Kind};
+    use chat::protocol::{ExecutionContext, ProcessSpec, TransportSpec};
+    let (host, mut request, path) = fixture();
+    let Destination::New(spec) = &mut request.destination else {
+        unreachable!()
+    };
+    spec.provider = Provider::Codex;
+    let store = registry(&host).unwrap();
+    let accepted = store
+        .lock()
+        .unwrap()
+        .submit_agent(&Origin::User, &request, now())
+        .unwrap();
+    let current_proof = host.lock().unwrap().proof().clone();
+    let mut original_proof = current_proof.clone();
+    original_proof.host_incarnation = HostIncarnation::new("before-holder-adoption");
+    let directory = path.parent().unwrap();
+    let id = TerminalId::new();
+    let mut original = chat::fresh_session(
+        Provider::Codex,
+        id,
+        directory.to_owned(),
+        &Account::system(Provider::Codex),
+    )
+    .unwrap();
+    original.proof = Some(original_proof.clone());
+    original.claim_owned_codex_listener(Path::new("/var/tmp"), &original_proof);
+    let socket = original
+        .owned_codex_listener
+        .as_ref()
+        .unwrap()
+        .socket
+        .clone();
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let lease = crate::daemon::HostLease::acquire(&paths, &original_proof).unwrap();
+    let context = Arc::new(ExecutionContext::new(Some(Arc::new(
+        std::fs::File::open(directory).unwrap(),
+    ))));
+    let process = ProcessSpec {
+        execution: Some(context.clone()),
+        messages: None,
+        transport: TransportSpec::OwnedUnixWebSocket { socket },
+        program: "/bin/sleep".into(),
+        arguments: vec!["60".into()],
+        working_directory: directory.to_owned(),
+        environment: Default::default(),
+        unset_environment: Default::default(),
+    };
+    let mut holder = chat::native_holder::spawn(process, original.clone()).unwrap();
+    context.installed();
+    let owner = holders::evidence(
+        &holders::socket(&holders::directory(Kind::Native).unwrap(), id),
+        Kind::Native,
+    )
+    .unwrap()
+    .unwrap();
+    holder
+        .confirm(
+            uuid::Uuid::new_v4().to_string(),
+            chat::protocol::ServerIdentity {
+                user_agent: "cagents/0.157.1 (Linux)".into(),
+                canonical_home: directory.to_owned(),
+                reported_home: directory.display().to_string(),
+            },
+            owner.root.clone(),
+        )
+        .unwrap();
+    holder.preserve();
+    store
+        .lock()
+        .unwrap()
+        .bind_agent(
+            accepted.agent.id,
+            None,
+            HostedSession::Chat(original.clone()),
+        )
+        .unwrap();
+    drop(lease);
+    let _lease = crate::daemon::HostLease::acquire(&paths, &current_proof).unwrap();
+    let (adopted, recovery) =
+        chat::native_holder::adopt(&owner, &original, &current_proof).unwrap();
+    let detached = adopted.preserve();
+    assert_ne!(recovery.source.proof, original.proof);
+    assert!(recovery.previous_sources.contains(&original));
+    let current = HostedSession::Chat(recovery.source.clone());
+    store
+        .lock()
+        .unwrap()
+        .adopt_authenticated_agent_session(
+            &recovery
+                .previous_sources
+                .iter()
+                .cloned()
+                .map(HostedSession::Chat)
+                .collect::<Vec<_>>(),
+            &current,
+        )
+        .unwrap();
+    let (agent, scope, pane) = {
+        let mut store = store.lock().unwrap();
+        let mut recipe = recovery.source.launch.recipe.clone();
+        recipe.program = "/bin/cat".into();
+        recipe.arguments.clear();
+        let terminal = crate::model::TerminalSession {
+            id,
+            launch: recipe,
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            transcript_path: None,
+            resume_hint: None,
+            continuity: crate::model::TerminalContinuity::Exited {
+                last_exit: crate::model::TerminalExit {
+                    code: Some(0),
+                    signal: None,
+                    occurred_at_unix_ms: 1,
+                },
+            },
+        };
+        let agent = store
+            .bind_agent_console(accepted.agent.id, &current, terminal.clone())
+            .unwrap();
+        let scope = agent.placement.clone();
+        let pane = crate::workspace_model::views::Pane {
+            id: crate::model::CardId::from_uuid(agent.id.as_uuid()),
+            title: "Legacy adopted console".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 1.0,
+            kind: crate::model::CardKind::Terminal(terminal),
+            scope: None,
+        };
+        store
+            .apply(&ModelEdit::SeedView {
+                scope: scope.clone(),
+                panes: vec![pane.clone()],
+                closed: vec![],
+            })
+            .unwrap();
+        (agent, scope, pane)
+    };
+    let before = store.lock().unwrap().model().unwrap();
+    let run = store.lock().unwrap().agent_run(accepted.run.id).unwrap();
+    // This old alias genuinely passes the original preflight predicate. The
+    // cleanup service must additionally check the actual current owner set.
+    preflight_retirement(&host, &original).unwrap();
+    let error = crate::host::chat::close_retained_native(&host, &original).unwrap_err();
+    assert!(error.contains("historical generation proof"), "{error}");
+    assert!(
+        owner.root.is_current(),
+        "preflight refusal must not Release the real retained server"
+    );
+    let (still_owned, exited) = chat::native_holder::inspect(&owner, &current_proof).unwrap();
+    assert!(!exited);
+    assert_eq!(still_owned.source, recovery.source);
+    assert_eq!(store.lock().unwrap().model().unwrap(), before);
+    assert_eq!(store.lock().unwrap().agent(agent.id).unwrap(), agent);
+    assert_eq!(store.lock().unwrap().agent_run(run.id).unwrap(), run);
+    assert!(!host.lock().unwrap().native_closing.contains_key(&id));
+    // Test-owned cleanup, only after all no-side-effect assertions.
+    {
+        let mut store = store.lock().unwrap();
+        let revision = store.view_revision(&scope).unwrap();
+        store
+            .apply(&ModelEdit::ChangeView {
+                scope,
+                expected_revision: revision,
+                operation: uuid::Uuid::new_v4(),
+                change: crate::workspace_model::views::Change::Remove { id: pane.id },
+            })
+            .unwrap();
+    }
+    detached.close().unwrap();
+    assert!(!owner.root.is_current());
 }
 
 #[test]
@@ -956,8 +1874,37 @@ fn committed_native_dispatch_is_idempotent_and_children_have_real_scoped_authori
     assert!(close(&host, &Authority::default(), child.agent.id).is_err());
     assert!(close(&host, &authority, child.agent.id).unwrap().closed);
 
-    // An ordinary UI ChatClose uses the same retirement transaction as the
-    // execution CLI. Afterwards its capability cannot create another child.
+    // An ordinary UI ChatClose must publish the pane tombstone in its first
+    // retirement transaction, without requiring a later execution Close call.
+    let scope = crate::workspace_model::views::Scope::Channel(parent.channel().unwrap());
+    let pane_id = crate::model::CardId::from_uuid(parent.id.as_uuid());
+    let HostedSession::Chat(parent_chat) = parent.session.as_ref().unwrap() else {
+        unreachable!()
+    };
+    registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .apply(&ModelEdit::SeedView {
+            scope: scope.clone(),
+            panes: vec![crate::workspace_model::views::Pane {
+                id: pane_id,
+                title: "Review".into(),
+                user_title: None,
+                pending_terminal_start: false,
+                width_fraction: 0.5,
+                kind: crate::model::CardKind::Chat(parent_chat.clone()),
+                scope: None,
+            }],
+            closed: vec![],
+        })
+        .unwrap();
+    let retained_run = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent_run(accepted.run.id)
+        .unwrap();
     let parent_session = parent.session.as_ref().unwrap().id();
     super::super::chat::process(
         &host,
@@ -976,6 +1923,14 @@ fn committed_native_dispatch_is_idempotent_and_children_have_real_scoped_authori
             .unwrap()
             .closed
     );
+    // Read a separate database connection, before any service-level Close, to
+    // verify the committed state that subscribed windows receive.
+    let stored = Registry::at(&path).unwrap();
+    let model = stored.model().unwrap();
+    let view = model.views.iter().find(|view| view.scope == scope).unwrap();
+    assert!(view.panes.iter().all(|pane| pane.id != pane_id));
+    assert!(view.retired.contains(&pane_id));
+    assert_eq!(stored.agent_run(accepted.run.id).unwrap(), retained_run);
     assert!(origin(&host, &authority).is_err());
     let Reply::Listed(agents) = process(&host, Authority::default(), Operation::List).unwrap()
     else {
@@ -1977,15 +2932,30 @@ fn an_owner_declines_a_background_request_its_settled_run_left_but_cannot_approv
         "the decision outlives the turn"
     );
 
-    for refused in [
-        answer(&asked.id, "allow"),
-        Control::Interrupt {
-            including_subagents: true,
-        },
-    ] {
-        let error = control(refused).unwrap_err();
-        assert!(error.contains("no active run"), "{error}");
-    }
+    let session = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(agent)
+        .unwrap()
+        .session
+        .unwrap()
+        .id();
+    let handle = host.lock().unwrap().chats[&session].handle.clone();
+    let stale = handle.snapshot(None).unwrap().generation.wrapping_sub(1);
+    assert!(
+        handle.try_close_if_idle(stale).is_err(),
+        "stale generation must not hide a pending permission request"
+    );
+    assert!(!handle.is_completed());
+
+    let error = control(answer(&asked.id, "allow")).unwrap_err();
+    assert!(error.contains("only decline"), "{error}");
+    let error = control(Control::Interrupt {
+        including_subagents: true,
+    })
+    .unwrap_err();
+    assert!(error.contains("no active run"), "{error}");
     let root = path.parent().unwrap();
     assert!(!root.join("decisions").exists(), "nothing was approved");
 
@@ -2608,6 +3578,129 @@ fn disconnected_blocked_inbox_poll_keeps_mail_pending() {
 }
 
 #[test]
+fn queued_mail_wakes_when_parent_settles_with_a_running_background_child() {
+    use crate::agent_execution::mailbox::{Outgoing, State as Delivery, To};
+    if isolated("queued_mail_wakes_when_parent_settles_with_a_running_background_child").is_some() {
+        return;
+    }
+    let (host, mut request, path) = fixture();
+    let root = path.parent().unwrap();
+    struct Release(std::path::PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, "release");
+        }
+    }
+    let release = Release(root.join("courier-release"));
+    request.prompt = "COURIER_BACKGROUND".into();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (session, handle) = loop {
+        let session = registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .session;
+        if let Some(HostedSession::Chat(session)) = session
+            && let Some(handle) = host
+                .lock()
+                .unwrap()
+                .chats
+                .get(&session.id)
+                .map(|record| record.handle.clone())
+            && root.join("courier-busy").exists()
+            && handle.background_subagents().len() == 1
+        {
+            assert!(!handle.is_idle());
+            break (session.id, handle);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture never reached its gated busy parent"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let Reply::Sent(sent) = process(
+        &host,
+        Authority::default(),
+        Operation::SendMessage(Outgoing {
+            to: To::Session(session.to_string()),
+            body: "Exact courier delivery after parent result".into(),
+            wait_ms: None,
+        }),
+    )
+    .unwrap() else {
+        panic!("sent receipt");
+    };
+    let stored = || {
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .message(sent.message.id)
+            .unwrap()
+            .unwrap()
+    };
+    let courier = mailbox::Courier::start(&host).unwrap();
+    courier.wait_for_scan(0); // Completes before result; never wakes the courier.
+    assert_eq!(stored().state, Delivery::Pending);
+    assert_eq!(handle.activity(), crate::agent::ActivityState::Working);
+    std::fs::write(&release.0, "release").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let snapshot = handle.snapshot(None).unwrap();
+        let deliveries = snapshot
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(&item.content,
+            chat::ItemContent::Delivery { body, .. } if body == &sent.message.body)
+            })
+            .count();
+        let provider_prompts = std::fs::read_to_string(root.join("prompts"))
+            .unwrap()
+            .lines()
+            .count();
+        if deliveries == 1 && provider_prompts == 2 && handle.is_idle() {
+            assert_eq!(snapshot.activity(), crate::agent::ActivityState::Working);
+            assert_eq!(
+                snapshot
+                    .subagents
+                    .iter()
+                    .filter(|child| child.status == chat::ToolStatus::Running)
+                    .count(),
+                1
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "eligible mail missed its parent-ready wake: {} visible deliveries",
+            deliveries
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let delivered = stored();
+    assert_eq!(delivered.state, Delivery::Delivered);
+    assert_eq!(delivered.to.session, Some(session));
+    assert_eq!(delivered.to.lineage, sent.message.to.lineage);
+    courier.wake_and_wait_for_scan();
+    assert_eq!(stored(), delivered);
+    assert_eq!(
+        std::fs::read_to_string(root.join("prompts"))
+            .unwrap()
+            .lines()
+            .count(),
+        2,
+        "one original prompt and one courier prompt, including after another scan"
+    );
+    drop(courier);
+    close(&host, &Authority::default(), accepted.agent.id).unwrap();
+}
+
+#[test]
 fn sessions_message_their_parent_peers_and_the_user_and_replies_find_their_askers() {
     use crate::agent_execution::{
         Lineage,
@@ -3078,4 +4171,125 @@ fn an_agents_connection_changes_only_the_terminals_its_lineage_controls() {
         )
         .unwrap();
     }
+}
+
+#[test]
+fn unavailable_retained_startup_snapshot_preserves_owner_and_returns_interrupted() {
+    let (handle, _) = chat::runtime::Handle::fixture_remote_attachment_pair();
+    let identity = handle.actor_identity().unwrap();
+    let result = provider_launch_snapshot(&handle);
+    assert!(
+        matches!(result, Err((State::Interrupted, reason)) if reason.contains("ownership was preserved"))
+    );
+    assert_eq!(handle.actor_identity(), Some(identity));
+    assert!(handle.owns_work());
+    assert!(!handle.is_completed());
+}
+
+#[test]
+fn execution_gates_reclaim_failed_and_repeated_close_churn() {
+    if isolated("execution_gates_reclaim_failed_and_repeated_close_churn").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    // Accept without dispatch: closing this agent exercises durable retirement
+    // without starting a provider, and subsequent closes use the repair path.
+    let accepted = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .submit_agent(&Origin::User, &request, now())
+        .unwrap();
+    assert!(
+        close(&host, &Authority::default(), accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    for _ in 0..256 {
+        assert!(close(&host, &Authority::default(), AgentId::new()).is_err());
+        assert!(
+            close(&host, &Authority::default(), accepted.agent.id)
+                .unwrap()
+                .closed
+        );
+        assert!(host.lock().unwrap().execution_gates.len() <= 1);
+    }
+    assert!(
+        host.lock()
+            .unwrap()
+            .execution_gates
+            .values()
+            .all(|gate| gate.upgrade().is_none())
+    );
+    assert!(!path.parent().unwrap().join("spawns").exists());
+}
+
+#[test]
+fn execution_gates_preserve_waiters_during_reclamation() {
+    if isolated("execution_gates_preserve_waiters_during_reclamation").is_some() {
+        return;
+    }
+    let (host, _, _) = fixture();
+    let agent = AgentId::new();
+    let holder = agent_gate(&host, agent);
+    let held = holder.lock().unwrap();
+    let (ready, waiting) = std::sync::mpsc::channel();
+    let (finish, finished) = std::sync::mpsc::channel();
+    let other = host.clone();
+    let thread = std::thread::spawn(move || {
+        let gate = agent_gate(&other, agent);
+        ready.send(Arc::downgrade(&gate)).unwrap();
+        let _held = gate.lock().unwrap();
+        finished.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
+    let waiter = waiting.recv_timeout(Duration::from_secs(10)).unwrap();
+    for _ in 0..256 {
+        drop(agent_gate(&host, AgentId::new()));
+        let current = agent_gate(&host, agent);
+        assert!(Arc::ptr_eq(&holder, &current));
+        assert!(current.try_lock().is_err());
+        assert!(host.lock().unwrap().execution_gates.len() <= 2);
+    }
+    drop(held);
+    drop(holder);
+    // Only the waiter now owns the gate. A fresh lookup must still join it.
+    let current = agent_gate(&host, agent);
+    assert!(Arc::ptr_eq(&waiter.upgrade().unwrap(), &current));
+    finish.send(()).unwrap();
+    thread.join().unwrap();
+    drop(current);
+    assert!(waiter.upgrade().is_none());
+    drop(agent_gate(&host, AgentId::new()));
+    assert!(!host.lock().unwrap().execution_gates.contains_key(&agent));
+}
+
+#[test]
+fn execution_gates_keep_existing_callers_after_successful_close() {
+    if isolated("execution_gates_keep_existing_callers_after_successful_close").is_some() {
+        return;
+    }
+    let (host, request, _) = fixture();
+    let accepted = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .submit_agent(&Origin::User, &request, now())
+        .unwrap();
+    let pending = agent_gate(&host, accepted.agent.id);
+    assert!(
+        close(&host, &Authority::default(), accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    let next = agent_gate(&host, accepted.agent.id);
+    assert!(Arc::ptr_eq(&pending, &next));
+    let held = pending.lock().unwrap();
+    assert!(next.try_lock().is_err());
+    drop(held);
+    assert!(
+        close(&host, &Authority::default(), accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    assert!(Arc::ptr_eq(&pending, &agent_gate(&host, accepted.agent.id)));
 }

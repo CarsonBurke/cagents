@@ -1526,6 +1526,9 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
             let previous_band = mem::take(&mut state.mounted);
             for (id, mut child) in previous_band.iter().copied().zip(children.drain(..)) {
                 reclaim_named_states(&mut child);
+                if !self.cards.iter().any(|card| card.id == id) {
+                    crate::ui_memory::release_parked(&mut child);
+                }
                 state.detached.insert(id, child);
             }
             for card in &mut self.cards {
@@ -2583,6 +2586,55 @@ mod tests {
         probe.elsewhere(&moved(RestProbe::INSIDE));
         probe.move_to(Point::new(151.0, 40.0));
         assert!(probe.rest().is_empty());
+    }
+
+    #[test]
+    fn parked_presentation_reclaims_named_state_before_releasing_its_subtree() {
+        let ids = [CardId::new(), CardId::new()];
+        let retained = Arc::new(HashMap::from([(ids[0], 0), (ids[1], 1)]));
+        let make = |index: usize| -> Element<'_, ()> {
+            VirtualStrip {
+                total_width: 320.0,
+                retained: retained.clone(),
+                focused: Some(ids[index]),
+                cards: vec![VirtualCard {
+                    id: ids[index],
+                    x: 0.0,
+                    width: 320.0,
+                    content_width: 320.0,
+                    on_screen: true,
+                    content: cosmic::widget::id_container(
+                        crate::ui_memory::gate(widget::Space::new()),
+                        widget::Id::new(format!("disposable-presentation-{index}")),
+                    )
+                    .into(),
+                }],
+            }
+            .into()
+        };
+        let mut element = make(0);
+        let mut tree = Tree::new(&element);
+        let owner = Arc::new(());
+        let released = Arc::downgrade(&owner);
+        // Model a retained/shaped allocation owned by the presentation tree.
+        // The named ancestor moves this entire subtree into iced's pool.
+        tree.children[0].children[0].children[0].state = tree::State::new(owner);
+        tree::NAMED.with(|cache| *cache.borrow_mut() = tree.take_all_named());
+        assert!(released.upgrade().is_some());
+        element = make(1);
+        tree.diff(&mut element);
+        assert!(
+            released.upgrade().is_none(),
+            "named extraction must not leave a presentation owner behind"
+        );
+        let parked = &tree.state.downcast_ref::<VirtualStripState>().detached[&ids[0]];
+        assert!(parked.children[0].children.is_empty());
+        // A real remount reconstructs the emptied gate through normal diffing.
+        tree::NAMED.with(|cache| *cache.borrow_mut() = tree.take_all_named());
+        element = make(0);
+        tree.diff(&mut element);
+        assert_eq!(tree.children[0].children[0].children.len(), 1);
+        tree::NAMED.with(|cache| cache.borrow_mut().clear());
     }
 
     #[test]
