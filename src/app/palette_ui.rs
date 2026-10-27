@@ -1821,22 +1821,38 @@ mod tests {
                 matches!(entry.2, Message::Palette(Action::FocusPane(id)) if id == target)
             }).unwrap();
             let held = Message::Palette(Action::Run(MessageBox(Box::new(selected))));
-            let before = (app.active_workspace.clone(), app.durable.active_channel,
-                app.workspace.order().collect::<Vec<_>>(), app.workspace.focused(),
-                app.settings.palette_recents.clone());
+            let before = (
+                app.active_workspace.clone(),
+                app.durable.active_channel,
+                app.workspace.order().collect::<Vec<_>>(),
+                app.workspace.focused(),
+                app.settings.palette_recents.clone(),
+            );
             let (response, _) = std::sync::mpsc::sync_channel(1);
             drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
-                action: instance::UiUpdateAction::Prepare, response,
+                action: instance::UiUpdateAction::Prepare,
+                response,
             })));
-            assert!(app.update_prepared, "real Prepare admitted the palette-open window");
+            assert!(
+                app.update_prepared,
+                "real Prepare admitted the palette-open window"
+            );
             drop(app.update(held.clone()));
-            assert_eq!((app.active_workspace.clone(), app.durable.active_channel,
-                app.workspace.order().collect::<Vec<_>>(), app.workspace.focused(),
-                app.settings.palette_recents.clone()), before);
+            assert_eq!(
+                (
+                    app.active_workspace.clone(),
+                    app.durable.active_channel,
+                    app.workspace.order().collect::<Vec<_>>(),
+                    app.workspace.focused(),
+                    app.settings.palette_recents.clone()
+                ),
+                before
+            );
             assert_eq!(app.palette.query.as_deref(), Some("@held pane"));
             let (response, receiver) = std::sync::mpsc::sync_channel(1);
             drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
-                action: instance::UiUpdateAction::Cancel, response,
+                action: instance::UiUpdateAction::Cancel,
+                response,
             })));
             assert_eq!(receiver.try_recv().unwrap(), "ok");
             drop(app.update(held));
@@ -1922,7 +1938,8 @@ mod tests {
         Arc::make_mut(&mut app.durable).cards.insert(0, other);
         assert_eq!(app.card_state(id).unwrap().id, id);
         assert_eq!(app.card_state_mut(id).unwrap().id, id);
-    }    #[test]
+    }
+    #[test]
     fn move_picker_ranks_destinations_and_keeps_category_prefixes_literal() {
         let mut app = settings_focus_fixture();
         let card = app.workspace.focused().unwrap();
