@@ -213,7 +213,7 @@ impl Registry {
 pub(super) fn published_fixture_from_rows(source: &Registry, version: u32) -> std::path::PathBuf {
     use std::os::unix::fs::OpenOptionsExt;
 
-    assert!([3, 9, 10, 12, 15].contains(&version));
+    assert!([3, 9, 10, 12, 15, 16, 20].contains(&version));
     assert_eq!(
         source
             .db
@@ -247,10 +247,11 @@ pub(super) fn published_fixture_from_rows(source: &Registry, version: u32) -> st
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap()
     };
-    assert!(
-        !tables
+    assert_eq!(
+        tables
             .iter()
-            .any(|name| name.contains("terminal_retention"))
+            .any(|name| name.contains("terminal_retention")),
+        version >= 20
     );
     let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
     for table in tables {
