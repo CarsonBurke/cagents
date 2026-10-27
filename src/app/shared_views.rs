@@ -1512,6 +1512,13 @@ impl Cagents {
                     self.sync_closed_chat_draft(id);
                 }
                 let message = match self.cards.get(&id) {
+                    Some(CardRuntime::Repository(runtime))
+                        if runtime.is_dirty()
+                            && (runtime.has_editor_recovery()
+                                || runtime.has_durability_warning()) =>
+                    {
+                        "A pane was closed in another client. Its editor is retained here; resolve its file recovery or durability warning, then save any remaining edits before closing it."
+                    }
                     Some(CardRuntime::Repository(runtime)) if !runtime.is_dirty() => {
                         if runtime.is_saving() {
                             "A pane was closed in another client. Its editor is retained here; wait for its save to finish before closing it."
@@ -1636,7 +1643,11 @@ impl Cagents {
                         && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&pane.id)
                         && runtime.blocks_navigation()
                     {
-                        let message = if runtime.is_dirty() {
+                        let message = if runtime.is_dirty()
+                            && (runtime.has_editor_recovery() || runtime.has_durability_warning())
+                        {
+                            "Another client changed this pane. Resolve this editor's file recovery or durability warning, then save any remaining edits before adopting that change."
+                        } else if runtime.is_dirty() {
                             "Another client changed this pane. Save or discard its unsaved edits before adopting that change."
                         } else if runtime.is_saving() {
                             "Another client changed this pane. Wait for its save to finish before adopting that change."
@@ -4085,6 +4096,13 @@ mod tests {
         let runtime = match state {
             "dirty" => RepositoryRuntime::dirty_fixture(pane.id),
             "saving" => RepositoryRuntime::post_persist_failure_fixture(pane.id).0,
+            "dirty-warning" => {
+                let (mut runtime, completion) =
+                    RepositoryRuntime::post_persist_failure_fixture(pane.id);
+                drop(runtime.update(completion));
+                assert!(runtime.is_dirty() && runtime.has_durability_warning());
+                runtime
+            }
             "warning" => {
                 let (mut runtime, completion) =
                     RepositoryRuntime::post_persist_failure_fixture(pane.id);
@@ -4128,9 +4146,15 @@ mod tests {
             "clean" => RepositoryRuntime::open_fixture(pane.id, "notes.txt", "saved\n").0,
             _ => unreachable!(),
         };
-        assert_eq!(runtime.is_dirty(), state == "dirty");
+        assert_eq!(
+            runtime.is_dirty(),
+            matches!(state, "dirty" | "dirty-warning")
+        );
         assert_eq!(runtime.is_saving(), state == "saving");
-        assert_eq!(runtime.has_durability_warning(), state == "warning");
+        assert_eq!(
+            runtime.has_durability_warning(),
+            matches!(state, "warning" | "dirty-warning")
+        );
         assert_eq!(runtime.has_editor_recovery(), state == "recovery");
         assert_eq!(runtime.blocks_navigation(), state != "clean");
         pane.kind = CardKind::Repository(runtime.descriptor.clone());
@@ -4145,7 +4169,7 @@ mod tests {
 
     #[test]
     fn shared_repository_removal_preserves_navigation_fences_and_exact_runtime() {
-        for state in ["dirty", "saving", "warning", "recovery"] {
+        for state in ["dirty", "saving", "warning", "recovery", "dirty-warning"] {
             let (mut app, channel, pane) = repository_retention_fixture(state);
             let Some(CardRuntime::Repository(before)) = app.cards.get(&pane.id) else {
                 unreachable!()
@@ -4164,7 +4188,10 @@ mod tests {
                 assert_eq!(current.save_error().map(str::to_owned), error, "{state}");
                 assert!(current.blocks_navigation(), "{state}");
                 assert_eq!(current.has_editor_recovery(), state == "recovery");
-                assert_eq!(current.has_durability_warning(), state == "warning");
+                assert_eq!(
+                    current.has_durability_warning(),
+                    matches!(state, "warning" | "dirty-warning")
+                );
                 assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
                 assert!(app.card_state(pane.id).unwrap().existence.is_open());
                 assert!(app.shared_views.retained.contains(&pane.id));
@@ -4172,6 +4199,11 @@ mod tests {
                 let notice = app.status.as_ref().unwrap().message.as_str();
                 match state {
                     "dirty" => assert!(notice.contains("save or discard them before closing")),
+                    "dirty-warning" => {
+                        assert!(notice.contains("resolve its file recovery or durability warning"));
+                        assert!(notice.contains("then save any remaining edits"));
+                        assert!(!notice.contains("discard"));
+                    }
                     "saving" => assert!(notice.contains("wait for its save to finish")),
                     "warning" | "recovery" => {
                         assert!(notice.contains("file recovery or durability warning"));
@@ -4190,7 +4222,7 @@ mod tests {
 
     #[test]
     fn shared_repository_replacement_preserves_navigation_fences_and_exact_runtime() {
-        for state in ["dirty", "saving", "warning", "recovery"] {
+        for state in ["dirty", "saving", "warning", "recovery", "dirty-warning"] {
             let (mut app, _, pane) = repository_retention_fixture(state);
             let Some(CardRuntime::Repository(before)) = app.cards.get(&pane.id) else {
                 unreachable!()
@@ -4215,12 +4247,24 @@ mod tests {
                 assert_eq!(current.save_error().map(str::to_owned), error, "{state}");
                 assert!(current.blocks_navigation(), "{state}");
                 assert_eq!(current.has_editor_recovery(), state == "recovery");
-                assert_eq!(current.has_durability_warning(), state == "warning");
+                assert_eq!(
+                    current.has_durability_warning(),
+                    matches!(state, "warning" | "dirty-warning")
+                );
                 assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
                 assert!(app.card_state(pane.id).unwrap().existence.is_open());
                 let notice = app.status.as_ref().unwrap().message.as_str();
                 match state {
                     "dirty" => assert!(notice.contains("Save or discard its unsaved edits")),
+                    "dirty-warning" => {
+                        assert!(
+                            notice.contains(
+                                "Resolve this editor's file recovery or durability warning"
+                            )
+                        );
+                        assert!(notice.contains("then save any remaining edits"));
+                        assert!(!notice.contains("discard"));
+                    }
                     "saving" => assert!(notice.contains("Wait for its save to finish")),
                     "warning" | "recovery" => {
                         assert!(notice.contains("file recovery or durability warning"));
