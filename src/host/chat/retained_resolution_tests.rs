@@ -1030,3 +1030,108 @@ fn real_helper_snapshot_publication_rechecks_exact_host_binding() {
         fixture.no_prompt();
     }
 }
+
+// Append inside the existing retained_resolution_tests module, where Fixture
+// and isolated() retain their original bounded real-helper ownership mechanics.
+#[test]
+fn real_retirement_commit_failure_cannot_reinstall_a_completed_cleanup_owner() {
+    let Some(root) = isolated() else { return };
+    let mut fixture = Fixture::new(root);
+    let original_scope = fixture.handle().launch_account_scope().unwrap().clone();
+    assert!(fixture.original.launch.session_id.is_none());
+    assert!(original_scope.revalidate().is_ok());
+    fixture.rotate_host_without_discovery();
+    assert!(fixture.host.lock().unwrap().chats.is_empty());
+
+    // Same actual durable-commit failure as the existing unattached-cleanup
+    // fixture: teardown succeeds, but its exact cleanup owner must remain
+    // retryable until the Registry can record the real retirement receipt.
+    let fault = rusqlite::Connection::open(fixture.root.join("registry.sqlite3")).unwrap();
+    fault
+        .execute_batch(
+            "CREATE TRIGGER reject_reinstall_retirement BEFORE INSERT ON native_actor_retirements \
+         BEGIN SELECT RAISE(ABORT, 'fixture reinstall retirement commit failure'); END;",
+        )
+        .unwrap();
+    assert!(
+        super::native_cleanup::close_retained(&fixture.host, &fixture.original)
+            .is_err_and(|error| error.contains("fixture reinstall retirement commit failure"))
+    );
+    assert!(!fixture.identity.record.root.is_current());
+    assert!(!fixture.identity.record.holder.is_current());
+    let cleanup_handle = fixture.handle();
+    assert!(cleanup_handle.is_close_only());
+    let cleanup_source = fixture.host.lock().unwrap().chats[&fixture.original.id]
+        .session
+        .clone();
+    let registry = super::super::agent_execution::registry(&fixture.host).unwrap();
+    let ownership = registry
+        .lock()
+        .unwrap()
+        .native_actor_ownership(fixture.identity.instance)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ownership.owner(), &fixture.identity.record);
+    assert_eq!(ownership.scope(), Ok(&original_scope));
+    assert!(
+        registry
+            .lock()
+            .unwrap()
+            .native_actor_retirement(fixture.identity.instance)
+            .unwrap()
+            .is_none()
+    );
+
+    // Exercise the real registered-client public Resolve path. No normal
+    // installation or flag clearing is allowed to turn completed cleanup into
+    // an input attachment, even though the requested pre-ID alias was issued.
+    assert!(fixture.resolve(11, &fixture.original).is_err());
+    assert!(fixture.spent(11));
+    assert!(fixture.attach(11, &cleanup_source).is_err());
+    {
+        let state = fixture.host.lock().unwrap();
+        let record = &state.chats[&fixture.original.id];
+        assert!(record.handle.same_attachment(&cleanup_handle));
+        assert!(record.handle.is_close_only());
+        assert_eq!(record.session, cleanup_source);
+        assert_eq!(record.execution_instance, fixture.identity.instance);
+        assert!(record.subscribers.is_empty());
+        assert!(state.chat_spawning.is_empty());
+    }
+    assert_eq!(
+        registry
+            .lock()
+            .unwrap()
+            .native_actor_ownership(fixture.identity.instance)
+            .unwrap(),
+        Some(ownership)
+    );
+    assert!(!fixture.identity.record.root.is_current());
+    assert!(!fixture.identity.record.holder.is_current());
+    fixture.no_prompt();
+
+    // Remove only this fixture's fault and finish the original cleanup retry;
+    // no replacement provider or new launch recipe is involved.
+    fault
+        .execute_batch("DROP TRIGGER reject_reinstall_retirement;")
+        .unwrap();
+    drop(fault);
+    super::native_cleanup::close_retained(&fixture.host, &fixture.original).unwrap();
+    assert!(
+        !fixture
+            .host
+            .lock()
+            .unwrap()
+            .chats
+            .contains_key(&fixture.original.id)
+    );
+    let retirement = registry
+        .lock()
+        .unwrap()
+        .native_actor_retirement(fixture.identity.instance)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retirement.owner(), &fixture.identity.record);
+    assert_eq!(retirement.scope(), Ok(&original_scope));
+    fixture.no_prompt();
+}
