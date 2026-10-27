@@ -1284,6 +1284,80 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn reopening_active_history_rechecks_protection_when_its_owner_returns() {
+        for nested in [false, true] {
+            let directories = tempfile::tempdir().unwrap();
+            let protections = tempfile::tempdir().unwrap();
+            let owner = directories.path().join("returned-owner");
+            let cwd = if nested {
+                owner.join("missing-subdir")
+            } else {
+                owner.clone()
+            };
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.worktree_protections
+                .use_fixture_runtime(protections.path().into());
+            if nested {
+                app.known_worktree_roots.insert(owner.clone());
+            }
+            drop(app.resume_saved_conversation(saved(&cwd)));
+            let history = app.workspace.focused().unwrap();
+            let card = app.card_state(history).unwrap().clone();
+            let CardKind::Chat(session) = &card.kind else {
+                panic!("the exact saved History card");
+            };
+            assert!(session.launch.needs_read_only_history());
+            assert_eq!(app.active_workspace.as_deref(), Some(owner.as_path()));
+            let cards = app.durable.cards.clone();
+            let generation = app.workspace_view_generation;
+
+            // An already active logical view is not a directory lease. The
+            // owner may return while History stays open; selecting that same
+            // card must recheck protection before taking a no-op fast path.
+            std::fs::create_dir(&owner).unwrap();
+            std::fs::write(owner.join("foreign"), b"keep other owner's data").unwrap();
+            let held =
+                crate::worktree_cleanup::fixture_protection(protections.path(), &owner, true)
+                    .unwrap();
+            app.resume_ui.open = true;
+            app.resume_ui.query = "keep active History selection".into();
+            let task = app.resume_saved_conversation(SavedConversation {
+                card: history,
+                title: card.title.clone(),
+                session: session.clone(),
+                open: true,
+                updated_at_unix_ms: 2,
+            });
+            assert_eq!(task.units(), 0, "refusal must not queue FocusCard");
+            drop(task);
+            assert!(app.resume_ui.open && app.resume_ui.error.is_some());
+            assert_eq!(app.resume_ui.query, "keep active History selection");
+            assert_eq!(app.active_workspace.as_deref(), Some(owner.as_path()));
+            assert_eq!(app.workspace.focused(), Some(history));
+            assert_eq!(app.workspace.order().collect::<Vec<_>>(), [history]);
+            assert_eq!(app.workspace_view_generation, generation);
+            assert_eq!(app.durable.cards, cards);
+            assert!(
+                app.status
+                    .as_ref()
+                    .is_some_and(|notice| notice.message.contains("Cannot open this worktree yet"))
+            );
+            assert_eq!(
+                std::fs::read(owner.join("foreign")).unwrap(),
+                b"keep other owner's data"
+            );
+            if nested {
+                assert!(
+                    !cwd.exists(),
+                    "selection must not recreate the missing leaf"
+                );
+            }
+            drop(held);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn missing_directory_resume_refuses_nonhistory_launches_without_changing_scope() {
         let directories = tempfile::tempdir().unwrap();
         let protections = tempfile::tempdir().unwrap();
