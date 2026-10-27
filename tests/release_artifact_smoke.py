@@ -143,17 +143,30 @@ class SmokeBoundary(unittest.TestCase):
         self.assertEqual(self.recorded(), [])
         self.assert_clean()
 
-    def test_wrong_distribution_and_symlink_rootfs_reject_before_execution(self):
+    def test_wrong_distribution_rootfs_rejects_before_execution(self):
         for release in ('ID=debian\nVERSION_ID="24.04"\n', 'ID=ubuntu\nVERSION_ID="22.04"\n'):
             with self.subTest(release=release):
                 (self.base / "etc/os-release").write_text(release)
                 self.assertNotEqual(self.invoke().returncode, 0)
                 self.assertEqual(self.recorded(), [])
+        self.assert_clean()
+
+    def test_symlink_rootfs_rejects_before_execution(self):
+        self.assertEqual(
+            (self.base / "etc/os-release").read_text(),
+            'ID=ubuntu\nVERSION_ID="24.04"\n',
+        )
         link = self.directory / "rootfs-link"
         link.symlink_to(self.base)
-        self.assertNotEqual(self.invoke(arguments=["--dist", str(self.dist), "--version", VERSION,
-                                                  "--rootfs", str(link)]).returncode, 0)
+        result = self.invoke(arguments=["--dist", str(self.dist), "--version", VERSION,
+                                        "--rootfs", str(link)])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "missing rootfs; run scripts/prepare-release-smoke-rootfs or provide --rootfs",
+            result.stderr,
+        )
         self.assertEqual(self.recorded(), [])
+        self.assert_clean()
 
     def test_preparation_refuses_unsafe_cache_before_network_or_namespace(self):
         cache = self.directory / "cache"
