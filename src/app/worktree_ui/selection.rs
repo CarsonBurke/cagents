@@ -2,6 +2,7 @@
 //!
 //! This deliberately does not coalesce commands that create/resume sessions.
 use super::*;
+mod cache;
 use notify::Watcher;
 use std::sync::{
     Mutex,
@@ -15,6 +16,10 @@ pub(in crate::app) struct State {
     ticket: u64,
     pending: Option<Request>,
     failed_sync: Option<(Vec<PathBuf>, Instant)>,
+    cache: Option<cache::Handle>,
+    cached: Option<Cached>,
+    watch_attempt: Option<WatchAttempt>,
+    cache_wake_armed: bool,
     owners_dirty: bool,
     refresh_scope: bool,
     retired_readiness: Vec<Arc<crate::instance::OwnedLock>>,
@@ -32,6 +37,12 @@ pub(in crate::app) struct State {
     after_retire: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     before_retire: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    watch_unavailable: bool,
+    #[cfg(test)]
+    cache_max_age: Option<Duration>,
+    #[cfg(test)]
+    watch_retired: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     followup_effects: Option<Vec<Task<Message>>>,
 }
@@ -184,63 +195,241 @@ impl Inputs {
     }
 }
 
-/// Watches only invalidate an active physical proof, never authorize a path.
-/// Keep their potentially joining destructor in the worker retirement packet.
+/// Persistent cache proofs never authorize a new destination. Only exact,
+/// unchanged automatic reprojection can reuse the already installed guards.
+#[derive(Clone, PartialEq, Eq)]
+struct CacheKey {
+    inputs: Inputs,
+    owners: Vec<(CardId, PathBuf)>,
+}
+
+impl CacheKey {
+    fn capture(app: &mut Cagents) -> Option<Self> {
+        // Check the resident metadata budget before cloning a potentially large
+        // workspace. Misses retain ordinary physical preparation, not a partial
+        // cache key. No UI path resolution, serialization or content hashing.
+        let rows = app
+            .durable
+            .cards
+            .len()
+            .saturating_add(app.known_worktree_roots.len())
+            .saturating_add(app.worktree_owners.len())
+            .saturating_add(
+                app.sidebar_model
+                    .projects
+                    .iter()
+                    .map(|p| 1 + p.worktrees.len())
+                    .sum::<usize>(),
+            );
+        if rows > cache::MAX_METADATA_ROWS {
+            return None;
+        }
+        let mut bytes = 0usize;
+        let mut add = |path: &Path| {
+            bytes = bytes.saturating_add(path.as_os_str().len());
+            bytes <= cache::MAX_METADATA_BYTES
+        };
+        if !app.known_worktree_roots.iter().all(|p| add(p))
+            || !app.worktree_owners.values().all(|p| add(p))
+            || !app.active_workspace.iter().all(|p| add(p))
+            || !app
+                .sidebar_model
+                .projects
+                .iter()
+                .all(|p| add(&p.repository) && p.worktrees.iter().all(|w| add(&w.path)))
+            || !app.durable.cards.iter().all(|card| {
+                card_directory(card).is_none_or(&mut add)
+                    && app.durable.card_scopes.get(&card.id).is_none_or(|p| add(p))
+                    && app
+                        .durable
+                        .repository_navigation
+                        .get(&card.id)
+                        .is_none_or(|navigation| add(&navigation.worktree))
+                    && app.cards.get(&card.id).is_none_or(|runtime| match runtime {
+                        CardRuntime::Repository(runtime) => add(&runtime.descriptor.worktree),
+                        _ => true,
+                    })
+            })
+        {
+            return None;
+        }
+        let device_bytes = crate::device::selected().map_or(0, |device| {
+            device
+                .name
+                .len()
+                .saturating_add(device.host.len())
+                .saturating_add(device.executable.len())
+        });
+        bytes = bytes.saturating_add(device_bytes);
+        if bytes > cache::MAX_METADATA_BYTES {
+            return None;
+        }
+        let inputs = Inputs::capture(
+            app,
+            Request {
+                generation: 0,
+                path: None,
+                create: false,
+                origin: None,
+                background: false,
+                refresh_channel: None,
+            },
+        );
+        let mut owners = app
+            .worktree_owners
+            .iter()
+            .map(|(id, path)| (*id, path.clone()))
+            .collect::<Vec<_>>();
+        owners.sort();
+        // Desired editor roots can include independent repository navigation.
+        if inputs
+            .protected
+            .iter()
+            .map(|p| p.as_os_str().len())
+            .sum::<usize>()
+            .saturating_add(bytes)
+            > cache::MAX_METADATA_BYTES
+        {
+            return None;
+        }
+        Some(Self { inputs, owners })
+    }
+}
+
+struct WatchAttempt {
+    state: Arc<cache::WatchState>,
+    epoch: u64,
+    checked: Instant,
+}
+
+struct Cached {
+    key: CacheKey,
+    state: Arc<cache::WatchState>,
+    epoch: u64,
+    checked: Instant,
+    complete: bool,
+}
+
+impl Cached {
+    fn current(&self, key: &CacheKey, max_age: Duration) -> bool {
+        self.complete && self.key == *key && self.state.healthy.load(Ordering::Acquire)
+            && self.state.epoch.load(Ordering::Acquire) == self.epoch
+            // A bounded slow fallback also covers silent backend event loss.
+            && self.checked.elapsed() < max_age
+    }
+}
+
+/// Lexical watches precede the first read; physical ancestor watches remain
+/// until their replacement proof is accepted and retired off UI. Unavailable
+/// or capped watches disable cache hits, never fresh physical preparation.
 struct Invalidation {
-    watcher: notify::RecommendedWatcher,
+    watcher: Option<notify::RecommendedWatcher>,
     targets: Arc<Mutex<HashSet<PathBuf>>>,
     registered: HashSet<PathBuf>,
-    epoch: Arc<AtomicU64>,
+    inspected: HashSet<PathBuf>,
+    state: Arc<cache::WatchState>,
 }
 
 impl Invalidation {
-    fn new() -> Result<Self, String> {
-        let epoch = Arc::new(AtomicU64::new(0));
+    fn new(state: Arc<cache::WatchState>) -> Self {
         let targets = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
         let observed = targets.clone();
-        let changed = epoch.clone();
-        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-            let invalid = match event {
-                Err(_) => true,
-                Ok(event) if matches!(event.kind, notify::EventKind::Access(_)) => false,
-                Ok(event) => {
-                    let targets = observed.lock().unwrap_or_else(|error| error.into_inner());
-                    event.paths.is_empty()
-                        || event
-                            .paths
-                            .iter()
-                            .any(|path| targets.iter().any(|target| target.starts_with(path)))
-                }
-            };
-            if invalid {
-                changed.fetch_add(1, Ordering::AcqRel);
-            }
-        })
-        .map_err(|error| error.to_string())?;
-        Ok(Self {
+        let changed = state.clone();
+        let enabled = state.healthy.load(Ordering::Acquire);
+        let watcher = enabled
+            .then(|| {
+                notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                    let invalid = match event {
+                        Err(_) => {
+                            changed.failed();
+                            return;
+                        }
+                        Ok(event) if matches!(event.kind, notify::EventKind::Access(_)) => false,
+                        Ok(event) => {
+                            let targets =
+                                observed.lock().unwrap_or_else(|error| error.into_inner());
+                            event.paths.is_empty()
+                                || event.paths.iter().any(|path| {
+                                    targets.iter().any(|target| target.starts_with(path))
+                                })
+                        }
+                    };
+                    if invalid {
+                        changed.changed();
+                    }
+                })
+            })
+            .and_then(Result::ok);
+        if watcher.is_none() {
+            state.healthy.store(false, Ordering::Release);
+        }
+        Self {
             watcher,
             targets,
             registered: HashSet::new(),
-            epoch,
-        })
+            inspected: HashSet::new(),
+            state,
+        }
     }
 
     fn register(&mut self, paths: impl IntoIterator<Item = PathBuf>) -> Result<(), String> {
-        let paths = paths.into_iter().collect::<Vec<_>>();
-        self.targets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .extend(paths.clone());
         for path in paths {
-            for parent in path.ancestors().skip(1).filter(|parent| parent.is_dir()) {
-                if self.registered.insert(parent.to_owned()) {
-                    self.watcher
-                        .watch(parent, notify::RecursiveMode::NonRecursive)
-                        .map_err(|error| error.to_string())?;
+            if path.as_os_str().len() > cache::MAX_PATH_BYTES {
+                self.state.healthy.store(false, Ordering::Release);
+                continue;
+            }
+            {
+                let mut targets = self
+                    .targets
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if !targets.contains(&path) && targets.len() == cache::MAX_TARGETS {
+                    self.state.healthy.store(false, Ordering::Release);
+                    continue;
+                }
+                targets.insert(path.clone());
+            }
+            for parent in path.ancestors().skip(1) {
+                if self.inspected.contains(parent) {
+                    continue;
+                }
+                if self.inspected.len() == cache::MAX_REGISTRATIONS {
+                    self.state.healthy.store(false, Ordering::Release);
+                    break;
+                }
+                self.inspected.insert(parent.to_owned());
+                match parent.metadata() {
+                    Ok(metadata) if metadata.is_dir() => {
+                        if self.watcher.as_mut().is_some_and(|watcher| {
+                            watcher
+                                .watch(parent, notify::RecursiveMode::NonRecursive)
+                                .is_ok()
+                        }) {
+                            self.registered.insert(parent.to_owned());
+                        } else {
+                            self.state.healthy.store(false, Ordering::Release);
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    _ => {
+                        self.state.healthy.store(false, Ordering::Release);
+                    }
                 }
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for Invalidation {
+    fn drop(&mut self) {
+        // The destructor itself can wait for notify's helper: all ownership
+        // paths must reach it on the admitted worker or idle custodian.
+        drop(self.watcher.take());
+        #[cfg(test)]
+        if let Some(retired) = &self.state.retired {
+            retired();
+        }
     }
 }
 
@@ -255,6 +444,7 @@ struct Prepared {
     inputs: Inputs,
     path: Option<PathBuf>,
     owners: HashMap<CardId, PathBuf>,
+    complete: bool,
     protections: crate::worktree_cleanup::WindowProtections,
     ready: Option<crate::instance::PreparedLock>,
     invalidation: Invalidation,
@@ -298,6 +488,7 @@ struct Client {
     wake: crossbeam_channel::Sender<()>,
     notifications: async_channel::Receiver<Notification>,
     join: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    cache: cache::Handle,
 }
 
 impl Drop for Client {
@@ -307,6 +498,14 @@ impl Drop for Client {
         // disappears, including receiver/Task closure during window teardown.
         self.shared.cancelled.store(true, Ordering::Release);
         let _ = self.wake.try_send(());
+        if let Some(join) = self
+            .join
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            self.cache.abandoned(join);
+        }
     }
 }
 
@@ -371,7 +570,10 @@ impl Receipt {
             .unwrap_or_else(|error| error.into_inner())
             .take();
         if let Some(join) = join {
-            if join.await.is_ok() {
+            if cache::Joining::new(join, self.client.cache.clone())
+                .complete()
+                .await
+            {
                 return Message::WorktreeNavigationRetired(generation);
             }
         }
@@ -385,6 +587,7 @@ struct Retirement {
     previous: Option<crate::worktree_cleanup::WindowProtections>,
     obsolete: Vec<Arc<crate::worktree_cleanup::Protection>>,
     readiness: Vec<Arc<crate::instance::OwnedLock>>,
+    cache_install: bool,
     #[cfg(test)]
     observed: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -398,6 +601,7 @@ fn worker(
     shared: Arc<Shared>,
     wake: crossbeam_channel::Receiver<()>,
     notifications: async_channel::Sender<Notification>,
+    cache: cache::Handle,
     initial: impl FnOnce() -> Result<Prepared, String>,
 ) {
     let mut result = worker_phase(initial);
@@ -516,7 +720,13 @@ fn worker(
             .unwrap_or_else(|error| error.into_inner());
         (slot.result.take(), slot.command.take())
     };
-    drop(result);
+    let install = matches!(&command, Some(Command::Retire(retirement)) if retirement.cache_install);
+    if let Some(Ok(prepared)) = result {
+        let Prepared { invalidation, .. } = prepared;
+        cache.replace(if install { Some(invalidation) } else { None });
+    } else {
+        cache.replace(None);
+    }
     drop(command);
     #[cfg(test)]
     if let Some(after) = &shared.after_retire {
@@ -532,9 +742,11 @@ fn resolve(
         Option<PathBuf>,
         HashMap<CardId, PathBuf>,
         Vec<(PathBuf, PathBuf)>,
+        bool,
     ),
     String,
 > {
+    let mut complete = true;
     let mut physical = HashMap::<PathBuf, PathBuf>::new();
     if let Some(path) = &inputs.request.path {
         let selected = path.canonicalize().map_err(|error| error.to_string())?;
@@ -543,14 +755,37 @@ fn resolve(
     for (root, _) in &inputs.roots {
         physical
             .entry(root.clone())
-            .or_insert_with(|| root.canonicalize().unwrap_or_else(|_| root.clone()));
+            .or_insert_with(|| match root.canonicalize() {
+                Ok(path) => path,
+                Err(_) => {
+                    complete = false;
+                    root.clone()
+                }
+            });
     }
     for (_, _, scope, directory) in &inputs.cards {
         for path in scope.iter().chain(directory) {
             physical
                 .entry(path.clone())
-                .or_insert_with(|| path.canonicalize().unwrap_or_else(|_| path.clone()));
+                .or_insert_with(|| match path.canonicalize() {
+                    Ok(path) => path,
+                    Err(_) => {
+                        complete = false;
+                        path.clone()
+                    }
+                });
         }
+    }
+    for path in &inputs.protected {
+        physical
+            .entry(path.clone())
+            .or_insert_with(|| match path.canonicalize() {
+                Ok(path) => path,
+                Err(_) => {
+                    complete = false;
+                    path.clone()
+                }
+            });
     }
     let owner = |path: &Path| {
         let canonical = physical.get(path).expect("captured physical path");
@@ -574,16 +809,17 @@ fn resolve(
         .collect();
     let mut physical = physical.into_iter().collect::<Vec<_>>();
     physical.sort();
-    Ok((path, owners, physical))
+    Ok((path, owners, physical, complete))
 }
 
 fn prepare(
     inputs: Inputs,
     protections: crate::worktree_cleanup::WindowProtections,
+    state: Arc<cache::WatchState>,
     #[cfg(test)] runtime: Option<PathBuf>,
     #[cfg(test)] after_acquire: Option<Arc<dyn Fn(&Path) + Send + Sync>>,
 ) -> Result<Prepared, String> {
-    let mut invalidation = Invalidation::new()?;
+    let mut invalidation = Invalidation::new(state);
     invalidation.register(
         inputs
             .roots
@@ -598,8 +834,8 @@ fn prepare(
             .chain(inputs.protected.iter().cloned())
             .chain(inputs.request.path.iter().cloned()),
     )?;
-    let epoch = invalidation.epoch.load(Ordering::Acquire);
-    let (path, owners, physical) = resolve(&inputs)?;
+    let epoch = invalidation.state.epoch.load(Ordering::Acquire);
+    let (path, owners, physical, complete) = resolve(&inputs)?;
     invalidation.register(physical.iter().map(|(_, physical)| physical.clone()))?;
     let paths = inputs
         .protected
@@ -646,8 +882,8 @@ fn prepare(
         .validate_navigation()
         .map_err(|error| error.to_string())?;
     let final_paths = resolve(&inputs)?;
-    if final_paths != (path.clone(), owners.clone(), physical)
-        || epoch != invalidation.epoch.load(Ordering::Acquire)
+    if final_paths != (path.clone(), owners.clone(), physical, complete)
+        || epoch != invalidation.state.epoch.load(Ordering::Acquire)
     {
         return Err("worktree paths changed while preparing; select the worktree again".into());
     }
@@ -655,6 +891,7 @@ fn prepare(
         inputs,
         path,
         owners,
+        complete,
         protections,
         ready,
         invalidation,
@@ -674,11 +911,106 @@ impl Cagents {
 
     pub(super) fn refresh_automatic_worktree_owners(&mut self) -> Task<Message> {
         self.collect_worktree_roots();
+        let key = CacheKey::capture(self);
+        let max_age = self.selection_cache_max_age();
+        if self.worktree_selection.active.is_none()
+            && self.worktree_selection.pending.is_none()
+            && self
+                .worktree_selection
+                .cache
+                .as_ref()
+                .is_some_and(cache::Handle::alive)
+            && self
+                .worktree_selection
+                .cached
+                .as_ref()
+                .is_some_and(|cached| key.as_ref().is_some_and(|key| cached.current(key, max_age)))
+            && key.as_ref().is_some_and(|key| {
+                !self
+                    .worktree_protections
+                    .navigation_sync_needed(&key.inputs.protected)
+            })
+        {
+            self.worktree_selection.owners_refreshed();
+            return Task::none();
+        }
         self.worktree_selection.refresh_scope = true;
         self.navigation_owners_changed();
         // This is background reconciliation, never a newer user navigation.
         // An explicit active/pending selection keeps its intent and priority.
         self.reconcile_navigation_protections()
+    }
+
+    pub(in crate::app) fn selection_cache_invalidated(&mut self) -> Task<Message> {
+        self.worktree_selection.cache_wake_armed = false;
+        let max_age = self.selection_cache_max_age();
+        let current = self
+            .worktree_selection
+            .watch_attempt
+            .as_ref()
+            .is_some_and(|cached| {
+                cached.state.epoch.load(Ordering::Acquire) == cached.epoch
+                    && cached.checked.elapsed() < max_age
+            });
+        if current {
+            // A backend error revokes warm hits immediately without inventing
+            // a path change or hot-looping a successful degraded preparation.
+            // A real path epoch still bypasses this bounded recovery deadline.
+            return self.arm_selection_cache();
+        }
+        self.worktree_selection.cached = None;
+        self.worktree_selection.refresh_scope = true;
+        self.navigation_owners_changed();
+        if self.worktree_selection.active.is_some() {
+            // One coalesced wake per active ticket; rearm after original join.
+            return self.reconcile_navigation_protections();
+        }
+        Task::batch([
+            self.reconcile_navigation_protections(),
+            self.arm_selection_cache(),
+        ])
+    }
+
+    fn selection_cache_max_age(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(age) = self.worktree_selection.cache_max_age {
+            return age;
+        }
+        Duration::from_secs(60)
+    }
+
+    fn arm_selection_cache(&mut self) -> Task<Message> {
+        if self.worktree_selection.active.is_some() {
+            return Task::none();
+        }
+        if self.worktree_selection.cache_wake_armed {
+            return Task::none();
+        }
+        let Some(cache) = &self.worktree_selection.cache else {
+            return Task::none();
+        };
+        if !cache.alive() {
+            return Task::none();
+        }
+        self.worktree_selection.cache_wake_armed = true;
+        // The observer holds only this receiver, never a native-resource sender.
+        let events = cache.events();
+        let age = self.selection_cache_max_age();
+        let remaining = self
+            .worktree_selection
+            .watch_attempt
+            .as_ref()
+            .map_or(age, |cached| age.saturating_sub(cached.checked.elapsed()));
+        let task = cosmic::task::future(async move {
+            let _ = tokio::time::timeout(remaining, events.recv()).await;
+            Message::WorktreeSelectionCacheInvalidated
+        });
+        #[cfg(test)]
+        if let Some(effects) = &mut self.worktree_selection.followup_effects {
+            effects.push(task);
+            return Task::none();
+        }
+        task
     }
 
     pub(in crate::app) fn navigate_worktree(
@@ -805,6 +1137,23 @@ impl Cagents {
             self.worktree_selection.before_prepare.clone(),
             self.worktree_selection.after_acquire.clone(),
         );
+        let (cache, owner) = match self.worktree_selection.cache.as_ref() {
+            Some(cache) => (cache.clone(), None),
+            _ => {
+                let (cache, owner) = cache::Handle::channel();
+                self.worktree_selection.cache = Some(cache.clone());
+                self.worktree_selection.cache_wake_armed = false;
+                (cache, Some(owner))
+            }
+        };
+        self.worktree_selection.cached = None;
+        self.worktree_selection.watch_attempt = None;
+        let watch_state = cache.watch_state(
+            #[cfg(test)]
+            self.worktree_selection.watch_retired.clone(),
+            #[cfg(test)]
+            self.worktree_selection.watch_unavailable,
+        );
         let shared = Arc::new(Shared {
             #[cfg(test)]
             before_retire: self.worktree_selection.before_retire.clone(),
@@ -819,22 +1168,26 @@ impl Cagents {
             wake: signal,
             notifications: receive,
             join: Mutex::new(None),
+            cache: cache.clone(),
         });
         let receipt = Receipt { client, phase: 0 };
         cosmic::task::future(async move {
             let join = tokio::task::spawn_blocking(move || {
-                worker(shared, wake, notifications, move || {
+                if let Some(owner) = owner {
+                    owner.start();
+                }
+                worker(shared, wake, notifications, cache, move || {
                     #[cfg(test)]
                     if let Some(before) = before {
                         before(inputs.request.path.as_deref().unwrap_or(Path::new("")));
                     }
                     #[cfg(test)]
                     {
-                        prepare(inputs, protections, runtime, after_acquire)
+                        prepare(inputs, protections, watch_state, runtime, after_acquire)
                     }
                     #[cfg(not(test))]
                     {
-                        prepare(inputs, protections)
+                        prepare(inputs, protections, watch_state)
                     }
                 })
             });
@@ -975,7 +1328,8 @@ impl Cagents {
                         // Latest desired selection, fresh snapshot, still behind
                         // this receipt's actual capability retirement.
                         self.worktree_selection.pending = Some(prepared.inputs.request.clone());
-                    } else if prepared.epoch != prepared.invalidation.epoch.load(Ordering::Acquire)
+                    } else if prepared.epoch
+                        != prepared.invalidation.state.epoch.load(Ordering::Acquire)
                     {
                         self.navigation_sync_failed();
                         self.status = Some(TransientNotice::warning(
@@ -1124,6 +1478,33 @@ impl Cagents {
                                         )))
                                     }
                                 }
+                                if self
+                                    .worktree_selection
+                                    .cache
+                                    .as_ref()
+                                    .is_some_and(cache::Handle::alive)
+                                    && prepared.invalidation.state.epoch.load(Ordering::Acquire)
+                                        == prepared.epoch
+                                {
+                                    let checked = Instant::now();
+                                    self.worktree_selection.watch_attempt = Some(WatchAttempt {
+                                        state: prepared.invalidation.state.clone(),
+                                        epoch: prepared.epoch,
+                                        checked,
+                                    });
+                                    if prepared.invalidation.state.healthy.load(Ordering::Acquire)
+                                        && let Some(key) = CacheKey::capture(self)
+                                    {
+                                        self.worktree_selection.cached = Some(Cached {
+                                            key,
+                                            state: prepared.invalidation.state.clone(),
+                                            epoch: prepared.epoch,
+                                            checked,
+                                            complete: prepared.complete,
+                                        });
+                                        retirement.cache_install = true;
+                                    }
+                                }
                                 drop(slot);
                                 return self.finish_worktree_navigation(
                                     generation, retirement, receipt, task,
@@ -1217,7 +1598,10 @@ impl Cagents {
             return Task::none();
         }
         self.worktree_selection.active = None;
-        self.dispatch_worktree_navigation()
+        Task::batch([
+            self.dispatch_worktree_navigation(),
+            self.arm_selection_cache(),
+        ])
     }
 }
 
@@ -1858,9 +2242,472 @@ mod tests {
         refiled_launch_remains_protected_after_retirement(false);
     }
 
+    fn current_folder(app: &Cagents, path: &Path) -> ProjectId {
+        app.sidebar_model
+            .projects
+            .iter()
+            .find(|p| p.repository == path)
+            .unwrap()
+            .id
+    }
+
+    fn cache_observer_tick(app: &mut Cagents) -> Message {
+        // Consume the ACTUAL observer timeout future, not a hand-made expiry.
+        app.worktree_selection.cache_wake_armed = false;
+        app.worktree_selection
+            .followup_effects
+            .as_mut()
+            .unwrap()
+            .clear();
+        no_effect(app.arm_selection_cache());
+        let observer = app
+            .worktree_selection
+            .followup_effects
+            .as_mut()
+            .unwrap()
+            .pop()
+            .unwrap();
+        matching(observer, |message| {
+            matches!(message, Message::WorktreeSelectionCacheInvalidated)
+        })
+    }
+
+    #[test]
+    fn unchanged_repository_reload_reuses_exact_scope_without_filesystem_preparation() {
+        let mut f = fixture();
+        assert!(f.app.worktree_selection.cached.is_some());
+        let starts = Arc::new(AtomicUsize::new(0));
+        let count = starts.clone();
+        f.app.worktree_selection.before_prepare = Some(Arc::new(move |_| {
+            count.fetch_add(1, AtomicOrdering::SeqCst);
+        }));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let count = reads.clone();
+        f.app
+            .worktree_protections
+            .observe_navigation_io(Arc::new(move || {
+                count.fetch_add(1, AtomicOrdering::SeqCst);
+            }));
+        let project = current_folder(&f.app, &f.old);
+        for _ in 0..12 {
+            no_effect(automatic_folder_load(&mut f.app, project, &f.old));
+        }
+        assert_eq!(starts.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(reads.load(AtomicOrdering::SeqCst), 0);
+        assert!(f.app.worktree_selection.active.is_none());
+        assert_eq!(f.app.active_workspace.as_ref(), Some(&f.old));
+        assert!(crate::worktree_cleanup::fixture_protection(&f.runtime, &f.old, true).is_err());
+    }
+
+    #[test]
+    fn cached_scope_does_not_skip_explicit_physical_authorization_or_context_changes() {
+        let mut f = fixture();
+        let (entered, release, starts) = blocked(&mut f.app);
+        let task = f.app.navigate_worktree(f.old.clone(), false, None);
+        let worker = std::thread::spawn(move || prepared(task));
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(starts.load(AtomicOrdering::SeqCst), 1);
+        release.send(()).unwrap();
+        let retirement = f.app.update(worker.join().unwrap());
+        no_effect(f.app.update(retired(retirement)));
+        // Same roots/counts are insufficient: a changed default decision is a
+        // new context even though this create=false refresh inserts no pane.
+        f.app.settings.default_worktree_pane = settings::DefaultPane::NativeChat;
+        let project = current_folder(&f.app, &f.old);
+        let task = automatic_folder_load(&mut f.app, project, &f.old);
+        let retirement = f.app.update(prepared(task));
+        no_effect(f.app.update(retired(retirement)));
+        assert_eq!(starts.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_alias_retarget_invalidates_cached_owner_and_retires_obsolete_targets() {
+        let mut f = fixture();
+        let base = f.old.parent().unwrap();
+        let first = base.join("first-owner");
+        let second = base.join("second-owner");
+        let alias = base.join("owner-alias");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        std::os::unix::fs::symlink(&first, &alias).unwrap();
+        folder(&mut f.app, &first);
+        folder(&mut f.app, &second);
+        let mut card = crate::app::tests::terminal_card_state();
+        let CardKind::Terminal(session) = &mut card.kind else {
+            unreachable!()
+        };
+        session.launch.working_directory = alias.clone();
+        let id = card.id;
+        Arc::make_mut(&mut f.app.durable).cards.push(card);
+        f.app.cards.insert(id, CardRuntime::Loading);
+        drop(f.app.select_worktree(first.clone(), false));
+        assert!(f.app.workspace.cards().iter().any(|card| card.id == id));
+        let task = f
+            .app
+            .update(Message::SettingsSearchChanged("new alias".into()));
+        let retirement = f.app.update(prepared(task));
+        no_effect(f.app.update(retired(retirement)));
+        assert_eq!(f.app.worktree_owners[&id], first);
+        let watch = f
+            .app
+            .worktree_selection
+            .cached
+            .as_ref()
+            .unwrap()
+            .state
+            .clone();
+        let epoch = watch.epoch.load(Ordering::Acquire);
+        let events = f.app.worktree_selection.cache.as_ref().unwrap().events();
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&second, &alias).unwrap();
+        executor().block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while watch.epoch.load(Ordering::Acquire) == epoch {
+                    events.recv().await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        });
+        let task = f.app.update(Message::WorktreeSelectionCacheInvalidated);
+        let retirement = f.app.update(prepared(task));
+        no_effect(f.app.update(retired(retirement)));
+        assert_eq!(f.app.worktree_owners[&id], second);
+        assert_eq!(f.app.active_workspace.as_ref(), Some(&first));
+        assert!(!f.app.workspace.cards().iter().any(|card| card.id == id));
+        let state = f.app.card_state_mut(id).unwrap();
+        state.existence = Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: None,
+            },
+        };
+        let task = f
+            .app
+            .update(Message::SettingsSearchChanged("closed alias".into()));
+        let retirement = f.app.update(prepared(task));
+        no_effect(f.app.update(retired(retirement)));
+        let (targets, registrations) = f.app.worktree_selection.cache.as_ref().unwrap().snapshot();
+        assert!(!targets.contains(&alias));
+        assert!(targets.len() <= cache::MAX_TARGETS);
+        assert!(registrations <= cache::MAX_REGISTRATIONS);
+    }
+
+    #[test]
+    fn backend_error_after_physical_preparation_revokes_cache_without_rejecting_current_scope() {
+        let mut f = fixture();
+        let message = prepared(f.app.navigate_worktree(f.next.clone(), false, None));
+        let Message::WorktreeNavigationPrepared { receipt, .. } = &message else {
+            unreachable!()
+        };
+        let state = {
+            let slot = receipt.client.shared.slot.lock().unwrap();
+            slot.result
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .invalidation
+                .state
+                .clone()
+        };
+        // The actual notify Err callback uses this same atomic transition.
+        // This is a source-owned backend-failure control, not OS exhaustion.
+        state.failed();
+        let retirement = f.app.update(message);
+        assert_eq!(f.app.active_workspace.as_ref(), Some(&f.next));
+        no_effect(f.app.update(retired(retirement)));
+        assert!(f.app.worktree_selection.cached.is_none());
+        assert!(crate::worktree_cleanup::fixture_protection(&f.runtime, &f.next, true).is_err());
+        assert!(f.app.worktree_selection.active.is_none());
+    }
+
+    #[test]
+    fn repeated_backend_failures_do_not_hot_retry_degraded_scopes_and_timer_recovery_succeeds() {
+        let mut f = fixture();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let count = starts.clone();
+        f.app.worktree_selection.before_prepare = Some(Arc::new(move |_| {
+            count.fetch_add(1, AtomicOrdering::SeqCst);
+        }));
+        let mut message = prepared(f.app.navigate_worktree(f.next.clone(), false, None));
+        for cycle in 0..3 {
+            let Message::WorktreeNavigationPrepared { receipt, .. } = &message else {
+                unreachable!()
+            };
+            {
+                let slot = receipt.client.shared.slot.lock().unwrap();
+                slot.result
+                    .as_ref()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .invalidation
+                    .state
+                    .failed();
+            }
+            let retirement = f.app.update(message);
+            no_effect(f.app.update(retired(retirement)));
+            assert_eq!(f.app.active_workspace.as_ref(), Some(&f.next));
+            assert!(f.app.worktree_selection.cached.is_none());
+            assert_eq!(starts.load(AtomicOrdering::SeqCst), cycle + 1);
+            let failure_wake = cache_observer_tick(&mut f.app);
+            no_effect(f.app.update(failure_wake));
+            assert_eq!(
+                starts.load(AtomicOrdering::SeqCst),
+                cycle + 1,
+                "its own backend failure wake must not start another scan"
+            );
+            f.app
+                .worktree_selection
+                .watch_attempt
+                .as_mut()
+                .unwrap()
+                .checked -= Duration::from_secs(61);
+            let retry = cache_observer_tick(&mut f.app);
+            let task = f.app.update(retry);
+            message = prepared(task);
+        }
+        // The fourth, deadline-admitted attempt uses the actual healthy watcher.
+        let retirement = f.app.update(message);
+        no_effect(f.app.update(retired(retirement)));
+        assert!(f.app.worktree_selection.cached.is_some());
+        assert_eq!(starts.load(AtomicOrdering::SeqCst), 4);
+    }
+
+    #[test]
+    fn unavailable_watch_degrades_to_physical_preparation_then_recovers_cache() {
+        let mut f = fixture();
+        f.app.worktree_selection.watch_unavailable = true;
+        let task = f.app.navigate_worktree(f.next.clone(), false, None);
+        let retirement = f.app.update(prepared(task));
+        no_effect(f.app.update(retired(retirement)));
+        assert_eq!(f.app.active_workspace.as_ref(), Some(&f.next));
+        assert!(f.app.worktree_selection.cached.is_none());
+        assert!(crate::worktree_cleanup::fixture_protection(&f.runtime, &f.next, true).is_err());
+        f.app.worktree_selection.watch_unavailable = false;
+        f.app.worktree_selection.cache_max_age = Some(Duration::from_millis(20));
+        let expired = cache_observer_tick(&mut f.app);
+        let task = f.app.update(expired);
+        let retirement = f.app.update(prepared(task));
+        no_effect(f.app.update(retired(retirement)));
+        assert!(f.app.worktree_selection.cached.is_some());
+        f.app.worktree_selection.cache_max_age = None;
+        let project = current_folder(&f.app, &f.next);
+        no_effect(automatic_folder_load(&mut f.app, project, &f.next));
+    }
+
+    #[test]
+    fn creating_a_missing_launch_ancestor_invalidates_idle_cache_and_acquires_its_real_lease() {
+        let mut f = fixture();
+        let missing = f.old.join("later-created/nested");
+        let mut card = crate::app::tests::terminal_card_state();
+        let CardKind::Terminal(session) = &mut card.kind else {
+            unreachable!()
+        };
+        session.launch.working_directory = missing.clone();
+        let id = card.id;
+        Arc::make_mut(&mut f.app.durable).cards.push(card);
+        f.app.cards.insert(id, CardRuntime::Loading);
+        Arc::make_mut(&mut f.app.durable)
+            .card_scopes
+            .insert(id, f.old.clone());
+        let task = f
+            .app
+            .update(Message::SettingsSearchChanged("missing launch".into()));
+        let retirement = f.app.update(prepared(task));
+        no_effect(f.app.update(retired(retirement)));
+        let cached = f.app.worktree_selection.cached.as_ref().unwrap();
+        assert!(
+            !cached.complete,
+            "a missing path is a watched negative dependency, not a warm physical proof"
+        );
+        let state = cached.state.clone();
+        let epoch = cached.epoch;
+        let events = f.app.worktree_selection.cache.as_ref().unwrap().events();
+        std::fs::create_dir_all(&missing).unwrap();
+        executor().block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while state.epoch.load(Ordering::Acquire) == epoch {
+                    events.recv().await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        });
+        let task = f.app.update(Message::WorktreeSelectionCacheInvalidated);
+        let retirement = f.app.update(prepared(task));
+        no_effect(f.app.update(retired(retirement)));
+        assert!(f.app.worktree_selection.cached.as_ref().unwrap().complete);
+        assert!(crate::worktree_cleanup::fixture_protection(&f.runtime, &missing, true).is_err());
+        assert!(crate::worktree_cleanup::fixture_protection(&f.runtime, &f.old, true).is_err());
+    }
+
+    #[test]
+    fn dirty_prepared_receipt_never_adopts_cached_old_inode_and_releases_it_after_retirement() {
+        let mut f = fixture();
+        let message = prepared(f.app.navigate_worktree(f.next.clone(), false, None));
+        let Message::WorktreeNavigationPrepared { receipt, .. } = &message else {
+            unreachable!()
+        };
+        let (state, epoch) = {
+            let slot = receipt.client.shared.slot.lock().unwrap();
+            let prepared = slot.result.as_ref().unwrap().as_ref().unwrap();
+            (prepared.invalidation.state.clone(), prepared.epoch)
+        };
+        let events = f.app.worktree_selection.cache.as_ref().unwrap().events();
+        let moved = f.old.parent().unwrap().join("moved-prepared-inode");
+        std::fs::rename(&f.next, &moved).unwrap();
+        std::fs::create_dir(&f.next).unwrap();
+        executor().block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while state.epoch.load(Ordering::Acquire) == epoch {
+                    events.recv().await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        });
+        assert!(crate::worktree_cleanup::fixture_protection(&f.runtime, &moved, true).is_err());
+        let retirement = f.app.update(message);
+        assert_eq!(f.app.active_workspace.as_ref(), Some(&f.old));
+        no_effect(f.app.update(retired(retirement)));
+        assert!(f.app.worktree_selection.cached.is_none());
+        drop(crate::worktree_cleanup::fixture_protection(&f.runtime, &moved, true).unwrap());
+        assert!(crate::worktree_cleanup::fixture_protection(&f.runtime, &f.old, true).is_err());
+    }
+
+    #[test]
+    fn oversized_metadata_uses_physical_preparation_without_retaining_a_partial_cache_key() {
+        let mut f = fixture();
+        for _ in 0..cache::MAX_METADATA_ROWS {
+            let mut card = crate::app::tests::terminal_card_state();
+            let CardKind::Terminal(session) = &mut card.kind else {
+                unreachable!()
+            };
+            session.launch.working_directory = f.old.clone();
+            Arc::make_mut(&mut f.app.durable).cards.push(card);
+        }
+        let discovered = f.old.join("large-scope-boundary");
+        std::fs::create_dir(&discovered).unwrap();
+        folder(&mut f.app, &discovered);
+        let task = f.app.update(Message::SettingsSearchChanged(
+            "many parked descriptors".into(),
+        ));
+        let retirement = f.app.update(prepared(task));
+        no_effect(f.app.update(retired(retirement)));
+        assert!(f.app.worktree_selection.cached.is_none());
+        assert!(crate::worktree_cleanup::fixture_protection(&f.runtime, &f.old, true).is_err());
+        assert!(f.app.worktree_selection.active.is_none());
+    }
+
+    #[test]
+    fn expired_cache_revalidation_remains_on_the_single_filesystem_worker() {
+        let mut f = fixture();
+        f.app.worktree_selection.cached.as_mut().unwrap().checked -= Duration::from_secs(61);
+        f.app
+            .worktree_selection
+            .watch_attempt
+            .as_mut()
+            .unwrap()
+            .checked -= Duration::from_secs(61);
+        let ui = std::thread::current().id();
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let observed = reads.clone();
+        f.app
+            .worktree_protections
+            .observe_navigation_io(Arc::new(move || {
+                observed.lock().unwrap().push(std::thread::current().id());
+            }));
+        let expired = cache_observer_tick(&mut f.app);
+        let task = f.app.update(expired);
+        let retirement = f.app.update(prepared(task));
+        no_effect(f.app.update(retired(retirement)));
+        assert!(!reads.lock().unwrap().is_empty());
+        assert!(reads.lock().unwrap().iter().all(|thread| *thread != ui));
+    }
+
+    #[test]
+    fn cancelling_retirement_after_handle_take_preserves_original_join_before_cache_drain() {
+        let ui = std::thread::current().id();
+        let (cache, owner) = cache::Handle::channel();
+        owner.start();
+        let (dropped, observed) = crossbeam_channel::bounded(1);
+        let state = cache.watch_state(
+            Some(Arc::new(move || {
+                dropped.send(std::thread::current().id()).unwrap();
+            })),
+            false,
+        );
+        let installer = cache.clone();
+        std::thread::spawn(move || installer.replace(Some(Invalidation::new(state))))
+            .join()
+            .unwrap();
+        let (notifications, receive) = async_channel::bounded(1);
+        let (at_return, waiting) = crossbeam_channel::bounded(1);
+        let (release, wait) = crossbeam_channel::bounded(1);
+        let worker_sender = cache.clone();
+        let original = executor().spawn_blocking(move || {
+            drop(worker_sender);
+            notifications.send_blocking(Notification::Retired).unwrap();
+            at_return.send(()).unwrap();
+            wait.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+        waiting.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (wake, _receiver) = crossbeam_channel::bounded(1);
+        let client = Arc::new(Client {
+            shared: Arc::new(Shared::default()),
+            wake,
+            notifications: receive,
+            join: Mutex::new(Some(original)),
+            cache: cache.clone(),
+        });
+        let receipt = Receipt {
+            client: client.clone(),
+            phase: 0,
+        };
+        let mut retired = Box::pin(receipt.retired(99));
+        let polled = executor().block_on(async { iced::futures::poll!(retired.as_mut()) });
+        assert!(polled.is_pending());
+        assert!(
+            client.join.lock().unwrap().is_none(),
+            "actual handle-take boundary reached"
+        );
+        drop(retired); // Actual suspended await: RAII must transfer original.
+        drop(client);
+        drop(cache);
+        assert!(observed.recv_timeout(Duration::from_millis(40)).is_err());
+        release.send(()).unwrap();
+        assert_ne!(observed.recv_timeout(Duration::from_secs(3)).unwrap(), ui);
+    }
+
+    #[test]
+    fn idle_cached_watcher_is_destroyed_off_ui_when_the_window_drops() {
+        let mut f = fixture();
+        let ui = std::thread::current().id();
+        let (send, receive) = crossbeam_channel::bounded(1);
+        f.app.worktree_selection.watch_retired = Some(Arc::new(move || {
+            send.send(std::thread::current().id()).unwrap();
+        }));
+        let task = f.app.navigate_worktree(f.old.clone(), false, None);
+        let retirement = f.app.update(prepared(task));
+        no_effect(f.app.update(retired(retirement)));
+        assert!(
+            receive.try_recv().is_err(),
+            "cached native watcher survives ticket join"
+        );
+        drop(f.app);
+        assert_ne!(receive.recv_timeout(Duration::from_secs(3)).unwrap(), ui);
+    }
+
     #[test]
     fn inactive_repository_reload_prepares_owners_and_guards_without_blocking_input() {
         let mut f = fixture();
+        let discovered = f.old.join("discovered-folder");
+        std::fs::create_dir(&discovered).unwrap();
+        folder(&mut f.app, &discovered);
         let project = f
             .app
             .sidebar_model
@@ -1929,6 +2776,9 @@ mod tests {
     #[test]
     fn explicit_selection_supersedes_blocked_background_reload_without_a_second_worker() {
         let mut f = fixture();
+        let discovered = f.old.join("discovered-folder");
+        std::fs::create_dir(&discovered).unwrap();
+        folder(&mut f.app, &discovered);
         let project = f
             .app
             .sidebar_model
@@ -2184,6 +3034,11 @@ mod tests {
 
     fn deferred_close(background: bool) {
         let mut f = fixture();
+        if background {
+            let discovered = f.old.join("deferred-new-folder");
+            std::fs::create_dir(&discovered).unwrap();
+            folder(&mut f.app, &discovered);
+        }
         let protected = if background {
             f.old.clone()
         } else {

@@ -4189,6 +4189,7 @@ pub enum Message {
         receipt: worktree_ui::selection::Receipt,
     },
     WorktreeNavigationRetired(u64),
+    WorktreeSelectionCacheInvalidated,
     Device(device_ui::Action),
     ReviewFilePanelToggle {
         card: CardId,
@@ -14334,6 +14335,7 @@ impl Application for Cagents {
             Message::WorktreeNavigationRetired(generation) => {
                 self.worktree_navigation_retired(generation)
             }
+            Message::WorktreeSelectionCacheInvalidated => self.selection_cache_invalidated(),
             Message::TerminalFailure(action) => self.update_terminal_failure(action),
             Message::Device(action) => self.update_device(action),
             Message::Palette(action) => self.update_palette(action),
