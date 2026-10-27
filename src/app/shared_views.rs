@@ -823,7 +823,10 @@ impl Cagents {
         self.shared_views
             .pending
             .push((operation, scope.clone(), change.clone()));
-        self.shared_views.attached.insert(card);
+        if matches!(change, Change::Insert { ref pane, .. } if matches!(pane.kind, CardKind::Chat(_)))
+        {
+            self.shared_views.attached.insert(card);
+        }
         self.publish_model_edit(ModelEdit::ChangeView {
             scope,
             expected_revision: revision,
@@ -975,9 +978,12 @@ impl Cagents {
                         panes: legacy.clone(),
                         closed,
                     });
-                    self.shared_views
-                        .attached
-                        .extend(legacy.iter().map(|pane| pane.id));
+                    self.shared_views.attached.extend(
+                        legacy
+                            .iter()
+                            .filter(|pane| matches!(pane.kind, CardKind::Chat(_)))
+                            .map(|pane| pane.id),
+                    );
                     self.shared_views.baseline.insert(scope.clone(), legacy);
                 }
                 continue;
@@ -996,7 +1002,9 @@ impl Cagents {
                 .map(|view| view.revision)
                 .unwrap_or(0);
             for change in views::changes(&previous, &panes) {
-                if let Change::Insert { pane, .. } = &change {
+                if let Change::Insert { pane, .. } = &change
+                    && matches!(pane.kind, CardKind::Chat(_))
+                {
                     self.shared_views.attached.insert(pane.id);
                 }
                 let operation = match &change {
@@ -4966,25 +4974,93 @@ mod tests {
     #[test]
     fn first_start_empty_view_does_not_convert_creation_to_local_only() {
         let (mut app, channel, card, target, receiver) = unpublished_default_chat();
+        let directory = tempfile::tempdir().unwrap();
+        let (writer, _) = crate::session::SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("first-send-view"),
+        )
+        .unwrap();
+        app.session = Some(writer);
         compose_default_chat(&mut app, target);
-        // Exercise the ordinary first-send reducer, but never poll the returned
-        // provider Task. No real provider or user daemon is contacted here.
-        let start = app.handle_chat_ui(super::super::chat_ui::Action::Submit(
+        // First publish A, then Send, then an empty snapshot while the save
+        // receipt is waiting. This used to project A over the new runtime B.
+        drop(app.reconcile_shared_views());
+        let source = match &app.card_state(card).unwrap().kind {
+            CardKind::Chat(session) => session.clone(),
+            _ => unreachable!(),
+        };
+        let save = app.handle_chat_ui(super::super::chat_ui::Action::Submit(
             target,
             crate::chat::PromptMode::Send,
         ));
+        assert!(app.chat_start_pending(card));
         drop(app.reconcile_shared_views());
         assert!(!app.durable.local_only_cards.contains(&card));
         assert!(app.card_state(card).unwrap().existence.is_open());
+        let completion = std::thread::spawn(move || {
+            use cosmic::iced::futures::StreamExt;
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let mut stream = cosmic::iced::runtime::task::into_stream(save).unwrap();
+                    while let Some(action) =
+                        tokio::time::timeout(Duration::from_secs(5), stream.next())
+                            .await
+                            .unwrap()
+                    {
+                        if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
+                            Message::ChatUi(
+                                action @ super::super::chat_ui::Action::DraftStartCheckpointed(
+                                    _,
+                                    _,
+                                    _,
+                                ),
+                            ),
+                        )) = action
+                        {
+                            return action;
+                        }
+                    }
+                    panic!("checkpoint receipt");
+                })
+        })
+        .join()
+        .unwrap();
+        assert!(matches!(
+            &completion,
+            super::super::chat_ui::Action::DraftStartCheckpointed(_, _, Ok(()))
+        ));
+        // Only the save Task ran. Drop the returned provider Task unpolled.
+        let provider = app.handle_chat_ui(completion);
+        let candidate = match &app.card_state(card).unwrap().kind {
+            CardKind::Chat(session) => session.clone(),
+            _ => unreachable!(),
+        };
+        assert_ne!(source.id, candidate.id);
+        drop(app.reconcile_shared_views());
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Chat(runtime)) if runtime.session.id == candidate.id)
+        );
+        assert!(!app.durable.local_only_cards.contains(&card));
         assert!(
             app.local_view_cards(&Scope::Channel(channel))
                 .contains(&card)
         );
-        assert!(
-            std::iter::from_fn(|| receiver.try_recv().ok()).any(|edit| matches!(edit,
+        let edits = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            edits
+                .iter()
+                .filter(|edit| matches!(edit,
             ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. } if pane.id == card))
+                .count(),
+            1
         );
-        drop(start);
+        assert!(edits.iter().any(|edit| matches!(edit,
+            ModelEdit::ChangeView { change: Change::Update { before, pane }, .. }
+                if pane.id == card && before.kind == CardKind::Chat(source.clone()) && pane.kind == CardKind::Chat(candidate.clone()))));
+        drop(provider);
     }
 
     #[test]
