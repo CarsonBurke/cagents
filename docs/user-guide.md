@@ -721,12 +721,39 @@ request:
 cagents automation propose --request-id UUID --definition automation.json --wait
 ```
 
-The definition is saved separately from schedules. In a focused cagents window
-showing that project's workspace, **Review request** opens **Approve scheduled work?** with the saved prompt,
-schedule and timezone, directory, channel, account, model, permissions, and any
-shell precheck. **Approve and enable** atomically creates the schedule and its
-approval receipt; **Decline** creates no schedule. The waiting conversation
-receives that decision without asking you to copy a terminal command.
+The definition is saved separately from schedules. **Pending approvals** shows
+unresolved requests from every project in each window. Its count includes all
+pending requests, rather than only unread notifications. Choose **Review
+requests**, then **Review request** beside a request to load its complete saved
+settings. **Next requests** pages through longer lists; **Refresh** recovers a
+failed read or a list that changed while you were browsing.
+
+**Approve scheduled work?** shows the saved prompt, schedule and timezone,
+directory, channel, account, model, permissions, and any shell precheck.
+**Not now**, Escape, and the default Enter action only close the review; they
+send no new decision. Closing does not cancel a decision already sent. If a
+response is lost, the outcome may be unknown. Reopen the request to review its
+current state. **Approve and enable** atomically creates the schedule and its
+approval receipt; **Decline** creates no schedule. The waiting
+conversation receives that decision without asking you to copy a terminal
+command. A new request can also appear in Attention or as a desktop alert.
+Choosing its alert loads the current request for review; it never approves it.
+
+You can also review and decide from your own terminal:
+
+```sh
+cagents automation proposals
+cagents automation review-proposal PROPOSAL_ID --registry REGISTRY_ID
+cagents automation approve PROPOSAL_ID --registry REGISTRY_ID --revision REVISION --confirm
+cagents automation decline PROPOSAL_ID --registry REGISTRY_ID --revision REVISION
+```
+
+Use the registry identity returned by the list and the revision returned by the
+full review. Add `--json` for structured output. Listing prints the arguments
+needed to continue a longer page. Run these global listing, review, and decision commands from your own terminal.
+Agent sessions can propose requests and wait for their own decision; these global
+management commands are unavailable to them.
+
 Defaults are resolved when preparing the request, and approval verifies the
 saved account, directory identity, and channel membership again. Reusing the
 same request ID returns the same definition and receipt; use a new ID for
@@ -774,7 +801,9 @@ account registries prevent this orphan cleanup.
 and requests for attention. Alerts are suppressed while their pane is focused
 unless **Notify while focused** is enabled. By default, they name the provider and
 folder without copying prompts or output. **Show message previews** optionally
-adds bounded message context. **Send test notification** reports
+adds bounded message context. Automation-request alerts stay generic by default;
+with previews enabled, they can include the requesting conversation's available
+name and the project folder name. **Send test notification** reports
 whether the desktop portal accepted the request; desktop settings control its
 presentation and sound.
 
