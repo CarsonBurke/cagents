@@ -19298,9 +19298,19 @@ mod tests {
             app.chat_ui.attempt(card).unwrap().intent,
             chat::Intent::Restore
         );
-        // Simulate a disconnected pane after its restore attempt settled. No
-        // provider or control task is executed by this UI admission fixture.
-        app.chat_ui.phases.remove(&card);
+        // Complete the normal Ready admission before disconnecting the pane.
+        // This is a UI fixture; no provider or control task is executed.
+        let target = chat_runtime_attempt(&app, card);
+        let handle = Arc::new(ClientHandle::fixture(
+            source.clone(),
+            Snapshot {
+                ready: true,
+                session_id: source.launch.session_id.clone(),
+                native_continuity: source.native_continuity.clone(),
+                ..Snapshot::default()
+            },
+        ));
+        answer_start(&mut app, target, Ok(handle));
         let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
             panic!("native pane")
         };
