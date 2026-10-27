@@ -327,6 +327,23 @@ fn restored_inspect_and_policy_refuse_another_physical_repository() {
     }
     let fixture = Fixture::new();
     let other = Fixture::new();
+    let empty = fixture._root.path().join("empty");
+    fs::create_dir(&empty).unwrap();
+    git(&empty, &["init", "-q", "-b", "main"]);
+    let Execution::Reply {
+        reply: Reply::Inspected { snapshot, .. },
+        ..
+    } = fixture.execute(Operation::Inspect {
+        repository: empty.clone(),
+        path: empty,
+    })
+    else {
+        panic!("empty repository must remain inspectable");
+    };
+    let snapshot: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+    assert_eq!(snapshot["unpushed_commits"], 0);
+    assert!(snapshot["head_oid"].is_null());
+    assert!(snapshot["content"]["verdict"].get("Blocked").is_some());
     let created = fixture.create("original");
     let replacement = other.create("foreign");
     for operation in [

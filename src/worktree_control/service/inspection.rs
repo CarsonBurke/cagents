@@ -128,6 +128,14 @@ impl Selection {
         detached: bool,
         cancel: &CancellationToken,
     ) -> Result<u64, String> {
+        if self
+            .service()
+            .resolve_head(self.checkout.path(), cancel)
+            .map_err(|error| error.to_string())?
+            .is_none()
+        {
+            return Ok(0);
+        }
         let mut command = RepositoryService::system("git")
             .git_base(self.checkout.path(), false)
             .args(["rev-list", "--count", "HEAD", "--not", "--remotes"])
@@ -273,8 +281,18 @@ pub(super) fn inspect<E: ProcessExecutor>(
         .map(|entry| &entry.path)
         .collect::<std::collections::HashSet<_>>()
         .len();
+    let untracked = status
+        .entries
+        .iter()
+        .filter(|entry| entry.area == crate::repository::ChangeArea::Untracked)
+        .count();
+    let branch = status.branch().map(str::to_owned);
+    let head = selected
+        .service()
+        .resolve_head(selected.checkout.path(), cancel)
+        .map_err(|error| error.to_string())?;
     let unpushed = selected.commit_count(false, cancel)?;
-    let detached = if inspection.branch.is_none() {
+    let detached = if branch.is_none() {
         selected.commit_count(true, cancel)?
     } else {
         0
@@ -296,7 +314,7 @@ pub(super) fn inspect<E: ProcessExecutor>(
     }
     selected.verify(cancel)?;
     // The string keeps host-only repository types out of the isolated CLI graph.
-    let snapshot = serde_json::to_string(&serde_json::json!({"fingerprint":fingerprint,"modified":modified,"untracked":inspection.untracked,"notable_ignored":notable,"unpushed_commits":unpushed,"detached_only_commits":detached,"branch":inspection.branch,"head_oid":inspection.head,"content":inspection})).map_err(|error| error.to_string())?;
+    let snapshot = serde_json::to_string(&serde_json::json!({"fingerprint":fingerprint,"modified":modified,"untracked":untracked,"notable_ignored":notable,"unpushed_commits":unpushed,"detached_only_commits":detached,"branch":branch,"head_oid":head.map(|oid| oid.to_string()),"content":inspection})).map_err(|error| error.to_string())?;
     Ok(Reply::Inspected {
         snapshot,
         disposable_ignored_directories: policy,

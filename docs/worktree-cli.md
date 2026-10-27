@@ -58,6 +58,9 @@ the current policy and notable-file inventory; changing either invalidates the
 previous confirmation. The inspect fingerprint can be supplied to `remove
 --fingerprint FINGERPRINT` to bind commit-loss consent to that exact evidence.
 Discarding local files still requires `--force`.
+The policy does not waive the existing blocked, nested-repository or filtered-file
+safeguards. It uses Git's normal clone-local configuration semantics; retaining
+the repository directories does not confine an intentionally symlinked config file.
 
 An inactive lock from a settled cagents creation has an explicit recovery path:
 
