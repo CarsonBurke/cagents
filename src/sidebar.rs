@@ -4147,6 +4147,9 @@ impl SidebarState {
                     self.commit_draft.amend = *amend;
                 }
             }
+            // Paging is resolved against the current complete model by the app,
+            // together with the matching native scroll operation.
+            SidebarAction::ChangePage { .. } => {}
             SidebarAction::ChangeViewport {
                 key,
                 scope,
@@ -4266,6 +4269,12 @@ pub enum SidebarAction {
         key: ActiveWorktreeKey,
         area: ChangeArea,
         command: ChangeGroupCommand,
+    },
+    ChangePage {
+        key: ActiveWorktreeKey,
+        scope: ChangeTreeScope,
+        first_row: usize,
+        epoch: u64,
     },
     ChangeViewport {
         key: ActiveWorktreeKey,
@@ -9184,14 +9193,78 @@ fn change_viewport_rows<'a>(
     (visible, count)
 }
 
+fn change_scroll_id(key: &ActiveWorktreeKey, scope: ChangeTreeScope, epoch: u64) -> Id {
+    stable_id(format!(
+        "changes.scroll.{}.{scope:?}.{epoch}",
+        key.worktree_id
+    ))
+}
+
+/// A keyboard-accessible viewport jump uses live rows, not an old rendered
+/// count. Keep its model coordinates and the native scroll operation together.
+pub(crate) fn change_page_target(
+    state: &mut SidebarState,
+    source: &SourceControlModel,
+    action: &SidebarAction,
+) -> Option<(Id, f32)> {
+    let SidebarAction::ChangePage {
+        key,
+        scope,
+        first_row,
+        epoch,
+    } = action
+    else {
+        return None;
+    };
+    if source.key != *key
+        || state.active_worktree.as_ref() != Some(key)
+        || state.change_scroll_epoch != *epoch
+    {
+        return None;
+    }
+    let rows = match scope {
+        ChangeTreeScope::Area(area)
+            if state.changes_tab == ChangesTab::Changes
+                && state.section_expanded(PanelSection::for_area(*area)) =>
+        {
+            &source.group(*area)?.tree
+        }
+        ChangeTreeScope::Branch if state.changes_tab == ChangesTab::Branch => {
+            let BranchChanges::Ready(branch) = &source.branch_changes else {
+                return None;
+            };
+            &branch.tree
+        }
+        _ => return None,
+    };
+    let (_, total) = change_viewport_rows(
+        rows,
+        state.collapsed_change_directories.get(scope),
+        state.change_list_mode == FileListMode::Flat,
+        0,
+    );
+    let first = (*first_row).min(total.saturating_sub(crate::change_list::VIEW_ROWS));
+    state.change_first_rows.insert(*scope, first);
+    Some((
+        change_scroll_id(key, *scope, *epoch),
+        first as f32 * PANEL_ROW_HEIGHT,
+    ))
+}
+
 fn virtual_changes<'a>(
     state: &SidebarState,
     key: &ActiveWorktreeKey,
     scope: ChangeTreeScope,
     rows: Vec<crate::sticky_tree::Row<'a, SidebarAction>>,
     total: usize,
-    _modal_open: bool,
+    modal_open: bool,
 ) -> Element<'a, SidebarAction> {
+    let first = state
+        .change_first_rows
+        .get(&scope)
+        .copied()
+        .unwrap_or(0)
+        .min(total.saturating_sub(crate::change_list::VIEW_ROWS));
     let range = crate::change_list::visible_range(
         total,
         state.change_first_rows.get(&scope).copied().unwrap_or(0),
@@ -9209,10 +9282,7 @@ fn virtual_changes<'a>(
     let callback_key = key.clone();
     let epoch = state.change_scroll_epoch;
     let scroll: Element<'a, SidebarAction> = widget::scrollable(content)
-        .id(stable_id(format!(
-            "changes.scroll.{}.{scope:?}.{}",
-            key.worktree_id, state.change_scroll_epoch
-        )))
+        .id(change_scroll_id(&key, scope, epoch))
         .on_scroll(move |viewport| SidebarAction::ChangeViewport {
             key: callback_key.clone(),
             scope,
@@ -9230,7 +9300,48 @@ fn virtual_changes<'a>(
         .into();
     // A scrollable ID only identifies operations; it does not reset State.
     // Replace the native child Tree when layout coordinates are reset.
-    RowInteraction::change_scroll(scroll, key, scope, epoch)
+    let scroll = RowInteraction::change_scroll(scroll, key.clone(), scope, epoch);
+    if total <= crate::change_list::VIEW_ROWS {
+        return scroll;
+    }
+    let action = |first_row| {
+        gated(
+            SidebarAction::ChangePage {
+                key: key.clone(),
+                scope,
+                first_row,
+                epoch,
+            },
+            modal_open,
+        )
+    };
+    let navigation = widget::row::with_children(vec![
+        crate::ui_controls::button::secondary("Previous")
+            .on_press_maybe(
+                (first > 0)
+                    .then(|| action(first.saturating_sub(crate::change_list::VIEW_ROWS)))
+                    .flatten(),
+            )
+            .into(),
+        design::caption(format!(
+            "{}–{} of {total}",
+            first + 1,
+            (first + crate::change_list::VIEW_ROWS).min(total)
+        ))
+        .into(),
+        crate::ui_controls::button::secondary("Next")
+            .on_press_maybe(
+                (first + crate::change_list::VIEW_ROWS < total)
+                    .then(|| action(first + crate::change_list::VIEW_ROWS))
+                    .flatten(),
+            )
+            .into(),
+    ])
+    .spacing(space::XS)
+    .align_y(Alignment::Center);
+    widget::column::with_children(vec![scroll, navigation.into()])
+        .spacing(space::XS)
+        .into()
 }
 
 /// The tree/flat switch for a list of changed files, as one action that
@@ -19870,6 +19981,214 @@ pub(crate) mod tests {
         };
         assert_eq!(selection.len(), 501);
         assert_eq!(selection.last().unwrap().path, paths[500]);
+    }
+
+    #[test]
+    fn file_directory_changes_remain_individually_openable_in_groups_and_branches() {
+        let mut source = source_control();
+        let entries = [("a", ChangeKind::Deleted), ("a/b", ChangeKind::Added)];
+        source.groups = vec![ChangeGroup::new(
+            source.key.worktree_id,
+            ChangeArea::Staged,
+            entries
+                .iter()
+                .map(|(path, kind)| {
+                    ChangeRow::new(
+                        source.key.worktree_id,
+                        &changed(repo_path(path), ChangeArea::Staged, *kind, None),
+                    )
+                })
+                .collect(),
+        )];
+        source.branch_changes =
+            BranchChanges::Ready(Arc::new(BranchChangesModel::new(BranchComparison {
+                base_ref: ref_name("refs/heads/trunk"),
+                base_oid: oid_of(0x22),
+                head: oid_of(0x11),
+                merge_base: oid_of(0x22),
+                entries: entries
+                    .iter()
+                    .map(|(path, kind)| crate::repository::DiffEntry {
+                        path: repo_path(path),
+                        old_path: None,
+                        kind: *kind,
+                        added_lines: None,
+                        removed_lines: None,
+                    })
+                    .collect(),
+            })));
+        let renderer = headless_renderer();
+        let mut state = panel_state(&panel_model());
+        for mode in [FileListMode::Tree, FileListMode::Flat] {
+            state.apply(&SidebarAction::SetChangeListMode {
+                key: source.key.clone(),
+                mode,
+            });
+            state.apply(&SidebarAction::SetChangesTab {
+                key: source.key.clone(),
+                tab: ChangesTab::Changes,
+            });
+            let actions = frame_enter_presses(
+                &renderer,
+                change_group_view(&state, &source, &source.groups[0], false),
+            );
+            let opened = actions
+                .iter()
+                .filter_map(|action| match action {
+                    SidebarAction::OpenChange {
+                        path,
+                        area: ChangeArea::Staged,
+                        ..
+                    } => Some(path.clone()),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                opened,
+                [repo_path("a"), repo_path("a/b")].into_iter().collect(),
+                "{mode:?}"
+            );
+            if mode == FileListMode::Tree {
+                assert!(actions.iter().any(|action| matches!(action,
+                    SidebarAction::ToggleChangeDirectory { path, .. } if *path == repo_path("a"))));
+            }
+            state.apply(&SidebarAction::SetChangesTab {
+                key: source.key.clone(),
+                tab: ChangesTab::Branch,
+            });
+            let opened =
+                frame_enter_presses(&renderer, branch_changes_section(&state, &source, false))
+                    .into_iter()
+                    .filter_map(|action| match action {
+                        SidebarAction::OpenBranchFile { path, .. } => Some(path),
+                        _ => None,
+                    })
+                    .collect::<BTreeSet<_>>();
+            assert_eq!(
+                opened,
+                [repo_path("a"), repo_path("a/b")].into_iter().collect(),
+                "branch {mode:?}"
+            );
+        }
+        let command = SidebarAction::ChangeGroup {
+            key: source.key.clone(),
+            area: ChangeArea::Staged,
+            command: ChangeGroupCommand::Unstage,
+        };
+        let Some(SidebarAction::Unstage { selection, .. }) =
+            resolve_group_command(&source, &command)
+        else {
+            panic!("unstage group");
+        };
+        assert_eq!(
+            selection
+                .iter()
+                .map(|selected| selected.path.clone())
+                .collect::<BTreeSet<_>>(),
+            [repo_path("a"), repo_path("a/b")].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn keyboard_viewport_controls_reach_unmounted_rows_and_move_native_scroll_together() {
+        use cosmic::iced::{
+            Rectangle, Vector,
+            advanced::widget::{Operation, operation},
+        };
+        #[derive(Default)]
+        struct Offset(Option<f32>);
+        impl Operation for Offset {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn scrollable(
+                &mut self,
+                _id: Option<&Id>,
+                _bounds: Rectangle,
+                _content: Rectangle,
+                translation: Vector,
+                _state: &mut dyn operation::Scrollable,
+            ) {
+                self.0 = Some(translation.y);
+            }
+        }
+        let renderer = headless_renderer();
+        let mut source = source_control();
+        source.groups = vec![ChangeGroup::new(
+            source.key.worktree_id,
+            ChangeArea::Unstaged,
+            (0..80)
+                .map(|index| {
+                    ChangeRow::new(
+                        source.key.worktree_id,
+                        &changed(
+                            repo_path(&format!("file-{index:04}.rs")),
+                            ChangeArea::Unstaged,
+                            ChangeKind::Modified,
+                            None,
+                        ),
+                    )
+                })
+                .collect(),
+        )];
+        let mut state = panel_state(&panel_model());
+        let scope = ChangeTreeScope::Area(ChangeArea::Unstaged);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(380.0, 600.0));
+        let mut element = change_group_view(&state, &source, &source.groups[0], false);
+        let mut tree = Tree::new(&element);
+        let _ = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        drop(element);
+        let mut last_action = None;
+        for expected in [16, 32] {
+            let action = frame_enter_presses(&renderer, change_group_view(&state, &source, &source.groups[0], false))
+                .into_iter().find(|action| matches!(action, SidebarAction::ChangePage { first_row, .. } if *first_row == expected))
+                .expect("Next is focusable and activates with Enter, without a wheel event");
+            let (id, offset) = change_page_target(&mut state, &source, &action).unwrap();
+            let mut element = change_group_view(&state, &source, &source.groups[0], false);
+            tree.diff(&mut element);
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut operation::scrollable::scroll_to::<()>(
+                    id,
+                    operation::scrollable::AbsoluteOffset {
+                        x: None,
+                        y: Some(offset),
+                    },
+                ),
+            );
+            let mut native = Offset::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut native);
+            assert_eq!(native.0, Some(offset));
+            assert_eq!(state.change_first_rows.get(&scope), Some(&expected));
+            last_action = Some(action);
+        }
+        let actions = frame_enter_presses(
+            &renderer,
+            change_group_view(&state, &source, &source.groups[0], false),
+        );
+        assert!(actions.iter().any(|action| matches!(action, SidebarAction::OpenChange { path, .. } if *path == repo_path("file-0032.rs"))));
+        assert!(actions.iter().any(
+            |action| matches!(action, SidebarAction::Stage { selection, .. }
+            if selection.len() == 1 && selection[0].path == repo_path("file-0032.rs"))
+        ));
+        state.apply(&SidebarAction::SetChangeListMode {
+            key: source.key.clone(),
+            mode: FileListMode::Flat,
+        });
+        assert!(
+            change_page_target(&mut state, &source, last_action.as_ref().unwrap()).is_none(),
+            "old layout navigation is retired"
+        );
+        assert!(!state.change_first_rows.contains_key(&scope));
     }
 
     #[test]

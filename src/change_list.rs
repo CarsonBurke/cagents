@@ -63,9 +63,9 @@ fn path_cmp(left: &FileTreeEntry, right: &FileTreeEntry) -> Ordering {
     loop {
         match (a.next(), b.next()) {
             (Some(a_component), Some(b_component)) => {
-                if a_component != b_component {
-                    let a_directory = a.peek().is_some() || left.directory;
-                    let b_directory = b.peek().is_some() || right.directory;
+                let a_directory = a.peek().is_some() || left.directory;
+                let b_directory = b.peek().is_some() || right.directory;
+                if a_component != b_component || a_directory != b_directory {
                     return b_directory
                         .cmp(&a_directory)
                         .then_with(|| natural_cmp(a_component, b_component));
@@ -185,6 +185,23 @@ mod tests {
         let chain = tree(&["one/two/three/file.rs"]);
         assert_eq!(chain[0].label, "one/two/three");
         assert_eq!(chain[1].depth, 1);
+    }
+
+    #[test]
+    fn directory_replacements_keep_descendants_before_the_same_named_file() {
+        let compact = tree(&["a", "a/b/c", "z"]);
+        assert_eq!(
+            compact
+                .iter()
+                .map(|row| (row.path.clone(), row.depth, row.directory))
+                .collect::<Vec<_>>(),
+            vec![
+                (RepoPath::parse("a/b").unwrap(), 0, true),
+                (RepoPath::parse("a/b/c").unwrap(), 1, false),
+                (RepoPath::parse("a").unwrap(), 0, false),
+                (RepoPath::parse("z").unwrap(), 0, false),
+            ]
+        );
     }
 
     #[test]

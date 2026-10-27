@@ -10783,6 +10783,15 @@ impl Cagents {
         }
     }
 
+    /// Completed and superseded read data can be as large as the live panel.
+    /// Move its destruction to the existing blocking worker lane too.
+    fn retire_source_control_data<T: Send + 'static>(data: T) -> Task<Message> {
+        cosmic::task::future(async move {
+            let _ = tokio::task::spawn_blocking(move || drop(data)).await;
+            Message::SourceControlReleased
+        })
+    }
+
     /// Retires the old binding off the UI thread and releases large free arenas.
     fn release_source_control(&mut self) -> Task<Message> {
         let previous = self.sidebar_model.source_control.take();
@@ -15438,6 +15447,17 @@ impl Application for Cagents {
                 {
                     return Task::none();
                 }
+                if matches!(&action, SidebarAction::ChangePage { .. }) {
+                    let Some(source) = self.sidebar_model.source_control.as_ref() else {
+                        return Task::none();
+                    };
+                    let Some((id, offset)) = sidebar::change_page_target(&mut self.sidebar_state, source, &action) else {
+                        return Task::none();
+                    };
+                    return iced::widget::scrollable::scroll_to(id, iced::widget::scrollable::AbsoluteOffset {
+                        x: None, y: Some(offset),
+                    }).map(cosmic::Action::App);
+                }
                 self.sidebar_state.apply(&action);
                 // Opening a row, by pointer or keyboard, is navigation: it
                 // ends any explicit selection and anchors a later range, but
@@ -15723,6 +15743,7 @@ impl Application for Cagents {
                     | SidebarAction::ToggleSourceControlPanel { .. }
                     | SidebarAction::SetChangeListMode { .. }
                     | SidebarAction::ChangeViewport { .. }
+                    | SidebarAction::ChangePage { .. }
                     | SidebarAction::ChangeGroup { .. }
                     | SidebarAction::SetWorktreePanel { .. }
                     | SidebarAction::ToggleDirectory { .. }
@@ -17689,7 +17710,7 @@ impl Application for Cagents {
                 if request != self.refresh_ui.source_generation
                     || !self.source_control_is_bound(&key)
                 {
-                    return Task::none();
+                    return Self::retire_source_control_data(result);
                 }
                 self.refresh_ui.source_cancel = None;
                 // The expensive panel model follows its existing request
@@ -17767,15 +17788,16 @@ impl Application for Cagents {
                 if let Some(previous) = self.sidebar_model.source_control.as_ref() {
                     previous.carry_mutation_into(&mut next);
                 }
-                self.sidebar_model.source_control = Some(next);
-                let task = match snapshot {
-                    Some(snapshot) => self.refresh_branch_changes(&snapshot),
+                let previous = self.sidebar_model.source_control.replace(next);
+                let task = match snapshot.as_ref() {
+                    Some(snapshot) => self.refresh_branch_changes(snapshot),
                     None => {
                         self.cancel_branch_changes();
                         Task::none()
                     }
                 };
-                Task::batch([task, self.reload_pending_source_control(&key)])
+                let retirement = Self::retire_source_control_data((previous, snapshot));
+                Task::batch([task, retirement, self.reload_pending_source_control(&key)])
             }
             Message::SourceControlHistory {
                 generation,
@@ -31842,6 +31864,79 @@ mod tests {
             "no trailing reload after the pending edge was consumed"
         );
         assert!(app.refresh_ui.source_cancel.is_none());
+    }
+
+    #[test]
+    fn completed_source_control_data_is_retired_off_the_update_thread() {
+        struct Retired(std::sync::mpsc::Sender<std::thread::ThreadId>);
+        impl Drop for Retired {
+            fn drop(&mut self) {
+                self.0.send(std::thread::current().id()).unwrap();
+            }
+        }
+        let caller = std::thread::current().id();
+        let (sent, received) = std::sync::mpsc::channel();
+        let task = Cagents::retire_source_control_data(Retired(sent));
+        assert!(received.try_recv().is_err());
+        assert!(matches!(
+            task_app_message(task),
+            Message::SourceControlReleased
+        ));
+        assert_ne!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            caller
+        );
+    }
+
+    #[test]
+    fn stale_prepared_source_control_result_only_retires_its_data() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        let generation = app.refresh_ui.source_generation;
+        let active = CancellationToken::default();
+        app.refresh_ui.source_cancel = Some(active.clone());
+        app.refresh_ui.source_reload_pending = true;
+        let previous_head = app
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .unwrap()
+            .head_oid
+            .clone();
+        let snapshot = RepositorySnapshot {
+            status: crate::repository::StatusSnapshot::default(),
+            files: Default::default(),
+            remotes: Vec::new(),
+            local_refs: Vec::new(),
+            remote_refs: Vec::new(),
+            remote_heads: Vec::new(),
+        };
+        let model = SourceControlModel::ready(key.clone(), &snapshot);
+        let task = app.update(Message::SourceControlLoaded {
+            key,
+            request: generation.wrapping_sub(1),
+            result: Ok(SourceControlRead {
+                status: snapshot.status.display_summary(),
+                prepared: Some(Box::new((snapshot, model))),
+                head_repository: None,
+                read: git_ui::next_status_read(),
+            }),
+        });
+        assert_eq!(
+            app.sidebar_model.source_control.as_ref().unwrap().head_oid,
+            previous_head
+        );
+        assert_eq!(app.refresh_ui.source_generation, generation);
+        assert!(app.refresh_ui.source_reload_pending);
+        assert!(app.refresh_ui.source_cancel.is_some());
+        assert!(!active.is_cancelled());
+        assert!(matches!(
+            task_app_message(task),
+            Message::SourceControlReleased
+        ));
+        assert_eq!(app.refresh_ui.source_generation, generation);
     }
 
     #[test]

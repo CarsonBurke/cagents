@@ -703,6 +703,10 @@ pub struct SnapshotCache {
     status_attempt_failed: bool,
     lines: BTreeMap<RepoPath, (FileIdentity, u64)>,
     observed: BTreeMap<RepoPath, Option<FileIdentity>>,
+    /// Every absent changed path was a proven deletion, not an unreadable
+    /// root or an escaped/unobservable file. Unknown observations cannot
+    /// certify a whole-snapshot cache hit.
+    observations_complete: bool,
     browse_root: Option<FileIdentity>,
     admin: BTreeMap<PathBuf, Option<FileIdentity>>,
 }
@@ -1018,6 +1022,7 @@ impl SnapshotCache {
     /// its directory membership too, so the slow fallback repairs missed events.
     pub fn observe_browse(&mut self, worktree: &Path, files: &WorkingFiles) {
         let Ok(root) = fs_safety::Root::open(worktree) else {
+            self.observations_complete = false;
             return;
         };
         self.browse_root = fs::symlink_metadata(worktree)
@@ -1040,6 +1045,7 @@ impl SnapshotCache {
                 let metadata = fs_safety::metadata_beneath(&root, path.as_path())
                     .ok()
                     .map(|metadata| file_identity(&metadata));
+                self.observations_complete &= metadata.is_some();
                 self.observed.insert(path, metadata);
             }
         }
@@ -1168,13 +1174,13 @@ fn emit_file_tree(
     rows: &mut Vec<FileTreeEntry>,
 ) {
     for directory in [true, false] {
-        for (name, child) in
-            node.children.iter().filter(
-                |(_, child)| {
-                    if directory { !child.file } else { child.file }
-                },
-            )
-        {
+        for (name, child) in node.children.iter().filter(|(_, child)| {
+            if directory {
+                !child.file || !child.children.is_empty()
+            } else {
+                child.file
+            }
+        }) {
             let restore = prefix.len();
             if !prefix.is_empty() {
                 prefix.push(b'/');
@@ -4717,6 +4723,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         digest.update([u8::from(truncated)]);
         let digest: [u8; 32] = digest.finalize().into();
         let mut observations_fresh = false;
+        let mut observations_complete = true;
         if !cache.dirty
             && cache.digest == Some(digest)
             && cache.metadata.is_some()
@@ -4726,15 +4733,23 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 .is_none_or(|policy| !policy.reconcile_unchanged)
         {
             let root = fs_safety::Root::open(worktree).ok();
-            let mut unchanged = true;
+            observations_complete = root.is_some();
+            let mut unchanged = root.is_some() && cache.observations_complete;
             // Keep the observation pass for a changed snapshot, rather than
             // stat every changed path again before measuring its line counts.
             for (path, previous) in &mut cache.observed {
-                let current = root
+                let current = match root
                     .as_ref()
-                    .and_then(|root| fs_safety::metadata_beneath(root, path.as_path()).ok())
-                    .map(|metadata| file_identity(&metadata));
-                unchanged &= current == *previous;
+                    .map(|root| fs_safety::metadata_beneath(root, path.as_path()))
+                {
+                    Some(Ok(metadata)) => Some(file_identity(&metadata)),
+                    Some(Err(error)) if error.is_not_found() => None,
+                    _ => {
+                        observations_complete = false;
+                        None
+                    }
+                };
+                unchanged &= observations_complete && current == *previous;
                 *previous = current;
             }
             observations_fresh = true;
@@ -4764,18 +4779,28 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         status.untracked_omitted = !options.untracked_changes;
         status.listing_truncated = truncated;
         let root = fs_safety::Root::open(worktree).ok();
+        observations_complete &= root.is_some();
         // Capture identities before the readers. A concurrent write after a
         // diff must remain detectable by the next missed-event reconciliation.
         let mut observed = BTreeMap::new();
         for entry in &status.entries {
-            observed.entry(entry.path.clone()).or_insert_with(|| {
+            let identity = observed.entry(entry.path.clone()).or_insert_with(|| {
                 if observations_fresh && let Some(identity) = cache.observed.get(&entry.path) {
                     return *identity;
                 }
-                root.as_ref()
-                    .and_then(|root| fs_safety::metadata_beneath(root, entry.path.as_path()).ok())
-                    .map(|metadata| file_identity(&metadata))
+                match root
+                    .as_ref()
+                    .map(|root| fs_safety::metadata_beneath(root, entry.path.as_path()))
+                {
+                    Some(Ok(metadata)) => Some(file_identity(&metadata)),
+                    Some(Err(error)) if error.is_not_found() => None,
+                    _ => {
+                        observations_complete = false;
+                        None
+                    }
+                }
             });
+            observations_complete &= identity.is_some() || entry.kind == ChangeKind::Deleted;
         }
         if status
             .entries
@@ -4899,6 +4924,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let (files, remotes, local_refs, remote_refs, remote_heads) =
             cache.metadata.as_ref().unwrap();
         cache.observed = observed;
+        cache.observations_complete = observations_complete;
         cache.numstats = numstats;
         cache.numstats_ready = true;
         cache.browse_root = options
@@ -8374,6 +8400,22 @@ mod tests {
     }
 
     #[test]
+    fn file_tree_preserves_a_changed_file_and_its_directory_replacement() {
+        let rows = build_file_tree(&[path("a"), path("a/b"), path("z")]);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.path.clone(), row.depth, row.directory))
+                .collect::<Vec<_>>(),
+            vec![
+                (path("a"), 0, true),
+                (path("a/b"), 1, false),
+                (path("a"), 0, false),
+                (path("z"), 0, false),
+            ]
+        );
+    }
+
+    #[test]
     fn watch_projection_preserves_a_prefix_without_changing_complete_inventory_reads() {
         let listing = b"H first.txt\0H second.txt\0";
         let service = fake_service(vec![success(listing), success(listing)]);
@@ -9272,6 +9314,86 @@ mod tests {
 
         fn service() -> RepositoryService<IsolatedExecutor> {
             RepositoryService::new("git", Arc::new(IsolatedExecutor))
+        }
+
+        #[test]
+        fn missed_event_cache_rechecks_unknown_roots_and_keeps_known_deletions_fast() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("repo");
+            fs::create_dir(&root).unwrap();
+            git(&root, &["init", "-b", "main"]);
+            fs::write(root.join("first"), b"base\n").unwrap();
+            git(&root, &["add", "first"]);
+            git(&root, &["commit", "--quiet", "-m", "base"]);
+            fs::write(root.join("first"), b"changed\n").unwrap();
+            let service = service();
+            let cancel = CancellationToken::new();
+            let options = SnapshotOptions {
+                status_limit: None,
+                untracked_changes: false,
+                untracked_files: false,
+            };
+            let mut cache = SnapshotCache::default();
+            assert!(
+                service
+                    .snapshot_cached(&root, options, &cancel, &mut cache)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                service
+                    .snapshot_cached(&root, options, &cancel, &mut cache)
+                    .unwrap()
+                    .is_none()
+            );
+
+            let retained = directory.path().join("retained");
+            fs::rename(&root, &retained).unwrap();
+            std::os::unix::fs::symlink(&retained, &root).unwrap();
+            assert!(
+                fs_safety::Root::open(&root).is_err(),
+                "Git follows this path but the no-follow observer cannot certify it"
+            );
+            assert!(
+                service
+                    .snapshot_cached(&root, options, &cancel, &mut cache)
+                    .unwrap()
+                    .is_some()
+            );
+            fs::write(retained.join("first"), b"changed\nsecond\nthird\n").unwrap();
+            let refreshed = service
+                .snapshot_cached(&root, options, &cancel, &mut cache)
+                .unwrap()
+                .expect("equal unknown observations are not an unchanged proof");
+            let entry = refreshed
+                .status
+                .entries
+                .iter()
+                .find(|entry| entry.path == path("first"))
+                .unwrap();
+            assert_eq!(entry.added_lines, Some(3));
+            assert_eq!(entry.removed_lines, Some(1));
+            assert!(!cache.observations_complete);
+
+            fs::remove_file(&root).unwrap();
+            fs::rename(&retained, &root).unwrap();
+            fs::remove_file(root.join("first")).unwrap();
+            assert!(
+                service
+                    .snapshot_cached(&root, options, &cancel, &mut cache)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                cache.observations_complete,
+                "a missing deleted file is a known observation"
+            );
+            assert!(
+                service
+                    .snapshot_cached(&root, options, &cancel, &mut cache)
+                    .unwrap()
+                    .is_none()
+            );
         }
 
         mod scale_support {
