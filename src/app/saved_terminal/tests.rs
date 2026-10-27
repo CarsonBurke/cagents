@@ -656,3 +656,86 @@ fn confirmed_completed_saved_state_refuses_changed_source_lineage_or_incomplete_
     incomplete.boot_id = crate::model::BootId::new("");
     assert!(confirm_disconnected(&source, None, &[], &incomplete).is_err());
 }
+
+#[test]
+fn startup_qualification_keeps_saved_readiness_separate_from_unresolved_and_live_owners() {
+    let (mut app, card, source) = fixture();
+    let request = pending(&mut app, card, &source);
+    drop(app.update_saved_terminal(complete(card, source.clone(), request, Ok(None))));
+    assert!(app.saved_terminal_ready(card));
+    assert_eq!(app.startup_pane_check(), Ok(true));
+    for _ in 0..3 {
+        drop(app.qualify_startup_terminals());
+        assert!(app.restored_agent_attaches.is_empty());
+        assert_eq!(app.terminal_starts_in_flight(), 0);
+    }
+
+    let mut unresolved = app.durable.cards[0].clone();
+    unresolved.id = CardId::new();
+    let mut unresolved_source = source.clone();
+    unresolved_source.id = TerminalId::new();
+    unresolved.kind = CardKind::Terminal(unresolved_source.clone());
+    let mut live = unresolved.clone();
+    live.id = CardId::new();
+    let mut live_source = exact_live(&source);
+    live_source.id = TerminalId::new();
+    live.kind = CardKind::Terminal(live_source.clone());
+    Arc::make_mut(&mut app.durable)
+        .cards
+        .extend([unresolved.clone(), live.clone()]);
+    app.cards.insert(unresolved.id, CardRuntime::Loading);
+    app.cards.insert(live.id, CardRuntime::Loading);
+    assert!(app.prepare_saved_terminal(unresolved.id, &unresolved_source));
+    app.lifecycle.register(
+        live.id,
+        Exposure::Offscreen,
+        Residency::Hibernated,
+        Instant::now(),
+    );
+    assert_eq!(
+        app.startup_pane_check(),
+        Ok(false),
+        "unresolved saved inspection and unattached live owner remain pending"
+    );
+    drop(app.qualify_startup_terminals());
+    assert!(
+        app.terminal_start_in_flight(live.id),
+        "known-live ownership still uses the actual serial attach path"
+    );
+    assert!(!app.terminal_start_in_flight(card));
+    assert!(!app.terminal_start_in_flight(unresolved.id));
+    assert!(
+        app.restored_agent_attaches.is_empty(),
+        "saved entries never enter the legacy attachment queue"
+    );
+    assert_eq!(app.startup_pane_check(), Ok(false));
+
+    // Leave just the unresolved saved pane beside the verified one. Settling a
+    // different live owner's serial bookkeeping must not waive this pending check.
+    Arc::make_mut(&mut app.durable)
+        .cards
+        .retain(|state| state.id != live.id);
+    app.cards.remove(&live.id);
+    app.lifecycle.remove(live.id);
+    drop(app.finish_terminal_start(live.id));
+    assert_eq!(app.startup_pane_check(), Ok(false));
+    for _ in 0..3 {
+        drop(app.qualify_startup_terminals());
+        assert!(app.restored_agent_attaches.is_empty());
+        assert_eq!(app.terminal_starts_in_flight(), 0);
+    }
+    Arc::make_mut(&mut app.durable)
+        .cards
+        .retain(|state| state.id != unresolved.id);
+    app.cards.remove(&unresolved.id);
+    assert_eq!(
+        app.startup_pane_check(),
+        Ok(true),
+        "a window containing only verified saved data is ready"
+    );
+    assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
+    assert_eq!(
+        app.card_state(card).unwrap().kind,
+        CardKind::Terminal(source)
+    );
+}

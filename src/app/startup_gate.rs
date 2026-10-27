@@ -128,6 +128,7 @@ impl Cagents {
             if card.existence.is_open()
                 && matches!(&card.kind, CardKind::Terminal(session) if !terminal_ended(session))
                 && matches!(self.cards.get(&card.id), Some(CardRuntime::Loading))
+                && self.saved_terminal_current(card.id).is_none()
                 && !self.restored_agent_attaches.contains(&card.id)
             {
                 self.restored_agent_attaches.push_back(card.id);
