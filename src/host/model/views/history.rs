@@ -1,5 +1,4 @@
-//! INACTIVE history-format integration: no allocated published schema yet.
-//! Do not execute or ship this proposal until its opener/migration is joined.
+//! Bounded recent history backed by scope-lifetime retirement and replay guards.
 //!
 //! A future published migration must import every old tombstone before enabling
 //! bounded recent JSON. These indexed guards are permanent for a scope's life;
@@ -27,7 +26,7 @@ use crate::workspace_model::views::RECENT_RETIRED_LIMIT;
 
 /// Run only inside the opener's already admitted write transaction, after all
 /// preceding published migrations. The caller owns rollback, schema admission
-/// and final header publication. No production caller exists yet.
+/// and final header publication.
 pub(super) fn migrate(tx: &Transaction<'_>) -> Result<(), String> {
     let views = super::all(tx)?;
     // Validate before rewriting a history payload. A guard for an active pane
@@ -136,7 +135,6 @@ pub(super) fn trim_recent(view: &mut View) -> bool {
 #[cfg(test)]
 mod fixtures;
 
-// Allocation-dependent assembled view/retirement tests. Do not execute this
-// proposal as schema19: the production opener has not created its guards.
+// Assembled view/retirement contracts use the published production opener.
 #[cfg(test)]
 mod integration_tests;

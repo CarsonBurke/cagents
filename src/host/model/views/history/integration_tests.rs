@@ -1,5 +1,4 @@
-//! INACTIVE, allocation-dependent integration contracts. The owner must join
-//! the allocated opener/reference-layout migration before running this layer.
+//! Published history integration contracts using the canonical Registry opener.
 //! These synthetic Registry fixtures launch no provider or terminal process.
 use super::fixtures::{fixture, pane, rows};
 use super::*;

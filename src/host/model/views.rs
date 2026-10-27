@@ -1,11 +1,9 @@
 use super::*;
 use crate::workspace_model::views::{Change, Scope, View};
 
-// INACTIVE PROPOSAL: do not adopt this integration without the owning
-// published-schema allocation, opener and migration being joined atomically.
 mod history;
 
-/// Inactive until the schema owner joins the allocated published migration.
+/// Import permanent history guards and replay identities in the admitted opener transaction.
 pub(super) fn migrate_history(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     history::migrate(tx)
 }

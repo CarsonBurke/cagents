@@ -1,4 +1,4 @@
-//! Allocation-dependent contracts. This proposal has no published schema slot.
+//! Published replay-identity contracts using the canonical Registry opener.
 use super::super::fixtures::{fixture, pane, rows};
 use super::*;
 use crate::{
