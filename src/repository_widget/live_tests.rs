@@ -287,7 +287,10 @@ async fn background_read_cannot_overwrite_edits_or_newer_selection() {
         runtime.editor_text().as_deref(),
         Some("typed while loading")
     );
-    assert!(runtime.document_reading, "stale completion schedules a retry");
+    assert!(
+        runtime.document_reading,
+        "stale completion schedules a retry"
+    );
     // A native event can advance the watch revision before this completion.
     // The stale read must preserve edits immediately, then its real retry
     // must finish before the latest disk state can establish a conflict.
