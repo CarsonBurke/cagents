@@ -1505,7 +1505,7 @@ impl Cagents {
                 .spacing(space::M)
                 .align_y(Alignment::Center);
                 let on_press = Message::Palette(Action::Run(MessageBox(Box::new(message))));
-                let button = widget::button::custom(
+                let button: Element<'_, Message> = widget::button::custom(
                     widget::container(row)
                         .height(Length::Fill)
                         .align_y(Alignment::Center),
