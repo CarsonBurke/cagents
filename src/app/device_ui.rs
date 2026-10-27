@@ -330,13 +330,25 @@ impl Cagents {
                     || self.automation_ui.draft_dialog_open()
                     || self.device_ui.open
                     || self.chat_ui.image_viewer.is_some()
-                    || self.terminal_paste.is_some()
                 {
                     return Task::none();
                 }
+                if self.terminal_paste.is_some() {
+                    return crate::interaction::guarded_focus(
+                        widget::Id::new("terminal-paste-cancel"),
+                        Vec::new(),
+                        None,
+                    )
+                    .map(cosmic::Action::App);
+                }
                 #[cfg(feature = "integrated-browser")]
                 if self.browser_import.open() {
-                    return Task::none();
+                    return crate::interaction::guarded_focus(
+                        widget::Id::new("dialog.browser-import.cancel"),
+                        Vec::new(),
+                        None,
+                    )
+                    .map(cosmic::Action::App);
                 }
                 if self.session_recovery.open() {
                     return self.focus_session_recovery_after_cover();
@@ -344,7 +356,15 @@ impl Cagents {
                 if self.daemon_health_ui.confirmation {
                     return self.focus_daemon_health_after_cover();
                 }
-                if self.update_ui.confirmation.is_none() && self.terminal_close_dialog_visible() {
+                if self.update_ui.confirmation.is_some() {
+                    return crate::interaction::guarded_focus(
+                        widget::Id::new("update.cancel"),
+                        Vec::new(),
+                        None,
+                    )
+                    .map(cosmic::Action::App);
+                }
+                if self.terminal_close_dialog_visible() {
                     return self.focus_terminal_close_after_cover();
                 }
                 return Task::none();
@@ -2073,6 +2093,75 @@ mod tests {
                     ),
                     Some(owner),
                     "old restore cannot blur reopened Device files: resume={resume}, retained={retain_target}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn uncovering_legacy_cancel_controls_restores_once_and_yields_to_newer_focus() {
+        #[cfg(not(feature = "integrated-browser"))]
+        let scenes = ["paste", "update"];
+        #[cfg(feature = "integrated-browser")]
+        let scenes = ["paste", "update", "browser-import"];
+        for scene in scenes {
+            for foreign_focus in [false, true] {
+                let mut app = super::super::tests::context_inspector_test_app(false);
+                let expected = match scene {
+                    "paste" => {
+                        app.terminal_paste = Some((CardId::new(), "first\nsecond".into()));
+                        widget::Id::new("terminal-paste-cancel")
+                    }
+                    "update" => {
+                        app.update_ui.confirmation = Some(crate::update::UpdateConfirmation {
+                            nonce: uuid::Uuid::new_v4().to_string(),
+                            preview: crate::update::impact::Preview {
+                                candidate: crate::update::impact::Candidate {
+                                    version: "9.8.7".into(),
+                                    protocol: 32,
+                                    digest: "fixture".into(),
+                                },
+                                replaces_daemon: false,
+                                daemon: None,
+                            },
+                            expires_at_unix_ms: u64::MAX,
+                        });
+                        widget::Id::new("update.cancel")
+                    }
+                    #[cfg(feature = "integrated-browser")]
+                    "browser-import" => {
+                        drop(app.update(Message::BrowserImport(browser_import_ui::Action::Open)));
+                        widget::Id::new("dialog.browser-import.cancel")
+                    }
+                    _ => unreachable!(),
+                };
+                app.device_ui.open = true;
+                let delayed = app.update_device(Action::Close);
+                assert!(
+                    iced::runtime::task::into_stream(app.update_device(Action::Close)).is_none()
+                );
+                let foreign = widget::Id::new("fixture.newer-focus");
+                let mut children = vec![cosmic::Application::dialog(&app).unwrap()];
+                children.push(
+                    crate::ui_controls::field::text("Newer input", "draft")
+                        .id(foreign.clone())
+                        .on_input(|_| Message::CancelDialog)
+                        .into(),
+                );
+                let effects = if foreign_focus {
+                    iced::widget::operation::focus(foreign.clone())
+                        .map(cosmic::Action::App)
+                        .chain(delayed)
+                } else {
+                    delayed
+                };
+                assert_eq!(
+                    super::super::tests::focused_element(
+                        widget::column::with_children(children).into(),
+                        effects,
+                    ),
+                    Some(if foreign_focus { foreign } else { expected }),
+                    "legacy adapter scene={scene}, newer_focus={foreign_focus}",
                 );
             }
         }
