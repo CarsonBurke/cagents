@@ -3,6 +3,104 @@
 use super::*;
 use crate::daemon::holder_registry::{self as registry, Kind};
 
+#[cfg(test)]
+mod paired_projection_tests;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_PUBLICATION: std::cell::RefCell<Option<Box<dyn FnOnce(&SharedHost)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct BeforePublicationHook(std::marker::PhantomData<std::rc::Rc<()>>);
+
+#[cfg(test)]
+impl Drop for BeforePublicationHook {
+    fn drop(&mut self) {
+        BEFORE_PUBLICATION.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+#[cfg(test)]
+fn before_publication_for_test(
+    action: impl FnOnce(&SharedHost) + 'static,
+) -> BeforePublicationHook {
+    BEFORE_PUBLICATION.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "native publication hook already owned"
+        );
+        *slot.borrow_mut() = Some(Box::new(action));
+    });
+    BeforePublicationHook(std::marker::PhantomData)
+}
+
+fn project_paired_terminal(
+    state: &HostState,
+    terminal: &crate::model::TerminalSession,
+    paired_holder: Option<&crate::terminal::holder::Record>,
+    proof: &HostSessionProof,
+) -> Result<
+    (
+        crate::model::TerminalSession,
+        crate::terminal::TerminalHandle,
+    ),
+    String,
+> {
+    // Raw terminal records retain their original custody descriptor. Current
+    // ownership comes from the same authenticated worker, not that old proof.
+    let current = state
+        .terminals
+        .get(&terminal.id)
+        .filter(|current| {
+            current.handle.holder_identity().is_some()
+                && current.handle.holder_identity() == paired_holder
+                && current.session.launch == terminal.launch
+                && current.session.owned_codex_listener == terminal.owned_codex_listener
+        })
+        .ok_or("The paired terminal could not be recovered; native ownership was preserved")?;
+    let projected = state.native_terminal_projection(terminal.id)?;
+    if projected.continuity.live_proof().as_ref() != Some(proof) {
+        return Err("The paired terminal belongs to a different daemon owner".into());
+    }
+    Ok((projected, current.handle.clone()))
+}
+
+fn pair_projection_is_current(
+    state: &HostState,
+    terminal: Option<&crate::model::TerminalSession>,
+    handle: Option<&crate::terminal::TerminalHandle>,
+) -> bool {
+    match (terminal, handle) {
+        (None, None) => true,
+        (Some(terminal), Some(handle)) => {
+            state.terminals.get(&terminal.id).is_some_and(|current| {
+                current.handle.same_worker(handle)
+                    && state
+                        .native_terminal_projection(terminal.id)
+                        .is_ok_and(|projected| projected == *terminal)
+            })
+        }
+        _ => false,
+    }
+}
+
+fn restored_thread_ready(handle: &Handle, expected: Option<&str>) -> Result<bool, String> {
+    match handle.confirmed_session_id() {
+        None => Ok(false),
+        Some(actual) if Some(actual.as_str()) != expected => {
+            Err("Retained server confirmed a different conversation".into())
+        }
+        // Confirmation and durable capability are published separately. Until
+        // both arrive, UpdateSource's unsupported no-op is not an ownership ACK.
+        Some(_) => Ok(matches!(
+            handle.native_continuity(),
+            chat::NativeContinuity::Durable { .. }
+        )),
+    }
+}
+
 /// Diagnostic data only: it never authorizes attaching, launching or cleanup.
 /// Keep hashes rather than another copy of launch environments for every alias.
 #[derive(Default)]
@@ -263,15 +361,14 @@ fn restore_authenticated(
             if handle.is_completed() {
                 return Err("Retained server disconnected during adoption".into());
             }
-            if let Some(actual) = handle.confirmed_session_id() {
-                return if Some(actual) == expected_thread {
-                    Ok(())
-                } else {
-                    Err("Retained server confirmed a different conversation".into())
-                };
+            if restored_thread_ready(&handle, expected_thread.as_deref())? {
+                return Ok(());
             }
             if Instant::now() >= deadline {
-                return Err("Retained server did not confirm its thread within 30 seconds".into());
+                return Err(
+                    "Retained server did not confirm durable continuity for its thread within 30 seconds"
+                        .into(),
+                );
             }
             thread::sleep(Duration::from_millis(20));
         }
@@ -301,19 +398,10 @@ fn restore_authenticated(
         // Terminal recovery has already authenticated its own holder lineage.
         // Keep that exact worker through the native holder's acknowledgment;
         // an equal recipe alone cannot authorize a concurrent replacement.
-        let current = state
-            .terminals
-            .get(&terminal.id)
-            .filter(|current| {
-                current.handle.holder_identity().is_some()
-                    && current.handle.holder_identity() == paired_holder.as_ref()
-                    && current.session.launch == terminal.launch
-                    && current.session.owned_codex_listener == terminal.owned_codex_listener
-                    && current.session.continuity.live_proof().as_ref() == Some(proof)
-            })
-            .ok_or("The paired terminal could not be recovered; native ownership was preserved")?;
-        *terminal = current.session.clone();
-        Ok(Some(current.handle.clone()))
+        let (projected, worker) =
+            project_paired_terminal(&state, terminal, paired_holder.as_ref(), proof)?;
+        *terminal = projected;
+        Ok(Some(worker))
     })();
     let paired = match paired {
         Ok(paired) => paired,
@@ -350,15 +438,8 @@ fn restore_authenticated(
         return Err(error);
     }
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
-    let pair_unchanged = match (&session.terminal, &paired) {
-        (None, None) => true,
-        (Some(terminal), Some(handle)) => {
-            state.terminals.get(&terminal.id).is_some_and(|current| {
-                current.session == *terminal && current.handle.same_worker(handle)
-            })
-        }
-        _ => false,
-    };
+    let pair_unchanged =
+        pair_projection_is_current(&state, session.terminal.as_ref(), paired.as_ref());
     if state.shutting_down || !pair_unchanged {
         drop(state);
         let _ = handle.close();
@@ -391,10 +472,14 @@ fn restore_authenticated(
         completion_observed: false,
         returning_terminal: false,
     };
-    let expected_pair = record.session.terminal.clone();
     drop(state);
     let response = session_snapshot(&record.session, &record.handle)?;
-    record.handle.commit_native_installation()?;
+    #[cfg(test)]
+    BEFORE_PUBLICATION.with(|slot| {
+        if let Some(action) = slot.borrow_mut().take() {
+            action(host);
+        }
+    });
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     if state.shutting_down
         || state.proof() != proof
@@ -402,17 +487,20 @@ fn restore_authenticated(
             .chats
             .get(&id)
             .is_some_and(|current| current.handle.owns_work())
-        || expected_pair.as_ref().is_some_and(|terminal| {
-            state
-                .terminals
-                .get(&terminal.id)
-                .is_none_or(|current| current.session != *terminal)
-        })
+        || !pair_projection_is_current(
+            &state,
+            record.session.terminal.as_ref(),
+            record.paired_terminal.as_ref(),
+        )
     {
         drop(state);
         let _ = record.handle.close();
         return Err("Native adoption changed before attachment publication".into());
     }
+    // This path constructs a Local adopted handle: committing is an atomic
+    // flag, not a holder RPC. Keep it uncommitted through every refusal above
+    // so dropping the failed attachment preserves the original provider.
+    record.handle.commit_native_installation()?;
     let retired = state.chats.insert(id, record);
     if let Some(context) = execution_context {
         context.installed();
