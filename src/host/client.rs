@@ -605,7 +605,7 @@ pub(super) fn process_request(
                 let _exclusive = gate.write().unwrap_or_else(|p| p.into_inner());
                 ensure_control_open(host)?;
                 super::account_lifecycle::ensure_idle(host)?;
-                super::account_readiness::ensure_unused(host, &request.path)?;
+                super::account_readiness::ensure_unused(host, &removal_request.path)?;
                 prepared
                     .remove(|windows| {
                         host.lock()
