@@ -400,14 +400,15 @@ mod tests {
                         .owns_keyboard(&iced::Event::Keyboard(event.clone()))
                 );
             }
+            assert!(
+                messages.iter().any(|message| matches!(message,
+                    Message::NativeKeyEvent { source: found, .. } if found == &source
+                )),
+                "the real native observer must queue the original source"
+            );
             for message in messages {
                 drop(app.update(message));
             }
-            drop(app.update(Message::TaggedKeyEvent {
-                event: event.clone(),
-                captured: true,
-                source: source.clone(),
-            }));
             assert!(
                 !context.is_current(old_intent),
                 "consumed native Copy/Cut supersedes the older message intent"
@@ -424,6 +425,13 @@ mod tests {
             );
 
             let current = write_shared_literal(Arc::from("newer native selection"));
+            // The subscription copy is refused after the native event. It
+            // must not cancel a newer clipboard task created in between.
+            drop(app.update(Message::TaggedKeyEvent {
+                event,
+                captured: true,
+                source,
+            }));
             let current_effects = iced::futures::executor::block_on(async {
                 iced::runtime::task::into_stream(current)
                     .unwrap()
@@ -434,6 +442,45 @@ mod tests {
                 iced::runtime::Action::Clipboard(iced::runtime::clipboard::Action::Write { contents, .. })
                     if contents == "newer native selection"
             )), "the newer clipboard intent remains emittable");
+
+            // Modal widgets outside the body observer have only the captured
+            // subscription path. That genuine fallback must still supersede
+            // a pending message Copy; it is not a duplicate NativeKeyEvent.
+            app.device_ui.open = true;
+            let modal_intent = context.advance();
+            let modal_old = clipboard_write(
+                context.clone(),
+                modal_intent,
+                "message before modal copy".into(),
+                || true,
+            );
+            drop(app.update(Message::TaggedKeyEvent {
+                event: keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(character.into()),
+                    modified_key: keyboard::Key::Character(character.into()),
+                    physical_key: keyboard::key::Physical::Code(code),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::CTRL,
+                    text: None,
+                    repeat: false,
+                },
+                captured: true,
+                source: Source::tracked(
+                    PressCycle::new(keyboard::key::Physical::Code(code)),
+                    Transition::Press,
+                ),
+            }));
+            assert!(!context.is_current(modal_intent));
+            let modal_effects = iced::futures::executor::block_on(async {
+                iced::runtime::task::into_stream(modal_old)
+                    .unwrap()
+                    .collect::<Vec<_>>()
+                    .await
+            });
+            assert!(
+                modal_effects.is_empty(),
+                "unobserved modal Copy/Cut still cancels the old write"
+            );
         }
     }
     #[test]
