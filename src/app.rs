@@ -18532,7 +18532,13 @@ impl Application for Cagents {
                         .align_x(Alignment::End)
                         .width(Length::Fill)
                         .height(Length::Fill);
-                    let foreground = crate::interaction::layer(dismiss, aligned.into());
+                    let overlay_content = widget::column::with_children(vec![
+                        self.overlay_window_header(),
+                        aligned.into(),
+                    ])
+                    .width(Length::Fill)
+                    .height(Length::Fill);
+                    let foreground = crate::interaction::layer(dismiss, overlay_content.into());
                     inspector::ModalOverlay::new(background, foreground).into()
                 }
             }

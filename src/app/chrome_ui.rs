@@ -2618,13 +2618,34 @@ impl Cagents {
         .into()
     }
 
+    pub(super) fn inspector_owns_window_controls(&self) -> bool {
+        matches!(
+            self.context_inspector_mount(),
+            Some(InspectorLayout::Docked)
+        )
+    }
+
+    /// The workspace header's window controls stay above an inspector overlay.
+    /// Mount them in the modal foreground so they remain visible, clickable,
+    /// and available to accessibility without exposing the obscured workbench.
+    pub(super) fn overlay_window_header(&self) -> Element<'_, Message> {
+        widget::container(
+            widget::container(self.native_header(widget::Space::new().into(), None, true))
+                .width(160),
+        )
+        .align_x(Alignment::End)
+        .width(Length::Fill)
+        .height(design::HEADER_HEIGHT)
+        .into()
+    }
+
     fn workspace_header_width(&self) -> f32 {
         let navigator = if should_show_card_navigator(self.workspace.cards().len()) {
             design::PANE_NAVIGATOR_RESERVED_WIDTH
         } else {
             0.0
         };
-        let controls = if self.context_inspector_open {
+        let controls = if self.inspector_owns_window_controls() {
             0.0
         } else {
             let count = usize::from(self.core.window.show_close)
@@ -2799,7 +2820,7 @@ impl Cagents {
             self.native_header(
                 tabs.into(),
                 Some(actions.into()),
-                !self.context_inspector_open,
+                !self.inspector_owns_window_controls() && !self.context_inspector_is_overlay(),
             )
         };
         let mut rows = vec![header];
@@ -3353,7 +3374,11 @@ impl Cagents {
             .spacing(space::XXS)
             .align_y(Alignment::Center)
             .into();
-            let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
+            let heading = self.native_header(
+                self.sidebar_toggle(),
+                Some(end),
+                self.inspector_owns_window_controls(),
+            );
             return widget::column::with_children(vec![
                 heading,
                 crate::interaction::focused_escape(
@@ -3446,7 +3471,11 @@ impl Cagents {
         .spacing(space::XXS)
         .align_y(Alignment::Center)
         .into();
-        let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
+        let heading = self.native_header(
+            self.sidebar_toggle(),
+            Some(end),
+            self.inspector_owns_window_controls(),
+        );
         let tabs = widget::row::with_children(vec![
             tabs.into(),
             crate::ui_controls::button::secondary("Channel work")
