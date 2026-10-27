@@ -1,6 +1,8 @@
 use super::state::{ClientId, HostLock, HostState, SharedHost};
 #[cfg(test)]
 mod account_isolation_tests;
+#[cfg(test)]
+mod account_recovery_target_tests;
 pub(super) mod capacity;
 mod native_cleanup;
 mod native_recovery;
@@ -2172,6 +2174,10 @@ fn recover_account(
             });
             handle
         };
+        // A refused replacement must leave the original actor and history
+        // intact. The temporary source reservation drops on this error;
+        // actual spawn still reauthorizes the account at its own boundary.
+        check_launch_account(&replacement.launch)?;
         // The actor checks this generation after every previously admitted
         // command. A UI snapshot alone cannot prove a timed-out turn is idle.
         crate::account::handoff::preflight(&source, &replacement).map_err(unavailable)?;
@@ -2206,6 +2212,9 @@ fn recover_account(
                 "The original conversation still owns work; reconnect or close it before changing accounts",
             ));
         }
+    }
+    if !automatic {
+        check_launch_account(&replacement.launch)?;
     }
     let id = replacement.id;
     // The checks above prove the candidate replaces the source, so it joins the
