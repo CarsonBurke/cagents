@@ -126,6 +126,20 @@ pub(in crate::host) fn resolve(
             .chat_resolutions
             .insert(client, Attempt::Spent(attempt));
     }
+    // Startup discovery can miss an unvisited retained owner. Resolve its
+    // exact issued source through ordinary authenticated adoption before
+    // asking for lineage. This route never executes a saved launch recipe,
+    // even if the holder disappears between discovery and authentication.
+    let missing = !host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .contains_key(&source.id);
+    if missing {
+        // Client zero is the existing unattached startup-adoption mode.
+        // Resolve must not subscribe this connection before its Attach.
+        super::native_recovery::restore(host, 0, source).map_err(unavailable)?;
+    }
     let resolved = super::resolve_upgrade(host, source)?;
     let mut grant = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
