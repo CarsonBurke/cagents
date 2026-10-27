@@ -885,6 +885,7 @@ mod tests {
             launching: Mutex::default(),
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
+            notifications: Mutex::default(),
         }));
         (directory, host, handle, automation)
     }
@@ -1847,6 +1848,7 @@ mod tests {
             root: directory.path().join("prechecks"),
             wake: Wake::default(),
             workers: Mutex::default(),
+            launching: Mutex::default(),
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
             notifications: Mutex::default(),
