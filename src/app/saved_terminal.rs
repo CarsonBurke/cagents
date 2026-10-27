@@ -72,6 +72,18 @@ impl Action {
     }
 }
 
+/// Preserve the existing remote User route. A scoped caller must instead be
+/// refused by this captured-scope path before any endpoint/bridge resolution.
+fn owns_context(remote: bool, authority: &crate::agent_execution::Authority) -> bool {
+    !remote || authority.token().is_some()
+}
+
+/// These callbacks can reach ordinary User commands. Inherited scope must not
+/// escape the captured refusal through a different control on the same view.
+fn allows_command(authority: &crate::agent_execution::Authority, command: Command) -> bool {
+    authority.token().is_none() || matches!(command, Command::CopyDetails)
+}
+
 fn candidate(session: &TerminalSession) -> bool {
     matches!(
         session.continuity,
@@ -99,7 +111,12 @@ fn attachment(
         if expected != hosted.session {
             return Err("The existing terminal has different saved source evidence".into());
         }
-        if !hosted.session.continuity.can_resume_live(proof) && !terminal_ended(&hosted.session) {
+        if !hosted.session.continuity.can_resume_live(proof)
+            && !matches!(
+                hosted.session.continuity,
+                TerminalContinuity::RelaunchAvailable { .. } | TerminalContinuity::Exited { .. }
+            )
+        {
             return Err("The existing terminal has uncertain ownership".into());
         }
         return Ok(Some(hosted.session.clone()));
@@ -116,6 +133,96 @@ fn attachment(
     Ok(None)
 }
 
+/// A saved proof can select a current descriptor directly only on the same
+/// authenticated host. Changed-host lineage remains the recovery wrapper's job.
+fn current_host_attachment(
+    source: &TerminalSession,
+    terminals: &[crate::terminal::ipc::TerminalDescriptor],
+    proof: &HostSessionProof,
+) -> Result<Option<TerminalSession>, String> {
+    if source.continuity.live_proof().as_ref() != Some(proof)
+        || !terminals.iter().any(|entry| entry.session.id == source.id)
+    {
+        return Ok(None);
+    }
+    attachment(source, terminals, proof)
+}
+
+/// The current surface reducer has no read-only completion witness apart from
+/// an actual exit record. Attaching unknown-exit completion would promote it to
+/// Live on the first host-proof wake. Keep it in the saved presentation after
+/// confirmed read-only inventory instead; never mount it or invent exit 0.
+fn surface_attachment_allowed(session: &TerminalSession) -> Result<(), String> {
+    if matches!(
+        session.continuity,
+        TerminalContinuity::RelaunchAvailable {
+            last_exit: None,
+            ..
+        }
+    ) {
+        return Err(
+            "This terminal has finished, but its final state cannot be restored safely yet".into(),
+        );
+    }
+    Ok(())
+}
+
+/// A readiness-sensitive decision must use inventory obtained after BuildInfo.
+/// A changed or newly published related owner is uncertainty, never absence.
+fn confirm_disconnected(
+    source: &TerminalSession,
+    selected_completed: Option<&TerminalSession>,
+    terminals: &[crate::terminal::ipc::TerminalDescriptor],
+    proof: &HostSessionProof,
+) -> Result<(), String> {
+    if !proof.is_complete() {
+        return Err("The terminal service did not confirm its identity".into());
+    }
+    let origin = source.recovery_origin.unwrap_or(source.id);
+    if let Some(expected) = selected_completed {
+        let selected = attachment(expected, terminals, proof)?;
+        if selected.as_ref() != Some(expected) {
+            return Err(
+                "The completed terminal changed while checking recovery; reconnect again".into(),
+            );
+        }
+    }
+    if terminals.iter().any(|terminal| {
+        Some(terminal.session.id) != selected_completed.map(|session| session.id)
+            && (terminal.session.id == source.id
+                || terminal.session.recovery_origin == Some(origin)
+                || terminal
+                    .upgrade_sources
+                    .iter()
+                    .any(|previous| previous.id == source.id))
+    }) {
+        return Err("Terminal ownership changed while checking recovery; reconnect again".into());
+    }
+    Ok(())
+}
+
+/// Exact live/known-exit attachments do not require general startup readiness.
+/// Unknown-exit completion stays a saved pane, without mounting a surface or
+/// inventing an exit. Both that decision and absence require fresh post-gate
+/// inventory on the same authenticated client, never a partial pre-gate list.
+fn inspect_inventory(
+    source: &TerminalSession,
+    terminals: &[crate::terminal::ipc::TerminalDescriptor],
+    proof: &HostSessionProof,
+    ready_inventory: impl FnOnce() -> Result<Vec<crate::terminal::ipc::TerminalDescriptor>, String>,
+) -> Result<Option<TerminalSession>, String> {
+    let selected = attachment(source, terminals, proof)?;
+    if selected
+        .as_ref()
+        .is_some_and(|session| surface_attachment_allowed(session).is_ok())
+    {
+        return Ok(selected);
+    }
+    let refreshed = ready_inventory()?;
+    confirm_disconnected(source, selected.as_ref(), &refreshed, proof)?;
+    Ok(None)
+}
+
 /// Keep the captured endpoint through the actual attachment, not just its
 /// inventory lookup. The normal constructor may resolve the selected device
 /// again; this saved-source operation must not follow a later device switch.
@@ -126,6 +233,7 @@ fn attach_existing(
     proof: HostSessionProof,
     sender: async_channel::Sender<TerminalWakeup>,
 ) -> Result<StartedTerminal, String> {
+    surface_attachment_allowed(&recovered.session)?;
     let handle = crate::terminal::HostedTerminalHandle::connect_at(
         socket,
         recovered.session.id,
@@ -207,14 +315,26 @@ impl Cagents {
         })
     }
 
+    pub(super) fn saved_terminal_transcript_context(
+        &self,
+        card: CardId,
+    ) -> Option<(uuid::Uuid, PathBuf)> {
+        if !self.saved_terminal_diagnostics_allowed(card) {
+            return None;
+        }
+        let entry = self.saved_terminal_current(card)?;
+        Some((entry.request, entry.socket.as_ref().ok()?.clone()?))
+    }
+
     /// Called only from restoration, never a new terminal/clone/user launch.
     pub(super) fn prepare_saved_terminal(
         &mut self,
         card: CardId,
         source: &TerminalSession,
     ) -> bool {
+        let authority = crate::agent_execution::Authority::from_environment();
         if !candidate(source)
-            || crate::device::is_remote()
+            || !owns_context(crate::device::is_remote(), &authority)
             || self.shared_views.defaults.contains_key(&card)
             || self.shared_views.attached.contains(&card)
             || self.durable.pending_terminal_creations.contains(&card)
@@ -223,7 +343,6 @@ impl Cagents {
         {
             return false;
         }
-        let authority = crate::agent_execution::Authority::from_environment();
         let socket = if authority.token().is_some() || crate::device::is_remote() {
             Ok(None)
         } else {
@@ -345,26 +464,61 @@ impl Cagents {
                     let mut client = crate::control::ControlClient::connect(&socket)
                         .map_err(|error| error.to_string())?;
                     let proof = client.proof().clone();
-                    // List remains available while startup recovery retains hidden
-                    // original owners. BuildInfo does not: never turn that partial
-                    // inventory into successful disconnected-pane admission.
-                    client.daemon_version().map_err(|error| error.to_string())?;
+                    let terminals = client.list().map_err(|error| error.to_string())?;
+                    if let Some(session) = current_host_attachment(&source, &terminals, &proof)? {
+                        if surface_attachment_allowed(&session).is_err() {
+                            client.daemon_version().map_err(|error| error.to_string())?;
+                            let refreshed = client.list().map_err(|error| error.to_string())?;
+                            confirm_disconnected(&source, Some(&session), &refreshed, &proof)?;
+                            return Ok(None);
+                        }
+                        return attach_existing(
+                            card,
+                            daemon_recovery::RecoveredTerminal {
+                                attach_completed: terminal_ended(&session),
+                                session,
+                                expected_host: Some(proof.clone()),
+                                recovery_lease: None,
+                            },
+                            socket,
+                            proof,
+                            sender,
+                        )
+                        .map(Some);
+                    }
                     if source.continuity.live_proof().is_some() {
                         let recovered = daemon_recovery::inspect_saved_at(source.clone(), &socket)?;
                         if recovered.expected_host.as_ref() != Some(&proof) {
                             return Err("The terminal service changed during recovery".into());
                         }
-                        // Recheck while the existing recovery lease remains held.
-                        client.daemon_version().map_err(|error| error.to_string())?;
                         if matches!(
                             recovered.session.continuity,
                             TerminalContinuity::Live { .. }
                                 | TerminalContinuity::DetachedSameBoot { .. }
                         ) || recovered.attach_completed
                         {
+                            if surface_attachment_allowed(&recovered.session).is_err() {
+                                client.daemon_version().map_err(|error| error.to_string())?;
+                                let refreshed = client.list().map_err(|error| error.to_string())?;
+                                confirm_disconnected(
+                                    &source,
+                                    Some(&recovered.session),
+                                    &refreshed,
+                                    &proof,
+                                )?;
+                                drop(recovered);
+                                return Ok(None);
+                            }
                             return attach_existing(card, recovered, socket, proof, sender)
                                 .map(Some);
                         }
+                        // A partial inventory during retained startup may still
+                        // support exact Attach, but must not prove absence.
+                        // Confirm admission readiness on the same proof-pinned
+                        // client while the existing recovery lease is held.
+                        client.daemon_version().map_err(|error| error.to_string())?;
+                        let refreshed = client.list().map_err(|error| error.to_string())?;
+                        confirm_disconnected(&source, None, &refreshed, &proof)?;
                         // This is an unused, normally authorized replay plan.
                         // Retain the ORIGINAL descriptor, never its derived ID,
                         // recipe, hints or transcript path. Dropping it releases
@@ -372,9 +526,11 @@ impl Cagents {
                         drop(recovered);
                         return Ok(None);
                     }
-                    let terminals = client.list().map_err(|error| error.to_string())?;
-                    client.daemon_version().map_err(|error| error.to_string())?;
-                    let Some(session) = attachment(&source, &terminals, &proof)? else {
+                    let selected = inspect_inventory(&source, &terminals, &proof, || {
+                        client.daemon_version().map_err(|error| error.to_string())?;
+                        client.list().map_err(|error| error.to_string())
+                    })?;
+                    let Some(session) = selected else {
                         return Ok(None);
                     };
                     attach_existing(
@@ -438,6 +594,9 @@ impl Cagents {
             else {
                 return Task::none();
             };
+            if !allows_command(&entry.authority, command) {
+                return Task::none();
+            }
             let pending = matches!(entry.disposition, Disposition::Pending);
             let dormant = matches!(entry.disposition, Disposition::Dormant);
             let relaunch_available = matches!(entry.directory, Directory::Available);
@@ -593,7 +752,9 @@ impl Cagents {
         let entry = self.saved_terminal_current(card)?;
         let pending = matches!(entry.disposition, Disposition::Pending);
         let dormant = matches!(entry.disposition, Disposition::Dormant);
-        let relaunch_available = dormant && matches!(entry.directory, Directory::Available);
+        let relaunch_available = dormant
+            && matches!(entry.directory, Directory::Available)
+            && allows_command(&entry.authority, Command::Relaunch);
         let request = entry.request;
         let action = |command| {
             Message::SavedTerminal(Action::User {
@@ -608,20 +769,24 @@ impl Cagents {
                 &format!("saved-terminal.{control}.{request}.{pending}"),
             )
         };
-        let description = match entry.disposition {
-            Disposition::Pending => "Checking for the existing terminal…",
-            Disposition::Dormant => {
-                "Not connected. The saved command was not restarted. Reconnect checks for the original terminal. Resume or Restart runs the saved session only when you choose."
-            }
-            Disposition::Unavailable => {
-                "The existing terminal could not be verified. Reconnect to check again; the saved command has not been restarted."
+        let description = if entry.authority.token().is_some() {
+            "Use the original workspace window to reconnect or manage this saved terminal. You can copy its details here."
+        } else {
+            match entry.disposition {
+                Disposition::Pending => "Checking for the existing terminal…",
+                Disposition::Dormant => {
+                    "Not connected. The saved command was not restarted. Reconnect checks for the original terminal. Resume or Restart runs the saved session only when you choose."
+                }
+                Disposition::Unavailable => {
+                    "The existing terminal could not be verified. Reconnect to check again; the saved command has not been restarted."
+                }
             }
         };
         let reconnect =
             crate::ui_controls::button::primary(if pending { "Checking…" } else { "Reconnect" })
                 .id(control_id("reconnect"))
                 .name("Reconnect saved terminal");
-        let reconnect = if pending {
+        let reconnect = if pending || !allows_command(&entry.authority, Command::Reconnect) {
             reconnect
         } else {
             reconnect.on_press(action(Command::Reconnect))
@@ -645,17 +810,26 @@ impl Cagents {
             crate::ui_controls::button::secondary("Open another folder…")
                 .id(control_id("folder"))
                 .name("Choose another workspace folder")
-                .on_press(action(Command::Folder))
+                .on_press_maybe(
+                    allows_command(&entry.authority, Command::Folder)
+                        .then(|| action(Command::Folder)),
+                )
                 .into(),
             crate::ui_controls::button::secondary("New terminal in selected workspace")
                 .id(control_id("new"))
                 .name("Create a separate terminal in the currently selected workspace")
-                .on_press(action(Command::NewTerminal))
+                .on_press_maybe(
+                    allows_command(&entry.authority, Command::NewTerminal)
+                        .then(|| action(Command::NewTerminal)),
+                )
                 .into(),
             crate::ui_controls::button::secondary("Close")
                 .id(control_id("close"))
                 .name("Close saved terminal pane")
-                .on_press(action(Command::Close))
+                .on_press_maybe(
+                    allows_command(&entry.authority, Command::Close)
+                        .then(|| action(Command::Close)),
+                )
                 .into(),
         ]);
         let diagnostics = widget::flex_row(vec![
@@ -695,7 +869,13 @@ impl Cagents {
         .spacing(space::M)
         .width(Length::Fill);
         Some(crate::ui_controls::owned(
-            (request, pending, dormant, relaunch_available),
+            (
+                request,
+                pending,
+                dormant,
+                relaunch_available,
+                entry.authority.token().is_none(),
+            ),
             widget::scrollable(widget::container(content).padding(space::L)).height(Length::Fill),
         ))
     }

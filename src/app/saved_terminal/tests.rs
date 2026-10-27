@@ -384,3 +384,358 @@ fn a_missing_or_unverified_directory_has_no_enabled_relaunch_callback() {
         assert!(app.saved_terminal_view(card).is_some());
     }
 }
+
+#[test]
+fn remote_user_keeps_its_existing_route_but_scoped_callers_cannot_fall_back_to_user() {
+    let user = crate::agent_execution::Authority::default();
+    let scoped = crate::agent_execution::Authority::session("synthetic-scoped-capability".into());
+    assert!(owns_context(false, &user));
+    assert!(
+        !owns_context(true, &user),
+        "ordinary remote users keep the existing device route"
+    );
+    assert!(owns_context(false, &scoped));
+    assert!(
+        owns_context(true, &scoped),
+        "inherited remote scope must be captured and refused before bridge resolution"
+    );
+}
+
+#[test]
+fn retained_startup_blocks_absence_but_keeps_exact_live_attachments_inspectable() {
+    let (_, _, source) = fixture();
+    let live = exact_live(&source);
+    let result = inspect_inventory(&source, &[descriptor(live.clone())], &proof(), || {
+        panic!("an exact available attachment must not request general startup readiness")
+    });
+    assert_eq!(result.unwrap(), Some(live));
+    assert!(
+        inspect_inventory(&source, &[], &proof(), || Err(
+            "retained startup ownership".into()
+        ))
+        .is_err()
+    );
+    let mut conflicting = exact_live(&source);
+    conflicting.launch.working_directory = PathBuf::from("/different-source");
+    assert!(
+        inspect_inventory(&source, &[descriptor(conflicting)], &proof(), || {
+            panic!("a source conflict cannot be converted into admitted absence")
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn an_issued_unknown_exit_is_saved_ready_only_after_fresh_post_gate_confirmation() {
+    let (_, _, source) = fixture();
+    let before = source.clone();
+    let result = inspect_inventory(&source, &[descriptor(source.clone())], &proof(), || {
+        Ok(vec![descriptor(source.clone())])
+    })
+    .unwrap();
+    assert!(
+        result.is_none(),
+        "saved readiness never mounts the completed surface"
+    );
+    assert_eq!(source, before);
+    assert!(!terminal_ended(&source), "no exit record was manufactured");
+    assert!(surface_attachment_allowed(&source).is_err());
+    assert!(
+        inspect_inventory(&source, &[descriptor(source.clone())], &proof(), || {
+            Err("retained startup ownership".into())
+        })
+        .is_err()
+    );
+    assert!(
+        inspect_inventory(&source, &[descriptor(source.clone())], &proof(), || {
+            Ok(vec![])
+        })
+        .is_err(),
+        "the exact completed record must still exist after readiness"
+    );
+}
+
+#[test]
+fn scoped_saved_controls_cannot_dispatch_user_commands_but_user_recovery_remains_available() {
+    let (mut app, card, source) = fixture();
+    let request = pending(&mut app, card, &source);
+    drop(app.update_saved_terminal(complete(card, source.clone(), request, Ok(None))));
+    app.saved_terminals
+        .entries
+        .get_mut(&card)
+        .unwrap()
+        .authority =
+        crate::agent_execution::Authority::session("synthetic-scoped-capability".into());
+    let original = app.durable.cards.clone();
+    for command in [
+        Command::Reconnect,
+        Command::Relaunch,
+        Command::Transcript,
+        Command::Folder,
+        Command::NewTerminal,
+        Command::Close,
+    ] {
+        assert!(!allows_command(
+            &app.saved_terminals.entries[&card].authority,
+            command
+        ));
+        let task = app.update_saved_terminal(Action::User {
+            card,
+            request,
+            command,
+        });
+        assert!(
+            iced::runtime::task::into_stream(task).is_none(),
+            "refused controls cannot enqueue a picker, bridge, launch, close or inspection"
+        );
+        assert_eq!(app.durable.cards, original);
+        assert!(!app.terminal_start_in_flight(card));
+    }
+    assert!(allows_command(
+        &app.saved_terminals.entries[&card].authority,
+        Command::CopyDetails
+    ));
+    app.saved_terminals
+        .entries
+        .get_mut(&card)
+        .unwrap()
+        .authority = crate::agent_execution::Authority::default();
+    for command in [
+        Command::Reconnect,
+        Command::Relaunch,
+        Command::Transcript,
+        Command::Folder,
+        Command::NewTerminal,
+        Command::Close,
+    ] {
+        assert!(allows_command(
+            &app.saved_terminals.entries[&card].authority,
+            command
+        ));
+    }
+    // Construct, but never poll, the ordinary User reinspection task.
+    let task = app.update_saved_terminal(Action::User {
+        card,
+        request,
+        command: Command::Relaunch,
+    });
+    assert!(iced::runtime::task::into_stream(task).is_some());
+    assert!(app.terminal_start_in_flight(card));
+    assert_eq!(
+        app.card_state(card).unwrap().kind,
+        CardKind::Terminal(source)
+    );
+}
+
+#[test]
+fn same_host_completed_source_uses_exact_inventory_before_replay_recovery() {
+    let (_, _, source) = fixture();
+    let saved = exact_live(&source);
+    let mut completed = source.clone();
+    completed.continuity = TerminalContinuity::RelaunchAvailable {
+        recipe: completed.launch.clone(),
+        last_exit: Some(crate::model::TerminalExit {
+            code: Some(7),
+            signal: None,
+            occurred_at_unix_ms: 123,
+        }),
+    };
+    let selected = current_host_attachment(&saved, &[descriptor(completed.clone())], &proof())
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected, completed);
+    assert!(surface_attachment_allowed(&selected).is_ok());
+    assert_eq!(
+        saved,
+        exact_live(&source),
+        "the saved descriptor is unchanged"
+    );
+    let unknown = current_host_attachment(&saved, &[descriptor(source.clone())], &proof())
+        .unwrap()
+        .unwrap();
+    assert_eq!(unknown, source);
+    assert!(surface_attachment_allowed(&unknown).is_err());
+    let live = current_host_attachment(&saved, &[descriptor(saved.clone())], &proof())
+        .unwrap()
+        .unwrap();
+    assert!(surface_attachment_allowed(&live).is_ok());
+}
+
+#[test]
+fn direct_inventory_cannot_bypass_changed_host_lineage_or_replace_source_evidence() {
+    let (_, _, source) = fixture();
+    let saved = exact_live(&source);
+    let mut changed = proof();
+    changed.host_incarnation = crate::model::HostIncarnation::new("replacement-host");
+    assert_eq!(
+        current_host_attachment(&saved, &[descriptor(source.clone())], &changed).unwrap(),
+        None
+    );
+    assert_eq!(
+        current_host_attachment(&saved, &[], &proof()).unwrap(),
+        None
+    );
+    let mut wrong = source;
+    wrong.launch.working_directory = PathBuf::from("/wrong-recipe");
+    assert!(current_host_attachment(&saved, &[descriptor(wrong)], &proof()).is_err());
+}
+
+#[test]
+fn transcript_context_is_bound_to_the_saved_nonce_source_and_selected_endpoint() {
+    let (mut app, card, source) = fixture();
+    let request = pending(&mut app, card, &source);
+    drop(app.update_saved_terminal(complete(card, source.clone(), request, Ok(None))));
+    let context = app.saved_terminal_transcript_context(card).unwrap();
+    assert_eq!(context.0, request);
+    assert_eq!(
+        Some(context.1.clone()),
+        crate::terminal::ipc::daemon_socket_path().ok()
+    );
+    app.saved_terminals.entries.get_mut(&card).unwrap().socket =
+        Ok(Some(PathBuf::from("/different-selected-service")));
+    assert!(app.saved_terminal_transcript_context(card).is_none());
+    app.saved_terminals.entries.get_mut(&card).unwrap().socket = Ok(Some(context.1));
+    let replacement = uuid::Uuid::new_v4();
+    app.saved_terminals.entries.get_mut(&card).unwrap().request = replacement;
+    assert_eq!(
+        app.saved_terminal_transcript_context(card).unwrap().0,
+        replacement
+    );
+    if let CardKind::Terminal(current) = &mut Arc::make_mut(&mut app.durable).cards[0].kind {
+        current.resume_hint = Some("new-source".into());
+    }
+    assert!(app.saved_terminal_transcript_context(card).is_none());
+}
+
+#[test]
+fn post_gate_inventory_cannot_hide_an_owner_published_during_startup() {
+    let (_, _, source) = fixture();
+    let live = exact_live(&source);
+    assert!(
+        inspect_inventory(&source, &[], &proof(), || {
+            Ok(vec![descriptor(live.clone())])
+        })
+        .is_err(),
+        "pre-gate absence cannot override newly published live ownership"
+    );
+    assert_eq!(
+        inspect_inventory(&source, &[], &proof(), || Ok(vec![])).unwrap(),
+        None
+    );
+    let saved = exact_live(&source);
+    let mut descendant = live;
+    descendant.id = TerminalId::new();
+    descendant.recovery_origin = Some(source.id);
+    assert!(
+        confirm_disconnected(&saved, None, &[descriptor(descendant)], &proof()).is_err(),
+        "an unused replay plan cannot hide a newly published descendant"
+    );
+}
+
+#[test]
+fn confirmed_completed_saved_state_refuses_changed_source_lineage_or_incomplete_proof() {
+    let (_, _, source) = fixture();
+    let mut changed = source.clone();
+    changed.resume_hint = Some("changed-after-readiness".into());
+    assert!(
+        confirm_disconnected(&source, Some(&source), &[descriptor(changed)], &proof()).is_err()
+    );
+    let mut descendant = exact_live(&source);
+    descendant.id = TerminalId::new();
+    descendant.recovery_origin = Some(source.id);
+    assert!(
+        confirm_disconnected(
+            &source,
+            Some(&source),
+            &[descriptor(source.clone()), descriptor(descendant)],
+            &proof()
+        )
+        .is_err()
+    );
+    let mut incomplete = proof();
+    incomplete.boot_id = crate::model::BootId::new("");
+    assert!(confirm_disconnected(&source, None, &[], &incomplete).is_err());
+}
+
+#[test]
+fn startup_qualification_keeps_saved_readiness_separate_from_unresolved_and_live_owners() {
+    let (mut app, card, source) = fixture();
+    let request = pending(&mut app, card, &source);
+    drop(app.update_saved_terminal(complete(card, source.clone(), request, Ok(None))));
+    assert!(app.saved_terminal_ready(card));
+    assert_eq!(app.startup_pane_check(), Ok(true));
+    for _ in 0..3 {
+        drop(app.qualify_startup_terminals());
+        assert!(app.restored_agent_attaches.is_empty());
+        assert_eq!(app.terminal_starts_in_flight(), 0);
+    }
+
+    let mut unresolved = app.durable.cards[0].clone();
+    unresolved.id = CardId::new();
+    let mut unresolved_source = source.clone();
+    unresolved_source.id = TerminalId::new();
+    unresolved.kind = CardKind::Terminal(unresolved_source.clone());
+    let mut live = unresolved.clone();
+    live.id = CardId::new();
+    let mut live_source = exact_live(&source);
+    live_source.id = TerminalId::new();
+    live.kind = CardKind::Terminal(live_source.clone());
+    Arc::make_mut(&mut app.durable)
+        .cards
+        .extend([unresolved.clone(), live.clone()]);
+    app.cards.insert(unresolved.id, CardRuntime::Loading);
+    app.cards.insert(live.id, CardRuntime::Loading);
+    assert!(app.prepare_saved_terminal(unresolved.id, &unresolved_source));
+    app.lifecycle.register(
+        live.id,
+        Exposure::Offscreen,
+        Residency::Hibernated,
+        Instant::now(),
+    );
+    assert_eq!(
+        app.startup_pane_check(),
+        Ok(false),
+        "unresolved saved inspection and unattached live owner remain pending"
+    );
+    drop(app.qualify_startup_terminals());
+    assert!(
+        app.terminal_start_in_flight(live.id),
+        "known-live ownership still uses the actual serial attach path"
+    );
+    assert!(!app.terminal_start_in_flight(card));
+    assert!(!app.terminal_start_in_flight(unresolved.id));
+    assert!(
+        app.restored_agent_attaches.is_empty(),
+        "saved entries never enter the legacy attachment queue"
+    );
+    assert_eq!(app.startup_pane_check(), Ok(false));
+
+    // Leave just the unresolved saved pane beside the verified one. Settling a
+    // different live owner's serial bookkeeping must not waive this pending check.
+    Arc::make_mut(&mut app.durable)
+        .cards
+        .retain(|state| state.id != live.id);
+    app.cards.remove(&live.id);
+    app.lifecycle.remove(live.id);
+    drop(app.finish_terminal_start(live.id));
+    assert_eq!(app.startup_pane_check(), Ok(false));
+    for _ in 0..3 {
+        drop(app.qualify_startup_terminals());
+        assert!(app.restored_agent_attaches.is_empty());
+        assert_eq!(app.terminal_starts_in_flight(), 0);
+    }
+    Arc::make_mut(&mut app.durable)
+        .cards
+        .retain(|state| state.id != unresolved.id);
+    app.cards.remove(&unresolved.id);
+    assert_eq!(
+        app.startup_pane_check(),
+        Ok(true),
+        "a window containing only verified saved data is ready"
+    );
+    assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
+    assert_eq!(
+        app.card_state(card).unwrap().kind,
+        CardKind::Terminal(source)
+    );
+}
