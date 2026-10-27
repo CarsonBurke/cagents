@@ -321,77 +321,80 @@ impl Cagents {
     /// particular, a retained recovery must keep keyboard ownership rather
     /// than returning it to a background terminal or composer.
     fn focus_after_device_close(&mut self) -> Task<Message> {
-        // The image viewer handles keys at the app level and has no native
-        // focus target. Leave the workspace unfocused while it is exposed.
-        if self.chat_ui.image_viewer.is_some() {
-            return Task::none();
-        }
+        let target = match self.exposed_dialog_focus() {
+            dialog_ui::DialogFocus::Preserve => {
+                // These legacy owners have phase-aware restoration adapters.
+                // Invoke them only when no higher owner actually covers them.
+                if self.automation_approval_open()
+                    || self.transient_work_close.is_some()
+                    || self.automation_ui.draft_dialog_open()
+                    || self.device_ui.open
+                    || self.chat_ui.image_viewer.is_some()
+                    || self.terminal_paste.is_some()
+                {
+                    return Task::none();
+                }
+                #[cfg(feature = "integrated-browser")]
+                if self.browser_import.open() {
+                    return Task::none();
+                }
+                if self.session_recovery.open() {
+                    return self.focus_session_recovery_after_cover();
+                }
+                if self.daemon_health_ui.confirmation {
+                    return self.focus_daemon_health_after_cover();
+                }
+                if self.update_ui.confirmation.is_none() && self.terminal_close_dialog_visible() {
+                    return self.focus_terminal_close_after_cover();
+                }
+                return Task::none();
+            }
+            dialog_ui::DialogFocus::Focus(target) => target,
+            dialog_ui::DialogFocus::NoOwner => self.workspace.focused().map_or_else(
+                || widget::Id::new(TOOLBAR_FOCUS_ID),
+                |card| self.card_keyboard_focus(card),
+            ),
+        };
         let mut same_owner = Vec::new();
         let mut marker = None;
-        let target = if self.terminal_paste.is_some() {
-            Some(widget::Id::new("terminal-paste-cancel"))
-        } else {
-            #[cfg(feature = "integrated-browser")]
-            if self.browser_import.open() {
-                return crate::interaction::guarded_focus(
-                    widget::Id::new("dialog.browser-import.cancel"),
-                    Vec::new(),
-                    None,
-                )
-                .map(cosmic::Action::App);
-            }
-            if self.session_recovery.open() {
-                return self.focus_session_recovery_after_cover();
-            } else if self.daemon_health_ui.confirmation {
-                return self.focus_daemon_health_after_cover();
-            } else if self.update_ui.confirmation.is_some() {
-                Some(widget::Id::new("update.cancel"))
-            } else if self.terminal_close_dialog_visible() {
-                return self.focus_terminal_close_after_cover();
-            } else if self.settings_reset_confirm {
-                self.settings_reset_focus_confirm = false;
-                marker = Some(self.settings_reset_focus_marker());
-                same_owner.push(widget::Id::new("dialog.reset-settings.confirm"));
-                Some(widget::Id::new("dialog.reset-settings.cancel"))
-            } else if self.sidebar_state.pending_discard().is_some() {
-                Some(sidebar::discard_cancel_id())
-            } else if let Some(close) = &mut self.dirty_repository_close {
-                close.focused = DirtyCloseControl::Cancel;
-                marker = Some(dirty_close_focus_marker(close));
-                same_owner.extend([
-                    dirty_close_control_id(close.card, DirtyCloseControl::Save),
-                    dirty_close_control_id(close.card, DirtyCloseControl::Discard),
-                ]);
-                Some(dirty_close_control_id(
+        if self.reset_dialog_focus_target().as_ref() == Some(&target) {
+            marker = Some(self.settings_reset_focus_marker());
+            same_owner.extend([
+                self.reset_settings_control_id(false),
+                self.reset_settings_control_id(true),
+            ]);
+        } else if self.dirty_close_focus_target().as_ref() == Some(&target)
+            && let Some(close) = &self.dirty_repository_close
+            && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&close.card)
+        {
+            marker = Some(dirty_close_focus_marker(close));
+            same_owner.extend([
+                dirty_close_control_id(
+                    close.presentation,
                     close.card,
                     DirtyCloseControl::Cancel,
-                ))
-            } else if let Some(dialog) = &self.sidebar_selection_ui.dialog {
-                Some(dialog.focus_target())
-            } else if self.project_ui.modal_open() {
-                Some(self.project_ui.focus_target())
-            } else if self.channel_ui.modal_open() {
-                Some(channel_ui::State::focus_target())
-            } else if self.worktree_dialog.is_some() {
-                Some(worktree_dialog_focus_id())
-            } else if self.resume_ui.open {
-                Some(resume_ui::focus_id())
-            } else if self.pull_request_dialog.is_some() {
-                Some(pull_request_dialog_focus_id())
-            } else if self.context_inspector_is_overlay() {
-                Some(context_inspector_toggle_id())
-            } else {
-                self.workspace
-                    .focused()
-                    .map(|card| self.card_keyboard_focus(card))
-            }
-        };
-        crate::interaction::guarded_focus(
-            target.unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
-            same_owner,
-            marker,
-        )
-        .map(cosmic::Action::App)
+                    !runtime.is_saving(),
+                    false,
+                ),
+                dirty_close_control_id(
+                    close.presentation,
+                    close.card,
+                    DirtyCloseControl::Discard,
+                    runtime.can_abandon_unsaved_changes(),
+                    false,
+                ),
+                dirty_close_control_id(
+                    close.presentation,
+                    close.card,
+                    DirtyCloseControl::Save,
+                    runtime.can_save(),
+                    runtime.has_save_conflict(),
+                ),
+            ]);
+        }
+        // In addition to the router's current eligible target, retain the
+        // mounted presentation/phase and newer native focus witnesses.
+        crate::interaction::guarded_focus(target, same_owner, marker).map(cosmic::Action::App)
     }
 
     pub(super) fn update_device(&mut self, action: Action) -> Task<Message> {
@@ -2076,37 +2079,51 @@ mod tests {
     }
 
     #[test]
-    fn returning_to_settings_cancel_keeps_logical_and_native_focus_aligned() {
-        let mut app = super::super::tests::context_inspector_test_app(false);
-        app.settings_reset_confirm = true;
-        app.settings_reset_focus_confirm = true;
-        app.device_ui.open = true;
-        let delayed = app.update_device(Action::Close);
-        assert!(!app.device_ui.open);
-        assert!(!app.settings_reset_focus_confirm);
-        let cancel = widget::Id::new("dialog.reset-settings.cancel");
-        let confirm = widget::Id::new("dialog.reset-settings.confirm");
-        let effects = iced::widget::operation::focus(confirm)
-            .map(cosmic::Action::App)
-            .chain(delayed);
-        assert_eq!(
-            super::super::tests::focused_element(
+    fn returning_to_settings_retains_logical_and_native_choice() {
+        for confirm in [false, true] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            drop(app.update(Message::ResetSettings));
+            if !confirm {
+                drop(app.update(Message::KeyEvent {
+                    event: super::super::dialog_ui::tests::key_press(keyboard::key::Named::Tab),
+                    captured: false,
+                }));
+            }
+            assert_eq!(app.settings_reset_focus_confirm, confirm);
+            app.device_ui.open = true;
+            let delayed = app.update_device(Action::Close);
+            assert!(!app.device_ui.open);
+            assert_eq!(app.settings_reset_focus_confirm, confirm);
+            let target = app.reset_settings_control_id(confirm);
+            let other = app.reset_settings_control_id(!confirm);
+            let effects = iced::widget::operation::focus(other)
+                .map(cosmic::Action::App)
+                .chain(delayed);
+            assert_eq!(
+                super::super::tests::focused_element(
+                    cosmic::Application::dialog(&app).unwrap(),
+                    effects
+                ),
+                Some(target.clone()),
+            );
+            let action = super::super::dialog_ui::tests::enter_control(
                 cosmic::Application::dialog(&app).unwrap(),
-                effects
-            ),
-            Some(cancel.clone()),
-        );
-        let action = super::super::dialog_ui::tests::enter_control(
-            cosmic::Application::dialog(&app).unwrap(),
-            cancel,
-        );
-        assert!(matches!(action, Message::CancelResetSettings));
-        drop(app.update(action));
-        assert!(!app.settings_reset_confirm);
+                target,
+            );
+            assert!(matches!(
+                (confirm, &action),
+                (true, Message::ConfirmResetSettings) | (false, Message::CancelResetSettings)
+            ));
+            // Inspect the real primary message without executing a reset.
+            if !confirm {
+                drop(app.update(action));
+                assert!(!app.settings_reset_confirm);
+            }
+        }
     }
 
     #[test]
-    fn delayed_settings_cancel_yields_to_newer_tab_and_reopened_confirmation() {
+    fn delayed_settings_restore_yields_to_newer_tab_and_reopened_confirmation() {
         for reopen in [false, true] {
             let mut app = super::super::tests::context_inspector_test_app(false);
             drop(app.update(Message::ResetSettings));
@@ -2117,22 +2134,21 @@ mod tests {
                 drop(app.update(Message::CancelResetSettings));
                 drop(app.update(Message::ResetSettings));
                 assert_ne!(app.settings_reset_presentation, old_instance);
-                iced::widget::operation::focus(widget::Id::new("dialog.reset-settings.confirm"))
-                    .map(cosmic::Action::App)
+                dialog_ui::focus_target_task(app.reset_settings_control_id(true))
             } else {
                 app.update(Message::KeyEvent {
                     event: super::super::dialog_ui::tests::key_press(keyboard::key::Named::Tab),
                     captured: false,
                 })
             };
-            assert_eq!(app.settings_reset_focus_confirm, !reopen);
+            assert_eq!(app.settings_reset_focus_confirm, reopen);
             assert_eq!(
                 super::super::tests::focused_element(
                     cosmic::Application::dialog(&app).unwrap(),
                     newer.chain(delayed),
                 ),
-                Some(widget::Id::new("dialog.reset-settings.confirm")),
-                "old Cancel restore cannot override the newer settings owner: reopen={reopen}",
+                Some(app.reset_settings_control_id(reopen)),
+                "old restore cannot override the newer settings owner: reopen={reopen}",
             );
             assert!(app.settings_reset_confirm);
         }

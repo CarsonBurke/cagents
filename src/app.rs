@@ -24475,7 +24475,7 @@ mod tests {
     }
 
     #[test]
-    fn delayed_dirty_cancel_yields_to_newer_tab_and_reopened_confirmation() {
+    fn delayed_dirty_restore_yields_to_newer_tab_and_reopened_confirmation() {
         for reopen in [false, true] {
             let (mut app, card) = editing_repository_app();
             drop(app.begin_dirty_close(DirtyCloseIntent::Card(card), VecDeque::from([card])));
@@ -24489,11 +24489,7 @@ mod tests {
                     app.dirty_repository_close.as_ref().unwrap().presentation,
                     old_instance
                 );
-                iced::widget::operation::focus(dirty_close_control_id(
-                    card,
-                    DirtyCloseControl::Save,
-                ))
-                .map(cosmic::Action::App)
+                dialog_ui::focus_target_task(app.dirty_close_focus_target().unwrap())
             } else {
                 app.update(Message::KeyEvent {
                     event: dialog_ui::tests::key_press(keyboard::key::Named::Tab),
@@ -24501,19 +24497,14 @@ mod tests {
                 })
             };
             let current = app.dirty_repository_close.as_ref().unwrap().focused;
-            assert_eq!(current == DirtyCloseControl::Cancel, reopen);
-            let expected = if reopen {
-                DirtyCloseControl::Save
-            } else {
-                current
-            };
+            assert_eq!(current == DirtyCloseControl::Cancel, !reopen);
             assert_eq!(
                 focused_element(
                     cosmic::Application::dialog(&app).unwrap(),
                     newer.chain(delayed),
                 ),
-                Some(dirty_close_control_id(card, expected)),
-                "old Cancel restore cannot override the newer dirty-close owner: reopen={reopen}",
+                app.dirty_close_focus_target(),
+                "old restore cannot override the newer dirty-close owner: reopen={reopen}",
             );
             assert!(app.card_state(card).unwrap().existence.is_open());
         }
@@ -24521,30 +24512,28 @@ mod tests {
 
     #[test]
     fn device_close_focuses_visible_dirty_confirmation_before_retained_resume() {
-        let (mut app, card) = editing_repository_app();
-        drop(app.begin_dirty_close(DirtyCloseIntent::Card(card), VecDeque::from([card])));
-        app.dirty_repository_close.as_mut().unwrap().focused = DirtyCloseControl::Save;
-        app.resume_ui.open = true;
-        app.device_ui.open = true;
-        let task = app.update(Message::KeyEvent {
-            event: dialog_ui::tests::key_press(keyboard::key::Named::Escape),
-            captured: false,
-        });
-        assert!(!app.device_ui.open);
-        assert!(app.resume_ui.open);
-        assert!(app.dirty_repository_close.is_some());
-        assert_eq!(
-            app.dirty_repository_close.as_ref().unwrap().focused,
-            DirtyCloseControl::Cancel
-        );
-        let effects =
-            iced::widget::operation::focus(dirty_close_control_id(card, DirtyCloseControl::Save))
-                .map(cosmic::Action::App)
-                .chain(task);
-        assert_eq!(
-            focused_element(cosmic::Application::dialog(&app).unwrap(), effects),
-            Some(dirty_close_control_id(card, DirtyCloseControl::Cancel)),
-        );
+        for control in [DirtyCloseControl::Cancel, DirtyCloseControl::Save] {
+            let (mut app, card) = editing_repository_app();
+            drop(app.begin_dirty_close(DirtyCloseIntent::Card(card), VecDeque::from([card])));
+            app.dirty_repository_close.as_mut().unwrap().focused = control;
+            let expected = app.dirty_close_focus_target().unwrap();
+            app.resume_ui.open = true;
+            app.device_ui.open = true;
+            let task = app.update(Message::KeyEvent {
+                event: dialog_ui::tests::key_press(keyboard::key::Named::Escape),
+                captured: false,
+            });
+            assert!(!app.device_ui.open);
+            assert!(app.resume_ui.open);
+            assert_eq!(
+                app.dirty_repository_close.as_ref().unwrap().focused,
+                control
+            );
+            assert_eq!(
+                focused_element(cosmic::Application::dialog(&app).unwrap(), task),
+                Some(expected),
+            );
+        }
     }
 
     #[test]

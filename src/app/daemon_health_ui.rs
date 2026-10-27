@@ -227,7 +227,13 @@ impl Cagents {
         if !self.daemon_health_ui.confirmation || self.daemon_health_is_covered() {
             return None;
         }
-        let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
+        let keyboard::Event::KeyPressed {
+            key,
+            modifiers,
+            repeat,
+            ..
+        } = event
+        else {
             return None;
         };
         let keyboard::Key::Named(key) = key else {
@@ -254,6 +260,7 @@ impl Cagents {
             ));
         }
         if *key == Named::Enter
+            && !repeat
             && !captured
             && !modifiers.control()
             && !modifiers.alt()
@@ -877,6 +884,19 @@ mod tests {
             },
         ] {
             drop(app.update_daemon_health_ui(stale));
+            assert!(!app.daemon_health_ui.restarting);
+            assert!(Arc::ptr_eq(
+                app.daemon_health_ui.target.as_ref().unwrap(),
+                &target
+            ));
+        }
+        app.daemon_health_ui.focus = 1;
+        let mut repeated = key(keyboard::key::Named::Enter);
+        if let keyboard::Event::KeyPressed { repeat, .. } = &mut repeated {
+            *repeat = true;
+        }
+        for captured in [false, true] {
+            drop(app.daemon_health_key_event(&repeated, captured));
             assert!(!app.daemon_health_ui.restarting);
             assert!(Arc::ptr_eq(
                 app.daemon_health_ui.target.as_ref().unwrap(),
