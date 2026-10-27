@@ -247,6 +247,36 @@ impl Journal {
             .map_err(|error| error.to_string())
     }
 
+    /// Remove opt-in excerpts without changing attention, delivery or evidence
+    /// identities. Turning privacy back on must also cover restored notices.
+    pub fn clear_content(&mut self) -> Result<Vec<(Uuid, Target)>, String> {
+        self.0
+            .transaction::<_, diesel::result::Error, _>(|connection| {
+                let rows = notices::table
+                    .select((notices::session, notices::id, notices::event))
+                    .load::<(String, String, String)>(connection)?;
+                let mut changed = Vec::new();
+                for (target, id, serialized) in rows {
+                    let mut event = Event::from_journal(&serialized)
+                        .map_err(|_| diesel::result::Error::RollbackTransaction)?;
+                    if event.content.take().is_none() {
+                        continue;
+                    }
+                    let serialized = serde_json::to_string(&event)
+                        .map_err(|_| diesel::result::Error::RollbackTransaction)?;
+                    let id = id
+                        .parse()
+                        .map_err(|_| diesel::result::Error::RollbackTransaction)?;
+                    diesel::update(notices::table.find(target))
+                        .set(notices::event.eq(serialized))
+                        .execute(connection)?;
+                    changed.push((id, event.target));
+                }
+                Ok(changed)
+            })
+            .map_err(|error| format!("Could not clear private notification previews: {error}"))
+    }
+
     pub fn acknowledge(&mut self, id: Uuid) -> Result<Option<String>, String> {
         diesel::update(notices::table.filter(notices::id.eq(id.to_string())))
             .set((notices::acknowledged.eq(true), notices::delivered.eq(true)))
@@ -329,6 +359,52 @@ mod tests {
     };
     use rusqlite::Connection;
 
+    #[test]
+    fn disabling_previews_clears_retained_text_without_changing_acknowledgement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("notifications.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        let mut original = event(TerminalId::new(), "one");
+        original.content = Some(crate::notifications::Content {
+            conversation: "Private conversation".into(),
+            preview: "Private response".into(),
+            request: None,
+        });
+        let notice = journal.record(original, false).unwrap().unwrap();
+        journal.delivered(notice.id).unwrap();
+        journal.acknowledge(notice.id).unwrap();
+        let cleared = journal.clear_content().unwrap();
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(cleared[0].0, notice.id);
+        assert_eq!(cleared[0].1, notice.event.target);
+        assert!(journal.clear_content().unwrap().is_empty());
+        drop(journal);
+        let mut reopened = Journal::open(&path).unwrap();
+        let retained = reopened.list().unwrap();
+        assert_eq!(retained[0].id, notice.id);
+        assert!(retained[0].acknowledged && retained[0].delivered);
+        assert!(retained[0].event.content.is_none());
+    }
+
+    #[test]
+    fn acknowledgement_of_first_question_cannot_swallow_the_next_waiting_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&directory.path().join("notifications.sqlite3")).unwrap();
+        let session = TerminalId::new();
+        let mut first = event(session, "turn:waiting:1");
+        first.evidence.kind = Kind::Waiting;
+        let first = journal.record(first, false).unwrap().unwrap();
+        let mut second = event(session, "turn:waiting:2");
+        second.evidence.kind = Kind::Waiting;
+        let second = journal.record(second, false).unwrap().unwrap();
+        assert_ne!(first.id, second.id);
+        assert!(journal.acknowledge(first.id).unwrap().is_none());
+        let notices = journal.list().unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].id, second.id);
+        assert!(!notices[0].acknowledged);
+    }
+
     fn seed_owners(journal: &mut Journal) {
         let rows: Vec<_> = (1..MAX_SESSIONS)
             .map(|i| {
@@ -351,6 +427,7 @@ mod tests {
         message: crate::model::MessageId,
     ) -> Event {
         Event {
+            content: None,
             target: Target::SessionInbox(lineage),
             source_session: Some(session),
             provider: None,
@@ -744,6 +821,7 @@ mod tests {
 
     fn event(session: TerminalId, key: &str) -> Event {
         Event {
+            content: None,
             target: crate::notifications::Target::Session(session),
             source_session: Some(session),
             provider: Some(Provider::Codex),
@@ -810,6 +888,7 @@ mod tests {
             request: "request-one".into(),
         };
         let make = |request: ReviewRequest| Event {
+            content: None,
             evidence: Evidence {
                 key: request.request.clone(),
                 kind: Kind::ReviewRequested,
@@ -989,5 +1068,56 @@ mod tests {
         assert_eq!(count, KEYS_PER_SESSION);
         assert_eq!(journal.list().unwrap().len(), 1);
         assert!(journal.list().unwrap()[0].delivered);
+    }
+
+    #[test]
+    fn automation_lifecycle_replay_keeps_latest_notice_and_actor_retirement_separate() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("automation.sqlite3");
+        let id = Uuid::new_v4();
+        let make = |sequence, kind| Event {
+            target: Target::Automation { id, sequence },
+            source_session: None,
+            provider: None,
+            directory: None,
+            destination: None,
+            evidence: Evidence {
+                key: format!("automation:{id}:lifecycle:{sequence}"),
+                kind,
+            },
+            content: None,
+        };
+        let old = make(17, Kind::AutomationPaused);
+        let current = make(18, Kind::AutomationBlocked);
+        let mut journal = Journal::open(&path).unwrap();
+        let first = journal.record(old.clone(), false).unwrap().unwrap();
+        journal.acknowledge(first.id).unwrap();
+        let second = journal.record(current.clone(), false).unwrap().unwrap();
+        assert_ne!(first.id, second.id);
+        journal
+            .retire(Target::Session(TerminalId::from_uuid(id)))
+            .unwrap();
+        journal
+            .retire(Target::AgentRun(crate::model::RunId::from_uuid(id)))
+            .unwrap();
+        assert_eq!(
+            journal.list().unwrap(),
+            vec![second.clone()],
+            "actor predecessor retirement cannot own automation history"
+        );
+        journal.acknowledge(first.id).unwrap();
+        assert!(!journal.list().unwrap()[0].acknowledged);
+        drop(journal);
+        let mut reopened = Journal::open(&path).unwrap();
+        assert!(
+            reopened.record(old, false).unwrap().is_none(),
+            "older durable duplicate cannot restore its earlier target or kind"
+        );
+        assert_eq!(reopened.list().unwrap(), vec![second.clone()]);
+        reopened.acknowledge(second.id).unwrap();
+        assert!(reopened.record(current, false).unwrap().is_none());
+        let final_notice = reopened.list().unwrap().pop().unwrap();
+        assert_eq!(final_notice.id, second.id);
+        assert!(final_notice.acknowledged);
     }
 }

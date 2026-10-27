@@ -44,6 +44,7 @@ type ActionTask = iced::Task<Action>;
 
 pub mod cache;
 pub mod checkout;
+pub mod checkout_ui;
 pub mod discussion;
 pub mod discussion_ui;
 pub mod file_pages;
@@ -78,11 +79,30 @@ pub struct CheckoutTarget {
     pub repository: PathBuf,
     pub number: u64,
     pub head: crate::repository::Oid,
+    pub pull_request: Option<PullRequestKey>,
+    pub head_ref_name: String,
+    pub head_repository: Option<GitHubRepoKey>,
 }
 
 impl CheckoutTarget {
+    /// A caller without a forge identity can still request a local commit checkout.
+    pub fn read_only(repository: PathBuf, number: u64, head: crate::repository::Oid) -> Self {
+        Self {
+            repository,
+            number,
+            head,
+            pull_request: None,
+            head_ref_name: String::new(),
+            head_repository: None,
+        }
+    }
+
     pub fn suggested_branch(&self) -> String {
-        format!("pr/{}-{}", self.number, &self.head.as_str()[..8])
+        if self.head_ref_name.is_empty() {
+            format!("pr/{}", self.number)
+        } else {
+            self.head_ref_name.clone()
+        }
     }
 }
 
@@ -219,6 +239,7 @@ pub enum Action {
     },
     OpenUrl(Url),
     Checkout,
+    ExistingCheckout(checkout_ui::Action),
     DismissNotice,
 }
 
@@ -228,7 +249,8 @@ impl Action {
     pub fn allowed_while_modal(&self) -> bool {
         matches!(
             self,
-            Self::FilePage(file_pages::PageAction::Loaded { .. })
+            Self::ExistingCheckout(checkout_ui::Action::Finished { .. })
+                | Self::FilePage(file_pages::PageAction::Loaded { .. })
                 | Self::Loaded { .. }
                 | Self::ListLoaded { .. }
                 | Self::TargetLoaded { .. }
@@ -257,6 +279,7 @@ pub enum Effect {
     PreviousChange,
     OpenUrl(Url),
     Checkout(CheckoutTarget),
+    OpenCheckout(PathBuf),
     /// Which pull request is under review changed; `None` after `Close`.
     SelectionChanged(Option<u64>),
     /// A discussion of the whole file opened above the first diff row, so
@@ -383,6 +406,7 @@ impl ReviewSource {
 pub struct State {
     unavailable_reason: Option<String>,
     discussion: discussion_ui::DiscussionState,
+    existing_checkout: checkout_ui::Confirmation,
     parked_discussions: Vec<(ReviewTarget, discussion_ui::DiscussionState)>,
     api: Arc<dyn GitHubReviewApi>,
     cache: Option<Arc<dyn cache::Store>>,
@@ -585,6 +609,7 @@ impl State {
         Self {
             unavailable_reason: None,
             discussion: discussion_ui::DiscussionState::default(),
+            existing_checkout: checkout_ui::Confirmation::default(),
             parked_discussions: Vec::new(),
             api,
             cache: None,
@@ -675,6 +700,14 @@ impl State {
 
     pub fn list(&self) -> &ListState {
         &self.list
+    }
+
+    pub fn selection_generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn report_checkout_error(&mut self, error: String) {
+        self.notice = Some(format!("Could not prepare PR checkout. {error}"));
     }
 
     pub fn target(&self) -> Option<&ReviewTarget> {
@@ -947,6 +980,9 @@ impl State {
                 self.refreshing = false;
                 match result {
                     Ok(loaded) => {
+                        if let Some(target) = &self.target {
+                            crate::github::polling::succeeded(&target.repository.host);
+                        }
                         self.adopt(&loaded);
                         return self.load_discussion();
                     }
@@ -974,6 +1010,9 @@ impl State {
                     return self.load_list();
                 }
                 if !self.refreshing
+                    && self.target.as_ref().is_some_and(|target| {
+                        crate::github::polling::ready(&target.repository.host, false)
+                    })
                     && self.last_refresh.is_some_and(|last| {
                         now.saturating_duration_since(last) >= Duration::from_secs(30)
                     })
@@ -1101,6 +1140,7 @@ impl State {
             }
             Action::Checkout => {
                 if !self.refreshing
+                    && !self.existing_checkout.busy()
                     && let (Some(target), Some(context), Some(range)) =
                         (&self.target, &self.context, &self.range)
                     && context.head_oid == range.head.as_str()
@@ -1109,10 +1149,20 @@ impl State {
                         repository: target.worktree.clone(),
                         number: target.pull_request.number,
                         head: range.head.clone(),
+                        pull_request: Some(
+                            PullRequestKey::new(
+                                target.repository.clone(),
+                                target.pull_request.number,
+                            )
+                            .expect("validated PR identity"),
+                        ),
+                        head_ref_name: target.pull_request.head_ref_name.clone(),
+                        head_repository: target.pull_request.head_repository_key(),
                     }));
                 }
                 ActionTask::none()
             }
+            Action::ExistingCheckout(action) => self.update_existing_checkout(action),
             Action::DismissNotice => {
                 self.notice = None;
                 ActionTask::none()
@@ -1175,6 +1225,13 @@ impl State {
             return ActionTask::none();
         };
         if !crate::github::polling::ready(&source.repository.host, true) {
+            let message = crate::github::polling::rate_limit(&source.repository.host)
+                .map(|limit| limit.to_string())
+                .unwrap_or_else(|| "GitHub refresh is paused. Try again shortly.".into());
+            if !matches!(self.list, ListState::Ready(_)) {
+                self.list = ListState::Failed(message.clone());
+            }
+            self.list_error = Some(message);
             return ActionTask::none();
         }
         self.list_cancellation.cancel();
@@ -1320,6 +1377,7 @@ impl State {
     }
 
     fn reset_target(&mut self) {
+        self.existing_checkout.reset();
         self.cache_loading = false;
         self.cache_dirty = false;
         self.cached_viewer = None;
@@ -1357,7 +1415,12 @@ impl State {
     }
 
     fn refresh(&mut self) -> ActionTask {
-        if self.target.is_none() {
+        let Some(target) = &self.target else {
+            return ActionTask::none();
+        };
+        if !crate::github::polling::ready(&target.repository.host, true) {
+            self.notice = crate::github::polling::rate_limit(&target.repository.host)
+                .map(|limit| limit.to_string());
             return ActionTask::none();
         }
         match self.load {
@@ -1776,10 +1839,14 @@ impl State {
         .center(Length::Fixed(ROW_ICON_WIDTH))
         .into();
         let controls = crate::ui_controls::toolbar_actions(vec![
-            icon_button(Icon::Branch, "Create worktree from reviewed commit")
+            icon_button(Icon::Branch, "Check out pull request")
                 .on_press_maybe(
-                    (!modal_open && !busy && self.context.is_some() && self.range.is_some())
-                        .then(|| self.fenced(Action::Checkout)),
+                    (!modal_open
+                        && !busy
+                        && !self.existing_checkout.busy()
+                        && self.context.is_some()
+                        && self.range.is_some())
+                    .then(|| self.fenced(Action::Checkout)),
                 )
                 .into(),
             icon_button(
@@ -1876,6 +1943,9 @@ impl State {
             })
             .into(),
         );
+        if let Some(confirmation) = self.existing_checkout_view(modal_open) {
+            rows.push(confirmation);
+        }
         widget::column::with_children(rows)
             .spacing(space::XS)
             .padding(Padding::from([space::M, space::M]))
@@ -2298,6 +2368,21 @@ impl State {
         self.unavailable_reason = reason;
     }
 
+    fn browser_query_status(&self) -> &'static str {
+        let query = self.browser_query.trim();
+        if self.list_loaded_query.as_deref() != Some(query) {
+            if query.is_empty() {
+                " · refresh pending"
+            } else {
+                " · search pending"
+            }
+        } else if query.is_empty() {
+            ""
+        } else {
+            " · repository search"
+        }
+    }
+
     pub fn browser<'a>(&'a self, modal_open: bool) -> Element<'a, Action> {
         if self.source.is_none() {
             return widget::container(
@@ -2491,11 +2576,7 @@ impl State {
                     ListState::Ready(rows) => rows.len(),
                     _ => 0,
                 },
-                if self.browser_query.trim().is_empty() {
-                    ""
-                } else {
-                    " · repository search"
-                }
+                self.browser_query_status()
             ))
             .into(),
             widget::container(widget::column::with_children(
@@ -3182,6 +3263,51 @@ pub(crate) mod tests {
     use crate::github::{PullRequestFile, RemoteValue};
     use crate::repository::ValidatedRefName;
 
+    #[test]
+    fn summary_title_ellipsis_preserves_ordinary_word_wrap_geometry() {
+        use cosmic::iced::advanced::graphics::text::cosmic_text::{
+            Attrs, AttrsList, Ellipsize, EllipsizeHeightLimit, Family, FontSystem, Hinting,
+            ShapeBuffer, ShapeLine, Shaping, Wrap, fontdb,
+        };
+
+        // Exercise the text engine reexported by the UI, so removing or
+        // bypassing the temporary dependency patch also fails an app test.
+        let mut db = fontdb::Database::new();
+        db.load_font_data(
+            include_bytes!("../vendor/libcosmic/res/open-sans/OpenSans-Regular.ttf").to_vec(),
+        );
+        let mut fonts = FontSystem::new_with_locale_and_db("en-US".into(), db);
+        let text = "Pack my box with five dozen liquor jugs. Sphinx of black quartz, judge my vow.";
+        let attrs = AttrsList::new(&Attrs::new().family(Family::Name("Open Sans")));
+        let shaped = ShapeLine::new(&mut fonts, text, &attrs, Shaping::Advanced, 8);
+        let layout = |ellipsize| {
+            let mut lines = Vec::new();
+            shaped.layout_to_buffer(
+                &mut ShapeBuffer::default(),
+                18.0,
+                Some(110.0),
+                Wrap::WordOrGlyph,
+                ellipsize,
+                None,
+                &mut lines,
+                None,
+                Hinting::Disabled,
+            );
+            lines
+        };
+        let ordinary = layout(Ellipsize::None);
+        let limited = layout(Ellipsize::End(EllipsizeHeightLimit::Lines(
+            SUMMARY_TITLE_LINES,
+        )));
+        assert!(ordinary.len() > SUMMARY_TITLE_LINES);
+        assert_eq!(limited.len(), SUMMARY_TITLE_LINES);
+        let expected = &ordinary[SUMMARY_TITLE_LINES - 1].glyphs[0];
+        let actual = &limited[SUMMARY_TITLE_LINES - 1].glyphs[0];
+        assert_eq!(actual.start, expected.start);
+        assert_eq!(actual.x, expected.x);
+        assert!(!text[actual.start..actual.end].starts_with(' '));
+    }
+
     fn path(value: &str) -> RepoPath {
         RepoPath::parse(value).unwrap()
     }
@@ -3494,6 +3620,101 @@ pub(crate) mod tests {
         }));
         assert!(state.listed_target(1).is_none());
         assert!(state.listed_target(2).is_some());
+    }
+
+    #[test]
+    fn selected_review_refresh_obeys_shared_server_and_transient_backoff() {
+        for (host, error, manual_allowed) in [
+            (
+                "review-server-limit.invalid",
+                crate::github::GitHubError::RateLimited {
+                    limit: crate::github::polling::RateLimit {
+                        retry_at: crate::github::polling::now() + 120,
+                    },
+                },
+                false,
+            ),
+            (
+                "review-transient-backoff.invalid",
+                crate::github::GitHubError::Inspection("offline".into()),
+                true,
+            ),
+        ] {
+            let (mut state, _) = state();
+            let mut selected = target(1);
+            selected.repository = GitHubRepoKey::new(host, None, "o", "r").unwrap();
+            state.target = Some(selected);
+            state.load = LoadState::Ready;
+            state.last_refresh = Some(Instant::now() - Duration::from_secs(31));
+            let before = state.load_generation;
+            crate::github::polling::failed(host, &error);
+
+            drop(state.update(Action::RefreshIfDue(Instant::now())));
+            assert_eq!(state.load_generation, before, "{host}");
+            assert!(!state.refreshing, "{host}");
+            assert_eq!(state.load, LoadState::Ready);
+
+            drop(state.update(Action::Refresh));
+            assert_eq!(
+                state.load_generation,
+                before + u64::from(manual_allowed),
+                "{host}"
+            );
+            assert_eq!(state.refreshing, manual_allowed, "{host}");
+            assert_eq!(state.load, LoadState::Ready);
+            assert!(state.target.is_some());
+            if !manual_allowed {
+                assert!(state.notice.as_deref().unwrap().contains("Retrying at"));
+            }
+
+            // A successful in-flight load clears transient failures, while a
+            // server deadline learned by another poller remains authoritative.
+            finish_load(&mut state, loaded(vec![], vec![]));
+            assert_eq!(crate::github::polling::ready(host, false), manual_allowed);
+            assert!(!state.refreshing);
+        }
+    }
+
+    #[test]
+    fn blocked_repository_search_keeps_rows_and_reports_its_pending_query() {
+        let (mut state, _) = state();
+        let repository =
+            GitHubRepoKey::new("browser-server-limit.invalid", None, "o", "r").unwrap();
+        state.source = Some(ReviewSource {
+            repository: repository.clone(),
+            worktree: "/repo".into(),
+        });
+        state.list = ListState::Ready(vec![Arc::new(pull_request(1))]);
+        state.list_loaded_query = Some(String::new());
+        let before = state.list_generation;
+        crate::github::polling::failed(
+            &repository.host,
+            &crate::github::GitHubError::RateLimited {
+                limit: crate::github::polling::RateLimit {
+                    retry_at: crate::github::polling::now() + 120,
+                },
+            },
+        );
+
+        drop(state.update(Action::BrowserQuery("needle".into())));
+        drop(state.update(Action::BrowserSearch("needle".into())));
+        assert_eq!(state.list_generation, before + 1);
+        assert!(!state.list_loading);
+        assert!(
+            matches!(&state.list, ListState::Ready(rows) if rows.len() == 1 && rows[0].number == 1)
+        );
+        assert_eq!(state.list_loaded_query.as_deref(), Some(""));
+        assert_eq!(state.browser_query_status(), " · search pending");
+        assert!(state.list_error.as_deref().unwrap().contains("Retrying at"));
+
+        // The same budget must give an unopened browser a truthful error,
+        // rather than a spinner for a request it did not start.
+        let (mut unopened, _) = self::state();
+        drop(unopened.set_source(state.source.clone()));
+        assert!(!unopened.list_loading);
+        assert!(
+            matches!(&unopened.list, ListState::Failed(message) if message.contains("Retrying at"))
+        );
     }
 
     #[test]
@@ -4036,7 +4257,7 @@ pub(crate) mod tests {
         };
         assert_eq!(target.repository, PathBuf::from("/repo"));
         assert_eq!(target.head.as_str(), "a".repeat(40));
-        assert_eq!(target.suggested_branch(), "pr/1-aaaaaaaa");
+        assert_eq!(target.suggested_branch(), "feature");
         state.context = None;
         drop(state.update(Action::Checkout));
         assert!(state.take_effects().is_empty());

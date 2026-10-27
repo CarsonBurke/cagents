@@ -122,6 +122,8 @@ impl State {
             return ActionTask::none();
         };
         if !crate::github::polling::ready(&target.repository.host, true) {
+            self.error = crate::github::polling::rate_limit(&target.repository.host)
+                .map(|limit| limit.to_string());
             return ActionTask::none();
         }
         self.cancellation.cancel();
@@ -1387,6 +1389,36 @@ mod tests {
         assert_eq!(state.filter, "keep");
         assert!(!state.description.is_empty());
         crate::github::polling::succeeded(host);
+    }
+
+    #[test]
+    fn a_server_limited_inspector_explains_its_wait_without_discarding_content() {
+        let host = "inspector-server-limit.invalid";
+        let mut selected = target();
+        selected.repository = GitHubRepoKey::new(host, None, "owner", "repo").unwrap();
+        crate::github::polling::failed(
+            host,
+            &crate::github::GitHubError::RateLimited {
+                limit: crate::github::polling::RateLimit {
+                    retry_at: crate::github::polling::now() + 120,
+                },
+            },
+        );
+        let mut state = State::default();
+        drop(state.synchronize(Some(selected), None));
+        assert!(!state.loading);
+        assert!(state.error.as_deref().unwrap().contains("Retrying at"));
+        state.loaded = true;
+        state.filter = "keep".into();
+        state.description = markdown::parse("Loaded content").collect();
+        let before = state.generation;
+        drop(state.update(Action::Refresh));
+        assert_eq!(state.generation, before);
+        assert!(!state.loading);
+        assert!(state.loaded);
+        assert_eq!(state.filter, "keep");
+        assert!(!state.description.is_empty());
+        assert!(state.error.as_deref().unwrap().contains("Retrying at"));
     }
 
     #[test]

@@ -24,11 +24,17 @@ use crate::repository::{
 
 #[cfg(feature = "ui")]
 pub mod avatar;
-pub mod review_requests;
+pub mod checkout;
 pub mod polling;
 pub mod review_actions;
+pub mod review_requests;
 
 const PR_LIST_FIELDS: &str = "id,number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,statusCheckRollup";
+/// The Work board's view of the user's own pull requests: identity and state
+/// only. Check rollups are the expensive part of a listing (a hundred of them
+/// can time out GitHub's GraphQL), so they are read for open ones alone.
+const PR_AUTHORED_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,updatedAt,url";
+const PR_AUTHORED_REVIEW_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,updatedAt,url,reviewDecision,statusCheckRollup";
 const PR_VIEW_FIELDS: &str = "id,number,title,body,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,createdAt,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,additions,deletions,changedFiles,statusCheckRollup";
 /// The fields every review comment carries, whichever query returns it.
 const REVIEW_COMMENT_FIELDS: &str = "id author{login} body createdAt url viewerDidAuthor viewerCanUpdate viewerCanDelete commentState:state";
@@ -660,6 +666,16 @@ impl PullRequestStateFilter {
     }
 }
 
+/// The signed-in user's pull requests, most recently updated first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoredPullRequestsRequest {
+    pub repository: GitHubRepoKey,
+    pub state: PullRequestStateFilter,
+    pub limit: u16,
+    /// Also read review decisions and check rollups.
+    pub review: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListPullRequestsRequest {
     pub repository: GitHubRepoKey,
@@ -1174,7 +1190,9 @@ pub trait GitHubReviewApi: Send + Sync {
         _cursor: Option<&str>,
         _cancellation: &CancellationToken,
     ) -> Result<PullRequestPage, GitHubError> {
-        Err(GitHubError::Inspection("Repository search is unavailable".into()))
+        Err(GitHubError::Inspection(
+            "Repository search is unavailable".into(),
+        ))
     }
 
     fn pull_request_page(
@@ -1253,8 +1271,25 @@ impl GitHubError {
     pub fn rate_limit(&self) -> Option<polling::RateLimit> {
         match self {
             Self::RateLimited { limit } => Some(limit.clone()),
-            Self::InvalidResponse { source, process } => source.rate_limit().or_else(|| polling::RateLimit::classify(&format!("{}\n{}", String::from_utf8_lossy(&process.stdout), String::from_utf8_lossy(&process.stderr)), polling::now())),
-            Self::Process(failure) => polling::RateLimit::classify(&format!("{}\n{}\n{}", failure.message, String::from_utf8_lossy(&failure.stdout), String::from_utf8_lossy(&failure.stderr)), polling::now()),
+            Self::InvalidResponse { source, process } => source.rate_limit().or_else(|| {
+                polling::RateLimit::classify(
+                    &format!(
+                        "{}\n{}",
+                        String::from_utf8_lossy(&process.stdout),
+                        String::from_utf8_lossy(&process.stderr)
+                    ),
+                    polling::now(),
+                )
+            }),
+            Self::Process(failure) => polling::RateLimit::classify(
+                &format!(
+                    "{}\n{}\n{}",
+                    failure.message,
+                    String::from_utf8_lossy(&failure.stdout),
+                    String::from_utf8_lossy(&failure.stderr)
+                ),
+                polling::now(),
+            ),
             _ => polling::RateLimit::classify(&self.to_string(), polling::now()),
         }
     }
@@ -1280,7 +1315,9 @@ pub enum GitHubAvailability {
         pull_requests: Vec<(PullRequest, Vec<PullRequestCheck>)>,
         refreshed_at: i64,
     },
-    RateLimited { limit: polling::RateLimit },
+    RateLimited {
+        limit: polling::RateLimit,
+    },
     Failed {
         detail: String,
     },
@@ -1326,7 +1363,9 @@ impl GitHubAvailability {
     }
 
     pub fn from_error(error: GitHubError) -> Self {
-        if let Some(limit) = error.rate_limit() { return Self::RateLimited { limit }; }
+        if let Some(limit) = error.rate_limit() {
+            return Self::RateLimited { limit };
+        }
         match error {
             GitHubError::UnsupportedAuthStatus { .. } => Self::UnsupportedCli,
             GitHubError::Process(failure) if failure.kind == ProcessFailureKind::Spawn => {
@@ -1503,6 +1542,30 @@ impl<E: ProcessExecutor> GitHubService<E> {
         ])
     }
 
+    pub fn list_authored_command(&self, request: &AuthoredPullRequestsRequest) -> CommandSpec {
+        self.gh_command([
+            OsString::from("pr"),
+            OsString::from("list"),
+            OsString::from("-R"),
+            request.repository.gh_selector().into(),
+            OsString::from("--author"),
+            OsString::from("@me"),
+            OsString::from("--state"),
+            request.state.as_str().into(),
+            OsString::from("--search"),
+            OsString::from("sort:updated-desc"),
+            OsString::from("--limit"),
+            request.limit.clamp(1, 200).to_string().into(),
+            OsString::from("--json"),
+            if request.review {
+                PR_AUTHORED_REVIEW_FIELDS
+            } else {
+                PR_AUTHORED_FIELDS
+            }
+            .into(),
+        ])
+    }
+
     pub fn view_command(&self, key: &PullRequestKey) -> CommandSpec {
         self.gh_command([
             OsString::from("pr"),
@@ -1623,13 +1686,50 @@ impl<E: ProcessExecutor> GitHubService<E> {
         )
     }
 
+    pub fn list_authored(
+        &self,
+        request: &AuthoredPullRequestsRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<PullRequest>, GitHubError> {
+        let command = self.list_authored_command(request);
+        let output = self.run_checked(&command, &request.repository, cancellation)?;
+        attach_process(
+            parse_pull_request_list(&output.stdout, &request.repository),
+            &output,
+        )
+    }
+
     pub fn view(
         &self,
         key: &PullRequestKey,
         cancellation: &CancellationToken,
     ) -> Result<PullRequest, GitHubError> {
+        self.view_with_budget(key, cancellation, None)
+    }
+
+    /// A targeted read can use a smaller process budget without changing the
+    /// defaults of unrelated GitHub operations. Cancellation also bounds its
+    /// wait for the shared process permit.
+    pub fn view_with_timeout(
+        &self,
+        key: &PullRequestKey,
+        cancellation: &CancellationToken,
+        timeout: Duration,
+    ) -> Result<PullRequest, GitHubError> {
+        self.view_with_budget(key, cancellation, Some(timeout))
+    }
+
+    fn view_with_budget(
+        &self,
+        key: &PullRequestKey,
+        cancellation: &CancellationToken,
+        timeout: Option<Duration>,
+    ) -> Result<PullRequest, GitHubError> {
         key.validate()?;
-        let command = self.view_command(key);
+        let mut command = self.view_command(key);
+        if let Some(timeout) = timeout {
+            command = command.timeout(timeout);
+        }
         let output = self.run_checked(&command, &key.repository, cancellation)?;
         let pull_request =
             attach_process(parse_pull_request(&output.stdout, &key.repository), &output)?;
@@ -1795,7 +1895,9 @@ impl<E: ProcessExecutor> GitHubService<E> {
         let command = self.graphql_command(repository, query, variables);
         let output = self.run_checked(&command, repository, cancellation)?;
         let result = attach_process(parse_graphql(&output.stdout), &output);
-        if let Err(error) = &result { polling::failed(&repository.host, error); }
+        if let Err(error) = &result {
+            polling::failed(&repository.host, error);
+        }
         result
     }
 
@@ -2098,9 +2200,13 @@ impl<E: ProcessExecutor> GitHubService<E> {
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, GitHubError> {
         repository.validate()?;
-        let result = self.execute(command, cancellation).map_err(GitHubError::from)
+        let result = self
+            .execute(command, cancellation)
+            .map_err(GitHubError::from)
             .and_then(|output| self.checked_output(output, repository));
-        if let Err(error) = &result { polling::failed(&repository.host, error); }
+        if let Err(error) = &result {
+            polling::failed(&repository.host, error);
+        }
         result
     }
 
@@ -2109,7 +2215,16 @@ impl<E: ProcessExecutor> GitHubService<E> {
         output: ProcessOutput,
         repository: &GitHubRepoKey,
     ) -> Result<ProcessOutput, GitHubError> {
-        if !output.success && let Some(limit) = polling::RateLimit::classify(&format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr)), polling::now()) {
+        if !output.success
+            && let Some(limit) = polling::RateLimit::classify(
+                &format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+                polling::now(),
+            )
+        {
             return Err(GitHubError::RateLimited { limit });
         }
         if output.success {
@@ -2889,8 +3004,8 @@ pub fn pull_request_number(
         .ok_or_else(|| GitHubValidationError::InvalidPullRequestUrl(url.to_string()))?
         .collect();
     if segments.len() != 4
-        || segments[0] != repository.owner
-        || segments[1] != repository.name
+        || !segments[0].eq_ignore_ascii_case(&repository.owner)
+        || !segments[1].eq_ignore_ascii_case(&repository.name)
         || segments[2] != "pull"
     {
         return Err(GitHubValidationError::InvalidPullRequestUrl(
@@ -2950,7 +3065,13 @@ fn decode_value<T: DeserializeOwned>(value: &serde_json::Value) -> Result<T, Git
 
 fn parse_graphql(output: &[u8]) -> Result<serde_json::Value, GitHubError> {
     let mut envelope: serde_json::Value = parse_json(output)?;
-    if let Some(limit) = polling::RateLimit::classify(&envelope.get("errors").map(ToString::to_string).unwrap_or_default(), polling::now()) {
+    if let Some(limit) = polling::RateLimit::classify(
+        &envelope
+            .get("errors")
+            .map(ToString::to_string)
+            .unwrap_or_default(),
+        polling::now(),
+    ) {
         return Err(GitHubError::RateLimited { limit });
     }
     if let Some(errors) = envelope.get("errors").and_then(serde_json::Value::as_array)
@@ -3285,6 +3406,49 @@ mod tests {
 
     fn repository() -> GitHubRepoKey {
         GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap()
+    }
+
+    #[test]
+    fn authored_listing_asks_for_rollups_only_when_reviews_are_wanted() {
+        let service = GitHubService::new("gh", Arc::new(FakeExecutor::default()));
+        let arguments = |review| {
+            service
+                .list_authored_command(&AuthoredPullRequestsRequest {
+                    repository: repository(),
+                    state: PullRequestStateFilter::All,
+                    limit: 500,
+                    review,
+                })
+                .arguments
+                .into_iter()
+                .map(|argument| argument.into_string().unwrap())
+                .collect::<Vec<_>>()
+        };
+        let cheap = arguments(false);
+        assert_eq!(
+            cheap[..12],
+            [
+                "pr",
+                "list",
+                "-R",
+                "github.com/owner/repo",
+                "--author",
+                "@me",
+                "--state",
+                "all",
+                "--search",
+                "sort:updated-desc",
+                "--limit",
+                "200"
+            ]
+        );
+        assert!(!cheap.last().unwrap().contains("statusCheckRollup"));
+        assert!(
+            arguments(true)
+                .last()
+                .unwrap()
+                .contains("statusCheckRollup")
+        );
     }
 
     #[test]
@@ -3739,25 +3903,25 @@ mod tests {
             "remote",
             "add",
             "origin",
-            "https://github.com/CarsonBurke/cleanrl.git",
+            "https://github.com/ExampleContributor/example-project.git",
         ]);
         git(&[
             "remote",
             "add",
             "upstream",
-            "https://github.com/vwxyzjn/cleanrl.git",
+            "https://github.com/ExampleUpstream/example-project.git",
         ]);
         git(&["config", "branch.Feature/Case.remote", "upstream"]);
         git(&["config", "branch.Feature/Case.pushRemote", "origin"]);
         git(&[
             "config",
             "remote.origin.pushurl",
-            "git@github.com:ActualPublisher/cleanrl.git",
+            "git@github.com:ActualPublisher/example-project.git",
         ]);
         let key = worktree_head_repository(temp.path(), "Feature/Case", &CancellationToken::new())
             .unwrap();
         assert_eq!(key.owner, "ActualPublisher");
-        assert_eq!(key.name, "cleanrl");
+        assert_eq!(key.name, "example-project");
         git(&["config", "branch.Feature/Case.pushRemote", "unknown"]);
         assert!(
             worktree_head_repository(temp.path(), "Feature/Case", &CancellationToken::new())
@@ -4447,3 +4611,6 @@ mod tests {
         assert!(argument_strings(&commands[0]).contains(&"path=src/lib.rs".to_owned()));
     }
 }
+
+#[cfg(test)]
+mod channel_work_tests;

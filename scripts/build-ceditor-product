@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""Build one ceditor product lane and print its Cargo-reported executable path."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+
+def main():
+    if len(sys.argv) < 3:
+        sys.exit("usage: build-ceditor-product NAME CARGO_BUILD_ARGUMENTS...")
+    name = sys.argv[1]
+    products = []
+    command = ["cargo", "build", *sys.argv[2:], "--message-format=json-render-diagnostics"]
+    with subprocess.Popen(command, stdout=subprocess.PIPE, encoding="utf-8") as child:
+        for line in child.stdout:
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                # Preserve unexpected build output without mixing it into the path.
+                sys.stderr.write(line)
+                continue
+            if message.get("reason") == "compiler-message":
+                sys.stderr.write(message.get("message", {}).get("rendered") or "")
+            target = message.get("target", {})
+            if (message.get("reason") == "compiler-artifact"
+                    and target.get("name") == name
+                    and "bin" in target.get("kind", [])
+                    and message.get("executable") is not None):
+                products.append(message["executable"])
+        status = child.wait()
+    if status:
+        return status if status > 0 else 128 - status
+    if len(products) != 1:
+        sys.exit(f"Cargo did not report exactly one executable for {name} (found {len(products)})")
+    product = products[0]
+    if not isinstance(product, str) or not os.path.isabs(product):
+        sys.exit(f"Cargo reported an invalid executable path for {name}")
+    if not Path(product).is_file() or not os.access(product, os.X_OK):
+        sys.exit(f"Cargo executable for {name} is missing or not runnable: {product}")
+    print(product)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except OSError as error:
+        sys.exit(f"Could not build ceditor product: {error}")

@@ -308,7 +308,10 @@ pub fn open(text: &str, verify: impl FnOnce(&str, &str) -> bool) -> Option<Opene
     })
 }
 
-/// The daemon's key for sealing frames. It never leaves the daemon.
+/// The daemon-side signer for courier frames. Retained actors receive only a
+/// recognizer API, through authenticated private bootstrap. That recognizer
+/// still holds the registry-wide symmetric MAC material: matched helper code is
+/// inside the daemon's trusted realm, and this is not compromise containment.
 #[cfg(feature = "host")]
 pub(crate) struct Seal([u8; 32]);
 
@@ -323,6 +326,10 @@ impl std::fmt::Debug for Seal {
 impl Seal {
     pub(crate) fn new(key: [u8; 32]) -> Self {
         Self(key)
+    }
+
+    pub(crate) fn recognizer(&self) -> Recognizer {
+        Recognizer(self.0)
     }
 
     /// A truncated HMAC-SHA-256: 128 bits are far beyond what forging one
@@ -343,6 +350,49 @@ impl Seal {
         let framed = frame(message, now);
         let tag = self.tag(&framed);
         format!("{framed}{SEAL}{tag}]")
+    }
+}
+
+/// Recognition authority used by a Store; it exposes no frame-signing method.
+/// HMAC verification remains symmetric, so a compromised holder of this value
+/// could recover the shared signing material. Providers never receive it.
+#[cfg(feature = "host")]
+#[derive(Clone)]
+pub(crate) struct Recognizer([u8; 32]);
+
+#[cfg(feature = "host")]
+impl std::fmt::Debug for Recognizer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Recognizer(<redacted>)")
+    }
+}
+
+/// Serialized only on the inherited, authenticated retained-owner startup
+/// channel. Never store in discovery, process environment, journals or logs.
+#[cfg(feature = "host")]
+#[derive(Serialize, Deserialize)]
+pub(crate) struct RetainedRecognition([u8; 32]);
+
+#[cfg(feature = "host")]
+impl std::fmt::Debug for RetainedRecognition {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RetainedRecognition(<redacted>)")
+    }
+}
+
+#[cfg(feature = "host")]
+impl RetainedRecognition {
+    pub(crate) fn into_recognizer(self) -> Recognizer {
+        Recognizer(self.0)
+    }
+}
+
+#[cfg(feature = "host")]
+impl Recognizer {
+    /// Explicitly delegate recognition to the trusted retained actor, never to
+    /// its provider. This is a typed API restriction, not asymmetric crypto.
+    pub(crate) fn delegate_to_retained_owner(&self) -> RetainedRecognition {
+        RetainedRecognition(self.0)
     }
 
     pub(crate) fn open(&self, text: &str) -> Option<Opened> {
@@ -453,7 +503,7 @@ mod tests {
         let seal = Seal::new([7; 32]);
         let mut message = message();
         let sealed = seal.seal(&message, 0);
-        let opened = seal.open(&sealed).unwrap();
+        let opened = seal.recognizer().open(&sealed).unwrap();
         assert_eq!(opened.from, "Fix login bug");
         assert_eq!(opened.sender, short(message.from.session.unwrap()));
         assert_eq!(
@@ -462,27 +512,31 @@ mod tests {
         );
         assert_eq!(opened.summary, "");
         // A provider that echoes the prompt with a final newline still matches.
-        assert!(seal.open(&format!("{sealed}\n")).is_some());
+        assert!(seal.recognizer().open(&format!("{sealed}\n")).is_some());
 
         // Another daemon's seal, an edited body, and an unsealed lookalike do not.
-        assert!(Seal::new([8; 32]).open(&sealed).is_none());
-        assert!(seal.open(&sealed.replace("Hold off", "Go ahead")).is_none());
-        assert!(seal.open(&frame(&message, 0)).is_none());
+        assert!(Seal::new([8; 32]).recognizer().open(&sealed).is_none());
+        assert!(
+            seal.recognizer()
+                .open(&sealed.replace("Hold off", "Go ahead"))
+                .is_none()
+        );
+        assert!(seal.recognizer().open(&frame(&message, 0)).is_none());
 
         // A title that reads like a reply's tail is still only a title.
         message.from.title = Some("Fix to your message 1234abcd".into());
-        let opened = seal.open(&seal.seal(&message, 0)).unwrap();
+        let opened = seal.recognizer().open(&seal.seal(&message, 0)).unwrap();
         assert_eq!(opened.from, "Fix to your message 1234abcd");
         assert_eq!(opened.summary, "");
 
         message.wait_until_ms = Some(1);
-        let opened = seal.open(&seal.seal(&message, 0)).unwrap();
+        let opened = seal.recognizer().open(&seal.seal(&message, 0)).unwrap();
         assert_eq!(opened.summary, "Asks for a reply");
 
         message.reply_to = Some(MessageId::new());
         message.wait_until_ms = Some(1);
         message.from = Party::user();
-        let opened = seal.open(&seal.seal(&message, 0)).unwrap();
+        let opened = seal.recognizer().open(&seal.seal(&message, 0)).unwrap();
         assert_eq!(opened.from, "you");
         assert_eq!(opened.sender, "");
         assert_eq!(
@@ -496,7 +550,7 @@ mod tests {
             session: Some(TerminalId::new()),
             title: None,
         };
-        let opened = seal.open(&seal.seal(&message, 0)).unwrap();
+        let opened = seal.recognizer().open(&seal.seal(&message, 0)).unwrap();
         assert_eq!(
             opened.from,
             format!("agent {}", short(message.from.session.unwrap()))
@@ -522,14 +576,14 @@ mod tests {
             at: None,
         };
         let mut prompt = item(Role::User, &text);
-        seal.recognize(&mut prompt);
+        seal.recognizer().recognize(&mut prompt);
         assert!(matches!(
             prompt.content,
             ItemContent::Delivery { kind: DeliveryKind::Message, ref from, .. } if from == "Fix login bug"
         ));
         // The agent quoting a message is not the message arriving again.
         let mut quoted = item(Role::Assistant, &text);
-        seal.recognize(&mut quoted);
+        seal.recognizer().recognize(&mut quoted);
         assert!(matches!(quoted.content, ItemContent::Text { .. }));
     }
 
