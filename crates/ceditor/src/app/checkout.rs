@@ -474,7 +474,18 @@ impl Editor {
             if !self.checkout_owners.is_empty() {
                 rows.push(widget::text::title4("Retained creation ownership").into());
                 for (id, retained) in &self.checkout_owners {
-                    rows.push(widget::text::body(format!("Creation {id}")).into());
+                    let description = retained
+                        .as_ref()
+                        .and_then(|retained| retained.report.request.as_ref())
+                        .map(|request| {
+                            format!(
+                                "{} · {}",
+                                request.branch.as_str(),
+                                request.destination.display()
+                            )
+                        })
+                        .unwrap_or_else(|| format!("Creation {id}"));
+                    rows.push(widget::text::body(description).into());
                     if let Some(retained) = retained {
                         rows.push(design::caption(&retained.report.detail).into());
                         if let Some(owner) = retained.retention() {
@@ -630,7 +641,7 @@ mod tests {
     use super::super::tests::{editor, git, git_fixture, open_real_git, run_tasks, sidebar_action};
     use super::*;
 
-    fn click_retained_checkout(app: &Editor, label: &str) -> Message {
+    fn click_retained_checkout(app: &Editor, label: &str, expected_description: &str) -> Message {
         use iced::advanced::{Layout, Shell, layout, mouse, renderer::Headless, widget::Tree};
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let renderer = runtime.block_on(<cosmic::Renderer as Headless>::new(iced::Font::DEFAULT, iced::Pixels::from(16), Some("tiny-skia"))).unwrap();
@@ -640,6 +651,10 @@ mod tests {
         let node = view.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(iced::Size::ZERO, viewport.size()));
         let point = {
             let accessible = view.as_widget().a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+            assert!(
+                accessible.root().iter().chain(accessible.children()).any(|entry| entry.node().label() == Some(expected_description)),
+                "the evicted retained creation must still identify its branch and destination"
+            );
             let button = accessible.root().iter().chain(accessible.children()).find(|entry| entry.node().label() == Some(label)).expect("retained owner control stays mounted after history eviction");
             assert!(!button.node().is_disabled()); let bounds = button.node().bounds().unwrap();
             iced::Point::new(((bounds.x0 + bounds.x1) / 2.0) as f32, ((bounds.y0 + bounds.y1) / 2.0) as f32)
@@ -696,18 +711,27 @@ mod tests {
         let original_report = app.checkout_owners[&id].as_ref().unwrap().report.clone();
         for index in 0..20 {
             let mut request = original_report.request.as_ref().unwrap().clone(); request.operation_id = OperationId::new();
+            request.branch = cagents::repository::ValidatedBranchName::parse(format!("newer-fixture-{index}")).unwrap();
+            request.destination = data.path().join(format!("newer-fixture-{index}"));
             let mut newer = RetainedWorktreeCreation::not_started(&request, 1, "actual typed preflight refusal fixture".into());
             newer.report.created_at_unix_ms = original_report.created_at_unix_ms + index + 1;
             drop(app.update(Message::Checkout(Action::Finished(request.operation_id, Ok(newer)))));
         }
         assert_eq!(app.checkout_history.len(), 20);
         assert!(!app.checkout_history.iter().any(|report| report.operation_id == id), "serialized history evicts the old description");
+        assert!(app.checkout_history.iter().filter_map(|report| report.request.as_ref()).all(|request| {
+            request.branch.as_str() != "retained-child" && request.destination != destination
+        }), "newer history cannot satisfy the evicted original's accessible description");
         assert!(app.checkout_owners.get(&id).and_then(Option::as_ref).is_some(), "live ownership is independent");
         drop(app.update(Message::CloseWindow));
         assert!(!app.exiting, "unresolved transfer/lifecycle proof cannot disappear on exit");
         let created = app.checkout_owners[&id].as_ref().unwrap().created.clone().unwrap();
         drop(app.update(Message::Checkout(Action::History)));
-        let emitted = click_retained_checkout(&app, "Open retained worktree");
+        let emitted = click_retained_checkout(
+            &app,
+            "Open retained worktree",
+            &format!("retained-child · {}", destination.display()),
+        );
         assert!(matches!(emitted, Message::Checkout(Action::OpenRecorded(operation)) if operation == id), "actual mounted live-owner row names the evicted original");
         let task = app.update(emitted); run_tasks(&mut app, task);
         assert!(app.tabs.iter().any(|tab| tab.created_worktree.as_ref().is_some_and(|cap| cap.operation() == id)));
