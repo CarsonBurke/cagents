@@ -98,6 +98,11 @@ impl Store {
         Ok(())
     }
     pub(crate) fn publish_copy_sources(&self, state: &mut crate::chat::Snapshot) {
+        if self.peer_query.guard(&self.db).is_err() {
+            state.text_copy_sources.conversation.clear();
+            state.text_copy_sources.conversation_revision = self.copy_revision.wrapping_add(1);
+            return;
+        }
         // Child descriptors belong to the existing bounded runtime items;
         // publishing parent pages must not replace that independent authority.
         state.text_copy_sources.conversation_revision = self.copy_revision;
@@ -108,6 +113,7 @@ impl Store {
         source: &TextCopySource,
         offset: u64,
     ) -> Result<TextCopyPage, String> {
+        self.peer_query.guard(&self.db)?;
         if source.scope != TextCopyScope::Conversation || source.cache != self.copy_cache {
             return Err("Full message is unavailable in this owned cache".into());
         }
