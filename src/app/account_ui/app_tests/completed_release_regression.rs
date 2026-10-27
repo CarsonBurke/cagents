@@ -462,3 +462,38 @@ fn settled_original_live_sign_in_synchronously_acquires_the_guarded_close() {
     );
     drop(close); // Actual daemon close is unpolled; no backend completion is claimed.
 }
+
+#[test]
+fn an_old_callback_blockage_releases_verification_without_blocking_the_retry() {
+    let (mut app, card, source) = ended_fixture(false);
+    drop(app.select_worktree("/repo".into(), false));
+    let key = app.account_ui.logins[0].key;
+    let cleanup = app.sign_in_cleanup(key);
+    drop(app.update(Message::AccountUi(Action::LoginTick)));
+    assert_eq!(app.account_ui.logins[0].phase, LoginPhase::Verifying);
+    drop(app.update(Message::RetryCard(card)));
+    let replacement = app.card_state(card).unwrap().clone();
+    let CardKind::Terminal(next) = &replacement.kind else {
+        panic!()
+    };
+    assert_ne!(next.id, source.id);
+    let before_completion = now_ms();
+    let result = app.update(Message::AccountUi(Action::LoginCallbackBlocked {
+        key,
+        cleanup,
+    }));
+    assert_eq!(
+        result.units(),
+        0,
+        "old callback does not probe or close the retry"
+    );
+    drop(result);
+    assert_eq!(app.card_state(card), Some(&replacement));
+    assert_eq!(
+        app.account_ui.logins[0].phase,
+        LoginPhase::Waiting,
+        "the old completed verification must not strand the new login in Verifying"
+    );
+    assert!(app.account_ui.logins[0].next_check >= before_completion + LOGIN_RETRY);
+    assert!(!app.pane_close_owned(card));
+}

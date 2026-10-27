@@ -2860,9 +2860,10 @@ impl Cagents {
             } => self.open_account_login(provider, device, result),
             Action::LoginTick => self.check_logins(),
             Action::LoginCallbackBlocked { key, cleanup } => {
-                if cleanup.key != key || !self.sign_in_cleanup_matches(&cleanup) {
+                if cleanup.key != key {
                     return Task::none();
                 }
+                let matches = self.sign_in_cleanup_matches(&cleanup);
                 if let Some(login) = self
                     .account_ui
                     .logins
@@ -2870,7 +2871,15 @@ impl Cagents {
                     .find(|login| login.key == key)
                     && login.phase == LoginPhase::Verifying
                 {
-                    login.phase = LoginPhase::CallbackBlocked;
+                    if matches {
+                        login.phase = LoginPhase::CallbackBlocked;
+                    } else {
+                        // The old callback completed its verification slot,
+                        // but cannot block a retry of the same home's login.
+                        // A later normal tick follows the current terminal.
+                        login.phase = LoginPhase::Waiting;
+                        login.next_check = now_ms() + LOGIN_RETRY;
+                    }
                 }
                 Task::none()
             }
