@@ -91,6 +91,18 @@ impl<Message> Widget<Message, Theme, Renderer> for Leaf {
             .push(("overlay", layout.virtual_offset()));
         None
     }
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        _tree: &Tree,
+        _cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        self.visits
+            .0
+            .borrow_mut()
+            .push(("a11y", layout.virtual_offset()));
+        iced_accessibility::A11yTree::default()
+    }
     fn drag_destinations(
         &self,
         _tree: &Tree,
