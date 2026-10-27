@@ -213,7 +213,7 @@ impl Registry {
 pub(super) fn published_fixture_from_rows(source: &Registry, version: u32) -> std::path::PathBuf {
     use std::os::unix::fs::OpenOptionsExt;
 
-    assert!([3, 9, 10, 12, 15, 16, 20, 21, 22].contains(&version));
+    assert!([2, 3, 9, 10, 11, 12, 15, 16, 20, 21, 22].contains(&version));
     assert_eq!(
         source
             .db
@@ -221,9 +221,10 @@ pub(super) fn published_fixture_from_rows(source: &Registry, version: u32) -> st
             .unwrap(),
         super::SCHEMA_VERSION
     );
-    let path = source
-        .path
-        .with_file_name(format!("published-schema-{version}.sqlite3"));
+    let path = source.path.with_file_name(format!(
+        "published-schema-{version}-{}.sqlite3",
+        Uuid::new_v4()
+    ));
     drop(
         std::fs::OpenOptions::new()
             .write(true)
@@ -273,7 +274,10 @@ pub(super) fn published_fixture_from_rows(source: &Registry, version: u32) -> st
         let rows = {
             let mut statement = source
                 .db
-                .prepare(&format!("SELECT {selected} FROM {table}"))
+                // These admitted predecessor layouts all have rowid tables. Keep
+                // relative insertion order: mailbox arrival and schema 22 backfill use
+                // it even when timestamps are intentionally nonmonotonic.
+                .prepare(&format!("SELECT {selected} FROM {table} ORDER BY rowid"))
                 .unwrap();
             statement
                 .query_map([], |row| {
