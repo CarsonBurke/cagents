@@ -329,7 +329,7 @@ impl Cagents {
                     self.cards.get(&state.id),
                     Some(CardRuntime::Failed(Failure::Terminal(_)) | CardRuntime::Completed)
                 ) || ended_terminal(Some(state)).is_some()
-                    || self.saved_terminal_current(state.id).is_some()
+                    || self.saved_terminal_diagnostics_allowed(state.id)
             })
             .filter_map(|state| {
                 if let CardKind::Terminal(session) = &state.kind {
@@ -411,7 +411,10 @@ impl Cagents {
                 .id(card_control_id(card, "failure.copy"))
                 .on_press(Message::TerminalFailure(Action::Copy(card)))
                 .into(),
-            self.terminal_transcript_control(card, Message::TerminalFailure(Action::Reveal(card))),
+            self.terminal_transcript_control(
+                card,
+                Some(Message::TerminalFailure(Action::Reveal(card))),
+            ),
         ])
         .spacing(space::S)
         .wrap()
@@ -420,7 +423,7 @@ impl Cagents {
     pub(super) fn terminal_transcript_control(
         &self,
         card: CardId,
-        action: Message,
+        action: Option<Message>,
     ) -> Element<'static, Message> {
         let probe = self.terminal_failure.probes.get(&card);
         let remote = crate::device::is_remote();
@@ -435,7 +438,7 @@ impl Cagents {
             },
         )
         .id(card_control_id(card, "failure.folder"));
-        let folder = if available {
+        let folder = if let Some(action) = action.filter(|_| available) {
             folder.on_press(action)
         } else {
             folder

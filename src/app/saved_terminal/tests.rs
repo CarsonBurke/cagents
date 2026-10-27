@@ -329,3 +329,58 @@ fn directory_evidence_is_presentation_and_does_not_change_the_saved_recipe() {
     assert!(app.saved_terminal_ready(card));
     assert!(app.saved_terminal_view(card).is_some());
 }
+
+#[test]
+fn diagnostics_cannot_borrow_user_scope_or_a_later_endpoint() {
+    let (mut app, card, source) = fixture();
+    let request = pending(&mut app, card, &source);
+    assert!(!app.saved_terminal_diagnostics_allowed(card));
+    drop(app.update_saved_terminal(complete(card, source, request, Ok(None))));
+    assert!(app.saved_terminal_diagnostics_allowed(card));
+    let endpoint = app.saved_terminals.entries[&card].socket.clone();
+    app.saved_terminals
+        .entries
+        .get_mut(&card)
+        .unwrap()
+        .authority =
+        crate::agent_execution::Authority::session("synthetic-scoped-capability".into());
+    assert!(!app.saved_terminal_diagnostics_allowed(card));
+    let entry = app.saved_terminals.entries.get_mut(&card).unwrap();
+    entry.authority = crate::agent_execution::Authority::default();
+    entry.socket = Ok(Some(PathBuf::from(
+        "/different-selected-endpoint/control.sock",
+    )));
+    assert!(!app.saved_terminal_diagnostics_allowed(card));
+    app.saved_terminals.entries.get_mut(&card).unwrap().socket = endpoint;
+    app.begin_terminal_start(card);
+    assert!(!app.saved_terminal_diagnostics_allowed(card));
+    drop(app.finish_terminal_start(card));
+}
+
+#[test]
+fn a_missing_or_unverified_directory_has_no_enabled_relaunch_callback() {
+    let (mut app, card, source) = fixture();
+    let request = pending(&mut app, card, &source);
+    drop(app.update_saved_terminal(complete(card, source.clone(), request, Ok(None))));
+    for directory in [Directory::Missing, Directory::Unknown] {
+        app.saved_terminals
+            .entries
+            .get_mut(&card)
+            .unwrap()
+            .directory = directory;
+        drop(app.update_saved_terminal(Action::User {
+            card,
+            request,
+            command: Command::Relaunch,
+        }));
+        assert!(
+            !app.terminal_start_in_flight(card),
+            "even an old queued callback must not start inspection or relaunch"
+        );
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Terminal(source.clone())
+        );
+        assert!(app.saved_terminal_view(card).is_some());
+    }
+}

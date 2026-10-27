@@ -186,6 +186,27 @@ impl Cagents {
         })
     }
 
+    /// Diagnostics must not reopen a User control connection for an inherited
+    /// scoped caller, a pending inspection or a later selected endpoint.
+    pub(super) fn saved_terminal_diagnostics_allowed(&self, card: CardId) -> bool {
+        self.saved_terminal_current(card).is_some_and(|entry| {
+            !matches!(entry.disposition, Disposition::Pending)
+                && entry.authority.token().is_none()
+                && !self.terminal_start_in_flight(card)
+                && !self.terminal_retry_pending(card)
+                && entry
+                    .socket
+                    .as_ref()
+                    .ok()
+                    .and_then(|socket| socket.as_ref())
+                    .is_some_and(|expected| {
+                        !crate::device::is_remote()
+                            && crate::terminal::ipc::daemon_socket_path().ok().as_ref()
+                                == Some(expected)
+                    })
+        })
+    }
+
     /// Called only from restoration, never a new terminal/clone/user launch.
     pub(super) fn prepare_saved_terminal(
         &mut self,
@@ -419,13 +440,14 @@ impl Cagents {
             };
             let pending = matches!(entry.disposition, Disposition::Pending);
             let dormant = matches!(entry.disposition, Disposition::Dormant);
+            let relaunch_available = matches!(entry.directory, Directory::Available);
             let source = entry.source.clone();
             if self.pane_close_owned(card) || self.refuse_for_deleting_card(card) {
                 return Task::none();
             }
             return match command {
                 Command::Reconnect if !pending => self.inspect_saved_terminal(card),
-                Command::Relaunch if !pending && dormant => {
+                Command::Relaunch if !pending && dormant && relaunch_available => {
                     self.inspect_saved_terminal_for(card, true)
                 }
                 Command::CopyDetails => {
@@ -445,7 +467,7 @@ impl Cagents {
                     chat_ui::invalidate_copy_intent();
                     iced::clipboard::write(text).map(cosmic::Action::App)
                 }
-                Command::Transcript => {
+                Command::Transcript if self.saved_terminal_diagnostics_allowed(card) => {
                     self.update_terminal_failure(terminal_failure::Action::Reveal(card))
                 }
                 Command::Folder => self.update(Message::OpenRepository),
@@ -571,6 +593,7 @@ impl Cagents {
         let entry = self.saved_terminal_current(card)?;
         let pending = matches!(entry.disposition, Disposition::Pending);
         let dormant = matches!(entry.disposition, Disposition::Dormant);
+        let relaunch_available = dormant && matches!(entry.directory, Directory::Available);
         let request = entry.request;
         let action = |command| {
             Message::SavedTerminal(Action::User {
@@ -614,7 +637,7 @@ impl Cagents {
                 crate::ui_controls::button::secondary(label)
                     .id(control_id("relaunch"))
                     .name("Explicitly relaunch the saved terminal")
-                    .on_press(action(Command::Relaunch))
+                    .on_press_maybe(relaunch_available.then(|| action(Command::Relaunch)))
                     .into(),
             );
         }
@@ -641,7 +664,11 @@ impl Cagents {
                 .name("Copy saved terminal details")
                 .on_press(action(Command::CopyDetails))
                 .into(),
-            self.terminal_transcript_control(card, action(Command::Transcript)),
+            self.terminal_transcript_control(
+                card,
+                self.saved_terminal_diagnostics_allowed(card)
+                    .then(|| action(Command::Transcript)),
+            ),
         ])
         .spacing(space::S as u16);
         let directory_notice = match entry.directory {
@@ -668,7 +695,7 @@ impl Cagents {
         .spacing(space::M)
         .width(Length::Fill);
         Some(crate::ui_controls::owned(
-            (request, pending, dormant),
+            (request, pending, dormant, relaunch_available),
             widget::scrollable(widget::container(content).padding(space::L)).height(Length::Fill),
         ))
     }
