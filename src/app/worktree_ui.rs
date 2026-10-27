@@ -413,6 +413,7 @@ impl Cagents {
     /// Resolve filesystem aliases only when changing/restoring scope, never in
     /// the render path or by rewriting a hosted session's durable launch recipe.
     fn collect_worktree_roots(&mut self) {
+        let previous_count = self.known_worktree_roots.len();
         // Deleted worktree rows disappear from navigation, not from ownership.
         // Otherwise a surviving nested session would fall into its parent repo.
         self.known_worktree_roots
@@ -439,6 +440,9 @@ impl Cagents {
                         _ => None,
                     }),
             );
+        if self.known_worktree_roots.len() != previous_count {
+            self.navigation_owners_changed();
+        }
     }
 
     fn refresh_worktree_owners(&mut self, selected: Option<&Path>) -> Option<PathBuf> {
@@ -493,7 +497,9 @@ impl Cagents {
                 Some((card.id, owner.clone()))
             })
             .collect();
-        selected.map(resolve)
+        let selected = selected.map(resolve);
+        self.worktree_selection.owners_refreshed();
+        selected
     }
 
     /// Refresh which worktree rows hold an open pane after state changes,
@@ -521,7 +527,7 @@ impl Cagents {
         }) {
             #[cfg(test)]
             terminal_output_tests::record_folder_root_refresh();
-            if self.worktree_selection.is_active() {
+            if self.worktree_selection.needs_reconciliation() {
                 // The active preparation's model fence will see this new
                 // boundary. Do not canonicalize a newly loaded Folder in the
                 // UI tail while that same filesystem worker may be stalled.

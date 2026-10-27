@@ -724,12 +724,13 @@ impl WindowProtections {
     pub(crate) fn defer_navigation_sync(
         &mut self,
         paths: &[PathBuf],
+        owners_changed: bool,
     ) -> io::Result<Option<std::sync::Arc<crate::instance::OwnedLock>>> {
         let requested = paths
             .iter()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
-        if requested == self.requested {
+        if requested == self.requested && !owners_changed {
             return Ok(None);
         }
         if let Some(ready) = self.ready.take() {

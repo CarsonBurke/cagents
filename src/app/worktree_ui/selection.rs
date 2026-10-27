@@ -15,6 +15,7 @@ pub(in crate::app) struct State {
     ticket: u64,
     pending: Option<Request>,
     failed_sync: Option<(Vec<PathBuf>, Instant)>,
+    owners_dirty: bool,
     retired_readiness: Vec<Arc<crate::instance::OwnedLock>>,
     #[cfg(test)]
     local_window: bool,
@@ -42,6 +43,14 @@ impl State {
 
     pub(in crate::app) fn is_active(&self) -> bool {
         self.active.is_some()
+    }
+
+    pub(in crate::app) fn needs_reconciliation(&self) -> bool {
+        self.is_active() || self.owners_dirty || !self.retired_readiness.is_empty()
+    }
+
+    pub(super) fn owners_refreshed(&mut self) {
+        self.owners_dirty = false;
     }
 
     pub(in crate::app) fn cancel(&mut self) {
@@ -667,11 +676,36 @@ impl Cagents {
         self.dispatch_worktree_navigation()
     }
 
+    pub(super) fn navigation_owners_changed(&mut self) {
+        self.worktree_selection.owners_dirty = true;
+        if self.worktree_selection.is_active() {
+            // A new boundary can change owners without changing the OLD cached
+            // desired paths. Revoke readiness immediately, even when collection
+            // occurs after this update's ordinary protection tail.
+            let paths = self.desired_worktree_protections();
+            match self
+                .worktree_protections
+                .defer_navigation_sync(&paths, true)
+            {
+                Ok(Some(ready)) => self.worktree_selection.retired_readiness.push(ready),
+                Ok(None) => {}
+                Err(error) => {
+                    self.status = Some(TransientNotice::warning(format!(
+                        "Cannot defer worktree protection: {error}"
+                    )))
+                }
+            }
+        }
+    }
+
     pub(in crate::app) fn reconcile_navigation_protections(&mut self) -> Task<Message> {
         let mut paths = self.desired_worktree_protections();
         paths.sort();
         paths.dedup();
-        match self.worktree_protections.defer_navigation_sync(&paths) {
+        match self
+            .worktree_protections
+            .defer_navigation_sync(&paths, self.worktree_selection.owners_dirty)
+        {
             Ok(Some(ready)) => self.worktree_selection.retired_readiness.push(ready),
             Ok(None) => {}
             Err(error) => {
@@ -684,7 +718,8 @@ impl Cagents {
         if self.worktree_selection.active.is_some() || self.worktree_selection.pending.is_some() {
             return Task::none();
         }
-        if !self.worktree_protections.navigation_sync_needed(&paths)
+        if (!self.worktree_protections.navigation_sync_needed(&paths)
+            && !self.worktree_selection.owners_dirty)
             || self
                 .worktree_selection
                 .failed_sync
@@ -1002,6 +1037,7 @@ impl Cagents {
                                 ));
                                 self.worktree_selection.failed_sync = None;
                                 self.worktree_owners = std::mem::take(&mut prepared.owners);
+                                self.worktree_selection.owners_refreshed();
                                 let task = if let Some(path) = &prepared.path {
                                     let scope =
                                         self.commit_worktree_selection(path.clone(), false).1;
@@ -1542,6 +1578,91 @@ mod tests {
         no_effect(f.app.update(retired(retirement)));
         assert_eq!(starts.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(ui_reads.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cancelled_navigation_reconciles_new_nested_folder_owners_before_readiness() {
+        let mut f = fixture();
+        let nested = f.old.join("nested");
+        let launch_directory = nested.join("app");
+        std::fs::create_dir_all(&launch_directory).unwrap();
+        let mut terminal = crate::app::tests::terminal_card_state();
+        let CardKind::Terminal(session) = &mut terminal.kind else {
+            unreachable!()
+        };
+        session.launch.working_directory = launch_directory;
+        session.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: session.launch.clone(),
+            last_exit: None,
+        };
+        let card = terminal.id;
+        Arc::make_mut(&mut f.app.durable).cards.push(terminal);
+        f.app.cards.insert(card, CardRuntime::Loading);
+        drop(f.app.select_worktree(f.old.clone(), false));
+        assert_eq!(f.app.worktree_owners[&card], f.old);
+        let (entered, release, starts) = blocked(&mut f.app);
+        let first = f.app.navigate_worktree(f.next.clone(), false, None);
+        let worker = std::thread::spawn(move || prepared(first));
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        let project = ProjectId::new();
+        f.app.repository_generations.insert(project, 1);
+        drop(f.app.update(Message::RepositoryLoaded {
+            open_cards: false,
+            project_id: project,
+            generation: 1,
+            result: Ok(Box::new(LoadedRepository {
+                project: ProjectState {
+                    id: project,
+                    generation: 0,
+                    name: "new nested folder".into(),
+                    repository: nested.clone(),
+                    kind: ProjectKind::Folder,
+                    existence: Existence::Open,
+                },
+                repository: None,
+                worktrees: Vec::new(),
+                github: GitHubAvailability::NotAssociated,
+                review_repository: None,
+                head_repositories: HashMap::new(),
+            })),
+        }));
+        assert!(f.app.known_worktree_roots.contains(&nested));
+        assert!(f.app.worktree_selection.owners_dirty);
+        assert_eq!(f.app.worktree_owners[&card], f.old);
+        assert!(
+            crate::instance::owned_lock(
+                &f.runtime.join("navigation-ready"),
+                libc::LOCK_EX | libc::LOCK_NB
+            )
+            .is_ok(),
+            "old owner map cannot advertise readiness"
+        );
+        drop(f.app.open_utility_card(CardKind::Settings));
+        let focused = f.app.workspace.focused();
+        release.send(()).unwrap();
+        let retirement = f.app.update(worker.join().unwrap());
+        let reconcile = f.app.update(retired(retirement));
+        assert!(
+            f.app.worktree_selection.is_active(),
+            "owner-only work survives cancellation"
+        );
+        let retirement = f.app.update(prepared(reconcile));
+        assert_eq!(f.app.worktree_owners[&card], nested);
+        assert!(!f.app.worktree_selection.owners_dirty);
+        assert_eq!(f.app.active_workspace.as_ref(), Some(&f.old));
+        assert_eq!(f.app.workspace.focused(), focused);
+        no_effect(f.app.update(retired(retirement)));
+        assert_eq!(starts.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(f.app.worktree_owners[&card], nested);
+        assert_eq!(f.app.workspace.focused(), focused);
+        assert!(crate::worktree_cleanup::fixture_protection(&f.runtime, &nested, true).is_err());
+        assert!(
+            crate::instance::owned_lock(
+                &f.runtime.join("navigation-ready"),
+                libc::LOCK_EX | libc::LOCK_NB
+            )
+            .is_err()
+        );
     }
 
     #[test]

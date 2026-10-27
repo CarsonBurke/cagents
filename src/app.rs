@@ -14842,7 +14842,7 @@ impl Application for Cagents {
                             // into distinct worktrees after session restoration.
                             // Only the project holding the scope can move it,
                             // and re-selecting resolves every card's owner.
-                            task = if self.worktree_selection.is_active() {
+                            task = if self.worktree_selection.needs_reconciliation() {
                                 // An automatic reload must neither block input
                                 // nor supersede an accepted explicit selection.
                                 // Its new roots/rows invalidate that same worker's
@@ -17674,7 +17674,7 @@ impl Application for Cagents {
         // recorded with this update rather than the next.
         self.reconcile_terminal_review_owner();
         let task = Task::batch([task, self.flush_settings_on_blur()]);
-        let task = if self.worktree_selection.is_active() || navigation_completion {
+        let task = if self.worktree_selection.needs_reconciliation() || navigation_completion {
             Task::batch([task, self.reconcile_navigation_protections()])
         } else {
             if !terminal_metadata_unchanged { self.sync_worktree_protections(); }
