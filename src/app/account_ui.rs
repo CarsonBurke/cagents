@@ -47,15 +47,14 @@ use crate::account::{
 use crate::agent::Provider;
 
 mod check;
+mod connection;
 mod import;
 mod table;
 
 fn remote_lifecycle<T: serde::de::DeserializeOwned>(
     operation: account::remote::Operation,
 ) -> Result<T, String> {
-    match crate::device_service::request(crate::device_service::Operation::AccountLifecycle {
-        operation,
-    })? {
+    match connection::request(crate::device_service::Operation::AccountLifecycle { operation })? {
         crate::device_service::Reply::AccountLifecycle(value) => {
             serde_json::from_value(value).map_err(|error| error.to_string())
         }
@@ -1711,20 +1710,17 @@ impl Cagents {
         let generation = self.account_ui.discovery_generation;
         if crate::device::is_remote() {
             return cosmic::task::future(async move {
-                let result =
-                    tokio::task::spawn_blocking(|| {
-                        match crate::device_service::request(
-                            crate::device_service::Operation::AccountsRead,
-                        )? {
-                            crate::device_service::Reply::Accounts(value) => {
-                                serde_json::from_value(value).map_err(|error| error.to_string())
-                            }
-                            _ => Err("The device did not return its accounts".into()),
+                let result = tokio::task::spawn_blocking(|| {
+                    match connection::request(crate::device_service::Operation::AccountsRead)? {
+                        crate::device_service::Reply::Accounts(value) => {
+                            serde_json::from_value(value).map_err(|error| error.to_string())
                         }
-                    })
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result);
+                        _ => Err("The device did not return its accounts".into()),
+                    }
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
                 Message::AccountUi(Action::RemoteLoaded(generation, result))
             });
         }
@@ -1837,20 +1833,17 @@ impl Cagents {
                 self.account_ui.discovery_generation.wrapping_add(1);
             let generation = self.account_ui.discovery_generation;
             return cosmic::task::future(async move {
-                let result =
-                    tokio::task::spawn_blocking(|| {
-                        match crate::device_service::request(
-                            crate::device_service::Operation::AccountsRead,
-                        )? {
-                            crate::device_service::Reply::Accounts(value) => {
-                                serde_json::from_value(value).map_err(|error| error.to_string())
-                            }
-                            _ => Err("The device did not return its accounts".into()),
+                let result = tokio::task::spawn_blocking(|| {
+                    match connection::request(crate::device_service::Operation::AccountsRead)? {
+                        crate::device_service::Reply::Accounts(value) => {
+                            serde_json::from_value(value).map_err(|error| error.to_string())
                         }
-                    })
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result);
+                        _ => Err("The device did not return its accounts".into()),
+                    }
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
                 Message::AccountUi(Action::RemoteLoaded(generation, result))
             });
         }
@@ -1880,12 +1873,10 @@ impl Cagents {
                 let result = tokio::task::spawn_blocking(move || {
                     let registry =
                         serde_json::to_value(registry).map_err(|error| error.to_string())?;
-                    match crate::device_service::request(
-                        crate::device_service::Operation::AccountsUpdate {
-                            expected_revision,
-                            registry,
-                        },
-                    )? {
+                    match connection::request(crate::device_service::Operation::AccountsUpdate {
+                        expected_revision,
+                        registry,
+                    })? {
                         crate::device_service::Reply::AccountRegistry(value) => {
                             serde_json::from_value(value).map_err(|error| error.to_string())
                         }
@@ -2075,9 +2066,10 @@ impl Cagents {
         let probe = cosmic::task::future(async move {
             let outcome = if crate::device::is_remote() {
                 tokio::task::spawn_blocking(move || {
-                    match crate::device_service::request(
-                        crate::device_service::Operation::AccountProbe { account, force },
-                    )? {
+                    match connection::request(crate::device_service::Operation::AccountProbe {
+                        account,
+                        force,
+                    })? {
                         crate::device_service::Reply::AccountProbe(value) => {
                             serde_json::from_value(value).map_err(|error| error.to_string())
                         }
@@ -2546,9 +2538,9 @@ impl Cagents {
                         let _ = tokio::task::spawn_blocking(move || {
                             let reports = serde_json::to_value((entries, catalogs))
                                 .map_err(|error| error.to_string())?;
-                            crate::device_service::request(
-                                crate::device_service::Operation::AccountsCache { reports },
-                            )
+                            connection::request(crate::device_service::Operation::AccountsCache {
+                                reports,
+                            })
                         })
                         .await;
                     })
@@ -3306,9 +3298,9 @@ impl Cagents {
             self.account_ui.table.close_popups();
             return cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    match crate::device_service::request(
-                        crate::device_service::Operation::AccountLogin { account },
-                    )? {
+                    match connection::request(crate::device_service::Operation::AccountLogin {
+                        account,
+                    })? {
                         crate::device_service::Reply::Login(recipe) => Ok(recipe),
                         _ => Err("The device did not prepare its provider login".into()),
                     }
@@ -3999,12 +3991,10 @@ impl Cagents {
             // No cache: the answer is about a home no other window knows.
             let outcome = if crate::device::is_remote() {
                 tokio::task::spawn_blocking(move || {
-                    match crate::device_service::request(
-                        crate::device_service::Operation::AccountProbe {
-                            account,
-                            force: true,
-                        },
-                    )? {
+                    match connection::request(crate::device_service::Operation::AccountProbe {
+                        account,
+                        force: true,
+                    })? {
                         crate::device_service::Reply::AccountProbe(value) => {
                             serde_json::from_value(value).map_err(|error| error.to_string())
                         }
@@ -5196,7 +5186,7 @@ fn browser_login_available() -> Result<(), String> {
 fn check_browser_login_host(path: &Path) -> Result<(), String> {
     // The daemon may not have started yet. Its atomic spawn reservation is
     // authoritative; this earlier check avoids creating a needless home.
-    let mut client = match crate::control::ControlClient::connect(path) {
+    let mut client = match connection::at(path) {
         Ok(client) => client,
         Err(crate::control::ControlError::Connect(error))
             if matches!(
@@ -5244,8 +5234,7 @@ fn with_callback_unread(unread: Option<String>, outcome: Outcome) -> Outcome {
 
 fn callback_failed_on_host(terminal: TerminalId) -> Result<bool, String> {
     let path = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-    let mut client =
-        crate::control::ControlClient::connect(&path).map_err(|error| error.to_string())?;
+    let mut client = connection::at(&path).map_err(|error| error.to_string())?;
     let hosted = client.list().map_err(|error| error.to_string())?;
     // A cancelled and already removed terminal has no failure left to read.
     if !hosted
@@ -5277,8 +5266,7 @@ fn ended_on_host(
     watched: &[(uuid::Uuid, TerminalId, HostSessionProof)],
 ) -> Result<Vec<(uuid::Uuid, TerminalId)>, String> {
     let path = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-    let mut client =
-        crate::control::ControlClient::connect(&path).map_err(|error| error.to_string())?;
+    let mut client = connection::at(&path).map_err(|error| error.to_string())?;
     let hosted = client.list().map_err(|error| error.to_string())?;
     let session = client.proof().clone();
     Ok(watched
@@ -5316,13 +5304,15 @@ fn offstrip_close_matches(state: Option<&CardState>, source: &TerminalSession) -
 /// a session of its own is asked again with that session, so a close is
 /// only reported done once the terminal has ended or is gone.
 fn stop_hosted(terminal: TerminalId, proof: &HostSessionProof) -> Result<(), String> {
+    let authority = crate::agent_execution::Authority::from_environment();
+    connection::require_user(&authority)?;
     use super::terminal_close::{CloseOutcome, close_hosted_terminal};
     let outcome = match close_hosted_terminal(terminal, proof, true) {
         CloseOutcome::Stale => {
             let path =
                 crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
             let mut client =
-                crate::control::ControlClient::connect(&path).map_err(|error| error.to_string())?;
+                connection::at_as(&path, authority).map_err(|error| error.to_string())?;
             let hosted = client.list().map_err(|error| error.to_string())?;
             match hosted
                 .iter()

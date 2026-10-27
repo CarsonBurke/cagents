@@ -530,12 +530,13 @@ fn perform(request: Request) -> Result<Response, Failure> {
     if Profile::current() != request.profile {
         return Err(Failure::Changed);
     }
-    let socket = match &request.kind {
-        RequestKind::Prepare(_, target) => target.socket.clone(),
-        _ => crate::terminal::ensure_daemon_ready().map_err(|_| Failure::Unavailable)?,
+    let (socket, mut client) = match &request.kind {
+        RequestKind::Prepare(_, target) => (
+            target.socket.clone(),
+            super::connection::at(&target.socket).map_err(|_| Failure::Unavailable)?,
+        ),
+        _ => super::connection::current().map_err(|_| Failure::Unavailable)?,
     };
-    let mut client =
-        crate::control::ControlClient::connect(&socket).map_err(|_| Failure::Unavailable)?;
     let proof = client.proof().clone();
     let operation = wire_operation(&request, &proof)?;
     let reply = client.device_operation(crate::device_service::Operation::AccountImport(operation)).map_err(|error| {

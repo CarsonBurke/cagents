@@ -133,7 +133,7 @@ fn message(action: Action) -> Message {
     super::message(super::Action::CodingConfig(action))
 }
 fn inspect(context: Context) -> Result<Observation, Failure> {
-    let mut client = crate::control::ControlClient::connect(&context.target.socket)
+    let mut client = super::super::connection::at(&context.target.socket)
         .map_err(|_| Failure::DeviceUnavailable)?;
     if client.proof() != &context.target.proof {
         return Err(Failure::DeviceChanged);
@@ -151,7 +151,7 @@ fn inspect(context: Context) -> Result<Observation, Failure> {
     }
 }
 fn create(context: Context, request: CreateRequest) -> Result<CreateReport, Failure> {
-    let mut client = crate::control::ControlClient::connect(&context.target.socket)
+    let mut client = super::super::connection::at(&context.target.socket)
         .map_err(|_| Failure::DeviceUnavailable)?;
     if client.proof() != &context.target.proof {
         return Err(Failure::DeviceChanged);

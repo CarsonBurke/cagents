@@ -182,9 +182,7 @@ fn message(action: Action) -> Message {
     Message::AccountUi(super::Action::Check(action))
 }
 fn prepare() -> Result<Target, Failure> {
-    let socket = crate::terminal::ensure_daemon_ready().map_err(|_| Failure::DeviceUnavailable)?;
-    let client =
-        crate::control::ControlClient::connect(&socket).map_err(|_| Failure::DeviceUnavailable)?;
+    let (socket, client) = super::connection::current().map_err(|_| Failure::DeviceUnavailable)?;
     Ok(Target {
         socket,
         proof: client.proof().clone(),
@@ -212,8 +210,8 @@ fn exchange(
 }
 fn run(target: Target, request: CheckRequest) -> Result<CheckReport, Failure> {
     request.validate().map_err(|_| Failure::InvalidResponse)?;
-    let mut client = crate::control::ControlClient::connect(&target.socket)
-        .map_err(|_| Failure::DeviceUnavailable)?;
+    let mut client =
+        super::connection::at(&target.socket).map_err(|_| Failure::DeviceUnavailable)?;
     exchange(&mut client, &target, &request)
 }
 
