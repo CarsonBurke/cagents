@@ -710,6 +710,9 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
         views::{Change, Pane, Scope, View},
     };
     let mut app = crate::app::tests::context_inspector_test_app(false);
+    // Model the mounted foreground strip; a zero-width fixture intentionally
+    // drops transcript bodies as offscreen presentation.
+    app.workspace.resize_viewport(1280.0);
     let directory = tempfile::tempdir().unwrap();
     let repository = directory.path().to_path_buf();
     let project = crate::model::ProjectId::new();
@@ -797,23 +800,27 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
     let command = pending.id;
     drop(app.apply_workspace_model_update(ModelUpdate::Read(empty.clone())));
     assert_eq!(runtime(&app, card).pending.as_ref().unwrap().id, command);
-    handle.replace_snapshot_for_test(Snapshot {
-        ready: true,
-        busy: true,
-        session_id: Some("first-send-native-thread".into()),
-        items: vec![Arc::new(chat::Item {
-            id: "original-user-item".into(),
-            role: chat::Role::User,
-            content: chat::ItemContent::Text {
-                text: "one original prompt".into(),
-                thinking: false,
-                phase: Default::default(),
-            },
-            started_at: None,
-            at: None,
-        })],
-        ..Snapshot::default()
-    });
+    super::show_chat_snapshot_for_test(
+        &mut app,
+        card,
+        Snapshot {
+            ready: true,
+            busy: true,
+            session_id: Some("first-send-native-thread".into()),
+            items: vec![Arc::new(chat::Item {
+                id: "original-user-item".into(),
+                role: chat::Role::User,
+                content: chat::ItemContent::Text {
+                    text: "one original prompt".into(),
+                    thinking: false,
+                    phase: Default::default(),
+                },
+                started_at: None,
+                at: None,
+            })],
+            ..Snapshot::default()
+        },
+    );
     drop(app.handle_chat_ui(Action::CommandFinished(target, command, Ok(()))));
     assert!(runtime(&app, card).pending.is_none());
     assert!(runtime(&app, card).queued.is_none());
