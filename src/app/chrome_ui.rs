@@ -1425,6 +1425,7 @@ mod tests {
         cache: iced::runtime::user_interface::Cache,
         cursor: iced::mouse::Cursor,
         events: &[iced::Event],
+        width: f32,
     ) -> (
         iced::runtime::user_interface::Cache,
         Vec<Message>,
@@ -1435,7 +1436,7 @@ mod tests {
         let entry = app.ordered_chrome_notices()[0];
         let mut ui = UserInterface::build(
             app.chrome_notice_view(entry),
-            Size::new(300.0, 5000.0),
+            Size::new(width, 5000.0),
             cache,
             renderer,
         );
@@ -1498,7 +1499,7 @@ mod tests {
             "Details preserves the text-builder height of adjacent Dismiss"
         );
         assert!(
-            b.x0 >= 0.0 && b.x1 <= 300.0 && b.x1 > b.x0,
+            b.x0 >= 0.0 && b.x1 <= f64::from(width) && b.x1 > b.x0,
             "narrow button geometry {b:?}"
         );
         assert!(
@@ -1519,6 +1520,61 @@ mod tests {
     #[test]
     fn notice_details_real_controls_keep_original_press_owner_and_current_keyboard_ring() {
         use iced::{Event, mouse, runtime::user_interface::Cache};
+        const DETAILS: &str = "NEW_REASON\nline2\nline3\nline4\nline5\nNEW_TAIL";
+
+        fn diagnostic_height(nodes: &iced_accessibility::A11yTree) -> f64 {
+            let mut diagnostic = nodes.root().iter().chain(nodes.children()).filter(|node| {
+                node.node().label() == Some(DETAILS) || node.node().value() == Some(DETAILS)
+            });
+            let bounds = diagnostic
+                .next()
+                .expect("the actual full diagnostic text node")
+                .node()
+                .bounds()
+                .expect("the diagnostic has actual layout bounds");
+            assert!(diagnostic.next().is_none(), "one diagnostic text node");
+            assert!(bounds.y1.is_finite() && bounds.y0.is_finite());
+            assert!(bounds.y1 > bounds.y0);
+            bounds.y1 - bounds.y0
+        }
+
+        fn toggle_details(
+            app: &mut Cagents,
+            renderer: &mut cosmic::Renderer,
+            cache: Cache,
+            width: f32,
+            current: u64,
+        ) -> Cache {
+            let (cache, messages, point, _) =
+                notice_row_step(app, renderer, cache, mouse::Cursor::Unavailable, &[], width);
+            assert!(messages.is_empty());
+            let cursor = mouse::Cursor::Available(point);
+            let (cache, messages, _, _) = notice_row_step(
+                app,
+                renderer,
+                cache,
+                cursor,
+                &[Event::Mouse(mouse::Event::ButtonPressed(
+                    mouse::Button::Left,
+                ))],
+                width,
+            );
+            assert!(messages.is_empty());
+            let (cache, mut messages, _, _) = notice_row_step(
+                app,
+                renderer,
+                cache,
+                cursor,
+                &[Event::Mouse(mouse::Event::ButtonReleased(
+                    mouse::Button::Left,
+                ))],
+                width,
+            );
+            assert!(matches!(messages.as_slice(),
+                [Message::ChromeUi(Action::ToggleNoticeDetails(id))] if *id == current));
+            drop(app.update(messages.remove(0)));
+            cache
+        }
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.notices.record(TransientNotice::error("Save refused")
             .with_details("first diagnostic\nline two\nline three\nline four\nline five\nTAIL_VISIBLE_AFTER_EXPANSION")
@@ -1532,38 +1588,52 @@ mod tests {
             Cache::default(),
             mouse::Cursor::Unavailable,
             &[],
+            300.0,
         );
         assert!(messages.is_empty());
         let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
         let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
         let cursor = mouse::Cursor::Available(point);
         let (cache, messages, _, _) =
-            notice_row_step(&app, &mut renderer, cache, cursor, &[press.clone()]);
+            notice_row_step(&app, &mut renderer, cache, cursor, &[press.clone()], 300.0);
         assert!(messages.is_empty());
         app.notices.record(
             TransientNotice::error("New save refusal")
-                .with_details("NEW_REASON\nline2\nline3\nline4\nline5\nNEW_TAIL")
+                .with_details(DETAILS)
                 .with_key(NoticeKey::AccountLink),
         );
         let current = app.notices.recent().next().unwrap().id;
         assert_ne!(old, current);
-        let (cache, messages, point, _) =
-            notice_row_step(&app, &mut renderer, cache, cursor, &[release.clone()]);
+        let (cache, messages, point, _) = notice_row_step(
+            &app,
+            &mut renderer,
+            cache,
+            cursor,
+            &[release.clone()],
+            300.0,
+        );
         assert!(
             messages.is_empty(),
             "old held press cannot activate replacement details"
         );
         let cursor = mouse::Cursor::Available(point);
-        let (cache, messages, _, _) = notice_row_step(&app, &mut renderer, cache, cursor, &[press]);
+        let (cache, messages, _, _) =
+            notice_row_step(&app, &mut renderer, cache, cursor, &[press], 300.0);
         assert!(messages.is_empty());
-        let (cache, mut messages, _, _) =
-            notice_row_step(&app, &mut renderer, cache, cursor, &[release]);
+        let (cache, mut messages, _, collapsed_nodes) =
+            notice_row_step(&app, &mut renderer, cache, cursor, &[release], 300.0);
+        let collapsed_height = diagnostic_height(&collapsed_nodes);
         assert!(
             matches!(messages.as_slice(), [Message::ChromeUi(Action::ToggleNoticeDetails(id))] if *id == current)
         );
         drop(app.update(messages.remove(0)));
         assert_eq!(app.chrome_ui.expanded_notice, Some(current));
-        let (_, _, _, nodes) = notice_row_step(&app, &mut renderer, cache, cursor, &[]);
+        let (mut cache, _, _, nodes) =
+            notice_row_step(&app, &mut renderer, cache, cursor, &[], 300.0);
+        assert!(
+            diagnostic_height(&nodes) > collapsed_height + 1.0,
+            "same-content Details expansion must increase actual text layout height"
+        );
         assert!(
             nodes.root().iter().chain(nodes.children()).any(|n| n
                 .node()
@@ -1576,6 +1646,98 @@ mod tests {
                 .iter()
                 .any(|id| id.as_ref() == notice_details_id(current))
         );
+        // Reuse the same retained UI cache through both policies and viewport
+        // widths. Full AX text exists even while clipped, so measure its actual
+        // node bounds rather than treating NEW_TAIL presence as expansion.
+        cache = toggle_details(&mut app, &mut renderer, cache, 300.0, current);
+        for width in [300.0, 900.0] {
+            assert!(app.chrome_ui.expanded_notice.is_none());
+            let (next, messages, _, nodes) = notice_row_step(
+                &app,
+                &mut renderer,
+                cache,
+                mouse::Cursor::Unavailable,
+                &[],
+                width,
+            );
+            cache = next;
+            assert!(messages.is_empty());
+            let collapsed = diagnostic_height(&nodes);
+            cache = toggle_details(&mut app, &mut renderer, cache, width, current);
+            assert_eq!(app.chrome_ui.expanded_notice, Some(current));
+            let (next, messages, _, nodes) = notice_row_step(
+                &app,
+                &mut renderer,
+                cache,
+                mouse::Cursor::Unavailable,
+                &[],
+                width,
+            );
+            cache = next;
+            assert!(messages.is_empty());
+            let expanded = diagnostic_height(&nodes);
+            assert!(
+                expanded > collapsed + 1.0,
+                "actual diagnostic must expand at width {width}: {collapsed} -> {expanded}"
+            );
+            cache = toggle_details(&mut app, &mut renderer, cache, width, current);
+            let (next, messages, _, nodes) = notice_row_step(
+                &app,
+                &mut renderer,
+                cache,
+                mouse::Cursor::Unavailable,
+                &[],
+                width,
+            );
+            cache = next;
+            assert!(messages.is_empty());
+            assert!(app.chrome_ui.expanded_notice.is_none());
+            assert!(
+                (diagnostic_height(&nodes) - collapsed).abs() <= 0.5,
+                "Hide details returns the same retained diagnostic to its original height"
+            );
+        }
+
+        // Exercise the actual graphics paragraph's same-content update path,
+        // including a different numeric limit and the no-change fast path.
+        use iced::advanced::text::{self, Paragraph as _};
+        type Paragraph = <cosmic::Renderer as text::Renderer>::Paragraph;
+        let config = |ellipsize| text::Text {
+            content: DETAILS,
+            bounds: iced::Size::new(300.0, 5000.0),
+            size: iced::Pixels(14.0),
+            line_height: text::LineHeight::Absolute(iced::Pixels(20.0)),
+            font: iced::Font::MONOSPACE,
+            align_x: text::Alignment::Left,
+            align_y: iced::alignment::Vertical::Top,
+            shaping: text::Shaping::Advanced,
+            wrapping: text::Wrapping::WordOrGlyph,
+            ellipsize,
+        };
+        let limited = |lines| text::Ellipsize::End(text::EllipsizeHeightLimit::Lines(lines));
+        let mut paragraph = text::paragraph::Plain::<Paragraph>::default();
+        assert!(paragraph.update(config(text::Ellipsize::None)));
+        let full_height = paragraph.min_height();
+        assert!(!paragraph.update(config(text::Ellipsize::None)));
+        assert!(paragraph.update(config(limited(4))));
+        let four_lines = paragraph.min_height();
+        assert!(four_lines < full_height);
+        assert!(paragraph.update(config(limited(2))));
+        assert!(paragraph.min_height() < four_lines);
+        assert!(paragraph.update(config(text::Ellipsize::None)));
+        assert_eq!(paragraph.min_height(), full_height);
+        assert!(!paragraph.update(config(text::Ellipsize::None)));
+        // Renderer primitive equality must also distinguish the policy even
+        // when this particular short text fits both limits at the same size.
+        let short = |policy| config(policy).with_content("one line");
+        let two = Paragraph::with_text(short(limited(2)));
+        let four = Paragraph::with_text(short(limited(4)));
+        assert_eq!(two.min_bounds(), four.min_bounds());
+        assert_ne!(two, four);
+
+        cache = toggle_details(&mut app, &mut renderer, cache, 900.0, current);
+        assert_eq!(app.chrome_ui.expanded_notice, Some(current));
+        drop(cache);
         drop(app.update(Message::DismissNotice(current)));
         assert!(app.chrome_ui.expanded_notice.is_none());
     }
