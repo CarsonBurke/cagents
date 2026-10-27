@@ -17989,7 +17989,10 @@ mod tests {
             generation: app.workspace_view_generation,
             event: WorkspaceViewportEvent::Resized(1_600.0),
         }));
-        assert_eq!(app.workspace.visibility(card), Some(VisibilityClass::Visible));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
         let target = chat_runtime(&app, card).target;
         let handle = chat_runtime(&app, card).handle().unwrap().clone();
         write(&mut app, card, "accepted ");
@@ -18035,7 +18038,10 @@ mod tests {
         // Hidden transcript-derived history is disposable. The daemon hydrates
         // it again only after the reader returns to the actual visible pane.
         return_to_chat(&mut app);
-        assert_eq!(app.workspace.visibility(card), Some(VisibilityClass::Visible));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
         let runtime = chat_runtime(&app, card);
         assert!(runtime.visible.load(Ordering::Relaxed));
         assert_eq!(runtime.target, target);
@@ -20900,11 +20906,11 @@ mod tests {
     /// either order, including when its chat never got as far as starting.
     #[test]
     fn a_channel_closes_when_its_last_pane_does() {
+        use super::super::workspace_model_sync::ModelUpdate;
         use crate::workspace_model::{
             ModelChannel, ModelEdit, ModelProject,
             views::{Pane, Scope, View},
         };
-        use super::super::workspace_model_sync::ModelUpdate;
 
         for (chat_first, chat_state) in [(true, 0), (true, 1), (true, 2), (false, 0), (false, 2)] {
             let mut app = crate::app::tests::context_inspector_test_app(true);
@@ -21014,13 +21020,19 @@ mod tests {
                 before_ack.push(edit);
             }
             assert!(
-                !before_ack.iter().any(|edit| matches!(edit, ModelEdit::RetireEmptyChannel { .. })),
+                !before_ack
+                    .iter()
+                    .any(|edit| matches!(edit, ModelEdit::RetireEmptyChannel { .. })),
                 "the occupied canonical view cannot authorize retirement: {before_ack:?}"
             );
 
             let mut settled = app.workspace_model.clone();
             settled.sequence = 11;
-            let view = settled.views.iter_mut().find(|view| view.scope == scope).unwrap();
+            let view = settled
+                .views
+                .iter_mut()
+                .find(|view| view.scope == scope)
+                .unwrap();
             view.panes.clear();
             view.retired = vec![terminal, chat];
             view.revision = 8;
@@ -21033,12 +21045,16 @@ mod tests {
             while let Ok(edit) = published.try_recv() {
                 after_ack.push(edit);
             }
-            let retire_requests = after_ack.iter().filter_map(|edit| match edit {
-                ModelEdit::RetireEmptyChannel { home, expected_view_revision } => {
-                    Some((*home, *expected_view_revision))
-                }
-                _ => None,
-            }).collect::<Vec<_>>();
+            let retire_requests = after_ack
+                .iter()
+                .filter_map(|edit| match edit {
+                    ModelEdit::RetireEmptyChannel {
+                        home,
+                        expected_view_revision,
+                    } => Some((*home, *expected_view_revision)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
             assert_eq!(retire_requests, vec![(home, 8)], "{after_ack:?}");
 
             // These are explicit App model-reply fixtures, not an executed
@@ -21052,7 +21068,9 @@ mod tests {
             // An authoritative no-work retirement reply removes that same Home.
             settled.sequence = 13;
             settled.channels.retain(|entry| entry.id != channel);
-            settled.views.retain(|view| view.scope != Scope::Channel(channel));
+            settled
+                .views
+                .retain(|view| view.scope != Scope::Channel(channel));
             drop(app.apply_workspace_model_update(ModelUpdate::Read(settled)));
             assert!(!channel_exists(&app));
             assert!(app.channel_ui.was_deleted(channel));

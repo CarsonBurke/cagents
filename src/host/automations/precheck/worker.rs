@@ -105,6 +105,9 @@ impl Worker {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        // The supervisor and executor exec before launching the user's shell;
+        // neither can recover the daemon's process-local saved limit afterward.
+        crate::host::descriptor_limit::inherit(&mut command);
         unsafe {
             command.pre_exec(move || {
                 // The dedicated owner keeps this lease across exec. It marks
