@@ -1,6 +1,6 @@
 //! Peer-read staging deliberately releases control before cache/RPC work.
-//! Publication repeats admission and consumes the private prepared page while
-//! the host model and delivery queue serialize final permission admission.
+//! Publication observes canonical permission after the cache read, then the
+//! host serializes its resident attachment check and private page enqueue.
 use super::*;
 
 fn admit_request(

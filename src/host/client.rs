@@ -292,9 +292,10 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
                 ..
             }
         ) {
-            // A peer page carries an authorization observation which must be
-            // checked at queue admission. It cannot take the ordinary
-            // handle-return-unlock-push response path below.
+            // Peer pages recheck canonical permission after the cache read,
+            // outside HostState, then check resident attachments and enqueue.
+            // Keep private staging custody through that sequence instead of
+            // the ordinary handle-return-unlock-push response path below.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 peer_inspection::process(&host, client_id, request_id, &delivery, request)
             }))
