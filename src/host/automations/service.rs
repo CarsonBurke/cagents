@@ -306,10 +306,7 @@ fn process_hosted(
             // Optional resident metadata only: never wait for naming, open the
             // transcript, or make naming availability an admission condition.
             let requester = if matches!(&request, Request::Propose { .. }) {
-                chat.handle
-                    .conversation_title()
-                    .ok()
-                    .and_then(|(_, title)| title)
+                chat.handle.conversation_title_prefix().ok().flatten()
             } else {
                 None
             };

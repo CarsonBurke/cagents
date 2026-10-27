@@ -702,6 +702,13 @@ impl Handle {
             Owner::Remote(remote) => remote.conversation_title(),
         }
     }
+    /// Bounded optional requester title from the same captured owner.
+    pub(crate) fn conversation_title_prefix(&self) -> Result<Option<String>, TitleUnavailable> {
+        match &self.0 {
+            Owner::Local(local) => local.conversation_title_prefix(),
+            Owner::Remote(remote) => remote.conversation_title_prefix(),
+        }
+    }
     #[cfg(test)]
     pub(crate) fn fixture_retained_native_holder(
         &self,
