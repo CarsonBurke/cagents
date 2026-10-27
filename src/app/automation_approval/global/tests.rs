@@ -153,6 +153,166 @@ fn open(app: &mut Cagents, proposal: &Proposal) {
 }
 
 #[test]
+fn decision_watch_loss_and_transport_error_keep_truthful_close_and_old_result_fences() {
+    fn dialog(app: &Cagents) -> (Vec<String>, Vec<Message>) {
+        use cosmic::iced::{
+            Event, Point, Rectangle, Size,
+            advanced::{Layout, Shell, clipboard, layout, widget::Tree},
+            mouse,
+        };
+        use iced_accessibility::accesskit::Role;
+
+        let renderer = crate::app::tests::headless_renderer();
+        let mut element = app
+            .automation_approval_dialog()
+            .expect("the exact review remains open");
+        let mut tree = Tree::new(element.as_widget());
+        let size = Size::new(1000.0, 900.0);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, size),
+        );
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let labels = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter_map(|node| node.node().label().map(str::to_owned))
+            .collect();
+        let buttons: Vec<_> = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter(|node| {
+                node.node().role() == Role::Button && node.node().label() == Some("Not now")
+            })
+            .collect();
+        assert_eq!(
+            buttons.len(),
+            1,
+            "select the actual button, not its paragraph"
+        );
+        assert!(
+            !buttons[0].node().is_disabled(),
+            "local dismissal remains available"
+        );
+        let rect = buttons[0].node().bounds().expect("mounted dismiss control");
+        let point = Point::new(
+            ((rect.x0 + rect.x1) / 2.0) as f32,
+            ((rect.y0 + rect.y1) / 2.0) as f32,
+        );
+        let mut messages = Vec::new();
+        for event in [
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(event),
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &Rectangle::with_size(size),
+            );
+        }
+        (labels, messages)
+    }
+
+    for watch_lost in [true, false] {
+        let mut app = app();
+        let a = proposal(1);
+        let b = proposal(2);
+        let key = install(&mut app, &[a.clone(), b.clone()]);
+        open(&mut app, &a);
+        let old_generation = app.automation_approval.generation;
+        let task = app.update(Message::AutomationApproval(ApprovalAction::Decide {
+            id: a.id,
+            revision: a.revision,
+            generation: old_generation,
+            approved: true,
+        }));
+        assert!(task.units() > 0);
+        drop(task); // Deliberately unpolled: scheduling is not proof of a sent RPC.
+        assert!(app.automation_approval.deciding);
+        if watch_lost {
+            drop(app.update(Message::WorkspaceModelObserved(
+                ModelUpdate::ProposalWatchLost,
+            )));
+            assert!(app.automation_approval.global.review_stale);
+            assert!(!app.automation_approval.global.can_decide());
+            assert_ne!(app.automation_approval.generation, old_generation);
+        } else {
+            drop(
+                app.update(Message::AutomationApproval(ApprovalAction::Finished {
+                    generation: old_generation,
+                    result: Arc::new(Err("connection closed before a receipt arrived".into())),
+                })),
+            );
+        }
+        assert!(!app.automation_approval.deciding);
+        assert_eq!(app.automation_approval.proposal.as_ref(), Some(&a));
+        let (labels, mut messages) = dialog(&app);
+        let visible = labels.join("\n");
+        if watch_lost {
+            assert!(
+                visible.contains("Closing this review does not cancel a decision already sent.")
+            );
+        } else {
+            assert!(visible.contains("Could not confirm the decision outcome."));
+            assert!(visible.contains("A decision already sent may still complete."));
+            assert!(visible.contains("connection closed before a receipt arrived"));
+        }
+        assert!(!visible.contains("keeps it pending"));
+        assert!(
+            matches!(messages.as_slice(), [Message::AutomationApproval(ApprovalAction::Dismiss { id, revision, generation })]
+            if *id == a.id && *revision == a.revision && *generation == app.automation_approval.generation)
+        );
+        drop(app.update(messages.pop().unwrap()));
+        assert!(!app.automation_approval_open());
+        assert!(!app.automation_approval.deciding);
+
+        if watch_lost {
+            model(&mut app, key.identity, 2, true);
+            let held = flight(&app);
+            drop(complete(
+                &mut app,
+                held,
+                Ok(delivery(
+                    key.identity,
+                    key.sequence,
+                    2,
+                    &[a.clone(), b.clone()],
+                )),
+            ));
+        }
+        open(&mut app, &b);
+        let replacement_generation = app.automation_approval.generation;
+        let mut receipt = a.clone();
+        receipt.state = ProposalState::Declined;
+        let late = app.update(Message::AutomationApproval(ApprovalAction::Finished {
+            generation: old_generation,
+            result: Arc::new(Ok(receipt)),
+        }));
+        assert_eq!(
+            late.units(),
+            0,
+            "old results cannot replace or close another review"
+        );
+        drop(late);
+        assert_eq!(app.automation_approval.proposal.as_ref(), Some(&b));
+        assert_eq!(app.automation_approval.generation, replacement_generation);
+        assert!(app.automation_approval.error.is_none());
+        assert!(!app.automation_approval.deciding);
+    }
+}
+
+#[test]
 fn dirty_model_edge_and_reconnect_keep_the_owned_slot_until_matching_completion() {
     let mut app = app();
     let original = flight(&app);

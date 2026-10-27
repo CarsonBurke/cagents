@@ -367,8 +367,8 @@ impl Cagents {
                 if !self.approval_action_is_current(id, revision, generation) {
                     return Task::none();
                 }
-                // Dismissal is local navigation. The immutable pending proposal
-                // stays available for another review; no daemon decision runs.
+                // Dismissal is local navigation and sends no new decision.
+                // An earlier decision may still complete independently.
                 self.automation_approval.available = self.automation_approval.proposal.clone();
                 self.automation_approval.error = None;
                 self.close_automation_approval()
@@ -477,7 +477,9 @@ impl Cagents {
                         Task::batch([closed, self.drive_global_proposal_read()])
                     }
                     Err(error) => {
-                        state.error = Some(error.to_string());
+                        state.error = Some(format!(
+                            "Could not confirm the decision outcome. A decision already sent may still complete. Review the request again to check its current state.\n{error}"
+                        ));
                         state.focus = 0;
                         approval_focus(state.generation, 0)
                     }
@@ -601,7 +603,7 @@ impl Cagents {
         }
         if state.global.review_stale {
             content = content.push(notice_body(
-                "Refreshing the exact request before a decision. Not now keeps it pending.",
+                "The exact request must be refreshed before another decision. Closing this review does not cancel a decision already sent.",
             ));
         }
         if let Some(error) = &state.error {
