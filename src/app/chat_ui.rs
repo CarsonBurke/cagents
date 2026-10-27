@@ -7728,6 +7728,8 @@ impl Cagents {
                     .writer
                     .ptr_eq(&Arc::downgrade(&writer.operation_store()))
             });
+        let creation_revoked =
+            self.shared_chat_creation_revoked(target.card, pending.scope.as_ref());
         let message_matches = self.cards.get(&target.card).is_some_and(|card| match card {
             CardRuntime::Chat(runtime)
                 if runtime.target == target
@@ -7760,7 +7762,7 @@ impl Cagents {
             self.release_draft_start_capture(target.card);
             return Task::none();
         }
-        if self.shared_chat_creation_revoked(target.card) {
+        if creation_revoked {
             self.release_draft_start_capture(target.card);
             if let Some(runtime) = self.chat_card_runtime_mut(target) {
                 runtime.error = Some("This pane was closed or its creation was refused. Your draft is retained; nothing was started.".into());

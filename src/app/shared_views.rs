@@ -837,13 +837,26 @@ impl Cagents {
 
     /// Passive retention preserves work, but cannot authorize a provider start
     /// after another client retired the pane or the registry refused creation.
-    pub(super) fn shared_chat_creation_revoked(&self, card: CardId) -> bool {
-        self.shared_views.retained.contains(&card)
-            || self
-                .workspace_model
-                .views
-                .iter()
-                .any(|view| view.retired.contains(&card))
+    pub(super) fn shared_chat_creation_revoked(&self, card: CardId, scope: Option<&Scope>) -> bool {
+        if self.shared_views.retained.contains(&card) {
+            return true;
+        }
+        let mut owners = self
+            .workspace_model
+            .views
+            .iter()
+            .filter(|view| view.panes.iter().any(|pane| pane.id == card));
+        if let Some(owner) = owners.next() {
+            // A transfer retires the source while preserving the exact current
+            // destination. Only that unique owner can override old tombstones.
+            return owners.next().is_some()
+                || Some(&owner.scope) != scope
+                || owner.retired.contains(&card);
+        }
+        self.workspace_model
+            .views
+            .iter()
+            .any(|view| view.retired.contains(&card))
     }
 
     /// An automatic empty composer has no shared descriptor yet. Once it has
@@ -5137,6 +5150,53 @@ mod tests {
                 "revoked creation must not be recreated"
             );
         }
+    }
+
+    #[test]
+    fn transferred_native_draft_can_complete_its_first_start_checkpoint() {
+        let (mut app, channel, card, target, receiver) = unpublished_default_chat();
+        compose_default_chat(&mut app, target);
+        drop(app.reconcile_shared_views());
+        let pane = app
+            .local_view_panes(&Scope::Channel(channel))
+            .into_iter()
+            .find(|pane| pane.id == card)
+            .unwrap();
+        let source = app
+            .durable
+            .channels
+            .iter()
+            .find(|entry| entry.id != channel)
+            .unwrap()
+            .id;
+        let mut retired_source = View::empty(source);
+        retired_source.retired.push(card);
+        app.workspace_model.views[0].panes.push(pane);
+        app.workspace_model.views.push(retired_source);
+        app.shared_views.pending.clear();
+        drop(app.reconcile_shared_views());
+        while receiver.try_recv().is_ok() {}
+        let directory = tempfile::tempdir().unwrap();
+        let (writer, _) = crate::session::SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("first-send-transferred"),
+        )
+        .unwrap();
+        app.session = Some(writer);
+        let save = app.handle_chat_ui(super::super::chat_ui::Action::Submit(
+            target,
+            crate::chat::PromptMode::Send,
+        ));
+        let completion = first_start_save_completion(save);
+        assert!(matches!(
+            &completion,
+            super::super::chat_ui::Action::DraftStartCheckpointed(_, _, Ok(()))
+        ));
+        let start = app.handle_chat_ui(completion);
+        assert!(app.chat_start_pending(card));
+        assert!(cosmic::iced::runtime::task::into_stream(start).is_some());
+        assert!(!app.durable.local_only_cards.contains(&card));
+        assert_eq!(app.local_view_cards(&Scope::Channel(channel)), vec![card]);
     }
 
     #[test]
