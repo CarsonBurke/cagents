@@ -958,7 +958,7 @@ mod tests {
         requested.proof = Some(proof());
         let expected = requested.clone();
         let worker = std::thread::spawn(move || {
-            for step in 0..3 {
+            for step in 0..4 {
                 let request: ClientEnvelope = ipc::read_frame(&mut peer).unwrap().unwrap();
                 assert_eq!(request.version, 119);
                 assert_eq!(request.proof, Some(proof()));
@@ -966,13 +966,21 @@ mod tests {
                     (0, ClientRequest::ChatAttach { session }) if session == expected => ServerResponse::ChatAttached {
                         session,
                         snapshot: crate::chat::Snapshot {
-                            session_id: expected.launch.session_id.clone(), exited: true,
+                            session_id: expected.launch.session_id.clone(), exited: true, history_loading: true,
                             read_only_reason: Some("Saved conversation history is read-only; no provider was started.".into()),
                             ..Default::default()
                         },
                     },
                     (1, ClientRequest::ChatVisibility { chat_id, visible: true }) if chat_id == expected.id => ServerResponse::Accepted,
-                    (2, ClientRequest::ChatDetach { chat_id }) if chat_id == expected.id => ServerResponse::Detached,
+                    (2, ClientRequest::ChatRead { chat_id, after_generation: None }) if chat_id == expected.id => ServerResponse::ChatSnapshot {
+                        chat_id,
+                        snapshot: Some(crate::chat::Snapshot {
+                            session_id: expected.launch.session_id.clone(), exited: true,
+                            read_only_reason: Some("Saved conversation history is read-only; no provider was started.".into()),
+                            ..Default::default()
+                        }),
+                    },
+                    (3, ClientRequest::ChatDetach { chat_id }) if chat_id == expected.id => ServerResponse::Detached,
                     other => panic!("Unexpected history request (no Start, Close or Release permitted): {other:?}"),
                 };
                 // Only exact target-chat events may interleave with the reply.

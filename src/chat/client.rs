@@ -3499,6 +3499,64 @@ mod tests {
         }
     }
 
+    #[test]
+    fn failed_saved_claude_restore_sends_no_start_request() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let live = host_proof("current");
+        let mut source = omp_card(Some(CONVERSATION), Some(host_proof("old")));
+        source.launch.provider = crate::agent::Provider::Claude;
+        source.launch.recipe.program = "must-not-run".into();
+        source.launch.recipe.arguments.clear();
+        let expected = source.clone();
+        let worker = thread::spawn(move || {
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            for step in 0..2 {
+                let request: ClientEnvelope = ipc::read_frame(&mut peer).unwrap().unwrap();
+                let message = match (step, request.request) {
+                    (0, ClientRequest::Connect { .. }) => ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof: live.clone(),
+                            resumed: Vec::new(),
+                        },
+                    },
+                    (1, ClientRequest::ResolveUpgradeChat { source }) if source == expected => {
+                        ServerMessage::Error(ipc::ProtocolError::new(
+                            ipc::ProtocolErrorCode::TerminalUnavailable,
+                            "Exact history is unavailable",
+                            false,
+                        ))
+                    }
+                    other => panic!("Unexpected saved history request: {other:?}"),
+                };
+                ipc::write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: live.clone(),
+                        message,
+                    },
+                )
+                .unwrap();
+            }
+            let extra: Option<ClientEnvelope> = ipc::read_frame(&mut peer).unwrap();
+            assert!(extra.is_none(), "a failed restore must not send ChatStart");
+        });
+        let result = ClientHandle::connect_on(
+            stream,
+            source,
+            Intent::Restore,
+            None,
+            false,
+            None,
+            None,
+            None,
+            |_| {},
+        );
+        assert!(result.is_err());
+        worker.join().unwrap();
+    }
+
     fn negotiate_with_recovery(
         live: &HostSessionProof,
         session: Session,

@@ -19194,6 +19194,48 @@ mod tests {
     }
 
     #[test]
+    fn saved_history_readiness_requires_exact_settled_read_only_attachment() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+        let original = chat_runtime(&app, card);
+        let mut source = original.session.clone();
+        source.native_continuity = chat::NativeContinuity::ReconnectOnly;
+        let snapshot = Snapshot {
+            session_id: source.launch.session_id.clone(),
+            exited: true,
+            read_only_reason: Some("Saved history; no provider was started".into()),
+            ..Default::default()
+        };
+        for mutation in 0..6 {
+            let mut observed = snapshot.clone();
+            match mutation {
+                1 => observed.history_loading = true,
+                2 => observed.session_id = Some("different-conversation".into()),
+                3 => observed.error = Some("History cannot be loaded".into()),
+                4 => observed.busy = true,
+                _ => {}
+            }
+            let handle = Arc::new(ClientHandle::fixture(source.clone(), observed));
+            let mut runtime = Runtime::new(
+                original.target,
+                source.clone(),
+                Connection::Live(handle),
+                false,
+                original.syntax_theme,
+            );
+            if mutation == 5 {
+                runtime.disconnected = true;
+            }
+            let ready = runtime.restored_pane_ready();
+            match mutation {
+                0 => assert_eq!(ready, Ok(true)),
+                1 => assert_eq!(ready, Ok(false)),
+                _ => assert!(ready.is_err()),
+            }
+        }
+    }
+
+    #[test]
     fn failed_retry_adapter_cannot_acknowledge_retained_native_cleanup() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
