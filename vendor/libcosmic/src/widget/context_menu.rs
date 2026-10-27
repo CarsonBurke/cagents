@@ -619,3 +619,166 @@ impl Drop for LocalState {
             .with_data_mut(|state| state.reset());
     }
 }
+
+#[cfg(all(test, feature = "a11y", feature = "tokio"))]
+mod accessibility_tests {
+    use super::*;
+    use iced::advanced::{clipboard, renderer::Headless};
+    use iced_accessibility::accesskit::{Action, ActionRequest, NodeId, Role, TreeId};
+    use iced_core::{Layout, Rectangle, Shell, layout::Limits};
+    use std::borrow::Cow;
+
+    #[test]
+    fn popup_widget_uses_actual_parent_layout_and_retires_with_its_owner() {
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(crate::Renderer::new(
+                iced::Font::default(),
+                iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .expect("headless native renderer");
+        for retire_owner in [false, true] {
+            let mut owner = context_menu(
+                iced::widget::Space::new()
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+                Some(vec![menu::Tree::new(crate::Element::from(
+                    crate::widget::button::custom(crate::widget::text("Copy branch"))
+                        .name("Copy branch")
+                        .on_press(7usize),
+                ))]),
+            );
+            let mut owner_tree =
+                Tree::new(&owner as &dyn Widget<usize, crate::Theme, crate::Renderer>);
+            owner.diff(&mut owner_tree);
+            let owner_node = owner.layout(
+                &mut owner_tree,
+                &renderer,
+                &Limits::new(Size::new(240.0, 40.0), Size::new(240.0, 40.0)),
+            );
+            let mut messages = Vec::new();
+            owner.update(
+                &mut owner_tree,
+                &iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+                Layout::new(&owner_node),
+                mouse::Cursor::Available(Point::new(0.25, 0.25)),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &Rectangle::with_size(Size::new(900.0, 650.0)),
+            );
+            assert!(messages.is_empty());
+            let shared = owner_tree
+                .state
+                .downcast_ref::<LocalState>()
+                .menu_bar_state
+                .clone();
+            let bounds = Rectangle::new(Point::ORIGIN, Size::new(240.0, 0.5));
+            // This is the actual owned Menu Widget used by the popup factory,
+            // retaining the SAME Rc state as its parent ContextMenu owner.
+            let mut popup = menu::Menu {
+                tree: shared,
+                menu_roots: Cow::Owned(owner.context_menu.as_ref().unwrap().clone()),
+                bounds_expand: 16,
+                menu_overlays_parent: true,
+                close_condition: CloseCondition {
+                    leave: false,
+                    click_outside: true,
+                    click_inside: true,
+                },
+                item_width: ItemWidth::Uniform(240),
+                item_height: ItemHeight::Dynamic(40),
+                bar_bounds: bounds,
+                main_offset: 0,
+                cross_offset: 0,
+                root_bounds_list: vec![bounds],
+                path_highlight: Some(PathHighlight::MenuActive),
+                style: Cow::Owned(crate::theme::menu_bar::MenuBarStyle::Default),
+                position: Point::ORIGIN,
+                is_overlay: false,
+                window_id: window::Id::unique(),
+                depth: 0,
+                on_surface_action: None,
+            };
+            init_root_menu(
+                &mut popup,
+                &renderer,
+                &mut Shell::new(&mut messages),
+                Point::new(0.25, 0.25),
+                Size::new(900.0, 650.0),
+                Vector::ZERO,
+                bounds,
+                0.0,
+            );
+            let mut popup_tree = Tree::empty();
+            let node = Widget::layout(
+                &mut popup,
+                &mut popup_tree,
+                &renderer,
+                &Limits::new(Size::new(240.0, 40.0), Size::new(240.0, 40.0)),
+            );
+            // An ordinary popup container may move the actual Widget node
+            // after layout. AX and dispatch must use that passed layout.
+            let shifted = node.move_to(Point::new(57.0, 83.0));
+            let layout = Layout::new(&shifted);
+            let nodes = Widget::a11y_nodes(&popup, layout, &popup_tree, mouse::Cursor::Unavailable);
+            let button = nodes
+                .root()
+                .iter()
+                .find(|node| node.node().label() == Some("Copy branch"))
+                .unwrap();
+            assert_eq!(button.node().role(), Role::Button);
+            assert!(button.node().supports_action(Action::Click));
+            assert!(!button.node().supports_action(Action::Focus));
+            let expected = layout
+                .children()
+                .next()
+                .unwrap()
+                .children()
+                .next()
+                .unwrap()
+                .bounds();
+            let actual = button.node().bounds().unwrap();
+            assert_eq!(actual.x0, f64::from(expected.x));
+            assert_eq!(actual.y0, f64::from(expected.y));
+            let target: NodeId = button.id().clone().into();
+            let mut kept_owner = Some(owner_tree);
+            if retire_owner {
+                drop(kept_owner.take());
+                assert!(
+                    Widget::a11y_nodes(&popup, layout, &popup_tree, mouse::Cursor::Unavailable)
+                        .root()
+                        .is_empty()
+                );
+            }
+            Widget::update(
+                &mut popup,
+                &mut popup_tree,
+                &iced::Event::A11y(
+                    iced_core::widget::Id::from(target.0),
+                    ActionRequest {
+                        action: Action::Click,
+                        target_tree: TreeId::ROOT,
+                        target_node: target,
+                        data: None,
+                    },
+                ),
+                layout,
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &Rectangle::new(Point::new(57.0, 83.0), Size::new(240.0, 40.0)),
+            );
+            assert_eq!(messages, if retire_owner { vec![] } else { vec![7] });
+            assert!(
+                Widget::a11y_nodes(&popup, layout, &popup_tree, mouse::Cursor::Unavailable)
+                    .root()
+                    .is_empty()
+            );
+        }
+    }
+}

@@ -561,42 +561,6 @@ mod tests {
             );
         }
 
-        fn focused(&mut self) -> Option<Id> {
-            #[derive(Default)]
-            struct Focus(Option<Id>);
-            impl Operation for Focus {
-                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
-                    visit(self);
-                }
-                fn focusable(
-                    &mut self,
-                    id: Option<&Id>,
-                    _: Rectangle,
-                    state: &mut dyn operation::Focusable,
-                ) {
-                    if state.is_focused() {
-                        self.0 = id.cloned();
-                    }
-                }
-            }
-            let mut focus = Focus::default();
-            if let Some(mut overlay) = self.element.as_widget_mut().overlay(
-                &mut self.tree,
-                Layout::new(&self.row),
-                &self.renderer,
-                &self.viewport,
-                Vector::ZERO,
-            ) {
-                let node = overlay
-                    .as_overlay_mut()
-                    .layout(&self.renderer, self.viewport.size());
-                overlay
-                    .as_overlay_mut()
-                    .operate(Layout::new(&node), &self.renderer, &mut focus);
-            }
-            focus.0
-        }
-
         fn replace_owned(&mut self, owner: u64, offset: usize) {
             let entries = (0..3)
                 .map(|index| {
@@ -677,10 +641,6 @@ mod tests {
         assert_ne!(current.id(), disabled.id());
         assert!(menu.action(&disabled, Action::Click).is_empty());
         assert!(menu.action(&disabled, Action::Focus).is_empty());
-        assert!(
-            menu.focused().is_none(),
-            "disabled Focus cannot borrow native focus"
-        );
         let first = menu.named("Action 0").node().bounds().unwrap();
         let point = Point::new(
             ((first.x0 + first.x1) / 2.0) as f32,
@@ -703,9 +663,12 @@ mod tests {
         assert!(menu.action(&current, Action::Click).is_empty());
         menu.open();
         let current = menu.named("Action 2");
+        assert!(
+            !current.node().supports_action(Action::Focus),
+            "Focus is not implemented by this bounded menu AX path"
+        );
         assert!(menu.action(&current, Action::Focus).is_empty());
-        let current_id: iced_accessibility::accesskit::NodeId = current.id().clone().into();
-        assert_eq!(menu.focused(), Some(Id::from(current_id.0)));
+        assert_eq!(menu.named("Action 2").id(), current.id());
         assert_eq!(menu.action(&current, Action::Click), [2]);
     }
 
@@ -804,7 +767,6 @@ mod tests {
         let current = menu.named("Action 0");
         assert_ne!(old.id(), current.id());
         assert!(menu.action(&old, Action::Focus).is_empty());
-        assert!(menu.focused().is_none());
         assert_eq!(menu.action(&current, Action::Click), [100]);
     }
 }

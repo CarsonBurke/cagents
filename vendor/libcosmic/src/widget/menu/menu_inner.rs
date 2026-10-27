@@ -636,70 +636,6 @@ impl<'b, Message: Clone + 'static> Menu<'b, Message> {
         })
     }
 
-    #[cfg(feature = "a11y")]
-    fn operate_accessible(
-        &mut self,
-        renderer: &crate::Renderer,
-        operation: &mut dyn iced_core::widget::Operation,
-        translation: Vector,
-    ) {
-        self.tree.inner.with_data_mut(|state| {
-            let Some(&root) = state.active_root.first().filter(|_| state.open) else {
-                return;
-            };
-            let Some(root_menu) = self.menu_roots.get(root) else {
-                return;
-            };
-            let Some(root_tree) = state.tree.children.get_mut(root) else {
-                return;
-            };
-            for (depth, menu) in state.menu_states.iter().enumerate() {
-                let Some(measured) = menu
-                    .accessibility
-                    .as_ref()
-                    .filter(|m| m.surface == self.window_id)
-                else {
-                    continue;
-                };
-                let Some(items) = menu_items_at(root_menu, &state.active_root, depth) else {
-                    continue;
-                };
-                let node = measured.node.clone().translate(translation);
-                operation.container(None, node.bounds());
-                operation.traverse(&mut |operation| {
-                    for (index, layout) in
-                        (measured.first..=measured.last).zip(Layout::new(&node).children())
-                    {
-                        let Some(item) = items.get(index) else {
-                            continue;
-                        };
-                        if let Some(tree) = root_tree.children.get_mut(item.index) {
-                            let nodes = item_accessibility(
-                                item,
-                                tree,
-                                layout,
-                                Cursor::Unavailable,
-                                measured.clip + translation,
-                            );
-                            if nodes
-                                .root()
-                                .iter()
-                                .all(|node| node.node().is_hidden() || node.node().is_disabled())
-                            {
-                                continue;
-                            }
-                            item.item.element.with_data_mut(|element| {
-                                element
-                                    .as_widget_mut()
-                                    .operate(tree, layout, renderer, operation);
-                            });
-                        }
-                    }
-                });
-            }
-        });
-    }
-
     // AT requests are addressed to actual current numeric IDs, independently
     // of pointer hover. Unknown/retired IDs never borrow the hovered callback.
     #[cfg(feature = "a11y")]
@@ -711,7 +647,7 @@ impl<'b, Message: Clone + 'static> Menu<'b, Message> {
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
     ) -> bool {
-        use iced_accessibility::{IdEq, accesskit::Action};
+        use iced_accessibility::IdEq;
         let event::Event::A11y(id, request) = event else {
             return false;
         };
@@ -721,7 +657,6 @@ impl<'b, Message: Clone + 'static> Menu<'b, Message> {
         let translation = layout.position() - Point::ORIGIN + (self.position - Point::ORIGIN);
         let mut messages = Vec::new();
         let mut local = Shell::new(&mut messages);
-        let mut admitted = false;
         self.tree.inner.with_data_mut(|state| {
             let Some(&root) = state.active_root.first() else {
                 return;
@@ -775,10 +710,6 @@ impl<'b, Message: Clone + 'static> Menu<'b, Message> {
                     {
                         return;
                     }
-                    admitted = true;
-                    if request.action == Action::Focus {
-                        menu.index = Some(index);
-                    }
                     item.item.update(
                         tree,
                         event,
@@ -793,15 +724,6 @@ impl<'b, Message: Clone + 'static> Menu<'b, Message> {
                 }
             }
         });
-        // The runtime normally applies Focus before delivering this event. Do
-        // the same scoped operation here for direct Widget/native popup paths.
-        if admitted && request.action == Action::Focus {
-            self.operate_accessible(
-                renderer,
-                &mut iced_core::widget::operation::focusable::focus::<()>(id.clone()),
-                translation,
-            );
-        }
         let activated = !local.is_empty();
         shell.merge(local, std::convert::identity);
         if activated {
@@ -1213,21 +1135,6 @@ impl<Message: Clone + 'static> overlay::Overlay<Message, crate::Theme, crate::Re
         self.draw(renderer, theme, style, layout, cursor);
     }
 
-    fn operate(
-        &mut self,
-        layout: Layout<'_>,
-        renderer: &crate::Renderer,
-        operation: &mut dyn iced_core::widget::Operation,
-    ) {
-        #[cfg(feature = "a11y")]
-        self.operate_accessible(
-            renderer,
-            operation,
-            layout.position() - Point::ORIGIN + (self.position - Point::ORIGIN),
-        );
-        let _ = (layout, renderer, operation);
-    }
-
     fn mouse_interaction(
         &self,
         layout: Layout<'_>,
@@ -1449,22 +1356,6 @@ impl<Message: std::clone::Clone + 'static> Widget<Message, crate::Theme, crate::
         }
     }
 
-    fn operate(
-        &mut self,
-        _tree: &mut Tree,
-        layout: Layout<'_>,
-        renderer: &crate::Renderer,
-        operation: &mut dyn iced_core::widget::Operation,
-    ) {
-        #[cfg(feature = "a11y")]
-        self.operate_accessible(
-            renderer,
-            operation,
-            layout.position() - Point::ORIGIN + (self.position - Point::ORIGIN),
-        );
-        let _ = (layout, renderer, operation);
-    }
-
     #[cfg(feature = "a11y")]
     fn a11y_nodes(
         &self,
@@ -1545,7 +1436,11 @@ fn item_accessibility<Message: 'static>(
 
 #[cfg(feature = "a11y")]
 fn clip_accessibility_node(node: &mut iced_accessibility::A11yNode, clip: Rectangle) {
-    use iced_accessibility::accesskit::Rect;
+    use iced_accessibility::accesskit::{Action, Rect};
+    // These menus currently implement addressed AT activation, not native
+    // keyboard focus ownership. Do not advertise Focus until that separate
+    // menu keyboard/input-barrier composition is qualified.
+    node.node_mut().remove_action(Action::Focus);
     if node.node().is_disabled() {
         node.node_mut().clear_actions();
     }
@@ -2207,130 +2102,4 @@ fn search_bound(
         index = left;
     }
     index
-}
-
-#[cfg(all(test, feature = "a11y", feature = "tokio"))]
-mod accessibility_tests {
-    use super::*;
-    use iced::advanced::{clipboard, renderer::Headless};
-    use iced_accessibility::accesskit::{Action, ActionRequest, NodeId, Role, TreeId};
-
-    #[test]
-    fn popup_widget_accessibility_uses_actual_parent_layout_and_numeric_target() {
-        let renderer = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(crate::Renderer::new(
-                iced::Font::default(),
-                iced::Pixels(14.0),
-                Some("tiny-skia"),
-            ))
-            .expect("headless native renderer");
-        let mut roots = vec![MenuTree::with_children(
-            crate::Element::from(crate::widget::Row::new()),
-            vec![MenuTree::new(crate::Element::from(
-                crate::widget::button::custom(crate::widget::text("Copy branch"))
-                    .name("Copy branch")
-                    .on_press(7usize),
-            ))],
-        )];
-        roots[0].set_index();
-        let shared = MenuBarState::default();
-        shared.inner.with_data_mut(|state| {
-            state.open = true;
-            crate::widget::menu::menu_roots_diff(&mut roots, &mut state.tree);
-        });
-        let bounds = Rectangle::new(Point::ORIGIN, Size::new(240.0, 0.5));
-        let mut menu = Menu {
-            tree: shared,
-            menu_roots: Cow::Owned(roots),
-            bounds_expand: 16,
-            menu_overlays_parent: true,
-            close_condition: CloseCondition {
-                leave: false,
-                click_outside: true,
-                click_inside: true,
-            },
-            item_width: ItemWidth::Uniform(240),
-            item_height: ItemHeight::Dynamic(40),
-            bar_bounds: bounds,
-            main_offset: 0,
-            cross_offset: 0,
-            root_bounds_list: vec![bounds],
-            path_highlight: Some(PathHighlight::MenuActive),
-            style: Cow::Owned(crate::theme::menu_bar::MenuBarStyle::Default),
-            position: Point::ORIGIN,
-            is_overlay: false,
-            window_id: window::Id::unique(),
-            depth: 0,
-            on_surface_action: None,
-        };
-        let mut messages = Vec::new();
-        init_root_menu(
-            &mut menu,
-            &renderer,
-            &mut Shell::new(&mut messages),
-            Point::new(0.25, 0.25),
-            Size::new(900.0, 650.0),
-            Vector::ZERO,
-            bounds,
-            0.0,
-        );
-        let mut tree = Tree::empty();
-        let node = Widget::layout(
-            &mut menu,
-            &mut tree,
-            &renderer,
-            &Limits::new(Size::new(240.0, 40.0), Size::new(240.0, 40.0)),
-        );
-        // This is the real Menu Widget layout moved by an outer container,
-        // exactly the seam used by the production separate-popup view.
-        let shifted = node.move_to(Point::new(57.0, 83.0));
-        let layout = Layout::new(&shifted);
-        let nodes = Widget::a11y_nodes(&menu, layout, &tree, Cursor::Unavailable);
-        let button = nodes
-            .root()
-            .iter()
-            .find(|node| node.node().label() == Some("Copy branch"))
-            .unwrap();
-        assert_eq!(button.node().role(), Role::Button);
-        let expected = layout
-            .children()
-            .next()
-            .unwrap()
-            .children()
-            .next()
-            .unwrap()
-            .bounds();
-        let actual = button.node().bounds().unwrap();
-        assert_eq!(actual.x0, f64::from(expected.x));
-        assert_eq!(actual.y0, f64::from(expected.y));
-        let target: NodeId = button.id().clone().into();
-        Widget::update(
-            &mut menu,
-            &mut tree,
-            &iced::Event::A11y(
-                iced_core::widget::Id::from(target.0),
-                ActionRequest {
-                    action: Action::Click,
-                    target_tree: TreeId::ROOT,
-                    target_node: target,
-                    data: None,
-                },
-            ),
-            layout,
-            Cursor::Unavailable,
-            &renderer,
-            &mut clipboard::Null,
-            &mut Shell::new(&mut messages),
-            &Rectangle::new(Point::new(57.0, 83.0), Size::new(240.0, 40.0)),
-        );
-        assert_eq!(messages, [7]);
-        assert!(
-            Widget::a11y_nodes(&menu, layout, &tree, Cursor::Unavailable)
-                .root()
-                .is_empty()
-        );
-    }
 }
