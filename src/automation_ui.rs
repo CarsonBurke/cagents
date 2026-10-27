@@ -124,7 +124,10 @@ pub enum Action {
     MoreLifecycle,
     Run(Uuid),
     InspectRun(crate::model::RunId),
-    CancelRun,
+    CancelRun {
+        automation: Uuid,
+        firing: Uuid,
+    },
     OpenSession,
     Received {
         sequence: u64,
@@ -1138,6 +1141,17 @@ impl State {
     }
 
     pub fn update(&mut self, action: Action) -> Option<Effect> {
+        if let Action::CancelRun { automation, firing } = &action
+            && !self.run.as_ref().is_some_and(|run| {
+                run.firing.automation == *automation
+                    && run.firing.id == *firing
+                    && run.firing.state.is_active()
+            })
+        {
+            // Refuse a stale callback before it can consume a current read,
+            // confirmation, or another run's mutation slot.
+            return None;
+        }
         if self.lifecycle_notice.is_some() {
             // This surface is historical only. Retained callbacks from the
             // previous editor cannot mutate or open a different run behind it.
@@ -1878,16 +1892,14 @@ impl State {
                 }
                 self.run = None;
             }
-            Action::CancelRun => {
-                if let Some(run) = &self.run {
-                    return self.request(
-                        Pending::Mutate,
-                        Request::Cancel {
-                            id: run.firing.automation,
-                            firing: run.firing.id,
-                        },
-                    );
-                }
+            Action::CancelRun { automation, firing } => {
+                return self.request(
+                    Pending::Mutate,
+                    Request::Cancel {
+                        id: automation,
+                        firing,
+                    },
+                );
             }
             Action::OpenSession => {
                 if let Some(run) = &self.run {
@@ -2611,11 +2623,20 @@ impl State {
                         ));
                     }
                 }
-                content = content.push(
+                let mut subject = [0; 32];
+                subject[..16].copy_from_slice(run.firing.automation.as_bytes());
+                subject[16..].copy_from_slice(run.firing.id.as_bytes());
+                // A retained press belongs to the exact displayed run. Keep
+                // its native state for the same subject, retire it on replacement.
+                content = content.push(crate::interaction::keyed_list_rows(vec![(
+                    subject,
                     widget::row::with_children(vec![
                         button(
                             "Cancel run",
-                            Action::CancelRun,
+                            Action::CancelRun {
+                                automation: run.firing.automation,
+                                firing: run.firing.id,
+                            },
                             !busy && run.firing.state.is_active(),
                         ),
                         button(
@@ -2629,8 +2650,9 @@ impl State {
                         ),
                     ])
                     .spacing(space::S)
-                    .wrap(),
-                );
+                    .wrap()
+                    .into(),
+                )]));
             }
         }
         let vertical =
@@ -6972,7 +6994,10 @@ mod tests {
                         id,
                         firing: requested,
                     },
-            }) = state.update(Action::CancelRun)
+            }) = state.update(Action::CancelRun {
+                automation: owner.id,
+                firing: firing.firing.id,
+            })
             else {
                 panic!("explicit cancel")
             };
@@ -7243,6 +7268,332 @@ mod tests {
             matches!(selecting.update(Action::InspectRun(run)),Some(Effect::Request{request:Request::ShowRun{run:actual},..}) if actual==run)
         );
         assert!(selecting.lifecycle_notice.is_none());
+    }
+    fn cancel_detail(owner: &Automation) -> RunDetail {
+        let mut detail = run_of(owner);
+        let run = crate::model::RunId::new();
+        detail.firing.state = crate::automations::FiringState::Running;
+        detail.firing.run = Some(run);
+        detail.run = Some(crate::agent_execution::Run {
+            id: run,
+            agent: crate::model::AgentId::new(),
+            state: crate::agent_execution::State::Running,
+            revision: 1,
+            accepted_ms: 100,
+            started_ms: Some(100),
+            finished_ms: None,
+            provider_key: None,
+            result: Default::default(),
+        });
+        detail
+    }
+
+    fn inspect_cancel_detail(state: &mut State, detail: &RunDetail) {
+        let run = detail.run.as_ref().unwrap().id;
+        let Some(Effect::Request {
+            sequence,
+            request: Request::ShowRun { run: requested },
+        }) = state.update(Action::InspectRun(run))
+        else {
+            panic!("the public activation must request its exact run")
+        };
+        assert_eq!(requested, run);
+        assert!(matches!(
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::Detail(detail.clone()))),
+            }),
+            Some(Effect::ReadRun(read)) if read == run
+        ));
+        assert_eq!(state.run.as_ref().unwrap().firing.id, detail.firing.id);
+        assert!(state.pending.is_none());
+    }
+
+    fn assert_cancel_request(state: &mut State, action: Action, detail: &RunDetail) {
+        let Some(Effect::Request {
+            request: Request::Cancel { id, firing },
+            ..
+        }) = state.update(action)
+        else {
+            panic!("a fresh exact active subject must still cancel")
+        };
+        assert_eq!((id, firing), (detail.firing.automation, detail.firing.id));
+        assert!(matches!(state.pending, Some((_, Pending::Mutate))));
+    }
+
+    #[test]
+    fn queued_cancel_cannot_retarget_after_another_run_is_read_or_consume_its_ui_work() {
+        let owner = automation();
+        let a = cancel_detail(&owner);
+        let mut other_owner = owner.clone();
+        other_owner.id = Uuid::new_v4();
+        let b = cancel_detail(&other_owner);
+        let old = Action::CancelRun {
+            automation: a.firing.automation,
+            firing: a.firing.id,
+        };
+        let mut state = State::default();
+        inspect_cancel_detail(&mut state, &a);
+        inspect_cancel_detail(&mut state, &b);
+        assert!(state.update(old.clone()).is_none());
+        assert!(state.pending.is_none());
+        assert_eq!(state.run.as_ref().unwrap().firing.id, b.firing.id);
+
+        // A foreign callback must not even supersede B's real background read.
+        let Some(Effect::Request { sequence, request }) = state.update(Action::Tick) else {
+            panic!("current run should refresh")
+        };
+        assert!(matches!(request, Request::ShowFiring { id } if id == b.firing.id));
+        assert!(state.update(old.clone()).is_none());
+        assert!(
+            matches!(state.pending, Some((pending, Pending::RefreshRun)) if pending == sequence)
+        );
+        assert!(matches!(
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::Detail(b.clone()))),
+            }),
+            Some(Effect::ReadRun(read)) if read == b.run.as_ref().unwrap().id
+        ));
+
+        for action in [
+            old,
+            Action::CancelRun {
+                automation: a.firing.automation,
+                firing: b.firing.id,
+            },
+            Action::CancelRun {
+                automation: b.firing.automation,
+                firing: a.firing.id,
+            },
+        ] {
+            assert!(state.update(action).is_none());
+            assert!(state.pending.is_none());
+        }
+        state.selected = Some(other_owner.clone());
+        assert!(state.update(Action::Enable).is_none());
+        let consent = state.confirmation.as_ref().unwrap().generation;
+        assert!(
+            state
+                .update(Action::CancelRun {
+                    automation: a.firing.automation,
+                    firing: a.firing.id,
+                })
+                .is_none()
+        );
+        assert_eq!(state.confirmation.as_ref().unwrap().generation, consent);
+        assert!(state.update(Action::CancelConfirmation).is_none());
+
+        // The exact original subject is no longer cancellable after settlement.
+        let mut completed = b.clone();
+        completed.firing.state = crate::automations::FiringState::Succeeded;
+        completed.firing.finished_ms = Some(200);
+        completed.run.as_mut().unwrap().state = crate::agent_execution::State::Succeeded;
+        completed.run.as_mut().unwrap().finished_ms = Some(200);
+        inspect_cancel_detail(&mut state, &completed);
+        assert!(
+            state
+                .update(Action::CancelRun {
+                    automation: b.firing.automation,
+                    firing: b.firing.id,
+                })
+                .is_none()
+        );
+        assert!(state.pending.is_none());
+
+        inspect_cancel_detail(&mut state, &b);
+        let fresh = Action::CancelRun {
+            automation: b.firing.automation,
+            firing: b.firing.id,
+        };
+        assert_cancel_request(&mut state, fresh.clone(), &b);
+        assert!(
+            state.update(fresh).is_none(),
+            "in-flight mutation keeps its slot"
+        );
+    }
+
+    type CancelUi<'a> =
+        cosmic::iced::runtime::UserInterface<'a, Action, cosmic::Theme, cosmic::Renderer>;
+
+    fn cancel_frame<'a>(
+        state: &'a State,
+        cache: cosmic::iced::runtime::user_interface::Cache,
+        renderer: &mut cosmic::Renderer,
+    ) -> CancelUi<'a> {
+        let mut ui = cosmic::iced::runtime::UserInterface::build(
+            state.view(),
+            cosmic::iced::Size::new(900.0, 1100.0),
+            cache,
+            renderer,
+        );
+        ui.draw(
+            renderer,
+            &cosmic::theme::active(),
+            &cosmic::iced::advanced::renderer::Style::default(),
+            cosmic::iced::mouse::Cursor::Unavailable,
+        );
+        ui
+    }
+
+    fn cancel_bounds(ui: &CancelUi<'_>) -> cosmic::iced::Rectangle {
+        use cosmic::iced::{Point, Rectangle, Size, mouse};
+        let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+        let rect = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| node.node().label() == Some("Cancel run"))
+            .expect("the actual Details cancellation control is mounted")
+            .node()
+            .bounds()
+            .unwrap();
+        let bounds = Rectangle::new(
+            Point::new(rect.x0 as f32, rect.y0 as f32),
+            Size::new((rect.x1 - rect.x0) as f32, (rect.y1 - rect.y0) as f32),
+        );
+        assert!(Rectangle::with_size(Size::new(900.0, 1100.0)).contains(bounds.center()));
+        bounds
+    }
+
+    fn cancel_pointer(
+        ui: &mut CancelUi<'_>,
+        renderer: &mut cosmic::Renderer,
+        point: cosmic::iced::Point,
+        pressed: bool,
+    ) -> Vec<Action> {
+        use cosmic::iced::{Event, mouse};
+        let mut messages = Vec::new();
+        let event = if pressed {
+            mouse::Event::ButtonPressed(mouse::Button::Left)
+        } else {
+            mouse::Event::ButtonReleased(mouse::Button::Left)
+        };
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                Event::Mouse(event),
+            ],
+            mouse::Cursor::Available(point),
+            renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        messages
+    }
+
+    #[test]
+    fn retained_details_cancel_press_stays_with_its_run_across_coalesced_reads() {
+        use cosmic::iced::runtime::user_interface::Cache;
+        let owner = automation();
+        let a = cancel_detail(&owner);
+        let b = cancel_detail(&owner);
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        for replacement in [false, true] {
+            let mut state = State::default();
+            inspect_cancel_detail(&mut state, &a);
+            let mut ui = cancel_frame(&state, Cache::new(), &mut renderer);
+            let point = cancel_bounds(&ui).center();
+            assert!(cancel_pointer(&mut ui, &mut renderer, point, true).is_empty());
+            let cache = ui.into_cache();
+            let next = if replacement { &b } else { &a };
+            // Real public read + exact reply, coalesced before the next frame.
+            // Rendering a loading frame here would mask this replacement race.
+            inspect_cancel_detail(&mut state, next);
+            let mut ui = cancel_frame(&state, cache, &mut renderer);
+            assert_eq!(
+                cancel_bounds(&ui).center(),
+                point,
+                "same physical control geometry"
+            );
+            let mut messages = cancel_pointer(&mut ui, &mut renderer, point, false);
+            if replacement {
+                assert!(
+                    messages.is_empty(),
+                    "A's press cannot publish B's callback: {messages:?}"
+                );
+                assert!(cancel_pointer(&mut ui, &mut renderer, point, true).is_empty());
+                messages = cancel_pointer(&mut ui, &mut renderer, point, false);
+            }
+            let _ = ui.into_cache();
+            assert_eq!(
+                messages.len(),
+                1,
+                "unchanged release or fresh successor click: {messages:?}"
+            );
+            assert_cancel_request(&mut state, messages.remove(0), next);
+        }
+    }
+
+    #[test]
+    fn unchanged_details_cancel_keeps_native_keyboard_focus_and_replacement_retires_it() {
+        use cosmic::iced::advanced::widget::{Operation, operation};
+        use cosmic::iced::{Rectangle, runtime::user_interface::Cache};
+        struct Focus {
+            bounds: Rectangle,
+            id: Option<widget::Id>,
+            focused: bool,
+        }
+        impl Operation for Focus {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if bounds == self.bounds {
+                    self.id = id.cloned();
+                    self.focused = state.is_focused();
+                }
+            }
+        }
+        let owner = automation();
+        let a = cancel_detail(&owner);
+        let b = cancel_detail(&owner);
+        let mut state = State::default();
+        inspect_cancel_detail(&mut state, &a);
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut ui = cancel_frame(&state, Cache::new(), &mut renderer);
+        let bounds = cancel_bounds(&ui);
+        let mut focus = Focus {
+            bounds,
+            id: None,
+            focused: false,
+        };
+        ui.operate(&renderer, &mut focus);
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(focus.id.expect("actual Cancel button ID")),
+        );
+        let cache = ui.into_cache();
+        inspect_cancel_detail(&mut state, &a);
+        let mut ui = cancel_frame(&state, cache, &mut renderer);
+        let mut focus = Focus {
+            bounds: cancel_bounds(&ui),
+            id: None,
+            focused: false,
+        };
+        ui.operate(&renderer, &mut focus);
+        assert!(
+            focus.focused,
+            "same exact run keeps its native keyboard owner"
+        );
+        let cache = ui.into_cache();
+        inspect_cancel_detail(&mut state, &b);
+        let mut ui = cancel_frame(&state, cache, &mut renderer);
+        let mut focus = Focus {
+            bounds: cancel_bounds(&ui),
+            id: None,
+            focused: false,
+        };
+        ui.operate(&renderer, &mut focus);
+        assert!(
+            !focus.focused,
+            "another run cannot inherit A's native focus"
+        );
     }
 }
 pub fn state_label(state: crate::automations::FiringState) -> &'static str {
