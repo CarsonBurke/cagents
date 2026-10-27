@@ -10,7 +10,7 @@ are not vendored. It declares the focused cagents regression target instead.
 
 Backported fix: [upstream PR #535](https://github.com/pop-os/cosmic-text/pull/535),
 head `0c5d9c507798bcb779e5fbdb48ae339face06f9c` (open when backported),
-with one local boundary correction described below.
+with local boundary and partial-word corrections described below.
 Two library files differ from the published source:
 
 - `src/shape.rs`: after committing a word-wrapped visual line, the final
@@ -24,9 +24,12 @@ Two library files differ from the published source:
   registered in `scripts/qualify-checkout-cache.py` with the other local patches.
 
 The fix is shared by congruent LTR and RTL spans. Incongruent spans traverse
-words backward and use an exclusive end index; that branch is unchanged.
+words backward and use an exclusive end index. When glyph wrapping starts the
+last row inside a word, its remaining glyphs are included in width admission.
+An empty fit ends at that partial-word boundary rather than the full word end,
+so a row with room only for the ellipsis cannot create an inverted glyph slice.
 No source text is trimmed or rewritten. Intentional paragraph indentation,
-internal spaces, glyph wrapping, and one-line ellipsis retain their behavior.
+internal spaces, and one-line ellipsis retain their behavior.
 
 The geometry regression uses the repository's existing Open Sans font and
 `tests/fonts/NotoSansHebrew.ttf` from the same cosmic-text source archive. The
@@ -41,7 +44,11 @@ overwide-word case fails with the upstream-only backport at Word/60/two lines
 boundary correction.
 The height-limit regression separately checks the same continuation boundary
 with overwide LTR, RTL, and mixed-direction text, while preserving the source
-clusters and geometry of preceding unelided rows.
+clusters and geometry of preceding unelided rows. The partial-word regression
+also covers glyph wrapping in both reversed text directions, line and height
+limits, emitted width and source-cluster containment, and the narrow case where
+only the ellipsis fits. These additional regression results require execution;
+source inspection alone does not establish package or native qualification.
 
 ```sh
 CARGO_BUILD_JOBS=2 cargo test --locked -p cosmic-text --test wrapped_ellipsis

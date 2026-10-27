@@ -1639,7 +1639,9 @@ impl ShapeLine {
             }
             (glyph_end, glyphs_w)
         } else {
-            let mut glyph_end = word.glyphs.len();
+            // If no glyph fits, retain an empty range at the current
+            // boundary, including when it is inside a wrapped word.
+            let mut glyph_end = end_glyph_pos;
             for glyph_idx in (start_glyph_pos..end_glyph_pos).rev() {
                 let g_w = word.glyphs[glyph_idx].width(font_size);
                 if currently_used_width + glyphs_w + g_w > total_available_width {
@@ -1779,7 +1781,11 @@ impl ShapeLine {
                 (LayoutDirection::Forward, true, _) => (starting_word_index..word_count).collect(),
                 (LayoutDirection::Forward, false, Some(start)) => {
                     if span_index == start.span {
-                        (0..start.word).rev().collect()
+                        // A glyph-wrapped row can begin inside this word. Its
+                        // unconsumed prefix still contributes width and must
+                        // be considered before earlier words in the span.
+                        let end_word = start.word + usize::from(start.glyph > 0);
+                        (0..end_word).rev().collect()
                     } else {
                         (0..word_count).rev().collect()
                     }
@@ -1871,8 +1877,9 @@ impl ShapeLine {
                         }
                     } else {
                         // For an incongruent span in the forward direction, the
-                        // word indices are (0..start.word).rev(). Cap the VlRange
-                        // end at start.word_glyph_pos() so it doesn't include
+                        // word indices end at the current (possibly partial)
+                        // word. Cap the VlRange end at start.word_glyph_pos()
+                        // so it doesn't include
                         // words beyond start.word that belong to a previous line.
                         // For the backward direction (congruent span), the word
                         // indices are (start.word..word_count).rev() and
