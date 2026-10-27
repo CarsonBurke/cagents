@@ -168,6 +168,9 @@ fn durable_browser_urls_keep_navigation_authority_across_store_reopen() {
     #[cfg(feature = "integrated-browser")]
     assert_eq!(action, BrowserRestoreAction::HydrateIntegrated);
     #[cfg(not(feature = "integrated-browser"))]
-    assert_eq!(action, BrowserRestoreAction::OfferExternal(&expected.current_url));
+    assert_eq!(
+        action,
+        BrowserRestoreAction::OfferExternal(&expected.current_url)
+    );
     store.shutdown().unwrap();
 }
