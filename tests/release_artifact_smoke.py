@@ -143,17 +143,30 @@ class SmokeBoundary(unittest.TestCase):
         self.assertEqual(self.recorded(), [])
         self.assert_clean()
 
-    def test_wrong_distribution_and_symlink_rootfs_reject_before_execution(self):
+    def test_wrong_distribution_rootfs_rejects_before_execution(self):
         for release in ('ID=debian\nVERSION_ID="24.04"\n', 'ID=ubuntu\nVERSION_ID="22.04"\n'):
             with self.subTest(release=release):
                 (self.base / "etc/os-release").write_text(release)
                 self.assertNotEqual(self.invoke().returncode, 0)
                 self.assertEqual(self.recorded(), [])
+        self.assert_clean()
+
+    def test_symlink_rootfs_rejects_before_execution(self):
+        self.assertEqual(
+            (self.base / "etc/os-release").read_text(),
+            'ID=ubuntu\nVERSION_ID="24.04"\n',
+        )
         link = self.directory / "rootfs-link"
         link.symlink_to(self.base)
-        self.assertNotEqual(self.invoke(arguments=["--dist", str(self.dist), "--version", VERSION,
-                                                  "--rootfs", str(link)]).returncode, 0)
+        result = self.invoke(arguments=["--dist", str(self.dist), "--version", VERSION,
+                                        "--rootfs", str(link)])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "missing rootfs; run scripts/prepare-release-smoke-rootfs or provide --rootfs",
+            result.stderr,
+        )
         self.assertEqual(self.recorded(), [])
+        self.assert_clean()
 
     def test_preparation_refuses_unsafe_cache_before_network_or_namespace(self):
         cache = self.directory / "cache"
@@ -183,16 +196,20 @@ class SmokeBoundary(unittest.TestCase):
         cache.mkdir(mode=0o700)
         digest = "6bc2cde3930ad088b3bb46fa45279e96d25bc3810f209850ecbe4722711874f9"
         marker = cache / ".cagents-release-smoke-cache"
-        old = f"cagents-release-smoke-v1 ubuntu-24.04.3 amd64 {digest}\n"
+        old = f"cagents-release-smoke-v2 ubuntu-24.04.3 amd64 {digest}\n"
         marker.write_text(old)
         root = cache / "rootfs"
         root.mkdir()
+        (root / "opt").mkdir()
+        provision_marker = root / "opt/.cagents-release-smoke-provisioned-v2"
+        provision_marker.write_text(old)
         sentinel = root / "existing-data"
         sentinel.write_text("preserve\n")
         result = self.invoke(PREPARE, ["--cache", str(cache)])
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cache marker does not match", result.stderr)
         self.assertEqual(marker.read_text(), old)
+        self.assertEqual(provision_marker.read_text(), old)
         self.assertEqual(sentinel.read_text(), "preserve\n")
         self.assertEqual(self.recorded(), [])
         self.assertFalse(self.network_calls.exists())
@@ -202,7 +219,7 @@ class SmokeBoundary(unittest.TestCase):
         cache.mkdir(mode=0o700)
         digest = "6bc2cde3930ad088b3bb46fa45279e96d25bc3810f209850ecbe4722711874f9"
         (cache / ".cagents-release-smoke-cache").write_text(
-            f"cagents-release-smoke-v2 ubuntu-24.04.3 amd64 {digest}\n"
+            f"cagents-release-smoke-v3 ubuntu-24.04.3 amd64 {digest}\n"
         )
         with (cache / ".lock").open("w") as held:
             fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
