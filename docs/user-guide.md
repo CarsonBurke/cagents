@@ -730,9 +730,11 @@ failed read or a list that changed while you were browsing.
 
 **Approve scheduled work?** shows the saved prompt, schedule and timezone,
 directory, channel, account, model, permissions, and any shell precheck.
-**Not now**, Escape, and the default Enter action leave the request pending;
-they do not decline it. **Approve and enable** atomically creates the schedule
-and its approval receipt; **Decline** creates no schedule. The waiting
+**Not now**, Escape, and the default Enter action only close the review; they
+send no new decision. Closing does not cancel a decision already sent. If a
+response is lost, the outcome may be unknown. Reopen the request to review its
+current state. **Approve and enable** atomically creates the schedule and its
+approval receipt; **Decline** creates no schedule. The waiting
 conversation receives that decision without asking you to copy a terminal
 command. A new request can also appear in Attention or as a desktop alert.
 Choosing its alert loads the current request for review; it never approves it.
