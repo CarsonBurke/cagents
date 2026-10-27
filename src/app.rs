@@ -20228,7 +20228,7 @@ mod tests {
         );
     }
 
-    fn install_window_close_storage(app: &mut Cagents, directory: &Path) {
+    pub(super) fn install_window_close_storage(app: &mut Cagents, directory: &Path) {
         let (writer, _) = SessionRuntime::open(
             directory.join("window.sqlite3"),
             crate::model::BootId::new("window-close-test"),
@@ -20258,7 +20258,7 @@ mod tests {
             })
     }
 
-    fn acknowledge_test_window_close(app: &mut Cagents, window: window::Id) {
+    pub(super) fn acknowledge_test_window_close(app: &mut Cagents, window: window::Id) {
         let task = app.update(Message::WindowCloseRequested(window));
         assert!(app.pending_window_close.is_some());
         assert!(app.exit.is_none());
