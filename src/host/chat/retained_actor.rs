@@ -1689,6 +1689,7 @@ pub(in crate::host) fn reconcile_previous_boot_history(host: &SharedHost) -> Res
                         .map_err(String::as_str)
                 || !inspection.state.close.completed
                 || !inspection.state.close.exited
+                || !inspection.state.installed
                 || inspection.state.owns_work
                 || inspection.state.outbox_ack != inspection.state.outbox_latest
                 || inspection.state.continuity_loss.is_some()

@@ -538,6 +538,10 @@ impl Registry {
             return Ok(false);
         };
         let current = ownership.source();
+        // An installation can ACK before canonical publication fails. Its
+        // immutable Pending intent then still carries ReconnectOnly, while
+        // the authenticated helper has actually issued retained continuity.
+        // That alias is cleanup evidence, never a new execution grant.
         if !source
             .proof
             .as_ref()
@@ -548,11 +552,27 @@ impl Registry {
             || source.launch.recipe != current.launch.recipe
             || source.launch.session_id.is_some()
             || current.launch.session_id.is_none()
-            || source.native_continuity != current.native_continuity
+            || !issued.contains(current)
+            || !issued.contains(retirement_source)
+            || retirement_source.id != current.id
+            || retirement_source.launch != current.launch
+            || !retirement_source
+                .proof
+                .as_ref()
+                .is_some_and(|proof| proof.is_complete() && &proof.boot_id == boot)
+            || retirement_source.terminal != current.terminal
+            || retirement_source.owned_codex_listener != current.owned_codex_listener
+            || source.native_continuity != retirement_source.native_continuity
             || !matches!(
                 current.native_continuity,
+                crate::chat::NativeContinuity::ReconnectOnly
+                    | crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+            )
+            || !matches!(
+                retirement_source.native_continuity,
                 crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
             )
+            || !retirement_source.has_valid_native_continuity()
             || !current.has_valid_native_continuity()
             || current.terminal.is_some()
             || current.owned_codex_listener.is_some()
@@ -1871,7 +1891,7 @@ mod tests {
     fn removed_completed_previous_boot_execution_archives_without_borrowing_cleanup_authority() {
         use crate::daemon::holder_registry::{Kind, Process, Record};
         use crate::workspace_model::views::{Pane, Scope};
-        for case in 0..11 {
+        for case in 0..13 {
             let (mut registry, directory, request) = fixture();
             let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
             let HostedSession::Chat(mut current) = source() else {
@@ -1935,11 +1955,15 @@ mod tests {
                 holder: Process { pid: 42, start: 1 },
                 root: Process { pid: 43, start: 2 },
             };
+            let mut pending = current.clone();
+            if case >= 11 {
+                pending.native_continuity = crate::chat::NativeContinuity::ReconnectOnly;
+            }
             registry
                 .register_pending_native_actor_ownership(
                     actor,
                     &owner,
-                    &current,
+                    &pending,
                     Err("unit fixture has no account authority"),
                 )
                 .unwrap();
@@ -1984,9 +2008,9 @@ mod tests {
                     )
                     .unwrap();
             }
-            if case == 8 {
+            if case == 8 || case >= 11 {
                 registry
-                    .fresh_agent_authority(&HostedSession::Chat(current.clone()))
+                    .fresh_agent_authority(&HostedSession::Chat(pending.clone()))
                     .unwrap();
             }
             if case == 9 {
@@ -2015,6 +2039,9 @@ mod tests {
                 registry.db.execute_batch("CREATE TRIGGER reject_history_archive BEFORE UPDATE OF closed ON agents BEGIN SELECT RAISE(FAIL, 'fixture archive failure'); END;").unwrap();
             }
             let mut issued = vec![current.clone()];
+            if case == 11 {
+                issued.push(pending);
+            }
             if case == 10 {
                 let mut earlier = current.clone();
                 earlier.proof.as_mut().unwrap().host_incarnation =
@@ -2043,12 +2070,12 @@ mod tests {
                 ),
                 _ => assert_eq!(
                     result.unwrap_or_else(|error| panic!("case {case}: {error}")),
-                    case == 0 || case == 8,
+                    case == 0 || case == 8 || case == 11,
                     "case {case}"
                 ),
             }
             let mut expected = before.clone();
-            expected.closed = case == 0 || case == 8;
+            expected.closed = case == 0 || case == 8 || case == 11;
             assert_eq!(
                 registry.agent(accepted.agent.id).unwrap(),
                 expected,
@@ -2069,7 +2096,7 @@ mod tests {
                 registry.native_actor_retirement(actor).unwrap().is_none(),
                 "archival is not retirement proof"
             );
-            if case == 8 {
+            if case == 8 || case == 11 {
                 // Production calls this only after verified helper retirement.
                 // Archival itself retained the current source capability.
                 registry
