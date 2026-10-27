@@ -1345,7 +1345,7 @@ mod tests {
 
         let label = "Pending wrapped follow-up: review the wide conversation transcript, then resize to the narrow window and confirm that this deliberately long checklist label wraps onto multiple lines while its number and unchecked box stay aligned with the first line; nested completed tasks and ordinary numbered items must remain readable and unchanged.";
         let source = format!(
-            "8. [x] Finished\n9. [ ] {label}\n   1. [x] Nested finished\n   2. Ordinary nested item\n\n- [ ] Unordered pending\n- Ordinary bullet\n"
+            "Ordered checklist\n\n8. [x] Finished\n9. [ ] Pending\n   1. [x] Nested finished\n   2. Ordinary nested item\n\n10. [ ] {label}\n\n- [ ] Unordered pending\n- Ordinary bullet\n\nThe numbered checklist must show both numbering and completion state. Task markers are read-only transcript content.\n"
         );
         let cached = CachedItem::new(
             &ItemContent::Text {
@@ -1390,11 +1390,12 @@ mod tests {
                     .filter(|node| node.node().role() == Role::CheckBox)
                     .map(|node| node.node().bounds().expect("actual checkbox geometry"))
                     .collect();
-                assert_eq!(checks.len(), 4);
+                assert_eq!(checks.len(), 5);
                 for (index, number, body) in [
                     (0, "8.", "Finished"),
-                    (1, "9.", label),
+                    (1, "9.", "Pending"),
                     (2, "1.", "Nested finished"),
+                    (3, "10.", label),
                 ] {
                     let number = nodes
                         .iter()
@@ -1416,7 +1417,7 @@ mod tests {
                     assert!(check.y0 >= text.y0 - 0.01);
                     assert!(check.y1 <= text.y0 + line + 0.01);
                     assert!((number.y0 - text.y0).abs() <= 0.01);
-                    if index == 1 {
+                    if index == 3 {
                         assert!(text.y1 - text.y0 > line, "the label must actually wrap");
                         heights.push(text.y1 - text.y0);
                     }
@@ -1462,7 +1463,13 @@ mod tests {
                         .filter(|node| node.node().role() == Role::CheckBox)
                         .map(|node| node.node().is_selected())
                         .collect::<Vec<_>>(),
-                    [Some(true), Some(false), Some(true), Some(false)],
+                    [
+                        Some(true),
+                        Some(false),
+                        Some(true),
+                        Some(false),
+                        Some(false)
+                    ],
                 );
             }
             assert!(
