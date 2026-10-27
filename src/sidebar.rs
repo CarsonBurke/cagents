@@ -16017,7 +16017,7 @@ pub(crate) mod tests {
                 menu_buttons(child, result);
             }
         }
-        let mut unscrolled_row_y = None;
+        let mut unscrolled_row_y: Option<f64> = None;
         for scroll in [0.0, 80.0] {
             let sidebar = Sidebar::roomy();
             let bounds = Size::new(360.0, 640.0);
