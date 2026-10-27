@@ -2031,10 +2031,21 @@ mod tests {
                 .unwrap();
             let result =
                 registry.archive_previous_boot_execution(&ownership, &boot, &issued, &current);
-            if case == 7 || case == 9 {
-                assert!(result.is_err());
-            } else {
-                assert_eq!(result.unwrap(), case == 0 || case == 8, "case {case}");
+            match case {
+                7 => assert!(
+                    result.unwrap_err().contains("fixture archive failure"),
+                    "case {case}"
+                ),
+                9 => assert_eq!(
+                    result.unwrap_err(),
+                    "Historical cleanup census key changed its actor identity",
+                    "case {case}"
+                ),
+                _ => assert_eq!(
+                    result.unwrap_or_else(|error| panic!("case {case}: {error}")),
+                    case == 0 || case == 8,
+                    "case {case}"
+                ),
             }
             let mut expected = before.clone();
             expected.closed = case == 0 || case == 8;
@@ -2071,8 +2082,17 @@ mod tests {
                         .is_none()
                 );
             }
+            if case == 7 {
+                // Remove only our injected fault after proving full rollback;
+                // the normal reopen must still enforce the published layout.
+                registry
+                    .db
+                    .execute_batch("DROP TRIGGER reject_history_archive;")
+                    .unwrap();
+            }
             drop(registry);
-            let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+            let registry = Registry::at(&directory.path().join("model.sqlite3"))
+                .unwrap_or_else(|error| panic!("reopen case {case}: {error}"));
             assert_eq!(registry.agent(accepted.agent.id).unwrap(), expected);
             assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
         }
