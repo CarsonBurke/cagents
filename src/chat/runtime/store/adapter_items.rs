@@ -1068,4 +1068,68 @@ mod tests {
         );
         commit(&store, adapter.as_mut(), result);
     }
+    #[test]
+    fn reload_coverage_cannot_promote_shortened_identity_with_equal_stored_bytes() {
+        let resident = Arc::new(Mutex::new(Store::new().unwrap()));
+        let body = "complete original body";
+        let item = Item {
+            id: "shortened".into(),
+            role: Role::Assistant,
+            at: None,
+            started_at: None,
+            content: ItemContent::Tool {
+                name: "x".repeat(METADATA_LIMIT + 1),
+                input: body.into(),
+                output: String::new(),
+                status: crate::chat::ToolStatus::Running,
+            },
+        };
+        resident.lock().unwrap().apply(Event::Item(item)).unwrap();
+        let original: Vec<u8> = resident
+            .lock()
+            .unwrap()
+            .db
+            .query_row(
+                "SELECT metadata FROM items WHERE id='shortened'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut literal: Item = postcard::from_bytes(&original).unwrap();
+        let ItemContent::Tool { input, .. } = &mut literal.content else {
+            panic!("actual shortened Tool")
+        };
+        *input = body.into();
+        let reloaded = Arc::new(Mutex::new(Store::new().unwrap()));
+        reloaded
+            .lock()
+            .unwrap()
+            .apply(Event::History {
+                items: vec![literal],
+                has_earlier: false,
+            })
+            .unwrap();
+        let same: Vec<u8> = reloaded
+            .lock()
+            .unwrap()
+            .db
+            .query_row(
+                "SELECT metadata FROM items WHERE id='shortened'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(original, same);
+        let key = CanonicalItemKey::new(None, "shortened");
+        assert!(reader(&resident).read(&key).is_err());
+        assert!(reader(&reloaded).read(&key).unwrap().is_some());
+        assert!(
+            !resident
+                .lock()
+                .unwrap()
+                .is_covered_by(&reloaded.lock().unwrap())
+                .unwrap(),
+            "equal presentation bytes cannot replace the original shortened-source refusal with literal complete authority"
+        );
+    }
 }

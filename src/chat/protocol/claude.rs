@@ -635,7 +635,7 @@ impl Claude {
                 (status, matches!(item.content, ItemContent::Tool { .. })),
             );
         }
-        if parent.is_none() {
+        if key.parent.is_none() {
             self.hidden_task_rows.remove(&item.id);
         }
         self.tools.insert(parent, item);
@@ -663,7 +663,7 @@ impl Claude {
     }
     fn cached_tool(&self, parent: Option<&str>, id: &str) -> Result<Option<Item>, String> {
         let key = super::CanonicalItemKey::new(parent, id);
-        let hidden = parent.is_none() && self.hidden_task_rows.contains(id);
+        let hidden = key.agent_id.is_none() && self.hidden_task_rows.contains(id);
         let mut item = if let Some(item) = self.tools.get(parent, id) {
             if let Some(reader) = &self.item_reader {
                 if self.tools.pending(parent, id) {
@@ -6237,6 +6237,13 @@ mod tests {
         }
         assert!(adapter.tools.get(None, "claude-task:task").is_none());
         assert!(adapter.hidden_task_rows.contains("claude-task:task"));
+        assert!(
+            adapter
+                .cached_tool(Some(""), "claude-task:task")
+                .unwrap()
+                .is_some(),
+            "empty parent aliases the same structural root namespace"
+        );
         let source = adapter
             .cached_tool(None, "claude-task:task")
             .unwrap()

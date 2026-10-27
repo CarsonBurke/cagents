@@ -149,23 +149,24 @@ impl Store {
         }
         let mut items = self
             .db
-            .prepare("SELECT id,metadata,len0,len1,len2,spans FROM items ORDER BY ordinal")
+            .prepare("SELECT id,metadata,len0,len1,len2,spans,source_shortened FROM items ORDER BY ordinal")
             .map_err(|error| error.to_string())?;
         let mut rows = items.query([]).map_err(|error| error.to_string())?;
         let mut last_ordinal = None;
         while let Some(row) = rows.next().map_err(|error| error.to_string())? {
             let id: String = row.get(0).map_err(|error| error.to_string())?;
-            let resident: (Vec<u8>, i64, i64, i64, Vec<u8>) = (
+            let resident: (Vec<u8>, i64, i64, i64, Vec<u8>, bool) = (
                 row.get(1).map_err(|error| error.to_string())?,
                 row.get(2).map_err(|error| error.to_string())?,
                 row.get(3).map_err(|error| error.to_string())?,
                 row.get(4).map_err(|error| error.to_string())?,
                 row.get(5).map_err(|error| error.to_string())?,
+                row.get(6).map_err(|error| error.to_string())?,
             );
-            let loaded: Option<(i64, (Vec<u8>, i64, i64, i64, Vec<u8>))> = reloaded
+            let loaded: Option<(i64, (Vec<u8>, i64, i64, i64, Vec<u8>, bool))> = reloaded
                 .db
                 .query_row(
-                    "SELECT ordinal,metadata,len0,len1,len2,spans FROM items WHERE id=?1",
+                    "SELECT ordinal,metadata,len0,len1,len2,spans,source_shortened FROM items WHERE id=?1",
                     [&id],
                     |row| {
                         Ok((
@@ -176,6 +177,7 @@ impl Store {
                                 row.get(3)?,
                                 row.get(4)?,
                                 row.get(5)?,
+                                row.get(6)?,
                             ),
                         ))
                     },
