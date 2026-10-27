@@ -1145,3 +1145,244 @@ fn foreign_project_watch_reads_reconnect_and_decision_receipts_refresh_the_globa
     assert!(app.automation_approval.global.pending.is_empty());
     assert!(app.automation_approval.global.flight.is_none());
 }
+
+#[test]
+fn notice_open_queued_during_delivery_keeps_the_latest_exact_subject_after_clock_advance() {
+    for latest_b in [false, true] {
+        let mut app = app();
+        let a = proposal(200);
+        let b = proposal(201);
+        let page: Vec<_> = (1..=64).map(proposal).collect();
+        let identity = app.workspace_model.identity;
+        let initial = flight(&app);
+        drop(complete(
+            &mut app,
+            initial,
+            Ok(delivery(identity, 1, 66, &page)),
+        ));
+        let key = app.automation_approval.global.key.unwrap();
+        assert!(app.automation_approval.global.flight.is_none());
+        drop(
+            app.update(Message::NotificationUi(notification_ui::Action::HostBound(
+                crate::model::HostSessionProof {
+                    host_session_id: crate::model::HostSessionId::new("queued-notice"),
+                    boot_id: crate::model::BootId::new("queued-notice"),
+                    host_incarnation: crate::model::HostIncarnation::new("queued-notice"),
+                },
+            ))),
+        );
+        model(&mut app, identity, 2, false);
+        let held_delivery = flight(&app);
+        assert!(matches!(held_delivery.2, Read::Delivery));
+        let generation = app.automation_approval.generation;
+        let focused = app.workspace.focused();
+        let destination = app.active_workspace_destination();
+        for selected in std::iter::once(&a).chain(latest_b.then_some(&b)) {
+            drop(
+                app.update(Message::NotificationUi(notification_ui::Action::Activated(
+                    crate::notifications::Target::AutomationProposal {
+                        registry: identity,
+                        id: selected.id,
+                        revision: selected.revision,
+                    },
+                ))),
+            );
+            assert_eq!(flight(&app), held_delivery);
+            assert!(matches!(
+                &app.automation_approval.global.wanted,
+                Some(Read::Open { key: queued, id, revision, .. })
+                    if *queued == key && *id == selected.id && *revision == selected.revision
+            ));
+        }
+        let selected = if latest_b { &b } else { &a };
+        assert!(!app.modal_is_open());
+        // The activated subject is beyond the first 64 rows. An unrelated
+        // creation advances the delivery clock without changing its consent.
+        drop(complete(
+            &mut app,
+            held_delivery.clone(),
+            Ok(delivery(identity, 2, 67, &page)),
+        ));
+        let current = flight(&app);
+        let Read::Open {
+            key: current_key,
+            id,
+            revision,
+            generation: current_generation,
+            focused: current_focus,
+            destination: current_destination,
+        } = &current.2
+        else {
+            panic!("the explicit notice still owns the next full review");
+        };
+        let rekeyed = *current_key;
+        assert_eq!(current_key.identity, identity);
+        assert_eq!(current_key.epoch, key.epoch);
+        assert_eq!((*id, *revision), (selected.id, selected.revision));
+        assert_eq!(*current_generation, generation);
+        assert_eq!(*current_focus, focused);
+        assert_eq!(*current_destination, destination);
+        assert!(app.automation_approval.available.is_none());
+        let duplicate = complete(
+            &mut app,
+            held_delivery,
+            Ok(delivery(identity, 1, 66, &page)),
+        );
+        assert_eq!(duplicate.units(), 0);
+        drop(duplicate);
+        assert_eq!(
+            flight(&app),
+            current,
+            "an old delivery cannot release this read"
+        );
+        drop(complete(&mut app, current, Ok(review(identity, selected))));
+        assert_eq!(
+            app.automation_approval.proposal.as_ref(),
+            Some(selected),
+            "a queued notice must open its exact full review after the delivery clock advances"
+        );
+        assert_eq!(rekeyed.sequence, 2);
+        assert_eq!(
+            app.automation_approval.global.reviewed_identity,
+            Some(identity)
+        );
+        assert_eq!(app.automation_approval.generation, generation + 1);
+        assert_eq!(app.automation_approval.focus, 0, "Not now remains neutral");
+        assert!(!app.automation_approval.deciding);
+        assert!(app.automation_approval.global.flight.is_none());
+        assert!(app.automation_approval.global.wanted.is_none());
+    }
+}
+
+#[test]
+fn delivery_clock_rekey_does_not_survive_reconnect_or_registry_replacement() {
+    for replacement in [false, true] {
+        let mut app = app();
+        let a = proposal(1);
+        let key = install(&mut app, &[a.clone()]);
+        drop(
+            app.update(Message::NotificationUi(notification_ui::Action::HostBound(
+                crate::model::HostSessionProof {
+                    host_session_id: crate::model::HostSessionId::new("retired-notice"),
+                    boot_id: crate::model::BootId::new("retired-notice"),
+                    host_incarnation: crate::model::HostIncarnation::new("retired-notice"),
+                },
+            ))),
+        );
+        model(&mut app, key.identity, 2, false);
+        let old = flight(&app);
+        drop(
+            app.update(Message::NotificationUi(notification_ui::Action::Activated(
+                crate::notifications::Target::AutomationProposal {
+                    registry: key.identity,
+                    id: a.id,
+                    revision: a.revision,
+                },
+            ))),
+        );
+        assert!(matches!(
+            app.automation_approval.global.wanted,
+            Some(Read::Open { .. })
+        ));
+        let identity = if replacement {
+            uuid::Uuid::from_u128(50_000)
+        } else {
+            key.identity
+        };
+        model(&mut app, identity, 3, true);
+        assert_eq!(flight(&app), old, "retirement retains the physical slot");
+        assert!(app.automation_approval.global.wanted.is_none());
+        assert!(app.automation_approval.global.latest_open.is_none());
+        drop(complete(
+            &mut app,
+            old,
+            Ok(delivery(key.identity, 2, 1, &[a.clone()])),
+        ));
+        let current = flight(&app);
+        assert!(matches!(current.2, Read::Delivery));
+        assert!(current.1 > key.epoch);
+        drop(complete(
+            &mut app,
+            current,
+            Ok(delivery(identity, 3, 1, &[a])),
+        ));
+        assert!(!app.modal_is_open());
+        assert!(app.automation_approval.proposal.is_none());
+        assert!(app.automation_approval.global.authorized.is_none());
+        assert!(app.automation_approval.global.reviewed_identity.is_none());
+        assert!(app.automation_approval.global.flight.is_none());
+    }
+}
+
+#[test]
+fn rekeyed_notice_open_still_refuses_foreign_revision_focus_and_transport_results() {
+    for refusal in ["identity", "revision", "focus", "transport"] {
+        let mut app = app();
+        let a = proposal(1);
+        let key = install(&mut app, &[a.clone()]);
+        drop(
+            app.update(Message::NotificationUi(notification_ui::Action::HostBound(
+                crate::model::HostSessionProof {
+                    host_session_id: crate::model::HostSessionId::new("refused-notice"),
+                    boot_id: crate::model::BootId::new("refused-notice"),
+                    host_incarnation: crate::model::HostIncarnation::new("refused-notice"),
+                },
+            ))),
+        );
+        model(&mut app, key.identity, 2, false);
+        let held = flight(&app);
+        drop(
+            app.update(Message::NotificationUi(notification_ui::Action::Activated(
+                crate::notifications::Target::AutomationProposal {
+                    registry: key.identity,
+                    id: a.id,
+                    revision: a.revision,
+                },
+            ))),
+        );
+        drop(complete(
+            &mut app,
+            held,
+            Ok(delivery(key.identity, 2, 1, &[a.clone()])),
+        ));
+        let current = flight(&app);
+        assert!(matches!(current.2, Read::Open { id, revision, .. }
+            if id == a.id && revision == a.revision));
+        let generation = app.automation_approval.generation;
+        let response = match refusal {
+            "identity" => Ok(review(uuid::Uuid::from_u128(60_000), &a)),
+            "revision" => {
+                let mut changed = a.clone();
+                changed.revision += 1;
+                Ok(review(key.identity, &changed))
+            }
+            "focus" => {
+                let window = cosmic::iced::window::Id::RESERVED;
+                app.core.set_main_window_id(Some(window));
+                drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+                    window, false,
+                ))));
+                assert!(!app.refresh_ui.focused);
+                Ok(review(key.identity, &a))
+            }
+            "transport" => Err("synthetic scoped full-review refusal".into()),
+            _ => unreachable!(),
+        };
+        drop(complete(&mut app, current, response));
+        assert!(!app.modal_is_open(), "{refusal}");
+        assert!(app.automation_approval.proposal.is_none(), "{refusal}");
+        assert!(app.automation_approval.available.is_none(), "{refusal}");
+        assert!(
+            app.automation_approval.global.authorized.is_none(),
+            "{refusal}"
+        );
+        assert!(
+            app.automation_approval.global.latest_open.is_none(),
+            "{refusal}"
+        );
+        assert!(!app.automation_approval.deciding, "{refusal}");
+        assert_eq!(app.automation_approval.generation, generation, "{refusal}");
+        assert!(app.automation_approval.global.flight.is_none(), "{refusal}");
+        assert!(app.automation_approval.global.wanted.is_none(), "{refusal}");
+    }
+}
