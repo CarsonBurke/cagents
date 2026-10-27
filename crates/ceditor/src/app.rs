@@ -3626,6 +3626,7 @@ impl Application for Editor {
                     let Some(tab) = self.tab_mut(id) else {
                         return Task::none();
                     };
+                    let restoring_reload = tab.runtime.retains_reload_buffer();
                     let listing_changed = matches!(
                         &action,
                         RepositoryAction::FilesLoaded { result: Ok(_), .. }
@@ -3681,11 +3682,17 @@ impl Application for Editor {
                             }
                         }
                     }
-                    if focus_loaded && let Some(target) = tab.runtime.loaded_focus_target(id) {
-                        tasks.push(workspace_widget::focus_after_loading(
-                            cagents::repository_widget::editor_focus_id(id),
-                            target,
-                        ));
+                    if focus_loaded {
+                        if restoring_reload {
+                            if let Some(target) = tab.runtime.loaded_focus_target(id) {
+                                tasks.push(workspace_widget::focus_after_loading(
+                                    cagents::repository_widget::editor_focus_id(id),
+                                    target,
+                                ));
+                            }
+                        } else {
+                            tasks.push(tab.runtime.focus_editor(id).map(cosmic::Action::App));
+                        }
                     }
                     if find_preferences_changed {
                         let (options, preserve) = self.tab(id).unwrap().runtime.find_preferences();

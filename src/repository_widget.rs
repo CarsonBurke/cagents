@@ -3770,6 +3770,16 @@ impl RepositoryRuntime {
         Some(target)
     }
 
+    /// Whether the pending explicit Reload still owns its predecessor.
+    pub fn retains_reload_buffer(&self) -> bool {
+        matches!(
+            &self.document,
+            DocumentState::Loading {
+                predecessor: Some(_)
+            }
+        )
+    }
+
     /// The control a completed read restores when no other control owns input.
     /// A retained Reload keeps a focused Find field with its predecessor.
     pub fn loaded_focus_target(&self, card: CardId) -> Option<widget::Id> {

@@ -199,6 +199,7 @@ async fn dirty_buffer_survives_change_deletion_and_explicit_reload() {
     assert_eq!(runtime.editor_text().as_deref(), Some("my unsaved edits"));
     std::fs::write(&path, "replacement").unwrap();
     let task = runtime.update(RepositoryAction::Reload { card });
+    assert!(runtime.retains_reload_buffer());
     let mut stream = iced::runtime::task::into_stream(task).unwrap();
     let mut completed_read = None;
     while let Some(action) = stream.next().await {
@@ -230,6 +231,7 @@ async fn dirty_buffer_survives_change_deletion_and_explicit_reload() {
     settle(&mut runtime, task).await;
     assert_eq!(runtime.editor_text().as_deref(), Some("my unsaved edits"));
     assert!(!runtime.original_read_attested);
+    assert!(!runtime.retains_reload_buffer());
     assert!(
         runtime
             .save_error()
