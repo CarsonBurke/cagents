@@ -488,6 +488,7 @@ fn real_failed_cleanup_attachment_recovers_the_same_provider_without_closing_it(
         },
     )
     .unwrap();
+    fixture.host.lock().unwrap().register_client(13);
     for preview in [false, true] {
         let previous = fixture
             .host
@@ -522,7 +523,7 @@ fn real_failed_cleanup_attachment_recovers_the_same_provider_without_closing_it(
                 "recovered cleanup must be checkpointable: {impact:?}"
             );
         }
-        let attached = fixture.attach(12, &resolved).unwrap();
+        let attached = fixture.attach(13, &resolved).unwrap();
         assert!(matches!(attached, ServerResponse::ChatAttached { .. }));
         assert!(!fixture.handle().is_close_only());
         assert_eq!(
