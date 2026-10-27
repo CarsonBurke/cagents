@@ -6345,10 +6345,7 @@ impl Cagents {
         let skills = if session.is_unstarted() {
             self.open_chat_draft(card_id, session)
         } else {
-            let intent = if matches!(
-                session.native_continuity,
-                chat::NativeContinuity::Durable { .. }
-            ) {
+            let intent = if session.native_continuity.retains_provider() {
                 chat::Intent::Restore
             } else {
                 chat::Intent::Start
@@ -6895,11 +6892,7 @@ impl Cagents {
         };
         if !pending
             && session.proof.is_some()
-            && (session.owns_codex_listener()
-                || matches!(
-                    session.native_continuity,
-                    chat::NativeContinuity::Durable { .. }
-                ))
+            && (session.owns_codex_listener() || session.native_continuity.retains_provider())
         {
             let target = self.chat_ui.next_target(card);
             self.chat_ui.phases.insert(
@@ -19227,6 +19220,58 @@ mod tests {
             Ok(()),
         )));
         assert!(!app.card_state(card).unwrap().existence.is_open());
+    }
+
+    #[test]
+    fn retained_claude_insert_restores_and_failed_disconnected_close_preserves_its_pane() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut source = chat::fresh_session(
+            Provider::Claude,
+            TerminalId::new(),
+            directory.path().into(),
+            &crate::account::Account::system(Provider::Claude),
+        )
+        .unwrap();
+        source.launch.session_id = Some("f0e49307-af96-4edd-b23f-60b185fe4fea".into());
+        source.proof = Some(crate::model::HostSessionProof {
+            host_session_id: "saved-owner".into(),
+            boot_id: "fixture-boot".into(),
+            host_incarnation: "saved-incarnation".into(),
+        });
+        source.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        drop(app.insert_chat_card(source.clone(), None, None));
+        let card = app.workspace.focused().unwrap();
+        assert_eq!(
+            app.chat_ui.attempt(card).unwrap().intent,
+            chat::Intent::Restore
+        );
+        // Simulate a disconnected pane after its restore attempt settled. No
+        // provider or control task is executed by this UI admission fixture.
+        app.chat_ui.phases.remove(&card);
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+            panic!("native pane")
+        };
+        runtime.disconnected = true;
+        runtime.replace_draft(text_editor::Content::with_text("  keep this draft 🦀\n"));
+        runtime
+            .attachments
+            .push(Attachment::file("/fixture/unsent-image.png"));
+        let draft = runtime.composer.text();
+        let attachments = runtime.attachments.clone();
+        drop(app.begin_chat_close(card));
+        assert!(app.chat_close_owned(card));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        let target = app.chat_ui.phases[&card].target();
+        drop(app.handle_chat_ui(Action::RetainedCloseFinished(
+            target,
+            source.clone(),
+            Err("exact cleanup was refused".into()),
+        )));
+        assert_eq!(app.chat_return_session(card), Some(source));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert_eq!(chat_runtime(&app, card).composer.text(), draft);
+        assert_eq!(chat_runtime(&app, card).attachments, attachments);
     }
 
     #[test]
