@@ -1660,12 +1660,54 @@ mod tests {
 /// Convenience boundary for background UI/CLI tasks; all paths are interpreted
 /// by the daemon selected for this process.
 pub fn request(operation: Operation) -> Result<Reply, String> {
-    let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
-    crate::control::ControlClient::connect(&socket)
-        .map_err(|error| error.to_string())?
+    let authority = crate::agent_execution::Authority::from_environment();
+    request_as(
+        operation,
+        authority,
+        crate::control::daemon_autostart_disabled(),
+        crate::device::is_remote(),
+        || crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string()),
+        || crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string()),
+    )
+}
+
+fn request_as(
+    operation: Operation,
+    authority: crate::agent_execution::Authority,
+    no_start: bool,
+    remote: bool,
+    selected_socket: impl FnOnce() -> Result<PathBuf, String>,
+    ready_socket: impl FnOnce() -> Result<PathBuf, String>,
+) -> Result<Reply, String> {
+    // Resolving a remote socket can launch its SSH bridge before authentication.
+    // Device operations are reserved for User, so refuse scoped remote callers
+    // before either resolver can create transport or start a remote daemon.
+    if remote && authority.token().is_some() {
+        return Err(
+            "Device operations from an agent session require a user terminal on the remote device"
+                .into(),
+        );
+    }
+    // Presence, including an empty/invalid capability, must never become User
+    // startup or scope. Use the same captured authority after resolving a socket.
+    let socket = if authority.token().is_some() || no_start {
+        selected_socket()?
+    } else {
+        ready_socket()?
+    };
+    let mut client =
+        crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+    client
+        .authenticate(authority)
+        .map_err(|error| error.to_string())?;
+    client
         .device_operation(operation)
         .map_err(|error| error.to_string())
 }
+
+#[cfg(test)]
+mod request_tests;
+
 #[cfg(any(feature = "ui", feature = "host"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountSnapshot {
