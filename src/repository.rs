@@ -4499,24 +4499,37 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
     ) -> Result<(ProcessOutput, bool), RepositoryError> {
         let Some(limit) = limit else {
-            return self.run_checked(command, cancellation).map(|output| (output, false)).map_err(Into::into);
+            return self
+                .run_checked(command, cancellation)
+                .map(|output| (output, false))
+                .map_err(Into::into);
         };
         let physical_records = match format {
             status_limit::Format::Status => limit.saturating_mul(2).saturating_add(16),
             status_limit::Format::Numstat => limit.saturating_mul(3),
             status_limit::Format::Files => limit,
         };
-        let command = command.clone().output_limits(64 * 1024 * 1024, command.stderr_limit);
-        let prefix = self.executor.execute_nul_prefix(&command, cancellation, physical_records)
+        let command = command
+            .clone()
+            .output_limits(64 * 1024 * 1024, command.stderr_limit);
+        let prefix = self
+            .executor
+            .execute_nul_prefix(&command, cancellation, physical_records)
             .inspect_err(|failure| log_git_failure(&command, failure))?;
         let mut output = prefix.output;
         if !output.success {
             return Err(git_failure(&command, output).into());
         }
-        let (length, truncated) = match status_limit::prefix(&output.stdout, limit, prefix.truncated, format) {
-            Ok((prefix, truncated)) => (prefix.len(), truncated),
-            Err(error) => return Err(RepositoryError::InvalidGitOutput { error, process: output }),
-        };
+        let (length, truncated) =
+            match status_limit::prefix(&output.stdout, limit, prefix.truncated, format) {
+                Ok((prefix, truncated)) => (prefix.len(), truncated),
+                Err(error) => {
+                    return Err(RepositoryError::InvalidGitOutput {
+                        error,
+                        process: output,
+                    });
+                }
+            };
         output.stdout.truncate(length);
         Ok((output, truncated))
     }
@@ -8376,7 +8389,31 @@ mod tests {
         assert!(!complete.listing_truncated);
         let commands = service.executor.commands.lock().unwrap();
         assert_eq!(commands[0].stdout_limit, 64 * 1024 * 1024);
-        assert_eq!(commands[1].stdout_limit, service.working_files_command(Path::new("/repo")).stdout_limit);
+        assert_eq!(
+            commands[1].stdout_limit,
+            service
+                .working_files_command(Path::new("/repo"))
+                .stdout_limit
+        );
+    }
+
+    #[test]
+    fn watch_projection_rejects_a_natural_partial_record_before_the_capture_cap() {
+        let malformed = b"H complete.txt\0H incomplete.txt";
+        let service = fake_service(vec![success(malformed)]);
+        let error = service
+            .watch_files_projection(Path::new("/repo"), 10, &CancellationToken::new())
+            .unwrap_err();
+        match error {
+            RepositoryError::InvalidGitOutput {
+                error: GitParseError::Truncated { format },
+                process,
+            } => {
+                assert_eq!(format, "git ls-files");
+                assert_eq!(process.stdout, malformed);
+            }
+            other => panic!("natural malformed output must fail, got {other:?}"),
+        }
     }
 
     #[test]
@@ -8791,7 +8828,7 @@ mod tests {
         };
         let failure = || {
             Ok(ProcessOutput {
-                    exit_code: Some(128),
+                exit_code: Some(128),
                 signal: None,
                 success: false,
                 stdout: Vec::new(),
@@ -13516,7 +13553,7 @@ mod tests {
                     success(b""),
                     success(format!("{endpoint}\n").as_bytes()),
                     Ok(ProcessOutput {
-                                    exit_code: Some(128),
+                        exit_code: Some(128),
                         signal: None,
                         success: false,
                         stdout: Vec::new(),
