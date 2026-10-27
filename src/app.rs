@@ -7050,8 +7050,11 @@ impl Cagents {
         main.push(design::horizontal_rule());
         if review.selected().is_some() {
             main.push(
-                repository_widget::view_with_review(id, &pane.runtime, Some(review))
-                    .map(Message::Repository),
+                repository_widget::guard_consumed_input(
+                    repository_widget::view_with_review(id, &pane.runtime, Some(review)),
+                    &self.terminal_review_input,
+                )
+                .map(Message::Repository),
             );
         } else {
             let prompt = if review.is_open() {
@@ -9935,7 +9938,11 @@ impl Cagents {
                 })
                 .into(),
             Some(CardRuntime::Repository(runtime)) => {
-                repository_widget::view(id, runtime).map(Message::Repository)
+                repository_widget::guard_consumed_input(
+                    repository_widget::view(id, runtime),
+                    &self.terminal_review_input,
+                )
+                .map(Message::Repository)
             }
             Some(CardRuntime::PullRequests(pane)) => self.pull_request_card_view(id, pane),
             Some(CardRuntime::Settings) => settings_ui::settings_pane(
@@ -28058,6 +28065,253 @@ mod tests {
             focused(&app, initial.chain(Task::batch(tasks))),
             Some(repository_widget::editor_focus_id(pane)),
             "a freshly opened editor must receive typing without a body click"
+        );
+    }
+
+    #[test]
+    fn native_palette_held_enter_cannot_edit_a_freshly_focused_repository() {
+        use iced::runtime::core::keyboard::input::{PressCycle, Source, Transition};
+        use iced::{
+            Size,
+            advanced::{
+                clipboard,
+                widget::{Operation, operation},
+            },
+            keyboard::key::{Code, Named, Physical},
+            mouse,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let original = "fresh source\n";
+        std::fs::write(directory.path().join("notes.txt"), original).unwrap();
+        let (mut app, pane) = editing_repository_app();
+        app.context_inspector_open = false;
+        app.refresh_ui.focused = true;
+        app.window_width = 1900.0;
+        let view = RepositoryView {
+            project: ProjectId::new(),
+            repository: directory.path().into(),
+            worktree: directory.path().into(),
+            selected_file: None,
+        };
+        app.card_state_mut(pane).unwrap().kind = CardKind::Repository(view.clone());
+        let mut runtime = RepositoryRuntime::new_directory(view);
+        let load = runtime.update(RepositoryAction::OpenFile {
+            card: pane,
+            path: "notes.txt".into(),
+        });
+        app.cards
+            .insert(pane, CardRuntime::Repository(Box::new(runtime)));
+        let viewport = app.workspace.resize_viewport(1200.0);
+        drop(app.apply_viewport(viewport, false, false));
+        assert!(app.card_holds_keyboard(pane));
+        // Preserve the actual loading tree's header focus. Main's completed
+        // file-read focus operation must move it into the newly mounted editor.
+        let mut renderer = headless_renderer();
+        let mut loading = iced::runtime::UserInterface::build(
+            app.card_view(pane, true, false),
+            Size::new(1200.0, 800.0),
+            iced::runtime::user_interface::Cache::default(),
+            &mut renderer,
+        );
+        loading.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(app.card_header_widget_id(pane)),
+        );
+        let cache = loading.into_cache();
+
+        let worktree = directory.path().to_path_buf();
+        app.sidebar_model.projects = vec![SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "Held-key fixture".into(),
+            worktree.clone(),
+            vec![SidebarWorktree::new(
+                WorktreeId::new(),
+                worktree.clone(),
+                Some("fixture/held-enter".into()),
+                false,
+                false,
+                None,
+                None,
+                None,
+            )],
+            Vec::new(),
+        )];
+        app.sidebar_state
+            .sync_active_worktree(&app.sidebar_model, &SidebarFocus::Repository { worktree });
+        drop(app.update_palette(palette_ui::Action::Open));
+        drop(app.update_palette(palette_ui::Action::Query(">copy branch".into())));
+        let enter = |down, repeat| {
+            if down {
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(Named::Enter),
+                    modified_key: keyboard::Key::Named(Named::Enter),
+                    physical_key: Physical::Code(Code::Enter),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat,
+                }
+            } else {
+                keyboard::Event::KeyReleased {
+                    key: keyboard::Key::Named(Named::Enter),
+                    modified_key: keyboard::Key::Named(Named::Enter),
+                    physical_key: Physical::Code(Code::Enter),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                }
+            }
+        };
+        let held = PressCycle::new(Physical::Code(Code::Enter));
+        let held_press = Source::tracked(held.clone(), Transition::Press);
+        let held_release = Source::tracked(held.clone(), Transition::Release);
+        let mut palette = iced::runtime::UserInterface::build(
+            app.palette_surface().expect("open native palette"),
+            Size::new(880.0, 800.0),
+            iced::runtime::user_interface::Cache::default(),
+            &mut renderer,
+        );
+        palette.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(widget::Id::new("palette.query")),
+        );
+        let mut submitted = Vec::new();
+        let (_, statuses) = palette.update_with_sources(
+            &[iced::Event::Keyboard(enter(true, false))],
+            &[held_press.clone()],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut submitted,
+        );
+        assert_eq!(statuses, [iced::event::Status::Captured]);
+        assert!(
+            matches!(
+                submitted.as_slice(),
+                [Message::Palette(palette_ui::Action::SubmitFromNative(_))]
+            ),
+            "the actual palette must consume the activation before the load answers"
+        );
+        drop(palette);
+        for message in submitted {
+            drop(app.update(message));
+        }
+        assert!(!app.palette.is_open());
+
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut stream = iced::runtime::task::into_stream(load).unwrap();
+        let mut tasks = Vec::new();
+        let mut read_answered = false;
+        while let Some(action) = executor.block_on(stream.next()) {
+            if let iced::runtime::Action::Output(action) = action {
+                read_answered |= matches!(&action, RepositoryAction::FileLoadedAt { .. });
+                tasks.push(app.update(Message::Repository(action)));
+            }
+        }
+        assert!(
+            read_answered,
+            "use the real async file reader, not a loaded model substitute"
+        );
+        let mut editor = iced::runtime::UserInterface::build(
+            app.card_view(pane, true, false),
+            Size::new(1200.0, 800.0),
+            cache,
+            &mut renderer,
+        );
+        if let Some(mut effects) = iced::runtime::task::into_stream(Task::batch(tasks)) {
+            while let Some(effect) = executor.block_on(effects.next()) {
+                if let iced::runtime::Action::Widget(mut operation) = effect {
+                    loop {
+                        editor.operate(&renderer, operation.as_mut());
+                        match operation.finish() {
+                            operation::Outcome::Chain(next) => operation = next,
+                            _ => break,
+                        }
+                    }
+                }
+            }
+        }
+        let focused = Arc::new(std::sync::Mutex::new(None));
+        let sink = focused.clone();
+        let mut probe = operation::map(operation::focusable::find_focused(), move |id| {
+            *sink.lock().unwrap() = Some(id);
+        });
+        editor.operate(&renderer, &mut probe);
+        let _ = probe.finish();
+        assert_eq!(
+            *focused.lock().unwrap(),
+            Some(repository_widget::editor_focus_id(pane)),
+            "the production completed-load operation, not a test focus call, must focus the editor"
+        );
+
+        held.release(); // ingress can already have queued the release
+        let mut blocked = Vec::new();
+        let (_, statuses) = editor.update_with_sources(
+            &[
+                iced::Event::Keyboard(enter(true, true)),
+                iced::Event::Keyboard(enter(false, false)),
+            ],
+            &[held_press.clone(), held_release.clone()],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut blocked,
+        );
+        assert_eq!(statuses, [iced::event::Status::Captured; 2]);
+        assert!(
+            blocked.is_empty(),
+            "held palette input must emit neither editor Edit nor command"
+        );
+        // A genuinely new physical cycle is admitted even before the delayed
+        // App copy has retired the old key-up. Ownership is cycle-specific.
+        let fresh = PressCycle::new(Physical::Code(Code::Enter));
+        let mut accepted = Vec::new();
+        let (_, statuses) = editor.update_with_sources(
+            &[iced::Event::Keyboard(enter(true, false))],
+            &[Source::tracked(fresh, Transition::Press)],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut accepted,
+        );
+        assert_eq!(statuses, [iced::event::Status::Captured]);
+        assert!(
+            matches!(accepted.as_slice(), [Message::Repository(
+            RepositoryAction::EditorAction { card, action: repository_widget::EditorAction::Edit(
+                repository_widget::EditorEdit::Enter
+            ) }
+        )] if *card == pane),
+            "a new native press must emit exactly the ordinary editor Enter"
+        );
+        drop(editor);
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&pane) else {
+            panic!("repository")
+        };
+        assert_eq!(runtime.editor_text().as_deref(), Some(original));
+        for message in accepted {
+            drop(app.update(message));
+        }
+        drop(app.update(Message::TaggedKeyEvent {
+            event: enter(false, false),
+            source: held_release,
+            captured: true,
+        }));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&pane) else {
+            panic!("repository")
+        };
+        let edited = runtime.editor_text().unwrap();
+        assert_eq!(
+            edited.chars().filter(|c| *c == '\n').count(),
+            original.chars().filter(|c| *c == '\n').count() + 1
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("notes.txt")).unwrap(),
+            original,
+            "a native edit must not execute lazy save effects or write the fixture file"
         );
     }
 
