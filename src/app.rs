@@ -18136,9 +18136,7 @@ impl Application for Cagents {
         if let Some(surface) = self.sidebar_selection_dialog() {
             return Some(dialog_ui::overlay(
                 surface,
-                Some(Message::SidebarSelection(
-                    sidebar_selection_ui::Action::Dismiss,
-                )),
+                self.sidebar_selection_dialog_dismiss_message(),
                 1.0,
             ));
         }
@@ -18152,7 +18150,7 @@ impl Application for Cagents {
         if let Some(surface) = self.channel_dialog_view() {
             return Some(dialog_ui::overlay(
                 surface,
-                Some(Message::ChannelUi(channel_ui::Action::Dismiss)),
+                self.channel_dialog_dismiss_message(),
                 1.0,
             ));
         }
