@@ -1609,6 +1609,7 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     struct Fixture {
