@@ -67,6 +67,8 @@ pub(super) struct State {
 
 #[cfg(test)]
 mod tests {
+    mod window_controls;
+
     #[test]
     fn attention_popup_pages_unique_incidents_and_survives_an_empty_project_list() {
         let mut app = super::super::tests::context_inspector_test_app(false);
