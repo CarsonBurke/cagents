@@ -5919,7 +5919,7 @@ pub(crate) mod tests {
     }
 
     /// Positive fixture roots must match discovery's canonical session keys.
-    fn canonical_tempdir() -> tempfile::TempDir {
+    pub(super) fn canonical_tempdir() -> tempfile::TempDir {
         let parent = std::env::temp_dir().canonicalize().expect("temp parent");
         tempfile::tempdir_in(parent).expect("tempdir")
     }
