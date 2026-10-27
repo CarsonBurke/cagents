@@ -2522,13 +2522,17 @@ impl State {
                             None
                         }
                         HistoryStatus::Loaded if self.history.is_empty() => Some(
-                            crate::ui_controls::placeholder("No runs yet")
-                                .icon(crate::ui_controls::Icon::History.handle())
-                                .detail(if self.all_history {
-                                    "Runs of every automation appear here, newest first."
-                                } else {
-                                    "Runs appear here when the schedule fires or you choose Run now."
-                                }),
+                            crate::ui_controls::placeholder(if self.all_history {
+                                "No run history available"
+                            } else {
+                                "No runs yet"
+                            })
+                            .icon(crate::ui_controls::Icon::History.handle())
+                            .detail(if self.all_history {
+                                "Runs of every automation appear here, newest first."
+                            } else {
+                                "Runs appear here when the schedule fires or you choose Run now."
+                            }),
                         ),
                         HistoryStatus::Unrequested
                         | HistoryStatus::Loading
@@ -2544,6 +2548,13 @@ impl State {
                             content = content.push(empty.height(Length::Shrink));
                         }
                     }
+                    if !self.history.is_empty() {
+                        content = content.push(crate::design::caption(format!(
+                            "Up to {} settled history entries per automation. Settled history of removed automations expires after {} days; active or unresolved work is retained. Older settled details may be unavailable.",
+                            crate::automations::HISTORY_RETAINED_ROWS,
+                            crate::automations::REMOVED_HISTORY_RETENTION_DAYS,
+                        )));
+                    }
                     for firing in &self.history {
                         let origin = match &firing.trigger {
                             crate::automations::Trigger::Manual { .. } => "Manual".to_owned(),
@@ -2551,21 +2562,24 @@ impl State {
                                 format!("Scheduled {}", occurrence.local)
                             }
                         };
-                        content = content.push(button_owned(
-                            format!(
-                                "{} · {} · {} · {}{}",
-                                firing.name,
-                                timestamp(firing.created_ms),
-                                origin,
-                                state_label(firing.state),
-                                if firing.release_pending {
-                                    " · Session release pending"
-                                } else {
-                                    ""
-                                }
+                        content = content.push(crate::ui_controls::owned(
+                            firing.id,
+                            button_owned(
+                                format!(
+                                    "{} · {} · {} · {}{}",
+                                    firing.name,
+                                    timestamp(firing.created_ms),
+                                    origin,
+                                    firing_state_label(firing),
+                                    if firing.release_pending {
+                                        " · Session release pending"
+                                    } else {
+                                        ""
+                                    }
+                                ),
+                                Action::Run(firing.id),
+                                !busy,
                             ),
-                            Action::Run(firing.id),
-                            !busy,
                         ));
                     }
                     if self.history_next.is_some() {
@@ -2579,7 +2593,7 @@ impl State {
                     .push(crate::design::title(format!(
                         "{} · {}",
                         run.definition.name,
-                        state_label(run.firing.state)
+                        firing_state_label(&run.firing)
                     )))
                     .push(crate::design::body(format!(
                         "Started: {}\nTarget: {}",
@@ -3310,6 +3324,24 @@ fn timestamp(milliseconds: u64) -> String {
         .unwrap_or_else(|| "Unavailable time".into())
 }
 
+fn firing_state_label(firing: &Firing) -> String {
+    let state = state_label(firing.state);
+    match &firing.skipped_occurrences {
+        Some(skipped) => format!(
+            "{state} · {} {} · {} – {}",
+            skipped.count,
+            if skipped.count == 1 {
+                "occurrence"
+            } else {
+                "occurrences"
+            },
+            timestamp(skipped.first_occurrence_ms),
+            timestamp(skipped.last_occurrence_ms),
+        ),
+        None => state.to_owned(),
+    }
+}
+
 fn provider(index: usize) -> Provider {
     [Provider::Claude, Provider::Codex, Provider::Omp]
         .get(index)
@@ -3623,7 +3655,121 @@ mod tests {
             run: None,
             skip: None,
             diagnostic: None,
+            skipped_occurrences: None,
         }
+    }
+
+    #[test]
+    fn coalesced_skips_keep_one_history_identity_and_show_the_range_in_detail() {
+        use crate::automations::{
+            FiringState, HistoryPage, Occurrence, SkipReason, SkippedOccurrences,
+        };
+
+        for (count, last) in [(None, 60_000), (Some(1), 60_000), (Some(3), 180_000)] {
+            let owner = automation();
+            let mut firing = history_firing(60_000, FiringState::Skipped);
+            firing.automation = owner.id;
+            firing.name = owner.definition.name.clone();
+            firing.trigger = crate::automations::Trigger::Scheduled {
+                occurrence: Occurrence {
+                    due_ms: 60_000,
+                    local: "fixture-first".into(),
+                },
+            };
+            firing.skip = Some(SkipReason::Capacity);
+            firing.diagnostic = Some("At capacity; try later".into());
+            firing.skipped_occurrences = count.map(|count| SkippedOccurrences {
+                count,
+                first_occurrence_ms: 60_000,
+                last_occurrence_ms: last,
+            });
+            let cursor = HistoryCursor {
+                created_ms: firing.created_ms,
+                id: firing.id,
+            };
+            let mut state = State::default();
+            let Some(Effect::Request {
+                sequence,
+                request: Request::History { id: None, .. },
+            }) = state.update(Action::AllHistory)
+            else {
+                panic!("read the real history page");
+            };
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
+                    firings: vec![firing.clone()],
+                    next: Some(cursor.clone()),
+                }))),
+            });
+            assert_eq!(state.history.len(), 1);
+            assert_eq!(state.history[0].id, firing.id);
+            assert_eq!(state.history_next, Some(cursor.clone()));
+            let expected_state = match count {
+                Some(count) => format!(
+                    "Skipped · {count} {} · {} – {}",
+                    if count == 1 {
+                        "occurrence"
+                    } else {
+                        "occurrences"
+                    },
+                    timestamp(60_000),
+                    timestamp(last),
+                ),
+                None => "Skipped".to_owned(),
+            };
+            let row = format!(
+                "Daily review · {} · Scheduled fixture-first · {expected_state}",
+                timestamp(60_000),
+            );
+            for width in [300.0, 900.0] {
+                let history = Outline::of(&state, width, 700.0);
+                history.text(&row);
+                history.text(&format!(
+                    "Up to {} settled history entries per automation. Settled history of removed automations expires after {} days; active or unresolved work is retained. Older settled details may be unavailable.",
+                    crate::automations::HISTORY_RETAINED_ROWS,
+                    crate::automations::REMOVED_HISTORY_RETENTION_DAYS,
+                ));
+                assert!(buttons(&state, width).contains(&(row.clone(), true)));
+                assert!(buttons(&state, width).contains(&("Older runs".to_owned(), true)));
+            }
+            let Some(Effect::Request {
+                sequence,
+                request: Request::ShowFiring { id },
+            }) = state.update(Action::Run(firing.id))
+            else {
+                panic!("the existing history identity opens its exact detail");
+            };
+            assert_eq!(id, firing.id);
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::Detail(RunDetail {
+                    definition: owner.definition,
+                    firing,
+                    agent: None,
+                    run: None,
+                }))),
+            });
+            let detail = Outline::of(&state, 900.0, 700.0);
+            detail.text(&format!("Daily review · {expected_state}"));
+            detail.text("At capacity; try later");
+            assert_eq!(state.history_next, Some(cursor));
+            assert!(state.pending.is_none());
+        }
+        let empty = State {
+            all_history: true,
+            history_status: HistoryStatus::Loaded,
+            ..Default::default()
+        };
+        let history = Outline::of(&empty, 900.0, 700.0);
+        history.text("No run history available");
+        assert!(!history.texts.iter().any(|(text, _)| text == "No runs yet"));
+        let selected = State {
+            selected: Some(automation()),
+            history_status: HistoryStatus::Loaded,
+            ..Default::default()
+        };
+        Outline::of(&selected, 900.0, 700.0).text("No runs yet");
     }
 
     #[test]
@@ -7243,6 +7389,173 @@ mod tests {
             matches!(selecting.update(Action::InspectRun(run)),Some(Effect::Request{request:Request::ShowRun{run:actual},..}) if actual==run)
         );
         assert!(selecting.lifecycle_notice.is_none());
+    }
+
+    #[test]
+    fn retained_history_press_cannot_open_a_replacement_after_explicit_refresh() {
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use cosmic::iced::{Event, Point, Rectangle, Size, mouse};
+        type Ui<'a> = UserInterface<'a, Action, cosmic::Theme, cosmic::Renderer>;
+        fn frame<'a>(state: &'a State, cache: Cache, renderer: &mut cosmic::Renderer) -> Ui<'a> {
+            let mut ui =
+                UserInterface::build(state.view(), Size::new(900.0, 700.0), cache, renderer);
+            ui.draw(
+                renderer,
+                &cosmic::theme::active(),
+                &cosmic::iced::advanced::renderer::Style::default(),
+                mouse::Cursor::Unavailable,
+            );
+            ui
+        }
+        fn row_label(firing: &Firing) -> String {
+            format!(
+                "{} · {} · Manual · {}",
+                firing.name,
+                timestamp(firing.created_ms),
+                firing_state_label(firing),
+            )
+        }
+        fn bounds(ui: &Ui<'_>, label: &str) -> Rectangle {
+            let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+            let rect = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|node| node.node().label() == Some(label))
+                .unwrap_or_else(|| panic!("mounted history row {label}"))
+                .node()
+                .bounds()
+                .unwrap();
+            assert!(rect.x1 > rect.x0 && rect.y1 > rect.y0);
+            Rectangle::new(
+                Point::new(rect.x0 as f32, rect.y0 as f32),
+                Size::new((rect.x1 - rect.x0) as f32, (rect.y1 - rect.y0) as f32),
+            )
+        }
+
+        for replace in [false, true] {
+            let a = history_firing(60_000, crate::automations::FiringState::Succeeded);
+            let mut b = a.clone();
+            b.id = Uuid::new_v4();
+            b.name = "Other review".into();
+            assert_ne!(a.id, b.id);
+            let refreshed = if replace { b } else { a.clone() };
+            let mut state = State::default();
+            let Some(Effect::Request {
+                sequence,
+                request: Request::History { id: None, .. },
+            }) = state.update(Action::AllHistory)
+            else {
+                panic!("open the actual Run history view")
+            };
+            assert!(
+                state
+                    .update(Action::Received {
+                        sequence,
+                        result: std::sync::Arc::new(Ok(Response::History(history_page(
+                            vec![a.clone()],
+                            false,
+                        )))),
+                    })
+                    .is_none()
+            );
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let mut ui = frame(&state, Cache::new(), &mut renderer);
+            let point = bounds(&ui, &row_label(&a)).center();
+            assert!(Rectangle::with_size(Size::new(900.0, 700.0)).contains(point));
+            let mut messages = Vec::new();
+            let _ = ui.update(
+                &[
+                    Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                ],
+                mouse::Cursor::Available(point),
+                &mut renderer,
+                &mut cosmic::iced::advanced::clipboard::Null,
+                &mut messages,
+            );
+            assert!(messages.is_empty(), "press is not an activation");
+            let cache = ui.into_cache();
+
+            // A real foreground Refresh retains the loaded page while its
+            // request is pending, but disables its actual row controls.
+            let Some(Effect::Request {
+                sequence,
+                request:
+                    Request::History {
+                        id: None,
+                        before: None,
+                        ..
+                    },
+            }) = state.update(Action::Refresh)
+            else {
+                panic!("explicit history refresh")
+            };
+            assert!(buttons(&state, 900.0).contains(&(row_label(&a), false)));
+            let ui = frame(&state, cache, &mut renderer);
+            let cache = ui.into_cache();
+            assert!(
+                state
+                    .update(Action::Received {
+                        sequence,
+                        result: std::sync::Arc::new(Ok(Response::History(history_page(
+                            vec![refreshed.clone()],
+                            false,
+                        )))),
+                    })
+                    .is_none()
+            );
+            assert_eq!(state.history.len(), 1);
+            assert_eq!(state.history[0].id, refreshed.id);
+            assert!(state.pending.is_none());
+            assert!(state.run.is_none());
+            let mut ui = frame(&state, cache, &mut renderer);
+            let current_bounds = bounds(&ui, &row_label(&refreshed));
+            assert!(
+                current_bounds.contains(point),
+                "release is over the new row"
+            );
+            let _ = ui.update(
+                &[Event::Mouse(mouse::Event::ButtonReleased(
+                    mouse::Button::Left,
+                ))],
+                mouse::Cursor::Available(point),
+                &mut renderer,
+                &mut cosmic::iced::advanced::clipboard::Null,
+                &mut messages,
+            );
+            if replace {
+                assert!(
+                    messages.is_empty(),
+                    "a press on A cannot become the replacement B's read: {messages:?}",
+                );
+                let point = current_bounds.center();
+                let _ = ui.update(
+                    &[
+                        Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                    ],
+                    mouse::Cursor::Available(point),
+                    &mut renderer,
+                    &mut cosmic::iced::advanced::clipboard::Null,
+                    &mut messages,
+                );
+            }
+            assert!(
+                matches!(messages.as_slice(), [Action::Run(id)] if *id == refreshed.id),
+                "unchanged A's held press and replacement B's fresh press remain usable: {messages:?}",
+            );
+            let _ = ui.into_cache();
+            let Some(Effect::Request {
+                request: Request::ShowFiring { id },
+                ..
+            }) = state.update(messages.remove(0))
+            else {
+                panic!("only the exact row's read-only Details request")
+            };
+            assert_eq!(id, refreshed.id);
+        }
     }
 }
 pub fn state_label(state: crate::automations::FiringState) -> &'static str {

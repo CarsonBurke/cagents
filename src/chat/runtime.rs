@@ -646,6 +646,13 @@ impl LocalHandle {
                 }
                 actor.publish_activity();
                 completed.store(native_closed && direct_closed, Ordering::Release);
+                if native_closed && direct_closed {
+                    // Completion can leave a detached daemon with no other
+                    // event. Publish once after the ownership flag, even when
+                    // its hidden observation was already consumed. Reuse the
+                    // existing helper-compatible metadata notification.
+                    actor.observe_next.store(true, Ordering::Release);
+                }
                 actor.observe_update();
                 if actor.visible.load(Ordering::Acquire) {
                     (actor.notify)(Update::Presentation);

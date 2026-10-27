@@ -48,6 +48,8 @@ pub(crate) use worker::RenderStreamFixture;
 #[cfg(feature = "host")]
 pub use worker::TerminalHandle;
 #[cfg(feature = "host")]
+pub(crate) use worker::TerminalRetirement;
+#[cfg(feature = "host")]
 pub(crate) use worker::UpgradeSnapshot;
 #[cfg(feature = "host")]
 pub(crate) use worker::WeakTerminalHandle;
