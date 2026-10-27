@@ -230,6 +230,7 @@ mod tests {
             assert!(!error.contains(sensitive), "leaked {sensitive:?}: {error}");
         }
     }
+
     #[tokio::test]
     async fn native_opener_keeps_uri_and_reveal_arguments_out_of_diagnostics() {
         for (reveal, raw) in [
