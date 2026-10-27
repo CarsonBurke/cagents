@@ -90,6 +90,7 @@ done
 BUILD_SECONDS=skipped
 if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     BUILD_STARTED=$(date +%s)
+    command -v python3 >/dev/null 2>&1 || fail 'required command not found: python3'
     command -v zig >/dev/null 2>&1 || fail 'required command not found: zig'
     # Native build scripts run outside the repository and cannot rely on a mise
     # shim rediscovering mise.toml. Resolve the real executable up front.
@@ -114,27 +115,37 @@ if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     export CAGENTS_BUILD_METADATA
 
     build_target() {
-        cargo build \
+        product=$1
+        shift
+        python3 "$SCRIPT_DIR/build-ceditor-product" "$product" \
             --manifest-path "$ROOT_DIR/Cargo.toml" \
             --locked \
             --release \
             --target-dir "$TARGET_DIR" \
+            --target "$RELEASE_TARGET" \
             "$@"
     }
 
     # Keep package feature sets disjoint. A single invocation would unify
     # package features and compile/link both host and UI implementation graphs.
+    # Override config build.target with the validated native release target and
+    # use Cargo's exact executable paths, including configured output layouts.
     if [ "$VARIANT" = browserless ]; then
-        build_target --no-default-features --bin cagents
-        build_target --no-default-features --features host --bin cagentsd
-        build_target --no-default-features --features ui --bin cagents-ui
+        CLI_BINARY=$(build_target cagents --no-default-features --bin cagents)
+        HOST_BINARY=$(build_target cagentsd --no-default-features --features host --bin cagentsd)
+        UI_BINARY=$(build_target cagents-ui --no-default-features --features ui --bin cagents-ui)
     else
-        build_target --bin cagents
-        build_target --features host --bin cagentsd
-        build_target --features integrated-browser --bin cagents-ui
+        CLI_BINARY=$(build_target cagents --bin cagents)
+        HOST_BINARY=$(build_target cagentsd --features host --bin cagentsd)
+        UI_BINARY=$(build_target cagents-ui --features integrated-browser --bin cagents-ui)
     fi
     BUILD_FINISHED=$(date +%s)
     BUILD_SECONDS=$((BUILD_FINISHED - BUILD_STARTED))
+else
+    # Explicit prebuilt mode retains its native release layout.
+    CLI_BINARY=$TARGET_DIR/release/cagents
+    HOST_BINARY=$TARGET_DIR/release/cagentsd
+    UI_BINARY=$TARGET_DIR/release/cagents-ui
 fi
 
 # Report the package's whole resolved graph: the union of the lanes built above.
@@ -160,11 +171,11 @@ else
 fi
 RESOLVED_PACKAGE_IDS=$((RESOLVED_PACKAGE_IDS))
 
-for binary in cagents cagents-ui cagentsd; do
-    [ -x "$TARGET_DIR/release/$binary" ] || fail "missing release binary: $TARGET_DIR/release/$binary"
+for binary in "$CLI_BINARY" "$UI_BINARY" "$HOST_BINARY"; do
+    [ -x "$binary" ] || fail "missing release binary: $binary"
 done
 
-PROTOCOL_VERSION=$("$TARGET_DIR/release/cagents" daemon protocol-version) \
+PROTOCOL_VERSION=$("$CLI_BINARY" daemon protocol-version) \
     || fail 'cannot inspect packaged daemon protocol'
 case $PROTOCOL_VERSION in
     ''|*[!0-9]*) fail 'packaged CLI returned an invalid daemon protocol version' ;;
@@ -189,9 +200,9 @@ install -d -m 0755 \
     "$SHARE_DIR/icons/hicolor/128x128/apps" \
     "$SHARE_DIR/metainfo" \
     "$SHARE_DIR/doc/cagents"
-install -m 0755 "$TARGET_DIR/release/cagents" "$BIN_DIR/cagents"
-install -m 0755 "$TARGET_DIR/release/cagents-ui" "$BIN_DIR/cagents-ui"
-install -m 0755 "$TARGET_DIR/release/cagentsd" "$BIN_DIR/cagentsd"
+install -m 0755 "$CLI_BINARY" "$BIN_DIR/cagents"
+install -m 0755 "$UI_BINARY" "$BIN_DIR/cagents-ui"
+install -m 0755 "$HOST_BINARY" "$BIN_DIR/cagentsd"
 install -m 0644 /dev/null "$BIN_DIR/.cagents-ui-lease-v1"
 if [ "$VARIANT" = full ]; then
     install -m 0755 "$ROOT_DIR/packaging/cagents-uninstall" "$BIN_DIR/cagents-uninstall"
