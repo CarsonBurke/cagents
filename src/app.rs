@@ -4661,6 +4661,7 @@ struct PendingPanelOpen {
 }
 
 struct DirtyRepositoryClose {
+    focus_instance: uuid::Uuid,
     card: CardId,
     remaining: VecDeque<CardId>,
     intent: DirtyCloseIntent,
@@ -5227,6 +5228,7 @@ pub struct Cagents {
     /// confirms first like every other destructive action in the shell.
     settings_reset_confirm: bool,
     settings_reset_focus_confirm: bool,
+    settings_reset_focus_instance: uuid::Uuid,
     settings_reset_keyboard_nav: Option<bool>,
     pull_request_dialog: Option<PullRequestDialog>,
     /// Opening or dismissing a newer draft supersedes in-flight draft recovery.
@@ -12105,6 +12107,9 @@ impl Cagents {
         if self.automation_approval_open() {
             return self.cancel_automation_approval();
         }
+        if self.device_dialog_on_top() {
+            return self.update_device(device_ui::Action::Close);
+        }
         if self.session_recovery.open() {
             return self.update_session_recovery(session_recovery::Action::Cancel);
         }
@@ -12135,6 +12140,15 @@ impl Cagents {
         self.focus_context_overlay_if_exposed()
     }
 
+    /// Device tools are drawn above recovery and other form dialogs, but below
+    /// approvals and pending-work confirmations. Their keys share that order.
+    pub(super) fn device_dialog_on_top(&self) -> bool {
+        self.device_ui.open
+            && !self.automation_approval_open()
+            && self.transient_work_close.is_none()
+            && !self.automation_ui.draft_dialog_open()
+    }
+
     /// Whether a form dialog is the dialog on screen, not one under another.
     fn form_dialog_on_top(&self) -> bool {
         self.form_dialog_is_open()
@@ -12149,7 +12163,8 @@ impl Cagents {
         if self.browser_import.open() {
             return true;
         }
-        self.session_recovery.open()
+        self.device_ui.open
+            || self.session_recovery.open()
             || self.daemon_health_ui.confirmation
             || self.automation_approval_open()
             || self.dirty_repository_close.is_some()
@@ -12812,6 +12827,7 @@ impl Cagents {
         let restore_card = self.workspace.focused();
         let focused = DirtyCloseControl::Cancel;
         self.dirty_repository_close = Some(DirtyRepositoryClose {
+            focus_instance: uuid::Uuid::new_v4(),
             card,
             remaining: cards,
             intent,
@@ -13654,6 +13670,13 @@ impl Cagents {
             && !self.terminal_close_dialog_visible()
     }
 
+    fn settings_reset_focus_marker(&self) -> widget::Id {
+        widget::Id::new(format!(
+            "dialog.reset-settings.phase.{}.{}",
+            self.settings_reset_focus_instance, self.settings_reset_focus_confirm,
+        ))
+    }
+
     fn close_settings_reset(&mut self) -> Task<Message> {
         if !std::mem::take(&mut self.settings_reset_confirm) {
             return Task::none();
@@ -13957,6 +13980,7 @@ impl Application for Cagents {
             worktree_dialog: None,
             settings_reset_confirm: false,
             settings_reset_focus_confirm: false,
+            settings_reset_focus_instance: uuid::Uuid::new_v4(),
             settings_reset_keyboard_nav: None,
             pull_request_dialog: None,
             pull_request_dialog_generation: 0,
@@ -16829,6 +16853,18 @@ impl Application for Cagents {
                 if let Some(task) = self.automation_approval_key(&event, captured) {
                     return task;
                 }
+                if self.device_dialog_on_top() {
+                    if let keyboard::Event::ModifiersChanged(modifiers) = &event {
+                        self.keyboard_modifiers = *modifiers;
+                    }
+                    // Native device fields have already received the key. Do
+                    // not let a retained recovery or Resume dialog answer it.
+                    return if is_escape_press(&event) {
+                        self.update_device(device_ui::Action::Close)
+                    } else {
+                        Task::none()
+                    };
+                }
                 #[cfg(feature = "integrated-browser")]
                 if is_escape_press(&event) && self.browser_import_on_top() {
                     return self.update_browser_import(self.browser_import.escape_action());
@@ -17320,6 +17356,7 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 self.settings_reset_confirm = true;
+                self.settings_reset_focus_instance = uuid::Uuid::new_v4();
                 self.settings_reset_focus_confirm = false;
                 self.settings_reset_keyboard_nav = Some(self.core.keyboard_nav());
                 self.core.set_keyboard_nav(false);
@@ -17930,24 +17967,27 @@ impl Application for Cagents {
         if self.settings_reset_confirm {
             return Some(dialog_ui::overlay(
                 dialog_ui::surface(
-                    widget::column::with_children(vec![
-                        design::title("Reset all settings?").into(),
-                        notice_body(
-                            "Every customization returns to its default: keyboard shortcuts, \
+                    widget::container(
+                        widget::column::with_children(vec![
+                            design::title("Reset all settings?").into(),
+                            notice_body(
+                                "Every customization returns to its default: keyboard shortcuts, \
                              terminal font and theme, editor syntax theme, interface scale, \
                              pane widths, and the configured language servers.",
-                        ),
-                        notice_detail("This cannot be undone."),
-                        dialog_ui::confirmation_actions(
-                            crate::ui_controls::button::secondary("Cancel")
-                                .id(widget::Id::new("dialog.reset-settings.cancel"))
-                                .on_press(Message::CancelResetSettings),
-                            crate::ui_controls::button::destructive("Reset settings")
-                                .id(widget::Id::new("dialog.reset-settings.confirm"))
-                                .on_press(Message::ConfirmResetSettings),
-                        ),
-                    ])
-                    .spacing(space::M),
+                            ),
+                            notice_detail("This cannot be undone."),
+                            dialog_ui::confirmation_actions(
+                                crate::ui_controls::button::secondary("Cancel")
+                                    .id(widget::Id::new("dialog.reset-settings.cancel"))
+                                    .on_press(Message::CancelResetSettings),
+                                crate::ui_controls::button::destructive("Reset settings")
+                                    .id(widget::Id::new("dialog.reset-settings.confirm"))
+                                    .on_press(Message::ConfirmResetSettings),
+                            ),
+                        ])
+                        .spacing(space::M),
+                    )
+                    .id(self.settings_reset_focus_marker()),
                     480.0,
                 ),
                 Some(Message::CancelResetSettings),
@@ -18037,8 +18077,11 @@ impl Application for Cagents {
 
             return Some(dialog_ui::overlay(
                 dialog_ui::surface(
-                    widget::container(widget::column::with_children(rows).spacing(space::M))
-                        .id(widget::Id::new(format!("dialog.dirty-close.{card}"))),
+                    widget::container(
+                        widget::container(widget::column::with_children(rows).spacing(space::M))
+                            .id(dirty_close_focus_marker(close)),
+                    )
+                    .id(widget::Id::new(format!("dialog.dirty-close.{card}"))),
                     560.0,
                 ),
                 (!runtime.is_saving()).then_some(Message::CancelRepositoryClose),
@@ -18644,6 +18687,13 @@ impl Drop for Cagents {
 /// The stable header control that invokes and regains focus from the inspector.
 fn context_inspector_toggle_id() -> widget::Id {
     widget::Id::new("command.toggle-context-inspector")
+}
+
+fn dirty_close_focus_marker(close: &DirtyRepositoryClose) -> widget::Id {
+    widget::Id::new(format!(
+        "dialog.dirty-close.phase.{}.{}.{:?}",
+        close.focus_instance, close.card, close.focused,
+    ))
 }
 
 fn dirty_close_control_id(card: CardId, control: DirtyCloseControl) -> widget::Id {
@@ -20019,6 +20069,7 @@ mod tests {
         let third = CardId::new();
         let window = window::Id::unique();
         let mut close = DirtyRepositoryClose {
+            focus_instance: uuid::Uuid::new_v4(),
             card: first,
             remaining: VecDeque::from([second, third]),
             intent: DirtyCloseIntent::Application(window),
@@ -22489,6 +22540,7 @@ mod tests {
         let fixture = CloseSaveFixture::install(&mut app, card);
         let failure = fixture.post_persist_warning(&mut app, card);
         app.dirty_repository_close = Some(DirtyRepositoryClose {
+            focus_instance: uuid::Uuid::new_v4(),
             card,
             remaining: VecDeque::new(),
             intent: DirtyCloseIntent::Card(card),
@@ -22549,6 +22601,7 @@ mod tests {
         let fixture = CloseSaveFixture::install(&mut app, card);
         let failure = fixture.post_persist_warning(&mut app, card);
         app.dirty_repository_close = Some(DirtyRepositoryClose {
+            focus_instance: uuid::Uuid::new_v4(),
             card,
             remaining: VecDeque::new(),
             intent: DirtyCloseIntent::Application(window),
@@ -23912,6 +23965,79 @@ mod tests {
                 .is_some_and(|details| details.contains("refused the handoff"))),
             "the refusal is recorded as a notice, not a process abort: {:?}",
             app.notices.entries
+        );
+    }
+
+    #[test]
+    fn delayed_dirty_cancel_yields_to_newer_tab_and_reopened_confirmation() {
+        for reopen in [false, true] {
+            let (mut app, card) = editing_repository_app();
+            drop(app.begin_dirty_close(DirtyCloseIntent::Card(card), VecDeque::from([card])));
+            let old_instance = app.dirty_repository_close.as_ref().unwrap().focus_instance;
+            app.device_ui.open = true;
+            let delayed = app.update_device(device_ui::Action::Close);
+            let newer = if reopen {
+                drop(app.cancel_dirty_close());
+                drop(app.begin_dirty_close(DirtyCloseIntent::Card(card), VecDeque::from([card])));
+                assert_ne!(
+                    app.dirty_repository_close.as_ref().unwrap().focus_instance,
+                    old_instance
+                );
+                iced::widget::operation::focus(dirty_close_control_id(
+                    card,
+                    DirtyCloseControl::Save,
+                ))
+                .map(cosmic::Action::App)
+            } else {
+                app.update(Message::KeyEvent {
+                    event: dialog_ui::tests::key_press(keyboard::key::Named::Tab),
+                    captured: false,
+                })
+            };
+            let current = app.dirty_repository_close.as_ref().unwrap().focused;
+            assert_eq!(current == DirtyCloseControl::Cancel, reopen);
+            let expected = if reopen {
+                DirtyCloseControl::Save
+            } else {
+                current
+            };
+            assert_eq!(
+                focused_element(
+                    cosmic::Application::dialog(&app).unwrap(),
+                    newer.chain(delayed),
+                ),
+                Some(dirty_close_control_id(card, expected)),
+                "old Cancel restore cannot override the newer dirty-close owner: reopen={reopen}",
+            );
+            assert!(app.card_state(card).unwrap().existence.is_open());
+        }
+    }
+
+    #[test]
+    fn device_close_focuses_visible_dirty_confirmation_before_retained_resume() {
+        let (mut app, card) = editing_repository_app();
+        drop(app.begin_dirty_close(DirtyCloseIntent::Card(card), VecDeque::from([card])));
+        app.dirty_repository_close.as_mut().unwrap().focused = DirtyCloseControl::Save;
+        app.resume_ui.open = true;
+        app.device_ui.open = true;
+        let task = app.update(Message::KeyEvent {
+            event: dialog_ui::tests::key_press(keyboard::key::Named::Escape),
+            captured: false,
+        });
+        assert!(!app.device_ui.open);
+        assert!(app.resume_ui.open);
+        assert!(app.dirty_repository_close.is_some());
+        assert_eq!(
+            app.dirty_repository_close.as_ref().unwrap().focused,
+            DirtyCloseControl::Cancel
+        );
+        let effects =
+            iced::widget::operation::focus(dirty_close_control_id(card, DirtyCloseControl::Save))
+                .map(cosmic::Action::App)
+                .chain(task);
+        assert_eq!(
+            focused_element(cosmic::Application::dialog(&app).unwrap(), effects),
+            Some(dirty_close_control_id(card, DirtyCloseControl::Cancel)),
         );
     }
 
@@ -28504,6 +28630,7 @@ mod tests {
             worktree_dialog: None,
             settings_reset_confirm: false,
             settings_reset_focus_confirm: false,
+            settings_reset_focus_instance: uuid::Uuid::new_v4(),
             settings_reset_keyboard_nav: None,
             pull_request_dialog: None,
             pull_request_dialog_generation: 0,
@@ -29727,6 +29854,7 @@ mod tests {
             app.cards
                 .insert(card, CardRuntime::Repository(Box::new(runtime)));
             app.dirty_repository_close = Some(DirtyRepositoryClose {
+                focus_instance: uuid::Uuid::new_v4(),
                 card,
                 remaining: VecDeque::new(),
                 intent: DirtyCloseIntent::Card(card),
