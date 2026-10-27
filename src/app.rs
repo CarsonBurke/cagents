@@ -27834,6 +27834,7 @@ mod tests {
         // says so far better than an unwrap would.
         if let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) {
             let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
                 .build()
                 .expect("executor");
             while let Some(action) = executor.block_on(stream.next()) {
