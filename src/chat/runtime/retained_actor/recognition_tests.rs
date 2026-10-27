@@ -55,7 +55,7 @@ fn text_items(snapshot: &Snapshot) -> Vec<String> {
         .items
         .iter()
         .filter_map(|item| match &item.content {
-            chat::ItemContent::Text { text, .. } => Some(text.clone()),
+            chat::ItemContent::Text { text, .. } => Some(text.as_str().to_owned()),
             _ => None,
         })
         .collect()

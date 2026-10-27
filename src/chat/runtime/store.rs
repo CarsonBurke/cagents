@@ -1,6 +1,7 @@
 //! Private, disk-backed transcript. Stable provider IDs and byte-addressed chunks
 //! keep both long conversations and a single enormous tool result pageable.
 mod append;
+mod completed;
 mod file_changes;
 pub(crate) mod peer_query;
 mod text_copy;
@@ -388,7 +389,11 @@ impl Store {
         // back to the files it belongs to.
         let mut spans: Vec<usize> = Vec::new();
         let (mut body0, body1, body2) = match &mut item.content {
-            ItemContent::Text { text, .. } => (std::mem::take(text), String::new(), String::new()),
+            ItemContent::Text { text, .. } => (
+                std::mem::take(text).into_owned(),
+                String::new(),
+                String::new(),
+            ),
             // A delivery's body is as unbounded as prose; who sent it is identity.
             ItemContent::Delivery { body, .. } => {
                 (std::mem::take(body), String::new(), String::new())
@@ -1006,7 +1011,7 @@ impl Store {
                     // synthesizes to hold the text names the default rather
                     // than inventing narration the provider never declared.
                     content: ItemContent::Text {
-                        text: String::new(),
+                        text: (String::new()).into(),
                         thinking,
                         phase: Phase::Final,
                     },
@@ -1309,7 +1314,25 @@ impl Store {
                     item.id = item_id.into_owned();
                 }
                 let resident = old.get(item.id.as_str()).copied();
-                let (body0, prefix0) = self.field_reusing(&id, 0, start0, end0, resident)?;
+                // The root always rebuilds from current authoritative metadata.
+                // Finished nonroot bodies may share bytes, never their old clocks.
+                let shared_text = (part > 0)
+                    .then(|| {
+                        resident.and_then(|previous| {
+                            self.completed_text_body(
+                                &id,
+                                [[start0, end0], [start1, end1]],
+                                previous,
+                                &base,
+                            )
+                        })
+                    })
+                    .flatten();
+                let (body0, prefix0) = if shared_text.is_some() {
+                    (String::new(), true)
+                } else {
+                    self.field_reusing(&id, 0, start0, end0, resident)?
+                };
                 let (body1, prefix1) = self.field_reusing(&id, 1, start1, end1, resident)?;
                 if match &item.content {
                     ItemContent::Text { .. } | ItemContent::Command { .. } => prefix0,
@@ -1331,7 +1354,9 @@ impl Store {
                     };
                 let attached = attachment.as_ref().map_or(0, String::len);
                 match &mut item.content {
-                    ItemContent::Text { text, .. } => *text = body0,
+                    ItemContent::Text { text, .. } => {
+                        *text = shared_text.unwrap_or_else(|| body0.into())
+                    }
                     ItemContent::Delivery { body, .. } => *body = body0,
                     ItemContent::Command {
                         label,
@@ -2575,7 +2600,7 @@ mod tests {
                 id: "large".into(),
                 role: Role::Assistant,
                 content: ItemContent::Text {
-                    text: original.clone(),
+                    text: (original.clone()).into(),
                     thinking: false,
                     phase: Phase::Final,
                 },
@@ -3046,7 +3071,7 @@ mod tests {
             id: "text".into(),
             role: Role::Assistant,
             content: ItemContent::Text {
-                text: String::new(),
+                text: (String::new()).into(),
                 thinking: true,
                 phase: Phase::Final,
             },

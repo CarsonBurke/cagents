@@ -3424,7 +3424,7 @@ fn apply_projected_event(
                     id: item_id,
                     role,
                     content: ItemContent::Text {
-                        text: delta,
+                        text: (delta).into(),
                         thinking,
                         phase: Phase::Final,
                     },
@@ -3527,7 +3527,7 @@ fn apply_projected_event(
                     // receive the text declares the default instead of guessing
                     // that an unfinished message is narration.
                     content: ItemContent::Text {
-                        text: delta,
+                        text: (delta).into(),
                         thinking,
                         phase: Phase::Final,
                     },

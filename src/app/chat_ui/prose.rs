@@ -1359,7 +1359,7 @@ mod tests {
             id: "recursive-small-quotes".into(),
             role: chat::Role::Assistant,
             content: ItemContent::Text {
-                text: source,
+                text: (source).into(),
                 thinking: false,
                 phase: chat::Phase::Final,
             },
@@ -1548,7 +1548,7 @@ mod tests {
         for source in sources {
             let cached = CachedItem::new(
                 &ItemContent::Text {
-                    text: source,
+                    text: (source).into(),
                     thinking: false,
                     phase: chat::Phase::Final,
                 },
@@ -1968,7 +1968,7 @@ mod tests {
         );
         let cached = CachedItem::new(
             &ItemContent::Text {
-                text: source,
+                text: (source).into(),
                 thinking: false,
                 phase: chat::Phase::Final,
             },
@@ -2099,7 +2099,7 @@ mod tests {
             };
             let cached = CachedItem::new(
                 &ItemContent::Text {
-                    text: source.to_owned(),
+                    text: (source.to_owned()).into(),
                     thinking: false,
                     phase: chat::Phase::Final,
                 },
@@ -2204,7 +2204,7 @@ mod tests {
         };
         let cached = CachedItem::new(
             &ItemContent::Text {
-                text: String::new(),
+                text: (String::new()).into(),
                 thinking: false,
                 phase: chat::Phase::Final,
             },

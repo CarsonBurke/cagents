@@ -109,7 +109,7 @@ impl Part {
         max_text_bytes: usize,
     ) -> Result<Option<Self>, String> {
         use chat::{ItemContent, Role};
-        let (text, kind) = match (&item.role, &item.content) {
+        let (text, kind): (&str, Kind) = match (&item.role, &item.content) {
             (
                 Role::User,
                 ItemContent::Text {

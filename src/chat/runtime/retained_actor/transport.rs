@@ -3609,7 +3609,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
                     id: "retained-body".into(),
                     role: chat::Role::Assistant,
                     content: chat::ItemContent::Text {
-                        text,
+                        text: text.into(),
                         thinking: false,
                         phase: Default::default(),
                     },

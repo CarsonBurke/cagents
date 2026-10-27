@@ -1203,7 +1203,7 @@ fn recorded_message_stamp(
 impl CachedItem {
     fn preparing(item: &Arc<chat::Item>, theme: crate::settings::EditorSyntaxTheme) -> Self {
         let empty = ItemContent::Text {
-            text: String::new(),
+            text: (String::new()).into(),
             thinking: false,
             phase: chat::Phase::Final,
         };
@@ -3486,7 +3486,7 @@ impl Runtime {
                     .is_some_and(|previous| Arc::ptr_eq(previous, item));
                 if !unchanged {
                     let placeholder = ItemContent::Text {
-                        text: String::new(),
+                        text: (String::new()).into(),
                         thinking: false,
                         phase: chat::Phase::Commentary,
                     };
@@ -3953,7 +3953,7 @@ impl Runtime {
                                 previous.clone_from(text);
                             }
                         } else {
-                            self.history.push(text.clone());
+                            self.history.push(text.as_str().to_owned());
                         }
                         self.history_images.push(Vec::new());
                         let key =
@@ -13016,7 +13016,7 @@ mod tests {
 
     fn text(body: &str) -> ItemContent {
         ItemContent::Text {
-            text: body.to_owned(),
+            text: (body.to_owned()).into(),
             thinking: false,
             phase: chat::Phase::Final,
         }
@@ -14170,7 +14170,7 @@ mod tests {
             id: "completed-thinking".into(),
             role: chat::Role::Assistant,
             content: ItemContent::Text {
-                text: body.clone(),
+                text: (body.clone()).into(),
                 thinking: true,
                 phase: chat::Phase::Final,
             },
@@ -17122,7 +17122,7 @@ mod tests {
                         "old/input/0",
                         chat::Role::User,
                         ItemContent::Text {
-                            text: text.clone(),
+                            text: (text.clone()).into(),
                             thinking: false,
                             phase: chat::Phase::Final,
                         },
@@ -17141,7 +17141,7 @@ mod tests {
                         "new/input/0",
                         chat::Role::User,
                         ItemContent::Text {
-                            text: text.clone(),
+                            text: (text.clone()).into(),
                             thinking: false,
                             phase: chat::Phase::Final,
                         },
@@ -23884,7 +23884,7 @@ mod tests {
                 .appended(
                     "hello world",
                     &ItemContent::Text {
-                        text: "hello world and more".to_owned(),
+                        text: ("hello world and more".to_owned()).into(),
                         thinking: true,
                         phase: chat::Phase::Final,
                     }
@@ -23898,7 +23898,7 @@ mod tests {
                 .appended(
                     "hello world",
                     &ItemContent::Text {
-                        text: "hello world and more".to_owned(),
+                        text: ("hello world and more".to_owned()).into(),
                         thinking: false,
                         phase: chat::Phase::Commentary,
                     }

@@ -4324,7 +4324,7 @@ mod tests {
                     id: "history".into(),
                     role: super::super::Role::Assistant,
                     content: super::super::ItemContent::Text {
-                        text: "body".repeat(64 * 1024),
+                        text: ("body".repeat(64 * 1024)).into(),
                         thinking: false,
                         phase: Default::default(),
                     },
@@ -4547,7 +4547,7 @@ mod tests {
                 id: "received-prompt".into(),
                 role: Role::User,
                 content: ItemContent::Text {
-                    text: "prompt".repeat(64 * 1024),
+                    text: ("prompt".repeat(64 * 1024)).into(),
                     thinking: false,
                     phase: Default::default(),
                 },
@@ -6455,7 +6455,7 @@ mod tests {
             started_at: None,
             at: None,
             content: super::super::ItemContent::Text {
-                text: body,
+                text: (body).into(),
                 thinking: false,
                 phase: Default::default(),
             },

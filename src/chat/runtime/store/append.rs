@@ -30,6 +30,14 @@ impl Changes {
         let fields = self.fields.entry(id.into()).or_insert(prior);
         fields[field] = Some(fields[field].map_or(offset, |old| old.min(offset)));
     }
+    /// Read-only range proof for a payload shared by a fresh-metadata Item.
+    /// Caller must separately establish exact resident/cache/root/start ownership.
+    pub(super) fn preserves(&self, root: &str, field: usize, end: usize) -> bool {
+        self.fields
+            .get(root)
+            .and_then(|fields| fields.get(field))
+            .is_some_and(|offset| offset.is_none_or(|offset| end <= offset))
+    }
     pub(super) fn publish(
         &mut self,
         cache: uuid::Uuid,
@@ -148,7 +156,7 @@ mod tests {
             started_at: Some(3),
             at: Some(10),
             content: ItemContent::Text {
-                text,
+                text: text.into(),
                 thinking: false,
                 phase: Phase::Final,
             },

@@ -73,7 +73,7 @@ fn item(id: String, role: chat::Role, content: ItemContent) -> chat::Item {
 
 fn prose(text: String, thinking: bool, phase: chat::Phase) -> ItemContent {
     ItemContent::Text {
-        text,
+        text: text.into(),
         thinking,
         phase,
     }
@@ -924,7 +924,9 @@ fn a_refresh_of_a_full_window_with_metadata() {
             .items
             .iter()
             .filter_map(|item| match (&item.role, &item.content) {
-                (chat::Role::User, ItemContent::Text { text, .. }) => Some(text.clone()),
+                (chat::Role::User, ItemContent::Text { text, .. }) => {
+                    Some(text.as_str().to_owned())
+                }
                 _ => None,
             })
             .collect();

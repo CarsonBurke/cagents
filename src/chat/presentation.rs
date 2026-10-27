@@ -132,17 +132,20 @@ impl ItemChange {
     ) -> Self {
         if let Some(previous) = previous
             && let (Some(old), Some(new)) = (body(&previous.content), body(&current.content))
-            && (if prefix_proven {
-                new.len() >= old.len()
-            } else {
-                new.starts_with(old)
-            })
+            && (matches!((&previous.content, &current.content),
+                (ItemContent::Text { text: old, .. }, ItemContent::Text { text: new, .. })
+                    if old.shares_storage_with(new))
+                || if prefix_proven {
+                    new.len() >= old.len()
+                } else {
+                    new.starts_with(old)
+                })
         {
             let content = match &current.content {
                 ItemContent::Text {
                     thinking, phase, ..
                 } => ItemContent::Text {
-                    text: String::new(),
+                    text: (String::new()).into(),
                     thinking: *thinking,
                     phase: *phase,
                 },
@@ -247,9 +250,20 @@ fn apply_items(
                 suffix,
             } => {
                 let old = items.remove(&item.id).unwrap();
-                let mut text = body(&old.content).unwrap().to_owned();
-                text.push_str(&suffix);
-                *body_mut(&mut item.content).unwrap() = text;
+                match (&old.content, &mut item.content) {
+                    (ItemContent::Text { text: previous, .. }, ItemContent::Text { text, .. }) => {
+                        *text = previous.clone();
+                        // A metadata-only append must not invoke DerefMut/COW.
+                        if !suffix.is_empty() {
+                            text.push_str(&suffix);
+                        }
+                    }
+                    _ => {
+                        let mut text = body(&old.content).unwrap().to_owned();
+                        text.push_str(&suffix);
+                        *body_mut(&mut item.content).unwrap() = text;
+                    }
+                }
                 item
             }
         };
@@ -1012,5 +1026,77 @@ mod tests {
         let current = update.apply(&previous).unwrap();
         assert!(std::sync::Arc::ptr_eq(&summary, &current.file_changes));
         assert_eq!(current.file_changes.applied_files, 99);
+    }
+    #[test]
+    fn metadata_only_prose_updates_share_bytes_and_keep_current_identity() {
+        let old = text(
+            "root:native-part:9:text:0-131072:0-0",
+            &"λ".repeat(128 * 1024),
+        );
+        let retained = std::sync::Arc::new(old.clone());
+        let mut current = old.clone();
+        current.role = crate::chat::Role::User;
+        current.started_at = Some(71);
+        current.at = Some(99);
+        let ItemContent::Text {
+            thinking, phase, ..
+        } = &mut current.content
+        else {
+            unreachable!()
+        };
+        *thinking = true;
+        *phase = crate::chat::Phase::Commentary;
+        let changes = vec![ItemChange::between(Some(&old), &current)];
+        assert!(
+            matches!(&changes[0], ItemChange::Append { suffix, offset, .. }
+            if suffix.is_empty() && *offset == 256 * 1024)
+        );
+        let installed =
+            apply_items(&[retained.clone()], vec![current.id.clone()], changes).unwrap();
+        let (
+            ItemContent::Text { text: before, .. },
+            ItemContent::Text {
+                text: after,
+                thinking,
+                phase,
+            },
+        ) = (&retained.content, &installed[0].content)
+        else {
+            unreachable!()
+        };
+        assert!(before.shares_storage_with(after));
+        assert_eq!(installed[0].role, crate::chat::Role::User);
+        assert_eq!(installed[0].started_at, Some(71));
+        assert_eq!(installed[0].at, Some(99));
+        assert!(*thinking);
+        assert_eq!(*phase, crate::chat::Phase::Commentary);
+        assert_eq!(retained.at, Some(1));
+        assert_eq!(retained.started_at, Some(1));
+        assert_eq!(retained.role, crate::chat::Role::Assistant);
+    }
+
+    #[test]
+    fn streamed_prose_suffix_uses_copy_on_write_and_keeps_retained_snapshot() {
+        let old = text("answer", "original");
+        let retained = std::sync::Arc::new(old.clone());
+        let mut current = old.clone();
+        body_mut(&mut current.content).unwrap().push_str(" tail");
+        current.at = Some(2);
+        let installed = apply_items(
+            &[retained.clone()],
+            vec![current.id.clone()],
+            vec![ItemChange::between(Some(&old), &current)],
+        )
+        .unwrap();
+        let (ItemContent::Text { text: before, .. }, ItemContent::Text { text: after, .. }) =
+            (&retained.content, &installed[0].content)
+        else {
+            unreachable!()
+        };
+        assert!(!before.shares_storage_with(after));
+        assert_eq!(before, "original");
+        assert_eq!(after, "original tail");
+        assert_eq!(retained.at, Some(1));
+        assert_eq!(installed[0].at, Some(2));
     }
 }
