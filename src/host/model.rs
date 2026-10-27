@@ -48,7 +48,7 @@ mod terminal_owners;
 mod terminal_retention;
 mod views;
 
-const SCHEMA_VERSION: u32 = 22;
+const SCHEMA_VERSION: u32 = 23;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -651,6 +651,10 @@ fn migrate_through(
         automations::migrate_history(tx)?;
         schema::migration_checkpoint(22)?;
     }
+    if version < 23 && target >= 23 {
+        views::migrate_history(tx)?;
+        schema::migration_checkpoint(23)?;
+    }
     Ok(())
 }
 
@@ -1086,7 +1090,7 @@ mod tests {
 
     #[test]
     fn legacy_channel_names_migrate_as_authoritative() {
-        let (mut registry, directory) = registry();
+        let (mut registry, _directory) = registry();
         registry.apply(&open("/project")).unwrap();
         let id = ChannelId::new();
         registry
@@ -1097,28 +1101,28 @@ mod tests {
                 title_source: Default::default(),
             })
             .unwrap();
-        registry
-            .db
-            .execute_batch(
-                "DROP TABLE automation_precheck_history_cleanup;
-                 DROP TABLE automation_retired_manual_requests;
-                 DROP INDEX automation_removed_history;
-                 ALTER TABLE automation_firings DROP COLUMN previous_firing;
-                 DROP TABLE automation_run_attention;
-                 DROP TABLE shared_terminal_retention_pins;
-                 DROP TABLE terminal_retention_pins;
-                 DROP TABLE automation_notifications;
-                 DROP TABLE channel_work_placement_epochs;
-                 DROP TABLE channel_work_placement_clock;
-                 DROP TABLE channel_work_operations;
-                 DROP TABLE channel_work_entries;
-                 DROP TABLE channel_work_homes;
-                 DROP TABLE automation_lifecycle;
-                 ALTER TABLE channels DROP COLUMN title_source; PRAGMA user_version = 2;",
-            )
-            .unwrap();
+        let path = automation_proposals::published_fixture_from_rows(&registry, 2);
         drop(registry);
-        let mut restored = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let legacy = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            legacy
+                .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(legacy.query_row::<u64, _, _>("SELECT count(*) FROM sqlite_schema WHERE name IN ('retired_view_panes','compacted_view_operations','compacted_view_operation_scopes')", [], |row| row.get(0)).unwrap(), 0);
+        assert_eq!(
+            legacy
+                .query_row::<u64, _, _>(
+                    "SELECT count(*) FROM pragma_table_info('channels') WHERE name='title_source'",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            0
+        );
+        drop(legacy);
+        let mut restored = Registry::at(&path).unwrap();
         assert!(
             !restored
                 .apply(&ModelEdit::SuggestChannelTitle {

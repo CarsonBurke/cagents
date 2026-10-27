@@ -1,6 +1,13 @@
 use super::*;
 use crate::workspace_model::views::{Change, Scope, View};
 
+mod history;
+
+/// Import permanent history guards and replay identities in the admitted opener transaction.
+pub(super) fn migrate_history(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
+    history::migrate(tx)
+}
+
 pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     let current: u32 = tx
         .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -451,6 +458,7 @@ pub(super) fn retire_agent(
         return Ok(false);
     };
     let id = crate::model::CardId::from_uuid(agent.id.as_uuid());
+    history::retire(db, &view.scope, id)?;
     view.apply(&Change::Remove { id })?;
     view.revision = view
         .revision
@@ -466,12 +474,7 @@ pub(super) fn retire_agent(
 }
 
 pub(super) fn operation_seen(db: &Connection, operation: Uuid) -> Result<bool, String> {
-    db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM shared_view_edits WHERE operation = ?1)",
-        [operation.to_string()],
-        |row| row.get(0),
-    )
-    .map_err(|error| error.to_string())
+    history::operation_seen(db, operation)
 }
 
 pub(super) fn apply(
@@ -482,6 +485,13 @@ pub(super) fn apply(
         ModelEdit::SeedView { scope, .. } | ModelEdit::ChangeView { scope, .. } => scope,
         _ => return Err("expected a workspace view edit".into()),
     };
+    // A committed UUID is never new authority, even if a retry changes scope.
+    // Return before registration so the no-op cannot create unsequenced state.
+    if let ModelEdit::ChangeView { operation, .. } = edit
+        && operation_seen(transaction, *operation)?
+    {
+        return Ok(false);
+    }
     if !exists(transaction, scope)? {
         if matches!(
             edit,
@@ -503,6 +513,7 @@ pub(super) fn apply(
             // Migration is additive, including old independent windows. Closed
             // IDs are applied first and prevent stale caches from resurrecting.
             for id in closed {
+                history::retire(transaction, scope, *id)?;
                 changed |= view.apply(&Change::Remove { id: *id })?;
                 transaction
                     .execute(
@@ -512,6 +523,9 @@ pub(super) fn apply(
                     .map_err(|error| error.to_string())?;
             }
             for pane in panes {
+                if history::contains(transaction, scope, pane.id)? {
+                    continue;
+                }
                 if view.panes.iter().any(|existing| {
                     existing.id != pane.id
                         && crate::workspace_model::views::same_resource(&existing.kind, &pane.kind)
@@ -532,9 +546,6 @@ pub(super) fn apply(
             change,
             ..
         } => {
-            if operation_seen(transaction, *operation)? {
-                return Ok(false);
-            }
             if view.revision != *expected_revision {
                 return Err("workspace view revision conflict".into());
             }
@@ -560,6 +571,7 @@ pub(super) fn apply(
                         register(transaction, destination)?;
                         let mut target = read(transaction, destination)?;
                         target.retired.retain(|retired| retired != id);
+                        history::allow_transfer_back(transaction, destination, *id)?;
                         target.apply(&Change::Insert {
                             pane: pane.clone(),
                             before: *before,
@@ -578,6 +590,7 @@ pub(super) fn apply(
                                 params![key(destination)?, id.to_string()],
                             )
                             .map_err(|error| error.to_string())?;
+                        history::retire(transaction, scope, *id)?;
                         view.apply(&Change::Remove { id: *id })?
                     }
                 }
@@ -587,6 +600,9 @@ pub(super) fn apply(
                     false
                 }
                 Change::Insert { pane, .. } | Change::InsertIfEmpty { pane } => {
+                    if history::contains(transaction, scope, pane.id)? {
+                        return Ok(false);
+                    }
                     if owner(transaction, pane.id)?.is_some_and(|owner| &owner != scope) {
                         return Err(
                             "pane already belongs to another view; use an atomic transfer".into(),
@@ -638,6 +654,7 @@ pub(super) fn apply(
                     }
                 }
                 Change::Remove { id } => {
+                    history::retire(transaction, scope, *id)?;
                     transaction
                         .execute(
                             "DELETE FROM shared_view_panes WHERE id=?1 AND scope=?2",
@@ -654,6 +671,7 @@ pub(super) fn apply(
                     params![operation.to_string(), key(scope)?],
                 )
                 .map_err(|error| error.to_string())?;
+            history::compact_operations(transaction)?;
         }
         _ => unreachable!(),
     }

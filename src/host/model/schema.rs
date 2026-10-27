@@ -278,6 +278,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static TWENTY: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_ONE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_TWO: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY_THREE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -290,6 +291,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         20 => &TWENTY,
         21 => &TWENTY_ONE,
         22 => &TWENTY_TWO,
+        23 => &TWENTY_THREE,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -784,6 +786,15 @@ mod tests {
             (18, "DROP TABLE channel_work_placement_epochs;"),
             (18, "DROP TABLE channel_work_placement_clock;"),
             (19, "DROP TABLE automation_notifications;"),
+            (23, "DROP INDEX agents_open_by_recency;"),
+            (23, "DROP TABLE retired_view_panes;"),
+            (23, "DROP TABLE compacted_view_operations;"),
+            (23, "DROP TABLE compacted_view_operation_scopes;"),
+            (23, "DROP INDEX compacted_view_operations_by_scope;"),
+            (
+                23,
+                "ALTER TABLE compacted_view_operations RENAME COLUMN operation TO changed_operation;",
+            ),
             (
                 19,
                 "ALTER TABLE automation_notifications RENAME COLUMN sequence TO changed_sequence;",
@@ -1028,6 +1039,23 @@ mod tests {
                 .iter()
                 .any(|object| object.1 == "automation_notifications")
         );
+        // Keep the published 18 -> 19 contract independently observable even
+        // when the actual opener also applies all later allocated migrations.
+        let tx = db.transaction().unwrap();
+        super::super::migrate_through(&tx, 18, 19).unwrap();
+        require_open_layout(&tx, 19).unwrap();
+        let mut published19 = inspect(&tx).unwrap().objects;
+        let outbox = published19
+            .iter()
+            .position(|object| object.1 == "automation_notifications")
+            .unwrap();
+        assert_eq!(
+            published19.remove(outbox).3,
+            tokens(super::super::automation_notifications::SCHEMA_SQL).unwrap()
+        );
+        assert_eq!(published19, old_layout, "published 19 adds only the outbox");
+        tx.pragma_update(None, "user_version", 19).unwrap();
+        tx.commit().unwrap();
         drop(db);
         for _ in 0..2 {
             let registry = Registry::at(&path).unwrap();
@@ -1058,6 +1086,10 @@ mod tests {
                 "automation_precheck_history_cleanup",
                 "automation_retired_manual_requests",
                 "automation_removed_history",
+                "retired_view_panes",
+                "compacted_view_operation_scopes",
+                "compacted_view_operations",
+                "compacted_view_operations_by_scope",
             ];
             for name in retention_names {
                 let index = inventory
@@ -1072,6 +1104,9 @@ mod tests {
                 "automation_run_attention",
                 "automation_precheck_history_cleanup",
                 "automation_retired_manual_requests",
+                "retired_view_panes",
+                "compacted_view_operation_scopes",
+                "compacted_view_operations",
             ] {
                 assert_eq!(
                     registry
@@ -1422,7 +1457,7 @@ mod tests {
     fn each_actual_migration_failure_rolls_back_all_prior_steps_and_header() {
         let _clear = Clear;
         for step in [
-            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("rollback.sqlite3");
@@ -2035,4 +2070,5 @@ mod tests {
         }
         panic!("SIGKILL returned");
     }
+    include!("schema/history_tests.rs");
 }
