@@ -10758,7 +10758,11 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
     ) {
         self.content.as_widget_mut().operate(
             &mut tree.children[0],
-            layout.children().next().expect("diff content"),
+            layout
+                .children()
+                .next()
+                .expect("diff content")
+                .with_virtual_offset(layout.virtual_offset()),
             renderer,
             operation,
         );
@@ -10839,7 +10843,11 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
     > {
         self.content.as_widget_mut().overlay(
             &mut tree.children[0],
-            layout.children().next().expect("diff content"),
+            layout
+                .children()
+                .next()
+                .expect("diff content")
+                .with_virtual_offset(layout.virtual_offset()),
             renderer,
             viewport,
             translation,
@@ -17814,6 +17822,62 @@ mod tests {
     /// A buffer whose tokens are exactly the ones the smoke run found
     /// indistinguishable: a comment, a keyword, a string, and a macro call.
     const HIGHLIGHTABLE: &str = "// what main does\nfn main() {\n    let hello = \"world\";\n    println!(\"{hello}\");\n}\n";
+
+    #[test]
+    fn nested_horizontal_diff_preserves_operation_and_overlay_virtual_offsets() {
+        use crate::workspace_widget::forwarding_test::{Traverse, leaf, renderer};
+        use cosmic::iced::{Point, Size, Vector};
+
+        let renderer = renderer();
+        // The canvas cancels horizontal scrolling while a row applies it to
+        // its text. Neither real translation may consume the enclosing
+        // scrollable's virtual offset before a descendant opens an overlay
+        // or participates in an operation.
+        for offset in [
+            Vector::ZERO,
+            Vector::new(4.0, -20.0),
+            Vector::new(-9.0, 35.0),
+        ] {
+            let (content, visits) = leaf::<RepositoryAction>(Size::new(500.0, 60.0), vec![]);
+            let row = Element::new(DiffHorizontalContent {
+                content,
+                width: Length::Fixed(300.0),
+                content_width: 500.0,
+                offset: 80.0,
+                accessible_text: None,
+                viewport: None,
+            });
+            let mut canvas = Element::new(DiffHorizontalContent {
+                content: row,
+                width: Length::Fixed(100.0),
+                content_width: 300.0,
+                offset: -80.0,
+                accessible_text: None,
+                viewport: None,
+            });
+            let mut tree = Tree::new(&canvas);
+            let node = canvas
+                .as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(100.0, 60.0)),
+                )
+                .move_to(Point::new(30.0, 40.0));
+            let layout = Layout::new(&node).with_virtual_offset(offset);
+            canvas
+                .as_widget_mut()
+                .operate(&mut tree, layout, &renderer, &mut Traverse);
+            assert!(
+                canvas
+                    .as_widget_mut()
+                    .overlay(&mut tree, layout, &renderer, &layout.bounds(), Vector::ZERO)
+                    .is_none()
+            );
+            assert_eq!(visits.offsets("operate"), vec![offset]);
+            assert_eq!(visits.offsets("overlay"), vec![offset]);
+        }
+    }
 
     #[test]
     fn horizontal_diff_forwards_translated_and_clipped_drop_targets() {
