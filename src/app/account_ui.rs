@@ -45,6 +45,7 @@ use crate::account::{
     schedule::{self, Millis, Schedule, Trigger},
 };
 use crate::agent::Provider;
+use crate::terminal::ipc::TerminalCloseResult;
 
 mod check;
 mod connection;
@@ -905,6 +906,15 @@ pub struct Restored {
     entry: Option<Entry>,
 }
 
+/// Cleanup follows the terminal observed before verification, never a later
+/// sign-in found at the same home. This payload is private UI state, not wire.
+#[derive(Debug, Clone)]
+pub struct SignInCleanup {
+    key: uuid::Uuid,
+    authority: crate::agent_execution::Authority,
+    target: Option<(CardId, TerminalSession)>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Action {
     Check(check::Action),
@@ -988,7 +998,10 @@ pub enum Action {
         result: Result<(uuid::Uuid, PathBuf, PathBuf, Option<std::ffi::OsString>), String>,
     },
     LoginTick,
-    LoginCallbackBlocked(uuid::Uuid),
+    LoginCallbackBlocked {
+        key: uuid::Uuid,
+        cleanup: SignInCleanup,
+    },
     /// The daemon's answer for sign-ins whose terminals this window is not
     /// watching: the ones whose terminals have ended.
     LoginsEnded(Result<Vec<(uuid::Uuid, TerminalId)>, String>),
@@ -1001,10 +1014,12 @@ pub enum Action {
     },
     LoginVerified {
         key: uuid::Uuid,
+        cleanup: SignInCleanup,
         outcome: Outcome,
     },
     LoginSettled {
         key: uuid::Uuid,
+        cleanup: SignInCleanup,
         result: Result<Settled, String>,
     },
     CancelLogin(uuid::Uuid),
@@ -2844,7 +2859,10 @@ impl Cagents {
                 result,
             } => self.open_account_login(provider, device, result),
             Action::LoginTick => self.check_logins(),
-            Action::LoginCallbackBlocked(key) => {
+            Action::LoginCallbackBlocked { key, cleanup } => {
+                if cleanup.key != key || !self.sign_in_cleanup_matches(&cleanup) {
+                    return Task::none();
+                }
                 if let Some(login) = self
                     .account_ui
                     .logins
@@ -2894,7 +2912,12 @@ impl Cagents {
             } => {
                 // The card may have been retried while this close was in flight.
                 // Neither its result nor its error belongs to the replacement.
-                if !offstrip_close_matches(self.card_state(card), &source) {
+                if !offstrip_close_matches(self.card_state(card), &source)
+                    || self.terminal_start_in_flight(card)
+                    || self
+                        .card_state(card)
+                        .is_some_and(|state| matches!(state.residency, Residency::Hydrating { .. }))
+                {
                     return Task::none();
                 }
                 match result {
@@ -2902,14 +2925,22 @@ impl Cagents {
                     Ok(()) => Task::batch([self.retire_offstrip_card(card), self.check_logins()]),
                     Err(error) => {
                         self.status = Some(TransientNotice::error(format!(
-                            "The sign-in could not be stopped: {error}"
+                            "The original sign-in card was kept because terminal release was not confirmed: {error}. Reconnect and retry Close."
                         )));
                         Task::none()
                     }
                 }
             }
-            Action::LoginVerified { key, outcome } => self.login_verified(key, outcome),
-            Action::LoginSettled { key, result } => self.login_settled(key, result),
+            Action::LoginVerified {
+                key,
+                cleanup,
+                outcome,
+            } => self.login_verified(key, cleanup, outcome),
+            Action::LoginSettled {
+                key,
+                cleanup,
+                result,
+            } => self.login_settled(key, cleanup, result),
             Action::CancelLogin(key) => {
                 let Some(login) = self.account_ui.logins.iter().find(|login| login.key == key)
                 else {
@@ -3885,26 +3916,52 @@ impl Cagents {
     /// Forgets a pending sign-in through the selected daemon. Its home and
     /// any interrupted-removal history remain available for explicit recovery.
     fn discard_home(&self, key: uuid::Uuid, provider: Provider) -> Task<Message> {
-        self.discard_home_via(key, provider, {
-            let authority = self.account_ui.authority.clone();
+        self.discard_home_with_cleanup(key, provider, self.sign_in_cleanup(key))
+    }
+
+    fn discard_home_with_cleanup(
+        &self,
+        key: uuid::Uuid,
+        provider: Provider,
+        cleanup: SignInCleanup,
+    ) -> Task<Message> {
+        self.discard_home_via_source(key, provider, cleanup.clone(), {
+            let authority = cleanup.authority.clone();
             move |operation| remote_lifecycle::<Settled>(authority, operation)
         })
     }
 
+    #[cfg(test)]
     fn discard_home_via(
         &self,
         key: uuid::Uuid,
         provider: Provider,
         request: impl FnOnce(account::remote::Operation) -> Result<Settled, String> + Send + 'static,
     ) -> Task<Message> {
+        self.discard_home_via_source(key, provider, self.sign_in_cleanup(key), request)
+    }
+
+    fn discard_home_via_source(
+        &self,
+        key: uuid::Uuid,
+        provider: Provider,
+        cleanup: SignInCleanup,
+        request: impl FnOnce(account::remote::Operation) -> Result<Settled, String> + Send + 'static,
+    ) -> Task<Message> {
         cosmic::task::future(async move {
+            let authority = cleanup.authority.clone();
             let result = tokio::task::spawn_blocking(move || {
+                connection::require_user(&authority)?;
                 abandon_home(provider, key, request).map(Settled::Abandoned)
             })
             .await
             .map_err(|error| error.to_string())
             .and_then(|result| result);
-            Message::AccountUi(Action::LoginSettled { key, result })
+            Message::AccountUi(Action::LoginSettled {
+                key,
+                cleanup,
+                result,
+            })
         })
     }
 
@@ -3977,32 +4034,109 @@ impl Cagents {
         Task::batch(verify.into_iter().chain([ask]))
     }
 
-    /// Closes a sign-in card that is not on the strip on screen, which has
-    /// no card close to run: the daemon closes its terminal - a no-op for
-    /// one that has ended - and the card is then retired.
+    fn sign_in_cleanup(&self, key: uuid::Uuid) -> SignInCleanup {
+        let target = self
+            .account_ui
+            .logins
+            .iter()
+            .find(|login| login.key == key)
+            .and_then(|login| self.sign_in_card(login.provider, &login.home))
+            .and_then(
+                |card| match self.card_state(card).map(|state| &state.kind) {
+                    Some(CardKind::Terminal(source)) => Some((card, source.clone())),
+                    _ => None,
+                },
+            );
+        SignInCleanup {
+            key,
+            authority: self.account_ui.authority.clone(),
+            target,
+        }
+    }
+
+    fn sign_in_cleanup_matches(&self, cleanup: &SignInCleanup) -> bool {
+        cleanup.target.as_ref().is_none_or(|(card, source)| {
+            self.card_state(*card).is_some_and(|state| {
+                state.existence.is_open()
+                    && (matches!(&state.kind, CardKind::Terminal(current) if current == source)
+                        || offstrip_close_matches(Some(state), source))
+            })
+        })
+    }
+
+    /// Capture before returning a future. No-proof alone does not prove that
+    /// a pending or uncertain terminal never reached the daemon.
     fn close_offstrip_sign_in(&mut self, card: CardId) -> Task<Message> {
+        self.close_offstrip_sign_in_via(card, |authority| {
+            let path = connection::selected_socket(&authority)?;
+            connection::at(&path, authority).map_err(|error| error.to_string())
+        })
+    }
+
+    fn close_offstrip_sign_in_via(
+        &mut self,
+        card: CardId,
+        connect: impl FnOnce(crate::agent_execution::Authority) -> Result<ControlClient, String>
+        + Send
+        + 'static,
+    ) -> Task<Message> {
         let authority = self.account_ui.authority.clone();
-        let hosted = match self.card_state(card) {
-            Some(CardState {
-                kind: CardKind::Terminal(session),
+        let source = match self.card_state(card).map(|state| &state.kind) {
+            Some(CardKind::Terminal(source)) => source.clone(),
+            _ => return Task::none(),
+        };
+        self.close_offstrip_source(card, source, authority, connect)
+    }
+
+    fn close_offstrip_source(
+        &mut self,
+        card: CardId,
+        source: TerminalSession,
+        authority: crate::agent_execution::Authority,
+        connect: impl FnOnce(crate::agent_execution::Authority) -> Result<ControlClient, String>
+        + Send
+        + 'static,
+    ) -> Task<Message> {
+        if let Err(error) = connection::require_user(&authority) {
+            self.status = Some(TransientNotice::error(error));
+            return Task::none();
+        }
+        if self.terminal_start_in_flight(card)
+            || self
+                .card_state(card)
+                .is_some_and(|state| matches!(state.residency, Residency::Hydrating { .. }))
+        {
+            self.status = Some(TransientNotice::warning(
+                "The sign-in is still starting. Its original card was kept; wait and try Close again.",
+            ));
+            return Task::none();
+        }
+        if matches!(
+            source.continuity,
+            TerminalContinuity::RelaunchAvailable {
+                last_exit: None,
                 ..
-            }) => session
-                .continuity
-                .live_proof()
-                .map(|proof| (session.clone(), proof)),
-            _ => None,
-        };
-        let Some((source, proof)) = hosted else {
-            // Ended already, or never taken on by the daemon: nothing runs.
+            }
+        ) {
             return Task::batch([self.retire_offstrip_card(card), self.check_logins()]);
-        };
-        let terminal = source.id;
+        }
+        if !terminal_ended(&source) && source.continuity.live_proof().is_none() {
+            self.status = Some(TransientNotice::warning(
+                "The original sign-in has no confirmed terminal ownership. Its card was kept; reconnect and retry Close.",
+            ));
+            return Task::none();
+        }
         cosmic::task::future(async move {
-            let result =
-                tokio::task::spawn_blocking(move || stop_hosted(terminal, &proof, authority))
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result);
+            let original = source.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                // Scope is admitted before even an injected connection path.
+                connection::require_user(&authority)?;
+                let mut client = connect(authority)?;
+                stop_hosted(&mut client, &original)
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
             Message::AccountUi(Action::OffstripClosed {
                 card,
                 source,
@@ -4011,25 +4145,34 @@ impl Cagents {
         })
     }
 
-    /// Closes the card of a sign-in that has settled: its terminal has said
-    /// all it had to.
-    fn close_settled_sign_in(&mut self, provider: Provider, home: &Path) -> Task<Message> {
-        match self.sign_in_card(provider, home) {
-            Some(card) if !self.workspace.order().any(|id| id == card) => {
-                self.close_offstrip_sign_in(card)
-            }
-            Some(card)
-                if ended_terminal(self.card_state(card)).is_some()
-                    || matches!(self.cards.get(&card), Some(CardRuntime::Failed(_))) =>
-            {
-                cosmic::task::message(Message::CloseCard(card))
-            }
-            _ => Task::none(),
+    /// The successful account result does not authorize closing a newer retry
+    /// at the same home. Validate the captured source before any close effect.
+    fn close_settled_sign_in(&mut self, cleanup: SignInCleanup) -> Task<Message> {
+        if !self.sign_in_cleanup_matches(&cleanup) {
+            return Task::none();
+        }
+        let Some((card, source)) = cleanup.target else {
+            return Task::none();
+        };
+        if let Err(error) = connection::require_user(&cleanup.authority) {
+            self.status = Some(TransientNotice::error(error));
+            return Task::none();
+        }
+        if self.workspace.order().any(|current| current == card) {
+            // Synchronous capture enters the existing attempt/queue/transfer
+            // and pending-spawn fences; never queue an unbound CloseCard.
+            self.close_card_unasked(card)
+        } else {
+            self.close_offstrip_source(card, source, cleanup.authority, |authority| {
+                let path = connection::selected_socket(&authority)?;
+                connection::at(&path, authority).map_err(|error| error.to_string())
+            })
         }
     }
 
     fn verify_login(&mut self, key: uuid::Uuid) -> Task<Message> {
-        let authority = self.account_ui.authority.clone();
+        let cleanup = self.sign_in_cleanup(key);
+        let authority = cleanup.authority.clone();
         let browser_terminal = self.account_ui.logins.iter()
             .find(|login| login.key == key)
             .and_then(|login| self.sign_in_card(login.provider, &login.home))
@@ -4068,7 +4211,9 @@ impl Cagents {
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
                 match blocked {
-                    Ok(true) => return Message::AccountUi(Action::LoginCallbackBlocked(key)),
+                    Ok(true) => {
+                        return Message::AccountUi(Action::LoginCallbackBlocked { key, cleanup });
+                    }
                     Ok(false) => {}
                     Err(error) => unread = Some(error),
                 }
@@ -4098,13 +4243,22 @@ impl Cagents {
             };
             Message::AccountUi(Action::LoginVerified {
                 key,
+                cleanup,
                 outcome: with_callback_unread(unread, outcome),
             })
         })
     }
 
-    fn login_verified(&mut self, key: uuid::Uuid, outcome: Outcome) -> Task<Message> {
-        let authority = self.account_ui.authority.clone();
+    fn login_verified(
+        &mut self,
+        key: uuid::Uuid,
+        cleanup: SignInCleanup,
+        outcome: Outcome,
+    ) -> Task<Message> {
+        if cleanup.key != key {
+            return Task::none();
+        }
+        let authority = cleanup.authority.clone();
         let outcome = match outcome {
             Outcome::Answered {
                 ref identity,
@@ -4173,7 +4327,7 @@ impl Cagents {
                 return Task::none();
             }
             login.phase = LoginPhase::Settling;
-            return self.discard_home(key, provider);
+            return self.discard_home_with_cleanup(key, provider, cleanup);
         }
         login.phase = LoginPhase::Settling;
         if crate::device::is_remote() {
@@ -4187,7 +4341,11 @@ impl Cagents {
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
-                Message::AccountUi(Action::LoginSettled { key, result })
+                Message::AccountUi(Action::LoginSettled {
+                    key,
+                    cleanup,
+                    result,
+                })
             });
         }
         let managed = registry::Registered {
@@ -4211,6 +4369,7 @@ impl Cagents {
             if let Err(error) = connection::require_user(&authority) {
                 return Message::AccountUi(Action::LoginSettled {
                     key,
+                    cleanup,
                     result: Err(error),
                 });
             }
@@ -4253,11 +4412,23 @@ impl Cagents {
                 }
                 Err(error) => Err(error),
             };
-            Message::AccountUi(Action::LoginSettled { key, result })
+            Message::AccountUi(Action::LoginSettled {
+                key,
+                cleanup,
+                result,
+            })
         })
     }
 
-    fn login_settled(&mut self, key: uuid::Uuid, result: Result<Settled, String>) -> Task<Message> {
+    fn login_settled(
+        &mut self,
+        key: uuid::Uuid,
+        cleanup: SignInCleanup,
+        result: Result<Settled, String>,
+    ) -> Task<Message> {
+        if cleanup.key != key {
+            return Task::none();
+        }
         let Some(index) = self
             .account_ui
             .logins
@@ -4314,7 +4485,7 @@ impl Cagents {
                     TransientNotice::success(format!("{name} was added."))
                         .with_key(NoticeKey::SignIn(key)),
                 );
-                self.close_settled_sign_in(login.provider, &login.home)
+                self.close_settled_sign_in(cleanup)
             }
             Ok(Settled::Duplicate { existing, registry }) => {
                 if let Some(registry) = registry {
@@ -4329,7 +4500,7 @@ impl Cagents {
                     TransientNotice::warning(format!("That login is already added as {name}."))
                         .with_key(NoticeKey::SignIn(key)),
                 );
-                self.close_settled_sign_in(login.provider, &login.home)
+                self.close_settled_sign_in(cleanup)
             }
             Ok(Settled::Abandoned(registry)) => {
                 if let Some(registry) = registry {
@@ -4337,7 +4508,7 @@ impl Cagents {
                 }
                 // Nothing is left to save, so an earlier retry warning is moot.
                 self.resolve_notice(NoticeKey::SignIn(key));
-                self.close_settled_sign_in(login.provider, &login.home)
+                self.close_settled_sign_in(cleanup)
             }
             Err(error) => {
                 self.status = Some(
@@ -5397,56 +5568,57 @@ fn ended_on_host(
 // Match process identity, not the continuity variant: the original terminal
 // may legitimately exit before its close acknowledgement reaches this window.
 fn offstrip_close_matches(state: Option<&CardState>, source: &TerminalSession) -> bool {
+    matches!(state, Some(CardState { kind: CardKind::Terminal(current), existence, .. })
+        if existence.is_open() && sign_in_source_matches(current, source))
+}
+
+fn sign_in_source_matches(current: &TerminalSession, source: &TerminalSession) -> bool {
+    if terminal_ended(source) {
+        return current == source;
+    }
     let Some(proof) = source.continuity.live_proof() else {
         return false;
     };
-    matches!(state, Some(CardState { kind: CardKind::Terminal(current), existence, .. })
-        if existence.is_open()
-            && current.id == source.id
-            && current.launch == source.launch
-            && (current.continuity.live_proof().as_ref() == Some(&proof)
-                || matches!(current.continuity,
-                    TerminalContinuity::Exited { .. }
-                    | TerminalContinuity::RelaunchAvailable { last_exit: Some(_), .. })))
+    let mut original = source.clone();
+    original.continuity = current.continuity.clone();
+    original == *current
+        && (current.continuity.live_proof().as_ref() == Some(&proof) || terminal_ended(current))
 }
 
-/// Closes the hosted `terminal` for good. A daemon that restored it under
-/// a session of its own is asked again with that session, so a close is
-/// only reported done once the terminal has ended or is gone.
-fn stop_hosted(
-    terminal: TerminalId,
-    proof: &HostSessionProof,
-    authority: crate::agent_execution::Authority,
-) -> Result<(), String> {
-    connection::require_user(&authority)?;
-    use super::terminal_close::{CloseOutcome, close_hosted_terminal};
-    let outcome = match close_hosted_terminal(terminal, proof, true) {
-        CloseOutcome::Stale => {
-            let path = connection::selected_socket(&authority)?;
-            let mut client = connection::at(&path, authority).map_err(|error| error.to_string())?;
-            let hosted = client.list().map_err(|error| error.to_string())?;
-            match hosted
-                .iter()
-                .find(|descriptor| descriptor.session.id == terminal)
-            {
-                None => return Ok(()),
-                Some(descriptor) if terminal_ended(&descriptor.session) => return Ok(()),
-                Some(descriptor) => match descriptor.session.continuity.live_proof() {
-                    Some(current) if current != *proof => {
-                        close_hosted_terminal(terminal, &current, true)
-                    }
-                    _ => CloseOutcome::Stale,
-                },
-            }
+/// A completed source is released by its complete original descriptor. A live
+/// source may end under the SAME proof; a new daemon proof is never rebased.
+fn stop_hosted(client: &mut ControlClient, source: &TerminalSession) -> Result<(), String> {
+    let outcome = if terminal_ended(source) {
+        client.release_completed_terminal(source.clone(), true)
+    } else {
+        let proof = source.continuity.live_proof().ok_or(
+            "The original sign-in has no proved hosted or completed source",
+        )?;
+        if !proof.is_complete() || client.proof() != &proof {
+            return Err("The original daemon changed; the sign-in card was kept. Reconnect and retry Close.".into());
         }
-        outcome => outcome,
-    };
+        let hosted = client.list().map_err(|error| error.to_string())?;
+        let current = hosted.iter().find(|descriptor| descriptor.session.id == source.id)
+            .ok_or("The original terminal is unavailable; its card was kept. Reconnect and retry Close.")?;
+        if !sign_in_source_matches(&current.session, source) {
+            return Err("The original terminal changed; its card was kept. Retry Close from the original session.".into());
+        }
+        if terminal_ended(&current.session) {
+            let mut completed = source.clone();
+            completed.continuity = current.session.continuity.clone();
+            client.release_completed_terminal(completed, true)
+        } else {
+            client.close_terminal_checked(source.id, true)
+        }
+    }.map_err(|error| error.to_string())?;
     match outcome {
-        CloseOutcome::Closed => Ok(()),
-        CloseOutcome::Active | CloseOutcome::Stale => {
-            Err("its terminal is still running and could not be closed".to_owned())
+        TerminalCloseResult::Closed => Ok(()),
+        TerminalCloseResult::Active => {
+            Err("The original terminal still owns work; its card was kept. Retry Close.".into())
         }
-        CloseOutcome::Unreachable(error) => Err(error),
+        TerminalCloseResult::Unknown(error) => Err(format!(
+            "The original terminal could not be released; its card was kept. {error}"
+        )),
     }
 }
 
@@ -6042,7 +6214,7 @@ mod tests {
 
 #[cfg(test)]
 mod app_tests {
-    mod signin_cleanup;
+    mod completed_release_regression;
 
     #[test]
     fn codex_device_relogin_keeps_the_home_and_other_browser_preparation() {
@@ -6213,7 +6385,10 @@ mod app_tests {
         let mut app = context_inspector_test_app(false);
         let key = pending_login(&mut app, 512);
         app.account_ui.logins[0].phase = LoginPhase::Verifying;
-        let _ = app.update(Message::AccountUi(Action::LoginCallbackBlocked(key)));
+        let _ = app.update(Message::AccountUi(Action::LoginCallbackBlocked {
+            key,
+            cleanup: app.sign_in_cleanup(key),
+        }));
         assert_eq!(app.account_ui.logins[0].phase, LoginPhase::CallbackBlocked);
         let _ = app.update(Message::AccountUi(Action::LoginTick));
         assert_eq!(app.account_ui.logins[0].phase, LoginPhase::CallbackBlocked);
@@ -6448,6 +6623,7 @@ mod app_tests {
         // the card.
         let _ = app.update(Message::AccountUi(Action::LoginSettled {
             key,
+            cleanup: app.sign_in_cleanup(key),
             result: Ok(Settled::Abandoned(None)),
         }));
         assert!(app.account_ui.logins.is_empty());
@@ -6512,6 +6688,8 @@ mod app_tests {
             host_incarnation: crate::model::HostIncarnation::new("original-incarnation"),
         };
         let source = source.clone();
+        app.card_state_mut(card).unwrap().residency = Residency::Hot;
+        app.finish_terminal_start(card);
         app.account_ui.logins.push(Login {
             provider: Provider::Claude,
             key,
@@ -6756,6 +6934,8 @@ mod app_tests {
         let _ = app.select_worktree("/elsewhere".into(), false);
         assert!(!app.workspace.order().any(|id| id == card));
 
+        app.finish_terminal_start(card);
+        app.card_state_mut(card).unwrap().residency = Residency::Hibernated;
         // No daemon ever hosted it, so nothing needs stopping: the card is
         // retired at once and the sign-in, left without one, is settled.
         let _ = app.update(Message::AccountUi(Action::CancelLogin(key)));
@@ -8282,6 +8462,7 @@ mod app_tests {
         app.account_ui.logins[0].attempts = 1;
         let _ = app.update(Message::AccountUi(Action::LoginSettled {
             key,
+            cleanup: app.sign_in_cleanup(key),
             result: Err("auth terminal is still closing".into()),
         }));
         let login = &app.account_ui.logins[0];
@@ -8302,6 +8483,7 @@ mod app_tests {
             let _ = app.check_logins();
             let _ = app.login_verified(
                 key,
+                app.sign_in_cleanup(key),
                 Outcome::Answered {
                     catalog: None,
                     identity: Some(Identity {
@@ -8384,6 +8566,7 @@ mod app_tests {
             assert_eq!(app.account_ui.logins[0].attempts, attempt);
             let _ = app.update(Message::AccountUi(Action::LoginVerified {
                 key,
+                cleanup: app.sign_in_cleanup(key),
                 outcome: Outcome::Failed("not now".into()),
             }));
             if attempt < LOGIN_ATTEMPTS {
@@ -8484,6 +8667,7 @@ mod app_tests {
         let _ = app.update(Message::AccountUi(Action::LoginTick));
         let _ = app.update(Message::AccountUi(Action::LoginVerified {
             key: old,
+            cleanup: app.sign_in_cleanup(key),
             outcome: Outcome::Answered {
                 catalog: None,
                 identity: None,
@@ -8503,6 +8687,7 @@ mod app_tests {
         assert_eq!(app.account_ui.logins[0].phase, LoginPhase::Verifying);
         let _ = app.update(Message::AccountUi(Action::LoginVerified {
             key,
+            cleanup: app.sign_in_cleanup(key),
             outcome: Outcome::Answered {
                 catalog: None,
                 identity: None,
@@ -8512,6 +8697,7 @@ mod app_tests {
         assert_eq!(app.account_ui.logins[0].phase, LoginPhase::Settling);
         let _ = app.update(Message::AccountUi(Action::LoginSettled {
             key,
+            cleanup: app.sign_in_cleanup(key),
             result: Ok(Settled::Abandoned(None)),
         }));
         assert!(app.account_ui.logins.is_empty());
@@ -8545,6 +8731,7 @@ mod app_tests {
         };
         let _ = app.update(Message::AccountUi(Action::LoginSettled {
             key,
+            cleanup: app.sign_in_cleanup(key),
             result: Ok(Settled::Registered {
                 registry,
                 identity: Some(identity.clone()),
@@ -8597,6 +8784,7 @@ mod app_tests {
                 app.account_ui.logins[0].attempts = 1;
                 let _ = app.update(Message::AccountUi(Action::LoginSettled {
                     key,
+                    cleanup: app.sign_in_cleanup(key),
                     result: Err("reply lost".into()),
                 }));
                 assert_eq!(app.notices.len(), 1);
@@ -8604,6 +8792,7 @@ mod app_tests {
             app.account_ui.logins[0].attempts = LOGIN_ATTEMPTS;
             let _ = app.update(Message::AccountUi(Action::LoginVerified {
                 key,
+                cleanup: app.sign_in_cleanup(key),
                 outcome: Outcome::Failed("not now".into()),
             }));
             assert!(app.account_ui.logins.is_empty());
@@ -8637,6 +8826,7 @@ mod app_tests {
             app.account_ui.logins[0].attempts = attempt;
             let _ = app.update(Message::AccountUi(Action::LoginSettled {
                 key,
+                cleanup: app.sign_in_cleanup(key),
                 result: Err(error.into()),
             }));
         }
@@ -8662,6 +8852,7 @@ mod app_tests {
             .unwrap();
         let _ = app.update(Message::AccountUi(Action::LoginSettled {
             key,
+            cleanup: app.sign_in_cleanup(key),
             result: Ok(Settled::Registered {
                 registry,
                 identity: None,
@@ -8696,6 +8887,7 @@ mod app_tests {
         let key = pending_login(&mut app, 13);
         let _ = app.update(Message::AccountUi(Action::LoginSettled {
             key,
+            cleanup: app.sign_in_cleanup(key),
             result: Ok(Settled::Duplicate {
                 existing: system,
                 registry: None,
@@ -9884,7 +10076,7 @@ mod app_tests {
         });
         let message = lifecycle_message(task).await;
         assert!(
-            matches!(&message, Message::AccountUi(Action::LoginSettled { key: received, result: Err(_) }) if *received == key)
+            matches!(&message, Message::AccountUi(Action::LoginSettled { key: received, result: Err(_), .. }) if *received == key)
         );
         drop(app.update(message));
         assert_eq!(store.load().unwrap(), original);
@@ -9901,7 +10093,7 @@ mod app_tests {
         });
         let message = lifecycle_message(task).await;
         assert!(
-            matches!(&message, Message::AccountUi(Action::LoginSettled { key: received, result: Err(_) }) if *received == key)
+            matches!(&message, Message::AccountUi(Action::LoginSettled { key: received, result: Err(_), .. }) if *received == key)
         );
         drop(app.update(message));
         assert_eq!(store.load().unwrap(), original);
@@ -9913,7 +10105,7 @@ mod app_tests {
         });
         let message = lifecycle_message(task).await;
         assert!(
-            matches!(&message, Message::AccountUi(Action::LoginSettled { key: received, result: Err(_) }) if *received == key)
+            matches!(&message, Message::AccountUi(Action::LoginSettled { key: received, result: Err(_), .. }) if *received == key)
         );
         drop(app.update(message));
         assert_eq!(store.load().unwrap(), original);
@@ -9934,7 +10126,7 @@ mod app_tests {
         });
         let message = lifecycle_message(task).await;
         assert!(
-            matches!(&message, Message::AccountUi(Action::LoginSettled { key: received, result: Ok(Settled::Abandoned(Some(_))) }) if *received == key)
+            matches!(&message, Message::AccountUi(Action::LoginSettled { key: received, result: Ok(Settled::Abandoned(Some(_))), .. }) if *received == key)
         );
         drop(app.update(message));
         assert!(app.account_ui.logins.is_empty());
