@@ -130,6 +130,15 @@ fn history_migration_preserves_each_published_12_through_19_atomically_and_once(
         let registry = Registry::at(&path).unwrap();
         require_current(&registry.db).unwrap();
         assert_eq!(
+            registry.db.query_row::<u64, _, _>(
+                "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='agents_open_by_recency'",
+                [],
+                |row| row.get(0),
+            ).unwrap(),
+            1,
+            "the admitted23 upgrade installs the original global active-listing index atomically"
+        );
+        assert_eq!(
             history_preserved_rows(&registry.db, &prior_tables, version),
             preserved,
             "history migration preserves all pre-existing unrelated rows including CoreHome and placement clocks"
@@ -286,7 +295,7 @@ fn malformed_published19_operation_refuses_whole_history_upgrade_without_deletin
             .unwrap(),
         2100
     );
-    assert_eq!(db.query_row::<u64, _, _>("SELECT count(*) FROM sqlite_schema WHERE name IN ('retired_view_panes','compacted_view_operations','compacted_view_operation_scopes')", [], |row| row.get(0)).unwrap(), 0);
+    assert_eq!(db.query_row::<u64, _, _>("SELECT count(*) FROM sqlite_schema WHERE name IN ('retired_view_panes','compacted_view_operations','compacted_view_operation_scopes','agents_open_by_recency')", [], |row| row.get(0)).unwrap(), 0);
 }
 
 // Compare every pre-existing unrelated table, including populated CoreHome and
@@ -552,7 +561,7 @@ fn actual_twenty_through_twenty_two_predecessors_keep_payloads_and_fail_atomical
         let mut db = Connection::open(&path).unwrap();
         require_open_layout(&db, version).unwrap();
         assert_eq!(inspect(&db).unwrap().version, version);
-        assert_eq!(db.query_row::<u64,_,_>("SELECT count(*) FROM sqlite_schema WHERE name IN ('retired_view_panes','compacted_view_operations','compacted_view_operation_scopes')", [], |row| row.get(0)).unwrap(), 0);
+        assert_eq!(db.query_row::<u64,_,_>("SELECT count(*) FROM sqlite_schema WHERE name IN ('retired_view_panes','compacted_view_operations','compacted_view_operation_scopes','agents_open_by_recency')", [], |row| row.get(0)).unwrap(), 0);
         let retired = (0..1500).map(|_| CardId::new()).collect::<Vec<_>>();
         let key = serde_json::to_string(&scope).unwrap();
         let operations = (0..2100).map(|_| uuid::Uuid::new_v4()).collect::<Vec<_>>();
@@ -655,6 +664,15 @@ fn actual_twenty_through_twenty_two_predecessors_keep_payloads_and_fail_atomical
         }
         let registry = Registry::at(&path).unwrap();
         require_current(&registry.db).unwrap();
+        assert_eq!(
+            registry.db.query_row::<u64, _, _>(
+                "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='agents_open_by_recency'",
+                [],
+                |row| row.get(0),
+            ).unwrap(),
+            1,
+            "the admitted23 upgrade installs the original global active-listing index atomically"
+        );
         assert_eq!(inspect(&registry.db).unwrap().version, 23);
         assert_eq!(registry.model().unwrap().sequence, sequence + 1);
         assert_eq!(

@@ -2584,6 +2584,20 @@ mod tests {
             .join("; ");
         assert!(plan.contains("SEARCH"), "{plan}");
         assert!(plan.contains("agents_by_origin"), "{plan}");
+        // The original global active listing also needs its own recency path:
+        // an origin-first index cannot order unrelated active callers by rowid.
+        let plan = registry
+            .db
+            .prepare(&format!("EXPLAIN QUERY PLAN {ACTIVE_AGENTS}"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("; ");
+        assert!(plan.contains("SEARCH"), "{plan}");
+        assert!(plan.contains("agents_open_by_recency"), "{plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
     }
 
     #[test]

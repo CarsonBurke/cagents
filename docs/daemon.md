@@ -493,3 +493,40 @@ reviewed handoff before starting the replacement. Unlocked stale lease records
 do not block startup. Public staged-owner routing and explicit reviewed update
 handoffs keep their existing ownership checks; admission does not stop windows
 or hosted terminals automatically.
+
+
+## Workspace edit isolation
+
+Ordinary layout mutations use their own serialized SQLite connection. Waiting
+for its writer, committing with FULL durability, and hydrating the response
+model occur outside the global terminal-host mutex. Publication logs
+`host_lock_wait_us` and `host_lock_hold_us` at debug level. Model reads use one
+coherent WAL snapshot outside that mutex; subscriptions register before their
+snapshot so concurrent execution/layout commits cannot fall into a gap.
+Inferred conversation-title edits retain their existing resident identity/title
+guard under the host mutex. Pending-terminal completion keeps the exact original
+worker and the same workspace writer admission through its final saved-source
+check, publication and durable completion; a failed save can retry that worker.
+Current terminal-retirement admission still refuses new saved claims while
+cleanup is in flight.
+
+Views carry at most 256 recent retired pane IDs, backed by indexed per-scope
+resurrection guards for older IDs. At most 2048 recent operation receipts remain
+in the recent table; older successful operation identities move to a permanent
+scope-lifetime archive, so rebasing a lost reply cannot replay a committed edit.
+The archive and retirement guards grow until scope deletion; this is not an
+absolute bound on database size. Explicit atomic transfers may bring a pane back
+to a previous scope while preserving agent placement and terminal provenance.
+The allocated HostDB23 migration imports old guards before trimming recent
+history and preserves the published migrations through 22. Active-agent listings
+use separate global-recency and origin-specific indexed queries; historical
+execution receipts retain their idempotency and recovery evidence.
+
+Use `scripts/benchmark-terminal input --socket PATH` against a private matched
+daemon for a baseline, then add `--toggle-panes` to run committed pane
+insert/remove cycles from a second IPC client with the same originally captured
+authority and daemon proof. The report retains 30 ordered input-probe timestamps
+and the number of complete edit cycles inside the sealed measurement window;
+a toggled run with no such cycles fails. This probe measures input-to-snapshot
+latency, not native presentation. The original 30-live-stream native workload,
+resource observations and paired p99 comparison require separate actual evidence.

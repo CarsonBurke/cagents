@@ -786,6 +786,7 @@ mod tests {
             (18, "DROP TABLE channel_work_placement_epochs;"),
             (18, "DROP TABLE channel_work_placement_clock;"),
             (19, "DROP TABLE automation_notifications;"),
+            (23, "DROP INDEX agents_open_by_recency;"),
             (23, "DROP TABLE retired_view_panes;"),
             (23, "DROP TABLE compacted_view_operations;"),
             (23, "DROP TABLE compacted_view_operation_scopes;"),

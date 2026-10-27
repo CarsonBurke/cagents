@@ -45,6 +45,7 @@ pub(super) fn migrate(tx: &Transaction<'_>) -> Result<(), String> {
             scope TEXT NOT NULL REFERENCES shared_view_scopes(scope) ON DELETE CASCADE,
             id TEXT NOT NULL, PRIMARY KEY(scope, id)
         ) STRICT;
+        CREATE INDEX IF NOT EXISTS agents_open_by_recency ON agents(closed) WHERE closed=0;
         INSERT OR IGNORE INTO retired_view_panes(scope,id)
             SELECT shared_views.scope, retired.value
             FROM shared_views, json_each(shared_views.retired) AS retired;",

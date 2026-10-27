@@ -2813,8 +2813,8 @@ mod tests {
                 },
             },
         ] {
-            let error = process_request(&host, 1, ClientRequest::EditWorkspaceModel { edit })
-                .unwrap_err();
+            let error =
+                process_request(&host, 1, ClientRequest::EditWorkspaceModel { edit }).unwrap_err();
             assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
             assert!(error.retryable && error.message.contains("completing retirement"));
             assert_eq!(host.lock().unwrap().read_model().unwrap(), before);
