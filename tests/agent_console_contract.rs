@@ -344,7 +344,12 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
     ]);
     let deadline = Instant::now() + Duration::from_secs(10);
     let second = loop {
-        let second = fixture.cli(&["agent", "status", agent]);
+        let arguments = ["agent", "status", agent];
+        let output = fixture.output_until(&arguments, deadline);
+        assert!(output.status.success(), "{arguments:?}: {output:?}");
+        let second: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(second["ok"], true, "{second}");
+        let second = second["data"].clone();
         if second["run"]["id"] != first_run && second["run"]["state"] == "Succeeded" {
             break second;
         }
