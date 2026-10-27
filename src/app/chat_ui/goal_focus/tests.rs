@@ -444,8 +444,7 @@ fn restoration_preserves_named_and_anonymous_foreign_native_focus_and_requires_a
             field.id(widget::Id::new("foreign-native-editor")).into()
         };
         let mut ui = UserInterface::build(
-            widget::column::with_children(vec![runtime(&app, target).goal_panel().unwrap(), field])
-                .into(),
+            widget::column::with_children(vec![runtime(&app, target).goal_panel().unwrap(), field]),
             iced::Size::new(640.0, 900.0),
             cache,
             &mut renderer,
