@@ -1623,7 +1623,12 @@ impl Claude {
                             && (edit.is_none() || input.is_none())
                             && matches!(item.content, ItemContent::Changes { .. })
                         {
-                            step.events.push(Event::Error{message:format!("Tool failed: {}. Its exact original invocation is unavailable; the full failed attempted changes were preserved.",super::preview(content_text(&block["content"]).as_bytes(),512)),fatal:false});
+                            let message = content_text(&block["content"]);
+                            let message = &message[..message.floor_char_boundary(512)];
+                            step.events.push(Event::Error {
+                                message: format!("Tool failed: {message}. Its exact original invocation is unavailable; the full failed attempted changes were preserved."),
+                                fatal: false,
+                            });
                         }
                         apply_result(
                             &mut item.content,
