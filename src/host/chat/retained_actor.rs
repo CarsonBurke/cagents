@@ -1629,6 +1629,120 @@ pub(in crate::host) fn reconcile_startup_losses(host: &SharedHost) -> Result<(),
     Ok(())
 }
 
+/// A completed task from a previous kernel boot is saved history, not ownership
+/// of a current cleanup-only helper using the same saved allocation. Archive
+/// only an already removed presentation, before orphan adoption consults it.
+pub(in crate::host) fn reconcile_previous_boot_history(host: &SharedHost) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let proof = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .clone();
+    let registry = super::super::agent_execution::registry(host)?;
+    let mut after = None;
+    loop {
+        let page = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .native_actor_ownerships(after, 128)?;
+        if page.is_empty() {
+            return Ok(());
+        }
+        for ownership in page {
+            after = Some(ownership.actor());
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    "Historical execution inspection reached its startup budget; remaining records were preserved"
+                );
+                return Ok(());
+            }
+            if !ownership.is_pending() || ownership.owner().boot != proof.boot_id {
+                continue;
+            }
+            if !registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .has_previous_boot_execution(ownership.source().id, &proof.boot_id)?
+            {
+                continue;
+            }
+            let inspection = match Handle::inspect_remote_until(
+                ownership.owner(),
+                proof.clone(),
+                deadline,
+            ) {
+                Ok(inspection) => inspection,
+                Err(error) => {
+                    tracing::warn!(actor=%ownership.actor(), %error, "Historical execution cleanup could not authenticate its helper; original records preserved");
+                    continue;
+                }
+            };
+            if inspection.identity.instance != ownership.actor()
+                || &inspection.identity.record != ownership.owner()
+                || (ownership.source() != &inspection.source
+                    && !inspection.previous_sources.contains(ownership.source()))
+                || ownership.scope()
+                    != inspection
+                        .launch_account_scope
+                        .as_ref()
+                        .map_err(String::as_str)
+                || !inspection.state.close.completed
+                || !inspection.state.close.exited
+                || inspection.state.owns_work
+                || inspection.state.outbox_ack != inspection.state.outbox_latest
+                || inspection.state.continuity_loss.is_some()
+            {
+                continue;
+            }
+            // Reattach only for cleanup. This republishes the already closed
+            // snapshot under our authenticated epoch, without provider input.
+            let handle = match Handle::adopt_remote_for_close(
+                ownership.owner(),
+                inspection.source.clone(),
+                proof.clone(),
+                |_| {},
+            ) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    tracing::warn!(actor=%ownership.actor(), %error, "Historical helper cleanup remains retryable");
+                    continue;
+                }
+            };
+            if handle.actor_identity().as_ref() != Some(&inspection.identity)
+                || handle.launch_account_scope() != ownership.scope()
+                || !handle.retained_close_proved(&inspection.source, &proof)?
+            {
+                continue;
+            }
+            let current = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                !state.shutting_down
+                    && state.proof() == &proof
+                    && !state.chats.contains_key(&ownership.source().id)
+            };
+            if !current {
+                continue;
+            }
+            let mut issued = inspection.previous_sources;
+            issued.push(inspection.source.clone());
+            let archived = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .archive_previous_boot_execution(&ownership, &proof.boot_id, &issued)?;
+            if archived {
+                // Retire performs the existing final semantic ACK/real exit
+                // checks. Archival supplied no alias or execution authority.
+                if let Err(error) = publish_retirement(host, &handle, &inspection.source) {
+                    tracing::warn!(actor=%ownership.actor(), %error, "Historical task was archived; authenticated helper journal remains for cleanup retry");
+                } else {
+                    super::super::agent_execution::retired(host, &inspection.source)?;
+                }
+            }
+        }
+    }
+}
+
 /// Finish a durable retirement whose helper completed before the prior daemon
 /// could commit its registry receipt. No attachment or provider is created.
 /// A missing receipt remains unknown; a roster row alone never proves closure.
@@ -1657,12 +1771,15 @@ pub(in crate::host) fn reconcile_retired_actors(host: &SharedHost) -> Result<(),
             if ownership.owner().boot != proof.boot_id {
                 continue;
             }
-            if registry
+            let retired = registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .native_actor_retirement(ownership.actor())?
-                .is_some()
-            {
+                .native_actor_retirement(ownership.actor())?;
+            if let Some(retired) = retired {
+                // A crash can follow receipt commit but precede capability
+                // retirement. The existing process-identity CAS preserves any
+                // newer authority; this grants no execution from an archive.
+                super::super::agent_execution::retired(host, retired.source())?;
                 continue;
             }
             let retirement = Handle::inspect_retained_retirement(ownership.owner(), &proof)?;
