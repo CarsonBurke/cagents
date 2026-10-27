@@ -582,6 +582,16 @@ fn require_origin(
 ) -> Result<(), String> {
     match (&resolved.origin, &resolved.proof) {
         (Origin::User, None) => Ok(()),
+        (Origin::SelectedUser { .. }, None) => {
+            // Only the service constructs this internal origin after a fresh
+            // server selection. Reuse the pure exact-home, registry, bounds
+            // and unique-context validator before replay as well as writes.
+            resolved
+                .origin
+                .contexts(*home)
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        }
         (
             Origin::Actor {
                 home: source_home, ..
@@ -836,6 +846,32 @@ impl Registry {
         Ok(result)
     }
 
+    /// One canonical current-home/project read for server-side checkout
+    /// selection. Repository membership bounds discovery; it is not ownership.
+    pub(crate) fn read_channel_work_repository(
+        &self,
+        home: &Home,
+    ) -> Result<std::path::PathBuf, String> {
+        home.validate().map_err(|error| error.to_string())?;
+        let tx = self
+            .db
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        require_current_home(&tx, home)?;
+        let repository: String = tx
+            .query_row(
+                "SELECT c.repository FROM channels c JOIN projects p ON p.repository=c.repository
+             WHERE c.id=?1 AND c.ordinal=?2",
+                params![home.channel.to_string(), home.creation_ordinal],
+                |row| row.get(0),
+            )
+            .map_err(|_| "The channel's current project is unavailable")?;
+        let repository = std::path::PathBuf::from(repository);
+        repository_key(&repository)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(repository)
+    }
+
     /// Select across every tracked PR, independently of visible projection
     /// pages. JSON ranking scans this home's rows (O(N)); it returns at most
     /// four small keys, then decodes at most four bounded Entries.
@@ -943,13 +979,13 @@ impl Registry {
         // run/channel move. It never grants old-home mutation authority.
         let current_home = match &resolved.origin {
             Origin::User => home,
-            Origin::Actor { home, .. } => home,
+            Origin::SelectedUser { home, .. } | Origin::Actor { home, .. } => home,
         };
         require_origin(&tx, resolved, current_home)?;
         let record = operation_in(&tx, home, operation)?;
         if let Some(record) = &record {
             let allowed = match (&resolved.origin, &record.source) {
-                (Origin::User, _) => true,
+                (Origin::User | Origin::SelectedUser { .. }, _) => true,
                 (Origin::Actor { actor, .. }, work::Source::Session(original)) => {
                     actor.lineage == original.lineage
                 }
@@ -962,6 +998,44 @@ impl Registry {
         let result = record.map(|record| record.receipt);
         tx.commit().map_err(|error| error.to_string())?;
         Ok(result)
+    }
+
+    /// Resolve an immutable exact operation before asking for a new ephemeral
+    /// checkout selection. None grants no permission to perform a fresh write.
+    /// Source/schema guards and current projection share this Immediate tx.
+    pub(crate) fn try_replay_channel_work(
+        &mut self,
+        resolved: &TrustedResolvedOrigin,
+        request: &Mutation,
+    ) -> Result<Option<Reply>, ApplyError> {
+        let request = request.canonicalized().map_err(|error| error.to_string())?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        schema::require_current(&tx)?;
+        require_origin(&tx, resolved, &request.home)?;
+        let reply = if let Some(record) = operation_in(&tx, &request.home, request.operation)? {
+            let current = read_in(&tx, &request.home, Page::default())?;
+            Some(
+                work::replay_response(&record, &request, &resolved.origin, current)
+                    .map_err(|error| error.to_string())?,
+            )
+        } else {
+            let used: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM channel_work_operations WHERE operation=?1)",
+                    [request.operation.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if used {
+                return Err("The work operation already belongs to another context".into());
+            }
+            None
+        };
+        tx.commit().map_err(|_| ApplyError::CommitUncertain)?;
+        Ok(reply)
     }
 
     pub(crate) fn apply_channel_work(

@@ -2721,6 +2721,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::AutomationUi(action) => !action.background() && !action.answers_draft_dialog(),
         Message::WorkUi(action) => !action.background(),
         Message::ChannelWork(action) => !action.background(),
+        Message::ChannelWorkCompleted(_) => false,
         Message::OpenChannelWork(_) | Message::ChannelWorkEscape | Message::ChannelWorkNavigation(_) => true,
         Message::UpdateUi(update_ui::Action::Apply) => true,
         Message::PullRequestUi(action) => !action.allowed_while_modal(),
@@ -2841,6 +2842,10 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::ToggleContextInspector
             | Message::OpenChannelWork(_)
             | Message::ChannelWorkNavigation(_)
+            | Message::ChannelWork(
+                crate::channel_work_ui::Action::ShowSaved
+                    | crate::channel_work_ui::Action::OpenSaved { .. }
+            )
             | Message::Repository(RepositoryAction::NewTerminal { .. })
             | Message::Repository(RepositoryAction::MarkdownLink { .. })
             | Message::Sidebar(
@@ -4591,6 +4596,7 @@ pub enum Message {
     AutomationUi(crate::automation_ui::Action),
     WorkUi(crate::work_ui::Action),
     ChannelWork(crate::channel_work_ui::Action),
+    ChannelWorkCompleted(Box<channel_work::Completion>),
     OpenChannelWork(ChannelId),
     ChannelWorkNavigation(channel_work::Navigation),
     ChannelWorkPoll,
@@ -14110,6 +14116,7 @@ impl Application for Cagents {
             app.update_update_ui(update_ui::Action::Poll),
             app.update_update_ui(update_ui::Action::InspectInstallation),
             app.load_accounts(),
+            app.load_saved_channel_work(),
         ];
         // Unused default chats are never saved. Recreate the active scope's
         // placeholder only after restored runtimes have been initialized.
@@ -17290,6 +17297,7 @@ impl Application for Cagents {
             Message::AutomationUi(action) => self.update_automation_ui(action),
             Message::WorkUi(action) => self.update_work_ui(action),
             Message::ChannelWork(action) => self.update_channel_work(action),
+            Message::ChannelWorkCompleted(completion) => self.complete_channel_work(*completion),
             Message::OpenChannelWork(channel) => self.open_channel_work(channel),
             Message::ChannelWorkNavigation(navigation) => self.channel_navigation(navigation),
             Message::ChannelWorkEscape => self.escape_channel_work(),
@@ -22600,6 +22608,105 @@ mod tests {
             Some(CardRuntime::Repository(runtime)) if !runtime.blocks_navigation()
                 && runtime.save_error().is_none()
         ));
+    }
+
+    #[test]
+    fn saved_work_navigation_waits_for_the_focused_editor_save() {
+        if crate::repository_widget::retained_save_tests::isolated_test(
+            "app::tests::saved_work_navigation_waits_for_the_focused_editor_save",
+        ) {
+            return;
+        }
+        let (mut app, card) = editing_repository_app();
+        let fixture = CloseSaveFixture::install(&mut app, card);
+        CloseSaveFixture::edit(&mut app, card, "saved before recovery navigation\n");
+        let save = app.update(Message::Repository(RepositoryAction::Save {
+            card,
+            overwrite: false,
+        }));
+        CloseSaveFixture::assert_saving(&app, card);
+        assert!(app.focused_repository_is_saving());
+        for message in [
+            Message::ChannelWork(crate::channel_work_ui::Action::ShowSaved),
+            Message::ChannelWork(crate::channel_work_ui::Action::OpenSaved {
+                generation: uuid::Uuid::new_v4(),
+                operation: uuid::Uuid::new_v4(),
+            }),
+            Message::ChromeUi(chrome_ui::Action::Launch(chrome_ui::NewTab::SavedChanges)),
+        ] {
+            assert!(workspace_navigation_blocked_during_save(&message));
+            drop(app.update(message));
+            assert!(!app.channel_work_is_main());
+            assert!(!app.channel_work.view.saved_is_shown());
+            assert_eq!(app.workspace.focused(), Some(card));
+            CloseSaveFixture::assert_saving(&app, card);
+        }
+        // The actual Save and deferred focus persistence run concurrently.
+        // A slow durable write may let FocusSaveDue arrive first.
+        let completion = {
+            let mut stream = iced::runtime::task::into_stream(save)
+                .expect("the real save batch has an output");
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    loop {
+                        let action = stream
+                            .next()
+                            .await
+                            .expect("the save batch ended before its retained-save callback");
+                        match action {
+                            iced::runtime::Action::Output(cosmic::Action::App(
+                                message @ Message::Repository(
+                                    RepositoryAction::RetainedSaveFinished { .. },
+                                ),
+                            )) => {
+                                assert!(matches!(
+                                    &message,
+                                    Message::Repository(
+                                        RepositoryAction::RetainedSaveFinished { identity, .. }
+                                    ) if identity.card == card
+                                ));
+                                break message;
+                            }
+                            iced::runtime::Action::Output(cosmic::Action::App(
+                                Message::FocusSaveDue,
+                            )) => {
+                                drop(app.update(Message::FocusSaveDue));
+                                // The worker may have finished, but the UI owns
+                                // the save until its callback is applied.
+                                assert!(app.focused_repository_is_saving());
+                                assert!(matches!(
+                                    app.cards.get(&card),
+                                    Some(CardRuntime::Repository(runtime))
+                                        if runtime.is_saving()
+                                            && !runtime.can_abandon_unsaved_changes()
+                                ));
+                                assert_eq!(app.workspace.focused(), Some(card));
+                                assert!(!app.channel_work_is_main());
+                                assert!(!app.channel_work.view.saved_is_shown());
+                            }
+                            _ => panic!("unexpected action from the real editor-save batch"),
+                        }
+                    }
+                })
+        };
+        assert!(matches!(
+            &completion,
+            Message::Repository(RepositoryAction::RetainedSaveFinished { result: Ok(_), .. })
+        ));
+        drop(app.update(completion));
+        assert_eq!(
+            std::fs::read_to_string(&fixture.path).unwrap(),
+            "saved before recovery navigation\n"
+        );
+        assert!(!app.focused_repository_is_saving());
+        drop(app.update(Message::ChannelWork(
+            crate::channel_work_ui::Action::ShowSaved,
+        )));
+        assert!(app.channel_work_is_main());
+        assert!(app.channel_work.view.saved_is_shown());
     }
 
     #[test]
@@ -29826,6 +29933,7 @@ mod tests {
     pub(super) fn task_app_message(task: Task<Message>) -> Message {
         let mut stream = iced::runtime::task::into_stream(task).expect("task has an output");
         let action = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
             .build()
             .unwrap()
             .block_on(stream.next())

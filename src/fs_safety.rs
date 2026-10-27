@@ -117,6 +117,35 @@ impl Root {
         })
     }
 
+    /// Duplicates an already retained directory without resolving its name.
+    ///
+    /// `display_path` is diagnostic metadata only. The caller must separately
+    /// establish placement and effect authority for the original descriptor.
+    /// The duplicate retains the descriptor's access mode, including `O_PATH`.
+    pub(crate) fn from_retained_directory(
+        directory: &File,
+        display_path: PathBuf,
+    ) -> io::Result<Self> {
+        #[cfg(feature = "ui")]
+        if crate::device::is_remote() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote paths must be opened through the selected daemon",
+            ));
+        }
+        let directory = directory.try_clone()?;
+        if !directory.metadata()?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the retained descriptor is not a directory",
+            ));
+        }
+        Ok(Self {
+            directory: directory.into(),
+            path: display_path,
+        })
+    }
+
     /// The path this root was opened from, for error messages.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -1540,6 +1569,114 @@ pub(crate) mod tests {
     /// reached on kernels this test suite does not run on, so it is exercised
     /// explicitly rather than left to chance.
     const RESOLVERS: [Resolver; 2] = [Resolver::Kernel, Resolver::Walk];
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_root_keeps_original_directory_after_rename_and_name_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let name = directory.path().join("selected");
+        let moved = directory.path().join("moved");
+        fs::create_dir(&name).unwrap();
+        fs::write(name.join("marker"), b"original\n").unwrap();
+        let original = Root::open(&name).unwrap();
+        let file = original.retained_directory().unwrap();
+        let identity = file.metadata().unwrap();
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0 && flags & libc::O_PATH != 0);
+
+        fs::rename(&name, &moved).unwrap();
+        fs::create_dir(&name).unwrap();
+        fs::write(name.join("marker"), b"replacement\n").unwrap();
+        let replacement = fs::metadata(&name).unwrap();
+        assert_ne!(
+            (identity.dev(), identity.ino()),
+            (replacement.dev(), replacement.ino())
+        );
+        let retained = Root::from_retained_directory(&file, name.clone()).unwrap();
+        assert_ne!(retained.descriptor(), file.as_raw_fd());
+        let duplicate_flags = unsafe { libc::fcntl(retained.descriptor(), libc::F_GETFL) };
+        assert_eq!(duplicate_flags, flags);
+        let fd_flags = unsafe { libc::fcntl(retained.descriptor(), libc::F_GETFD) };
+        assert!(fd_flags >= 0 && fd_flags & libc::FD_CLOEXEC != 0);
+        drop(original);
+        drop(file);
+
+        let metadata = retained.metadata().unwrap();
+        assert_eq!(
+            (metadata.dev(), metadata.ino()),
+            (identity.dev(), identity.ino())
+        );
+        assert_eq!(retained.path(), name.as_path());
+        assert_eq!(read_all(&retained, "marker"), b"original\n");
+        assert_eq!(fs::read(name.join("marker")).unwrap(), b"replacement\n");
+        let after = fs::metadata(&name).unwrap();
+        assert_eq!(
+            (after.dev(), after.ino(), after.mode()),
+            (replacement.dev(), replacement.ino(), replacement.mode())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_root_rejects_open_regular_and_fifo_descriptors_without_reopening_names() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let regular = File::create(directory.path().join("regular")).unwrap();
+        let pipe = directory.path().join("pipe");
+        fifo(&pipe);
+        // No writer exists; acquiring this fixture descriptor must not block.
+        let pipe = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(pipe)
+            .unwrap();
+        for file in [&regular, &pipe] {
+            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0);
+            let error =
+                Root::from_retained_directory(file, directory.path().to_path_buf()).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) },
+                flags
+            );
+            assert!(
+                file.metadata().is_ok(),
+                "the caller still owns its descriptor"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_root_preserves_traversal_only_directory_access() {
+        struct RestorePermissions(PathBuf);
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let name = directory.path().join("search-only");
+        fs::create_dir(&name).unwrap();
+        fs::write(name.join("marker"), b"search access\n").unwrap();
+        let restore = RestorePermissions(name.clone());
+        fs::set_permissions(&name, fs::Permissions::from_mode(0o100)).unwrap();
+        let original = Root::open(&name).unwrap();
+        let file = original.retained_directory().unwrap();
+        let display = directory.path().join("absent-diagnostic-name");
+        assert!(!display.exists());
+        let retained = Root::from_retained_directory(&file, display.clone()).unwrap();
+        assert_eq!(retained.path(), display.as_path());
+        assert_eq!(retained.metadata().unwrap().mode() & 0o777, 0o100);
+        let flags = unsafe { libc::fcntl(retained.descriptor(), libc::F_GETFL) };
+        assert!(flags >= 0 && flags & libc::O_PATH != 0);
+        assert_eq!(read_all(&retained, "marker"), b"search access\n");
+        assert!(!display.exists(), "diagnostic metadata is never resolved");
+        drop(restore);
+    }
 
     #[test]
     fn a_relative_path_resolves_and_reads() {

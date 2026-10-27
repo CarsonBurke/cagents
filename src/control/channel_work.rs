@@ -34,11 +34,37 @@ pub enum WorkCommand {
         #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
         limit: u16,
     },
-    /// Declare a PR relationship; this does not claim verified filesystem writes.
+    /// Declare a PR or known local relationship; this does not prove filesystem writes.
     Track {
-        /// HTTPS pull request URL: https://HOST/OWNER/REPO/pull/NUMBER.
-        #[arg(value_parser = parse_pull_request)]
+        /// HTTPS pull request URL or a known local:UUID from this channel.
+        #[arg(value_parser = parse_target)]
         url: Target,
+        /// Relationship: contribute, steward, review, or reference.
+        #[arg(value_parser = parse_role)]
+        role: Role,
+        /// Channel UUID; omit to use your authenticated session's channel.
+        #[arg(long)]
+        channel: Option<ChannelId>,
+        /// Save the exact safe request before sending it. The path must not exist.
+        #[arg(long)]
+        save_request: Option<PathBuf>,
+    },
+    /// Track a user-selected worktree, after daemon-side physical validation (interactive user only).
+    TrackLocal {
+        /// Absolute checkout directory on the selected device.
+        directory: PathBuf,
+        /// Relationship: contribute, steward, review, or reference.
+        #[arg(value_parser = parse_role)]
+        role: Role,
+        /// Channel UUID; omit to use your authenticated session's channel.
+        #[arg(long)]
+        channel: Option<ChannelId>,
+        /// Save the exact safe request before sending it. The path must not exist.
+        #[arg(long)]
+        save_request: Option<PathBuf>,
+    },
+    /// Track this authenticated native session's original launch checkout, without choosing a directory.
+    TrackOwnLocal {
         /// Relationship: contribute, steward, review, or reference.
         #[arg(value_parser = parse_role)]
         role: Role,
@@ -51,8 +77,8 @@ pub enum WorkCommand {
     },
     /// End your participation, or all participation when invoked explicitly by the user.
     End {
-        /// HTTPS pull request URL: https://HOST/OWNER/REPO/pull/NUMBER.
-        #[arg(value_parser = parse_pull_request)]
+        /// HTTPS pull request URL or a known local:UUID from this channel.
+        #[arg(value_parser = parse_target)]
         url: Target,
         /// Channel UUID; omit to use your authenticated session's channel.
         #[arg(long)]
@@ -63,8 +89,8 @@ pub enum WorkCommand {
     },
     /// Mark a relationship as not belonging to this channel (explicit user only).
     Dismiss {
-        /// HTTPS pull request URL: https://HOST/OWNER/REPO/pull/NUMBER.
-        #[arg(value_parser = parse_pull_request)]
+        /// HTTPS pull request URL or a known local:UUID from this channel.
+        #[arg(value_parser = parse_target)]
         url: Target,
         /// Channel UUID; omit to use your authenticated session's channel.
         #[arg(long)]
@@ -128,10 +154,22 @@ fn parse_role(value: &str) -> Result<Role, String> {
 #[cfg(test)]
 use crate::github_identity::pull_request_path_segment as path_segment;
 
+fn parse_target(value: &str) -> Result<Target, String> {
+    if let Some(id) = value.strip_prefix("local:") {
+        return parse_uuid(id).map(Target::Local);
+    }
+    parse_pull_request(value)
+}
+
 fn parse_pull_request(value: &str) -> Result<Target, String> {
     Target::PullRequest(PullRequestKey::from_url(value)?)
         .canonicalized()
         .map_err(|_| "The PR identity is invalid".into())
+}
+
+enum LocalSource {
+    Directory(PathBuf),
+    OwnLaunch,
 }
 
 enum Prepared {
@@ -140,6 +178,12 @@ enum Prepared {
     Change {
         channel: Option<ChannelId>,
         change: Change,
+        save: Option<PathBuf>,
+    },
+    Local {
+        channel: Option<ChannelId>,
+        source: LocalSource,
+        role: Role,
         save: Option<PathBuf>,
     },
     Receipt(Home, Uuid),
@@ -164,6 +208,39 @@ impl Prepared {
                 page.validate().map_err(invalid)?;
                 Self::Show(channel, page)
             }
+            WorkCommand::TrackLocal {
+                directory,
+                role,
+                channel,
+                save_request,
+            } => {
+                if !directory.is_absolute()
+                    || directory.as_os_str().as_encoded_bytes().contains(&0)
+                    || directory.as_os_str().as_encoded_bytes().len()
+                        > crate::channel_work::MAX_CONTEXT_PATH_BYTES
+                    || directory.to_str().is_none()
+                {
+                    return Err(invalid(
+                        "Use an explicit absolute worktree directory on the selected device",
+                    ));
+                }
+                Self::Local {
+                    channel,
+                    source: LocalSource::Directory(directory),
+                    role,
+                    save: save_request,
+                }
+            }
+            WorkCommand::TrackOwnLocal {
+                role,
+                channel,
+                save_request,
+            } => Self::Local {
+                channel,
+                source: LocalSource::OwnLaunch,
+                role,
+                save: save_request,
+            },
             WorkCommand::Track {
                 url,
                 role,
@@ -368,6 +445,11 @@ where
         } => {
             let selected = context(channel, send)?;
             let revision = target_revision(selected.home, change.target(), send)?;
+            if revision.is_none() && matches!(change.target(), Target::Local(_)) {
+                return Err(invalid(
+                    "This Local identity is not tracked here; use track-local DIRECTORY ROLE to select a worktree",
+                ));
+            }
             let request = Request::Mutate {
                 mutation: Mutation {
                     home: selected.home,
@@ -376,6 +458,59 @@ where
                     change,
                 },
                 caller: selected.caller,
+            };
+            if let Some(path) = save {
+                save_request(&path, &request)?;
+            }
+            submit(request, send)
+        }
+        Prepared::Local {
+            channel,
+            source,
+            role,
+            save,
+        } => {
+            let context = context(channel, send)?;
+            let preparation = match source {
+                LocalSource::Directory(directory) => Request::PrepareLocal {
+                    home: context.home,
+                    directory,
+                    caller: context.caller.clone(),
+                },
+                LocalSource::OwnLaunch => {
+                    if context.caller.is_none() {
+                        return Err(invalid(
+                            "Own-checkout tracking requires an authenticated native session; an interactive user can use track-local DIRECTORY ROLE",
+                        ));
+                    }
+                    Request::PrepareOwnLocal {
+                        home: context.home,
+                        caller: context.caller.clone(),
+                    }
+                }
+            };
+            let selected = match send(preparation).map_err(protocol_error)? {
+                Response::Selected(selected) if selected.home == context.home => {
+                    selected.validate().map_err(|_| contract())?;
+                    selected
+                }
+                Response::Failed(Failure::Refused(reason)) => {
+                    return Err(AppError::new("channel_work_refused", reason));
+                }
+                _ => return Err(contract()),
+            };
+            let request = Request::ApplySelection {
+                selection: selected.selection,
+                mutation: Mutation {
+                    home: context.home,
+                    expected_revision: selected.expected_revision,
+                    operation: Uuid::new_v4(),
+                    change: Change::Claim {
+                        target: Target::Local(selected.context.id),
+                        role,
+                    },
+                },
+                caller: context.caller,
             };
             if let Some(path) = save {
                 save_request(&path, &request)?;
@@ -450,9 +585,8 @@ where
         "Captured channel work request: {}",
         serde_json::to_string(&request).map_err(invalid)?
     );
-    let Request::Mutate { mutation, .. } = &request else {
-        return Err(invalid("Expected a mutation request"));
-    };
+    let mutation =
+        request_mutation(&request).ok_or_else(|| invalid("Expected a mutation request"))?;
     let result = send(request.clone());
     match result {
         Ok(Response::Applied(reply)) if valid_reply(mutation, &reply) => Ok(CommandOutput {
@@ -493,9 +627,7 @@ fn valid_reply(mutation: &Mutation, reply: &crate::channel_work::Reply) -> bool 
 }
 
 fn uncertain(request: &Request) -> CommandOutput {
-    let Request::Mutate { mutation, .. } = request else {
-        unreachable!()
-    };
+    let mutation = request_mutation(request).expect("validated mutation request");
     let result = format!(
         "cagents channel work result --registry {} --channel {} --ordinal {} --operation {}",
         mutation.home.registry,
@@ -513,9 +645,38 @@ fn uncertain(request: &Request) -> CommandOutput {
     }
 }
 
+fn request_mutation(request: &Request) -> Option<&Mutation> {
+    match request {
+        Request::Mutate { mutation, .. } | Request::ApplySelection { mutation, .. } => {
+            Some(mutation)
+        }
+        _ => None,
+    }
+}
+
 fn validate_saved(request: &Request) -> Result<(), AppError> {
-    let Request::Mutate { mutation, caller } = request else {
-        return Err(invalid("Only an exact saved mutation can be applied"));
+    let (mutation, caller) = match request {
+        Request::Mutate { mutation, caller } => (mutation, caller),
+        Request::ApplySelection {
+            selection,
+            mutation,
+            caller,
+        } if !selection.is_nil()
+            && matches!(
+                mutation.change,
+                Change::Claim {
+                    target: Target::Local(_),
+                    ..
+                }
+            ) =>
+        {
+            (mutation, caller)
+        }
+        _ => {
+            return Err(invalid(
+                "Only an exact saved mutation or selected Local claim can be applied",
+            ));
+        }
     };
     if mutation.canonicalized().map_err(invalid)? != *mutation {
         return Err(invalid(
@@ -1184,5 +1345,611 @@ mod tests {
             load_request(&path).is_err(),
             "duplicate semantic fields are not an exact saved request"
         );
+    }
+
+    fn local_selection() -> crate::channel_work_api::LocalSelection {
+        crate::channel_work_api::LocalSelection {
+            selection: Uuid::from_u128(40),
+            home: home(),
+            expected_revision: 7,
+            context: crate::channel_work::CheckoutContext {
+                id: Uuid::from_u128(20),
+                registry: home().registry,
+                repository: "/project/.git".into(),
+                path: "/outside/worktree".into(),
+                branch: Some("unpublished".into()),
+                head: Some("a".repeat(40)),
+                generation: 3,
+                dirty: Some(true),
+            },
+        }
+    }
+    fn selected_request() -> Request {
+        let selected = local_selection();
+        Request::ApplySelection {
+            selection: selected.selection,
+            mutation: Mutation {
+                home: home(),
+                expected_revision: selected.expected_revision,
+                operation: Uuid::from_u128(50),
+                change: Change::Claim {
+                    target: Target::Local(selected.context.id),
+                    role: Role::Steward,
+                },
+            },
+            caller: context_value().caller,
+        }
+    }
+
+    #[test]
+    fn local_grammar_requires_explicit_absolute_directory_role_and_keeps_pr_parser_strict() {
+        assert!(Grammar::try_parse_from(["work", "track-local", "/outside/worktree"]).is_err());
+        let command = Grammar::try_parse_from([
+            "work",
+            "track-local",
+            "/outside/worktree",
+            "review",
+            "--channel",
+            &home().channel.to_string(),
+            "--save-request",
+            "/safe/request.json",
+        ])
+        .unwrap();
+        let Prepared::Local {
+            channel,
+            source: LocalSource::Directory(directory),
+            role,
+            save,
+        } = Prepared::new(command.command).unwrap()
+        else {
+            panic!("local preparation")
+        };
+        assert_eq!(channel, Some(home().channel));
+        assert_eq!(directory, PathBuf::from("/outside/worktree"));
+        assert_eq!(role, Role::Review);
+        assert_eq!(save, Some(PathBuf::from("/safe/request.json")));
+        for directory in ["relative", "~/worktree", ""] {
+            assert!(
+                Prepared::new(WorkCommand::TrackLocal {
+                    directory: directory.into(),
+                    role: Role::Review,
+                    channel: None,
+                    save_request: None
+                })
+                .is_err()
+            );
+        }
+        let local = format!("local:{}", Uuid::from_u128(20));
+        for command in ["track", "end", "dismiss"] {
+            let mut args = vec!["work", command, local.as_str()];
+            if command == "track" {
+                args.push("reference");
+            }
+            assert!(Grammar::try_parse_from(args).is_ok());
+        }
+        assert_eq!(
+            parse_target(&local).unwrap(),
+            Target::Local(Uuid::from_u128(20))
+        );
+        assert!(
+            parse_pull_request(&local).is_err(),
+            "PR-only parser must not silently accept a Local identity"
+        );
+        assert!(parse_target("local:00000000-0000-0000-0000-000000000000").is_err());
+        assert!(parse_target("local:not-a-uuid").is_err());
+    }
+
+    #[test]
+    fn track_local_captures_daemon_selection_cas_and_caller_before_saving_exact_lost_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("selection.json");
+        let selected = local_selection();
+        let mut sent = Vec::new();
+        let output = run(
+            Prepared::Local {
+                channel: Some(home().channel),
+                source: LocalSource::Directory("/outside/worktree".into()),
+                role: Role::Review,
+                save: Some(path.clone()),
+            },
+            &mut |request| {
+                sent.push(request.clone());
+                Ok(match request {
+                    Request::Context { channel } => {
+                        assert_eq!(channel, Some(home().channel));
+                        Response::Context(context_value())
+                    }
+                    Request::PrepareLocal {
+                        home: requested,
+                        directory,
+                        caller,
+                    } => {
+                        assert_eq!(requested, home());
+                        assert_eq!(directory, PathBuf::from("/outside/worktree"));
+                        assert_eq!(caller, context_value().caller);
+                        Response::Selected(selected.clone())
+                    }
+                    Request::ApplySelection {
+                        selection,
+                        mutation,
+                        caller,
+                    } => {
+                        assert_eq!(selection, selected.selection);
+                        assert_eq!(mutation.home, home());
+                        assert_eq!(
+                            mutation.expected_revision, 7,
+                            "CAS comes from selected exact target, never visible-page absence"
+                        );
+                        assert_eq!(
+                            mutation.change,
+                            Change::Claim {
+                                target: Target::Local(selected.context.id),
+                                role: Role::Review
+                            }
+                        );
+                        assert!(!mutation.operation.is_nil());
+                        assert_eq!(caller, context_value().caller);
+                        assert!(path.exists(), "request must be saved before dispatch");
+                        return Err(ControlError::ConnectionClosed);
+                    }
+                    _ => {
+                        panic!("local claim must not scan pages or fall back to ordinary mutation")
+                    }
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(sent.len(), 3);
+        assert_eq!(output.data["outcome"], "pending");
+        assert_eq!(
+            output.data["request"],
+            serde_json::to_value(&sent[2]).unwrap()
+        );
+        let saved = load_request(&path).unwrap();
+        assert_eq!(saved, sent[2]);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(save_request(&path, &selected_request()).is_err());
+        assert_eq!(
+            load_request(&path).unwrap(),
+            saved,
+            "existing snapshot is preserved"
+        );
+        for refused in [false, true] {
+            let mut retried = Vec::new();
+            let result = run(Prepared::Apply(saved.clone()), &mut |request| {
+                retried.push(request);
+                Ok(Response::Failed(if refused {
+                    Failure::Refused("Selection expired".into())
+                } else {
+                    Failure::Uncertain
+                }))
+            })
+            .unwrap();
+            assert_eq!(
+                retried,
+                [saved.clone()],
+                "retry must not prepare, rebind caller/CAS/ticket or generate another UUID"
+            );
+            assert_eq!(
+                result.data["request"],
+                serde_json::to_value(&saved).unwrap()
+            );
+            assert_eq!(
+                result.data["outcome"],
+                if refused { "failed" } else { "pending" }
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_local_context_selection_or_preparation_never_dispatches_a_write() {
+        for case in 0..13 {
+            let mut sent = Vec::new();
+            let result = run(
+                Prepared::Local {
+                    channel: Some(home().channel),
+                    source: LocalSource::Directory("/outside/worktree".into()),
+                    role: Role::Contribute,
+                    save: None,
+                },
+                &mut |request| {
+                    sent.push(request.clone());
+                    Ok(match request {
+                        Request::Context { .. } => {
+                            let mut context = context_value();
+                            if case == 0 {
+                                context.caller.as_mut().unwrap().card =
+                                    crate::model::CardId::from_uuid(Uuid::nil());
+                            }
+                            Response::Context(context)
+                        }
+                        Request::PrepareLocal { caller, .. } => {
+                            assert_eq!(
+                                caller,
+                                context_value().caller,
+                                "actor caller cannot become User fallback"
+                            );
+                            let mut selected = local_selection();
+                            match case {
+                                1 => selected.home.registry = Uuid::from_u128(99),
+                                2 => {
+                                    selected.home.channel =
+                                        ChannelId::from_uuid(Uuid::from_u128(99))
+                                }
+                                3 => selected.home.creation_ordinal += 1,
+                                4 => selected.context.registry = Uuid::from_u128(99),
+                                5 => selected.selection = Uuid::nil(),
+                                6 => selected.context.id = Uuid::nil(),
+                                7 => selected.context.generation = 0,
+                                8 => selected.context.path = "relative".into(),
+                                9 => return Ok(Response::Receipt(None)),
+                                10 => {
+                                    return Ok(Response::Failed(Failure::Refused(
+                                        "Original actor directory is unavailable".into(),
+                                    )));
+                                }
+                                11 => return Err(ControlError::ConnectionClosed),
+                                12 => return Ok(Response::Failed(Failure::Uncertain)),
+                                _ => unreachable!(),
+                            }
+                            Response::Selected(selected)
+                        }
+                        _ => panic!(
+                            "case {case}: invalid preparation must not emit ApplySelection/Mutate"
+                        ),
+                    })
+                },
+            );
+            assert!(result.is_err(), "case {case}");
+            assert_eq!(sent.len(), if case == 0 { 1 } else { 2 }, "case {case}");
+        }
+    }
+
+    #[test]
+    fn saved_local_selection_accepts_only_exact_claim_shape_and_preserves_recovery_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("selection.json");
+        let original = selected_request();
+        save_request(&path, &original).unwrap();
+        assert_eq!(load_request(&path).unwrap(), original);
+        for case in 0..5 {
+            let mut changed = original.clone();
+            let Request::ApplySelection {
+                selection,
+                mutation,
+                caller,
+            } = &mut changed
+            else {
+                unreachable!()
+            };
+            match case {
+                0 => *selection = Uuid::nil(),
+                1 => {
+                    mutation.change = Change::Claim {
+                        target: parse_pull_request("https://github.com/a/b/pull/1").unwrap(),
+                        role: Role::Contribute,
+                    }
+                }
+                2 => {
+                    mutation.change = Change::End {
+                        target: Target::Local(Uuid::from_u128(20)),
+                    }
+                }
+                3 => mutation.operation = Uuid::nil(),
+                4 => caller.as_mut().unwrap().session = TerminalId::from_uuid(Uuid::nil()),
+                _ => unreachable!(),
+            }
+            assert!(validate_saved(&changed).is_err(), "shape case {case}");
+            assert!(
+                run(Prepared::Apply(changed), &mut |_| panic!(
+                    "invalid snapshot cannot reach daemon"
+                ))
+                .is_err()
+            );
+        }
+        let mut value = serde_json::to_value(&original).unwrap();
+        value["ApplySelection"]
+            .as_object_mut()
+            .unwrap()
+            .insert("authority".into(), json!("forged"));
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(load_request(&path).is_err());
+        let mutation = request_mutation(&original).unwrap();
+        let mut entry = historical_entry(1);
+        entry.target = mutation.change.target().clone();
+        entry.user_ended = false;
+        entry.claims[0].active = true;
+        entry.revision = mutation.expected_revision + 1;
+        entry.contexts.push(local_selection().context);
+        let mut snapshot = snapshot_value();
+        snapshot.revision = 100;
+        snapshot.entries.push(entry);
+        let reply = crate::channel_work::Reply {
+            receipt: Receipt {
+                home: mutation.home,
+                operation: mutation.operation,
+                revision: mutation.expected_revision + 1,
+                sequence: 100,
+                changed: true,
+            },
+            snapshot,
+        };
+        for wrong_operation in [false, true] {
+            let mut response = reply.clone();
+            if wrong_operation {
+                response.receipt.operation = Uuid::from_u128(999);
+            }
+            let mut calls = 0;
+            let result = run(Prepared::Apply(original.clone()), &mut |request| {
+                calls += 1;
+                assert_eq!(request, original);
+                Ok(Response::Applied(response.clone()))
+            })
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert_eq!(
+                result.data["outcome"],
+                if wrong_operation {
+                    "pending"
+                } else {
+                    "succeeded"
+                }
+            );
+        }
+        let result = run(
+            Prepared::Receipt(mutation.home, mutation.operation),
+            &mut |request| {
+                assert_eq!(
+                    request,
+                    Request::Receipt {
+                        home: mutation.home,
+                        operation: mutation.operation
+                    }
+                );
+                Ok(Response::Receipt(None))
+            },
+        )
+        .unwrap();
+        assert_eq!(result.data["outcome"], "pending");
+        assert!(result.human.contains("does not prove no effect"));
+    }
+
+    #[test]
+    fn known_local_alias_uses_exact_target_cas_and_missing_identity_never_becomes_fresh_claim() {
+        let target = Target::Local(Uuid::from_u128(20));
+        for change in [
+            Change::Claim {
+                target: target.clone(),
+                role: Role::Reference,
+            },
+            Change::End {
+                target: target.clone(),
+            },
+            Change::Suppress {
+                target: target.clone(),
+            },
+        ] {
+            for exists in [false, true] {
+                let mut sent = Vec::new();
+                let result = run(
+                    Prepared::Change {
+                        channel: None,
+                        change: change.clone(),
+                        save: None,
+                    },
+                    &mut |request| {
+                        sent.push(request.clone());
+                        Ok(match request {
+                            Request::Context { .. } => Response::Context(context_value()),
+                            Request::ReadTarget {
+                                home: selected,
+                                target: requested,
+                            } => {
+                                assert_eq!(selected, home());
+                                assert_eq!(requested, target);
+                                let entry = exists.then(|| {
+                                    let mut entry = historical_entry(1);
+                                    entry.target = target.clone();
+                                    entry
+                                });
+                                Response::Target(target_value(target.clone(), entry))
+                            }
+                            Request::Mutate { mutation, caller } => {
+                                assert!(exists);
+                                assert_eq!(mutation.change, change);
+                                assert_eq!(mutation.expected_revision, 2);
+                                assert_eq!(caller, context_value().caller);
+                                Response::Failed(Failure::Refused("Fixed fixture refusal".into()))
+                            }
+                            _ => panic!("known Local does not prepare a different selection"),
+                        })
+                    },
+                );
+                if exists {
+                    assert_eq!(result.unwrap().data["outcome"], "failed");
+                    assert_eq!(sent.len(), 3);
+                } else {
+                    assert!(result.is_err());
+                    assert_eq!(sent.len(), 2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn own_local_grammar_requires_a_role_and_never_accepts_a_directory() {
+        for args in [
+            vec!["work", "track-own-local"],
+            vec!["work", "track-own-local", "unknown"],
+            vec!["work", "track-own-local", "review", "/outside/worktree"],
+            vec!["work", "track-own-local", "/outside/worktree", "review"],
+        ] {
+            assert!(Grammar::try_parse_from(args).is_err());
+        }
+        for (value, expected) in [
+            ("contribute", Role::Contribute),
+            ("steward", Role::Steward),
+            ("review", Role::Review),
+            ("reference", Role::Reference),
+        ] {
+            let channel = home().channel.to_string();
+            let command = Grammar::try_parse_from([
+                "work",
+                "track-own-local",
+                value,
+                "--channel",
+                &channel,
+                "--save-request",
+                "/safe/own-request.json",
+            ])
+            .unwrap();
+            let Prepared::Local {
+                channel,
+                source: LocalSource::OwnLaunch,
+                role,
+                save,
+            } = Prepared::new(command.command).unwrap()
+            else {
+                panic!("own launch preparation")
+            };
+            assert_eq!(channel, Some(home().channel));
+            assert_eq!(role, expected);
+            assert_eq!(save, Some(PathBuf::from("/safe/own-request.json")));
+        }
+    }
+
+    #[test]
+    fn own_local_captures_native_caller_and_exact_selection_before_saved_lost_request_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("own-selection.json");
+        let selected = local_selection();
+        let mut sent = Vec::new();
+        let output = run(
+            Prepared::Local {
+                channel: Some(home().channel), source: LocalSource::OwnLaunch,
+                role: Role::Steward, save: Some(path.clone()),
+            },
+            &mut |request| {
+                sent.push(request.clone());
+                Ok(match request {
+                    Request::Context { channel } => {
+                        assert_eq!(channel, Some(home().channel));
+                        Response::Context(context_value())
+                    }
+                    Request::PrepareOwnLocal { home: requested, caller } => {
+                        assert_eq!(requested, home());
+                        assert_eq!(caller, context_value().caller);
+                        Response::Selected(selected.clone())
+                    }
+                    Request::ApplySelection { selection, mutation, caller } => {
+                        assert_eq!(selection, selected.selection);
+                        assert_eq!(mutation.home, home());
+                        assert_eq!(mutation.expected_revision, selected.expected_revision);
+                        assert_eq!(mutation.change, Change::Claim {
+                            target: Target::Local(selected.context.id), role: Role::Steward,
+                        });
+                        assert!(!mutation.operation.is_nil());
+                        assert_eq!(caller, context_value().caller);
+                        assert_eq!(load_request(&path).unwrap(), *sent.last().unwrap());
+                        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+                        return Err(ControlError::ConnectionClosed);
+                    }
+                    _ => panic!("own launch cannot choose a directory, scan pages or fall back to User mutation"),
+                })
+            },
+        ).unwrap();
+        assert_eq!(sent.len(), 3);
+        assert_eq!(output.data["outcome"], "pending");
+        let saved = load_request(&path).unwrap();
+        assert_eq!(saved, sent[2]);
+        assert_eq!(
+            output.data["request"],
+            serde_json::to_value(&saved).unwrap()
+        );
+        let mut retried = Vec::new();
+        let output = run(Prepared::Apply(saved.clone()), &mut |request| {
+            retried.push(request);
+            Err(ControlError::ConnectionClosed)
+        })
+        .unwrap();
+        assert_eq!(
+            retried,
+            [saved.clone()],
+            "exact retry cannot recapture source, issue another selection or replace its operation"
+        );
+        assert_eq!(output.data["outcome"], "pending");
+        assert_eq!(
+            output.data["request"],
+            serde_json::to_value(&saved).unwrap()
+        );
+    }
+
+    #[test]
+    fn own_local_requires_native_context_and_valid_selected_reply_without_fallback() {
+        for case in 0..13 {
+            let mut sent = Vec::new();
+            let result = run(
+                Prepared::Local {
+                    channel: Some(home().channel),
+                    source: LocalSource::OwnLaunch,
+                    role: Role::Review,
+                    save: None,
+                },
+                &mut |request| {
+                    sent.push(request.clone());
+                    Ok(match request {
+                        Request::Context { .. } => {
+                            let mut context = context_value();
+                            if case == 0 {
+                                context.caller = None;
+                            }
+                            if case == 1 {
+                                context.caller.as_mut().unwrap().card =
+                                    crate::model::CardId::from_uuid(Uuid::nil());
+                            }
+                            Response::Context(context)
+                        }
+                        Request::PrepareOwnLocal {
+                            home: requested,
+                            caller,
+                        } => {
+                            assert_eq!(requested, home());
+                            assert_eq!(caller, context_value().caller);
+                            let mut selected = local_selection();
+                            match case {
+                                2 => selected.home.registry = Uuid::from_u128(99),
+                                3 => {
+                                    selected.home.channel =
+                                        ChannelId::from_uuid(Uuid::from_u128(99))
+                                }
+                                4 => selected.home.creation_ordinal += 1,
+                                5 => selected.context.registry = Uuid::from_u128(99),
+                                6 => selected.selection = Uuid::nil(),
+                                7 => selected.context.generation = 0,
+                                8 => selected.context.path = "relative".into(),
+                                9 => {
+                                    return Ok(Response::Failed(Failure::Refused(
+                                        "Native launch handle unavailable".into(),
+                                    )));
+                                }
+                                10 => return Err(ControlError::ConnectionClosed),
+                                11 => return Ok(Response::Failed(Failure::Uncertain)),
+                                12 => return Ok(Response::Receipt(None)),
+                                _ => unreachable!(),
+                            }
+                            Response::Selected(selected)
+                        }
+                        _ => panic!(
+                            "case {case}: refusal cannot prepare a User directory or dispatch any mutation"
+                        ),
+                    })
+                },
+            );
+            assert!(result.is_err(), "case {case}");
+            assert_eq!(sent.len(), if case < 2 { 1 } else { 2 }, "case {case}");
+        }
     }
 }

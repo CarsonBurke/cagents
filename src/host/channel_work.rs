@@ -1,5 +1,8 @@
 //! Authenticated channel intent. Forge reads are separate from the short
 //! canonical transactions that decide who may change a relation.
+pub(super) mod contexts;
+mod local;
+
 use super::{agent_execution, model::channel_work::TrustedResolvedOrigin, state::SharedHost};
 use crate::{
     agent_execution::{Authority, Origin as ExecutionOrigin},
@@ -63,7 +66,9 @@ fn process_inner(
                     }
                     home.channel
                 }
-                Origin::User => channel.ok_or("Choose a channel explicitly with --channel")?,
+                Origin::User | Origin::SelectedUser { .. } => {
+                    channel.ok_or("Choose a channel explicitly with --channel")?
+                }
             };
             let channel = model
                 .channels
@@ -144,7 +149,41 @@ fn process_inner(
             }
         }
         Request::Refresh { .. } => Err("Use the targeted forge refresh path".into()),
+        Request::PrepareLocal { .. }
+        | Request::PrepareOwnLocal { .. }
+        | Request::ApplySelection { .. } => {
+            Err("Use the scoped local checkout selection path".into())
+        }
     }
+}
+
+pub(super) fn prepare_local(
+    host: &SharedHost,
+    authority: &Authority,
+    home: Home,
+    directory: std::path::PathBuf,
+    captured: Option<Caller>,
+) -> Response {
+    local::prepare(host, authority, home, directory, captured)
+}
+
+pub(super) fn prepare_own_local(
+    host: &SharedHost,
+    authority: &Authority,
+    home: Home,
+    captured: Option<Caller>,
+) -> Response {
+    local::prepare_own(host, authority, home, captured)
+}
+
+pub(super) fn apply_selection(
+    host: &SharedHost,
+    authority: &Authority,
+    selection: uuid::Uuid,
+    mutation: work::Mutation,
+    captured: Option<Caller>,
+) -> Response {
+    local::apply(host, authority, selection, mutation, captured)
 }
 
 /// Called outside the client's admission guard. Network work never holds the

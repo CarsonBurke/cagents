@@ -1125,7 +1125,7 @@ fn enlarge_context_provenance(registry: &mut Registry, home: Home) {
                 branch: Some("b".repeat(1024)),
                 head: Some("a".repeat(64)),
                 generation: 1,
-                dirty: true,
+                dirty: Some(true),
             })
             .collect();
         entry.validate().unwrap();
@@ -2082,4 +2082,340 @@ fn missing_home_repair_refuses_orphaned_entries_and_operation_receipts() {
             "the rollback preserves the original admitted registry"
         );
     }
+}
+
+fn selected_user(home: Home, id: Uuid) -> TrustedResolvedOrigin {
+    TrustedResolvedOrigin {
+        origin: Origin::SelectedUser {
+            home,
+            contexts: vec![work::CheckoutContext {
+                id,
+                registry: home.registry,
+                repository: "/fixture/repository".into(),
+                path: "/fixture/repository/checkout".into(),
+                branch: Some("feature".into()),
+                head: Some("a".repeat(40)),
+                generation: 1,
+                dirty: Some(true),
+            }],
+        },
+        proof: None,
+    }
+}
+
+fn local_claim(home: Home, id: Uuid) -> Mutation {
+    Mutation {
+        home,
+        expected_revision: 0,
+        operation: Uuid::new_v4(),
+        change: Change::Claim {
+            target: Target::Local(id),
+            role: Role::Contribute,
+        },
+    }
+}
+
+#[test]
+fn selected_context_requires_exact_home_valid_contexts_and_no_actor_proof() {
+    let (mut registry, _directory, home) = fixture();
+    let id = Uuid::new_v4();
+    let request = local_claim(home, id);
+    let before = snapshot(&registry, &home);
+    let sequence = registry.model().unwrap().sequence;
+    assert!(
+        matches!(
+            registry.apply_channel_work(&user(), &request),
+            Err(ApplyError::Refused(_))
+        ),
+        "plain User plus an arbitrary Local UUID remains insufficient"
+    );
+    for case in 0..5 {
+        let mut origin = selected_user(home, id);
+        let Origin::SelectedUser {
+            home: selected,
+            contexts,
+        } = &mut origin.origin
+        else {
+            unreachable!()
+        };
+        match case {
+            0 => selected.channel = ChannelId::new(),
+            1 => contexts[0].registry = Uuid::new_v4(),
+            2 => contexts.push(contexts[0].clone()),
+            3 => contexts[0].path = "relative".into(),
+            4 => {
+                origin.proof = Some(SourceProof {
+                    authority: Authority::session("synthetic-not-issued".into()),
+                    source: native_source(),
+                    card: CardId::new(),
+                    view_revision: 0,
+                    placement_epoch: 0,
+                })
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            matches!(
+                registry.try_replay_channel_work(&origin, &request),
+                Err(ApplyError::Refused(_))
+            ),
+            "case {case}"
+        );
+        assert!(
+            matches!(
+                registry.apply_channel_work(&origin, &request),
+                Err(ApplyError::Refused(_))
+            ),
+            "case {case}"
+        );
+        assert_eq!(snapshot(&registry, &home), before);
+        assert_eq!(registry.model().unwrap().sequence, sequence);
+        assert!(
+            registry
+                .channel_work_receipt(&user(), &home, request.operation)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn selected_user_local_and_pr_claims_keep_server_context_provenance_and_user_semantics() {
+    let (mut registry, _directory, home) = fixture();
+    let id = Uuid::new_v4();
+    let selected = selected_user(home, id);
+    let local = local_claim(home, id);
+    let local_reply = registry.apply_channel_work(&selected, &local).unwrap();
+    let local_entry = &local_reply.snapshot.entries[0];
+    assert_eq!(local_entry.target, Target::Local(id));
+    assert_eq!(local_entry.claims[0].source, work::Source::User);
+    assert_eq!(local_entry.contexts[0].id, id);
+    let pr = registry
+        .apply_channel_work(&selected, &claim(home, 5, 0))
+        .unwrap();
+    let pr_entry = pr
+        .snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.target == target(5).canonicalized().unwrap())
+        .unwrap();
+    assert_eq!(pr_entry.claims[0].source, work::Source::User);
+    assert_eq!(pr_entry.contexts, local_entry.contexts);
+    assert_eq!(
+        registry
+            .channel_work_receipt(&selected, &home, local.operation)
+            .unwrap(),
+        Some(local_reply.receipt)
+    );
+    // This internal Store contract permits context provenance on a PR; the
+    // first ApplySelection service route deliberately offers Local Claim only.
+}
+
+#[test]
+fn replay_only_lookup_preserves_original_context_and_current_state_without_fresh_selection() {
+    let (mut registry, _directory, home) = fixture();
+    let id = Uuid::new_v4();
+    let original = local_claim(home, id);
+    let empty = snapshot(&registry, &home);
+    let sequence = registry.model().unwrap().sequence;
+    assert!(
+        registry
+            .try_replay_channel_work(&user(), &original)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(snapshot(&registry, &home), empty);
+    assert_eq!(registry.model().unwrap().sequence, sequence);
+    assert!(
+        registry
+            .channel_work_receipt(&user(), &home, original.operation)
+            .unwrap()
+            .is_none()
+    );
+    let applied = registry
+        .apply_channel_work(&selected_user(home, id), &original)
+        .unwrap();
+    registry
+        .apply_channel_work(
+            &user(),
+            &Mutation {
+                home,
+                expected_revision: 1,
+                operation: Uuid::new_v4(),
+                change: Change::End {
+                    target: Target::Local(id),
+                },
+            },
+        )
+        .unwrap();
+    let ended = snapshot(&registry, &home);
+    let sequence = registry.model().unwrap().sequence;
+    // No ephemeral selection survives here. Original semantic User/source is
+    // sufficient for receipt reconciliation, never for a new Local write.
+    let replay = registry
+        .try_replay_channel_work(&user(), &original)
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay.receipt, applied.receipt);
+    assert_eq!(replay.snapshot, ended);
+    assert!(replay.snapshot.history[0].user_ended);
+    let different_context = selected_user(home, Uuid::new_v4());
+    let replay = registry
+        .try_replay_channel_work(&different_context, &original)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        replay.snapshot.history[0].contexts, applied.snapshot.entries[0].contexts,
+        "same operation never adopts later observational selection metadata"
+    );
+    let mut conflict = original.clone();
+    conflict.change = Change::Claim {
+        target: Target::Local(id),
+        role: Role::Steward,
+    };
+    assert!(matches!(
+        registry.try_replay_channel_work(&user(), &conflict),
+        Err(ApplyError::Refused(_))
+    ));
+    let other = ChannelId::new();
+    let repository = registry.read_channel_work_repository(&home).unwrap();
+    registry
+        .apply(&ModelEdit::CreateChannel {
+            id: other,
+            repository,
+            title: "Other".into(),
+            title_source: Default::default(),
+        })
+        .unwrap();
+    let model = registry.model().unwrap();
+    let mut moved = original.clone();
+    moved.home = Home {
+        registry: home.registry,
+        channel: other,
+        creation_ordinal: model.channel(other).unwrap().ordinal,
+    };
+    let other_before = snapshot(&registry, &moved.home);
+    assert!(
+        matches!(
+            registry.try_replay_channel_work(&user(), &moved),
+            Err(ApplyError::Refused(_))
+        ),
+        "UUID collision in another valid home is not an absent operation"
+    );
+    assert_eq!(snapshot(&registry, &moved.home), other_before);
+    assert_eq!(snapshot(&registry, &home), ended);
+    assert_eq!(
+        sequence + 1,
+        registry.model().unwrap().sequence,
+        "only explicit CreateChannel changed the model"
+    );
+}
+
+#[test]
+fn replay_only_lookup_rechecks_actor_and_future_schema_before_returning_receipts() {
+    let (mut registry, directory, home) = fixture();
+    let native = native_origin(&mut registry, home);
+    let request = claim(home, 1, 0);
+    let applied = registry.apply_channel_work(&native, &request).unwrap();
+    let before = snapshot(&registry, &home);
+    assert!(
+        matches!(
+            registry.try_replay_channel_work(&user(), &request),
+            Err(ApplyError::Refused(_))
+        ),
+        "User does not silently become the original semantic Actor for replay"
+    );
+    let proof = native.proof.as_ref().unwrap();
+    registry
+        .db
+        .execute(
+            "DELETE FROM agent_authorities WHERE token=?1",
+            [proof.authority.token().unwrap()],
+        )
+        .unwrap();
+    assert!(matches!(
+        registry.try_replay_channel_work(&native, &request),
+        Err(ApplyError::Refused(_))
+    ));
+    assert_eq!(snapshot(&registry, &home), before);
+    assert_eq!(
+        registry
+            .channel_work_receipt(&user(), &home, request.operation)
+            .unwrap(),
+        Some(applied.receipt)
+    );
+    let user_request = claim(home, 2, 0);
+    registry.apply_channel_work(&user(), &user_request).unwrap();
+    let stable = snapshot(&registry, &home);
+    let sequence = registry.model().unwrap().sequence;
+    let writer = Connection::open(directory.path().join("model.sqlite3")).unwrap();
+    writer
+        .pragma_update(None, "user_version", super::super::SCHEMA_VERSION + 1)
+        .unwrap();
+    assert!(matches!(
+        registry.try_replay_channel_work(&user(), &user_request),
+        Err(ApplyError::Refused(_))
+    ));
+    assert!(matches!(
+        registry.try_replay_channel_work(&user(), &claim(home, 3, 0)),
+        Err(ApplyError::Refused(_))
+    ));
+    assert_eq!(snapshot(&registry, &home), stable);
+    assert_eq!(registry.model().unwrap().sequence, sequence);
+}
+
+#[test]
+fn channel_repository_read_requires_current_incarnation_and_existing_project() {
+    let (mut registry, _directory, home) = fixture();
+    let expected = registry
+        .model()
+        .unwrap()
+        .channel(home.channel)
+        .unwrap()
+        .repository
+        .clone();
+    let sequence = registry.model().unwrap().sequence;
+    assert_eq!(
+        registry.read_channel_work_repository(&home).unwrap(),
+        expected
+    );
+    assert_eq!(registry.model().unwrap().sequence, sequence);
+    let mut wrong = home;
+    wrong.registry = Uuid::new_v4();
+    assert!(registry.read_channel_work_repository(&wrong).is_err());
+    wrong = home;
+    wrong.creation_ordinal += 1;
+    assert!(registry.read_channel_work_repository(&wrong).is_err());
+    registry
+        .apply(&ModelEdit::DeleteChannel { id: home.channel })
+        .unwrap();
+    assert!(registry.read_channel_work_repository(&home).is_err());
+    registry
+        .apply(&ModelEdit::CreateChannel {
+            id: home.channel,
+            repository: expected.clone(),
+            title: "Replacement".into(),
+            title_source: Default::default(),
+        })
+        .unwrap();
+    assert!(
+        registry.read_channel_work_repository(&home).is_err(),
+        "same UUID must not rebind old Home"
+    );
+    let model = registry.model().unwrap();
+    let replacement = Home {
+        registry: home.registry,
+        channel: home.channel,
+        creation_ordinal: model.channel(home.channel).unwrap().ordinal,
+    };
+    assert_eq!(
+        registry.read_channel_work_repository(&replacement).unwrap(),
+        expected
+    );
+    registry
+        .apply(&ModelEdit::CloseProject {
+            repository: expected,
+        })
+        .unwrap();
+    assert!(registry.read_channel_work_repository(&replacement).is_err());
 }

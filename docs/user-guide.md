@@ -410,9 +410,9 @@ Created commit, and a failure to release it is reported rather than hidden.
 
 ## Channel work
 
-Open a channel and choose **Work** beside **Conversations** to see the PRs
-tracked in that channel. Return to **Conversations** to use its terminals and
-chats. Changing this view keeps those sessions running.
+Open a channel and choose **Work** beside **Conversations** to see its tracked
+PRs and local work. Return to **Conversations** to use its terminals and chats.
+Changing this view keeps those sessions running.
 
 Use **Track PR…** to enter the forge host, repository and PR number, or type or
 paste a full PR URL into **Repository**. The URL stays editable while the host
@@ -432,6 +432,59 @@ different repositories or forks. Checking out a branch does not declare a
 contribution, and switching branches or removing a checkout does not move the
 channel's tracked work.
 
+Use **Track local work…** to select an absolute checkout directory on the
+selected device. Choose **Inspect checkout**, review the captured repository,
+checkout, branch and HEAD, and select your role. **Track local work** submits
+that explicit declaration. Inspection does not establish authorship, prove
+filesystem writes, associate a PR or run a task. **Working-tree changes not
+inspected** means unknown, not clean.
+
+Before the GUI sends a selected-checkout declaration, it saves the original
+request privately. If that save cannot finish safely, the declaration is not
+sent and the draft remains available. **Saved channel changes**, available in
+channel Work and from a new tab, lists retained requests after reopening the
+app. Open the original request and choose **Check result** on its original
+device profile. Requests restored after reopening the app are result-check
+only: their checkout selection is not restored and they cannot be resent.
+A missing receipt remains unknown. Closing the view does
+not discard the request. There are sixteen disk recovery slots, with no
+expiry or automatic eviction; unresolved requests can keep those slots occupied.
+Ordinary PR and known-row changes keep their existing in-window recovery and
+are not saved by this selected-checkout feature.
+
+An inspection expires after five minutes. Before a new submission, use
+**Inspect again** if it expires or the checkout changes. Directory selection
+supports the interactive User only; provider sessions and issued
+Child callers cannot select arbitrary checkouts. Keep the original caller
+identity rather than attempting to change its authority.
+
+From an ordinary User CLI, choose the channel explicitly:
+
+```sh
+cagents channel work track-local /absolute/checkout contribute --channel CHANNEL_UUID --save-request /private/new-local-request.json
+```
+
+Roles are `contribute`, `steward`, `review` and `reference`. The checkout path
+belongs to the selected device. `--save-request` saves the exact request before
+sending; its file must not already exist. Once a Local identity is listed in
+that channel, `track local:UUID ROLE`, `end local:UUID` and `dismiss local:UUID`
+under `cagents channel work` accept that known identity with `--channel`.
+An arbitrary UUID cannot create a new Local relation.
+
+An authenticated native session can instead declare work in its own original
+launch checkout, without supplying a directory:
+
+```sh
+cagents channel work track-own-local contribute --save-request /private/new-own-local-request.json
+```
+
+This uses the session's actual channel, live process and retained launch
+checkout. Changing the shell's current directory does not select another
+checkout. The original launch must be at a checkout root; unsupported or closed
+holders are refused. This remains a session declaration, with its original
+session/run provenance, rather than an interactive User decision. Exact saved
+request and uncertain-result recovery use the same commands below.
+
 PR observations show when they were last read. **Refresh** checks tracked PRs;
 an unavailable forge preserves the previous observation. Closed, merged and
 ended work remains in **History**. Confirm a fresh work role before an earlier
@@ -442,8 +495,16 @@ pages; use the current-page and history controls to browse further.
 **Change role** corrects a relation, and **End tracking** moves it to history.
 Leaving an edited tracking form offers **Keep editing** or **Discard draft**.
 Submitted changes continue independently of the view. If a result is
-unconfirmed, use **Check result** or **Retry original change**; retry preserves
-the original target, role and operation.
+unconfirmed, use **Check result**. In the original window, **Retry original
+change**, when offered after checking, preserves the original target, role,
+selection and operation. Requests restored after restart offer only result
+checks. Do not inspect again and submit a new
+change to retry an uncertain one. A committed original receipt remains
+checkable after its inspection expires; a missing receipt does not prove that
+nothing happened. For a saved CLI request, use `cagents channel work apply
+/private/new-local-request.json`, or inspect `channel work result` with the
+original registry, channel, ordinal and operation UUID. Do not replace those
+values or generate a fresh request to resolve an unknown result.
 
 ## Work board
 

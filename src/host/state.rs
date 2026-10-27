@@ -287,6 +287,7 @@ pub(crate) struct HostState {
     pub(super) automations: Option<super::automations::Handle>,
     /// Answers Work board reads; absent before startup and after shutdown.
     pub(super) work: Option<super::work::Handle>,
+    pub(super) channel_work_selections: super::channel_work::contexts::Selections,
     /// Wakes the courier that hands messages to idle conversations.
     pub(super) mailbox: Option<super::agent_execution::mailbox::Handle>,
     /// Seals the messages the courier delivers and recognizes them in
@@ -434,6 +435,7 @@ impl HostState {
             agent_clients: BTreeMap::new(),
             automations: None,
             work: None,
+            channel_work_selections: Default::default(),
             mailbox: None,
             mailbox_seal: None,
             execution_gates: BTreeMap::new(),
