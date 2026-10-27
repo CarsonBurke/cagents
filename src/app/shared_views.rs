@@ -792,6 +792,7 @@ impl Cagents {
     pub(super) fn publish_new_managed_pane(&mut self, scope: Scope, card: CardId) {
         if !self.shared_views.initialized.contains(&scope)
             || self.shared_views.blocked.contains(&scope)
+            || matches!(&scope, Scope::Channel(id) if self.channel_ui.was_deleted(*id) || self.channel_ui.is_deleting(*id))
             || self.workspace_model.views.iter().any(|view| {
                 view.panes.iter().any(|pane| pane.id == card) || view.retired.contains(&card)
             })
@@ -822,12 +823,50 @@ impl Cagents {
         self.shared_views
             .pending
             .push((operation, scope.clone(), change.clone()));
+        self.shared_views.attached.insert(card);
         self.publish_model_edit(ModelEdit::ChangeView {
             scope,
             expected_revision: revision,
             operation,
             change,
         });
+    }
+
+    /// An automatic empty composer has no shared descriptor yet. Once it has
+    /// work, establish its one creation intent before an empty snapshot can
+    /// mistake that unpublished source for a pane removed by another window.
+    /// Already published, restored, refused and locally retained cards never
+    /// gain fresh creation authority from absence in a snapshot.
+    fn publish_unpublished_local_chats(&mut self) {
+        let candidates = self
+            .durable
+            .cards
+            .iter()
+            .filter_map(|card| {
+                if !card.existence.is_open()
+                    || !matches!(card.kind, CardKind::Chat(_))
+                    || self.shared_views.attached.contains(&card.id)
+                    || self.shared_views.retained.contains(&card.id)
+                    || self.chat_is_unused_default(card.id)
+                {
+                    return None;
+                }
+                let scope = self
+                    .durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.cards.contains(&card.id))
+                    .map(|channel| Scope::Channel(channel.id))
+                    .or_else(|| {
+                        self.card_worktree(card)
+                            .and_then(|path| self.worktree_view_scope(path))
+                    })?;
+                Some((scope, card.id))
+            })
+            .collect::<Vec<_>>();
+        for (scope, card) in candidates {
+            self.publish_new_managed_pane(scope, card);
+        }
     }
 
     pub(super) fn publish_view_changes(&mut self) {
@@ -936,6 +975,9 @@ impl Cagents {
                         panes: legacy.clone(),
                         closed,
                     });
+                    self.shared_views
+                        .attached
+                        .extend(legacy.iter().map(|pane| pane.id));
                     self.shared_views.baseline.insert(scope.clone(), legacy);
                 }
                 continue;
@@ -954,6 +996,9 @@ impl Cagents {
                 .map(|view| view.revision)
                 .unwrap_or(0);
             for change in views::changes(&previous, &panes) {
+                if let Change::Insert { pane, .. } = &change {
+                    self.shared_views.attached.insert(pane.id);
+                }
                 let operation = match &change {
                     Change::Insert { pane, .. }
                         if self.durable.pending_terminal_creations.contains(&pane.id) =>
@@ -1122,6 +1167,7 @@ impl Cagents {
     }
 
     pub(super) fn reconcile_shared_views(&mut self) -> Task<Message> {
+        self.publish_unpublished_local_chats();
         // A watcher snapshot can announce the destination before the explicit
         // transfer response arrives. Rebase before either snapshot projects.
         self.retarget_transferred_pane_updates(None);
@@ -4838,6 +4884,145 @@ mod tests {
         assert!(!app.shared_views.defaults.contains_key(&id));
         assert!(app.terminal_starts.lock().unwrap().contains_key(&id));
     }
+    fn unpublished_default_chat() -> (
+        Cagents,
+        ChannelId,
+        CardId,
+        super::super::chat_ui::Target,
+        async_channel::Receiver<ModelEdit>,
+    ) {
+        let (mut app, channel, _, _) = fixture();
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        app.workspace_model.views = vec![View::empty(channel)];
+        let (sender, receiver) = async_channel::unbounded();
+        app.workspace_model_tx = sender;
+        drop(app.add_default_pane(PathBuf::from("/repo"), settings::DefaultPane::NativeChat));
+        let card = app.workspace.focused().unwrap();
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+            panic!("native default draft");
+        };
+        let target = runtime.target;
+        assert!(app.chat_is_unused_default(card));
+        assert!(app.local_view_panes(&Scope::Channel(channel)).is_empty());
+        while receiver.try_recv().is_ok() {}
+        (app, channel, card, target, receiver)
+    }
+
+    fn compose_default_chat(app: &mut Cagents, target: super::super::chat_ui::Target) {
+        drop(app.handle_chat_ui(super::super::chat_ui::Action::Composer(
+            target,
+            iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Paste(
+                Arc::new("first message".into()),
+            )),
+        )));
+    }
+
+    #[test]
+    fn used_default_chat_reserves_one_insert_before_empty_view_projection() {
+        let (mut app, channel, card, target, receiver) = unpublished_default_chat();
+        // An untouched automatic composer remains local and ephemeral.
+        drop(app.reconcile_shared_views());
+        assert!(receiver.try_recv().is_err());
+        compose_default_chat(&mut app, target);
+        for _ in 0..3 {
+            drop(app.reconcile_shared_views());
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(app.workspace.card(card).is_some());
+            assert!(!app.durable.local_only_cards.contains(&card));
+            assert!(!app.shared_views.retained.contains(&card));
+        }
+        let edits = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+        let [(operation, pane)] = edits
+            .iter()
+            .filter_map(|edit| match edit {
+                ModelEdit::ChangeView {
+                    operation,
+                    change: Change::Insert { pane, .. },
+                    ..
+                } if pane.id == card => Some((*operation, pane.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let mut accepted = View::empty(channel);
+        accepted.revision = 1;
+        accepted.panes.push(pane.clone());
+        app.workspace_model.views = vec![accepted];
+        app.acknowledge_view_edit(Scope::Channel(channel), Some(operation));
+        drop(app.reconcile_shared_views());
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(app.local_view_cards(&Scope::Channel(channel)), vec![card]);
+        let saved = app.persistent_workspace();
+        let restored = State::for_workspace(&saved);
+        assert!(restored.attached.contains(&card));
+        assert!(!saved.local_only_cards.contains(&card));
+        assert!(
+            matches!(&app.card_state(card).unwrap().kind, CardKind::Chat(session) if session.is_unstarted())
+        );
+    }
+
+    #[test]
+    fn first_start_empty_view_does_not_convert_creation_to_local_only() {
+        let (mut app, channel, card, target, receiver) = unpublished_default_chat();
+        compose_default_chat(&mut app, target);
+        // Exercise the ordinary first-send reducer, but never poll the returned
+        // provider Task. No real provider or user daemon is contacted here.
+        let start = app.handle_chat_ui(super::super::chat_ui::Action::Submit(
+            target,
+            crate::chat::PromptMode::Send,
+        ));
+        drop(app.reconcile_shared_views());
+        assert!(!app.durable.local_only_cards.contains(&card));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(
+            app.local_view_cards(&Scope::Channel(channel))
+                .contains(&card)
+        );
+        assert!(
+            std::iter::from_fn(|| receiver.try_recv().ok()).any(|edit| matches!(edit,
+            ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. } if pane.id == card))
+        );
+        drop(start);
+    }
+
+    #[test]
+    fn refused_default_chat_insert_does_not_republish_on_empty_reads() {
+        let (mut app, _, card, target, receiver) = unpublished_default_chat();
+        compose_default_chat(&mut app, target);
+        drop(app.reconcile_shared_views());
+        let operation = std::iter::from_fn(|| receiver.try_recv().ok())
+            .find_map(|edit| match edit {
+                ModelEdit::ChangeView {
+                    operation,
+                    change: Change::Insert { pane, .. },
+                    ..
+                } if pane.id == card => Some(operation),
+                _ => None,
+            })
+            .unwrap();
+        app.shared_views.refused(operation);
+        for _ in 0..3 {
+            drop(app.reconcile_shared_views());
+        }
+        assert!(app.durable.local_only_cards.contains(&card));
+        assert!(
+            receiver.try_recv().is_err(),
+            "a refusal grants no creation retry"
+        );
+    }
+
+    #[test]
+    fn retired_default_chat_does_not_gain_creation_authority() {
+        let (mut app, _, card, target, receiver) = unpublished_default_chat();
+        compose_default_chat(&mut app, target);
+        app.workspace_model.views[0].retired.push(card);
+        drop(app.reconcile_shared_views());
+        assert!(app.durable.local_only_cards.contains(&card));
+        assert!(receiver.try_recv().is_err());
+    }
+
     #[test]
     fn edit_during_seed_is_published_before_projection() {
         let (mut app, a, _, pane) = fixture();
