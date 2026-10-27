@@ -27,6 +27,16 @@ pub struct Identity {
     pub start: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ReceiptObservedFailure {
+    owner: Identity,
+    descendant: Identity,
+}
+
+pub fn fail_after_receipt_observation(owner: Identity, descendant: Identity) -> ! {
+    std::panic::panic_any(ReceiptObservedFailure { owner, descendant })
+}
+
 impl Identity {
     pub fn read(pid: i32) -> io::Result<Self> {
         let raw = fs::read_to_string(format!("/proc/{pid}/stat"))?;
@@ -201,7 +211,7 @@ impl Custody {
         Ok(())
     }
 
-    fn settle(&self) -> io::Result<()> {
+    fn settle(&self) -> io::Result<bool> {
         // Body/Worker unwinding has finished. There are no remaining Child
         // waiters in this process; only this guardian may reap its family.
         for directory in self.cancels.borrow().iter() {
@@ -214,10 +224,13 @@ impl Custody {
             }
             std::thread::sleep(POLL);
         }
+        if reap()? {
+            return Ok(false);
+        }
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if reap()? {
-                return Ok(());
+                return Ok(true);
             }
             // Freeze launchers before inspecting their children. Every node
             // comes from the kernel genealogy of this guardian, not a PID file.
@@ -334,18 +347,39 @@ pub fn diagnostic(path: &Path) -> String {
 }
 
 pub fn isolated(name: &str, actor: fn(&str, &Path), body: impl FnOnce(&Custody)) {
+    isolated_with_rescue_control(name, actor, false, body);
+}
+
+pub fn isolated_rescue_control(name: &str, actor: fn(&str, &Path), body: impl FnOnce(&Custody)) {
+    isolated_with_rescue_control(name, actor, true, body);
+}
+
+fn isolated_with_rescue_control(
+    name: &str,
+    actor: fn(&str, &Path),
+    expect_rescue: bool,
+    body: impl FnOnce(&Custody),
+) {
     match std::env::var(STAGE).as_deref() {
         Ok("guardian") => {
             let mut subreaper = 0_i32;
             assert_eq!(
-                unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut subreaper, 0, 0, 0) },
+                unsafe {
+                    libc::prctl(
+                        libc::PR_GET_CHILD_SUBREAPER,
+                        &mut subreaper as *mut i32,
+                        0,
+                        0,
+                        0,
+                    )
+                },
                 0
             );
             assert_eq!(
                 subreaper, 1,
                 "Only the separately admitted guardian may reap this family"
             );
-            assert_eq!(std::env::var(TEST).as_deref(), Ok(name));
+            assert_eq!(std::env::var(TEST).unwrap(), name);
             let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
             let custody = Custody {
                 root: root.clone(),
@@ -353,16 +387,50 @@ pub fn isolated(name: &str, actor: fn(&str, &Path), body: impl FnOnce(&Custody))
                 cancels: RefCell::new(Vec::new()),
             };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&custody)));
-            if let Err(error) = custody.settle() {
-                // Keep the guardian, its exact pidfds and its evidence alive.
-                // The bounded outer test fails/quarantines this uncertainty;
-                // exiting here would abandon an unproved detached family.
-                fs::write(root.join("QUARANTINE"), error.to_string()).ok();
-                loop {
-                    std::thread::park_timeout(Duration::from_secs(60));
+            let observed_failure = result
+                .as_ref()
+                .err()
+                .and_then(|payload| payload.downcast_ref::<ReceiptObservedFailure>())
+                .copied();
+            let forced = match custody.settle() {
+                Ok(forced) => forced,
+                Err(error) => {
+                    // Keep the guardian, its exact pidfds and its evidence alive.
+                    // The bounded outer test fails/quarantines this uncertainty;
+                    // exiting here would abandon an unproved detached family.
+                    fs::write(root.join("QUARANTINE"), error.to_string()).ok();
+                    loop {
+                        std::thread::park_timeout(Duration::from_secs(60));
+                    }
                 }
-            }
+            };
             fs::write(root.join("SETTLED"), "ECHILD\n").unwrap();
+            if expect_rescue {
+                let failure = observed_failure
+                    .expect("Rescue control must fail with the exact receipt-observation payload");
+                assert!(forced, "Cooperative release is not forced-rescue coverage");
+                assert!(!failure.owner.present().unwrap());
+                assert!(!failure.descendant.present().unwrap());
+                assert_eq!(
+                    fs::read_to_string(root.join("rescue/leaf-reaped")).unwrap(),
+                    format!(
+                        "{} {} SIGKILL\n",
+                        failure.descendant.pid, failure.descendant.start
+                    )
+                );
+                fs::write(
+                    root.join("RESCUED"),
+                    format!(
+                        "receipt-before-reap {} {} {} {}\n",
+                        failure.owner.pid,
+                        failure.owner.start,
+                        failure.descendant.pid,
+                        failure.descendant.start
+                    ),
+                )
+                .unwrap();
+                return;
+            }
             if let Err(panic) = result {
                 std::panic::resume_unwind(panic);
             }
@@ -420,6 +488,22 @@ pub fn isolated(name: &str, actor: fn(&str, &Path), body: impl FnOnce(&Custody))
                     diagnostic(&root.path().join("guardian.stdout")),
                     diagnostic(&root.path().join("guardian.stderr"))
                 );
+            }
+            if expect_rescue {
+                let receipt = fs::read_to_string(root.path().join("RESCUED")).unwrap();
+                let fields: Vec<_> = receipt.split_whitespace().collect();
+                assert_eq!(fields.len(), 5);
+                assert_eq!(fields[0], "receipt-before-reap");
+                for pair in fields[1..].chunks_exact(2) {
+                    let original = Identity {
+                        pid: pair[0].parse().unwrap(),
+                        start: pair[1].parse().unwrap(),
+                    };
+                    assert!(
+                        !original.present().unwrap(),
+                        "Rescue left original fixture work present"
+                    );
+                }
             }
             root.disable_cleanup(false);
         }

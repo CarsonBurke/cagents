@@ -12,7 +12,7 @@ use std::{
         unix::{
             fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
             net::UnixStream,
-            process::CommandExt,
+            process::{CommandExt, ExitStatusExt},
         },
     },
     path::{Path, PathBuf},
@@ -111,6 +111,17 @@ impl Worker {
                 return Ok(path);
             }
             if let Some(status) = self.child.try_wait()? {
+                // Publication can win between the first path check and exit
+                // observation. Recheck without renewing the launch budget.
+                if Instant::now() >= self.deadline {
+                    return Err(Failure::ReceiptDeadline);
+                }
+                if path.try_exists()? {
+                    if Instant::now() >= self.deadline {
+                        return Err(Failure::ReceiptDeadline);
+                    }
+                    return Ok(path);
+                }
                 return Err(Failure::OwnerExited(format!(
                     "{status}: {}",
                     guardian::diagnostic(&self.directory.join("owner.stderr"))
@@ -228,14 +239,22 @@ fn await_release(control: &mut UnixStream) {
     // EOF on assertion unwinding also releases the private actor. Diagnostics
     // and success never depend on draining a descendant-held output pipe.
     match control.read(&mut token) {
-        Ok(0) | Ok(1) => {}
+        Ok(0) => {}
+        Ok(1) => assert_eq!(token, [b'R']),
         other => panic!("Private actor release failed: {other:?}"),
     }
 }
 
 fn actor(stage: &str, directory: &Path) {
     let fd: i32 = std::env::var(CONTROL).unwrap().parse().unwrap();
+    assert!(fd > 2);
     let mut control = unsafe { UnixStream::from_raw_fd(fd) };
+    // transfer_control clears this only for the intended exec. A nested actor
+    // receives its own explicitly transferred endpoint, never this owner's.
+    assert_eq!(
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+        0
+    );
     control
         .set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();
@@ -250,7 +269,7 @@ fn actor(stage: &str, directory: &Path) {
             );
             await_release(&mut control);
         }
-        "premature" => {
+        "premature" | "rescue" => {
             let (mut leaf_control, remote) = UnixStream::pair().unwrap();
             leaf_control
                 .set_read_timeout(Some(Duration::from_secs(30)))
@@ -280,6 +299,25 @@ fn actor(stage: &str, directory: &Path) {
             .unwrap();
             publish_receipt(directory);
             control.write_all(b"P").unwrap();
+            if stage == "rescue" {
+                // Deliberately ignore cancellation/control EOF. Only guardian
+                // rescue can stop this held setsid leaf; the owner then reaps
+                // it before parking so descendants-first ordering is provable.
+                loop {
+                    if let Some(status) = leaf.try_wait().unwrap() {
+                        assert_eq!(status.signal(), Some(libc::SIGKILL));
+                        fs::write(
+                            directory.join("leaf-reaped"),
+                            format!("{} {} SIGKILL\n", identity.pid, identity.start),
+                        )
+                        .unwrap();
+                        loop {
+                            std::thread::park_timeout(Duration::from_secs(60));
+                        }
+                    }
+                    std::thread::sleep(POLL);
+                }
+            }
             await_release(&mut control);
             leaf_control.write_all(b"R").unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -329,7 +367,7 @@ impl FakeOwner {
             .unwrap();
         let mut ready = [0];
         control.read_exact(&mut ready).unwrap();
-        assert_eq!(ready[0], if kind == "premature" { b'P' } else { b'S' });
+        assert_eq!(ready[0], if kind == "stall" { b'S' } else { b'P' });
         Self {
             worker: Worker {
                 directory,
@@ -429,6 +467,25 @@ fn receipt_controls_reject_live_descendants_and_bound_owner_completion() {
             let observed = stalled.worker.receipt(None);
             stalled.release_and_settle();
             assert_eq!(observed, Err(Failure::CompletionDeadline));
+        },
+    );
+}
+
+#[test]
+fn guardian_rescues_the_exact_family_after_receipt_observation_failure() {
+    guardian::isolated_rescue_control(
+        "guardian_rescues_the_exact_family_after_receipt_observation_failure",
+        actor,
+        |custody| {
+            let mut owner = FakeOwner::start(custody, "rescue");
+            let descendant = owner.worker.descendant();
+            let original_owner = Identity::read(owner.worker.child.id() as i32).unwrap();
+            match owner.worker.receipt(Some(descendant)) {
+                Err(Failure::ReceiptWhileDescendantPresent(identity)) if identity == descendant => {
+                    guardian::fail_after_receipt_observation(original_owner, descendant);
+                }
+                other => panic!("Rescue control rejected for the wrong reason: {other:?}"),
+            }
         },
     );
 }
