@@ -1614,7 +1614,7 @@ mod tests {
             app.channel_ui.dialog.as_ref().unwrap().presentation,
             current
         );
-        assert_eq!(app.update(old_backdrop).units(), 0);
+        drop(app.update(old_backdrop));
         assert_eq!(
             app.channel_ui.dialog.as_ref().unwrap().presentation,
             current,

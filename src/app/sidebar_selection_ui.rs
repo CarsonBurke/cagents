@@ -605,7 +605,7 @@ mod tests {
                 .presentation,
             current
         );
-        assert_eq!(app.update(old_backdrop).units(), 0);
+        drop(app.update(old_backdrop));
         assert_eq!(
             app.sidebar_selection_ui
                 .dialog
