@@ -2105,6 +2105,7 @@ pub fn save_merged(
 /// A save and its actual merged file contents, ordered while holding the file lock.
 #[derive(Clone, Debug)]
 pub struct SavedSettings {
+    pub file_revision: FileRevision,
     pub settings: AppSettings,
     pub reload_error: Option<String>,
     pub observed_at: std::time::Instant,
@@ -2136,9 +2137,11 @@ fn save_merged_observed_unlocked(
     save_unlocked(path, &settings)?;
     // Unknown values are preserved by saving. A known-but-invalid foreign
     // value in another category must keep its banner after this save too.
-    let loaded = load_unlocked(path)?;
+    let bytes = read_private_file(path)?;
+    let loaded = load_toml_bytes(&bytes)?;
     let reload_error = live_validation_error(&loaded);
     Ok(SavedSettings {
+        file_revision: FileRevision(Some(bytes.into())),
         settings: loaded.settings,
         reload_error,
         observed_at: std::time::Instant::now(),
@@ -2230,6 +2233,7 @@ pub fn load_live(path: impl AsRef<Path>) -> Result<AppSettings, String> {
 /// delivery. Stamp both valid and invalid snapshots inside the settings lock.
 #[derive(Clone, Debug)]
 pub struct LiveSettings {
+    pub file_revision: Option<FileRevision>,
     pub result: Result<AppSettings, String>,
     pub observed_at: std::time::Instant,
 }
@@ -2237,25 +2241,70 @@ pub struct LiveSettings {
 impl LiveSettings {
     pub fn now(result: Result<AppSettings, String>) -> Self {
         Self {
+            file_revision: None,
             result,
             observed_at: std::time::Instant::now(),
         }
     }
 }
 
+/// Exact bytes observed under the settings lock. Debug output deliberately
+/// omits configuration contents, including comments and unknown preferences.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FileRevision(Option<std::sync::Arc<[u8]>>);
+
+impl std::fmt::Debug for FileRevision {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("FileRevision(..)")
+    }
+}
+
 pub fn load_live_observed(path: impl AsRef<Path>) -> LiveSettings {
     let path = path.as_ref();
-    let result = (|| {
-        let _lock = settings_lock(path).map_err(|error| error.to_string())?;
-        let result = load_unlocked(path)
-            .map_err(|error| error.to_string())
-            .and_then(|loaded| match live_validation_error(&loaded) {
-                Some(error) => Err(error),
-                None => Ok(loaded.settings),
-            });
-        Ok::<_, String>(LiveSettings::now(result))
-    })();
-    result.unwrap_or_else(|error| LiveSettings::now(Err(error)))
+    match settings_lock(path) {
+        Ok(_lock) => load_live_observed_unlocked(path),
+        Err(error) => LiveSettings::now(Err(error.to_string())),
+    }
+}
+
+fn live_result(loaded: Result<Loaded, SettingsError>) -> Result<AppSettings, String> {
+    loaded
+        .map_err(|error| error.to_string())
+        .and_then(|loaded| match live_validation_error(&loaded) {
+            Some(error) => Err(error),
+            None => Ok(loaded.settings),
+        })
+}
+
+fn observed_bytes(bytes: Vec<u8>) -> LiveSettings {
+    LiveSettings {
+        result: live_result(load_toml_bytes(&bytes)),
+        file_revision: Some(FileRevision(Some(bytes.into()))),
+        observed_at: std::time::Instant::now(),
+    }
+}
+
+fn load_live_observed_unlocked(path: &Path) -> LiveSettings {
+    match read_private_file(path) {
+        Ok(bytes) => observed_bytes(bytes),
+        Err(SettingsError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            // Legacy migration can create the file. Read its actual bytes if
+            // it did; otherwise absence itself is a captured file identity.
+            let fallback = live_result(load_unlocked(path));
+            match read_private_file(path) {
+                Ok(bytes) => observed_bytes(bytes),
+                Err(SettingsError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    LiveSettings {
+                        result: fallback,
+                        file_revision: Some(FileRevision(None)),
+                        observed_at: std::time::Instant::now(),
+                    }
+                }
+                Err(error) => LiveSettings::now(Err(error.to_string())),
+            }
+        }
+        Err(error) => LiveSettings::now(Err(error.to_string())),
+    }
 }
 
 fn live_validation_error(loaded: &Loaded) -> Option<String> {
@@ -2372,7 +2421,33 @@ pub fn restore_backup(
 ) -> Result<(), SettingsError> {
     let path = path.as_ref();
     let _lock = settings_lock(path)?;
-    let bytes = read_private_file(backup.as_ref())?;
+    restore_backup_unlocked(path, backup.as_ref())
+}
+
+/// Refuse a queued Undo if any bytes changed since its captured observation.
+/// The comparison and replacement share the same lock as cooperating windows.
+pub fn restore_backup_if_unchanged(
+    path: impl AsRef<Path>,
+    backup: impl AsRef<Path>,
+    expected: &FileRevision,
+) -> Result<bool, SettingsError> {
+    let path = path.as_ref();
+    let _lock = settings_lock(path)?;
+    match (read_private_file(path), &expected.0) {
+        (Ok(bytes), Some(expected)) if bytes.as_slice() == expected.as_ref() => {}
+        (Err(SettingsError::Io(error)), None) if error.kind() == io::ErrorKind::NotFound => {}
+        (Ok(_), _) => return Ok(false),
+        (Err(SettingsError::Io(error)), _) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        (Err(error), _) => return Err(error),
+    }
+    restore_backup_unlocked(path, backup.as_ref())?;
+    Ok(true)
+}
+
+fn restore_backup_unlocked(path: &Path, backup: &Path) -> Result<(), SettingsError> {
+    let bytes = read_private_file(backup)?;
     reject_unsafe_destination(path)?;
     let mut temporary = tempfile::Builder::new()
         .prefix(".settings-undo-")
@@ -2467,8 +2542,11 @@ fn save_unlocked_for_keys(
 }
 
 fn load_toml(path: &Path) -> Result<Loaded, SettingsError> {
-    let bytes = read_private_file(path)?;
-    let document = std::str::from_utf8(&bytes)?;
+    load_toml_bytes(&read_private_file(path)?)
+}
+
+fn load_toml_bytes(bytes: &[u8]) -> Result<Loaded, SettingsError> {
+    let document = std::str::from_utf8(bytes)?;
     let settings = match toml::from_str::<SettingsHeader>(document)?.schema_version {
         LEGACY_SETTINGS_SCHEMA_VERSION => {
             AppSettings::from(toml::from_str::<V1TomlSettings>(document)?)
@@ -3378,6 +3456,62 @@ mod tests {
         assert_eq!(fs::read(&backup).unwrap(), original.as_bytes());
         restore_backup(&path, backup).unwrap();
         assert_eq!(fs::read(path).unwrap(), original.as_bytes());
+    }
+
+    #[test]
+    fn guarded_backup_restore_preserves_exact_original_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let original = b"# exact original\nschema_version = 3\n[unknown]\nkeep = true\n";
+        fs::write(&path, original).unwrap();
+        let backup = reset_with_backup(&path, &AppSettings::default()).unwrap();
+        let expected = load_live_observed(&path).file_revision.unwrap();
+
+        assert!(restore_backup_if_unchanged(&path, &backup, &expected).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), original.as_slice());
+        assert_eq!(fs::read(backup).unwrap(), original.as_slice());
+    }
+
+    #[test]
+    fn guarded_backup_restore_refuses_newer_invalid_bytes_and_allows_explicit_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        save(&path, &AppSettings::default()).unwrap();
+        let original = fs::read(&path).unwrap();
+        let backup = reset_with_backup(&path, &AppSettings::default()).unwrap();
+        let queued_revision = load_live_observed(&path).file_revision.unwrap();
+        let newer_bytes = b"# unfinished external edit\nschema_version = [\n";
+        fs::write(&path, newer_bytes).unwrap();
+
+        assert!(!restore_backup_if_unchanged(&path, &backup, &queued_revision).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), newer_bytes.as_slice());
+        assert_eq!(fs::read(&backup).unwrap(), original);
+        // Invalid files still have byte identity, so a deliberate retry can
+        // recover the backup after the failed reload has been presented.
+        let invalid = load_live_observed(&path);
+        assert!(invalid.result.is_err());
+        assert!(
+            restore_backup_if_unchanged(&path, &backup, &invalid.file_revision.unwrap()).unwrap()
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn guarded_backup_restore_does_not_recreate_a_file_deleted_after_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        save(&path, &AppSettings::default()).unwrap();
+        let backup = reset_with_backup(&path, &AppSettings::default()).unwrap();
+        let original_backup = fs::read(&backup).unwrap();
+        let expected = load_live_observed(&path).file_revision.unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert!(!restore_backup_if_unchanged(&path, &backup, &expected).unwrap());
+        assert!(!path.exists());
+        assert_eq!(fs::read(&backup).unwrap(), original_backup);
+        let missing = load_live_observed(&path).file_revision.unwrap();
+        assert!(restore_backup_if_unchanged(&path, &backup, &missing).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), original_backup);
     }
 
     #[test]
