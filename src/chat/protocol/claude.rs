@@ -467,7 +467,7 @@ impl Claude {
     }
 
     fn control(&mut self, mut request: Value) -> Result<Step, String> {
-        let expired = self.expire_controls(std::time::Instant::now());
+        let mut expired = self.expire_controls(std::time::Instant::now());
         let interrupt = string(&request, "subtype") == "interrupt";
         if !interrupt && self.controls.len() >= MAX_PENDING {
             return Err("Too many pending Claude control operations".into());
@@ -483,10 +483,24 @@ impl Claude {
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in old {
-                self.controls.remove(&id);
+                let request = self.controls.remove(&id).expect("pending interrupt");
                 self.control_deadlines.remove(&id);
+                // Its provider result may already have settled while waiting
+                // for this acknowledgement. Removing the deadline must not
+                // strand that exact old turn or borrow the new turn's result.
+                if let Some(generation) = request["_cagents_turn"].as_u64()
+                    && let Some((key, outcome, run)) = self.deferred_attention.remove(&generation)
+                {
+                    self.publish_deferred_finish(generation, key, outcome, &mut expired);
+                    if let Some(run) = run {
+                        expired.events.push(Event::Execution {
+                            run,
+                            event: crate::agent_execution::ProviderEvent::Finished { outcome },
+                        });
+                    }
+                }
                 self.control_replies.push((
-                    id,
+                    request["_cagents_ack"].as_str().unwrap_or(&id).to_owned(),
                     Err("A newer interrupt request superseded this one".into()),
                 ));
             }
@@ -5479,7 +5493,7 @@ mod tests {
     }
 
     #[test]
-    fn expiring_an_old_interrupt_cannot_clear_a_newer_turns_pending_interrupt() {
+    fn superseding_an_old_interrupt_settles_its_result_without_clearing_the_new_turn() {
         let mut adapter = Claude {
             busy: true,
             ..Default::default()
@@ -5494,27 +5508,37 @@ mod tests {
         let mut started = Step::default();
         adapter.start_turn(&mut started);
         adapter.busy = true;
-        let current = adapter.command(Command::Interrupt).unwrap().writes[0]["request_id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let now = std::time::Instant::now();
-        adapter
-            .control_deadlines
-            .insert(old, now - std::time::Duration::from_millis(1));
-        adapter
-            .control_deadlines
-            .insert(current.clone(), now + std::time::Duration::from_secs(10));
-        let expired = adapter.expire_controls(now);
-        assert_eq!(adapter.interruption, Some(false));
-        assert!(expired.events.iter().any(|event| matches!(
+        let replacement = adapter.command(Command::Interrupt).unwrap();
+        assert!(replacement.events.iter().any(|event| matches!(
             event,
             Event::PastTurnFinished {
                 outcome: crate::notifications::Kind::Succeeded,
                 ..
             }
         )));
+        assert!(adapter.deferred_attention.is_empty());
+        assert!(!adapter.controls.contains_key(&old));
+        assert!(!adapter.control_deadlines.contains_key(&old));
+        let current = replacement.writes[0]["request_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let now = std::time::Instant::now();
+        adapter
+            .control_deadlines
+            .insert(current.clone(), now + std::time::Duration::from_secs(10));
+        let expired = adapter.expire_controls(now);
+        assert_eq!(adapter.interruption, Some(false));
+        assert!(expired.events.is_empty());
         assert!(adapter.controls.contains_key(&current));
+        let late = adapter
+            .receive(json!({"type":"control_response","response":{"subtype":"success","request_id":old,"response":{}}}))
+            .unwrap();
+        assert!(
+            late.events.is_empty(),
+            "superseded acknowledgement cannot settle twice"
+        );
+        assert_eq!(adapter.interruption, Some(false));
         adapter
             .receive(json!({"type":"result","uuid":"new","subtype":"success","is_error":false}))
             .unwrap();
