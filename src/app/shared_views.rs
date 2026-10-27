@@ -5131,10 +5131,14 @@ mod tests {
                 super::super::chat_ui::Action::DraftStartCheckpointed(_, _, Ok(()))
             ));
             let start = app.handle_chat_ui(completion);
-            assert!(
-                cosmic::iced::runtime::task::into_stream(start).is_none(),
-                "revoked creation must emit no provider Task"
+            // handle_chat_ui batches even an empty result; its stream may
+            // exist without containing any work. No provider future is queued.
+            assert_eq!(
+                start.units(),
+                0,
+                "revoked creation must queue no provider work"
             );
+            drop(start);
             assert!(!app.chat_start_pending(card));
             assert!(
                 matches!(&app.card_state(card).unwrap().kind, CardKind::Chat(session) if session.is_unstarted())
@@ -5194,7 +5198,8 @@ mod tests {
         ));
         let start = app.handle_chat_ui(completion);
         assert!(app.chat_start_pending(card));
-        assert!(cosmic::iced::runtime::task::into_stream(start).is_some());
+        assert!(start.units() > 0);
+        drop(start);
         assert!(!app.durable.local_only_cards.contains(&card));
         assert_eq!(app.local_view_cards(&Scope::Channel(channel)), vec![card]);
     }

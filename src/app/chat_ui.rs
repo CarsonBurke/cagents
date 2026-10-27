@@ -7765,7 +7765,7 @@ impl Cagents {
         if creation_revoked {
             self.release_draft_start_capture(target.card);
             if let Some(runtime) = self.chat_card_runtime_mut(target) {
-                runtime.error = Some("This pane was closed or its creation was refused. Your draft is retained; nothing was started.".into());
+                runtime.error = Some("This pane was closed or its creation was refused. Nothing was started. Your draft is retained; copy it before closing this pane.".into());
             }
             return Task::none();
         }
