@@ -3,6 +3,9 @@
 #[path = "support/hosted_agent_cleanup.rs"]
 mod hosted_agent_cleanup;
 
+#[path = "support/private_cli_capture.rs"]
+mod private_cli_capture;
+
 use serde_json::Value;
 use std::{
     fs,
@@ -77,7 +80,7 @@ impl Fixture {
         };
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let output = fixture.output(&["daemon", "status"]);
+            let output = fixture.output_until(&["daemon", "status"], deadline);
             if output.status.success()
                 && serde_json::from_slice::<Value>(&output.stdout).unwrap()["data"]["running"]
                     == true
@@ -91,13 +94,6 @@ impl Fixture {
     }
 
     fn output(&self, arguments: &[&str]) -> Output {
-        let mut child = Self::command(self.root.path(), Path::new(env!("CARGO_BIN_EXE_cagents")))
-            .arg("--json")
-            .args(arguments)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
         // Explicit close includes the provider's bounded interrupt/teardown
         // budget, which is deliberately longer than ordinary RPCs.
         let timeout = if arguments.starts_with(&["agent", "close"]) {
@@ -105,16 +101,15 @@ impl Fixture {
         } else {
             20
         };
-        let deadline = Instant::now() + Duration::from_secs(timeout);
-        while child.try_wait().unwrap().is_none() {
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let output = child.wait_with_output().unwrap();
-                panic!("CLI timed out: {arguments:?}: {output:?}");
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        let output = child.wait_with_output().unwrap();
+        self.output_until(arguments, Instant::now() + Duration::from_secs(timeout))
+    }
+
+    fn output_until(&self, arguments: &[&str], deadline: Instant) -> Output {
+        let spec = private_cli_capture::private_cli(self.root.path())
+            .env("TERM", "xterm-256color")
+            .args(arguments.iter().copied());
+        let output = private_cli_capture::capture(spec, deadline)
+            .unwrap_or_else(|failure| panic!("CLI failed: {arguments:?}: {failure:?}"));
         self.agents.observe(&output);
         output
     }
