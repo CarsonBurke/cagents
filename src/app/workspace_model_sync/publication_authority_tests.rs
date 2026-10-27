@@ -1487,6 +1487,28 @@ fn local_retirement_resolves_publication_notice_without_waiting_for_another_mode
     app.notices.record(app.status.take().unwrap());
     let key = NoticeKey::SharedChannel(channel, project);
     assert!(app.notice_stands(key));
+    // Retire the unstarted default through its owning synchronous chat-close
+    // path before testing deletion of an actually empty channel. Returned
+    // teardown tasks are not executed; this fixture has no issued actor.
+    let card = app
+        .durable
+        .channels
+        .iter()
+        .find(|local| local.id == channel)
+        .unwrap()
+        .cards[0];
+    assert!(matches!(&app.card_state(card).unwrap().kind,
+        crate::model::CardKind::Chat(session) if session.is_unstarted() && session.proof.is_none()));
+    drop(app.begin_chat_close(card));
+    assert!(
+        app.durable
+            .channels
+            .iter()
+            .find(|local| local.id == channel)
+            .unwrap()
+            .cards
+            .is_empty()
+    );
     // An empty channel's public Delete action retires it locally. Its scoped
     // DeleteChannel can itself be refused with no model callback, so the real
     // all-update notice sweep must settle this report before any model arrives.
