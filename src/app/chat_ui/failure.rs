@@ -2,6 +2,10 @@
 use super::*;
 use chat::failure::{Failure, FailureKind};
 
+#[cfg(test)]
+#[path = "failure_prompt_context_tests.rs"]
+mod prompt_context_tests;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Source {
     Item(String),
@@ -256,11 +260,24 @@ impl State {
         // classified. User messages and ordinary assistant prose remain verbatim.
         let mut contexts = HashMap::new();
         let mut context = String::new();
+        let mut user_carriers = HashMap::new();
         for item in &runtime.snapshot.items {
             if item.role == chat::Role::User
                 && !matches!(item.content, ItemContent::Delivery { .. })
             {
-                context.clone_from(&item.id);
+                // One decoder message can contain text and several images.
+                // Keep its exact carrier, rather than making every part a
+                // different failure scope or merging adjacent submissions.
+                if let Some(carrier) = attachment_draft::message_key(provider, &item.id) {
+                    let scope = user_carriers
+                        .entry(carrier)
+                        .or_insert_with(|| format!("message\0{carrier}"));
+                    context.clone_from(scope);
+                } else {
+                    // An opaque legacy ID cannot collide with a normalized
+                    // message carrier that happens to have the same spelling.
+                    context = format!("item\0{}", item.id);
+                }
             }
             contexts.insert(item.id.as_str(), context.clone());
         }
@@ -357,7 +374,17 @@ impl State {
                     runtime.failures[index]
                         .0
                         .as_deref()
-                        .and_then(|id| contexts.get(id))
+                        .and_then(|id| {
+                            contexts.get(id).or_else(|| {
+                                // Paging may retain an image while the first
+                                // prompt part anchoring this note is absent.
+                                // Only a visible genuine User carrier proves
+                                // this relation; never infer it from prose or
+                                // a tool/group key alone.
+                                attachment_draft::message_key(provider, id)
+                                    .and_then(|carrier| user_carriers.get(carrier))
+                            })
+                        })
                         .map(String::as_str)
                         .unwrap_or(""),
                 );
@@ -450,6 +477,30 @@ impl State {
                         })
                         .unwrap_or_else(|| runtime.turns.last().map(|turn| turn.key.clone()))
                 });
+            if let Some(anchor) = incident.anchor.as_deref()
+                && !runtime.turns.iter().any(|turn| turn.key == anchor)
+                && incident.sources.iter().any(|source| {
+                    matches!(source, Source::Note(index) if runtime.failures[*index].0.as_deref() == Some(anchor))
+                })
+                && let Some(carrier) = attachment_draft::message_key(provider, anchor)
+                && user_carriers.contains_key(carrier)
+            {
+                // The original note keeps its captured anchor. Only its
+                // display destination follows a visible part of the SAME
+                // proven User message after paging removes the first part.
+                // A visual Turn key is a destination, never incident identity.
+                if let Some(turn) = runtime.turns.iter().find(|turn| {
+                    turn.prompt.iter().any(|index| {
+                        runtime.snapshot.items.get(*index).is_some_and(|item| {
+                            item.role == chat::Role::User
+                                && !matches!(item.content, ItemContent::Delivery { .. })
+                                && attachment_draft::message_key(provider, &item.id) == Some(carrier)
+                        })
+                    })
+                }) {
+                    incident.anchor = Some(turn.key.clone());
+                }
+            }
         }
         state.expanded = runtime
             .failure_ui
@@ -471,6 +522,7 @@ impl State {
                 &incident.summary,
                 &incident.sources,
                 &incident.first_item,
+                &incident.anchor,
                 &incident.active_recovery,
                 &incident.child_scope,
             )
