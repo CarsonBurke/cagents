@@ -5578,8 +5578,6 @@ impl State {
 
 #[cfg(test)]
 mod tests {
-    mod signin_cleanup;
-
     use super::*;
     use crate::account::WindowKind;
     use crate::app::tests::context_inspector_test_app;
@@ -6044,6 +6042,8 @@ mod tests {
 
 #[cfg(test)]
 mod app_tests {
+    mod signin_cleanup;
+
     #[test]
     fn codex_device_relogin_keeps_the_home_and_other_browser_preparation() {
         let mut app = context_inspector_test_app(false);

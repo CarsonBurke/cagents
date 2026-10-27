@@ -2,8 +2,14 @@ use super::*;
 
 #[test]
 fn ended_offstrip_signin_waits_for_daemon_release_before_local_retirement() {
-    let (mut app, card, _) = offstrip_close_fixture();
+    let (mut app, card, original) = offstrip_close_fixture();
     app.retire_ended_terminal(card, 0, None, false);
+    drop(app.update(Message::TerminalStarted {
+        card,
+        terminal: original.id,
+        result: Err("fixture start already ended".into()),
+    }));
+    assert!(!app.terminal_start_in_flight(card));
     assert!(ended_terminal(app.card_state(card)).is_some());
     assert!(!app.workspace.order().any(|current| current == card));
     let key = app.account_ui.logins[0].key;
