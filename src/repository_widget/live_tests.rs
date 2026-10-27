@@ -266,14 +266,32 @@ async fn background_read_cannot_overwrite_edits_or_newer_selection() {
         runtime.original_editor_root.clone(),
     )
     .unwrap();
-    read.watch_revision = Some(runtime.document_watch.as_ref().unwrap().revision());
+    // Model a delayed completion after a newer native event, independent of
+    // when this write's callback reaches the coordinator on the test host.
+    read.watch_revision = Some(
+        runtime
+            .document_watch
+            .as_ref()
+            .unwrap()
+            .revision()
+            .wrapping_sub(1),
+    );
     if let DocumentState::Editable(document) = &mut runtime.document {
         document.replace_text("typed while loading");
     }
-    drop(runtime.update(RepositoryAction::FileLoadedAt {
+    let task = runtime.update(RepositoryAction::FileLoadedAt {
         identity: identity.clone(),
         result: Ok(read),
-    }));
+    });
+    assert_eq!(
+        runtime.editor_text().as_deref(),
+        Some("typed while loading")
+    );
+    assert!(runtime.document_reading, "stale completion schedules a retry");
+    // A native event can advance the watch revision before this completion.
+    // The stale read must preserve edits immediately, then its real retry
+    // must finish before the latest disk state can establish a conflict.
+    settle(&mut runtime, task).await;
     assert_eq!(
         runtime.editor_text().as_deref(),
         Some("typed while loading")
