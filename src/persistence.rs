@@ -5,7 +5,7 @@ use std::{
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{Mutex, MutexGuard},
+    sync::{Mutex, MutexGuard, RwLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -32,11 +32,14 @@ use crate::{
 #[cfg(feature = "ui")]
 mod review_cache;
 
+mod closed_claims;
+pub(crate) use closed_claims::{ClosedTerminalClaim, ClosureKey, ClosureQuery};
+
 // Format 12 introduces retained Claude descriptors that older readers cannot
 // decode safely. Admission must reject them before partial workspace loading
 // can omit a card and a later snapshot can tombstone it. This supplements the
 // normal local IPC startup gate; it also fences permitted old-set/remote opens.
-pub const CURRENT_SCHEMA_VERSION: u32 = 13;
+pub const CURRENT_SCHEMA_VERSION: u32 = 14;
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -495,6 +498,101 @@ pub struct TerminalPaneRestoration {
     pub terminal: TerminalId,
 }
 
+fn restore_compacted_terminal_owner(
+    transaction: &Transaction<'_>,
+    terminal: TerminalId,
+) -> Result<()> {
+    if transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM terminal_recipes WHERE terminal_id = ?1)",
+        [terminal.to_string()],
+        |row| row.get::<_, bool>(0),
+    )? {
+        return Ok(());
+    }
+    let archived: Option<(String, String, i64)> = transaction.query_row(
+        "SELECT workspace_id, card_json, closed_at_unix_ms FROM closed_card_archives WHERE terminal_id = ?1 AND owns_terminal = 1",
+        [terminal.to_string()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).optional()?;
+    let Some((workspace, json, timestamp)) = archived else {
+        return Ok(());
+    };
+    let card: CardState = from_json("closed terminal archive", &json)?;
+    if !matches!(card.existence, Existence::Closed { .. })
+        || !matches!(&card.kind, CardKind::Terminal(session) if session.id == terminal)
+    {
+        return Err(StoreError::InvalidState(
+            "invalid compacted terminal owner".into(),
+        ));
+    }
+    let id = card.id.to_string();
+    let write = CardWrite::build(&workspace, &id, 0, &card, PersistedCardKind::Terminal)?;
+    transaction.execute(
+        UPSERT_CARD,
+        params![
+            id,
+            workspace,
+            write.ordinal,
+            u64_to_i64(card.generation, "card generation")?,
+            card.title,
+            f64::from(card.width_fraction),
+            write.existence_json,
+            "terminal",
+            write.content_json,
+            write.content_hash,
+            timestamp
+        ],
+    )?;
+    transaction.execute("UPDATE cards SET retired = 1 WHERE card_id = ?1", [&id])?;
+    save_card_payload(transaction, &id, &write, card.generation, timestamp)?;
+    Ok(())
+}
+
+/// Read recovery history on demand; it need not stay in every live workspace
+/// snapshot just so an exact daemon-authorized identity can be adopted later.
+fn closed_terminal_source(connection: &Connection, id: CardId) -> Result<Option<CardState>> {
+    let row = connection
+        .query_row(
+            "SELECT generation, title, width_fraction, existence_json, content_json
+         FROM cards WHERE card_id = ?1 AND kind_tag = 'terminal' AND retired = 1",
+            [id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, f64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    if row.is_none() {
+        let archived: Option<String> = connection.query_row(
+            "SELECT card_json FROM closed_card_archives WHERE card_id = ?1 AND kind_tag = 'terminal'", [id.to_string()], |row| row.get(0),
+        ).optional()?;
+        return archived
+            .map(|json| from_json("closed terminal archive", &json))
+            .transpose();
+    }
+    row.map(|(generation, title, width, existence, content)| {
+        let session = match content {
+            Some(content) => from_json("archived terminal", &content)?,
+            None => load_terminal_record(connection, id)?,
+        };
+        Ok(CardState {
+            id,
+            generation: i64_to_u64(generation, "card generation")?,
+            title,
+            width_fraction: width as f32,
+            existence: from_json("card existence", &existence)?,
+            exposure: Exposure::Offscreen,
+            residency: Residency::Cold,
+            kind: CardKind::Terminal(session),
+        })
+    })
+    .transpose()
+}
+
 fn select_closed_terminal_adoption(
     connection: &Connection,
     state: &WorkspaceState,
@@ -504,7 +602,11 @@ fn select_closed_terminal_adoption(
     let owner: Option<(String, String, String)> = connection
         .query_row(
             "SELECT c.card_id,c.workspace_id,c.existence_json FROM terminal_recipes t
-             JOIN cards c ON c.card_id=t.card_id WHERE t.terminal_id=?1",
+             JOIN cards c ON c.card_id=t.card_id WHERE t.terminal_id=?1
+             UNION ALL SELECT card_id, workspace_id, json_extract(card_json, '$.existence')
+             FROM closed_card_archives WHERE terminal_id = ?1 AND owns_terminal = 1
+             AND NOT EXISTS(SELECT 1 FROM terminal_recipes WHERE terminal_id = ?1)
+             LIMIT 1",
             [terminal.to_string()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -522,7 +624,13 @@ fn select_closed_terminal_adoption(
     {
         return Ok(None);
     }
-    let Some(source) = state.cards.iter().find(|card| card.id == alias) else {
+    let historical = closed_terminal_source(connection, alias)?;
+    let Some(source) = state
+        .cards
+        .iter()
+        .find(|card| card.id == alias)
+        .or(historical.as_ref())
+    else {
         return Ok(None);
     };
     if source.existence != from_json::<Existence>("terminal owner existence", &existence)?
@@ -560,7 +668,12 @@ fn validate_terminal_ownership_recovery(
     {
         return Err(invalid("the exact closed owner changed"));
     }
-    let source = state.cards.iter().find(|card| card.id == recovery.alias);
+    let historical = closed_terminal_source(transaction, recovery.alias)?;
+    let source = state
+        .cards
+        .iter()
+        .find(|card| card.id == recovery.alias)
+        .or(historical.as_ref());
     let target = state
         .cards
         .iter()
@@ -589,8 +702,8 @@ fn validate_terminal_ownership_recovery(
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkspaceCommit {
     pub generation: u64,
-    /// Every card row the workspace owns after the commit, tombstones included,
-    /// so a later snapshot that still carries a closed card has a valid base.
+    /// Rows this snapshot wrote, including newly committed closures. Later
+    /// snapshots omit released descriptors; archives are not an active base.
     pub card_generations: BTreeMap<CardId, u64>,
 }
 
@@ -600,8 +713,8 @@ pub struct WorkspaceCommit {
 /// This is [`WorkspaceCommit`] read back rather than returned by a commit, and
 /// it exists for one caller: a writer whose base storage rejected as stale
 /// needs the live generations to retry its own unchanged content against.
-/// Tombstoned cards are included because the save path checks a snapshot
-/// against every card row the workspace owns, not only the open ones.
+/// Only active rows are included. Closed history is resolved by ID only when
+/// a pending close or an explicitly authorized ownership recovery names it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StoredGenerations {
     pub workspace: u64,
@@ -665,6 +778,7 @@ impl RefusedClosure {
 /// one mutex, so callers cannot accidentally create a second writer lane.
 pub struct StateStore {
     inner: Mutex<StoreInner>,
+    closed_authority: RwLock<closed_claims::ClosedAuthority>,
     /// Retained so the store can size its own WAL sidecar without asking a
     /// caller for the path it was opened with.
     path: PathBuf,
@@ -774,7 +888,9 @@ impl StateStore {
         enforce_private_database(path)?;
         enforce_sqlite_sidecars(path)?;
 
+        let closed_authority = closed_claims::ClosedAuthority::open(&connection)?;
         Ok(Self {
+            closed_authority: RwLock::new(closed_authority),
             inner: Mutex::new(StoreInner {
                 refused_closures: RefusedClosures::new(),
                 connection,
@@ -826,8 +942,99 @@ impl StateStore {
         // A conversion defers its foreign keys, so a violation it caused would
         // surface here, attributed to no card. It cannot arise in practice:
         // the terminal and its transcript metadata move together.
+        let closure_stamp = (commit.generation != base.workspace)
+            .then(|| self.prepare_closure_commit(&transaction))
+            .transpose()?;
         transaction.commit()?;
+        if let Some(stamp) = closure_stamp {
+            self.finish_closure_commit(stamp)?;
+        }
         Ok(commit)
+    }
+
+    /// Compact at most one small batch on the writer thread. Resumable chat
+    /// and terminal descriptors move to a separate archive; resurrection
+    /// guards are permanent and active workspace queries never scan history.
+    pub fn compact_closed_cards(&self, older_than_unix_ms: i64) -> Result<usize> {
+        let mut inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let previous_changes = inner.connection.total_changes();
+        let transaction = inner
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ids = {
+            let mut query = transaction.prepare(
+                "SELECT card_id, workspace_id, kind_tag, updated_at_unix_ms FROM cards
+                 WHERE retired = 1 AND updated_at_unix_ms < ?1
+                 AND NOT EXISTS(SELECT 1 FROM closed_terminal_claims t WHERE t.card_id = cards.card_id AND t.unknown = 1)
+                 ORDER BY updated_at_unix_ms, card_id LIMIT 32",
+            )?;
+            query
+                .query_map([older_than_unix_ms], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut compacted = 0;
+        for (id, workspace, kind, closed_at) in &ids {
+            let card_id = parse_id("closed card", id)?;
+            if kind == "chat" || kind == "terminal" {
+                let card = match if kind == "terminal" {
+                    closed_terminal_source(&transaction, card_id)
+                } else {
+                    load_card_connection(&transaction, card_id, &self.boot_id, None)
+                } {
+                    Ok(Some(card)) => card,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(%error, card = %card_id, "preserving unreadable closed pane while compacting other history");
+                        closed_claims::preserve_unknown_claim(&transaction, card_id)?;
+                        continue;
+                    }
+                };
+                let terminal = match &card.kind {
+                    CardKind::Terminal(session) => Some(session.id.to_string()),
+                    _ => None,
+                };
+                let content = match &card.kind {
+                    CardKind::Chat(session) => to_json(session)?,
+                    CardKind::Terminal(session) => to_json(session)?,
+                    _ => unreachable!(),
+                };
+                let owns = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM terminal_recipes WHERE card_id = ?1)",
+                    [id],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if owns {
+                    transaction.execute("UPDATE closed_card_archives SET owns_terminal = 0 WHERE terminal_id = ?1 AND owns_terminal = 1", [&terminal])?;
+                }
+                transaction.execute(
+                    "INSERT INTO closed_card_archives(card_id, workspace_id, kind_tag, terminal_id, owns_terminal, card_json, content_json, closed_at_unix_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(card_id) DO UPDATE SET card_json = excluded.card_json, content_json = excluded.content_json, owns_terminal = excluded.owns_terminal",
+                    params![id, workspace, kind, terminal, owns, to_json(&card)?, content, closed_at],
+                )?;
+            }
+            transaction.execute("DELETE FROM transcript_metadata WHERE terminal_id IN (SELECT terminal_id FROM terminal_recipes WHERE card_id = ?1)", [id])?;
+            transaction.execute("DELETE FROM terminal_recipes WHERE card_id = ?1", [id])?;
+            transaction.execute("DELETE FROM browser_restore WHERE card_id = ?1", [id])?;
+            compacted += transaction
+                .execute("DELETE FROM cards WHERE card_id = ?1 AND retired = 1", [id])?;
+        }
+        let closure_stamp = (transaction.total_changes() != previous_changes)
+            .then(|| self.prepare_closure_commit(&transaction))
+            .transpose()?;
+        transaction.commit()?;
+        if let Some(stamp) = closure_stamp {
+            self.finish_closure_commit(stamp)?;
+        }
+        Ok(compacted)
     }
 
     /// Resolve an archived resource owner for a daemon-authorized canonical pane.
@@ -922,6 +1129,7 @@ impl StateStore {
             ));
         }
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        restore_compacted_terminal_owner(&transaction, session.id)?;
         if metadata(&transaction, "last_boot_id")?.as_deref() != Some(boot_id.as_str()) {
             return Err(StoreError::InvalidState(
                 "repair requires the store's current boot".into(),
@@ -961,7 +1169,9 @@ impl StateStore {
             // Replays do not overwrite a canonical actor's newer runtime proof.
             return Ok(None);
         }
-        let source = &stored[&alias];
+        let source = existing_card(&transaction, alias)?.ok_or_else(|| {
+            StoreError::InvalidState("terminal historical owner disappeared".into())
+        })?;
         if !matches!(source.existence, Existence::Closed { .. })
             || source.kind != PersistedCardKind::Terminal
         {
@@ -972,7 +1182,7 @@ impl StateStore {
         check_generation(
             "card",
             alias,
-            base.cards.get(&alias).copied().unwrap_or(0),
+            base.cards.get(&alias).copied().unwrap_or(source.generation),
             Some(source.generation),
         )?;
         if let Some(target) = stored.get(&canonical.id) {
@@ -1040,6 +1250,7 @@ impl StateStore {
                 alias.to_string()
             ],
         )?;
+        transaction.execute("UPDATE closed_card_archives SET owns_terminal = 0 WHERE card_id = ?1 AND owns_terminal = 1", [alias.to_string()])?;
         let ordinal: i64 = transaction.query_row(
             "SELECT COALESCE((SELECT ordinal FROM cards WHERE card_id=?1),
                  (SELECT COALESCE(MAX(ordinal),-1)+1 FROM cards WHERE workspace_id=?2))",
@@ -1141,6 +1352,14 @@ impl StateStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch("PRAGMA defer_foreign_keys=ON")?;
         let mut prepared = state.clone();
+        for terminal in adoptions
+            .iter()
+            .map(|adoption| adoption.terminal)
+            .chain(restorations.iter().map(|restoration| restoration.terminal))
+            .chain(recovery.iter().map(|recovery| recovery.terminal))
+        {
+            restore_compacted_terminal_owner(&transaction, terminal)?;
+        }
         let mut generations = base.cards.clone();
         let mut adoptions = adoptions.to_vec();
         if let Some(recovery) = recovery {
@@ -1164,10 +1383,12 @@ impl StateStore {
             }
         }
         for adoption in &adoptions {
+            let historical = closed_terminal_source(&transaction, adoption.alias)?;
             let source = state
                 .cards
                 .iter()
                 .find(|card| card.id == adoption.alias)
+                .or(historical.as_ref())
                 .ok_or_else(|| {
                     StoreError::InvalidState("pane adoption needs its closed alias".into())
                 })?;
@@ -1224,7 +1445,11 @@ impl StateStore {
                     "pane adoption cannot take another pane's resource".into(),
                 ));
             }
-            let expected = base.cards.get(&adoption.alias).copied().unwrap_or(0);
+            let expected = base
+                .cards
+                .get(&adoption.alias)
+                .copied()
+                .unwrap_or(source.generation);
             if generation != expected {
                 return Err(StoreError::StaleGeneration {
                     entity: format!("card {}", adoption.alias),
@@ -1248,6 +1473,7 @@ impl StateStore {
                     "terminal ownership changed during pane adoption".into(),
                 ));
             }
+            transaction.execute("UPDATE closed_card_archives SET owns_terminal = 0 WHERE card_id = ?1 AND owns_terminal = 1", [adoption.alias.to_string()])?;
             transaction.execute(INVALIDATE_CARD_HASH, [adoption.canonical.to_string()])?;
             generations.insert(adoption.alias, next);
         }
@@ -1260,7 +1486,13 @@ impl StateStore {
             },
             refused_closures,
         )?;
+        let closure_stamp = (commit.generation != base.workspace)
+            .then(|| self.prepare_closure_commit(&transaction))
+            .transpose()?;
         transaction.commit()?;
+        if let Some(stamp) = closure_stamp {
+            self.finish_closure_commit(stamp)?;
+        }
         Ok(commit)
     }
 
@@ -1879,7 +2111,7 @@ impl StateStore {
                     w.updated_at_unix_ms,
                     SUM(CASE WHEN c.existence_json = '\"open\"' THEN 1 ELSE 0 END)
              FROM workspaces w
-             LEFT JOIN cards c ON c.workspace_id = w.workspace_id
+             LEFT JOIN cards c ON c.workspace_id = w.workspace_id AND c.retired = 0
              GROUP BY w.workspace_id
              ORDER BY w.updated_at_unix_ms DESC, w.workspace_id",
         )?;
@@ -1937,6 +2169,11 @@ impl StateStore {
         let mut statement = inner.connection.prepare(
             "SELECT card_id, title, content_json, existence_json, updated_at_unix_ms
              FROM cards WHERE kind_tag = 'chat'
+             UNION ALL
+             SELECT a.card_id, json_extract(a.card_json, '$.title'),
+                    a.content_json, json_extract(a.card_json, '$.existence'), a.closed_at_unix_ms
+             FROM closed_card_archives a WHERE a.kind_tag = 'chat'
+             AND NOT EXISTS(SELECT 1 FROM cards c WHERE c.card_id = a.card_id)
              ORDER BY updated_at_unix_ms DESC, card_id",
         )?;
         let rows = statement.query_map([], |row| {
@@ -2468,9 +2705,9 @@ impl StateStore {
         prune_transcript_directory(directory, &live, retention)
     }
 
-    /// Every terminal id storage still knows about, from both tables that can
-    /// name one: a recipe row can outlive its transcript metadata and vice
-    /// versa, and either is reason enough to keep the file.
+    /// Every terminal id storage still knows about. A recipe, transcript row,
+    /// or retained descriptor (including compacted history) is reason enough
+    /// to keep the file.
     pub fn live_terminal_ids(&self) -> Result<HashSet<String>> {
         let inner = self.lock_inner()?;
         ensure_open(&inner)?;
@@ -2623,6 +2860,18 @@ pub fn read_navigable_session_ids(path: &Path) -> Result<Vec<TerminalId>> {
             Ok(Some(id)) => ids.push(id),
             Ok(None) => {}
             Err(error) => tracing::warn!(%error, "Skipping unreadable saved session identity"),
+        }
+    }
+    // Read-only navigation also works against older, unmigrated windows.
+    if transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'closed_card_archives')", [], |row| row.get::<_, bool>(0))? {
+        let mut archives = transaction.prepare("SELECT content_json FROM closed_card_archives a WHERE kind_tag = 'chat' AND NOT EXISTS(SELECT 1 FROM cards c WHERE c.card_id = a.card_id)")?;
+        for content in archives.query_map([], |row| row.get::<_, String>(0))? {
+            let identity: Result<crate::chat::Session> = content.map_err(StoreError::from).and_then(|content| from_json("archived chat identity", &content));
+            match identity {
+                Ok(session) if session.launch.session_id.is_some() => ids.push(session.id),
+                Ok(_) => {},
+                Err(error) => tracing::warn!(%error, "Skipping unreadable archived session identity"),
+            }
         }
     }
     Ok(ids)
@@ -3003,6 +3252,22 @@ fn collect_live_terminal_ids(connection: &Connection, live: &mut HashSet<String>
         let terminal: TerminalSession = from_json("archived terminal", &row?)?;
         live.insert(terminal.id.to_string());
     }
+    // Compaction moves the original terminal identity out of the live tables.
+    // Read archives last so an atomic compaction between these queries cannot
+    // make a retained transcript look orphaned. Older windows have no archive.
+    if connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'closed_card_archives')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )? {
+        let mut statement = connection.prepare(
+            "SELECT terminal_id FROM closed_card_archives WHERE kind_tag = 'terminal'",
+        )?;
+        for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+            let terminal: TerminalId = parse_id("archived terminal", &row?)?;
+            live.insert(terminal.to_string());
+        }
+    }
     Ok(())
 }
 
@@ -3332,12 +3597,31 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         return Ok(());
     }
 
+    migrate_reserved(connection)
+}
+
+// The outer schema read is only a fast path. Another compatible opener can
+// commit while this connection waits, so DDL and its stamp must be admitted
+// again under the actual SQLite writer reservation.
+fn migrate_reserved(connection: &mut Connection) -> Result<()> {
     // SQLite cannot alter a CHECK constraint. Rebuild its parent table with
     // foreign keys temporarily disabled outside the transaction, preserving
     // every child row and checking the complete graph before commit.
     connection.pragma_update(None, "foreign_keys", false)?;
     let result = (|| -> Result<()> {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: u32 =
+            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if current > CURRENT_SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedSchema {
+                found: current,
+                supported: CURRENT_SCHEMA_VERSION,
+            });
+        }
+        if current == CURRENT_SCHEMA_VERSION {
+            transaction.commit()?;
+            return Ok(());
+        }
         if current < 1 {
             migrate_to_v1(&transaction)?;
         }
@@ -3446,6 +3730,83 @@ fn migrate(connection: &mut Connection) -> Result<()> {
                  ALTER TABLE cards_v13 RENAME TO cards;
                  CREATE INDEX cards_workspace_order_idx ON cards(workspace_id, ordinal);",
             )?;
+        }
+        if current < 14 {
+            transaction.execute_batch(
+                "ALTER TABLE cards ADD COLUMN retired INTEGER NOT NULL DEFAULT 0 CHECK(retired IN (0, 1));
+                 UPDATE cards SET retired = 1 WHERE CASE WHEN json_valid(existence_json) THEN json_type(existence_json, '$.closed') IS NOT NULL ELSE 1 END;
+                 CREATE TABLE closed_cards (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    card_id TEXT UNIQUE NOT NULL,
+                    workspace_id TEXT NOT NULL,
+                    closed_at_unix_ms INTEGER NOT NULL
+                 ) STRICT;
+                 INSERT INTO closed_cards(card_id, workspace_id, closed_at_unix_ms) SELECT card_id, workspace_id, COALESCE(CASE WHEN json_valid(existence_json) THEN CASE WHEN typeof(json_extract(existence_json, '$.closed.tombstone.closed_at_unix_ms')) = 'integer' THEN json_extract(existence_json, '$.closed.tombstone.closed_at_unix_ms') END END, updated_at_unix_ms) FROM cards WHERE retired = 1;
+                 CREATE TABLE closed_terminal_claims (
+                    card_id TEXT PRIMARY KEY NOT NULL REFERENCES closed_cards(card_id),
+                    claims_json TEXT NOT NULL,
+                    unknown INTEGER NOT NULL DEFAULT 0 CHECK(unknown IN (0, 1))
+                 ) STRICT;
+                 CREATE INDEX closed_terminal_claims_unknown_idx ON closed_terminal_claims(card_id) WHERE unknown = 1;
+                 CREATE TABLE closed_terminal_claim_keys (
+                    card_id TEXT NOT NULL REFERENCES closed_cards(card_id),
+                    ordinal INTEGER NOT NULL CHECK(ordinal IN (0, 1)),
+                    terminal_id TEXT NOT NULL,
+                    lineage_root TEXT,
+                    claim_json TEXT NOT NULL,
+                    PRIMARY KEY(card_id, ordinal)
+                 ) STRICT;
+                 CREATE INDEX closed_terminal_claim_keys_id ON closed_terminal_claim_keys(terminal_id);
+                 CREATE INDEX closed_terminal_claim_keys_root ON closed_terminal_claim_keys(lineage_root) WHERE lineage_root IS NOT NULL;
+                 CREATE TABLE closed_card_archives (
+                    card_id TEXT PRIMARY KEY NOT NULL,
+                    workspace_id TEXT NOT NULL,
+                    kind_tag TEXT NOT NULL,
+                    terminal_id TEXT,
+                    owns_terminal INTEGER NOT NULL CHECK(owns_terminal IN (0, 1)),
+                    card_json TEXT NOT NULL,
+                    content_json TEXT NOT NULL,
+                    closed_at_unix_ms INTEGER NOT NULL
+                 ) STRICT;
+                 CREATE INDEX closed_card_archives_terminal_idx ON closed_card_archives(terminal_id) WHERE owns_terminal = 1;
+                 CREATE INDEX cards_active_workspace_order_idx ON cards(workspace_id, ordinal) WHERE retired = 0;
+                 CREATE INDEX cards_retired_age_idx ON cards(updated_at_unix_ms, card_id) WHERE retired = 1;",
+            )?;
+        }
+        if current < 14 {
+            // Legacy existence is arbitrary TEXT. Quarantine unreadable rows
+            // without parsing them, preserve forensic bytes and narrow IDs,
+            // and pause automatic resource adoption when attribution is lost.
+            let damaged = transaction
+                .prepare(
+                    "SELECT card_id, kind_tag FROM cards WHERE NOT json_valid(existence_json)",
+                )?
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for (id, kind) in damaged {
+                tracing::warn!(card = %id, %kind, "quarantined unreadable legacy card existence; original bytes retained");
+                if matches!(kind.as_str(), "terminal" | "chat") {
+                    closed_claims::preserve_unknown_claim(
+                        &transaction,
+                        parse_id("closed card", &id)?,
+                    )?;
+                }
+            }
+            let ids = transaction.prepare("SELECT card_id FROM cards WHERE retired = 1 AND kind_tag IN ('terminal', 'chat')")?
+                .query_map([], |row| row.get::<_, String>(0))?.collect::<std::result::Result<Vec<_>, _>>()?;
+            for id in ids {
+                if let Err(error) =
+                    closed_claims::save_claims(&transaction, parse_id("closed card", &id)?)
+                {
+                    tracing::warn!(%error, "could not recover closed resource claim; automatic terminal adoption paused");
+                    closed_claims::preserve_unknown_claim(
+                        &transaction,
+                        parse_id("closed card", &id)?,
+                    )?;
+                }
+            }
         }
         let violation = transaction
             .prepare("PRAGMA foreign_key_check")?
@@ -3670,7 +4031,8 @@ fn reconcile_startup(connection: &mut Connection, boot_id: &BootId) -> Result<Re
     if dirty_shutdown || boot_changed {
         let terminal_rows = {
             let mut statement = transaction.prepare(
-                "SELECT terminal_id, recipe_json, continuity_json FROM terminal_recipes",
+                "SELECT t.terminal_id, t.recipe_json, t.continuity_json FROM terminal_recipes t
+                 JOIN cards c ON c.card_id = t.card_id WHERE c.retired = 0",
             )?;
             statement
                 .query_map([], |row| {
@@ -3751,7 +4113,7 @@ fn reconcile_startup(connection: &mut Connection, boot_id: &BootId) -> Result<Re
 const SELECT_WORKSPACE_GENERATION: &str =
     "SELECT generation FROM workspaces WHERE workspace_id = ?1";
 const SELECT_WORKSPACE_CARD_GENERATIONS: &str =
-    "SELECT card_id, generation FROM cards WHERE workspace_id = ?1";
+    "SELECT card_id, generation FROM cards WHERE workspace_id = ?1 AND retired = 0";
 const SELECT_WORKSPACE_EXISTENCE: &str =
     "SELECT existence_json FROM workspaces WHERE workspace_id = ?1";
 const SELECT_PROJECT_GENERATION: &str = "SELECT generation FROM projects WHERE project_id = ?1";
@@ -3770,7 +4132,10 @@ const UPSERT_WORKSPACE: &str = "INSERT INTO workspaces (
         schema_version = excluded.schema_version,
         existence_json = excluded.existence_json,
         focused_card_id = excluded.focused_card_id,
-        updated_at_unix_ms = excluded.updated_at_unix_ms";
+        updated_at_unix_ms = excluded.updated_at_unix_ms
+     WHERE workspaces.schema_version IS NOT excluded.schema_version
+        OR workspaces.existence_json IS NOT excluded.existence_json
+        OR workspaces.focused_card_id IS NOT excluded.focused_card_id";
 
 const UPSERT_CARD: &str = "INSERT INTO cards (
         card_id, workspace_id, ordinal, generation, title, width_fraction, existence_json,
@@ -3890,7 +4255,8 @@ fn save_workspace_transaction(
         })
         .map(|id| id.to_string());
 
-    transaction
+    let changes_before = transaction.total_changes();
+    let workspace_changed = transaction
         .prepare_cached(UPSERT_WORKSPACE)?
         .execute(params![
             workspace_id,
@@ -3903,37 +4269,37 @@ fn save_workspace_transaction(
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:active_worktree"),
-        &to_json(&state.active_worktree)?,
+        &to_metadata_json(&state.active_worktree)?,
     )?;
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:worktree_focus"),
-        &to_json(&state.worktree_focus)?,
+        &to_metadata_json(&state.worktree_focus)?,
     )?;
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:project_order"),
-        &to_json(&state.project_order)?,
+        &to_metadata_json(&state.project_order)?,
     )?;
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:{CHANNELS_FIELD}"),
-        &to_json(&state.channels)?,
+        &to_metadata_json(&state.channels)?,
     )?;
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:{ACTIVE_CHANNEL_FIELD}"),
-        &to_json(&state.active_channel)?,
+        &to_metadata_json(&state.active_channel)?,
     )?;
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:card_scopes"),
-        &to_json(&state.card_scopes)?,
+        &to_metadata_json(&state.card_scopes)?,
     )?;
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:workspace_history"),
-        &to_json(&state.workspace_history)?,
+        &to_metadata_json(&state.workspace_history)?,
     )?;
     set_metadata(
         transaction,
@@ -3943,7 +4309,7 @@ fn save_workspace_transaction(
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:chat_drafts"),
-        &to_json(&state.chat_drafts)?,
+        &to_metadata_json(&state.chat_drafts)?,
     )?;
     set_metadata(
         transaction,
@@ -3953,12 +4319,12 @@ fn save_workspace_transaction(
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:repository_navigation"),
-        &to_json(&state.repository_navigation)?,
+        &to_metadata_json(&state.repository_navigation)?,
     )?;
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:workspace_model_identity"),
-        &to_json(&state.workspace_model_identity)?,
+        &to_metadata_json(&state.workspace_model_identity)?,
     )?;
 
     let pending = state
@@ -3980,12 +4346,17 @@ fn save_workspace_transaction(
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:local_only_cards"),
-        &to_json(&state.local_only_cards)?,
+        &to_json(&state.local_only_cards.iter().collect::<BTreeSet<_>>())?,
     )?;
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:pending_terminal_creations"),
-        &to_json(&state.pending_terminal_creations)?,
+        &to_json(
+            &state
+                .pending_terminal_creations
+                .iter()
+                .collect::<BTreeSet<_>>(),
+        )?,
     )?;
 
     let existing = existing_cards(transaction, &workspace_id)?;
@@ -3995,10 +4366,22 @@ fn save_workspace_transaction(
         .map(|card| card.id)
         .collect::<BTreeSet<_>>();
     let mut card_generations = BTreeMap::new();
+    refused_closures.retain(|id, _| incoming_ids.contains(id));
 
     for (ordinal, card) in state.cards.iter().enumerate() {
-        let expected = base.cards.get(&card.id).copied().unwrap_or(0);
-        let stored = existing.get(&card.id);
+        let historical = if !card.existence.is_open() && !existing.contains_key(&card.id) {
+            existing_card(transaction, card.id)?
+        } else {
+            None
+        };
+        let stored = existing.get(&card.id).or(historical.as_ref());
+        let expected = base.cards.get(&card.id).copied().unwrap_or_else(|| {
+            if matches!(card.existence, Existence::Closed { .. }) {
+                historical.as_ref().map_or(0, |stored| stored.generation)
+            } else {
+                0
+            }
+        });
         let generation = if card.existence.is_open() {
             save_card(
                 transaction,
@@ -4022,6 +4405,13 @@ fn save_workspace_transaction(
             )
         }
         .map_err(|error| error.in_card(card.id))?;
+        if matches!(card.existence, Existence::Closed { .. }) {
+            let closed_at = match &card.existence {
+                Existence::Closed { tombstone } => tombstone.closed_at_unix_ms,
+                _ => unreachable!(),
+            };
+            retire_card(transaction, card.id, &workspace_id, closed_at)?;
+        }
         card_generations.insert(card.id, generation);
     }
 
@@ -4037,11 +4427,25 @@ fn save_workspace_transaction(
             },
         };
         let generation = tombstone_card(transaction, *card_id, stored, &tombstone, timestamp)?;
+        retire_card(transaction, *card_id, &workspace_id, timestamp)?;
         card_generations.insert(*card_id, generation);
     }
 
+    let changed = transaction.total_changes() != changes_before;
+    if changed && workspace_changed == 0 {
+        transaction.execute(
+            "UPDATE workspaces SET generation = ?1, updated_at_unix_ms = ?2
+             WHERE workspace_id = ?3",
+            params![
+                u64_to_i64(next, "workspace generation")?,
+                timestamp,
+                workspace_id
+            ],
+        )?;
+    }
+
     Ok(WorkspaceCommit {
-        generation: next,
+        generation: if changed { next } else { base.workspace },
         card_generations,
     })
 }
@@ -4059,6 +4463,18 @@ fn save_card(
 ) -> Result<u64> {
     let kind = card_kind(&card.kind);
     let card_id = card.id.to_string();
+
+    if card.existence.is_open()
+        && transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM closed_cards WHERE card_id = ?1)",
+            [&card_id],
+            |row| row.get::<_, bool>(0),
+        )?
+    {
+        return Err(StoreError::InvalidState(format!(
+            "tombstoned card {card_id} cannot be resurrected"
+        )));
+    }
 
     if stored.is_none() {
         // Only a card this workspace has never owned can collide with a row
@@ -4102,15 +4518,6 @@ fn save_card(
             actual: 0,
         });
     }
-    if let CardKind::Chat(session) = &card.kind {
-        validate_chat_identity(
-            transaction,
-            card.id,
-            session,
-            stored.map(|stored| stored.kind),
-        )?;
-    }
-
     let write = CardWrite::build(workspace_id, &card_id, ordinal, card, kind)?;
     if stored.is_some_and(|stored| stored.content_hash == Some(write.content_hash)) {
         // Every value this write would bind, apart from `generation` and
@@ -4119,6 +4526,15 @@ fn save_card(
         // rows untouched is not an approximation of the write — it is the
         // write, with zero dirtied pages and zero WAL frames.
         return Ok(expected);
+    }
+
+    if let CardKind::Chat(session) = &card.kind {
+        validate_chat_identity(
+            transaction,
+            card.id,
+            session,
+            stored.map(|stored| stored.kind),
+        )?;
     }
 
     let card_generation = next_generation(expected, "card", card.id)?;
@@ -4163,6 +4579,17 @@ fn save_closed_card(
     timestamp: i64,
     refused_closures: &mut RefusedClosures,
 ) -> Result<u64> {
+    if stored.is_none()
+        && transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM closed_cards WHERE card_id = ?1)",
+            [card.id.to_string()],
+            |row| row.get::<_, bool>(0),
+        )?
+    {
+        // A queued snapshot may outlive history compaction. Its guard already
+        // landed; recreating the heavy row adds no durability or resume data.
+        return Ok(0);
+    }
     if let Some(stored) = stored
         && stored.kind == PersistedCardKind::Terminal
         && transaction.query_row(
@@ -5112,13 +5539,61 @@ struct ExistingCard {
     content_hash: Option<i64>,
 }
 
+/// A close is committed before its owner drops the heavy card descriptor.
+/// Guards outlive history compaction and refuse old snapshots in every window.
+fn retire_card(
+    transaction: &Transaction<'_>,
+    id: CardId,
+    workspace: &str,
+    timestamp: i64,
+) -> Result<()> {
+    // Even an ignored AUTOINCREMENT insert can dirty sqlite_sequence. Avoid
+    // executing it for an existing guard so a quiet flush writes zero pages.
+    if transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM closed_cards WHERE card_id = ?1)",
+        [id.to_string()],
+        |row| row.get::<_, bool>(0),
+    )? {
+        return Ok(());
+    }
+    let newly_closed = transaction.execute(
+        "INSERT INTO closed_cards(card_id, workspace_id, closed_at_unix_ms) VALUES (?1, ?2, ?3)
+         ON CONFLICT(card_id) DO NOTHING",
+        params![id.to_string(), workspace, timestamp],
+    )?;
+    transaction.execute(
+        "UPDATE cards SET retired = 1 WHERE card_id = ?1 AND retired = 0",
+        [id.to_string()],
+    )?;
+    if newly_closed > 0 {
+        if let Err(error) = closed_claims::save_claims(transaction, id) {
+            tracing::warn!(%error, card = %id, "closed resource attribution unreadable; saved tombstone and paused automatic terminal adoption");
+            closed_claims::preserve_unknown_claim(transaction, id)?;
+        }
+    }
+    Ok(())
+}
+
+fn existing_card(transaction: &Transaction<'_>, id: CardId) -> Result<Option<ExistingCard>> {
+    transaction.query_row(
+        "SELECT kind_tag, existence_json, generation, content_hash FROM cards WHERE card_id = ?1",
+        [id.to_string()],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?, row.get::<_, Option<i64>>(3)?)),
+    ).optional()?.map(|(kind, existence, generation, content_hash)| Ok(ExistingCard {
+        kind: PersistedCardKind::parse(&kind)?,
+        existence: from_json("card existence", &existence)?,
+        generation: i64_to_u64(generation, "card generation")?,
+        content_hash,
+    })).transpose()
+}
+
 fn existing_cards(
     transaction: &Transaction<'_>,
     workspace_id: &str,
 ) -> Result<BTreeMap<CardId, ExistingCard>> {
     let mut statement = transaction.prepare_cached(
         "SELECT card_id, kind_tag, existence_json, generation, content_hash
-         FROM cards WHERE workspace_id = ?1",
+         FROM cards WHERE workspace_id = ?1 AND retired = 0",
     )?;
     let rows = statement.query_map([workspace_id], |row| {
         Ok((
@@ -5203,7 +5678,7 @@ fn load_workspace_manifest_connection(
 
     let mut statement = connection.prepare(
         "SELECT card_id, generation, ordinal, title, width_fraction, existence_json, kind_tag
-         FROM cards WHERE workspace_id = ?1 ORDER BY ordinal, card_id",
+         FROM cards WHERE workspace_id = ?1 AND retired = 0 ORDER BY ordinal, card_id",
     )?;
     let rows = statement.query_map([id.to_string()], |row| {
         Ok((
@@ -5386,7 +5861,16 @@ fn load_card_connection(
         )
         .optional()?;
     let Some((generation, title, width, existence, kind, content)) = row else {
-        return Ok(None);
+        let archived: Option<String> = connection
+            .query_row(
+                "SELECT card_json FROM closed_card_archives WHERE card_id = ?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        return archived
+            .map(|json| from_json("closed card archive", &json))
+            .transpose();
     };
     let kind = match PersistedCardKind::parse(&kind)? {
         PersistedCardKind::Terminal
@@ -5760,10 +6244,19 @@ fn set_metadata(transaction: &Transaction<'_>, key: &str, value: &str) -> Result
     transaction
         .prepare_cached(
             "INSERT INTO metadata (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value
+             WHERE metadata.value IS NOT excluded.value",
         )?
         .execute(params![key, value])?;
     Ok(())
+}
+
+// Navigation maps reconstruct with fresh HashMap seeds at restore. Canonical
+// object order makes an identical logical snapshot an actual zero-write save.
+fn to_metadata_json(value: &impl Serialize) -> Result<String> {
+    let mut value = serde_json::to_value(value)?;
+    value.sort_all_objects();
+    to_json(&value)
 }
 
 fn to_json(value: &impl Serialize) -> Result<String> {
@@ -5840,6 +6333,38 @@ mod tests {
         BrowserId, BrowserSession, CardState, HostIncarnation, HostSessionId, LaunchRecipe,
         TerminalSession,
     };
+
+    // A historical fixture uses today's writer only while populating open
+    // cards. Remove these temporary retirement fields before exercising the
+    // actual old-schema migration, rather than stamping a v12 table as old.
+    fn add_legacy_writer_retirement_fields(connection: &Connection) {
+        connection.execute_batch("ALTER TABLE cards ADD COLUMN retired INTEGER NOT NULL DEFAULT 0 CHECK(retired IN (0,1));
+            CREATE TABLE closed_cards(card_id TEXT PRIMARY KEY NOT NULL);").unwrap();
+    }
+
+    fn remove_legacy_writer_retirement_fields(connection: &Connection) {
+        let closed: i64 = connection
+            .query_row("SELECT count(*) FROM closed_cards", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            closed, 0,
+            "these legacy fixture builders contain only open cards"
+        );
+        connection
+            .execute_batch("DROP TABLE closed_cards; ALTER TABLE cards DROP COLUMN retired;")
+            .unwrap();
+    }
+
+    fn remove_v12_fixture_schema(connection: &Connection) {
+        connection
+            .execute_batch(
+                "DROP INDEX cards_active_workspace_order_idx;
+            DROP INDEX cards_retired_age_idx; DROP TABLE closed_card_archives;
+            DROP TABLE closed_terminal_claim_keys; DROP TABLE closed_terminal_claims; DROP TABLE closed_cards;
+            ALTER TABLE cards DROP COLUMN retired;",
+            )
+            .unwrap();
+    }
 
     fn boot(value: &str) -> BootId {
         BootId::new(value)
@@ -6201,17 +6726,17 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_v11_layout_migration_is_format_only_and_preserves_rows() {
+    fn synthetic_v11_layout_migration_preserves_rows_through_retirement() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("state.sqlite3");
         write_retained_ui_fixture(&path);
         let mut connection = Connection::open(&path).unwrap();
         configure_connection(&connection, DEFAULT_BUSY_TIMEOUT).unwrap();
-        // Synthetic layout test only. Exported before/after compatibility
-        // fixtures above always use actual normal-writer schema admission.
+        // Synthetic layout test only. Restore the pre-retirement column/table
+        // layout instead of stamping today's v14 schema as a v11 database.
+        remove_v12_fixture_schema(&connection);
         connection.pragma_update(None, "user_version", 11).unwrap();
         let before = logical_ui_rows(&connection);
-        let schema = connection.query_row("SELECT group_concat(sql, char(10)) FROM (SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name)", [], |row| row.get::<_, String>(0)).unwrap();
         migrate(&mut connection).unwrap();
         assert_eq!(
             connection
@@ -6219,8 +6744,39 @@ mod tests {
                 .unwrap(),
             CURRENT_SCHEMA_VERSION
         );
-        assert_eq!(logical_ui_rows(&connection), before);
-        assert_eq!(connection.query_row("SELECT group_concat(sql, char(10)) FROM (SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name)", [], |row| row.get::<_, String>(0)).unwrap(), schema);
+        let mut after = logical_ui_rows(&connection);
+        for table in [
+            "closed_cards",
+            "closed_terminal_claims",
+            "closed_terminal_claim_keys",
+            "closed_card_archives",
+        ] {
+            assert!(
+                after.remove(table).unwrap().is_empty(),
+                "open fixture must not invent closure evidence"
+            );
+        }
+        for row in after.get_mut("cards").unwrap() {
+            assert_eq!(
+                row.pop().as_deref(),
+                Some("Integer(0)"),
+                "only the new open residency flag is added"
+            );
+        }
+        assert_eq!(
+            after, before,
+            "all existing payload/navigation/proof rows remain byte-exact"
+        );
+        assert!(
+            !connection
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query([])
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -9529,6 +10085,7 @@ mod tests {
         lane.save(&store, &workspace).unwrap();
         drop(store);
         let connection = Connection::open(&database).unwrap();
+        remove_v12_fixture_schema(&connection);
         connection
             .execute_batch(
                 "ALTER TABLE terminal_recipes DROP COLUMN owned_codex_listener;
@@ -9835,6 +10392,7 @@ mod tests {
             fidelity: BrowserRestoreFidelity::HistoryAndScroll,
         });
         workspace.cards.push(browser.clone());
+        add_legacy_writer_retirement_fields(&transaction);
         let commit = save_workspace_transaction(
             &transaction,
             &workspace,
@@ -9845,6 +10403,7 @@ mod tests {
             &mut RefusedClosures::new(),
         )
         .unwrap();
+        remove_legacy_writer_retirement_fields(&transaction);
         transaction.pragma_update(None, "user_version", 3).unwrap();
         transaction
             .execute_batch(
@@ -9920,6 +10479,7 @@ mod tests {
             fidelity: BrowserRestoreFidelity::HistoryAndScroll,
         });
         workspace.cards.push(browser.clone());
+        add_legacy_writer_retirement_fields(&transaction);
         let commit = save_workspace_transaction(
             &transaction,
             &workspace,
@@ -9939,6 +10499,7 @@ mod tests {
                 )
                 .is_err()
         );
+        remove_legacy_writer_retirement_fields(&transaction);
         transaction.pragma_update(None, "user_version", 5).unwrap();
         transaction
             .execute_batch(
@@ -10076,6 +10637,7 @@ mod tests {
         store.save_project(&project).unwrap();
         drop(store);
         let connection = Connection::open(&path).unwrap();
+        remove_v12_fixture_schema(&connection);
         connection
             .execute_batch(
                 "ALTER TABLE projects DROP COLUMN kind_json;
@@ -10205,6 +10767,295 @@ mod tests {
             StateStore::open(linked.join("state.sqlite3"), boot("boot-directory-link")),
             Err(StoreError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied
         ));
+    }
+
+    #[test]
+    fn v11_corrupt_cold_workspace_existence_is_quarantined_without_blocking_healthy_restore() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let boot_id = boot("legacy-corrupt-existence");
+        let store = StateStore::open(&path, boot_id.clone()).unwrap();
+        let damaged = workspace_with_terminal(&boot_id);
+        let healthy = workspace_with_terminal(&boot_id);
+        SaveLane::default().save(&store, &damaged).unwrap();
+        SaveLane::default().save(&store, &healthy).unwrap();
+        store.shutdown().unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP INDEX cards_active_workspace_order_idx;
+            DROP INDEX cards_retired_age_idx;
+            DROP TABLE closed_card_archives;
+            DROP TABLE closed_terminal_claim_keys; DROP TABLE closed_terminal_claims;
+            DROP TABLE closed_cards;
+            ALTER TABLE cards DROP COLUMN retired;
+            PRAGMA user_version = 11;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE cards SET existence_json = '{malformed' WHERE card_id = ?1",
+                [damaged.cards[0].id.to_string()],
+            )
+            .unwrap();
+        drop(connection);
+        let migrated = StateStore::open(&path, boot_id).unwrap();
+        assert_eq!(migrated.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        let restored = migrated.load_workspace(healthy.id, None).unwrap().unwrap();
+        assert_eq!(restored.cards.len(), 1);
+        assert_eq!(restored.cards[0].id, healthy.cards[0].id);
+        assert!(migrated.card_was_closed(damaged.cards[0].id));
+        assert!(migrated.has_unknown_closed_claims());
+        assert!(
+            migrated
+                .load_workspace(damaged.id, None)
+                .unwrap()
+                .unwrap()
+                .cards
+                .is_empty()
+        );
+        let raw: String = migrated
+            .lock_inner()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT existence_json FROM cards WHERE card_id = ?1",
+                [damaged.cards[0].id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw, "{malformed", "migration must preserve forensic bytes");
+        let stored = migrated.stored_generations(restored.id).unwrap();
+        let mut lane = SaveLane {
+            workspace: stored.workspace,
+            cards: stored.cards,
+        };
+        lane.save(&migrated, &restored).unwrap();
+    }
+
+    #[test]
+    fn v13_retirement_preserves_work_and_retained_payloads_and_fences_closed_cards() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("v13-retirement.sqlite3");
+        let (mut state, proof) = retained_ui_format_workspace();
+        let mut work = state.cards[0].clone();
+        work.id = CardId::new();
+        work.kind = CardKind::Work;
+        work.title = "Work board survives migration".into();
+        let mut closed = work.clone();
+        closed.id = CardId::new();
+        closed.kind = CardKind::Settings;
+        let closed_id = closed.id;
+        state.cards.extend([work, closed.clone()]);
+        let store = StateStore::open(&path, proof.boot_id.clone()).unwrap();
+        SaveLane::default().save(&store, &state).unwrap();
+        store.save_window_view("unrelated-window-view-λ").unwrap();
+        store
+            .save_dismissed_update("unrelated-update-marker")
+            .unwrap();
+        store.shutdown().unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        // Reconstruct the actual main v13 layout. Its Work CHECK and retained
+        // Claude payloads remain; only the unpublished retirement schema goes.
+        connection
+            .execute_batch(
+                "DROP INDEX cards_active_workspace_order_idx;
+            DROP INDEX cards_retired_age_idx; DROP TABLE closed_card_archives;
+            DROP TABLE closed_terminal_claim_keys; DROP TABLE closed_terminal_claims;
+            DROP TABLE closed_cards; ALTER TABLE cards DROP COLUMN retired;
+            PRAGMA user_version = 13;",
+            )
+            .unwrap();
+        let existence = Existence::Closed {
+            tombstone: Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: Some("legacy close".into()),
+            },
+        };
+        connection
+            .execute(
+                "UPDATE cards SET existence_json=?1 WHERE card_id=?2",
+                params![to_json(&existence).unwrap(), closed_id.to_string()],
+            )
+            .unwrap();
+        let retained_id = state.cards[1].id;
+        let raw: String = connection
+            .query_row(
+                "SELECT content_json FROM cards WHERE card_id=?1",
+                [retained_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(connection);
+        state.cards.pop();
+        let migrated = StateStore::open(&path, proof.boot_id.clone()).unwrap();
+        assert_eq!(migrated.schema_version().unwrap(), 14);
+        assert_retained_ui_fixture(&migrated, &state, &proof);
+        assert!(migrated.card_was_closed(closed_id));
+        let after: String = migrated
+            .lock_inner()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT content_json FROM cards WHERE card_id=?1",
+                [retained_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after, raw,
+            "retained reader boundary does not rewrite provider payloads"
+        );
+        assert_eq!(migrated.compact_closed_cards(i64::MAX).unwrap(), 1);
+        assert!(migrated.load_card(closed_id, None).unwrap().is_none());
+        assert!(
+            migrated.card_was_closed(closed_id),
+            "compact guard outlives payload"
+        );
+        let base = migrated.stored_generations(state.id).unwrap();
+        state.cards.push(closed);
+        assert!(
+            migrated
+                .save_workspace(
+                    &state,
+                    SnapshotBase {
+                        workspace: base.workspace,
+                        cards: &base.cards,
+                    }
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be resurrected")
+        );
+        migrated.shutdown().unwrap();
+        drop(migrated);
+        let reopened = StateStore::open(&path, proof.boot_id.clone()).unwrap();
+        state.cards.pop();
+        assert_retained_ui_fixture(&reopened, &state, &proof);
+        assert!(reopened.card_was_closed(closed_id));
+    }
+
+    fn retirement_v11_migration_connection(path: &Path) -> Connection {
+        let store = StateStore::open(path, boot("reservation-race")).unwrap();
+        store.shutdown().unwrap();
+        drop(store);
+        let connection = Connection::open(path).unwrap();
+        configure_connection(&connection, DEFAULT_BUSY_TIMEOUT).unwrap();
+        connection
+            .execute_batch(
+                "DROP INDEX cards_active_workspace_order_idx;
+            DROP INDEX cards_retired_age_idx; DROP TABLE closed_card_archives;
+            DROP TABLE closed_terminal_claim_keys; DROP TABLE closed_terminal_claims; DROP TABLE closed_cards;
+            ALTER TABLE cards DROP COLUMN retired; PRAGMA user_version = 11;",
+            )
+            .unwrap();
+        connection
+    }
+
+    #[test]
+    fn retirement_migration_admits_second_compatible_opener_under_writer_reservation() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let mut delayed = retirement_v11_migration_connection(&path);
+        let observed: u32 = delayed
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(observed, 11, "the delayed outer branch sees old schema");
+        let mut winner = Connection::open(&path).unwrap();
+        configure_connection(&winner, DEFAULT_BUSY_TIMEOUT).unwrap();
+        migrate(&mut winner).unwrap();
+        let changes = delayed.total_changes();
+        // The production stale outer branch now reaches its real helper after
+        // another connection committed the current DDL and stamp atomically.
+        migrate_reserved(&mut delayed).unwrap();
+        assert_eq!(
+            delayed.total_changes(),
+            changes,
+            "compatible completed migration does no writes"
+        );
+        assert_eq!(
+            delayed
+                .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            delayed
+                .pragma_query_value::<u32, _>(None, "foreign_keys", |row| row.get(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            delayed
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('cards') WHERE name='retired'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn retirement_migration_refuses_future_schema_committed_after_outer_observation() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let mut delayed = retirement_v11_migration_connection(&path);
+        let observed: u32 = delayed
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(observed, 11);
+        let winner = Connection::open(&path).unwrap();
+        winner.execute_batch("BEGIN IMMEDIATE; CREATE TABLE future_owned(value TEXT NOT NULL) STRICT;
+            INSERT INTO future_owned VALUES ('preserve future intent'); PRAGMA user_version=15; COMMIT;").unwrap();
+        let before: Vec<(String, Option<String>)> = winner
+            .prepare("SELECT name,sql FROM sqlite_master ORDER BY type,name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(matches!(
+            migrate_reserved(&mut delayed),
+            Err(StoreError::UnsupportedSchema {
+                found: 15,
+                supported: 14
+            })
+        ));
+        assert_eq!(
+            delayed
+                .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            15
+        );
+        assert_eq!(
+            delayed
+                .pragma_query_value::<u32, _>(None, "foreign_keys", |row| row.get(0))
+                .unwrap(),
+            1
+        );
+        let after: Vec<(String, Option<String>)> = delayed
+            .prepare("SELECT name,sql FROM sqlite_master ORDER BY type,name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "future schema must receive no retirement DDL"
+        );
+        assert_eq!(
+            delayed
+                .query_row("SELECT value FROM future_owned", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "preserve future intent"
+        );
     }
 
     #[test]
@@ -10437,9 +11288,12 @@ mod tests {
             .unwrap()
         };
         assert_eq!(
-            stored,
-            Some(to_json(&restored.channels).unwrap()),
-            "saving must keep writing the durable spelling an older build reads"
+            serde_json::from_str::<serde_json::Value>(
+                &stored.expect("legacy navigation key remains stored")
+            )
+            .unwrap(),
+            serde_json::to_value(&restored.channels).unwrap(),
+            "saving must retain the legacy key and complete JSON fields; object key order is not schema"
         );
         let reloaded = store.load_workspace(workspace.id, None).unwrap().unwrap();
         assert_eq!(reloaded.channels, restored.channels);
@@ -10759,10 +11613,14 @@ mod tests {
             CardKind::Terminal(replacement.clone())
         );
         assert_eq!(
-            restored.cards[1].kind,
-            CardKind::Terminal(replacement.clone())
+            restored.cards.len(),
+            1,
+            "committed closed history is not active workspace ownership"
         );
-        assert_eq!(restored.cards[1].existence, workspace.cards[1].existence);
+        let archived = store.load_card(history_card, None).unwrap().unwrap();
+        assert_eq!(archived.kind, CardKind::Terminal(replacement.clone()));
+        assert_eq!(archived.existence, workspace.cards[1].existence);
+        assert!(store.card_was_closed(history_card));
         workspace.cards[0].kind = CardKind::Terminal(replacement.clone());
         lane.save(&store, &workspace).unwrap();
         // Even after active ownership is released, an old closed snapshot
@@ -11007,6 +11865,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let (mut workspace, mut session) = agent_workspace(crate::agent::Provider::Claude);
         let card = workspace.cards[0].id;
+        let source_terminal = session.terminal.clone().expect("fixture source terminal");
         // A source terminal that is not the conversation's own is refused
         // whatever storage holds.
         session.id = TerminalId::new();
@@ -11024,6 +11883,22 @@ mod tests {
         });
         assert_eq!(refusals, 1);
         assert!(store.load_card(card, None).unwrap().is_none());
+        assert!(store.card_was_closed(card));
+        assert!(
+            store.has_unknown_closed_claims(),
+            "a card-ID guard alone cannot replace its missing resource attribution"
+        );
+        assert!(
+            store.terminal_was_closed(&source_terminal),
+            "automatic inventory must not re-adopt the discarded resource"
+        );
+        store.shutdown().unwrap();
+        drop(store);
+        let reopened =
+            StateStore::open(directory.path().join("state.sqlite3"), boot("boot")).unwrap();
+        assert!(reopened.card_was_closed(card));
+        assert!(reopened.has_unknown_closed_claims());
+        assert!(reopened.terminal_was_closed(&source_terminal));
     }
 
     #[test]
@@ -11049,7 +11924,7 @@ mod tests {
         let mut old_card = original.cards[0].clone();
         old_card.generation = resurrection.generation;
         resurrection.cards.push(old_card);
-        let error = lane.save(&store, &resurrection).unwrap_err();
+        let error = card_refusal(lane.save(&store, &resurrection), card_id);
         assert!(matches!(error, StoreError::InvalidState(_)));
     }
 
@@ -11179,6 +12054,831 @@ mod tests {
     }
 
     #[test]
+    fn closed_identity_lookup_uses_only_its_indexed_lineage_after_reopen() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let boot_id = boot("indexed-closure");
+        let store = StateStore::open(&path, boot_id.clone()).unwrap();
+        let mut state = workspace_with_terminal(&boot_id);
+        let CardKind::Terminal(source) = &mut state.cards[0].kind else {
+            unreachable!()
+        };
+        source.resume_hint = None;
+        source.launch.program = "/bin/sh".into();
+        source.launch.arguments = vec!["-c".into(), "true".into()];
+        let CardKind::Terminal(first) = state.cards[0].kind.clone() else {
+            unreachable!()
+        };
+        let mut second = state.cards[0].clone();
+        second.id = CardId::new();
+        let CardKind::Terminal(second_terminal) = &mut second.kind else {
+            unreachable!()
+        };
+        second_terminal.id = TerminalId::new();
+        let second_root = second_terminal.id;
+        state.cards.push(second);
+        for card in &mut state.cards {
+            card.existence = closed_by_user();
+        }
+        state.focused = None;
+        SaveLane::default().save(&store, &state).unwrap();
+        // An unrelated damaged historical payload cannot be a reason to scan
+        // and decode all history while opening or checking another identity.
+        store
+            .lock_inner()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE closed_terminal_claim_keys SET claim_json='{invalid' WHERE terminal_id=?1",
+                [second_root.to_string()],
+            )
+            .unwrap();
+        store.shutdown().unwrap();
+        drop(store);
+        let store = StateStore::open(&path, boot_id.clone()).unwrap();
+        let mut hosted = first.clone();
+        hosted.id = TerminalId::new();
+        hosted.recovery_origin = Some(first.id);
+        hosted.continuity = TerminalContinuity::Live {
+            host_session_id: HostSessionId::new("new"),
+            boot_id,
+            host_incarnation: HostIncarnation::new("new"),
+        };
+        assert_eq!(store.cached_closure(&ClosureQuery::terminal(&hosted)), None);
+        assert!(store.terminal_was_closed(&hosted));
+        assert!(!store.has_unknown_closed_claims());
+        hosted.launch.arguments.push("different-content".into());
+        assert_eq!(
+            store.cached_closure(&ClosureQuery::terminal(&hosted)),
+            None,
+            "an answer cannot be relabelled with another recovery recipe"
+        );
+        assert!(!store.terminal_was_closed(&hosted));
+        let inner = store.lock_inner().unwrap();
+        for (sql, index) in [
+            (
+                "EXPLAIN QUERY PLAN SELECT 1 FROM closed_terminal_claim_keys WHERE terminal_id=?1",
+                "closed_terminal_claim_keys_id",
+            ),
+            (
+                "EXPLAIN QUERY PLAN SELECT claim_json FROM closed_terminal_claim_keys WHERE lineage_root=?1",
+                "closed_terminal_claim_keys_root",
+            ),
+        ] {
+            let plans = inner
+                .connection
+                .prepare(sql)
+                .unwrap()
+                .query_map([first.id.to_string()], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(plans.iter().any(|plan| plan.contains(index)), "{plans:?}");
+        }
+        drop(inner);
+        hosted.recovery_origin = Some(second_root);
+        assert!(
+            store.terminal_was_closed(&hosted),
+            "the actually requested damaged lineage refuses"
+        );
+        assert!(store.has_unknown_closed_claims());
+        hosted.recovery_origin = Some(TerminalId::new());
+        assert!(
+            store.terminal_was_closed(&hosted),
+            "a failed canonical read cannot heal through another request"
+        );
+        let cards = [
+            ClosureQuery::Card(CardId::new()),
+            ClosureQuery::Card(CardId::new()),
+        ];
+        for query in &cards {
+            assert!(!store.resolve_closure(query.clone()).unwrap());
+        }
+        for query in &cards {
+            assert_eq!(
+                store.cached_closure(query),
+                Some(false),
+                "sticky terminal quarantine cannot evict unrelated card answers repeatedly"
+            );
+        }
+    }
+
+    #[test]
+    fn closed_identity_negative_is_withdrawn_before_commit_and_never_replayed() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::open(
+            directory.path().join("state.sqlite3"),
+            boot("closure-cache"),
+        )
+        .unwrap();
+        let mut state = workspace_with_terminal(&boot("closure-cache"));
+        let id = state.cards[0].id;
+        let query = ClosureQuery::Card(id);
+        let mut lane = SaveLane::default();
+        lane.save(&store, &state).unwrap();
+        assert!(!store.resolve_closure(query.clone()).unwrap());
+        assert_eq!(store.cached_closure(&query), Some(false));
+        {
+            let mut inner = store.lock_inner().unwrap();
+            let transaction = inner
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            transaction.execute("INSERT INTO closed_cards(card_id,workspace_id,closed_at_unix_ms) VALUES (?1,?2,1)", params![id.to_string(), state.id.to_string()]).unwrap();
+            store.prepare_closure_commit(&transaction).unwrap();
+            assert_eq!(
+                store.cached_closure(&query),
+                None,
+                "withdraw before SQLite COMMIT/fsync"
+            );
+            transaction.rollback().unwrap();
+        }
+        assert_eq!(
+            store.cached_closure(&query),
+            None,
+            "rollback is not a positive admission"
+        );
+        assert!(!store.resolve_closure(query.clone()).unwrap());
+        state.cards[0].existence = closed_by_user();
+        state.focused = None;
+        lane.save(&store, &state).unwrap();
+        assert_eq!(
+            store.cached_closure(&query),
+            None,
+            "actual close invalidates the prior worker answer"
+        );
+        assert!(store.resolve_closure(query.clone()).unwrap());
+        assert_eq!(store.cached_closure(&query), Some(true));
+    }
+
+    /// Run alone on a quiet host; normal CI must not enforce scheduler timing.
+    #[test]
+    #[ignore = "serial native performance receipt, 100 alternating warm samples"]
+    fn two_thousand_closed_cards_do_not_tax_startup_or_noop_flush() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("retirement-benchmark");
+        let paths = [
+            directory.path().join("fresh.sqlite3"),
+            directory.path().join("closed.sqlite3"),
+        ];
+        for (index, path) in paths.iter().enumerate() {
+            let store = StateStore::open(path, boot_id.clone()).unwrap();
+            let mut state = WorkspaceState::default();
+            state.cards = (0..if index == 1 { 2000 } else { 0 })
+                .map(|ordinal| {
+                    let kind = if ordinal % 2 == 0 {
+                        let mut template = workspace_with_terminal(&boot_id);
+                        let CardKind::Terminal(mut terminal) = template.cards.remove(0).kind else {
+                            unreachable!()
+                        };
+                        terminal.resume_hint = None;
+                        terminal.recovery_origin = Some(TerminalId::new());
+                        terminal.launch.program = "/bin/sh".into();
+                        terminal.launch.arguments = vec![
+                            "-c".into(),
+                            format!("printf 'retirement-{ordinal}'; exec sleep 3600"),
+                        ];
+                        terminal
+                            .launch
+                            .environment
+                            .insert("LANG".into(), "C.UTF-8".into());
+                        CardKind::Terminal(terminal)
+                    } else {
+                        let provider = if ordinal % 4 == 1 {
+                            crate::agent::Provider::Claude
+                        } else {
+                            crate::agent::Provider::Codex
+                        };
+                        let (_, mut chat) = agent_workspace(provider);
+                        let native_id = uuid::Uuid::new_v4().to_string();
+                        let terminal = chat.terminal.as_mut().unwrap();
+                        terminal.launch.arguments[1] = native_id.clone();
+                        terminal.resume_hint =
+                            crate::model::agent_recovery::hint_from_launch(&terminal.launch);
+                        terminal.continuity = TerminalContinuity::Live {
+                            host_session_id: HostSessionId::new("benchmark-host"),
+                            boot_id: boot_id.clone(),
+                            host_incarnation: HostIncarnation::new("benchmark-incarnation"),
+                        };
+                        terminal.recovery_origin = Some(TerminalId::new());
+                        chat.launch.recipe = terminal.launch.clone();
+                        chat.launch.session_id = Some(native_id);
+                        chat.proof = terminal.continuity.live_proof();
+                        CardKind::Chat(chat)
+                    };
+                    CardState {
+                        id: CardId::new(),
+                        generation: 0,
+                        title: format!("Closed pane {ordinal}"),
+                        width_fraction: 1.0,
+                        existence: closed_by_user(),
+                        exposure: Exposure::Offscreen,
+                        residency: Residency::Cold,
+                        kind,
+                    }
+                })
+                .collect();
+            SaveLane::default().save(&store, &state).unwrap();
+            let inner = store.lock_inner().unwrap();
+            let rows: i64 = inner
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM closed_terminal_claims WHERE unknown = 0",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                rows,
+                if index == 1 { 2000 } else { 0 },
+                "benchmark must include real terminal/chat claim decoding"
+            );
+            let mut claim_records = 0;
+            let mut proof_lineages = 0;
+            let mut statement = inner
+                .connection
+                .prepare("SELECT claims_json FROM closed_terminal_claims")
+                .unwrap();
+            for claims in statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+            {
+                let claims =
+                    serde_json::from_str::<Vec<serde_json::Value>>(&claims.unwrap()).unwrap();
+                proof_lineages += claims
+                    .iter()
+                    .filter(|claim| claim["proof"].is_object() && claim["content"].is_object())
+                    .count();
+                claim_records += claims.len();
+            }
+            assert_eq!(claim_records, if index == 1 { 3000 } else { 0 });
+            assert_eq!(proof_lineages, if index == 1 { 2000 } else { 0 });
+            drop(statement);
+            drop(inner);
+            store.shutdown().unwrap();
+        }
+        let mut startup = [Vec::new(), Vec::new()];
+        let mut flush = [Vec::new(), Vec::new()];
+        for round in 0..110 {
+            for offset in 0..2 {
+                let index = (round + offset) % 2;
+                let begun = std::time::Instant::now();
+                let store = StateStore::open(&paths[index], boot_id.clone()).unwrap();
+                let summary = store.list_workspaces().unwrap().remove(0);
+                let state = store.load_workspace(summary.id, None).unwrap().unwrap();
+                assert!(state.cards.is_empty());
+                let startup_ns = begun.elapsed().as_nanos() as u64;
+                let base = store.stored_generations(state.id).unwrap();
+                let changes = store.lock_inner().unwrap().connection.total_changes();
+                let begun = std::time::Instant::now();
+                let committed = store
+                    .save_workspace(
+                        &state,
+                        SnapshotBase {
+                            workspace: base.workspace,
+                            cards: &base.cards,
+                        },
+                    )
+                    .unwrap();
+                let flush_ns = begun.elapsed().as_nanos() as u64;
+                assert_eq!(committed.generation, base.workspace);
+                assert_eq!(
+                    store.lock_inner().unwrap().connection.total_changes(),
+                    changes
+                );
+                store.shutdown().unwrap();
+                if round >= 10 {
+                    startup[index].push(startup_ns);
+                    flush[index].push(flush_ns);
+                }
+            }
+        }
+        fn median(values: &mut [u64]) -> u64 {
+            values.sort_unstable();
+            values[values.len() / 2]
+        }
+        let startup = [median(&mut startup[0]), median(&mut startup[1])];
+        let flush = [median(&mut flush[0]), median(&mut flush[1])];
+        let startup_ratio = startup[1] as f64 / startup[0] as f64;
+        let flush_ratio = flush[1] as f64 / flush[0] as f64;
+        let receipt = serde_json::json!({"closed_cards":2000,"plain_terminal_cards":1000,"native_chat_cards":1000,"native_providers":["Claude","Codex"],"claim_rows":2000,"claim_records":3000,"proof_and_content_lineages":2000,"samples":100,"startup_median_ns":startup,"noop_flush_median_ns":flush,"startup_ratio":startup_ratio,"noop_flush_ratio":flush_ratio,"budget_ratio":1.10});
+        eprintln!("{receipt}");
+        if let Some(path) = std::env::var_os("CAGENTS_RETIRE_BENCH_OUTPUT") {
+            std::fs::write(path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        }
+        assert!(
+            startup_ratio <= 1.10,
+            "startup exceeded 10% history budget: {receipt}"
+        );
+        assert!(
+            flush_ratio <= 1.10,
+            "noop flush exceeded 10% history budget: {receipt}"
+        );
+    }
+
+    #[test]
+    fn unreadable_chat_can_be_tombstoned_without_blocking_other_saves() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let store = StateStore::open(&path, boot("unreadable-close")).unwrap();
+        let (mut state, session) = agent_workspace(crate::agent::Provider::Claude);
+        state.cards[0].kind = CardKind::Chat(session);
+        let id = state.cards[0].id;
+        let mut lane = SaveLane::default();
+        lane.save(&store, &state).unwrap();
+        store
+            .lock_inner()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE cards SET content_json = '{invalid' WHERE card_id = ?1",
+                [id.to_string()],
+            )
+            .unwrap();
+        let restored = store
+            .load_workspace_restored(state.id, None)
+            .unwrap()
+            .unwrap();
+        assert!(restored.state.cards.is_empty());
+        assert_eq!(restored.warnings.len(), 1);
+        lane.save(&store, &restored.state).unwrap();
+        assert!(store.card_was_closed(id));
+        assert!(store.has_unknown_closed_claims());
+        let mut healthy = restored.state.clone();
+        healthy.cards.push(CardState {
+            id: CardId::new(),
+            generation: 0,
+            title: "Healthy closed pane".into(),
+            width_fraction: 1.0,
+            existence: closed_by_user(),
+            exposure: Exposure::Offscreen,
+            residency: Residency::Cold,
+            kind: CardKind::Settings,
+        });
+        lane.save(&store, &healthy).unwrap();
+        assert_eq!(store.compact_closed_cards(i64::MAX).unwrap(), 1);
+        assert_eq!(store.compact_closed_cards(i64::MAX).unwrap(), 0);
+        let forensic: String = store
+            .lock_inner()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT content_json FROM cards WHERE card_id = ?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(forensic, "{invalid");
+        assert!(
+            store
+                .load_workspace(state.id, None)
+                .unwrap()
+                .unwrap()
+                .cards
+                .is_empty()
+        );
+        store.shutdown().unwrap();
+        drop(store);
+        let reopened = StateStore::open(&path, boot("unreadable-close")).unwrap();
+        assert!(reopened.card_was_closed(id));
+        assert!(reopened.has_unknown_closed_claims());
+    }
+
+    #[test]
+    fn a_pending_closed_snapshot_rebases_onto_an_active_only_base() {
+        let directory = tempdir().unwrap();
+        let store =
+            StateStore::open(directory.path().join("state.sqlite3"), boot("close-rebase")).unwrap();
+        let mut state = workspace_with_terminal(&boot("close-rebase"));
+        let mut lane = SaveLane::default();
+        lane.save(&store, &state).unwrap();
+        state.cards[0].existence = closed_by_user();
+        state.focused = None;
+        lane.save(&store, &state).unwrap();
+        let refreshed = store.stored_generations(state.id).unwrap();
+        assert!(refreshed.cards.is_empty());
+        let unchanged = store
+            .save_workspace(
+                &state,
+                SnapshotBase {
+                    workspace: refreshed.workspace,
+                    cards: &refreshed.cards,
+                },
+            )
+            .unwrap();
+        assert_eq!(unchanged.generation, refreshed.workspace);
+        let mut concurrent = state.clone();
+        concurrent.cards.clear();
+        concurrent.active_worktree = Some(PathBuf::from("/changed-navigation"));
+        let moved = store
+            .save_workspace(
+                &concurrent,
+                SnapshotBase {
+                    workspace: refreshed.workspace,
+                    cards: &refreshed.cards,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            store.save_workspace(
+                &state,
+                SnapshotBase {
+                    workspace: refreshed.workspace,
+                    cards: &refreshed.cards
+                }
+            ),
+            Err(StoreError::StaleGeneration { .. })
+        ));
+        let rebased = store.stored_generations(state.id).unwrap();
+        assert_eq!(rebased.workspace, moved.generation);
+        store
+            .save_workspace(
+                &state,
+                SnapshotBase {
+                    workspace: rebased.workspace,
+                    cards: &rebased.cards,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn restored_navigation_is_a_zero_write_snapshot() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::open(
+            directory.path().join("state.sqlite3"),
+            boot("navigation-noop"),
+        )
+        .unwrap();
+        let mut state = workspace_with_terminal(&boot("navigation-noop"));
+        let id = state.cards[0].id;
+        state.chat_drafts.insert(id, "unsent work".into());
+        state.worktree_focus.insert(PathBuf::from("/project"), id);
+        state.local_only_cards.insert(id);
+        let mut lane = SaveLane::default();
+        lane.save(&store, &state).unwrap();
+        // Raw stored descriptors, not restore's intentional live-continuity
+        // downgrade, isolate navigation serialization in this contract.
+        let mut restored = store.load_workspace(state.id, None).unwrap().unwrap();
+        restored.cards[0].kind = state.cards[0].kind.clone();
+        let before = store.lock_inner().unwrap().connection.total_changes();
+        let generation = lane.workspace;
+        assert_eq!(lane.save(&store, &restored).unwrap().generation, generation);
+        assert_eq!(
+            store.lock_inner().unwrap().connection.total_changes(),
+            before
+        );
+    }
+
+    #[test]
+    fn compaction_is_bounded_and_never_removes_guards() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::open(
+            directory.path().join("state.sqlite3"),
+            boot("batch-compaction"),
+        )
+        .unwrap();
+        let mut state = WorkspaceState::default();
+        state.cards = (0..40)
+            .map(|_| CardState {
+                id: CardId::new(),
+                generation: 0,
+                title: "Closed".into(),
+                width_fraction: 1.0,
+                existence: closed_by_user(),
+                exposure: Exposure::Offscreen,
+                residency: Residency::Cold,
+                kind: CardKind::Settings,
+            })
+            .collect();
+        SaveLane::default().save(&store, &state).unwrap();
+        assert_eq!(store.compact_closed_cards(i64::MAX).unwrap(), 32);
+        assert_eq!(store.compact_closed_cards(i64::MAX).unwrap(), 8);
+        assert_eq!(store.compact_closed_cards(i64::MAX).unwrap(), 0);
+        let inner = store.lock_inner().unwrap();
+        assert_eq!(
+            inner
+                .connection
+                .query_row("SELECT count(*) FROM cards", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            inner
+                .connection
+                .query_row("SELECT count(*) FROM closed_cards", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            40
+        );
+    }
+
+    #[test]
+    fn unchanged_closed_chat_does_not_decode_its_stored_session() {
+        let directory = tempdir().unwrap();
+        let store =
+            StateStore::open(directory.path().join("state.sqlite3"), boot("closed-chat")).unwrap();
+        let (mut workspace, session) = agent_workspace(crate::agent::Provider::Claude);
+        workspace.cards[0].kind = CardKind::Chat(session);
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        workspace.cards[0].existence = closed_by_user();
+        workspace.focused = None;
+        lane.save(&store, &workspace).unwrap();
+        let id = workspace.cards[0].id;
+        // Deliberately poison only the stored session while keeping its old
+        // fingerprint. This is a probe of whether the unchanged save consults
+        // the payload; integrity repair is not the quiet save path's job.
+        store
+            .lock_inner()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE cards SET content_json = '{invalid' WHERE card_id = ?1",
+                [id.to_string()],
+            )
+            .unwrap();
+        let before = store.lock_inner().unwrap().connection.total_changes();
+        let wal_path = sqlite_sidecar_path(&store.path, "-wal");
+        let wal_before = fs::read(&wal_path).unwrap();
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(
+            store.lock_inner().unwrap().connection.total_changes(),
+            before
+        );
+        assert_eq!(fs::read(wal_path).unwrap(), wal_before);
+    }
+
+    #[test]
+    fn compaction_keeps_closed_conversation_resume_and_navigation() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let store = StateStore::open(&path, boot("closed-chat")).unwrap();
+        let (mut workspace, session) = agent_workspace(crate::agent::Provider::Claude);
+        let identity = session.id;
+        workspace.cards[0].kind = CardKind::Chat(session);
+        workspace.cards[0].existence = closed_by_user();
+        workspace.focused = None;
+        SaveLane::default().save(&store, &workspace).unwrap();
+        let before = store.saved_conversations().unwrap();
+        assert_eq!(before.len(), 1);
+        assert!(!before[0].open);
+        assert_eq!(store.compact_closed_cards(i64::MAX).unwrap(), 1);
+        let after = store.saved_conversations().unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].card, before[0].card);
+        assert_eq!(after[0].title, before[0].title);
+        assert_eq!(after[0].session, before[0].session);
+        assert_eq!(after[0].open, before[0].open);
+        assert_eq!(after[0].updated_at_unix_ms, before[0].updated_at_unix_ms);
+        assert!(
+            read_navigable_session_ids(&path)
+                .unwrap()
+                .contains(&identity)
+        );
+        assert!(
+            store
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .cards
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn compacted_terminal_transcripts_survive_reopen_and_pruning() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("archived-terminal.sqlite3");
+        let transcripts = directory.path().join("transcripts");
+        fs::create_dir(&transcripts).unwrap();
+        let boot_id = boot("archived-transcript");
+        let store = StateStore::open(&path, boot_id.clone()).unwrap();
+        let mut workspace = workspace_with_terminal(&boot_id);
+        let card = workspace.cards[0].id;
+        let CardKind::Terminal(terminal) = &mut workspace.cards[0].kind else {
+            unreachable!();
+        };
+        let id = terminal.id;
+        let transcript = transcripts.join(format!("{id}.log"));
+        terminal.transcript_path = Some(transcript.clone());
+        let bytes = b"original closed terminal output\n";
+        fs::write(&transcript, bytes).unwrap();
+        let original = fs::metadata(&transcript).unwrap();
+        let orphan = transcripts.join(format!("{}.log", TerminalId::new()));
+        fs::write(&orphan, b"unrelated orphan").unwrap();
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        workspace.cards[0].existence = closed_by_user();
+        workspace.focused = None;
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(store.compact_closed_cards(i64::MAX).unwrap(), 1);
+        {
+            let inner = store.lock_inner().unwrap();
+            for table in ["cards", "terminal_recipes", "transcript_metadata"] {
+                assert_eq!(
+                    inner
+                        .connection
+                        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                            .get::<_, i64>(0),)
+                        .unwrap(),
+                    0,
+                    "the transcript must be claimed by its archive alone"
+                );
+            }
+        }
+        drop(store);
+        let store = StateStore::open(&path, boot_id).unwrap();
+        let saved = store.load_card(card, None).unwrap().unwrap();
+        assert!(matches!(&saved.kind, CardKind::Terminal(terminal)
+            if terminal.id == id && terminal.transcript_path.as_ref() == Some(&transcript)));
+        let local_ids = store.live_terminal_ids().unwrap();
+        let other_window_ids = read_live_terminal_ids(&path).unwrap();
+        let report = store
+            .prune_transcripts(&transcripts, HashSet::new(), TranscriptRetention::default())
+            .unwrap();
+        assert_eq!(report.removed_orphaned, 1);
+        assert_eq!(report.removed_oversized, 0);
+        assert_eq!(report.removed_for_budget, 0);
+        assert_eq!(report.retained, 1);
+        assert!(
+            !orphan.exists(),
+            "real unrelated orphans are still reclaimed"
+        );
+        assert_eq!(fs::read(&transcript).unwrap(), bytes);
+        let after = fs::metadata(&transcript).unwrap();
+        assert_eq!((after.dev(), after.ino()), (original.dev(), original.ino()));
+        assert!(local_ids.contains(&id.to_string()));
+        assert_eq!(other_window_ids, local_ids);
+
+        // A reader of an actual pre-archive schema must not migrate it merely
+        // to collect liveness. Build that schema from its original migration.
+        let legacy_path = directory.path().join("legacy-window.sqlite3");
+        let mut legacy = Connection::open(&legacy_path).unwrap();
+        let transaction = legacy.transaction().unwrap();
+        migrate_to_v1(&transaction).unwrap();
+        transaction.pragma_update(None, "user_version", 1).unwrap();
+        transaction.commit().unwrap();
+        drop(legacy);
+        assert!(read_live_terminal_ids(&legacy_path).unwrap().is_empty());
+        let legacy =
+            Connection::open_with_flags(&legacy_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(
+            legacy
+                .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            1
+        );
+        assert!(!legacy.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'closed_card_archives')",
+            [], |row| row.get::<_, bool>(0),
+        ).unwrap());
+
+        // Damaged attribution must stop pruning before any files are removed.
+        // The compacted archive is still a claim, even without live-table rows.
+        fs::write(&orphan, b"keep when attribution is unavailable").unwrap();
+        store.lock_inner().unwrap().connection.execute(
+            "UPDATE closed_card_archives SET terminal_id = 'invalid-terminal-id' WHERE card_id = ?1",
+            [card.to_string()],
+        ).unwrap();
+        assert!(read_live_terminal_ids(&path).is_err());
+        assert!(
+            store
+                .prune_transcripts(&transcripts, HashSet::new(), TranscriptRetention::default(),)
+                .is_err()
+        );
+        assert!(orphan.exists());
+        assert_eq!(fs::read(&transcript).unwrap(), bytes);
+        let after = fs::metadata(&transcript).unwrap();
+        assert_eq!((after.dev(), after.ino()), (original.dev(), original.ino()));
+    }
+
+    #[test]
+    fn committed_close_leaves_active_workspace_but_keeps_resume_and_guard() {
+        let directory = tempdir().unwrap();
+        let store =
+            StateStore::open(directory.path().join("state.sqlite3"), boot("retirement")).unwrap();
+        let mut workspace = workspace_with_terminal(&boot("retirement"));
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let id = workspace.cards[0].id;
+        workspace.cards[0].existence = Existence::Closed {
+            tombstone: Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: Some("closed by user".into()),
+            },
+        };
+        workspace.focused = None;
+        lane.save(&store, &workspace).unwrap();
+        assert!(
+            store
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .cards
+                .is_empty()
+        );
+        assert!(
+            store
+                .stored_generations(workspace.id)
+                .unwrap()
+                .cards
+                .is_empty()
+        );
+        let archived = closed_terminal_source(&store.lock_inner().unwrap().connection, id)
+            .unwrap()
+            .unwrap();
+        let CardKind::Terminal(claimed) = &archived.kind else {
+            unreachable!()
+        };
+        assert!(store.card_was_closed(id));
+        assert!(store.terminal_was_closed(claimed));
+        assert_eq!(store.compact_closed_cards(i64::MAX).unwrap(), 1);
+        assert_eq!(store.compact_closed_cards(i64::MAX).unwrap(), 0);
+        assert_eq!(store.load_card(id, None).unwrap().unwrap(), archived);
+        assert_eq!(
+            store
+                .lock_inner()
+                .unwrap()
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM cards WHERE card_id = ?1",
+                    [id.to_string()],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .lock_inner()
+                .unwrap()
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM closed_cards WHERE card_id = ?1",
+                    [id.to_string()],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        let mut canonical = archived.clone();
+        canonical.id = CardId::new();
+        canonical.generation = 0;
+        canonical.existence = Existence::Open;
+        let CardKind::Terminal(session) = &canonical.kind else {
+            unreachable!()
+        };
+        let terminal = session.id;
+        let canonical_id = canonical.id;
+        workspace.cards = vec![canonical];
+        workspace.focused = Some(canonical_id);
+        let adoption = store
+            .closed_terminal_pane_adoption(&workspace, canonical_id, terminal)
+            .unwrap()
+            .unwrap();
+        assert_eq!(adoption.alias, id);
+        let commit = store
+            .save_workspace_with_terminal_adoptions(
+                &workspace,
+                SnapshotBase {
+                    workspace: lane.workspace,
+                    cards: &lane.cards,
+                },
+                &[adoption],
+            )
+            .unwrap();
+        assert!(
+            store
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .cards
+                .iter()
+                .any(|card| card.id == canonical_id)
+        );
+        let mut resurrection = archived;
+        resurrection.existence = Existence::Open;
+        workspace.cards.push(resurrection);
+        assert!(
+            store
+                .save_workspace(
+                    &workspace,
+                    SnapshotBase {
+                        workspace: commit.generation,
+                        cards: &commit.card_generations
+                    }
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be resurrected")
+        );
+    }
+
+    #[test]
     fn wal_is_paired_with_normal_synchronous() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("state.sqlite3");
@@ -11235,9 +12935,19 @@ mod tests {
         assert!(quiet_after_first.2.is_some());
 
         // A snapshot that changes nothing must not rewrite a single card row,
-        // even though the workspace generation advances.
+        // or workspace generation.
+        let before = store.lock_inner().unwrap().connection.total_changes();
+        let wal_before = fs::read(sqlite_sidecar_path(&path, "-wal")).unwrap();
         let commit = lane.save(&store, &workspace).unwrap();
-        assert_eq!(commit.generation, 2);
+        assert_eq!(
+            fs::read(sqlite_sidecar_path(&path, "-wal")).unwrap(),
+            wal_before
+        );
+        assert_eq!(commit.generation, 1);
+        assert_eq!(
+            store.lock_inner().unwrap().connection.total_changes(),
+            before
+        );
         assert_eq!(commit.card_generations[&quiet_id], 1);
         assert_eq!(commit.card_generations[&busy_id], 1);
         assert_eq!(stored_card_row(&store, quiet_id), quiet_after_first);
