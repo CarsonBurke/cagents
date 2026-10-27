@@ -4380,6 +4380,231 @@ mod tests {
         )));
     }
 
+    #[tokio::test]
+    async fn canonical_peer_updates_retain_real_pending_reload_until_explicit_resolution() {
+        use crate::repository_widget::{EditorAction, EditorEdit};
+        use cosmic::iced::{self, futures::StreamExt};
+
+        // Drain the real file worker and reducer follow-ups, as the repository
+        // live tests do. Never manufacture a FileLoaded completion or root.
+        async fn settle(runtime: &mut RepositoryRuntime, task: iced::Task<RepositoryAction>) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut tasks = vec![task];
+                while let Some(task) = tasks.pop() {
+                    if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                        while let Some(action) = stream.next().await {
+                            if let iced::runtime::Action::Output(action) = action {
+                                tasks.push(runtime.update(action));
+                            }
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("real repository read did not settle within five seconds");
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("live.txt");
+        std::fs::write(&path, "original disk text\n").unwrap();
+        std::fs::write(directory.path().join("peer.txt"), "peer disk text\n").unwrap();
+        let (mut app, channel, _, mut pane) = fixture();
+        let project = app
+            .durable
+            .channels
+            .iter()
+            .find(|row| row.id == channel)
+            .unwrap()
+            .project_id;
+        let descriptor = crate::model::RepositoryView {
+            project,
+            repository: directory.path().into(),
+            worktree: directory.path().into(),
+            selected_file: Some("live.txt".into()),
+        };
+        pane.kind = CardKind::Repository(descriptor.clone());
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .retain(|row| row.id == channel);
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "real file retention".into(),
+            descriptor.repository.clone(),
+            vec![crate::sidebar::SidebarWorktree::from_durable(
+                crate::model::WorktreeId::new(),
+                descriptor.worktree.clone(),
+                Some("main".into()),
+            )],
+            Vec::new(),
+        ));
+        app.known_worktree_roots.insert(descriptor.worktree.clone());
+        let mut view = View::empty(channel);
+        view.panes.push(pane.clone());
+        app.workspace_model.views = vec![view];
+        app.workspace_model.projects = vec![crate::workspace_model::ModelProject {
+            repository: descriptor.repository.clone(),
+            name: "real file retention".into(),
+            kind: Default::default(),
+            ordinal: 1,
+        }];
+        app.workspace_model.channels = vec![crate::workspace_model::ModelChannel {
+            id: channel,
+            repository: descriptor.repository.clone(),
+            title: "view".into(),
+            title_source: Default::default(),
+            ordinal: 1,
+        }];
+        drop(app.reconcile_shared_views());
+        drop(app.select_channel(channel));
+        assert!(app.workspace.card(pane.id).is_some());
+        // Replace the unpolled attachment with a genuinely opened runtime,
+        // retaining the production shell projection and canonical read path.
+        let mut runtime = RepositoryRuntime::new_directory(descriptor.clone());
+        let initial = runtime.initial_load(pane.id);
+        settle(&mut runtime, initial).await;
+        assert_eq!(
+            runtime.editor_text().as_deref(),
+            Some("original disk text\n")
+        );
+        let root = runtime
+            .retained_editor_root()
+            .expect("actual read owns its root");
+        assert_eq!(root.path(), directory.path());
+        let subscription_count = |runtime: &RepositoryRuntime| {
+            iced::advanced::subscription::into_recipes(runtime.document_subscription(pane.id)).len()
+        };
+        assert_eq!(subscription_count(&runtime), 1);
+        for action in [
+            EditorAction::SelectAll,
+            EditorAction::Edit(EditorEdit::Paste(Arc::new("my unsaved edits\n".into()))),
+        ] {
+            let task = runtime.update(RepositoryAction::EditorAction {
+                card: pane.id,
+                action,
+            });
+            settle(&mut runtime, task).await;
+        }
+        let original_text = runtime.editor_text().unwrap();
+        assert_eq!(original_text, "my unsaved edits\n");
+        assert!(runtime.is_dirty() && runtime.blocks_navigation());
+        app.cards
+            .insert(pane.id, CardRuntime::Repository(Box::new(runtime)));
+        app.status = None;
+        app.notices.clear();
+
+        // Removing the actual file makes the proposed Reload fail. Keeping its
+        // task unpolled fixes the interleaving without a sleep or fake callback.
+        std::fs::remove_file(&path).unwrap();
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&pane.id) else {
+            unreachable!()
+        };
+        let identity = &**runtime as *const RepositoryRuntime;
+        let reload = runtime.update(RepositoryAction::Reload { card: pane.id });
+        assert!(runtime.retains_reload_buffer() && runtime.blocks_navigation());
+        assert!(runtime.is_dirty());
+        assert_eq!(
+            runtime.editor_text(),
+            None,
+            "Loading keeps its predecessor private"
+        );
+
+        // Exercise both canonical descriptor replacement and peer removal,
+        // rather than calling the retention helper directly. Each distinct
+        // incident reports once; repeated reads preserve the user's dismissal.
+        for replacement in [true, false] {
+            let view = app
+                .workspace_model
+                .views
+                .iter_mut()
+                .find(|view| view.scope == Scope::Channel(channel))
+                .unwrap();
+            if replacement {
+                let CardKind::Repository(incoming) = &mut view.panes[0].kind else {
+                    unreachable!()
+                };
+                incoming.selected_file = Some("peer.txt".into());
+            } else {
+                view.panes.clear();
+            }
+            retention_full_read(&mut app);
+            assert_eq!(app.notices.entries.len(), 1);
+            let notice = app.notices.entries[0].id;
+            retention_full_read(&mut app);
+            assert_eq!(app.notices.entries.len(), 1);
+            assert_eq!(app.notices.entries[0].id, notice);
+            assert_eq!(app.notices.entries[0].repeats, 1);
+            drop(app.update(Message::DismissNotice(notice)));
+            retention_full_read(&mut app);
+            assert!(app.notices.is_empty());
+            let Some(CardRuntime::Repository(current)) = app.cards.get(&pane.id) else {
+                panic!("canonical peer projection replaced the pending real Reload");
+            };
+            assert_eq!(&**current as *const RepositoryRuntime, identity);
+            assert_eq!(current.descriptor, descriptor);
+            assert!(Arc::ptr_eq(&current.retained_editor_root().unwrap(), &root));
+            assert!(current.retains_reload_buffer() && current.is_dirty());
+            assert!(current.blocks_navigation());
+            assert_eq!(subscription_count(current), 1);
+            assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+            assert!(app.card_state(pane.id).unwrap().existence.is_open());
+            if !replacement {
+                assert!(app.shared_views.retained.contains(&pane.id));
+                assert!(app.durable.local_only_cards.contains(&pane.id));
+            }
+            assert_eq!(app.shared_views.retention_incidents.len(), 1);
+        }
+
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&pane.id) else {
+            unreachable!()
+        };
+        settle(runtime, reload).await;
+        assert_eq!(&**runtime as *const RepositoryRuntime, identity);
+        assert!(!runtime.retains_reload_buffer());
+        assert_eq!(
+            runtime.editor_text().as_deref(),
+            Some(original_text.as_str())
+        );
+        assert!(
+            runtime
+                .save_error()
+                .unwrap()
+                .contains("your edits were kept")
+        );
+        assert!(runtime.is_dirty() && runtime.blocks_navigation());
+        assert!(Arc::ptr_eq(&runtime.retained_editor_root().unwrap(), &root));
+        retention_full_read(&mut app);
+        assert!(
+            app.notices.is_empty(),
+            "a failed Reload does not reannounce the same incident"
+        );
+        assert!(app.cards.contains_key(&pane.id));
+
+        // Only an explicit, successful read resolves this predecessor. A later
+        // canonical removal may then retire the very same now-clean editor.
+        std::fs::write(&path, "resolved disk text\n").unwrap();
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&pane.id) else {
+            unreachable!()
+        };
+        let reload = runtime.update(RepositoryAction::Reload { card: pane.id });
+        settle(runtime, reload).await;
+        assert_eq!(&**runtime as *const RepositoryRuntime, identity);
+        assert_eq!(
+            runtime.editor_text().as_deref(),
+            Some("resolved disk text\n")
+        );
+        assert!(!runtime.is_dirty() && !runtime.blocks_navigation());
+        assert_eq!(runtime.save_error(), None);
+        assert!(Arc::ptr_eq(&runtime.retained_editor_root().unwrap(), &root));
+        retention_full_read(&mut app);
+        assert!(!app.cards.contains_key(&pane.id));
+        assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+        assert!(!app.shared_views.retention_incidents.contains_key(&pane.id));
+        assert!(app.notices.is_empty());
+        // No subscription stream or task is kept alive beyond its runtime.
+        // Event delivery and native UI acceptance are separate owning checks.
+    }
+
     #[test]
     fn retention_notice_full_reads_preserve_dismissal_and_do_not_count_unchanged_incidents() {
         for state in ["dirty", "saving", "warning", "recovery"] {
