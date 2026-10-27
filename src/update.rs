@@ -2676,7 +2676,7 @@ if c['held']: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
 json.dump(dict(pid=os.getpid(),proof=c['proof']),f);f.flush();os.fsync(f.fileno())
 listener=socket.socket(socket.AF_UNIX);listener.bind(str(s));listener.listen(2);listener.settimeout(.05)
 Path(c['ready']).write_text(str(os.getpid()))
-count=0
+count=0;impacts=0
 try:
  while not Path(c['release']).exists():
   assert time.monotonic()<deadline
@@ -2693,13 +2693,25 @@ try:
    assert read(n).hex()==c['connect']
    count+=1;assert count<=c['connections']
    reply=bytes.fromhex(c['reply']);stream.sendall(struct.pack('>I',len(reply))+reply)
-   assert stream.recv(1)==b'', 'entry must not preview/prepare/stop'
+   first=stream.recv(1)
+   if first:
+    n=struct.unpack('>I',first+read(3))[0];assert n<=1024*1024
+    assert c['impact_request'] is not None, 'entry must not preview/prepare/stop'
+    assert read(n).hex()==c['impact_request'];impacts+=1;assert impacts==1
+    if c['impact_reply'] is not None:
+     reply=bytes.fromhex(c['impact_reply']);stream.sendall(struct.pack('>I',len(reply))+reply)
+     assert stream.recv(1)==b'', 'preview must never prepare/stop'
  assert count==c['connections']
+ assert impacts==int(c['impact_request'] is not None)
 finally:
  listener.close();f.close();s.unlink();lock.unlink()
 "#).unwrap();
         let mut sequence = 0;
-        let mut start = |executable: &Path, current: bool, held: bool, connections: usize| {
+        let mut start = |executable: &Path,
+                         current: bool,
+                         held: bool,
+                         connections: usize,
+                         impact: Option<(&[u8], Option<&[u8]>)>| {
             sequence += 1;
             let ready = root.join(format!("ready-{sequence}"));
             let release = root.join(format!("release-{sequence}"));
@@ -2710,6 +2722,8 @@ finally:
                 "connect": connect.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
                 "reply": (if current { &current_reply } else { &other_reply }).iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
                 "connections": connections,
+                "impact_request": impact.map(|(request, _)| request.iter().map(|byte| format!("{byte:02x}")).collect::<String>()),
+                "impact_reply": impact.and_then(|(_, reply)| reply).map(|reply| reply.iter().map(|byte| format!("{byte:02x}")).collect::<String>()),
             })).unwrap()).unwrap();
             let child = Command::new(executable)
                 .args([script.as_os_str(), config.as_os_str()])
@@ -2728,21 +2742,27 @@ finally:
         let executable = prefix.join("versions/old/bin/cagentsd");
         // The served window is already new. This exact production entry
         // decision must nevertheless route the unknown old owner to its CLI.
-        let mut fixture = start(&executable, false, true, 1);
+        let mut fixture = start(&executable, false, true, 1, None);
         assert_eq!(installed_entry_worker(&window, &served).unwrap(), "old");
         fixture.finish();
         // Fully qualified current peers still follow the original UI-only
         // replacement route; no inventory or preparation request is sent.
-        let mut fixture = start(&executable, true, true, 2);
+        let mut fixture = start(&executable, true, true, 2, None);
         assert_eq!(installed_entry_worker(&old_window, &served).unwrap(), "old");
         fixture.finish();
-        let mut fixture = start(&executable, false, false, 1);
+        let mut fixture = start(&executable, false, false, 1, None);
         assert!(installed_entry_worker(&window, &served).is_err());
         fixture.finish();
         // Unknown service at the served candidate must not fall back to the
         // old window's CLI merely to replace that window's UI.
         fs::copy("/usr/bin/python3", prefix.join("versions/new/bin/cagentsd")).unwrap();
-        let mut fixture = start(&prefix.join("versions/new/bin/cagentsd"), false, true, 1);
+        let mut fixture = start(
+            &prefix.join("versions/new/bin/cagentsd"),
+            false,
+            true,
+            1,
+            None,
+        );
         assert!(installed_entry_worker(&old_window, &served).is_err());
         fixture.finish();
         let foreign = root.join("foreign");
@@ -2753,21 +2773,126 @@ finally:
             foreign.join("versions/old/bin/cagentsd"),
         )
         .unwrap();
-        let mut fixture = start(&foreign.join("versions/old/bin/cagentsd"), false, true, 1);
+        let mut fixture = start(
+            &foreign.join("versions/old/bin/cagentsd"),
+            false,
+            true,
+            1,
+            None,
+        );
         assert!(installed_entry_worker(&window, &served).is_err());
         fixture.finish();
         fs::remove_file(foreign.join(".cagents-install-root")).unwrap();
-        let mut fixture = start(&foreign.join("versions/old/bin/cagentsd"), false, true, 1);
+        let mut fixture = start(
+            &foreign.join("versions/old/bin/cagentsd"),
+            false,
+            true,
+            1,
+            None,
+        );
         assert!(installed_entry_worker(&window, &served).is_err());
+        fixture.finish();
+        // An older installed executable at the CURRENT protocol still owns
+        // real sessions. Exercise the production installed-preview path, not
+        // just the worker selector or a candidate-version inequality.
+        let expected = impact::DaemonImpact {
+            capability: crate::terminal_ipc::ShutdownCapability {
+                proof: proof.clone(),
+                token: "private-installed-checkpoint".into(),
+                inventory_generation: 7,
+                live_terminals: 1,
+                background_subagents: 0,
+                background_identity: "none".into(),
+                expires_at_unix_ms: 100,
+            },
+            policy: impact::Policy::WhenIdle,
+            sessions: vec![impact::SessionImpact {
+                id: crate::model::TerminalId::new(),
+                kind: impact::SessionKind::Terminal,
+                title: "Existing installed terminal".into(),
+                identity: "exact-installed-source-owner".into(),
+                disposition: impact::Disposition::Continues,
+                reason: "Checkpoint must preserve this actual source row".into(),
+                interrupted_subagents: Vec::new(),
+            }],
+            blockers: Vec::new(),
+        };
+        let impact_request = postcard::to_stdvec(&ClientEnvelope {
+            version: crate::terminal_ipc::PROTOCOL_VERSION,
+            request_id: 2,
+            proof: Some(proof.clone()),
+            request: ClientRequest::UpgradeImpact {
+                policy: impact::Policy::WhenIdle,
+            },
+        })
+        .unwrap();
+        let impact_reply = postcard::to_stdvec(&ServerEnvelope {
+            version: crate::terminal_ipc::PROTOCOL_VERSION,
+            request_id: Some(2),
+            proof: proof.clone(),
+            message: ServerMessage::Response {
+                response: ServerResponse::UpgradeImpact(expected.clone()),
+            },
+        })
+        .unwrap();
+        let fallback_marker = root.join("unexpected-compatible-fallback");
+        let mut candidate_bytes = anonymous_file().unwrap();
+        write!(
+            candidate_bytes,
+            "#!/bin/sh\nif [ \"$3\" = protocol-version ]; then\n  echo '{{\"data\":{{\"protocol_version\":{}}}}}'\nelse\n  : > '{}'\n  echo '{{\"data\":{{\"running\":true,\"daemon_version\":\"fixture\"}}}}'\nfi\n",
+            crate::terminal_ipc::PROTOCOL_VERSION,
+            fallback_marker.display(),
+        )
+        .unwrap();
+        seal_file(&candidate_bytes).unwrap();
+        let staged = candidate::Staged::from_file(
+            candidate_bytes,
+            "new".into(),
+            "private-installed-bytes".into(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let mut fixture = start(
+            &executable,
+            true,
+            true,
+            6,
+            Some((&impact_request, Some(&impact_reply))),
+        );
+        let observed = installed::observe_installed_source_for_test(
+            &window,
+            &served,
+            &staged,
+            impact::Policy::WhenIdle,
+        )
+        .unwrap();
+        assert!(observed.replaces_daemon);
+        assert_eq!(observed.daemon, Some(expected));
+        assert!(!fallback_marker.exists());
+        fixture.finish();
+        // The source then refuses impact by closing the actual request. A
+        // compatible candidate status is deliberately available, but cannot
+        // downgrade that failed checkpoint to a UI-only update.
+        let mut fixture = start(&executable, true, true, 4, Some((&impact_request, None)));
+        assert!(
+            installed::observe_installed_source_for_test(
+                &window,
+                &served,
+                &staged,
+                impact::Policy::WhenIdle,
+            )
+            .is_err()
+        );
+        assert!(!fallback_marker.exists());
         fixture.finish();
         // A replacement using the very same executable and proof text is
         // still another process: the held original pidfd/epoch must refuse it.
-        let mut fixture = start(&executable, false, true, 2);
+        let mut fixture = start(&executable, false, true, 2, None);
         let original = source::inspect_installed_identity().unwrap();
         let same_owner = source::inspect_installed_identity().unwrap();
         original.verify_same_owner(&same_owner).unwrap();
         fixture.finish();
-        let mut replacement = start(&executable, false, true, 1);
+        let mut replacement = start(&executable, false, true, 1, None);
         let replacement_identity = source::inspect_installed_identity().unwrap();
         let owner = installed_daemon_owner(&window).unwrap().unwrap();
         replacement_identity

@@ -281,6 +281,18 @@ fn observe_installed_source(
     })
 }
 
+// Keep the production observer private while its owning parent tests exercise
+// actual installed executable routing and transport failure behavior.
+#[cfg(test)]
+pub(super) fn observe_installed_source_for_test(
+    layout: &InstallLayout,
+    root: &Path,
+    staged: &candidate::Staged,
+    policy: impact::Policy,
+) -> Result<impact::Preview, UpdateError> {
+    observe_installed_source(layout, root, staged, policy)
+}
+
 const WAITING_FOR_STARTUP: &str = "Restoring sessions is taking longer. Saved windows will reopen after terminal startup settles.";
 
 fn wait_for_daemon_start(
