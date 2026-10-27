@@ -397,12 +397,22 @@ impl Cagents {
             .views
             .iter()
             .filter(|view| view.panes.iter().any(|pane| pane.id == retry.card));
-        if canonical
-            .next()
-            .is_some_and(|view| view.scope != retry.scope)
-            || canonical.next().is_some()
-        {
-            return Task::none();
+        if let Some(view) = canonical.next() {
+            if view.scope != retry.scope || canonical.next().is_some() {
+                return Task::none();
+            }
+            if view.panes.iter().any(|pane| {
+                pane.id == retry.card
+                    && !matches!(&pane.kind, CardKind::Chat(session) if session == &retry.source)
+            }) {
+                // The old local runtime remains inert until seed admission.
+                // Its retry must not authorize the canonical successor instead.
+                if let Some(failure) = self.shared_views.admission_failures.get_mut(&retry.card) {
+                    failure.retry_available = false;
+                    failure.message = "This saved conversation changed in another window. Close and reopen this window to reconnect. Saved drafts and sessions are retained".into();
+                }
+                return Task::none();
+            }
         }
         self.shared_views
             .admission_failures

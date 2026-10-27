@@ -2051,6 +2051,104 @@ fn failed_seed_retry_rejects_stale_owner_source_registry_and_attempt() {
 }
 
 #[test]
+fn failed_seed_retry_cannot_authorize_a_same_scope_canonical_successor() {
+    if isolated("failed_seed_retry_cannot_authorize_a_same_scope_canonical_successor") {
+        return;
+    }
+    use crate::app::workspace_model_sync::ModelUpdate;
+    let daemon = ScriptedDaemon::start();
+    for changed in ["session", "proof", "recipe", "title"] {
+        let (mut app, active, hidden, pane, identity) = cached_chat();
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        let draft = "Original refused conversation draft  ";
+        app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(pane.id, draft.into())]));
+        let startup = app.initialize_runtimes();
+        settle(&mut app, startup);
+        let mut view = View::empty(hidden);
+        view.panes.push(pane.clone());
+        let canonical = model(identity, active, hidden, view);
+        let connected = app.apply_workspace_model_update(ModelUpdate::Connected(canonical.clone()));
+        settle(&mut app, connected);
+        let scope = Scope::Channel(hidden);
+        let failed = framed_seed(queued_seed(&rx, &scope), canonical.clone(), true);
+        apply_seed_updates(&mut app, failed);
+        let retry = app
+            .shared_chat_admission_failure(pane.id)
+            .unwrap()
+            .retry()
+            .unwrap();
+        let CardKind::Chat(source) = &pane.kind else {
+            unreachable!()
+        };
+
+        // A real newer watcher snapshot can replace the canonical actor while
+        // failed seeding intentionally keeps its old local runtime unprojected.
+        let mut newer = canonical;
+        newer.sequence += 1;
+        let successor = newer
+            .views
+            .iter_mut()
+            .find(|view| view.scope == scope)
+            .unwrap();
+        let successor = successor
+            .panes
+            .iter_mut()
+            .find(|entry| entry.id == pane.id)
+            .unwrap();
+        let CardKind::Chat(session) = &mut successor.kind else {
+            unreachable!()
+        };
+        match changed {
+            "session" => session.id = TerminalId::new(),
+            "proof" => session.proof.as_mut().unwrap().host_incarnation = "new-incarnation".into(),
+            "recipe" => session.launch.recipe.arguments.push("new-source".into()),
+            "title" => successor.title = "Newer presentation only".into(),
+            _ => unreachable!(),
+        }
+        let read = app.apply_workspace_model_update(ModelUpdate::Read(newer.clone()));
+        settle(&mut app, read);
+        assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+        assert!(app.chat_awaiting_admission(pane.id));
+        assert_eq!(
+            app.durable.pending_chat_admissions.get(&pane.id),
+            Some(source)
+        );
+        let task = app.retry_shared_chat_admission(retry);
+        settle(&mut app, task);
+        if changed == "title" {
+            let next = queued_seed(&rx, &scope);
+            assert!(matches!(next, ModelEdit::SeedView { .. }));
+        } else {
+            assert!(
+                rx.is_empty(),
+                "{changed}: an old retry cannot admit a newer canonical actor"
+            );
+            assert_eq!(app.workspace_model, newer);
+            assert!(app.shared_views.seed_admissions.get(&scope).unwrap().failed);
+            let failure = app.shared_chat_admission_failure(pane.id).unwrap();
+            assert!(
+                failure.retry().is_none(),
+                "do not leave an ineffective retry available"
+            );
+            assert!(failure.message().contains("Close and reopen this window"));
+        }
+        assert_eq!(
+            app.persistent_workspace()
+                .chat_drafts
+                .get(&pane.id)
+                .map(String::as_str),
+            Some(draft),
+            "{changed}: the original unsent draft remains intact"
+        );
+        assert!(
+            daemon.requests().is_empty(),
+            "retry is never provider admission"
+        );
+    }
+}
+
+#[test]
 fn closed_or_full_publisher_reports_seed_failure_without_admitting_cached_chat() {
     if isolated("closed_or_full_publisher_reports_seed_failure_without_admitting_cached_chat") {
         return;
