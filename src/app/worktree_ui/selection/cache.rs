@@ -298,7 +298,7 @@ impl Owner {
         // Receiver closure proves every UI and admitted-worker sender is gone.
         // Never await a worker while it might still be awaiting a Take reply.
         for join in self.abandoned.drain(..) {
-            let _ = iced::futures::executor::block_on(join);
+            let _ = cosmic::iced::futures::executor::block_on(join);
         }
         drop(self.cached.take());
         drop(self.returning.take());

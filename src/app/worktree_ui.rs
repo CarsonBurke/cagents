@@ -418,7 +418,7 @@ impl Cagents {
 
     /// Resolve filesystem aliases only when changing/restoring scope, never in
     /// the render path or by rewriting a hosted session's durable launch recipe.
-    fn collect_worktree_roots(&mut self) {
+    pub(super) fn collect_worktree_roots(&mut self) {
         let previous_count = self.known_worktree_roots.len();
         // Deleted worktree rows disappear from navigation, not from ownership.
         // Otherwise a surviving nested session would fall into its parent repo.

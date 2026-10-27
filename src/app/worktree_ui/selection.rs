@@ -2,6 +2,7 @@
 //!
 //! This deliberately does not coalesce commands that create/resume sessions.
 use super::*;
+use crate::model::WorktreeId;
 mod cache;
 use notify::Watcher;
 use std::sync::{
@@ -909,7 +910,7 @@ impl Cagents {
         local
     }
 
-    pub(super) fn refresh_automatic_worktree_owners(&mut self) -> Task<Message> {
+    pub(in crate::app) fn refresh_automatic_worktree_owners(&mut self) -> Task<Message> {
         self.collect_worktree_roots();
         let key = CacheKey::capture(self);
         let max_age = self.selection_cache_max_age();
