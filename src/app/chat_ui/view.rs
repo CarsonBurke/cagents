@@ -4169,6 +4169,25 @@ pub(super) fn request_view_with_redirect<'a>(
     .padding(step::GAP_M)
     .width(Length::Fill)
     .into();
+    // Every request owns its retained subtree, including requests without
+    // the optional Enter/Escape decision-card wrapper. A replacement runtime
+    // must not inherit anonymous answer buttons from an earlier request.
+    let content: Element<'a, Message> = widget::id_container(
+        content,
+        card_control_id(
+            target.card,
+            &format!(
+                "chat-request-{}-{}-{}",
+                match surface {
+                    RequestSurface::Transcript => "transcript",
+                    RequestSurface::Permissions => "permissions",
+                },
+                target.generation,
+                request.id
+            ),
+        ),
+    )
+    .into();
     if available && request.kind == chat::RequestKind::Approval {
         let once = request
             .actions
@@ -4472,14 +4491,9 @@ pub(super) fn answer_control_id(
     request: &chat::Request,
     choice: &chat::Choice,
 ) -> widget::Id {
-    // Native events carry only their node identity. Bind that identity to the
-    // runtime attempt so a queued event cannot answer a new actor's request.
     card_control_id(
         target.card,
-        &format!(
-            "chat-answer-{}-{}-{}",
-            target.generation, request.id, choice.id
-        ),
+        &format!("chat-answer-{}-{}", request.id, choice.id),
     )
 }
 
@@ -7240,18 +7254,17 @@ mod tests {
     }
 
     #[test]
-    fn a_retired_runtime_cannot_answer_a_reused_native_approval() {
+    fn reused_requests_reject_retired_native_actions_in_both_surfaces() {
         use iced::advanced::{Layout, layout, widget::Tree};
-        use iced_accessibility::{
-            A11yId,
-            accesskit::{Action as NativeAction, ActionRequest, Role, TreeId},
+        use iced_accessibility::accesskit::{
+            Action as NativeAction, ActionRequest, NodeId, Role, TreeId,
         };
 
         fn advertised_answer(
             element: &Element<'_, Message>,
             tree: &Tree,
             node: &layout::Node,
-        ) -> A11yId {
+        ) -> NodeId {
             let accessible = element.as_widget().a11y_nodes(
                 Layout::new(node),
                 tree,
@@ -7262,9 +7275,10 @@ mod tests {
                 .iter()
                 .chain(accessible.children())
                 .find(|node| node.node().role() == Role::Button)
-                .expect("the actual approval answer is advertised")
+                .expect("the actual request answer is advertised")
                 .id()
                 .clone()
+                .into()
         }
 
         fn click(
@@ -7272,20 +7286,22 @@ mod tests {
             tree: &mut Tree,
             node: &layout::Node,
             renderer: &cosmic::Renderer,
-            id: A11yId,
+            target_node: NodeId,
         ) -> Vec<Message> {
-            let A11yId::Widget(widget) = id.clone() else {
-                panic!("the answer must have a widget identity");
-            };
             let mut messages = Vec::new();
+            // Match iced-winit conversion::a11y: native events contain only
+            // the advertised numeric NodeId, never a Custom widget name.
+            let event_id = iced::advanced::widget::Id::from(
+                u128::from(target_node.0) as u64,
+            );
             element.as_widget_mut().update(
                 tree,
                 &iced::Event::A11y(
-                    widget,
+                    event_id,
                     ActionRequest {
                         action: NativeAction::Click,
                         target_tree: TreeId::ROOT,
-                        target_node: id.into(),
+                        target_node,
                         data: None,
                     },
                 ),
@@ -7294,54 +7310,73 @@ mod tests {
                 renderer,
                 &mut iced::advanced::clipboard::Null,
                 &mut iced::advanced::Shell::new(&mut messages),
-                &iced::Rectangle::with_size(iced::Size::new(500.0, 200.0)),
+                &iced::Rectangle::with_size(iced::Size::new(500.0, 300.0)),
             );
             messages
         }
 
-        let request = chat::Request {
-            kind: chat::RequestKind::Approval,
-            id: "1".into(),
-            title: "Command approval".into(),
-            description: String::new(),
-            fields: Vec::new(),
-            actions: vec![choice("accept")],
-        };
+        let renderer = crate::app::tests::headless_renderer();
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(500.0, 300.0));
         let original = Target {
             card: CardId::new(),
             generation: 1,
         };
-        let renderer = crate::app::tests::headless_renderer();
-        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(500.0, 200.0));
-        let mut element = answers_view(original, &request, true, RequestSurface::Permissions);
-        let mut tree = Tree::new(element.as_widget());
-        let mut node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
-        let retired = advertised_answer(&element, &tree, &node);
-
-        // Ordinary redraws retain the live native control identity.
-        element = answers_view(original, &request, true, RequestSurface::Permissions);
-        tree.diff(element.as_widget_mut());
-        node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
-        let same_runtime = click(&mut element, &mut tree, &node, &renderer, retired.clone());
-        assert!(matches!(same_runtime.as_slice(),
-            [Message::ChatUi(Action::Answer(target, request, choice))]
-                if *target == original && request == "1" && choice == "accept"));
-
-        // A replacement actor can reuse the provider's numeric request IDs.
-        // A queued old native Click must not authorize its different request.
         let replacement = Target {
             generation: 2,
             ..original
         };
-        element = answers_view(replacement, &request, true, RequestSurface::Permissions);
-        tree.diff(element.as_widget_mut());
-        node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
-        let current = advertised_answer(&element, &tree, &node);
-        assert!(click(&mut element, &mut tree, &node, &renderer, retired).is_empty());
-        let fresh = click(&mut element, &mut tree, &node, &renderer, current);
-        assert!(matches!(fresh.as_slice(),
-            [Message::ChatUi(Action::Answer(target, request, choice))]
-                if *target == replacement && request == "1" && choice == "accept"));
+        let answers = Answers::new();
+        for surface in [RequestSurface::Transcript, RequestSurface::Permissions] {
+            for kind in [
+                chat::RequestKind::Approval,
+                chat::RequestKind::Question,
+                chat::RequestKind::Consent,
+            ] {
+                // A single choice deliberately omits the optional approval
+                // card focus wrapper. Question and Consent omit it as well.
+                let request = chat::Request {
+                    kind,
+                    id: "1".into(),
+                    title: "Request fixture".into(),
+                    description: String::new(),
+                    fields: Vec::new(),
+                    actions: vec![choice("accept")],
+                };
+                let mut element = request_view(original, &request, &answers, true, surface);
+                let mut tree = Tree::new(element.as_widget());
+                let mut node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                let first = advertised_answer(&element, &tree, &node);
+                let initial = click(&mut element, &mut tree, &node, &renderer, first);
+                assert!(matches!(initial.as_slice(),
+                    [Message::ChatUi(Action::Answer(target, id, choice))]
+                        if *target == original && id == "1" && choice == "accept"));
+
+                element = request_view(original, &request, &answers, true, surface);
+                tree.diff(element.as_widget_mut());
+                node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                let retired = advertised_answer(&element, &tree, &node);
+                if matches!(surface, RequestSurface::Transcript) {
+                    // Anonymous transcript answers retain their numeric ID on
+                    // ordinary redraw. Popup Custom IDs are freshly numbered.
+                    assert_eq!(first, retired);
+                }
+                let live = click(&mut element, &mut tree, &node, &renderer, retired);
+                assert!(matches!(live.as_slice(),
+                    [Message::ChatUi(Action::Answer(target, id, choice))]
+                        if *target == original && id == "1" && choice == "accept"));
+
+                // The new actor can reuse the provider's numeric request ID.
+                element = request_view(replacement, &request, &answers, true, surface);
+                tree.diff(element.as_widget_mut());
+                node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                let current = advertised_answer(&element, &tree, &node);
+                assert!(click(&mut element, &mut tree, &node, &renderer, retired).is_empty());
+                let fresh = click(&mut element, &mut tree, &node, &renderer, current);
+                assert!(matches!(fresh.as_slice(),
+                    [Message::ChatUi(Action::Answer(target, id, choice))]
+                        if *target == replacement && id == "1" && choice == "accept"));
+            }
+        }
     }
 
     fn model(id: &str, label: &str) -> chat::Model {
