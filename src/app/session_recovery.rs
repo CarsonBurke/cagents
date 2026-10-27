@@ -298,7 +298,13 @@ impl Cagents {
         if !self.session_recovery.open() {
             return None;
         }
-        let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
+        let keyboard::Event::KeyPressed {
+            key,
+            modifiers,
+            repeat,
+            ..
+        } = event
+        else {
             return None;
         };
         let keyboard::Key::Named(key) = key else {
@@ -330,6 +336,7 @@ impl Cagents {
             ));
         }
         if *key == Named::Enter
+            && !repeat
             && !captured
             && !modifiers.control()
             && !modifiers.alt()
@@ -932,7 +939,31 @@ mod tests {
             card,
             "latest unsent work\nnot the reviewed snapshot".into(),
         )]));
-        let task = app.update_session_recovery(Action::Confirm);
+        drop(app.session_recovery_key_event(&key(keyboard::key::Named::Tab, false), false));
+        assert_eq!(app.session_recovery.focus, 1);
+        let review = app.session_recovery.review.clone();
+        let before = Arc::clone(&app.durable);
+        let quarantine = app.save_health.as_ref().unwrap().quarantined.clone();
+        let store = app.session.as_ref().unwrap().operation_store();
+        let owner = review.as_ref().unwrap().recovery.alias;
+        let original_owner = store.load_card(owner, None).unwrap();
+        let original_target = store.load_card(card, None).unwrap();
+        let mut repeated = key(keyboard::key::Named::Enter, false);
+        if let keyboard::Event::KeyPressed { repeat, .. } = &mut repeated {
+            *repeat = true;
+        }
+        for captured in [false, true] {
+            drop(app.session_recovery_key_event(&repeated, captured));
+            assert!(!app.session_recovery.pending);
+            assert_eq!(app.session_recovery.review, review);
+            assert_eq!(app.durable, before);
+            assert_eq!(app.save_health.as_ref().unwrap().quarantined, quarantine);
+            assert_eq!(store.load_card(owner, None).unwrap(), original_owner);
+            assert_eq!(store.load_card(card, None).unwrap(), original_target);
+        }
+        let task = app
+            .session_recovery_key_event(&key(keyboard::key::Named::Enter, false), false)
+            .unwrap();
         assert!(app.session_recovery.pending);
         assert!(app.save_health.as_ref().unwrap().window_state_refused());
         drop(app.update_session_recovery(Action::Cancel));
