@@ -181,6 +181,10 @@ pub enum Action {
     RequestDelete(ChannelId),
     ConfirmDelete,
     Dismiss,
+    Answer {
+        presentation: uuid::Uuid,
+        confirm: bool,
+    },
     SessionsClosed(ChannelId, uuid::Uuid, Result<(), String>),
     RetryDelete(ChannelId),
     /// Runs a deletion that failed again, from the channel's row.
@@ -196,7 +200,11 @@ impl Action {
     pub fn answers_own_dialog(&self) -> bool {
         matches!(
             self,
-            Self::ConfirmDelete | Self::Dismiss | Self::SessionsClosed(..) | Self::RetryDelete(_)
+            Self::ConfirmDelete
+                | Self::Dismiss
+                | Self::Answer { .. }
+                | Self::SessionsClosed(..)
+                | Self::RetryDelete(_)
         )
     }
 }
@@ -210,6 +218,8 @@ pub struct State {
     deleting: HashSet<ChannelId>,
     /// Exact local targets retained until the matching close worker completes.
     closing: HashMap<ChannelId, ChannelCloseAttempt>,
+    /// Consent survives pending starts and failed close attempts without widening.
+    approved: HashMap<ChannelId, ChannelDeletionTarget>,
     /// Deletions that failed, with why, until retried or declined.
     failed: HashMap<ChannelId, String>,
     /// Channels this window has deleted.
@@ -225,6 +235,11 @@ pub struct State {
 #[derive(Debug)]
 struct ChannelCloseAttempt {
     operation: uuid::Uuid,
+    target: ChannelDeletionTarget,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ChannelDeletionTarget {
     registry: uuid::Uuid,
     project: ProjectId,
     members: Vec<CardId>,
@@ -257,13 +272,28 @@ fn closed_channel_source_matches(before: &CardKind, current: &CardKind) -> bool 
 
 #[derive(Debug, Clone)]
 struct Deletion {
+    presentation: uuid::Uuid,
+    origin: Option<sidebar::SelectionRow>,
     channel: ChannelId,
+    target: ChannelDeletionTarget,
     title: String,
     /// Open conversations the deletion closes, reported before it happens.
     chats: usize,
     /// Why the last deletion of this channel failed, when the dialog is
     /// opened again after it. Confirming retries it.
     failure: Option<String>,
+    review_required: bool,
+}
+
+impl Deletion {
+    fn control_id(&self, confirm: bool, enabled: bool) -> widget::Id {
+        let role = if confirm { "confirm" } else { "cancel" };
+        let eligibility = if enabled { "enabled" } else { "disabled" };
+        widget::Id::new(format!(
+            "dialog.channel.{}.{}.{role}.{eligibility}",
+            self.presentation, self.channel
+        ))
+    }
 }
 
 impl State {
@@ -300,13 +330,31 @@ impl State {
     pub(super) fn was_deleted(&self, id: ChannelId) -> bool {
         self.deleted.contains(&id)
     }
-
-    pub(super) fn focus_target() -> widget::Id {
-        widget::Id::new("dialog.channel.close")
-    }
 }
 
 impl Cagents {
+    fn channel_dialog_can_confirm(&self, dialog: &Deletion) -> bool {
+        !dialog.review_required
+            && self.channel_deletion_target_current(dialog.channel, &dialog.target)
+            && self.channel_deletion_blocker(dialog.channel).is_none()
+    }
+
+    pub(super) fn channel_dialog_focus_target(&self) -> Option<widget::Id> {
+        self.channel_ui
+            .dialog
+            .as_ref()
+            .map(|dialog| dialog.control_id(self.channel_dialog_can_confirm(dialog), true))
+    }
+
+    pub(super) fn channel_dialog_dismiss_message(&self) -> Option<Message> {
+        self.channel_ui.dialog.as_ref().map(|dialog| {
+            Message::ChannelUi(Action::Answer {
+                presentation: dialog.presentation,
+                confirm: false,
+            })
+        })
+    }
+
     /// Utility panes and closed chats do not own the channel conversation name.
     pub(super) fn channel_primary_chat(&self, channel: &ProjectChannel) -> Option<CardId> {
         channel.cards.iter().copied().find(|id| {
@@ -378,7 +426,7 @@ impl Cagents {
             let attempt = self.channel_ui.closing.remove(&id).unwrap();
             self.channel_ui.deleting.remove(&id);
             let result = result.and_then(|()| {
-                self.channel_close_targets_current(id, &attempt).then_some(()).ok_or_else(|| {
+                self.channel_deletion_target_current(id, &attempt.target).then_some(()).ok_or_else(|| {
                     "The channel's panes changed while sessions were closing; review them before deleting again".into()
                 })
             });
@@ -407,13 +455,32 @@ impl Cagents {
             };
         }
         if self.update_prepared
-            || self.focused_repository_is_saving()
+            || (self.focused_repository_is_saving() && !action.answers_own_dialog())
             || (self.modal_is_open() && !action.answers_own_dialog())
         {
             return Task::none();
         }
         match action {
             Action::SessionsClosed(..) | Action::RetryDelete(_) => unreachable!(),
+            Action::Answer {
+                presentation,
+                confirm,
+            } => {
+                if self
+                    .channel_ui
+                    .dialog
+                    .as_ref()
+                    .map(|dialog| dialog.presentation)
+                    != Some(presentation)
+                {
+                    return Task::none();
+                }
+                self.handle_channel_ui(if confirm {
+                    Action::ConfirmDelete
+                } else {
+                    Action::Dismiss
+                })
+            }
             Action::RetryFailed(id) => {
                 if !self.channel_ui.failed.contains_key(&id) {
                     return Task::none();
@@ -481,26 +548,67 @@ impl Cagents {
             Action::Delete(id) => self.begin_channel_deletion(id, false),
             Action::RequestDelete(id) => self.begin_channel_deletion(id, true),
             Action::ConfirmDelete => {
+                if self.exposed_dialog_focus()
+                    != self.channel_dialog_focus_target().map_or(
+                        super::dialog_ui::DialogFocus::NoOwner,
+                        super::dialog_ui::DialogFocus::Focus,
+                    )
+                {
+                    return Task::none();
+                }
                 let Some(deletion) = self.channel_ui.dialog.take() else {
                     return Task::none();
                 };
+                if deletion.review_required {
+                    self.channel_ui.dialog = Some(deletion);
+                    return self.focus_exposed_dialog();
+                }
+                if let Some(error) = self.channel_deletion_blocker(deletion.channel) {
+                    self.channel_ui.dialog = Some(Deletion {
+                        failure: Some(error),
+                        ..deletion
+                    });
+                    return self.focus_exposed_dialog();
+                }
+                if !self.channel_deletion_target_current(deletion.channel, &deletion.target) {
+                    self.channel_ui.dialog = Some(Deletion {
+                        failure: Some("The channel's panes changed. Cancel and review the channel before deleting again.".into()),
+                        review_required: true,
+                        ..deletion
+                    });
+                    return self.focus_exposed_dialog();
+                }
+                self.channel_ui
+                    .approved
+                    .insert(deletion.channel, deletion.target);
                 self.delete_channel(deletion.channel)
             }
             Action::Dismiss => {
+                let Some(target) = self.channel_dialog_focus_target() else {
+                    return Task::none();
+                };
+                if self.exposed_dialog_focus() != super::dialog_ui::DialogFocus::Focus(target) {
+                    return Task::none();
+                }
                 // Declining to delete a channel whose deletion failed is the
                 // answer to that failure, so its row stops asking.
-                if let Some(dismissed) = self.channel_ui.dialog.take()
-                    && self.channel_ui.failed.remove(&dismissed.channel).is_some()
-                {
+                let dismissed = self.channel_ui.dialog.take().unwrap();
+                if self.channel_ui.failed.remove(&dismissed.channel).is_some() {
+                    self.channel_ui.approved.remove(&dismissed.channel);
                     self.refresh_sidebar_channels();
                 }
-                let focus = self.nested_modal_focus_target().unwrap_or_else(|| {
-                    self.workspace
-                        .focused()
-                        .map(|card| self.card_keyboard_focus(card))
-                        .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID))
-                });
-                iced::widget::operation::focus(focus).map(cosmic::Action::App)
+                self.restore_dialog_focus(|| match dismissed.origin {
+                    Some(row) if self.visible_sidebar_rows().contains(&row) => {
+                        super::dialog_ui::focus_target_task(sidebar::selection_row_focus_id(row))
+                    }
+                    Some(_) => Task::none(),
+                    None => super::dialog_ui::focus_target_task(
+                        self.workspace
+                            .focused()
+                            .map(|card| self.card_keyboard_focus(card))
+                            .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
+                    ),
+                })
             }
         }
     }
@@ -582,27 +690,40 @@ impl Cagents {
         if self.channel_ui.is_deleting(id) {
             return Task::none();
         }
-        let Some(channel) = self
+        if let Some(error) = self.channel_deletion_blocker(id) {
+            self.status = Some(TransientNotice::warning(error));
+            return Task::none();
+        }
+        let Some(target) = self.channel_deletion_target(id) else {
+            return Task::none();
+        };
+        let channel = self
             .durable
             .channels
             .iter()
             .find(|channel| channel.id == id)
-        else {
-            return Task::none();
-        };
+            .unwrap();
         let title = channel_display_title(channel, self.sidebar_model.project(channel.project_id))
             .into_owned();
         let chats = self.channel_conversation_count(channel);
         if chats == 0 && !always_confirm {
+            self.channel_ui.approved.insert(id, target);
             return self.delete_channel(id);
         }
         self.channel_ui.dialog = Some(Deletion {
+            presentation: uuid::Uuid::new_v4(),
+            origin: self
+                .visible_sidebar_rows()
+                .contains(&sidebar::SelectionRow::Channel(id))
+                .then_some(sidebar::SelectionRow::Channel(id)),
             channel: id,
+            target,
             title,
             chats,
             failure: self.channel_ui.failed.get(&id).cloned(),
+            review_required: false,
         });
-        iced::widget::operation::focus(State::focus_target()).map(cosmic::Action::App)
+        self.focus_exposed_dialog()
     }
 
     /// The open conversations - chats and terminals - that deleting
@@ -621,8 +742,23 @@ impl Cagents {
             .count()
     }
 
+    pub(super) fn delete_confirmed_channel(
+        &mut self,
+        id: ChannelId,
+        target: ChannelDeletionTarget,
+    ) -> Task<Message> {
+        self.channel_ui.approved.insert(id, target);
+        self.delete_channel(id)
+    }
+
     pub(super) fn delete_channels(&mut self, ids: Vec<ChannelId>) -> Task<Message> {
-        Task::batch(ids.into_iter().map(|id| self.delete_channel(id)))
+        Task::batch(
+            ids.into_iter()
+                .filter_map(|id| self.channel_deletion_target(id).map(|target| (id, target)))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|(id, target)| self.delete_confirmed_channel(id, target)),
+        )
     }
 
     /// Removes a channel along with everything that existed only inside it.
@@ -632,6 +768,29 @@ impl Cagents {
     /// show - the same treatment worktree deletion gives the cards of the
     /// directory it removes.
     pub(super) fn delete_channel(&mut self, id: ChannelId) -> Task<Message> {
+        if self.channel_ui.closing.contains_key(&id) {
+            return Task::none();
+        }
+        let Some(mut target) = self
+            .channel_ui
+            .approved
+            .get(&id)
+            .cloned()
+            .or_else(|| self.channel_deletion_target(id))
+        else {
+            return Task::none();
+        };
+        if let Some(error) = self.channel_deletion_blocker(id) {
+            return self.refuse_channel_deletion(id, error);
+        }
+        if !self.channel_deletion_target_current(id, &target) {
+            return self.refuse_channel_deletion(
+                id,
+                "The channel's panes changed. Review the channel and choose Delete channel again."
+                    .into(),
+            );
+        }
+        self.channel_ui.approved.insert(id, target.clone());
         let Some(cards) = self
             .durable
             .channels
@@ -641,21 +800,21 @@ impl Cagents {
         else {
             return Task::none();
         };
-        if cards.iter().any(|card| self.pane_transfer_pending(*card)) {
-            self.status = Some(TransientNotice::warning(
-                "Wait for the pane move to finish before deleting this channel.",
-            ));
-            return Task::none();
-        }
         if !self.channel_ui.deleting.insert(id) {
             return Task::none();
         }
         self.channel_ui.failed.remove(&id);
         self.refresh_sidebar_channels();
-        // Settling spawns and closing sessions take a round trip each, and the
-        // row reports them meanwhile. The workspace leaves the channel now, so
+        // Closing sessions takes a round trip, and the row reports it
+        // meanwhile. The workspace leaves the channel now, so
         // nothing the user does in the meantime lands in a channel whose
         // sessions are being closed.
+        let removable = target
+            .members
+            .iter()
+            .copied()
+            .filter(|card| target.inactive.contains(card) || self.chat_is_unused_default(*card))
+            .collect::<HashSet<_>>();
         let leave = if self.durable.active_channel == Some(id)
             && let Some(index) = self
                 .durable
@@ -668,16 +827,27 @@ impl Cagents {
         } else {
             Task::none()
         };
-        if cards
+        // Leaving the scope synchronously prunes closed descriptors and
+        // unused automatic drafts. Retire only those known harmless members
+        // from consent; never recapture newly arrived panes or identities.
+        let members = self
+            .durable
+            .channels
             .iter()
-            .any(|card| self.pending_terminal_spawn(*card) || self.chat_start_pending(*card))
-        {
-            let retry = cosmic::task::future(async move {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                Message::ChannelUi(Action::RetryDelete(id))
-            });
-            return Task::batch([leave, retry]);
+            .find(|channel| channel.id == id)
+            .map(|channel| &channel.cards);
+        let removed = removable
+            .into_iter()
+            .filter(|card| members.is_some_and(|members| !members.contains(card)))
+            .collect::<HashSet<_>>();
+        target.members.retain(|card| !removed.contains(card));
+        target.inactive.retain(|card| !removed.contains(card));
+        target.panes.retain(|(card, _, _)| !removed.contains(card));
+        if !self.channel_deletion_target_current(id, &target) {
+            return Task::batch([leave, self.refuse_channel_deletion(id,
+                "The channel's panes changed. Review the channel and choose Delete channel again.".into())]);
         }
+        self.channel_ui.approved.insert(id, target.clone());
         let sessions: Vec<_> = self
             .durable
             .cards
@@ -693,48 +863,9 @@ impl Cagents {
             return Task::batch([leave, self.finish_delete_channel(id)]);
         }
         let operation = uuid::Uuid::new_v4();
-        let panes = self
-            .durable
-            .cards
-            .iter()
-            .filter(|card| cards.contains(&card.id) && card.existence.is_open())
-            .map(|card| {
-                (
-                    card.id,
-                    card.kind.clone(),
-                    self.workspace_model
-                        .views
-                        .iter()
-                        .any(|view| view.panes.iter().any(|pane| pane.id == card.id)),
-                )
-            })
-            .collect();
-        let project = self
-            .durable
-            .channels
-            .iter()
-            .find(|channel| channel.id == id)
-            .unwrap()
-            .project_id;
-        let inactive = cards
-            .iter()
-            .copied()
-            .filter(|card| {
-                self.card_state(*card)
-                    .is_none_or(|state| !state.existence.is_open())
-            })
-            .collect();
-        self.channel_ui.closing.insert(
-            id,
-            ChannelCloseAttempt {
-                operation,
-                registry: self.workspace_model.identity,
-                project,
-                members: cards,
-                inactive,
-                panes,
-            },
-        );
+        self.channel_ui
+            .closing
+            .insert(id, ChannelCloseAttempt { operation, target });
         let close = cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || close_sessions(sessions))
                 .await
@@ -745,7 +876,85 @@ impl Cagents {
         Task::batch([leave, close])
     }
 
-    fn channel_close_targets_current(&self, id: ChannelId, attempt: &ChannelCloseAttempt) -> bool {
+    pub(super) fn channel_deletion_target(&self, id: ChannelId) -> Option<ChannelDeletionTarget> {
+        let channel = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)?;
+        Some(ChannelDeletionTarget {
+            registry: self.workspace_model.identity,
+            project: channel.project_id,
+            members: channel.cards.clone(),
+            inactive: channel
+                .cards
+                .iter()
+                .copied()
+                .filter(|card| {
+                    self.card_state(*card)
+                        .is_none_or(|state| !state.existence.is_open())
+                })
+                .collect(),
+            panes: self
+                .durable
+                .cards
+                .iter()
+                .filter(|card| channel.cards.contains(&card.id) && card.existence.is_open())
+                .map(|card| {
+                    (
+                        card.id,
+                        card.kind.clone(),
+                        self.workspace_model
+                            .views
+                            .iter()
+                            .any(|view| view.panes.iter().any(|pane| pane.id == card.id)),
+                    )
+                })
+                .collect(),
+        })
+    }
+
+    pub(super) fn channel_deletion_blocker(&self, id: ChannelId) -> Option<String> {
+        let channel = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)?;
+        if channel.cards.iter().any(|card| {
+            matches!(self.cards.get(card),
+            Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
+        }) {
+            Some("Save or close this channel's unsaved editor buffers and resolve editor recovery before deleting it.".into())
+        } else if channel
+            .cards
+            .iter()
+            .any(|card| self.pane_transfer_pending(*card))
+        {
+            Some("Wait for the pane move to finish before deleting this channel.".into())
+        } else if channel
+            .cards
+            .iter()
+            .any(|card| self.pending_terminal_spawn(*card) || self.chat_start_pending(*card))
+        {
+            Some("Wait for this channel's panes to finish opening, then delete it again.".into())
+        } else {
+            None
+        }
+    }
+
+    fn refuse_channel_deletion(&mut self, id: ChannelId, error: String) -> Task<Message> {
+        self.channel_ui.deleting.remove(&id);
+        self.channel_ui.failed.insert(id, error.clone());
+        self.status = Some(TransientNotice::warning(error));
+        self.refresh_sidebar_channels();
+        Task::none()
+    }
+
+    pub(super) fn channel_deletion_target_current(
+        &self,
+        id: ChannelId,
+        attempt: &ChannelDeletionTarget,
+    ) -> bool {
         let Some(channel) = self
             .durable
             .channels
@@ -756,7 +965,13 @@ impl Cagents {
         };
         if self.workspace_model.identity != attempt.registry
             || channel.project_id != attempt.project
-            || channel.cards != attempt.members
+            // Snapshotting any leaving scope prunes already-closed members
+            // from every channel, including later targets in one group. Those
+            // descriptors close nothing; missing originally-open panes still
+            // invalidate consent, as do new or reopened members.
+            || channel.cards.iter().any(|card| !attempt.members.contains(card))
+            || attempt.members.iter().any(|card|
+                !channel.cards.contains(card) && !attempt.inactive.contains(card))
             || attempt.inactive.iter().any(|card| {
                 self.card_state(*card)
                     .is_some_and(|state| state.existence.is_open())
@@ -793,6 +1008,18 @@ impl Cagents {
     }
 
     pub(super) fn finish_delete_channel(&mut self, id: ChannelId) -> Task<Message> {
+        if let Some(error) = self.channel_deletion_blocker(id) {
+            return self.refuse_channel_deletion(id, error);
+        }
+        if let Some(target) = self.channel_ui.approved.get(&id)
+            && !self.channel_deletion_target_current(id, target)
+        {
+            return self.refuse_channel_deletion(
+                id,
+                "The channel's panes changed. Review the channel and choose Delete channel again."
+                    .into(),
+            );
+        }
         self.retire_channel(id, false)
     }
 
@@ -822,6 +1049,7 @@ impl Cagents {
         // identically whoever asked.
         self.publish_model_edit(ModelEdit::DeleteChannel { id });
         self.channel_ui.deleted.insert(id);
+        self.channel_ui.approved.remove(&id);
         let mut freed_utility = false;
         for card in channel.cards {
             // A utility pane outlives the channel it was visiting: it leaves
@@ -995,17 +1223,47 @@ impl Cagents {
                 "The last attempt failed: {failure}"
             )));
         }
+        let changed = !self.channel_deletion_target_current(dialog.channel, &dialog.target);
+        let blocker = self.channel_deletion_blocker(dialog.channel);
+        if changed && !dialog.review_required {
+            rows.push(super::notice_body(
+                "The channel's panes changed. Cancel and review the channel before deleting again.",
+            ));
+        } else if let Some(blocker) = &blocker
+            && dialog.failure.as_ref() != Some(blocker)
+        {
+            rows.push(super::notice_body(blocker.as_str()));
+        }
+        let confirm_enabled = self.channel_dialog_can_confirm(dialog);
+        let cancel_id = dialog.control_id(false, true);
+        let confirm_id = dialog.control_id(true, confirm_enabled);
         rows.push(super::dialog_ui::confirmation_actions(
-            crate::ui_controls::button::secondary("Cancel")
-                .id(widget::Id::new("dialog.channel.close"))
-                .on_press(Message::ChannelUi(Action::Dismiss)),
-            crate::ui_controls::button::destructive(if dialog.failure.is_some() {
-                "Retry delete"
-            } else {
-                "Delete channel"
-            })
-            .id(widget::Id::new("dialog.channel.confirm"))
-            .on_press(Message::ChannelUi(Action::ConfirmDelete)),
+            crate::ui_controls::owned(
+                cancel_id.clone(),
+                crate::ui_controls::button::secondary("Cancel")
+                    .id(cancel_id)
+                    .on_press(Message::ChannelUi(Action::Answer {
+                        presentation: dialog.presentation,
+                        confirm: false,
+                    })),
+            ),
+            crate::ui_controls::owned(
+                confirm_id.clone(),
+                crate::ui_controls::button::destructive(
+                    if dialog.failure.is_some() && !dialog.review_required {
+                        "Retry delete"
+                    } else {
+                        "Delete channel"
+                    },
+                )
+                .id(confirm_id)
+                .on_press_maybe(
+                    confirm_enabled.then_some(Message::ChannelUi(Action::Answer {
+                        presentation: dialog.presentation,
+                        confirm: true,
+                    })),
+                ),
+            ),
         ));
         Some(super::dialog_ui::surface(
             widget::column::with_children(rows).spacing(space::M),
@@ -1089,6 +1347,9 @@ impl Cagents {
         // it went, has nothing left to retry.
         self.channel_ui
             .failed
+            .retain(|id, _| durable.channels.iter().any(|channel| channel.id == *id));
+        self.channel_ui
+            .approved
             .retain(|id, _| durable.channels.iter().any(|channel| channel.id == *id));
         let channel_ui = &self.channel_ui;
         let state = &self.sidebar_state;
@@ -1241,47 +1502,621 @@ mod tests {
     use crate::sidebar::RowDeletion;
 
     #[test]
-    fn deletion_opens_on_cancel_and_enter_or_escape_keeps_the_channel_and_cards() {
-        for enter in [false, true] {
-            let (mut app, channel, _survivor, card) = channel_with_a_conversation();
-            let original = app.card_state(card).unwrap().clone();
-            let opening = app.handle_channel_ui(Action::Delete(channel));
-            assert_eq!(
-                super::super::tests::focused_element(app.channel_dialog_view().unwrap(), opening),
-                Some(widget::Id::new("dialog.channel.close"))
-            );
-            let cancel = if enter {
-                let message = super::super::dialog_ui::tests::enter_control(
-                    app.channel_dialog_view().unwrap(),
-                    State::focus_target(),
-                );
-                assert!(matches!(message, Message::ChannelUi(Action::Dismiss)));
-                message
-            } else {
-                Message::KeyEvent {
-                    event: keyboard::Event::KeyPressed {
-                        key: keyboard::Key::Named(keyboard::key::Named::Escape),
-                        modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
-                        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
-                        location: keyboard::Location::Standard,
-                        modifiers: keyboard::Modifiers::empty(),
-                        text: None,
-                        repeat: false,
-                    },
-                    captured: false,
+    fn deletion_opens_on_primary_and_cancel_or_escape_restores_exact_sidebar_invoker() {
+        for retry in [false, true] {
+            for cancel_button in [false, true] {
+                let (mut app, channel, _, card) = channel_with_a_conversation();
+                app.context_inspector_open = false;
+                if retry {
+                    app.channel_ui
+                        .failed
+                        .insert(channel, "Close was refused".into());
                 }
-            };
-            drop(app.update(cancel));
-            assert!(!app.channel_ui.modal_open());
-            assert!(
-                app.durable
-                    .channels
-                    .iter()
-                    .any(|current| current.id == channel)
-            );
-            assert_eq!(app.card_state(card), Some(&original));
-            assert!(!app.channel_ui.deletion_running());
+                let original = app.card_state(card).unwrap().clone();
+                let opening = app.handle_channel_ui(Action::RequestDelete(channel));
+                let dialog = app.channel_ui.dialog.as_ref().unwrap();
+                let confirm = dialog.control_id(true, true);
+                let cancel = dialog.control_id(false, true);
+                assert_eq!(app.channel_dialog_focus_target(), Some(confirm.clone()));
+                assert_eq!(
+                    super::super::tests::focused_element(
+                        app.channel_dialog_view().unwrap(),
+                        opening
+                    ),
+                    Some(confirm.clone())
+                );
+                assert!(matches!(
+                    super::super::dialog_ui::tests::enter_control(
+                        app.channel_dialog_view().unwrap(),
+                        confirm
+                    ),
+                    Message::ChannelUi(Action::Answer { confirm: true, .. })
+                ));
+                let message = if cancel_button {
+                    super::super::dialog_ui::tests::enter_control(
+                        app.channel_dialog_view().unwrap(),
+                        cancel,
+                    )
+                } else {
+                    Message::KeyEvent {
+                        event: super::super::dialog_ui::tests::key_press(
+                            keyboard::key::Named::Escape,
+                        ),
+                        captured: false,
+                    }
+                };
+                let task = app.update(message);
+                assert!(!app.channel_ui.modal_open());
+                assert_eq!(
+                    super::super::tests::focused(&app, task),
+                    Some(sidebar::selection_row_focus_id(
+                        sidebar::SelectionRow::Channel(channel)
+                    ))
+                );
+                assert_eq!(app.card_state(card), Some(&original));
+                assert!(!app.channel_ui.deletion_running());
+                assert_eq!(
+                    app.handle_channel_ui(Action::Dismiss).units(),
+                    0,
+                    "duplicate dismissal cannot refocus background content"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn channel_dialog_live_eligibility_matches_controls_and_new_presentation_refuses_old_answer() {
+        let (mut app, channel, _, _) = channel_with_a_conversation();
+        app.context_inspector_open = false;
+        drop(app.handle_channel_ui(Action::RequestDelete(channel)));
+        let dialog = app.channel_ui.dialog.as_ref().unwrap();
+        let old_presentation = dialog.presentation;
+        let old_backdrop = app.channel_dialog_dismiss_message().unwrap();
+        let stale_confirm = dialog.control_id(true, true);
+        let cancel = dialog.control_id(false, true);
+        let extra = app.durable.cards[0].id;
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|row| row.id == channel)
+            .unwrap()
+            .cards
+            .push(extra);
+        assert_eq!(app.channel_dialog_focus_target(), Some(cancel.clone()));
+        let (messages, _) = super::super::dialog_ui::tests::key_control(
+            app.channel_dialog_view().unwrap(),
+            stale_confirm,
+            super::super::dialog_ui::tests::key_press(keyboard::key::Named::Enter),
+        );
+        assert!(
+            messages.is_empty(),
+            "a live target change removes enabled confirmation before the next press"
+        );
+        let focus = app.handle_channel_ui(Action::ConfirmDelete);
+        assert_eq!(
+            super::super::tests::focused_element(app.channel_dialog_view().unwrap(), focus),
+            Some(cancel)
+        );
+        assert!(app.channel_ui.dialog.as_ref().unwrap().review_required);
+        drop(app.handle_channel_ui(Action::Dismiss));
+        drop(app.handle_channel_ui(Action::RequestDelete(channel)));
+        let current = app.channel_ui.dialog.as_ref().unwrap().presentation;
+        assert_ne!(old_presentation, current);
+        assert_eq!(
+            app.handle_channel_ui(Action::Answer {
+                presentation: old_presentation,
+                confirm: true
+            })
+            .units(),
+            0
+        );
+        assert_eq!(
+            app.channel_ui.dialog.as_ref().unwrap().presentation,
+            current
+        );
+        drop(app.update(old_backdrop));
+        assert_eq!(
+            app.channel_ui.dialog.as_ref().unwrap().presentation,
+            current,
+            "a queued backdrop dismissal cannot close a replacement presentation"
+        );
+        assert!(!app.channel_ui.deletion_running());
+        app.chat_ui.image_viewer = Some(chat_ui::images::Gallery::file(
+            "/fixture/public-image.png".into(),
+            None,
+            iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
+        ));
+        assert_eq!(
+            app.handle_channel_ui(Action::Answer {
+                presentation: current,
+                confirm: false
+            })
+            .units(),
+            0
+        );
+        assert!(
+            app.channel_ui.modal_open(),
+            "a covered answer cannot close or refocus another owner"
+        );
+    }
+
+    #[test]
+    fn channel_dialog_live_editor_blocker_clears_to_enabled_primary_without_cached_focus() {
+        let (mut app, channel, _, _) = channel_with_a_conversation();
+        let editor = add_deletion_editor(&mut app, channel, 0);
+        let (clean, _) =
+            repository_widget::RepositoryRuntime::open_fixture(editor, "notes.txt", "saved\n");
+        app.cards
+            .insert(editor, CardRuntime::Repository(Box::new(clean)));
+        drop(app.handle_channel_ui(Action::RequestDelete(channel)));
+        let dialog = app.channel_ui.dialog.as_ref().unwrap();
+        let confirm = dialog.control_id(true, true);
+        let cancel = dialog.control_id(false, true);
+        assert_eq!(app.channel_dialog_focus_target(), Some(confirm.clone()));
+        app.cards.insert(
+            editor,
+            CardRuntime::Repository(Box::new(blocked_deletion_editor(editor, 0))),
+        );
+        assert_eq!(app.channel_dialog_focus_target(), Some(cancel.clone()));
+        let focus = app.handle_channel_ui(Action::ConfirmDelete);
+        assert_eq!(
+            super::super::tests::focused_element(app.channel_dialog_view().unwrap(), focus),
+            Some(cancel)
+        );
+        let (clean, _) =
+            repository_widget::RepositoryRuntime::open_fixture(editor, "notes.txt", "saved\n");
+        app.cards
+            .insert(editor, CardRuntime::Repository(Box::new(clean)));
+        assert_eq!(app.channel_dialog_focus_target(), Some(confirm.clone()));
+        assert!(matches!(
+            super::super::dialog_ui::tests::enter_control(
+                app.channel_dialog_view().unwrap(),
+                confirm
+            ),
+            Message::ChannelUi(Action::Answer { confirm: true, .. })
+        ));
+    }
+
+    fn blocked_deletion_editor(id: CardId, mode: u8) -> repository_widget::RepositoryRuntime {
+        match mode {
+            0 => repository_widget::RepositoryRuntime::dirty_fixture(id),
+            1 => {
+                let mut runtime =
+                    repository_widget::RepositoryRuntime::post_persist_warning_fixture(id);
+                // Match the buffer to the persisted snapshot through real edits;
+                // the unresolved durability warning must remain a separate fence.
+                for action in [
+                    iced::widget::text_editor::Action::SelectAll,
+                    iced::widget::text_editor::Action::Edit(
+                        iced::widget::text_editor::Edit::Paste(Arc::new("B\n".into())),
+                    ),
+                ] {
+                    drop(
+                        runtime.update(repository_widget::RepositoryAction::EditorAction {
+                            card: id,
+                            action,
+                        }),
+                    );
+                }
+                assert!(!runtime.is_dirty());
+                assert!(runtime.blocks_navigation());
+                runtime
+            }
+            2 => repository_widget::RepositoryRuntime::post_persist_failure_fixture(id).0,
+            _ => {
+                let (mut runtime, _) =
+                    repository_widget::RepositoryRuntime::open_fixture(id, "notes.txt", "saved\n");
+                let authority = crate::recovery_authority::RecoverySlot::reserve()
+                    .unwrap()
+                    .retain("channel deletion regression".into(), || {
+                        Err("still unresolved".into())
+                    });
+                drop(
+                    runtime.update(repository_widget::RepositoryAction::RetainedSaveFinished {
+                        identity: repository_widget::AsyncIdentity {
+                            card: id,
+                            worktree: runtime.descriptor.worktree.clone(),
+                            path: "notes.txt".into(),
+                            generation: 0,
+                        },
+                        ticket: 0,
+                        revision: 0,
+                        saved_text: "saved\n".into(),
+                        result: Err(crate::editor::retained_save::RetainedSaveError::Recovery {
+                            message: "recover retained save".into(),
+                            authority,
+                        }),
+                    }),
+                );
+                assert!(runtime.has_editor_recovery());
+                assert!(!runtime.is_dirty());
+                runtime
+            }
+        }
+    }
+
+    fn add_deletion_editor(app: &mut Cagents, channel: ChannelId, mode: u8) -> CardId {
+        let id = CardId::new();
+        let runtime = blocked_deletion_editor(id, mode);
+        assert!(runtime.blocks_navigation());
+        if mode == 1 {
+            assert!(
+                !runtime.is_dirty(),
+                "durability recovery must also block a clean buffer"
+            );
+        }
+        let kind = CardKind::Repository(runtime.descriptor.clone());
+        let mut state = app.durable.cards[0].clone();
+        state.id = id;
+        state.kind = kind;
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.push(state);
+        durable
+            .channels
+            .iter_mut()
+            .find(|row| row.id == channel)
+            .unwrap()
+            .cards
+            .push(id);
+        app.cards
+            .insert(id, CardRuntime::Repository(Box::new(runtime)));
+        id
+    }
+
+    #[test]
+    fn channel_delete_admission_keeps_dirty_and_recovery_editors_for_pointer_keyboard_and_retry() {
+        for mode in 0..4 {
+            for request in [
+                Action::Delete as fn(ChannelId) -> Action,
+                Action::RequestDelete,
+                Action::RetryDelete,
+                Action::RetryFailed,
+            ] {
+                let (mut app, channel, _, _) = channel_with_a_conversation();
+                Arc::make_mut(&mut app.durable)
+                    .channels
+                    .iter_mut()
+                    .find(|row| row.id == channel)
+                    .unwrap()
+                    .cards
+                    .clear();
+                let editor = add_deletion_editor(&mut app, channel, mode);
+                let original = app.card_state(editor).unwrap().clone();
+                app.channel_ui
+                    .failed
+                    .insert(channel, "old close failure".into());
+                drop(app.handle_channel_ui(request(channel)));
+                assert!(app.durable.channels.iter().any(|row| row.id == channel));
+                assert_eq!(app.card_state(editor), Some(&original));
+                assert!(
+                    matches!(app.cards.get(&editor), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
+                );
+                assert!(!app.channel_ui.deletion_running());
+                assert!(
+                    app.channel_ui.closing.is_empty(),
+                    "no provider close was issued"
+                );
+                assert!(app.status.as_ref().unwrap().message.contains("editor"));
+            }
+        }
+    }
+
+    #[test]
+    fn channel_delete_confirmation_rejects_added_panes_and_replacement_chat_identity() {
+        for change in ["added", "removed", "replaced"] {
+            let (mut app, channel, _, conversation) = channel_with_a_conversation();
+            drop(app.handle_channel_ui(Action::RequestDelete(channel)));
+            if change == "replaced" {
+                let CardKind::Chat(session) = &mut app.card_state_mut(conversation).unwrap().kind
+                else {
+                    unreachable!()
+                };
+                session.id = crate::model::TerminalId::new();
+            } else if change == "removed" {
+                Arc::make_mut(&mut app.durable)
+                    .channels
+                    .iter_mut()
+                    .find(|row| row.id == channel)
+                    .unwrap()
+                    .cards
+                    .clear();
+            } else {
+                let mut added = app.card_state(conversation).unwrap().clone();
+                added.id = CardId::new();
+                let durable = Arc::make_mut(&mut app.durable);
+                durable
+                    .channels
+                    .iter_mut()
+                    .find(|row| row.id == channel)
+                    .unwrap()
+                    .cards
+                    .push(added.id);
+                durable.cards.push(added);
+            }
+            let current = app.durable.clone();
+            drop(app.handle_channel_ui(Action::ConfirmDelete));
+            assert_eq!(app.durable, current);
+            assert!(!app.channel_ui.deletion_running());
+            assert!(app.channel_ui.closing.is_empty());
+            assert!(
+                app.channel_ui
+                    .dialog
+                    .as_ref()
+                    .unwrap()
+                    .failure
+                    .as_ref()
+                    .unwrap()
+                    .contains("Cancel and review")
+            );
+            assert!(app.channel_ui.dialog.as_ref().unwrap().review_required);
+            drop(app.handle_channel_ui(Action::Dismiss));
+            assert!(!app.channel_ui.modal_open());
+            drop(app.handle_channel_ui(Action::RequestDelete(channel)));
+            drop(app.handle_channel_ui(Action::ConfirmDelete));
+            assert!(
+                app.channel_ui.is_deleting(channel) || app.channel_ui.was_deleted(channel),
+                "a fresh confirmation accepts reviewed contents"
+            );
+        }
+    }
+
+    #[test]
+    fn channel_delete_rechecks_editor_barriers_at_confirm_and_after_close() {
+        for mode in 0..4 {
+            for after_close in [false, true] {
+                let (mut app, channel, _, _) = channel_with_a_conversation();
+                let editor = CardId::new();
+                let (clean, _) = repository_widget::RepositoryRuntime::open_fixture(
+                    editor,
+                    "notes.txt",
+                    "saved\n",
+                );
+                let mut state = app.durable.cards[0].clone();
+                state.id = editor;
+                state.kind = CardKind::Repository(clean.descriptor.clone());
+                let durable = Arc::make_mut(&mut app.durable);
+                durable.cards.push(state);
+                durable
+                    .channels
+                    .iter_mut()
+                    .find(|row| row.id == channel)
+                    .unwrap()
+                    .cards
+                    .push(editor);
+                app.cards
+                    .insert(editor, CardRuntime::Repository(Box::new(clean)));
+                drop(app.handle_channel_ui(Action::RequestDelete(channel)));
+                if after_close {
+                    drop(app.handle_channel_ui(Action::ConfirmDelete));
+                }
+                let blocked = blocked_deletion_editor(editor, mode);
+                app.cards
+                    .insert(editor, CardRuntime::Repository(Box::new(blocked)));
+                if after_close {
+                    let operation = app.channel_ui.close_operation(channel);
+                    drop(app.handle_channel_ui(Action::SessionsClosed(channel, operation, Ok(()))));
+                } else {
+                    drop(app.handle_channel_ui(Action::ConfirmDelete));
+                }
+                assert!(app.durable.channels.iter().any(|row| row.id == channel));
+                assert!(app.card_state(editor).unwrap().existence.is_open());
+                assert!(
+                    matches!(app.cards.get(&editor), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
+                );
+                assert!(!app.channel_ui.deletion_running());
+            }
+        }
+    }
+
+    #[test]
+    fn channel_delete_retry_keeps_original_consent_after_a_close_failure() {
+        let (mut app, channel, _, conversation) = channel_with_a_conversation();
+        drop(app.handle_channel_ui(Action::Delete(channel)));
+        drop(app.handle_channel_ui(Action::ConfirmDelete));
+        let operation = app.channel_ui.close_operation(channel);
+        drop(app.handle_channel_ui(Action::SessionsClosed(
+            channel,
+            operation,
+            Err("offline".into()),
+        )));
+        let CardKind::Chat(session) = &mut app.card_state_mut(conversation).unwrap().kind else {
+            unreachable!()
+        };
+        session.id = crate::model::TerminalId::new();
+        drop(app.handle_channel_ui(Action::RetryFailed(channel)));
+        assert!(!app.channel_ui.deletion_running());
+        assert!(app.channel_ui.closing.is_empty());
+        assert!(app.channel_ui.failed[&channel].contains("Review the channel"));
+        drop(app.handle_channel_ui(Action::Delete(channel)));
+        drop(app.handle_channel_ui(Action::ConfirmDelete));
+        assert!(
+            app.channel_ui.is_deleting(channel),
+            "fresh Delete reviews the replacement and restores progress"
+        );
+    }
+
+    #[test]
+    fn channel_delete_cancel_remains_usable_while_the_focused_editor_is_saving() {
+        let (mut app, channel, _, _) = channel_with_a_conversation();
+        let editor = add_deletion_editor(&mut app, channel, 2);
+        let (clean, _) =
+            repository_widget::RepositoryRuntime::open_fixture(editor, "notes.txt", "saved\n");
+        app.cards
+            .insert(editor, CardRuntime::Repository(Box::new(clean)));
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.focused = Some(editor);
+        durable
+            .channels
+            .iter_mut()
+            .find(|row| row.id == channel)
+            .unwrap()
+            .focused = Some(editor);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        drop(app.handle_channel_ui(Action::RequestDelete(channel)));
+        assert!(app.channel_ui.modal_open());
+        app.cards.insert(
+            editor,
+            CardRuntime::Repository(Box::new(blocked_deletion_editor(editor, 2))),
+        );
+        assert!(app.focused_repository_is_saving());
+        drop(app.handle_channel_ui(Action::Dismiss));
+        assert!(!app.channel_ui.modal_open());
+        assert!(app.card_state(editor).unwrap().existence.is_open());
+        assert!(app.durable.channels.iter().any(|row| row.id == channel));
+    }
+
+    #[test]
+    fn channel_delete_waits_for_pending_start_before_collecting_consent() {
+        let (mut app, channel, _, card) = channel_with_a_conversation();
+        let mut terminal = match app.durable.cards[0].kind.clone() {
+            CardKind::Terminal(terminal) => terminal,
+            _ => unreachable!(),
+        };
+        terminal.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: terminal.launch.clone(),
+            last_exit: None,
+        };
+        app.card_state_mut(card).unwrap().kind = CardKind::Terminal(terminal);
+        app.cards.insert(card, CardRuntime::Loading);
+        app.begin_terminal_start(card);
+        assert!(app.pending_terminal_spawn(card));
+        drop(app.handle_channel_ui(Action::RequestDelete(channel)));
+        assert!(!app.channel_ui.modal_open());
+        assert!(!app.channel_ui.deletion_running());
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("finish opening")
+        );
+        drop(app.finish_terminal_start(card));
+        drop(app.handle_channel_ui(Action::RequestDelete(channel)));
+        assert!(
+            app.channel_ui.modal_open(),
+            "the settled pane can be reviewed and deleted"
+        );
+    }
+
+    #[test]
+    fn channel_delete_can_progress_after_editor_recovery_is_resolved() {
+        for mode in 0..4 {
+            let (mut app, channel, _, _) = channel_with_a_conversation();
+            Arc::make_mut(&mut app.durable)
+                .channels
+                .iter_mut()
+                .find(|row| row.id == channel)
+                .unwrap()
+                .cards
+                .clear();
+            let editor = add_deletion_editor(&mut app, channel, mode);
+            drop(app.handle_channel_ui(Action::Delete(channel)));
+            assert!(!app.channel_ui.was_deleted(channel));
+            let (clean, _) =
+                repository_widget::RepositoryRuntime::open_fixture(editor, "notes.txt", "saved\n");
+            app.cards
+                .insert(editor, CardRuntime::Repository(Box::new(clean)));
+            drop(app.handle_channel_ui(Action::Delete(channel)));
+            assert!(app.channel_ui.was_deleted(channel));
+            assert!(!app.card_state(editor).unwrap().existence.is_open());
+        }
+    }
+
+    #[test]
+    fn project_channel_delete_uses_fresh_scope_consent_after_an_individual_failure() {
+        let (mut app, channel, _, conversation) = channel_with_a_conversation();
+        drop(app.handle_channel_ui(Action::Delete(channel)));
+        drop(app.handle_channel_ui(Action::ConfirmDelete));
+        let operation = app.channel_ui.close_operation(channel);
+        drop(app.handle_channel_ui(Action::SessionsClosed(
+            channel,
+            operation,
+            Err("offline".into()),
+        )));
+        let CardKind::Chat(session) = &mut app.card_state_mut(conversation).unwrap().kind else {
+            unreachable!()
+        };
+        session.id = crate::model::TerminalId::new();
+        drop(app.delete_channels(vec![channel]));
+        assert!(app.channel_ui.is_deleting(channel));
+        assert_ne!(app.channel_ui.close_operation(channel), operation);
+    }
+
+    #[test]
+    fn channel_delete_own_navigation_can_discard_an_unused_automatic_draft() {
+        let (mut app, channel, _, conversation) = channel_with_a_conversation();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|row| row.id == channel)
+            .unwrap()
+            .cards
+            .clear();
+        drop(app.select_channel(channel));
+        assert!(app.active_workspace.is_some());
+        drop(app.add_default_pane(PathBuf::from("/repo"), settings::DefaultPane::NativeChat));
+        let draft = app.workspace.focused().unwrap();
+        assert!(app.chat_is_unused_default(draft));
+        assert_ne!(draft, conversation);
+        drop(app.handle_channel_ui(Action::RequestDelete(channel)));
+        assert!(app.channel_ui.modal_open());
+        drop(app.handle_channel_ui(Action::ConfirmDelete));
+        assert!(
+            app.channel_ui.was_deleted(channel),
+            "own draft cleanup must not invalidate consent"
+        );
+        assert!(app.card_state(draft).is_none());
+        assert!(!app.channel_ui.failed.contains_key(&channel));
+    }
+
+    #[test]
+    fn channel_delete_own_navigation_can_prune_an_already_closed_member() {
+        let (mut app, channel, _, conversation) = channel_with_a_conversation();
+        drop(app.select_channel(channel));
+        let mut closed = app.card_state(conversation).unwrap().clone();
+        closed.id = CardId::new();
+        closed.existence = super::super::project_ui::removed_existence("closed before deletion");
+        let durable = Arc::make_mut(&mut app.durable);
+        durable
+            .channels
+            .iter_mut()
+            .find(|row| row.id == channel)
+            .unwrap()
+            .cards
+            .push(closed.id);
+        durable.cards.push(closed);
+        drop(app.handle_channel_ui(Action::RequestDelete(channel)));
+        drop(app.handle_channel_ui(Action::ConfirmDelete));
+        let operation = app.channel_ui.close_operation(channel);
+        drop(app.handle_channel_ui(Action::SessionsClosed(channel, operation, Ok(()))));
+        assert!(app.channel_ui.was_deleted(channel));
+        assert!(!app.channel_ui.failed.contains_key(&channel));
+    }
+
+    #[test]
+    fn inactive_channel_delete_survives_unrelated_navigation_pruning_closed_members() {
+        let (mut app, channel, survivor, conversation) = channel_with_a_conversation();
+        drop(app.select_channel(survivor));
+        let mut closed = app.card_state(conversation).unwrap().clone();
+        closed.id = CardId::new();
+        closed.existence = super::super::project_ui::removed_existence("closed before deletion");
+        let durable = Arc::make_mut(&mut app.durable);
+        durable
+            .channels
+            .iter_mut()
+            .find(|row| row.id == channel)
+            .unwrap()
+            .cards
+            .push(closed.id);
+        durable.cards.push(closed);
+        drop(app.handle_channel_ui(Action::RequestDelete(channel)));
+        drop(app.handle_channel_ui(Action::ConfirmDelete));
+        let operation = app.channel_ui.close_operation(channel);
+        drop(app.select_worktree(PathBuf::from("/repo"), false));
+        drop(app.handle_channel_ui(Action::SessionsClosed(channel, operation, Ok(()))));
+        assert!(app.channel_ui.was_deleted(channel));
+        assert!(!app.channel_ui.failed.contains_key(&channel));
+        assert!(app.durable.channels.iter().any(|row| row.id == survivor));
     }
 
     #[test]
