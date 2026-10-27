@@ -71,6 +71,7 @@ impl Listing {
                         view_scope: None,
                         channel_repository: None,
                         state: cagents::agent::ActivityState::Working,
+                        status: None,
                         directory: Some("/fixture".into()),
                         worktree: Some("/fixture".into()),
                         project: Some("/fixture/.git".into()),

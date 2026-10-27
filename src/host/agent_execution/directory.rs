@@ -1,6 +1,8 @@
 //! Answers directory reads from the live hosted sessions and the durable
 //! delegation records. Reading confers no authority over any listed session.
 
+mod status;
+
 use super::{SharedHost, caller, registry};
 use crate::{
     agent::{ActivityState, Provider},
@@ -23,6 +25,7 @@ pub(in crate::host) struct Live {
     pub(in crate::host) provider: Option<Provider>,
     pub(in crate::host) title: Option<String>,
     pub(in crate::host) state: ActivityState,
+    pub(super) observed: Option<crate::agent_execution::directory::ExecutionStatus>,
     pub(in crate::host) directory: PathBuf,
 }
 
@@ -33,14 +36,19 @@ pub(super) fn read(
 ) -> Result<Directory, String> {
     // Reading confers nothing, so a capability whose session has ended reads
     // as a caller outside cagents rather than failing the whole listing.
-    let (caller_origin, caller) = caller(host, authority).unwrap_or((Origin::User, None));
+    let resolved_caller = caller(host, authority);
+    let caller_authorized = resolved_caller.is_ok();
+    let (caller_origin, caller) = resolved_caller.unwrap_or((Origin::User, None));
+    let caller_owner = Owner::from(&caller_origin);
     let mut live = live_sessions(host);
-    let (model, delegations, lineages) = {
+    let (model, delegations, mut run_details, lineages, pending_lineages) = {
         let registry = registry(host)?;
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         let model = registry.model()?;
         let lineages = registry.session_lineages(live.iter().map(|entry| entry.id))?;
         let mut delegations = BTreeMap::new();
+        let mut run_details = BTreeMap::new();
+        let pending_lineages = registry.pending_message_lineages()?;
         // Only a live session's delegation is listed, so only its latest run
         // is read.
         for agent in &model.agents {
@@ -51,6 +59,9 @@ pub(super) fn read(
                 continue;
             }
             let run = registry.latest_agent_run(agent.id)?;
+            let may_read_private = caller_authorized
+                && (Some(session.id()) == caller || Owner::from(&agent.origin) == caller_owner);
+            run_details.insert(session.id(), status::run(&run, may_read_private));
             delegations.insert(
                 session.id(),
                 (
@@ -64,7 +75,7 @@ pub(super) fn read(
                 ),
             );
         }
-        (model, delegations, lineages)
+        (model, delegations, run_details, lineages, pending_lineages)
     };
     let lineage = |id: TerminalId| lineages.get(&id).copied().unwrap_or(Lineage(id));
     // A plain shell is listed only where it matters: as the caller, or as the
@@ -76,7 +87,6 @@ pub(super) fn read(
                 .values()
                 .any(|(delegation, _)| delegation.owner == Owner::Session(lineage(entry.id)))
     });
-    let caller_owner = Owner::from(&caller_origin);
     let parent = caller
         .and_then(|caller| delegations.get(&caller))
         .and_then(|(delegation, _)| match delegation.owner {
@@ -138,6 +148,23 @@ pub(super) fn read(
         if !related && wanted.is_some() && project != wanted {
             continue;
         }
+        let may_read_private = caller_authorized
+            && (relation == Relation::Myself
+                || delegation
+                    .as_ref()
+                    .is_some_and(|delegation| delegation.owner == caller_owner));
+        let pending_message = pending_lineages.contains(&lineage(live.id));
+        let current_status = (live.surface == Surface::Chat
+            || delegation.is_some()
+            || (may_read_private && pending_message))
+            .then(|| {
+                status::project(
+                    live.observed,
+                    run_details.remove(&live.id),
+                    may_read_private,
+                    pending_message,
+                )
+            });
         let entry = Entry {
             id: live.id,
             surface: live.surface,
@@ -154,6 +181,7 @@ pub(super) fn read(
                     .map(|channel| channel.title.clone())
             }),
             state: live.state,
+            status: current_status,
             directory: Some(live.directory),
             worktree,
             project_name: project
@@ -234,13 +262,18 @@ pub(in crate::host) fn live_sessions(host: &SharedHost) -> Vec<Live> {
         if record.handle.is_completed() {
             continue;
         }
+        let observed = record.handle.execution_status();
+        let activity = observed
+            .as_ref()
+            .map_or_else(|| record.handle.activity(), |sample| sample.activity);
         live.push(Live {
             id: *id,
             surface: Surface::Chat,
             provider: Some(record.session.launch.provider),
             // Resident metadata only; a directory read never loads a transcript.
             title: record.handle.title(),
-            state: record.handle.activity(),
+            state: activity,
+            observed,
             directory: record.session.launch.recipe.working_directory.clone(),
         });
     }
@@ -260,6 +293,7 @@ pub(in crate::host) fn live_sessions(host: &SharedHost) -> Vec<Live> {
             provider: activity.map(|activity| activity.provider),
             title: record.conversation_title().map(str::to_owned),
             state: activity.map_or(ActivityState::Unknown, |activity| activity.state),
+            observed: None,
             directory: record.current_directory().to_path_buf(),
         });
     }

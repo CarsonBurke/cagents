@@ -200,6 +200,7 @@ struct Inner {
     wake: Mutex<UnixStream>,
     state: Arc<Mutex<Snapshot>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
+    execution_status: Arc<Mutex<Option<crate::agent_execution::directory::ExecutionStatus>>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -428,6 +429,7 @@ impl LocalHandle {
         let failure = Arc::new(Mutex::new(None));
         let store = Arc::new(Mutex::new(store));
         let confirmed_session = Arc::new(Mutex::new(None));
+        let execution_status = Arc::new(Mutex::new(None));
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
         let retain_cleanup_receipt = Arc::new(AtomicBool::new(false));
@@ -439,6 +441,7 @@ impl LocalHandle {
             wake: Mutex::new(wake),
             state: state.clone(),
             confirmed_session: confirmed_session.clone(),
+            execution_status: execution_status.clone(),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
             stop: stop.clone(),
@@ -485,6 +488,7 @@ impl LocalHandle {
                     adapter,
                     state,
                     confirmed_session,
+                    execution_status,
                     store,
                     visible,
                     observe_next,
@@ -1253,6 +1257,18 @@ impl LocalHandle {
             .activity()
     }
 
+    /// Last whole-frame request/activity publication; reads no transcript or
+    /// transport and does not claim the provider acknowledged an outbound run.
+    pub(crate) fn execution_status(
+        &self,
+    ) -> Option<crate::agent_execution::directory::ExecutionStatus> {
+        self.0
+            .execution_status
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
     /// Update preflights need activity without loading the transcript window.
     pub(crate) fn update_activity(&self) -> (bool, bool) {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -1874,6 +1890,7 @@ struct Actor {
     adapter: Box<dyn Adapter>,
     state: Arc<Mutex<Snapshot>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
+    execution_status: Arc<Mutex<Option<crate::agent_execution::directory::ExecutionStatus>>>,
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
@@ -2933,6 +2950,33 @@ impl Actor {
             self.dirty = true;
         }
         let activity = state.activity();
+        let active_run = self.execution.active();
+        let status_changed = {
+            let mut published = self
+                .execution_status
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            // Generation is an output of this publication, not an identity
+            // input: comparing it here would manufacture an endless edge.
+            let changed = published.as_ref().is_none_or(|previous| {
+                previous.activity != activity
+                    || previous.parent_busy != state.busy
+                    || previous.turn_generation != state.turn_generation
+                    || previous.active_run != active_run
+            });
+            if changed {
+                state.generation = state.generation.saturating_add(1);
+                self.dirty = true;
+            }
+            *published = Some(crate::agent_execution::directory::ExecutionStatus {
+                activity,
+                generation: state.generation,
+                turn_generation: state.turn_generation,
+                parent_busy: state.busy,
+                active_run,
+            });
+            changed
+        };
         let generation = state.generation;
         let waiting_fingerprint = if activity == ActivityState::Waiting {
             state.waiting_fingerprint()
@@ -2947,6 +2991,12 @@ impl Actor {
         let became_available = prompt_available && !self.prompt_available;
         self.prompt_available = prompt_available;
         drop(state);
+        if status_changed {
+            // A Settled-only frame may keep aggregate Working unchanged due
+            // to a background child. Wake the existing retained observation
+            // path only after the coherent cache is published.
+            (self.notify)(Update::Observed { generation });
+        }
         let baselined = std::mem::replace(&mut self.attention_baselined, true);
         let activity_changed = activity != self.activity;
         if activity_changed {
