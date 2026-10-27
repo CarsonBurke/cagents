@@ -60,6 +60,20 @@ pub fn focused_key<'a, Message: 'a>(
     .into()
 }
 
+/// A held Enter may move focus into a newly opened confirmation. Its native
+/// repeats must not activate that control; a fresh Enter still does.
+pub(crate) fn non_repeating_activation<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::NonRepeatingActivation,
+        tip: None,
+        on_focused_key: None,
+    }
+    .into()
+}
+
 #[derive(Default)]
 struct ChildFocus(bool);
 
@@ -1241,6 +1255,7 @@ fn fill_overflow_fade(renderer: &mut Renderer, bounds: Rectangle, from: Color, t
 enum Kind {
     KeyboardList(bool),
     FocusedKey,
+    NonRepeatingActivation,
     ListRow,
     ListEntry,
     TabHistory(bool),
@@ -1297,6 +1312,7 @@ struct HoverTag;
 struct TabHistoryTag;
 struct KeyboardListTag;
 struct FocusedKeyTag;
+struct NonRepeatingActivationTag;
 struct ListRowTag;
 struct FadeTag;
 struct TooltipTag;
@@ -1351,6 +1367,7 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         match self.kind {
             Kind::KeyboardList(_) => tree::Tag::of::<KeyboardListTag>(),
             Kind::FocusedKey => tree::Tag::of::<FocusedKeyTag>(),
+            Kind::NonRepeatingActivation => tree::Tag::of::<NonRepeatingActivationTag>(),
             Kind::ListRow | Kind::ListEntry => tree::Tag::of::<ListRowTag>(),
             Kind::TabHistory(_) => tree::Tag::of::<TabHistoryTag>(),
             Kind::Hover => tree::Tag::of::<HoverTag>(),
@@ -1461,6 +1478,31 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if matches!(self.kind, Kind::NonRepeatingActivation)
+            && !shell.is_event_captured()
+            && matches!(
+                event,
+                Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
+                    key: cosmic::iced::keyboard::Key::Named(
+                        cosmic::iced::keyboard::key::Named::Enter
+                    ),
+                    repeat: true,
+                    ..
+                })
+            )
+        {
+            let mut focus = ChildFocus::default();
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                &mut focus,
+            );
+            if focus.0 {
+                shell.capture_event();
+                return;
+            }
+        }
         if let Some(on_key) = &self.on_focused_key
             && let Event::Keyboard(event) = event
         {
@@ -1588,7 +1630,10 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             shell,
             viewport,
         );
-        if matches!(self.kind, Kind::TabHistory(_)) {
+        if matches!(
+            self.kind,
+            Kind::TabHistory(_) | Kind::NonRepeatingActivation
+        ) {
             return;
         }
         if matches!(self.kind, Kind::ContextMenu) {
@@ -1937,6 +1982,81 @@ mod tests {
                 Modifiers::CTRL | Modifiers::ALT
             ),
             None
+        );
+    }
+
+    #[test]
+    fn repeated_activation_is_captured_only_inside_the_focused_control() {
+        use cosmic::iced::{
+            keyboard,
+            runtime::{UserInterface, user_interface::Cache},
+        };
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let guarded = Id::new("activation.guarded");
+        let foreign = Id::new("activation.foreign");
+        let content = widget::column::with_children(vec![
+            non_repeating_activation(
+                widget::button::custom(crate::design::body("Guarded"))
+                    .id(guarded.clone())
+                    .on_press(1_u8),
+            ),
+            widget::button::custom(crate::design::body("Foreign"))
+                .id(foreign.clone())
+                .on_press(2_u8)
+                .into(),
+        ]);
+        let mut ui = UserInterface::build(
+            content,
+            Size::new(320.0, 160.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        let enter = |repeat| {
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat,
+            })
+        };
+        let mut messages = Vec::new();
+        // An unfocused guard must not consume another native control's key.
+        ui.operate(&renderer, &mut operation::focusable::focus::<()>(foreign));
+        ui.update(
+            &[enter(true)],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(messages, [2]);
+        messages.clear();
+        ui.operate(&renderer, &mut operation::focusable::focus::<()>(guarded));
+        let (_, statuses) = ui.update(
+            &[enter(true)],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(statuses, [cosmic::iced::event::Status::Captured]);
+        assert!(messages.is_empty());
+        ui.update(
+            &[enter(false)],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(
+            messages,
+            [1],
+            "a fresh native Enter still activates exactly once"
         );
     }
 

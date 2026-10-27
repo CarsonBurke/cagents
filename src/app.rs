@@ -4661,6 +4661,7 @@ struct PendingPanelOpen {
 }
 
 struct DirtyRepositoryClose {
+    presentation: uuid::Uuid,
     card: CardId,
     remaining: VecDeque<CardId>,
     intent: DirtyCloseIntent,
@@ -5226,6 +5227,7 @@ pub struct Cagents {
     /// Resetting settings destroys every customization with no undo, so it
     /// confirms first like every other destructive action in the shell.
     settings_reset_confirm: bool,
+    settings_reset_presentation: uuid::Uuid,
     settings_reset_focus_confirm: bool,
     settings_reset_keyboard_nav: Option<bool>,
     pull_request_dialog: Option<PullRequestDialog>,
@@ -12810,16 +12812,16 @@ impl Cagents {
         // while dirty-close is topmost; Cancel re-checks the live modal tree
         // and uses this only when none remains.
         let restore_card = self.workspace.focused();
-        let focused = DirtyCloseControl::Cancel;
+        let focused = self.preferred_dirty_close_control(card);
         self.dirty_repository_close = Some(DirtyRepositoryClose {
+            presentation: uuid::Uuid::new_v4(),
             card,
             remaining: cards,
             intent,
             focused,
             restore_card,
         });
-        iced::widget::operation::focus(dirty_close_control_id(card, focused))
-            .map(cosmic::Action::App)
+        self.focus_exposed_dialog()
     }
 
     fn close_pane_group(&mut self) -> Task<Message> {
@@ -12842,23 +12844,16 @@ impl Cagents {
         if matches!(self.cards.get(&close.card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
         {
             let card = close.card;
-            let focused = DirtyCloseControl::Cancel;
-            close.focused = focused;
+            close.focused = self.preferred_dirty_close_control(card);
             self.dirty_repository_close = Some(close);
-            return iced::widget::operation::focus(dirty_close_control_id(card, focused))
-                .map(cosmic::Action::App);
+            return self.focus_exposed_dialog();
         }
         if let Some(card) = close.next_unresolved(|card| {
             matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
         }) {
-            let focused = DirtyCloseControl::Cancel;
-            close.focused = focused;
+            close.focused = self.preferred_dirty_close_control(card);
             self.dirty_repository_close = Some(close);
-            return iced::widget::operation::focus(dirty_close_control_id(
-                card,
-                focused,
-            ))
-            .map(cosmic::Action::App);
+            return self.focus_exposed_dialog();
         }
         match close.intent {
             DirtyCloseIntent::PaneGroup => self.close_pane_group(),
@@ -12879,14 +12874,52 @@ impl Cagents {
         if matches!(close.intent, DirtyCloseIntent::PaneGroup) {
             self.chrome_ui.closing_group.clear();
         }
-        let restore_focus = self.nested_modal_focus_target().unwrap_or_else(|| {
-            resolve_restore_card(close.restore_card, self.workspace.focused(), |card| {
-                self.workspace.order().any(|candidate| candidate == card)
-            })
-            .map(|card| self.card_keyboard_focus(card))
-            .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID))
-        });
-        iced::widget::operation::focus(restore_focus).map(cosmic::Action::App)
+        self.restore_dialog_focus(|| {
+            let target =
+                resolve_restore_card(close.restore_card, self.workspace.focused(), |card| {
+                    self.workspace.order().any(|candidate| candidate == card)
+                })
+                .map(|card| self.card_keyboard_focus(card))
+                .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID));
+            dialog_ui::focus_target_task(target)
+        })
+    }
+
+    fn preferred_dirty_close_control(&self, card: CardId) -> DirtyCloseControl {
+        if matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.can_save())
+        {
+            DirtyCloseControl::Save
+        } else {
+            DirtyCloseControl::Cancel
+        }
+    }
+
+    fn dirty_close_focus_target(&self) -> Option<widget::Id> {
+        let close = self.dirty_repository_close.as_ref()?;
+        let CardRuntime::Repository(runtime) = self.cards.get(&close.card)? else {
+            return None;
+        };
+        let enabled = |control| match control {
+            DirtyCloseControl::Cancel => !runtime.is_saving(),
+            DirtyCloseControl::Discard => runtime.can_abandon_unsaved_changes(),
+            DirtyCloseControl::Save => runtime.can_save(),
+        };
+        let control = if enabled(close.focused) {
+            close.focused
+        } else if runtime.can_save() {
+            DirtyCloseControl::Save
+        } else if !runtime.is_saving() {
+            DirtyCloseControl::Cancel
+        } else {
+            return None;
+        };
+        Some(dirty_close_control_id(
+            close.presentation,
+            close.card,
+            control,
+            true,
+            control == DirtyCloseControl::Save && runtime.has_save_conflict(),
+        ))
     }
 
     fn nested_modal_focus_target(&self) -> Option<widget::Id> {
@@ -12896,14 +12929,14 @@ impl Cagents {
         if self.resume_ui.open {
             return Some(resume_ui::focus_id());
         }
-        if let Some(dialog) = &self.sidebar_selection_ui.dialog {
-            Some(dialog.focus_target())
+        if self.sidebar_selection_ui.dialog.is_some() {
+            self.sidebar_selection_dialog_focus_target()
         } else if self.sidebar_state.pending_discard().is_some() {
             Some(sidebar::discard_cancel_id())
         } else if self.project_ui.modal_open() {
             Some(self.project_ui.focus_target())
         } else if self.channel_ui.modal_open() {
-            Some(channel_ui::State::focus_target())
+            self.channel_dialog_focus_target()
         } else if self.worktree_dialog.is_some() {
             Some(worktree_dialog_focus_id())
         } else if self.pull_request_dialog.is_some() {
@@ -12959,20 +12992,26 @@ impl Cagents {
         let Some(close) = self.dirty_repository_close.as_mut() else {
             return Task::none();
         };
-        let saving = matches!(
-            self.cards.get(&close.card),
-            Some(CardRuntime::Repository(runtime)) if runtime.is_saving()
-        );
-        if saving {
+        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&close.card) else {
+            return Task::none();
+        };
+        if runtime.is_saving() {
             return Task::none();
         }
-        let discardable = matches!(
-            self.cards.get(&close.card),
-            Some(CardRuntime::Repository(runtime)) if runtime.can_abandon_unsaved_changes()
-        );
-        close.focused = next_dirty_close_control(close.focused, backwards, saving, discardable);
-        iced::widget::operation::focus(dirty_close_control_id(close.card, close.focused))
-            .map(cosmic::Action::App)
+        let discardable = runtime.can_abandon_unsaved_changes();
+        for _ in 0..3 {
+            close.focused = next_dirty_close_control(close.focused, backwards, false, discardable);
+            if close.focused != DirtyCloseControl::Save || runtime.can_save() {
+                return dialog_ui::focus_target_task(dirty_close_control_id(
+                    close.presentation,
+                    close.card,
+                    close.focused,
+                    true,
+                    close.focused == DirtyCloseControl::Save && runtime.has_save_conflict(),
+                ));
+            }
+        }
+        Task::none()
     }
 
     fn utility_card(&self, kind: &CardKind) -> Option<CardId> {
@@ -13659,18 +13698,34 @@ impl Cagents {
             return Task::none();
         }
         self.settings_reset_focus_confirm = false;
+        self.settings_reset_presentation = uuid::Uuid::nil();
         if let Some(restore) = self.settings_reset_keyboard_nav.take() {
             self.core.set_keyboard_nav(restore);
         }
-        let target = if self.settings_card_focused() {
-            widget::Id::new("settings.reset")
-        } else {
-            self.workspace.focused().map_or_else(
-                || widget::Id::new(TOOLBAR_FOCUS_ID),
-                |card| self.card_keyboard_focus(card),
-            )
-        };
-        iced::widget::operation::focus(target).map(cosmic::Action::App)
+        self.restore_dialog_focus(|| {
+            let target = if self.settings_card_focused() {
+                widget::Id::new("settings.reset")
+            } else {
+                self.workspace.focused().map_or_else(
+                    || widget::Id::new(TOOLBAR_FOCUS_ID),
+                    |card| self.card_keyboard_focus(card),
+                )
+            };
+            dialog_ui::focus_target_task(target)
+        })
+    }
+
+    fn reset_settings_control_id(&self, confirm: bool) -> widget::Id {
+        let role = if confirm { "confirm" } else { "cancel" };
+        widget::Id::new(format!(
+            "dialog.reset-settings.{}.{role}",
+            self.settings_reset_presentation
+        ))
+    }
+
+    fn reset_dialog_focus_target(&self) -> Option<widget::Id> {
+        self.settings_reset_confirm
+            .then(|| self.reset_settings_control_id(self.settings_reset_focus_confirm))
     }
 
     fn reset_settings(&mut self) -> Task<Message> {
@@ -13956,6 +14011,7 @@ impl Application for Cagents {
             repository_load_sequence: 0,
             worktree_dialog: None,
             settings_reset_confirm: false,
+            settings_reset_presentation: uuid::Uuid::nil(),
             settings_reset_focus_confirm: false,
             settings_reset_keyboard_nav: None,
             pull_request_dialog: None,
@@ -15291,6 +15347,7 @@ impl Application for Cagents {
                     }
                     SidebarAction::DeleteRow(row) => self.delete_sidebar_row(row),
                     SidebarAction::DeleteSelectedRows => self.begin_sidebar_group_delete(),
+                    SidebarAction::DeleteSelectedRowsFrom(row) => self.begin_sidebar_group_delete_from(row),
                     SidebarAction::ClearRowSelection => {
                         self.sidebar_state.clear_row_selection();
                         Task::none()
@@ -16974,13 +17031,7 @@ impl Application for Cagents {
                     }
                     if is_tab_press(&event).is_some() {
                         self.settings_reset_focus_confirm = !self.settings_reset_focus_confirm;
-                        let target = if self.settings_reset_focus_confirm {
-                            "dialog.reset-settings.confirm"
-                        } else {
-                            "dialog.reset-settings.cancel"
-                        };
-                        return iced::widget::operation::focus(widget::Id::new(target))
-                            .map(cosmic::Action::App);
+                        return self.focus_exposed_dialog();
                     }
                 }
                 if is_escape_press(&event) && !captured {
@@ -17320,11 +17371,11 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 self.settings_reset_confirm = true;
-                self.settings_reset_focus_confirm = false;
+                self.settings_reset_presentation = uuid::Uuid::new_v4();
+                self.settings_reset_focus_confirm = true;
                 self.settings_reset_keyboard_nav = Some(self.core.keyboard_nav());
                 self.core.set_keyboard_nav(false);
-                iced::widget::operation::focus(widget::Id::new("dialog.reset-settings.cancel"))
-                    .map(cosmic::Action::App)
+                self.focus_exposed_dialog()
             }
             Message::CancelResetSettings => self.close_settings_reset(),
             Message::ConfirmResetSettings => {
@@ -17928,6 +17979,8 @@ impl Application for Cagents {
         // discard every shortcut, font, theme and language-server entry the
         // user configured, with no undo.
         if self.settings_reset_confirm {
+            let cancel_id = self.reset_settings_control_id(false);
+            let confirm_id = self.reset_settings_control_id(true);
             return Some(dialog_ui::overlay(
                 dialog_ui::surface(
                     widget::column::with_children(vec![
@@ -17939,12 +17992,18 @@ impl Application for Cagents {
                         ),
                         notice_detail("This cannot be undone."),
                         dialog_ui::confirmation_actions(
-                            crate::ui_controls::button::secondary("Cancel")
-                                .id(widget::Id::new("dialog.reset-settings.cancel"))
-                                .on_press(Message::CancelResetSettings),
-                            crate::ui_controls::button::destructive("Reset settings")
-                                .id(widget::Id::new("dialog.reset-settings.confirm"))
-                                .on_press(Message::ConfirmResetSettings),
+                            crate::ui_controls::owned(
+                                cancel_id.clone(),
+                                crate::ui_controls::button::secondary("Cancel")
+                                    .id(cancel_id)
+                                    .on_press(Message::CancelResetSettings),
+                            ),
+                            crate::ui_controls::owned(
+                                confirm_id.clone(),
+                                crate::ui_controls::button::destructive("Reset settings")
+                                    .id(confirm_id)
+                                    .on_press(Message::ConfirmResetSettings),
+                            ),
                         ),
                     ])
                     .spacing(space::M),
@@ -18001,23 +18060,47 @@ impl Application for Cagents {
                 } else {
                     Message::SaveAndCloseRepository(card)
                 });
-            let mut controls: Vec<Element<'_, Message>> = vec![
+            let mut controls: Vec<Element<'_, Message>> = vec![crate::ui_controls::owned(
+                (
+                    close.presentation,
+                    card,
+                    DirtyCloseControl::Cancel,
+                    !runtime.is_saving(),
+                ),
                 crate::ui_controls::button::secondary("Cancel")
-                    .id(dirty_close_control_id(card, DirtyCloseControl::Cancel))
+                    .id(dirty_close_control_id(
+                        close.presentation,
+                        card,
+                        DirtyCloseControl::Cancel,
+                        !runtime.is_saving(),
+                        false,
+                    ))
                     .on_press_maybe(
                         (!runtime.is_saving()).then_some(Message::CancelRepositoryClose),
-                    )
-                    .into(),
-            ];
+                    ),
+            )];
             if runtime.can_abandon_unsaved_changes() {
-                controls.push(
+                controls.push(crate::ui_controls::owned(
+                    (close.presentation, card, DirtyCloseControl::Discard, true),
                     crate::ui_controls::button::destructive("Discard")
-                        .id(dirty_close_control_id(card, DirtyCloseControl::Discard))
-                        .on_press(Message::DiscardAndCloseRepository(card))
-                        .into(),
-                );
+                        .id(dirty_close_control_id(
+                            close.presentation,
+                            card,
+                            DirtyCloseControl::Discard,
+                            true,
+                            false,
+                        ))
+                        .on_press(Message::DiscardAndCloseRepository(card)),
+                ));
             }
-            controls.push(
+            controls.push(crate::ui_controls::owned(
+                (
+                    close.presentation,
+                    card,
+                    DirtyCloseControl::Save,
+                    runtime.can_save(),
+                    runtime.has_save_conflict(),
+                ),
                 crate::ui_controls::button::primary(if runtime.has_save_conflict() {
                     "Overwrite and close"
                 } else if runtime.has_durability_warning() {
@@ -18025,10 +18108,15 @@ impl Application for Cagents {
                 } else {
                     "Save and close"
                 })
-                .id(dirty_close_control_id(card, DirtyCloseControl::Save))
-                .on_press_maybe(save_message)
-                .into(),
-            );
+                .id(dirty_close_control_id(
+                    close.presentation,
+                    card,
+                    DirtyCloseControl::Save,
+                    runtime.can_save(),
+                    runtime.has_save_conflict(),
+                ))
+                .on_press_maybe(save_message),
+            ));
             let dismiss = controls.remove(0);
             rows.push(dialog_ui::confirmation_actions(
                 dismiss,
@@ -18646,13 +18734,22 @@ fn context_inspector_toggle_id() -> widget::Id {
     widget::Id::new("command.toggle-context-inspector")
 }
 
-fn dirty_close_control_id(card: CardId, control: DirtyCloseControl) -> widget::Id {
+fn dirty_close_control_id(
+    presentation: uuid::Uuid,
+    card: CardId,
+    control: DirtyCloseControl,
+    enabled: bool,
+    overwrite: bool,
+) -> widget::Id {
     let control = match control {
         DirtyCloseControl::Cancel => "cancel",
         DirtyCloseControl::Discard => "discard",
+        DirtyCloseControl::Save if overwrite => "overwrite",
         DirtyCloseControl::Save => "save",
     };
-    widget::Id::new(format!("dialog.dirty-close.{card}.{control}"))
+    widget::Id::new(format!(
+        "dialog.dirty-close.{presentation}.{card}.{control}.{enabled}"
+    ))
 }
 
 /// The pull-request dialog's first field, focused when it opens.
@@ -20019,6 +20116,7 @@ mod tests {
         let third = CardId::new();
         let window = window::Id::unique();
         let mut close = DirtyRepositoryClose {
+            presentation: uuid::Uuid::new_v4(),
             card: first,
             remaining: VecDeque::from([second, third]),
             intent: DirtyCloseIntent::Application(window),
@@ -22489,6 +22587,7 @@ mod tests {
         let fixture = CloseSaveFixture::install(&mut app, card);
         let failure = fixture.post_persist_warning(&mut app, card);
         app.dirty_repository_close = Some(DirtyRepositoryClose {
+            presentation: uuid::Uuid::new_v4(),
             card,
             remaining: VecDeque::new(),
             intent: DirtyCloseIntent::Card(card),
@@ -22549,6 +22648,7 @@ mod tests {
         let fixture = CloseSaveFixture::install(&mut app, card);
         let failure = fixture.post_persist_warning(&mut app, card);
         app.dirty_repository_close = Some(DirtyRepositoryClose {
+            presentation: uuid::Uuid::new_v4(),
             card,
             remaining: VecDeque::new(),
             intent: DirtyCloseIntent::Application(window),
@@ -23005,7 +23105,7 @@ mod tests {
         let task = app.update(Message::ResetSettings);
         assert_eq!(
             focused_element(cosmic::Application::dialog(&app).unwrap(), task),
-            Some(widget::Id::new("dialog.reset-settings.cancel"))
+            Some(app.reset_settings_control_id(true))
         );
         assert!(!app.core.keyboard_nav());
         let press = |key, backwards| keyboard::Event::KeyPressed {
@@ -23027,19 +23127,14 @@ mod tests {
         };
         // Both directions wrap within the two actions, even if a child has
         // captured the key before the application receives it.
-        for (backwards, target) in [
-            (false, "dialog.reset-settings.confirm"),
-            (false, "dialog.reset-settings.cancel"),
-            (true, "dialog.reset-settings.confirm"),
-            (true, "dialog.reset-settings.cancel"),
-        ] {
+        for (backwards, confirm) in [(false, false), (false, true), (true, false), (true, true)] {
             let task = app.update(Message::KeyEvent {
                 event: press(keyboard::key::Named::Tab, backwards),
                 captured: true,
             });
             assert_eq!(
                 focused_element(cosmic::Application::dialog(&app).unwrap(), task),
-                Some(widget::Id::new(target))
+                Some(app.reset_settings_control_id(confirm))
             );
         }
         let task = app.update(Message::KeyEvent {
@@ -23058,14 +23153,20 @@ mod tests {
     }
 
     #[test]
-    fn dirty_editor_confirmation_starts_on_cancel_and_enter_preserves_edits() {
+    fn dirty_editor_confirmation_starts_on_save_and_cancel_preserves_edits() {
         let (mut app, card) = editing_repository_app();
         let opening = app.update(Message::CloseCard(card));
-        let cancel = dirty_close_control_id(card, DirtyCloseControl::Cancel);
+        let primary = app.dirty_close_focus_target().unwrap();
         assert_eq!(
             focused_element(app.dialog().unwrap(), opening),
-            Some(cancel.clone())
+            Some(primary.clone())
         );
+        assert!(
+            matches!(dialog_ui::tests::enter_control(app.dialog().unwrap(), primary), Message::SaveAndCloseRepository(id) if id == card)
+        );
+        let presentation = app.dirty_repository_close.as_ref().unwrap().presentation;
+        let cancel =
+            dirty_close_control_id(presentation, card, DirtyCloseControl::Cancel, true, false);
         let message = dialog_ui::tests::enter_control(app.dialog().unwrap(), cancel);
         assert!(matches!(message, Message::CancelRepositoryClose));
         drop(app.update(message));
@@ -23074,6 +23175,421 @@ mod tests {
         assert!(
             matches!(&app.cards[&card],CardRuntime::Repository(runtime) if runtime.is_dirty() && !runtime.is_saving())
         );
+    }
+
+    #[test]
+    fn real_reset_opener_batch_and_held_enter_cannot_confirm_the_new_dialog() {
+        use iced::{
+            Event, Size,
+            advanced::{clipboard, widget::operation},
+            mouse,
+            runtime::{UserInterface, user_interface::Cache},
+        };
+        let mut renderer = headless_renderer();
+        let size = Size::new(1600.0, 1200.0);
+        let enter = |repeat| {
+            let mut event = dialog_ui::tests::key_press(keyboard::key::Named::Enter);
+            if let keyboard::Event::KeyPressed { repeat: value, .. } = &mut event {
+                *value = repeat;
+            }
+            Event::Keyboard(event)
+        };
+        let release = || {
+            Event::Keyboard(keyboard::Event::KeyReleased {
+                key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+            })
+        };
+        for released_in_old_batch in [false, true] {
+            let mut app = context_inspector_test_app(true);
+            app.context_inspector_open = false;
+            let card = app.workspace.focused().unwrap();
+            app.cards.insert(card, CardRuntime::Settings);
+            app.card_state_mut(card).unwrap().kind = CardKind::Settings;
+            app.settings_category = SettingsCategory::General;
+            let mut ui = UserInterface::build(app.view(), size, Cache::new(), &mut renderer);
+            ui.operate(
+                &renderer,
+                &mut operation::focusable::focus::<()>(widget::Id::new("settings.reset")),
+            );
+            let mut opening = vec![enter(false)];
+            if released_in_old_batch {
+                opening.push(release());
+            }
+            let mut messages = Vec::new();
+            ui.update(
+                &opening,
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert_eq!(
+                messages.len(),
+                1,
+                "the actual settings view emits one opening action"
+            );
+            assert!(matches!(messages[0], Message::ResetSettings));
+            let cache = ui.into_cache();
+            let focus = app.update(messages.pop().unwrap());
+            // All old-view native input is complete before the real reducer
+            // opens the dialog. The new UI gets redraw, never replayed input.
+            let mut ui = UserInterface::build(app.dialog().unwrap(), size, cache, &mut renderer);
+            let mut stream = iced::runtime::task::into_stream(focus).unwrap();
+            iced::futures::executor::block_on(async {
+                while let Some(action) = stream.next().await {
+                    let iced::runtime::Action::Widget(mut op) = action else {
+                        continue;
+                    };
+                    loop {
+                        ui.operate(&renderer, op.as_mut());
+                        match op.finish() {
+                            operation::Outcome::Chain(next) => op = next,
+                            _ => break,
+                        }
+                    }
+                }
+            });
+            ui.update(
+                &[Event::Window(window::Event::RedrawRequested(
+                    iced::time::Instant::now(),
+                ))],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert!(messages.is_empty());
+            if !released_in_old_batch {
+                let (_, statuses) = ui.update(
+                    &[enter(true)],
+                    mouse::Cursor::Unavailable,
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                assert_eq!(statuses, [iced::event::Status::Captured]);
+                assert!(
+                    messages.is_empty(),
+                    "a genuine later native repeat cannot confirm reset"
+                );
+                let cache = ui.into_cache();
+                let Event::Keyboard(event) = enter(true) else {
+                    unreachable!()
+                };
+                drop(app.update(Message::KeyEvent {
+                    event,
+                    captured: true,
+                }));
+                assert!(
+                    app.settings_reset_confirm,
+                    "the real reducer must not synthesize a confirmation"
+                );
+                ui = UserInterface::build(app.dialog().unwrap(), size, cache, &mut renderer);
+                ui.update(
+                    &[release()],
+                    mouse::Cursor::Unavailable,
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                assert!(messages.is_empty());
+            }
+            ui.update(
+                &[enter(false)],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert_eq!(messages.len(), 1);
+            assert!(
+                matches!(messages[0], Message::ConfirmResetSettings),
+                "a distinct fresh Enter reaches the enabled primary"
+            );
+            drop(ui);
+            drop(app.update(messages.pop().unwrap()));
+            assert!(!app.settings_reset_confirm);
+        }
+    }
+
+    #[test]
+    fn reopening_reset_retires_native_focus_and_held_press_of_the_old_presentation() {
+        use iced::{
+            Event, Point, Size,
+            advanced::{clipboard, widget::operation},
+            mouse,
+            runtime::{UserInterface, user_interface::Cache},
+        };
+        let mut app = context_inspector_test_app(false);
+        drop(app.update(Message::ResetSettings));
+        let old_id = app.reset_settings_control_id(true);
+        let mut renderer = headless_renderer();
+        let size = Size::new(800.0, 600.0);
+        let mut ui = UserInterface::build(app.dialog().unwrap(), size, Cache::new(), &mut renderer);
+        let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+        let bounds = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| node.node().label() == Some("Reset settings"))
+            .and_then(|node| node.node().bounds())
+            .unwrap();
+        let cursor = mouse::Cursor::Available(Point::new(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        ));
+        let mut messages = Vec::new();
+        ui.update(
+            &[Event::Mouse(mouse::Event::ButtonPressed(
+                mouse::Button::Left,
+            ))],
+            cursor,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert!(messages.is_empty());
+        let cache = ui.into_cache();
+        drop(app.update(Message::CancelResetSettings));
+        let opening = app.update(Message::ResetSettings);
+        let new_id = app.reset_settings_control_id(true);
+        assert_ne!(old_id, new_id);
+        let mut ui = UserInterface::build(app.dialog().unwrap(), size, cache, &mut renderer);
+        // Establish the new legitimate focus before delivering an old task.
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(new_id.clone()),
+        );
+        let mut stream =
+            iced::runtime::task::into_stream(dialog_ui::focus_target_task(old_id)).unwrap();
+        iced::futures::executor::block_on(async {
+            while let Some(iced::runtime::Action::Widget(mut op)) = stream.next().await {
+                loop {
+                    ui.operate(&renderer, op.as_mut());
+                    match op.finish() {
+                        operation::Outcome::Chain(next) => op = next,
+                        _ => break,
+                    }
+                }
+            }
+        });
+        ui.update(
+            &[Event::Mouse(mouse::Event::ButtonReleased(
+                mouse::Button::Left,
+            ))],
+            cursor,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert!(
+            messages.is_empty(),
+            "held old press cannot reset a newly presented dialog"
+        );
+        ui.update(
+            &[Event::Keyboard(dialog_ui::tests::key_press(
+                keyboard::key::Named::Enter,
+            ))],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(
+            messages.len(),
+            1,
+            "stale focus must not blur the legitimate new primary"
+        );
+        assert!(matches!(messages[0], Message::ConfirmResetSettings));
+        drop(ui);
+        drop(opening);
+    }
+
+    #[test]
+    fn dirty_close_focus_tracks_real_save_availability_without_enabling_a_stale_target() {
+        let (mut app, card) = editing_repository_app();
+        let opening = app.update(Message::CloseCard(card));
+        let save = app.dirty_close_focus_target().unwrap();
+        assert_eq!(
+            focused_element(app.dialog().unwrap(), opening),
+            Some(save.clone())
+        );
+        let (saving, _) = RepositoryRuntime::post_persist_failure_fixture(card);
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(saving)));
+        assert!(app.dirty_close_focus_target().is_none());
+        assert_eq!(app.focus_exposed_dialog().units(), 0);
+        let (messages, _) = dialog_ui::tests::key_control(
+            app.dialog().unwrap(),
+            save,
+            dialog_ui::tests::key_press(keyboard::key::Named::Enter),
+        );
+        assert!(
+            messages.is_empty(),
+            "a previously eligible Save cannot activate while saving"
+        );
+        // A clean external refresh leaves no eligible Save. Cancellation stays
+        // usable; neither initial focus nor Tab may select disabled Save.
+        let (clean, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "saved\n");
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(clean)));
+        let cancel = app.dirty_close_focus_target().unwrap();
+        assert_eq!(
+            focused_element(app.dialog().unwrap(), app.focus_exposed_dialog()),
+            Some(cancel.clone())
+        );
+        let tab = app.cycle_dirty_close_focus(false);
+        assert_eq!(
+            focused_element(app.dialog().unwrap(), tab),
+            Some(cancel.clone())
+        );
+        assert!(matches!(
+            dialog_ui::tests::enter_control(app.dialog().unwrap(), cancel),
+            Message::CancelRepositoryClose
+        ));
+    }
+
+    #[test]
+    fn reset_with_no_native_focus_does_not_confirm_from_an_uncaptured_enter_repeat() {
+        use iced::{
+            Event, Size,
+            advanced::{clipboard, widget::operation},
+            mouse,
+            runtime::{UserInterface, user_interface::Cache},
+        };
+        let mut app = context_inspector_test_app(false);
+        drop(app.update(Message::ResetSettings));
+        let mut renderer = headless_renderer();
+        let mut ui = UserInterface::build(
+            app.dialog().unwrap(),
+            Size::new(800.0, 600.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        // This explicitly tests absent focus, not a fabricated capture flag.
+        ui.operate(&renderer, &mut operation::focusable::unfocus::<()>());
+        let mut event = dialog_ui::tests::key_press(keyboard::key::Named::Enter);
+        if let keyboard::Event::KeyPressed { repeat, .. } = &mut event {
+            *repeat = true;
+        }
+        let mut messages = Vec::new();
+        let (_, statuses) = ui.update(
+            &[Event::Keyboard(event.clone())],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(statuses, [iced::event::Status::Ignored]);
+        assert!(messages.is_empty());
+        drop(ui);
+        drop(app.update(Message::KeyEvent {
+            event,
+            captured: false,
+        }));
+        assert!(app.settings_reset_confirm);
+        assert!(app.dialog().is_some());
+    }
+
+    #[test]
+    fn a_cached_save_press_cannot_become_overwrite_after_a_conflict() {
+        use iced::{
+            Event, Point, Size,
+            advanced::clipboard,
+            mouse,
+            runtime::{UserInterface, user_interface::Cache},
+        };
+        let (mut app, card) = editing_repository_app();
+        drop(app.update(Message::CloseCard(card)));
+        let save_id = app.dirty_close_focus_target().unwrap();
+        let mut renderer = headless_renderer();
+        let size = Size::new(800.0, 600.0);
+        let mut ui = UserInterface::build(app.dialog().unwrap(), size, Cache::new(), &mut renderer);
+        let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+        let bounds = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| node.node().label() == Some("Save and close"))
+            .and_then(|node| node.node().bounds())
+            .unwrap();
+        let cursor = mouse::Cursor::Available(Point::new(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        ));
+        let mut messages = Vec::new();
+        ui.update(
+            &[Event::Mouse(mouse::Event::ButtonPressed(
+                mouse::Button::Left,
+            ))],
+            cursor,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert!(messages.is_empty());
+        let cache = ui.into_cache();
+        // Existing in-memory runtime fixtures deliver the real conflict and
+        // editor reducers; this does not execute a save or mutate disk.
+        let (mut runtime, _) = RepositoryRuntime::post_persist_failure_fixture(card);
+        runtime.set_auto_save(false);
+        let conflict = runtime.conflicted_active_save_completion();
+        drop(runtime.update(conflict));
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: repository_widget::EditorAction::Edit(repository_widget::EditorEdit::Insert(
+                '!',
+            )),
+        }));
+        assert!(runtime.has_save_conflict() && runtime.can_save());
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        let overwrite_id = app.dirty_close_focus_target().unwrap();
+        assert_ne!(save_id, overwrite_id);
+        let mut ui = UserInterface::build(app.dialog().unwrap(), size, cache, &mut renderer);
+        let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+        let bounds = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| node.node().label() == Some("Overwrite and close"))
+            .and_then(|node| node.node().bounds())
+            .unwrap();
+        let cursor = mouse::Cursor::Available(Point::new(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        ));
+        ui.update(
+            &[Event::Mouse(mouse::Event::ButtonReleased(
+                mouse::Button::Left,
+            ))],
+            cursor,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert!(
+            messages.is_empty(),
+            "old Save press must not authorize Overwrite"
+        );
+        ui.update(
+            &[
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ],
+            cursor,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(messages[0], Message::OverwriteAndCloseRepository(id) if id == card));
     }
 
     #[test]
@@ -23929,8 +24445,8 @@ mod tests {
             },
         ));
         assert_eq!(
-            app.nested_modal_focus_target().unwrap().to_string(),
-            worktree_dialog_focus_id().to_string()
+            focused_element(app.dialog().unwrap(), app.focus_exposed_dialog()),
+            Some(worktree_dialog_focus_id())
         );
 
         app.worktree_dialog = None;
@@ -23946,16 +24462,19 @@ mod tests {
             retry_confirmation: None,
         });
         assert_eq!(
-            app.nested_modal_focus_target().unwrap().to_string(),
-            pull_request_dialog_focus_id().to_string()
+            focused_element(app.dialog().unwrap(), app.focus_exposed_dialog()),
+            Some(pull_request_dialog_focus_id())
         );
 
         app.pull_request_dialog = None;
         app.window_width = 900.0;
         assert!(app.context_inspector_is_overlay());
         assert_eq!(
-            app.nested_modal_focus_target().unwrap().to_string(),
-            context_inspector_toggle_id().to_string()
+            focused(
+                &app,
+                app.restore_dialog_focus(|| app.focus_context_overlay_if_exposed())
+            ),
+            Some(context_inspector_toggle_id())
         );
     }
 
@@ -28503,6 +29022,7 @@ mod tests {
             repository_load_sequence: 0,
             worktree_dialog: None,
             settings_reset_confirm: false,
+            settings_reset_presentation: uuid::Uuid::nil(),
             settings_reset_focus_confirm: false,
             settings_reset_keyboard_nav: None,
             pull_request_dialog: None,
@@ -29727,6 +30247,7 @@ mod tests {
             app.cards
                 .insert(card, CardRuntime::Repository(Box::new(runtime)));
             app.dirty_repository_close = Some(DirtyRepositoryClose {
+                presentation: uuid::Uuid::new_v4(),
                 card,
                 remaining: VecDeque::new(),
                 intent: DirtyCloseIntent::Card(card),
