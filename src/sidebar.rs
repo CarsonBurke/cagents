@@ -8158,24 +8158,6 @@ fn source_control_header<'a>(
         .width(Length::Fill)
         .into(),
     ]);
-    if let Some(branch) = worktree
-        .and_then(|row| row.branch.as_deref())
-        .filter(|_| !worktree.is_some_and(|row| row.detached))
-    {
-        header = header.push(icon_action(
-            Icon::CopyPath,
-            format!("Copy branch {branch}"),
-            gated(
-                SidebarAction::ProjectCommand {
-                    project_id: key.project_id,
-                    worktree_id: Some(key.worktree_id),
-                    command: ProjectCommand::CopyBranch,
-                },
-                modal_open,
-            ),
-            entity_id("source.copy-branch", key.worktree_id),
-        ));
-    }
     match view {
         PanelView::Files => {
             header = header.push(
@@ -12504,7 +12486,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn inspector_header_exposes_an_explicit_copy_branch_action() {
+    fn inspector_header_keeps_view_controls_without_a_dedicated_branch_copy_action() {
         let renderer = headless_renderer();
         let row = worktree(11, "feature/auth-fix", false);
         let mut source = source_control();
@@ -12514,8 +12496,13 @@ pub(crate) mod tests {
             &renderer,
             source_control_header(&state, &source, Some(&row), false, PanelView::Files),
         );
-        assert!(actions.iter().any(|action| matches!(action,
-            SidebarAction::ProjectCommand { worktree_id: Some(id), command: ProjectCommand::CopyBranch, .. } if *id == row.id)));
+        assert_eq!(
+            actions,
+            vec![SidebarAction::ToggleFilesFilter {
+                key: source.key.clone()
+            }],
+            "the header keeps its Files control; Copy branch belongs in the row menu"
+        );
         assert_eq!(row.label(), row.branch.as_deref().unwrap());
     }
 

@@ -240,6 +240,22 @@ where
         clipboard: &mut dyn Clipboard,
         messages: &mut Vec<Message>,
     ) -> (State, Vec<event::Status>) {
+        self.update_with_sources(
+            events, &[], cursor, renderer, clipboard, messages,
+        )
+    }
+
+    /// Dispatch aligned native provenance while retaining the old untagged API.
+    pub fn update_with_sources(
+        &mut self,
+        events: &[Event],
+        sources: &[crate::core::keyboard::input::Source],
+        cursor: mouse::Cursor,
+        renderer: &mut Renderer,
+        clipboard: &mut dyn Clipboard,
+        messages: &mut Vec<Message>,
+    ) -> (State, Vec<event::Status>) {
+        assert!(sources.is_empty() || sources.len() == events.len());
         // The supplied cursor is the position at the END of this batch.
         // A later motion must not change the target of an earlier press.
         let has_motion = events.iter().any(|event| {
@@ -314,6 +330,9 @@ where
                 for (index, (event, event_cursor)) in
                     events.iter().zip(&event_cursors).enumerate()
                 {
+                    let _source = crate::core::keyboard::input::scope(
+                        sources.get(index).cloned().unwrap_or_default(),
+                    );
                     let mut shell = Shell::new(messages);
 
                     // Overlay hit testing must use this event's position too.
@@ -418,7 +437,11 @@ where
             .iter()
             .zip(overlay_statuses)
             .zip(base_cursors)
-            .map(|((event, overlay_status), event_cursor)| {
+            .enumerate()
+            .map(|(index, ((event, overlay_status), event_cursor))| {
+                let _source = crate::core::keyboard::input::scope(
+                    sources.get(index).cloned().unwrap_or_default(),
+                );
                 if matches!(overlay_status, event::Status::Captured) {
                     return overlay_status;
                 }
