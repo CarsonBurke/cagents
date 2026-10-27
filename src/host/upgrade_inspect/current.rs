@@ -105,6 +105,11 @@ impl Client {
                 | ClientRequest::ChatList
                 | ClientRequest::ResolveUpgradeChat { .. }
                 | ClientRequest::ChatDetach { .. }
+                | ClientRequest::ChatAttach { .. }
+                | ClientRequest::ChatVisibility { .. }
+                | ClientRequest::ChatRead { .. }
+                | ClientRequest::ChatReleaseInspect { .. }
+                | ClientRequest::ChatRelease { .. }
         ) && !matches!(&request, ClientRequest::ChatStart { session, source: None, terminate_source: false, execution_environment }
             if self.protocol == 119 && session.native_continuity.retains_provider() && execution_environment.0.is_empty())
         {
@@ -112,7 +117,12 @@ impl Client {
         }
         let bootstrap_chat = match &request {
             ClientRequest::ChatStart { session, .. } if self.protocol == 119 => Some(session.id),
-            ClientRequest::ChatDetach { chat_id } if self.protocol == 119 => Some(*chat_id),
+            ClientRequest::ChatAttach { session } => Some(session.id),
+            ClientRequest::ChatDetach { chat_id }
+            | ClientRequest::ChatVisibility { chat_id, .. }
+            | ClientRequest::ChatRead { chat_id, .. }
+            | ClientRequest::ChatReleaseInspect { chat_id } => Some(*chat_id),
+            ClientRequest::ChatRelease { proof, .. } => Some(proof.session.id),
             _ => None,
         };
         let request_id = self.next;
@@ -154,6 +164,7 @@ impl Client {
             let event_chat = match envelope.message {
                 ServerMessage::ChatActivity { chat_id, .. }
                 | ServerMessage::ChatObserved { chat_id, .. }
+                | ServerMessage::ChatChanged { chat_id }
                 | ServerMessage::ChatAccountUsage { chat_id, .. } => Some(chat_id),
                 _ => None,
             };
@@ -246,12 +257,125 @@ impl Client {
             _ => Err("Source did not authenticate a saved conversation's lineage".into()),
         }
     }
+
+    /// Use only the existing forced-history Attach API. The request's current
+    /// proof addresses that read-only API; it is never persisted as a recovered
+    /// descriptor or presented as evidence of an old provider's execution.
+    /// Both the host's owner fences and exact release/coverage checks remain.
+    pub(super) fn inspect_saved_history(&mut self, source: &Session) -> Result<(), String> {
+        if ![119, ipc::PROTOCOL_VERSION].contains(&self.protocol)
+            || !source.is_saved_claude_history()
+        {
+            return Err("Saved history has no qualified read-only inspection API".into());
+        }
+        let mut requested = source.clone();
+        requested.proof = Some(self.proof.clone());
+        let response = self.request(
+            ClientRequest::ChatAttach {
+                session: requested.clone(),
+            },
+            true,
+        )?;
+        let inspection = (|| {
+            let ServerResponse::ChatAttached {
+                session,
+                mut snapshot,
+            } = response
+            else {
+                return Err("Saved history did not return its exact attachment".into());
+            };
+            if session != requested {
+                return Err(
+                    "Saved history changed its exact account, recipe or conversation".into(),
+                );
+            }
+            if !matches!(
+                self.request(
+                    ClientRequest::ChatVisibility {
+                        chat_id: source.id,
+                        visible: true
+                    },
+                    true
+                )?,
+                ServerResponse::Accepted
+            ) {
+                return Err("Saved history could not be inspected".into());
+            }
+            for _ in 0..64 {
+                if snapshot.exited
+                    && snapshot.read_only_reason.is_some()
+                    && !snapshot.history_loading
+                {
+                    if snapshot.session_id == source.launch.session_id
+                        && matches!(
+                            snapshot.native_continuity,
+                            crate::chat::NativeContinuity::ReconnectOnly
+                        )
+                        && !snapshot.busy
+                        && !snapshot.waiting
+                        && snapshot.requests.is_empty()
+                        && snapshot.error.is_none()
+                    {
+                        return Ok(());
+                    }
+                    return Err(
+                        "Saved history did not confirm an exact settled read-only conversation"
+                            .into(),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(5));
+                match self.request(
+                    ClientRequest::ChatRead {
+                        chat_id: source.id,
+                        after_generation: None,
+                    },
+                    true,
+                )? {
+                    ServerResponse::ChatSnapshot {
+                        chat_id,
+                        snapshot: Some(current),
+                    } if chat_id == source.id => snapshot = current,
+                    _ => return Err("Saved history did not publish its exact transcript".into()),
+                }
+            }
+            Err("Saved history exceeded the bounded readiness budget".into())
+        })();
+        let detached = self.request(ClientRequest::ChatDetach { chat_id: source.id }, true)?;
+        if !matches!(detached, ServerResponse::Detached) {
+            return Err("Saved history inspection could not detach its reader".into());
+        }
+        inspection?;
+        let ServerResponse::ChatReleaseInspected { inspection } = self.request(
+            ClientRequest::ChatReleaseInspect { chat_id: source.id },
+            true,
+        )?
+        else {
+            return Err("Saved history did not return its release inspection".into());
+        };
+        if inspection.proof.session != requested || inspection.release_blocked.is_some() {
+            return Err("Saved history still owns protected state; its reader was retained".into());
+        }
+        match self.request(
+            ClientRequest::ChatRelease {
+                proof: inspection.proof.clone(),
+                dry_run: false,
+            },
+            true,
+        )? {
+            ServerResponse::ChatReleased {
+                inspection: released,
+                dry_run: false,
+            } if released == inspection => Ok(()),
+            _ => Err("Saved history release changed its exact witness".into()),
+        }
+    }
 }
 
 // These versions have identical Connect/List/ChatList/ResolveUpgradeChat tags
 // and inventory DTOs. Version 100 appends capacity operations; 101 requires
 // atomic managed-pane adoption without changing these DTOs. This restricted
-// reader never accepts Snapshot, whose layout may change independently.
+// Inventory uses the frozen restricted decoder. The separate retained/history
+// methods admit full snapshots only for the explicitly qualified119/current pair.
 // Versions 102 (Copy sidecars), 103 (retained Claude continuity) and 104 (the
 // appended Work board request) preserve this subset, including the existing
 // continuity enum discriminants.
@@ -819,6 +943,79 @@ mod tests {
         assert!(
             matches!(peer.read(&mut [0]), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
         );
+    }
+
+    #[test]
+    fn legacy_history_preview_only_attaches_reads_detaches_and_releases_actual_witness() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let source = super::super::tests::session();
+        let mut requested = source.clone();
+        requested.proof = Some(proof());
+        let expected = requested.clone();
+        let worker = std::thread::spawn(move || {
+            let witness = crate::terminal_ipc::ChatReleaseInspection {
+                proof: crate::terminal_ipc::ChatReleaseProof {
+                    session: expected.clone(),
+                    execution_instance: uuid::Uuid::new_v4(),
+                    generation: 7,
+                },
+                release_blocked: None,
+            };
+            for step in 0..5 {
+                let request: ClientEnvelope = ipc::read_frame(&mut peer).unwrap().unwrap();
+                assert_eq!(request.version, 119);
+                assert_eq!(request.proof, Some(proof()));
+                let response = match (step, request.request) {
+                    (0, ClientRequest::ChatAttach { session }) if session == expected => ServerResponse::ChatAttached {
+                        session,
+                        snapshot: crate::chat::Snapshot {
+                            session_id: expected.launch.session_id.clone(), exited: true,
+                            read_only_reason: Some("Saved conversation history is read-only; no provider was started.".into()),
+                            ..Default::default()
+                        },
+                    },
+                    (1, ClientRequest::ChatVisibility { chat_id, visible: true }) if chat_id == expected.id => ServerResponse::Accepted,
+                    (2, ClientRequest::ChatDetach { chat_id }) if chat_id == expected.id => ServerResponse::Detached,
+                    (3, ClientRequest::ChatReleaseInspect { chat_id }) if chat_id == expected.id => ServerResponse::ChatReleaseInspected { inspection: witness.clone() },
+                    (4, ClientRequest::ChatRelease { proof, dry_run: false }) if proof == witness.proof => ServerResponse::ChatReleased { inspection: witness.clone(), dry_run: false },
+                    other => panic!("Unexpected history request (no Start or Close permitted): {other:?}"),
+                };
+                // Only exact target-chat events may interleave with the reply.
+                ipc::write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: 119,
+                        request_id: None,
+                        proof: proof(),
+                        message: ServerMessage::ChatChanged {
+                            chat_id: expected.id,
+                        },
+                    },
+                )
+                .unwrap();
+                ipc::write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: 119,
+                        request_id: Some(request.request_id),
+                        proof: proof(),
+                        message: ServerMessage::Response { response },
+                    },
+                )
+                .unwrap();
+            }
+        });
+        let mut client = Client {
+            stream,
+            proof: proof(),
+            next: 1,
+            protocol: 119,
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+        client.inspect_saved_history(&source).unwrap();
+        assert_ne!(source, requested, "original saved proof remains unchanged");
+        drop(client);
+        worker.join().unwrap();
     }
 
     #[test]

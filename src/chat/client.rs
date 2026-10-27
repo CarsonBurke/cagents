@@ -1207,6 +1207,12 @@ fn restore(
             refusal.unwrap_or_else(|| "No authenticated native holder was available.".into())
         )));
     }
+    if session.launch.provider == crate::agent::Provider::Claude {
+        return Err(StartFailure::from(format!(
+            "Saved Claude history could not be opened without starting a provider. Its exact conversation and draft are retained. {}",
+            refusal.unwrap_or_else(|| "No authenticated history attachment was available.".into())
+        )));
+    }
     if session.launch.session_id.is_none() {
         return Err(StartFailure::fresh(format!(
             "The daemon that was hosting this conversation is no longer running, and this card never recorded a conversation to resume. {}",

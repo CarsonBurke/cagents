@@ -138,7 +138,15 @@ pub(in crate::host) fn resolve(
     if missing {
         // Client zero is the existing unattached startup-adoption mode.
         // Resolve must not subscribe this connection before its Attach.
-        super::native_recovery::restore(host, 0, source).map_err(unavailable)?;
+        if let Err(native_error) = super::native_recovery::restore(host, 0, source) {
+            // A missing holder is not permission to execute its old recipe.
+            // The separate history constructor can only page saved data and
+            // repeats owner/managed-work fences under its admission guard.
+            if !source.is_saved_claude_history() {
+                return Err(unavailable(native_error));
+            }
+            super::capacity::recover_saved_history(host, source)?;
+        }
     }
     let resolved = super::resolve_upgrade(host, source)?;
     let mut grant = {

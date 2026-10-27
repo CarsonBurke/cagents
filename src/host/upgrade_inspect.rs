@@ -90,6 +90,12 @@ impl Reader {
             Self::Legacy68(client) => client.resolve(source),
         }
     }
+    fn inspect_saved_history(&mut self, source: &Session) -> Result<(), String> {
+        match self {
+            Self::Current(client) => client.inspect_saved_history(source),
+            _ => Err("Source has no qualified read-only history API".into()),
+        }
+    }
 }
 
 fn connect(request: &Request, deadline: Instant) -> Result<Reader, String> {
@@ -198,6 +204,7 @@ fn inspect(request: Request) -> Result<(), String> {
     // with the same actor ID cannot borrow each other's authentication.
     let initial_inventory = reader.list()?;
     let mut resolutions: Vec<(Session, Result<Session, String>)> = Vec::new();
+    let mut cold_history = Vec::new();
     for (_, kind) in &saved {
         check_deadline(deadline)?;
         if let CardKind::Chat(source) = kind {
@@ -219,6 +226,15 @@ fn inspect(request: Request) -> Result<(), String> {
                 } else {
                     reader.resolve(source)
                 };
+                if missing
+                    && source.is_saved_claude_history()
+                    && !result
+                        .as_ref()
+                        .is_ok_and(|resolved| resolved.native_continuity.retains_provider())
+                    && reader.inspect_saved_history(source).is_ok()
+                {
+                    cold_history.push(source.clone());
+                }
                 resolutions.push((source.clone(), result));
             }
         }
@@ -282,6 +298,9 @@ fn inspect(request: Request) -> Result<(), String> {
                 }
             }
             CardKind::Chat(source) if !source.is_unstarted() => {
+                if cold_history.iter().any(|issued| issued == &source) {
+                    continue;
+                }
                 if qualify_with_mode(
                     &source,
                     &inventory,

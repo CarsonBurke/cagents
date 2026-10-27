@@ -1353,6 +1353,71 @@ mod tests {
         assert!(host.lock().unwrap().chats.is_empty());
         assert!(host.lock().unwrap().chat_spawning.is_empty());
     }
+
+    #[test]
+    fn old_epoch_history_recovery_uses_real_handshake_without_launching_65_providers() {
+        use std::os::unix::fs::PermissionsExt;
+        let started = Instant::now();
+        let host = host();
+        let (directory, template, _) = closed_history(&host);
+        let original = inspect(&host, template.id).unwrap();
+        release(&host, &original.proof, false).unwrap();
+        let program = directory.path().join("must-not-run-provider");
+        let marker = directory.path().join("provider-was-started");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\ntouch '{}'\nexit 91\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for index in 0..65 {
+            // Half the run exercises a restored cwd. Neither filesystem state
+            // may select the provider constructor instead of forced History.
+            if index == 32 {
+                std::fs::create_dir(&template.launch.recipe.working_directory).unwrap();
+            }
+            let mut source = template.clone();
+            source.id = TerminalId::new();
+            source.launch.recipe.program = program.to_string_lossy().into_owned();
+            source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+            source.proof.as_mut().unwrap().host_incarnation =
+                HostIncarnation::new("previous-daemon");
+            let transcript = provider_history_path(&source);
+            std::fs::write(&transcript, serde_json::json!({"type":"user","uuid":format!("item-{index}"),"parentUuid":null,"sessionId":source.launch.session_id,"message":{"role":"user","content":"durable history body"}}).to_string()+"\n").unwrap();
+            let (client, server) = restore_client(&host, source.clone(), 100 + index);
+            let client = client.unwrap();
+            wait_for_client_history(&client, true);
+            let mut expected = source.clone();
+            expected.proof = Some(host.lock().unwrap().proof().clone());
+            assert_eq!(client.session(), expected);
+            let witness = client
+                .authenticated_upgrade_recovery()
+                .expect("actual Resolve/Attach witness");
+            assert!(witness.validate());
+            assert_eq!(witness.source(), &source);
+            assert_eq!(witness.replacement(), &expected);
+            {
+                let state = host.lock().unwrap();
+                let reader = &state.chats[&source.id];
+                assert!(reader.handle.is_read_only_history());
+                assert!(!reader.handle.owns_work());
+                assert!(!reader.subscribers.contains_key(&0));
+                assert!(!reader.observations.contains_key(&0));
+            }
+            assert!(!marker.exists(), "automatic restore launched a provider");
+            drop(client);
+            server.join().unwrap();
+            let release_proof = inspect(&host, source.id).unwrap();
+            assert_eq!(release_proof.release_blocked, None);
+            release(&host, &release_proof.proof, false).unwrap();
+        }
+        assert!(host.lock().unwrap().chats.is_empty());
+        assert!(!marker.exists());
+        eprintln!(
+            "65 exact history handshakes and releases: {:?}",
+            started.elapsed()
+        );
+    }
 }
 
 pub(in crate::host) fn status(host: &SharedHost) -> crate::terminal_ipc::ChatCapacity {
@@ -1665,8 +1730,16 @@ pub(super) fn restore_saved_history(
                 session,
                 handle: handle.clone(),
                 source_process: None,
-                subscribers: BTreeMap::from([(client, false)]),
-                observations: BTreeMap::from([(client, observation)]),
+                subscribers: if client == 0 {
+                    BTreeMap::new()
+                } else {
+                    BTreeMap::from([(client, false)])
+                },
+                observations: if client == 0 {
+                    BTreeMap::new()
+                } else {
+                    BTreeMap::from([(client, observation)])
+                },
                 completion_observed: false,
                 returning_terminal: false,
             };
@@ -1686,6 +1759,50 @@ pub(super) fn restore_saved_history(
     }
     drop(admission);
     result
+}
+
+/// Reopen saved data across daemon epochs, without upgrading it to execution
+/// ownership. The host issues the new proof only after the normal history
+/// constructor verifies the exact thread/account and fences native owners and
+/// managed agents. The old descriptor remains an exact Resolve alias.
+pub(super) fn recover_saved_history(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<(), ProtocolError> {
+    if !source.is_saved_claude_history() {
+        return Err(unavailable(
+            "This saved pane has no supported read-only history route",
+        ));
+    }
+    let mut session = source.clone();
+    session.proof = Some(
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .proof()
+            .clone(),
+    );
+    restore_saved_history(host, 0, session.clone())?;
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let record = state
+        .chats
+        .get(&source.id)
+        .ok_or_else(|| unavailable("Saved history changed during recovery"))?;
+    if record.session != session
+        || !record.handle.is_read_only_history()
+        || record.handle.owns_work()
+    {
+        return Err(unavailable(
+            "Saved history did not confirm a read-only attachment",
+        ));
+    }
+    let sources = state.upgrade_chats.entry(source.id).or_default();
+    if !sources.iter().any(|previous| previous.source == *source) {
+        sources.push(crate::upgrade::handoff::ChatSource {
+            source: source.clone(),
+            launch: source.launch.clone(),
+        });
+    }
+    Ok(())
 }
 
 pub(in crate::host) fn release(

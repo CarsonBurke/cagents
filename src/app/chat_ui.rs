@@ -3155,6 +3155,21 @@ impl Runtime {
             return Err("Conversation connection closed during recovery".into());
         }
         let snapshot = handle.snapshot();
+        if self.session.is_saved_claude_history()
+            && snapshot.exited
+            && snapshot.read_only_reason.is_some()
+            && snapshot.session_id == self.session.launch.session_id
+            && matches!(
+                snapshot.native_continuity,
+                crate::chat::NativeContinuity::ReconnectOnly
+            )
+            && snapshot.error.is_none()
+            && !snapshot.busy
+            && !snapshot.waiting
+            && snapshot.requests.is_empty()
+        {
+            return Ok(!snapshot.history_loading);
+        }
         if snapshot.exited || snapshot.read_only_reason.is_some() {
             return Err("Conversation cannot accept a message after recovery".into());
         }

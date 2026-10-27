@@ -828,6 +828,24 @@ impl Session {
         self.valid_native_continuity(&self.native_continuity)
     }
 
+    /// A saved transcript is eligible for the forced, read-only history API.
+    /// This shape is never authority to launch, close or resume a provider.
+    pub(crate) fn is_saved_claude_history(&self) -> bool {
+        self.launch.provider == Provider::Claude
+            && matches!(self.native_continuity, NativeContinuity::ReconnectOnly)
+            && self.terminal.is_none()
+            && self.owned_codex_listener.is_none()
+            && self
+                .proof
+                .as_ref()
+                .is_some_and(HostSessionProof::is_complete)
+            && self
+                .launch
+                .session_id
+                .as_ref()
+                .is_some_and(|id| id.len() == 36 && uuid::Uuid::parse_str(id).is_ok())
+    }
+
     /// Import an installed capability observed on this exact authenticated
     /// attachment. A missing capability never revokes one already recorded.
     /// Validation applies to the resulting descriptor, including pre-ID

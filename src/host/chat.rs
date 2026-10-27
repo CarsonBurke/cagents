@@ -3231,7 +3231,9 @@ pub(super) fn resolve_upgrade(
             state.native_adoption_failures.get(source).unwrap_or(
                 "The exact upgraded provider is unavailable. Its recovery evidence was retained; reopen this conversation from the provider's saved sessions."
             )))?;
-        if !record.handle.owns_work() {
+        if !record.handle.owns_work()
+            && !(source.is_saved_claude_history() && record.handle.is_read_only_history())
+        {
             return Err(unavailable(
                 "Restored native provider has closed; no writer was restarted",
             ));
