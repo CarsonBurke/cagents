@@ -1,6 +1,7 @@
 //! Private, disk-backed transcript. Stable provider IDs and byte-addressed chunks
 //! keep both long conversations and a single enormous tool result pageable.
 mod file_changes;
+pub(crate) mod peer_query;
 mod text_copy;
 use super::observed_at;
 use crate::chat::{Event, Item, ItemContent, Phase, Role};
@@ -45,6 +46,7 @@ pub(super) struct Window {
     pub has_later: bool,
 }
 pub(crate) struct Store {
+    peer_query: peer_query::State,
     db: Connection,
     copy_cache: uuid::Uuid,
     copy_revision: u64,
@@ -234,7 +236,9 @@ impl Store {
                 .map_err(|e| e.to_string())?;
             db.execute_batch(text_copy::SCHEMA)
                 .map_err(|e| e.to_string())?;
+            let peer_query = peer_query::initialize(&db)?;
             Ok(Self {
+                peer_query,
                 copy_cache: uuid::Uuid::new_v4(),
                 copy_revision: 0,
                 copy_projection: Default::default(),
@@ -459,6 +463,7 @@ impl Store {
         let transaction = self.db.transaction().map_err(|e| e.to_string())?;
         let index_spans = spans.clone();
         let spans = postcard::to_stdvec(&spans).map_err(|e| e.to_string())?;
+        self.peer_query.guard(&transaction)?;
         transaction.execute("INSERT INTO items VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans]).map_err(|e| e.to_string())?;
         if preserve_input {
             transaction
@@ -472,6 +477,7 @@ impl Store {
         }
         insert_body(&transaction, &item.id, 1, 0, &body1)?;
         insert_body(&transaction, &item.id, 2, 0, &body2)?;
+        peer_query::replace_item(&transaction, &item.id)?;
         let copy_invalidated = Self::copy_parent_put(
             &transaction,
             &item.id,
@@ -751,7 +757,13 @@ impl Store {
     }
     /// Returns the events the store does not own, plus any non-fatal warning raised
     /// while caching. Warnings are events, never errors: the caller must stay alive.
-    pub fn apply(&mut self, mut event: Event) -> Result<Vec<Event>, String> {
+    pub fn apply(&mut self, event: Event) -> Result<Vec<Event>, String> {
+        // Reset must revoke pending private text before the generic flush below.
+        let mut event = match event {
+            Event::Reset { reason } => return self.reset_peer_cache(reason),
+            event => event,
+        };
+        self.peer_query.guard_local()?;
         if let Some(seal) = &self.messages {
             match &mut event {
                 Event::Item(item) => seal.recognize(item),
@@ -805,6 +817,7 @@ impl Store {
                 item.at = at;
                 let metadata = postcard::to_stdvec(&item).map_err(|error| error.to_string())?;
                 let transaction = self.db.transaction().map_err(|error| error.to_string())?;
+                self.peer_query.guard(&transaction)?;
                 insert_body(&transaction, &id, field, offset as i64, &delta)?;
                 let update = if field == 0 {
                     "UPDATE items SET len0=len0+?2,metadata=?3 WHERE id=?1"
@@ -906,30 +919,7 @@ impl Store {
                 transaction.commit().map_err(|e| e.to_string())?;
                 self.dirty = true;
             }
-            Event::Reset { reason } => {
-                self.files_reset()?;
-                self.db
-                    .execute("DELETE FROM copy_sources", [])
-                    .map_err(|e| e.to_string())?;
-                self.copy_cache = uuid::Uuid::new_v4();
-                self.copy_revision = self.copy_revision.wrapping_add(1);
-                self.copy_projection.clear();
-                self.db
-                    .execute("DELETE FROM items", [])
-                    .map_err(|e| e.to_string())?;
-                self.end = None;
-                self.first = None;
-                self.newest = None;
-                self.forward = None;
-                self.paging = false;
-                self.provider_earlier = false;
-                self.cached_earlier = false;
-                self.pending_earlier = None;
-                self.latest_boundary = None;
-                self.dirty = true;
-                out.push(Event::Reset { reason });
-                return Ok(out);
-            }
+            Event::Reset { .. } => unreachable!("Reset is handled before pending text flush"),
             Event::HistoryLoading(false) => {
                 // A failed provider request must not leave its cursor waiting
                 // for an unrelated later history response. Successful pages
@@ -963,6 +953,10 @@ impl Store {
         Ok(out)
     }
     fn flush_text(&mut self) -> Result<Option<String>, String> {
+        self.peer_query.guard_local()?;
+        if self.pending_text.is_some() {
+            self.peer_query.guard(&self.db)?;
+        }
         match self.pending_text.take() {
             Some(pending) => match self.append(&pending.0, pending.1, pending.2, &pending.3) {
                 Ok(warning) => Ok(warning),
@@ -1026,6 +1020,7 @@ impl Store {
             item.at = at;
             let stamped = postcard::to_stdvec(&item).map_err(|e| e.to_string())?;
             let transaction = self.db.transaction().map_err(|e| e.to_string())?;
+            self.peer_query.guard(&transaction)?;
             insert_body(&transaction, id, 0, length, delta)?;
             transaction
                 .execute(
