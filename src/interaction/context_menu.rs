@@ -15,8 +15,16 @@ use super::*;
 pub(super) fn surface<'a, Message: Clone + 'static>(
     menu: Vec<widget::menu::Tree<Message>>,
 ) -> Element<'a, Message> {
+    surface_keyed((), menu)
+}
+
+pub(super) fn surface_keyed<'a, Key: Clone + Eq + 'static, Message: Clone + 'static>(
+    owner: Key,
+    menu: Vec<widget::menu::Tree<Message>>,
+) -> Element<'a, Message> {
     let items = menu.len();
     Element::new(MenuSurface {
+        owner,
         native: widget::context_menu(
             cosmic::iced::widget::Space::new()
                 .width(Length::Fill)
@@ -32,7 +40,15 @@ pub(super) fn surface<'a, Message: Clone + 'static>(
 pub(super) fn lazy_surface<'a, Message: Clone + 'static>(
     builder: impl Fn() -> Vec<widget::menu::Tree<Message>> + 'a,
 ) -> Element<'a, Message> {
+    lazy_surface_keyed((), builder)
+}
+
+pub(super) fn lazy_surface_keyed<'a, Key: Clone + Eq + 'static, Message: Clone + 'static>(
+    owner: Key,
+    builder: impl Fn() -> Vec<widget::menu::Tree<Message>> + 'a,
+) -> Element<'a, Message> {
     Element::new(MenuSurface {
+        owner,
         native: widget::context_menu(
             cosmic::iced::widget::Space::new()
                 .width(Length::Fill)
@@ -45,26 +61,28 @@ pub(super) fn lazy_surface<'a, Message: Clone + 'static>(
     })
 }
 
-/// How many items the menu had when the native widget last measured it.
+/// Shape and semantic owner of the native menu's retained measurement.
 ///
-/// This is the only quantity the retained menu geometry is indexed by: the
-/// native widget stores one `MenuState` per open level, and its `MenuBounds`
-/// holds a position and a size per item of the list that level was opened on.
-/// Our menus are flat, so the top-level item count is their entire shape.
-/// Retain the click in window space as well, to size the popup's anchor.
-struct MenuItems {
+/// The count protects geometry indexed by item position; the typed owner also
+/// retires same-count replacement actions. Neither reset touches the separate
+/// base row's focus/press state. Retain window geometry for popup placement and
+/// accessibility adapters that translate their complete base subtree.
+struct MenuItems<Key> {
+    owner: Key,
     count: usize,
     anchor: Point,
+    row_window: Point,
 }
 
-struct MenuSurface<'a, Message> {
+struct MenuSurface<'a, Key, Message> {
+    owner: Key,
     native: widget::ContextMenu<'a, Message>,
     items: usize,
     builder: Option<Box<dyn Fn() -> Vec<widget::menu::Tree<Message>> + 'a>>,
     footprint: layout::Node,
 }
 
-impl<Message: Clone + 'static> MenuSurface<'_, Message> {
+impl<Key: Clone + Eq + 'static, Message: Clone + 'static> MenuSurface<'_, Key, Message> {
     fn build_menu(&mut self) {
         if let Some(builder) = &self.builder {
             let menu = builder();
@@ -93,15 +111,19 @@ impl<Message: Clone + 'static> MenuSurface<'_, Message> {
     }
 }
 
-impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<'_, Message> {
+impl<Key: Clone + Eq + 'static, Message: Clone + 'static> Widget<Message, Theme, Renderer>
+    for MenuSurface<'_, Key, Message>
+{
     fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<MenuItems>()
+        tree::Tag::of::<MenuItems<Key>>()
     }
 
     fn state(&self) -> tree::State {
         tree::State::new(MenuItems {
+            owner: self.owner.clone(),
             count: self.items,
             anchor: Point::ORIGIN,
+            row_window: Point::ORIGIN,
         })
     }
 
@@ -110,7 +132,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
     }
 
     fn diff(&mut self, tree: &mut Tree) {
-        if tree.state.downcast_ref::<MenuItems>().count > 0 {
+        if tree.state.downcast_ref::<MenuItems<Key>>().count > 0 {
             self.build_menu();
         }
         // An open menu measures its items once, at the click that opens it, and
@@ -129,8 +151,12 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         // is not ours to do, since the native `LocalState` is opaque to us, and
         // an open menu that silently restructures under the pointer is a
         // mis-click waiting to happen either way.
-        let measured = tree.state.downcast_mut::<MenuItems>();
-        let remeasured = measured.count != self.items;
+        let measured = tree.state.downcast_mut::<MenuItems<Key>>();
+        let owner_changed = measured.owner != self.owner;
+        let remeasured = owner_changed || measured.count != self.items;
+        if owner_changed {
+            measured.owner = self.owner.clone();
+        }
         measured.count = self.items;
         if remeasured || tree.children.is_empty() {
             tree.children = vec![self.native_tree()];
@@ -178,7 +204,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         if opening {
             if self.builder.is_some() && self.items == 0 {
                 self.build_menu();
-                tree.state.downcast_mut::<MenuItems>().count = self.items;
+                tree.state.downcast_mut::<MenuItems<Key>>().count = self.items;
                 tree.children = vec![self.native_tree()];
             }
             self.native.diff(&mut tree.children[0]);
@@ -206,10 +232,11 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         // that one menu in content space again.
         let scroll = layout.virtual_offset();
         if opening {
-            tree.state.downcast_mut::<MenuItems>().anchor =
+            tree.state.downcast_mut::<MenuItems<Key>>().anchor =
                 cursor.position().unwrap_or_default() - scroll;
         }
         let row = layout.bounds();
+        tree.state.downcast_mut::<MenuItems<Key>>().row_window = row.position() - scroll;
         let anchor = layout::Node::new(row.size()).move_to(row.position() - scroll);
         self.native.update(
             &mut tree.children[0],
@@ -254,17 +281,40 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         tree: &Tree,
         cursor: mouse::Cursor,
     ) -> iced_accessibility::A11yTree {
-        self.native.a11y_nodes(layout, &tree.children[0], cursor)
+        let mut nodes = self.native.a11y_nodes(layout, &tree.children[0], cursor);
+        // The native overlay measured in window space. Ordinary scrollables
+        // pass a virtual offset; some base-layer adapters instead clear it and
+        // translate the complete subtree afterwards. Return coordinates in
+        // the same space as THIS passed row, so either ancestor translates
+        // once. Do not change the actual native layout or action hit geometry.
+        let window_row = tree.state.downcast_ref::<MenuItems<Key>>().row_window;
+        let delta = layout.position() - layout.virtual_offset() - window_row;
+        let translate = |node: &mut iced_accessibility::A11yNode| {
+            if let Some(bounds) = node.node().bounds() {
+                node.node_mut()
+                    .set_bounds(iced_accessibility::accesskit::Rect::new(
+                        bounds.x0 + f64::from(delta.x),
+                        bounds.y0 + f64::from(delta.y),
+                        bounds.x1 + f64::from(delta.x),
+                        bounds.y1 + f64::from(delta.y),
+                    ));
+            }
+        };
+        nodes.root_mut().iter_mut().for_each(translate);
+        // Preserve the real hierarchy/IDs while rebasing descendant text too.
+        nodes.children_mut().iter_mut().for_each(translate);
+        nodes
     }
 
     fn overlay<'a>(
         &'a mut self,
         tree: &'a mut Tree,
-        _layout: Layout<'a>,
+        layout: Layout<'a>,
         renderer: &Renderer,
         viewport: &Rectangle,
-        _translation: Vector,
+        translation: Vector,
     ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+        tree.state.downcast_mut::<MenuItems<Key>>().row_window = layout.position() + translation;
         if self.builder.is_some() && self.items == 0 {
             return None;
         }
@@ -280,7 +330,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         // Shortening this footprint near the right edge makes both choices
         // keep the popup inside the window, including clicks near its center
         // where neither side of a point anchor has enough room.
-        let anchor = tree.state.downcast_ref::<MenuItems>().anchor;
+        let anchor = tree.state.downcast_ref::<MenuItems<Key>>().anchor;
         let menu_width = 240.0;
         // A scrollable may supply only its clipped viewport. Its right edge
         // is in window space just like the anchor; its width alone is not.
@@ -301,7 +351,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
             Vector::ZERO,
         );
         if native.is_none() && self.builder.is_some() {
-            tree.state.downcast_mut::<MenuItems>().count = 0;
+            tree.state.downcast_mut::<MenuItems<Key>>().count = 0;
             self.items = 0;
         }
         native.map(|inner| overlay::Element::new(Box::new(PointerAwareMenu { inner, anchor })))
@@ -583,12 +633,9 @@ mod tests {
                     )
                 })
                 .collect();
-            self.element = crate::ui_controls::owned(
+            self.element = surface_keyed(
                 owner,
-                surface(widget::menu::items(
-                    &std::collections::HashMap::new(),
-                    entries,
-                )),
+                widget::menu::items(&std::collections::HashMap::new(), entries),
             );
             self.tree.diff(self.element.as_widget_mut());
             self.measure();

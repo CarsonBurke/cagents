@@ -470,6 +470,26 @@ pub fn context_menu_lazy<'a, Message: Clone + 'static>(
     .into()
 }
 
+/// A lazy menu whose captured actions belong to an explicit semantic owner.
+/// Changing that owner retires only the menu; the content keeps its native
+/// focus and pressed state.
+pub fn context_menu_lazy_keyed<'a, Key: Clone + Eq + 'static, Message: Clone + 'static>(
+    owner: Key,
+    content: impl Into<Element<'a, Message>>,
+    builder: impl Fn() -> Vec<widget::menu::Tree<Message>> + 'a,
+) -> Element<'a, Message> {
+    Effect {
+        content: layer(
+            content.into(),
+            context_menu::lazy_surface_keyed(owner, builder),
+        ),
+        kind: Kind::ContextMenu,
+        tip: None,
+        on_focused_key: None,
+    }
+    .into()
+}
+
 /// Keeps every key from the layers beneath a transient surface that the
 /// application's keyboard subscription drives, so a key that steers or
 /// dismisses it is not also typed into the pane it covers.

@@ -6188,6 +6188,11 @@ fn project_view<'a>(
             .state
             .rows
             .group_size(SelectionRow::Project(project_id)),
+        ContextMenuSource {
+            path: &entity.repository,
+            branch: None,
+            selection: &project.state.rows,
+        },
     );
     let header = RowInteraction::selectable(
         header,
@@ -6244,6 +6249,7 @@ fn project_view<'a>(
                             .state
                             .rows
                             .group_size(SelectionRow::Worktree(project_id, worktree.id)),
+                        &project.state.rows,
                         &project.state.query,
                         !project.state.hide_worktree_changes_icons,
                     ),
@@ -6477,6 +6483,11 @@ fn compact_project<'a>(
             .state
             .rows
             .group_size(SelectionRow::Project(entity.id)),
+        ContextMenuSource {
+            path: &entity.repository,
+            branch: None,
+            selection: &project.state.rows,
+        },
     );
     let header = RowInteraction::selectable(
         header,
@@ -6543,6 +6554,7 @@ fn compact_project<'a>(
                         .state
                         .rows
                         .group_size(SelectionRow::Worktree(entity.id, worktree.id)),
+                    &project.state.rows,
                     &project.state.query,
                     !project.state.hide_worktree_changes_icons,
                 ),
@@ -7161,6 +7173,7 @@ fn worktree_view<'a>(
     row_state: WorktreeRowState,
     compact: bool,
     selection_count: Option<usize>,
+    row_selection: &selection::Selection,
     query: &str,
     show_changes_icons: bool,
 ) -> Element<'static, SidebarAction> {
@@ -7344,6 +7357,11 @@ fn worktree_view<'a>(
             github_ready,
             editors,
             selection_count,
+            ContextMenuSource {
+                path: &worktree.path,
+                branch: worktree.branch.as_deref(),
+                selection: row_selection,
+            },
         ),
         deletion,
         compact,
@@ -7441,6 +7459,48 @@ fn project_channel_command_label(worktree: Option<WorktreeId>) -> &'static str {
     }
 }
 
+/// Typed inputs whose replacement changes a retained menu's meaning.
+/// Keep file trees/history and unrelated activity out of native row identity.
+struct ContextMenuSource<'a> {
+    path: &'a Path,
+    branch: Option<&'a str>,
+    selection: &'a selection::Selection,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ContextMenuOwner {
+    project: ProjectId,
+    worktree: Option<WorktreeId>,
+    source: [u8; 32],
+    git: bool,
+    has_branch: bool,
+    github_ready: bool,
+    editors: Arc<[SidebarEditor]>,
+    selection_count: Option<usize>,
+    // Ordinary single-row menus do not copy the full selected set. Group
+    // actions must distinguish changed members even when the count is equal.
+    group: Option<selection::Selection>,
+}
+
+impl ContextMenuSource<'_> {
+    fn resource(&self) -> [u8; 32] {
+        let mut hash = blake3::Hasher::new();
+        // Explicit resource bytes with presence/length tags, not Message or
+        // callback hashing. No path/branch allocation on the row's view path.
+        for value in [
+            Some(self.path.as_os_str().as_encoded_bytes()),
+            self.branch.map(str::as_bytes),
+        ] {
+            hash.update(&[u8::from(value.is_some())]);
+            if let Some(bytes) = value {
+                hash.update(&(bytes.len() as u64).to_le_bytes());
+                hash.update(bytes);
+            }
+        }
+        *hash.finalize().as_bytes()
+    }
+}
+
 fn context_controls<'a>(
     content: impl Into<Element<'a, SidebarAction>>,
     project_id: ProjectId,
@@ -7451,13 +7511,29 @@ fn context_controls<'a>(
     github_ready: bool,
     editors: &[SidebarEditor],
     selection_count: Option<usize>,
+    source: ContextMenuSource<'_>,
 ) -> Element<'a, SidebarAction> {
     use widget::menu::{Item, items};
-    let editors = editors.to_vec();
     if modal_open || selection_count.is_none() {
         return content.into();
     }
-    crate::interaction::context_menu_lazy(content, move || {
+    // Reuse the menu's existing editor snapshot for both identity and its lazy
+    // builder, rather than cloning strings again for the retained key.
+    let editors: Arc<[SidebarEditor]> = editors.to_vec().into();
+    let owner = ContextMenuOwner {
+        project: project_id,
+        worktree: worktree_id,
+        source: source.resource(),
+        git,
+        has_branch,
+        github_ready,
+        editors: editors.clone(),
+        selection_count,
+        group: selection_count
+            .is_some_and(|count| count > 1)
+            .then(|| source.selection.clone()),
+    };
+    crate::interaction::context_menu_lazy_keyed(owner, content, move || {
         let mut commands = vec![
             ("Open folder".to_owned(), None, ProjectCommand::Reveal),
             ("New terminal".to_owned(), None, ProjectCommand::NewTerminal),
@@ -13745,6 +13821,7 @@ pub(crate) mod tests {
                     WorktreeRowState::default(),
                     compact,
                     None,
+                    &selection::Selection::default(),
                     "",
                     show,
                 )
@@ -13804,6 +13881,7 @@ pub(crate) mod tests {
                 WorktreeRowState::default(),
                 false,
                 Some(1),
+                &selection::Selection::default(),
                 "",
                 true,
             );
@@ -14350,6 +14428,7 @@ pub(crate) mod tests {
                 },
                 false,
                 None,
+                &selection::Selection::default(),
                 query,
                 true,
             );
@@ -15215,6 +15294,11 @@ pub(crate) mod tests {
             false,
             &[],
             Some(1),
+            ContextMenuSource {
+                path: Path::new("/tmp/context-menu-fixture"),
+                branch: Some("main"),
+                selection: &selection::Selection::default(),
+            },
         );
         let mut tree = Tree::new(&element);
         let viewport = Rectangle::with_size(Size::new(240.0, 32.0));
@@ -15537,6 +15621,645 @@ pub(crate) mod tests {
                 }
             }
             rows
+        }
+    }
+
+    impl Sidebar {
+        fn context_frame(
+            &mut self,
+            events: &[cosmic::iced::Event],
+            cursor: cosmic::iced::mouse::Cursor,
+        ) -> (Vec<SidebarAction>, iced_accessibility::A11yTree) {
+            use cosmic::iced::advanced::{clipboard, renderer::Style};
+            let mut ui = interface(
+                &self.model,
+                &self.state,
+                &self.navigation,
+                self.bounds,
+                std::mem::take(&mut self.cache),
+                &mut self.renderer,
+            );
+            let mut messages = Vec::new();
+            ui.update(
+                events,
+                cursor,
+                &mut self.renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            ui.draw(
+                &mut self.renderer,
+                &cosmic::Theme::light(),
+                &Style::default(),
+                cursor,
+            );
+            let nodes = ui.a11y_nodes(cursor);
+            self.cache = ui.into_cache();
+            (messages, nodes)
+        }
+
+        fn open_worktree_context(&mut self, index: usize) -> iced_accessibility::A11yTree {
+            use cosmic::iced::{Event, mouse, time::Instant, window};
+            let id = selection_row_focus_id(SelectionRow::Worktree(
+                self.model.projects[0].id,
+                self.model.projects[0].worktrees[index].id,
+            ));
+            let (_, nodes) = self.context_frame(&[], mouse::Cursor::Unavailable);
+            let row = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|node| iced_accessibility::IdEq::eq(node.id(), &id.clone().into()))
+                .expect("actual visible worktree button");
+            let bounds = row.node().bounds().unwrap();
+            let point = cosmic::iced::Point::new(
+                ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+            );
+            assert!(cosmic::iced::Rectangle::with_size(self.bounds).contains(point));
+            self.context_frame(
+                &[Event::Mouse(mouse::Event::ButtonReleased(
+                    mouse::Button::Right,
+                ))],
+                mouse::Cursor::Available(point),
+            );
+            self.context_frame(
+                &[Event::Window(
+                    window::Event::RedrawRequested(Instant::now()),
+                )],
+                mouse::Cursor::Available(point),
+            )
+            .1
+        }
+    }
+
+    fn actual_context_button(
+        nodes: &iced_accessibility::A11yTree,
+        label: &str,
+    ) -> iced_accessibility::A11yNode {
+        nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| {
+                node.node().role() == iced_accessibility::accesskit::Role::Button
+                    && node.node().label() == Some(label)
+            })
+            .expect(label)
+            .clone()
+    }
+
+    fn actual_context_click(node: &iced_accessibility::A11yNode) -> cosmic::iced::Event {
+        use iced_accessibility::accesskit::{Action, ActionRequest, NodeId, TreeId};
+        let target: NodeId = node.id().clone().into();
+        cosmic::iced::Event::A11y(
+            Id::from(target.0),
+            ActionRequest {
+                action: Action::Click,
+                target_tree: TreeId::ROOT,
+                target_node: target,
+                data: None,
+            },
+        )
+    }
+
+    #[test]
+    fn sidebar_context_menu_keeps_single_row_identity_and_truthful_copy_actions() {
+        use cosmic::iced::mouse;
+        use iced_accessibility::accesskit::Action;
+        let mut sidebar = Sidebar::roomy();
+        let project = sidebar.model.projects[0].id;
+        let row = sidebar.model.projects[0].worktrees[0].clone();
+        let current = actual_context_button(&sidebar.open_worktree_context(0), "Copy branch");
+        assert!(current.node().supports_action(Action::Click));
+        assert!(!current.node().supports_action(Action::Focus));
+        let (_, stable) = sidebar.context_frame(&[], mouse::Cursor::Unavailable);
+        assert_eq!(
+            actual_context_button(&stable, "Copy branch").id(),
+            current.id()
+        );
+        // The target is outside this explicit group. Its menu remains a
+        // single-row action and should not clone/key the unrelated selection.
+        let others: Vec<_> = sidebar.model.projects[0].worktrees[1..3]
+            .iter()
+            .map(|row| SelectionRow::Worktree(project, row.id))
+            .collect();
+        for other in &others {
+            sidebar
+                .state
+                .select_rows(*other, SelectionIntent::Toggle, &others);
+        }
+        let (_, stable) = sidebar.context_frame(&[], mouse::Cursor::Unavailable);
+        assert_eq!(
+            actual_context_button(&stable, "Copy branch").id(),
+            current.id()
+        );
+        let (messages, closed) = sidebar.context_frame(
+            &[actual_context_click(&current)],
+            mouse::Cursor::Unavailable,
+        );
+        assert_eq!(
+            messages,
+            [SidebarAction::ProjectCommand {
+                project_id: project,
+                worktree_id: Some(row.id),
+                command: ProjectCommand::CopyBranch
+            }]
+        );
+        assert!(
+            !closed
+                .root()
+                .iter()
+                .chain(closed.children())
+                .any(|node| node.node().label() == Some("Copy branch"))
+        );
+        sidebar.state.clear_row_selection();
+        sidebar.model.projects[0].worktrees[0] =
+            SidebarWorktree::new(row.id, row.path, None, true, false, None, None, None);
+        let disabled = actual_context_button(
+            &sidebar.open_worktree_context(0),
+            "Copy branch (detached HEAD)",
+        );
+        assert!(disabled.node().is_disabled());
+        assert!(!disabled.node().supports_action(Action::Click));
+        assert!(
+            sidebar
+                .context_frame(
+                    &[actual_context_click(&disabled)],
+                    mouse::Cursor::Unavailable
+                )
+                .0
+                .is_empty()
+        );
+        let (_, nodes) = sidebar.context_frame(&[], mouse::Cursor::Unavailable);
+        let copy_path = actual_context_button(&nodes, "Copy path");
+        assert_eq!(
+            sidebar
+                .context_frame(
+                    &[actual_context_click(&copy_path)],
+                    mouse::Cursor::Unavailable
+                )
+                .0,
+            [SidebarAction::ProjectCommand {
+                project_id: project,
+                worktree_id: Some(row.id),
+                command: ProjectCommand::CopyPath
+            }]
+        );
+    }
+
+    #[test]
+    fn sidebar_context_menu_retires_replaced_owner_resource_and_editor_targets() {
+        use cosmic::iced::mouse;
+        for change in [
+            "project",
+            "worktree",
+            "path",
+            "branch",
+            "editor",
+            "availability",
+        ] {
+            let mut sidebar = Sidebar::roomy();
+            let label = if change == "editor" {
+                "Editor 0"
+            } else {
+                "Copy branch"
+            };
+            let old = actual_context_button(&sidebar.open_worktree_context(0), label);
+            let row = sidebar.model.projects[0].worktrees[0].clone();
+            match change {
+                "project" => sidebar.model.projects[0].id = project_id(90),
+                "worktree" => {
+                    sidebar.model.projects[0].worktrees[0] = SidebarWorktree::new(
+                        WorktreeId::from_uuid(Uuid::from_u128(90)),
+                        row.path,
+                        row.branch,
+                        false,
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                }
+                "path" => {
+                    sidebar.model.projects[0].worktrees[0] = SidebarWorktree::new(
+                        row.id,
+                        "/repo/replaced-source".into(),
+                        row.branch,
+                        false,
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                }
+                "branch" => {
+                    sidebar.model.projects[0].worktrees[0] = SidebarWorktree::new(
+                        row.id,
+                        row.path,
+                        Some("different-current-branch".into()),
+                        false,
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                }
+                "editor" => sidebar.model.external_editors[0].id = "replacement-editor".into(),
+                "availability" => {
+                    sidebar.model.projects[0].github_ready = !sidebar.model.projects[0].github_ready
+                }
+                _ => unreachable!(),
+            }
+            let (messages, nodes) =
+                sidebar.context_frame(&[actual_context_click(&old)], mouse::Cursor::Unavailable);
+            assert!(
+                messages.is_empty(),
+                "old numeric target must not borrow replacement: {change}"
+            );
+            assert!(
+                !nodes
+                    .root()
+                    .iter()
+                    .chain(nodes.children())
+                    .any(|node| node.node().label() == Some(label)),
+                "semantic change closes actual menu: {change}"
+            );
+            let current = actual_context_button(&sidebar.open_worktree_context(0), label);
+            assert_ne!(old.id(), current.id(), "fresh actual opening: {change}");
+            assert!(
+                sidebar
+                    .context_frame(&[actual_context_click(&old)], mouse::Cursor::Unavailable)
+                    .0
+                    .is_empty()
+            );
+            let command = if change == "editor" {
+                ProjectCommand::OpenEditor("replacement-editor".into())
+            } else {
+                ProjectCommand::CopyBranch
+            };
+            let expected = SidebarAction::ProjectCommand {
+                project_id: sidebar.model.projects[0].id,
+                worktree_id: Some(sidebar.model.projects[0].worktrees[0].id),
+                command,
+            };
+            assert_eq!(
+                sidebar
+                    .context_frame(
+                        &[actual_context_click(&current)],
+                        mouse::Cursor::Unavailable
+                    )
+                    .0,
+                [expected],
+                "fresh current control after negative: {change}"
+            );
+        }
+    }
+
+    #[test]
+    fn sidebar_context_menu_retires_same_count_changed_group_members() {
+        use cosmic::iced::mouse;
+        let mut sidebar = Sidebar::roomy();
+        let project = sidebar.model.projects[0].id;
+        let rows: Vec<_> = sidebar.model.projects[0].worktrees[..3]
+            .iter()
+            .map(|row| SelectionRow::Worktree(project, row.id))
+            .collect();
+        for row in &rows[..2] {
+            sidebar
+                .state
+                .select_rows(*row, SelectionIntent::Toggle, &rows);
+        }
+        let old = actual_context_button(&sidebar.open_worktree_context(0), "Delete 2 worktrees…");
+        sidebar.state.clear_row_selection();
+        for row in [rows[0], rows[2]] {
+            sidebar
+                .state
+                .select_rows(row, SelectionIntent::Toggle, &rows);
+        }
+        assert_eq!(sidebar.state.rows.group_size(rows[0]), Some(2));
+        let (messages, nodes) =
+            sidebar.context_frame(&[actual_context_click(&old)], mouse::Cursor::Unavailable);
+        assert!(messages.is_empty());
+        assert!(
+            !nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .any(|node| node.node().label() == Some("Delete 2 worktrees…"))
+        );
+        let current =
+            actual_context_button(&sidebar.open_worktree_context(0), "Delete 2 worktrees…");
+        assert_ne!(old.id(), current.id());
+        assert!(
+            sidebar
+                .context_frame(&[actual_context_click(&old)], mouse::Cursor::Unavailable)
+                .0
+                .is_empty()
+        );
+        assert_eq!(
+            sidebar
+                .context_frame(
+                    &[actual_context_click(&current)],
+                    mouse::Cursor::Unavailable
+                )
+                .0,
+            [SidebarAction::DeleteSelectedRows],
+            "normal guarded group-delete entry remains authoritative"
+        );
+    }
+
+    #[test]
+    fn sidebar_context_menu_scrolled_ax_bounds_match_actual_overlay_item_layout() {
+        use cosmic::iced::{
+            Event, Point, Rectangle, Vector,
+            advanced::{Layout, Shell, clipboard, mouse, widget::operation},
+            time::Instant,
+            window,
+        };
+        fn menu_buttons(layout: Layout<'_>, result: &mut Vec<Rectangle>) {
+            let bounds = layout.bounds();
+            if (bounds.width - 240.0).abs() < 0.01
+                && (bounds.height - 36.0).abs() < 0.01
+                && !result.contains(&bounds)
+            {
+                result.push(bounds);
+            }
+            for child in layout.children() {
+                menu_buttons(child, result);
+            }
+        }
+        let mut unscrolled_row_y = None;
+        for scroll in [0.0, 80.0] {
+            let sidebar = Sidebar::roomy();
+            let bounds = Size::new(360.0, 640.0);
+            let viewport = Rectangle::with_size(bounds);
+            let renderer = headless_renderer();
+            let shortcuts = crate::settings::KeyboardShortcuts::default();
+            let mut element = view_cached(
+                &sidebar.model,
+                &sidebar.state,
+                SidebarMode::Expanded,
+                design::NAVIGATION_DEFAULT_WIDTH,
+                false,
+                &sidebar.navigation,
+                &shortcuts,
+            );
+            let mut tree = Tree::new(&element);
+            element.as_widget_mut().diff(&mut tree);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(bounds, bounds),
+            );
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut operation::scrollable::scroll_to::<()>(
+                    stable_id("projects.scroll"),
+                    operation::scrollable::AbsoluteOffset {
+                        x: None,
+                        y: Some(scroll),
+                    },
+                ),
+            );
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(bounds, bounds),
+            );
+            let nodes = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                mouse::Cursor::Unavailable,
+            );
+            let project = sidebar.model.projects[0].id;
+            let row = sidebar.model.projects[0].worktrees[4].id;
+            let row_id = selection_row_focus_id(SelectionRow::Worktree(project, row));
+            let row_bounds = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|node| iced_accessibility::IdEq::eq(node.id(), &row_id.clone().into()))
+                .unwrap()
+                .node()
+                .bounds()
+                .unwrap();
+            if let Some(original_y) = unscrolled_row_y {
+                assert!(
+                    (original_y - row_bounds.y0 - f64::from(scroll)).abs() < 0.01,
+                    "the actual row must move by the requested scroll offset"
+                );
+            } else {
+                unscrolled_row_y = Some(row_bounds.y0);
+            }
+            let point = Point::new(
+                (row_bounds.x0 + 32.0) as f32,
+                ((row_bounds.y0 + row_bounds.y1) / 2.0) as f32,
+            );
+            assert!(viewport.contains(point));
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            let mut actual_rows = Vec::new();
+            {
+                let mut overlay = element
+                    .as_widget_mut()
+                    .overlay(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &viewport,
+                        Vector::ZERO,
+                    )
+                    .expect("actual sidebar context overlay");
+                let initial = overlay.as_overlay_mut().layout(&renderer, bounds);
+                overlay.as_overlay_mut().update(
+                    &Event::Window(window::Event::RedrawRequested(Instant::now())),
+                    Layout::new(&initial),
+                    mouse::Cursor::Available(point),
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                );
+                let measured = overlay.as_overlay_mut().layout(&renderer, bounds);
+                menu_buttons(Layout::new(&measured), &mut actual_rows);
+            }
+            actual_rows.sort_by(|a, b| a.y.total_cmp(&b.y));
+            let native_copy = actual_rows[5]; // Existing production menu ordering: Copy branch is sixth.
+            let nodes = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                mouse::Cursor::Unavailable,
+            );
+            let copy = actual_context_button(&nodes, "Copy branch");
+            let published = copy.node().bounds().unwrap();
+            assert!(
+                (published.x0 - f64::from(native_copy.x)).abs() < 0.01
+                    && (published.y0 - f64::from(native_copy.y)).abs() < 0.01
+                    && (published.x1 - f64::from(native_copy.x + native_copy.width)).abs() < 0.01
+                    && (published.y1 - f64::from(native_copy.y + native_copy.height)).abs() < 0.01,
+                "AX must match actual native item, not a twice-translated viewport guess; scroll={scroll}, AX={published:?}, native={native_copy:?}"
+            );
+            messages.clear();
+            {
+                let mut overlay = element
+                    .as_widget_mut()
+                    .overlay(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &viewport,
+                        Vector::ZERO,
+                    )
+                    .unwrap();
+                let measured = overlay.as_overlay_mut().layout(&renderer, bounds);
+                overlay.as_overlay_mut().update(
+                    &actual_context_click(&copy),
+                    Layout::new(&measured),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                );
+            }
+            assert_eq!(
+                messages,
+                [SidebarAction::ProjectCommand {
+                    project_id: project,
+                    worktree_id: Some(row),
+                    command: ProjectCommand::CopyBranch
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn context_menu_owner_changes_keep_the_unchanged_base_button_focus_and_press() {
+        use cosmic::iced::{
+            Event, Point, Rectangle,
+            advanced::{Layout, Shell, clipboard, widget::operation},
+            keyboard, mouse,
+        };
+        let renderer = headless_renderer();
+        let base_id = Id::new("context-menu.unchanged-base-button");
+        for change in ["branch", "editor", "availability"] {
+            for focus in [true, false] {
+                let make = |changed: bool| {
+                    let editor = SidebarEditor {
+                        id: if changed && change == "editor" {
+                            "replacement".into()
+                        } else {
+                            "original".into()
+                        },
+                        name: "Editor".into(),
+                        icon: "text-editor-symbolic".into(),
+                    };
+                    context_controls(
+                        widget::button::custom(design::body("Open worktree"))
+                            .id(base_id.clone())
+                            .width(240)
+                            .height(32)
+                            .on_press(SidebarAction::OpenRepositoryPicker),
+                        project_id(1),
+                        Some(WorktreeId::from_uuid(Uuid::from_u128(2))),
+                        false,
+                        true,
+                        true,
+                        changed && change == "availability",
+                        &[editor],
+                        Some(1),
+                        ContextMenuSource {
+                            path: Path::new("/repo/unchanged-worktree"),
+                            branch: Some(if changed && change == "branch" {
+                                "new-branch"
+                            } else {
+                                "original-branch"
+                            }),
+                            selection: &selection::Selection::default(),
+                        },
+                    )
+                };
+                let mut initial = make(false);
+                let mut tree = Tree::new(&initial);
+                initial.as_widget_mut().diff(&mut tree);
+                let viewport = Rectangle::with_size(Size::new(240.0, 32.0));
+                let node = initial.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(viewport.size(), viewport.size()),
+                );
+                let cursor = mouse::Cursor::Available(Point::new(120.0, 16.0));
+                let mut messages = Vec::new();
+                if focus {
+                    initial.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut operation::focusable::focus::<()>(base_id.clone()),
+                    );
+                } else {
+                    initial.as_widget_mut().update(
+                        &mut tree,
+                        &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                        Layout::new(&node),
+                        cursor,
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut Shell::new(&mut messages),
+                        &viewport,
+                    );
+                    assert!(messages.is_empty());
+                }
+                let mut changed = make(true);
+                tree.diff(changed.as_widget_mut());
+                let node = changed.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(viewport.size(), viewport.size()),
+                );
+                let event = if focus {
+                    Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                        modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::empty(),
+                        text: None,
+                        repeat: false,
+                    })
+                } else {
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+                };
+                changed.as_widget_mut().update(
+                    &mut tree,
+                    &event,
+                    Layout::new(&node),
+                    if focus {
+                        mouse::Cursor::Unavailable
+                    } else {
+                        cursor
+                    },
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                assert_eq!(
+                    messages,
+                    [SidebarAction::OpenRepositoryPicker],
+                    "same base row retains its native interaction while only the menu is retired: {change}, focus={focus}"
+                );
+            }
         }
     }
 
@@ -16433,6 +17156,11 @@ pub(crate) mod tests {
                 true,
                 &[],
                 Some(1),
+                ContextMenuSource {
+                    path: Path::new("/tmp/context-menu-fixture"),
+                    branch: Some("main"),
+                    selection: &selection::Selection::default(),
+                },
             )
         };
         let renderer = headless_renderer();
@@ -18881,6 +19609,7 @@ pub(crate) mod tests {
                 },
                 compact,
                 None,
+                &selection::Selection::default(),
                 "",
                 true,
             );

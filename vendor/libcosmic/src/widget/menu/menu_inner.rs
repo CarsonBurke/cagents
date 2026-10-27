@@ -659,6 +659,7 @@ impl<'b, Message: Clone + 'static> Menu<'b, Message> {
         if !self.tree.inner.with_data(|state| state.open) {
             return true;
         }
+        let target_id: iced_accessibility::A11yId = id.clone().into();
         let translation = layout.position() - Point::ORIGIN + (self.position - Point::ORIGIN);
         let mut messages = Vec::new();
         let mut local = Shell::new(&mut messages);
@@ -705,7 +706,7 @@ impl<'b, Message: Clone + 'static> Menu<'b, Message> {
                         .root()
                         .iter()
                         .chain(nodes.children())
-                        .find(|node| IdEq::eq(node.id(), id))
+                        .find(|node| IdEq::eq(node.id(), &target_id))
                     else {
                         continue;
                     };
