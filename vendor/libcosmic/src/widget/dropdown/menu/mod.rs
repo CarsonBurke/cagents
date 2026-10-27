@@ -80,13 +80,20 @@ where
         }
     }
 
-    pub(super) fn keyboard(mut self, open: Arc<AtomicBool>, source: Arc<AtomicU64>) -> Self {
+    pub(super) fn keyboard(
+        mut self,
+        open: Arc<AtomicBool>,
+        source: Arc<AtomicU64>,
+        epoch: u64,
+    ) -> Self {
         self.keyboard = Some(Keyboard {
-            epoch: source.load(Ordering::SeqCst),
+            epoch,
             source,
             open,
             reveal: self.state.reveal.clone(),
-            retired: Arc::new(AtomicBool::new(false)),
+            follow_highlight: self.state.follow_highlight.clone(),
+            viewport_size: self.state.viewport_size.clone(),
+            retired: self.state.retired.clone(),
         });
         self
     }
@@ -143,10 +150,8 @@ where
 }
 
 pub(super) fn activation_key(key: &keyboard::Key) -> bool {
-    matches!(
-        key,
-        keyboard::Key::Named(keyboard::key::Named::Enter | keyboard::key::Named::Space)
-    ) || matches!(key, keyboard::Key::Character(value) if value.as_str() == " ")
+    matches!(key, keyboard::Key::Named(keyboard::key::Named::Enter))
+        || matches!(key, keyboard::Key::Character(value) if value.as_str() == " ")
 }
 
 #[derive(Clone)]
@@ -155,6 +160,8 @@ struct Keyboard {
     epoch: u64,
     open: Arc<AtomicBool>,
     reveal: Arc<AtomicBool>,
+    follow_highlight: Arc<AtomicBool>,
+    viewport_size: Arc<Mutex<Option<Size>>>,
     retired: Arc<AtomicBool>,
 }
 
@@ -170,11 +177,20 @@ impl Keyboard {
 pub struct State {
     pub(crate) tree: RcWrapper<Tree>,
     reveal: Arc<AtomicBool>,
+    follow_highlight: Arc<AtomicBool>,
+    viewport_size: Arc<Mutex<Option<Size>>>,
+    retired: Arc<AtomicBool>,
 }
 
 impl State {
-    pub(super) fn reveal(&self) {
+    pub(super) fn begin_open(&mut self) {
         self.reveal.store(true, Ordering::SeqCst);
+        self.follow_highlight.store(true, Ordering::SeqCst);
+        *self.viewport_size.lock().unwrap() = None;
+        // Native popup view providers retain their cloned opening state. A
+        // newer opening gets its own retirement receipt; rebuilding an old
+        // provider must not regain permission to close or select again.
+        self.retired = Arc::new(AtomicBool::new(false));
     }
 
     /// Creates a new [`State`] for a [`Menu`].
@@ -182,6 +198,9 @@ impl State {
         Self {
             tree: RcWrapper::new(Tree::empty()),
             reveal: Arc::new(AtomicBool::new(false)),
+            follow_highlight: Arc::new(AtomicBool::new(true)),
+            viewport_size: Arc::new(Mutex::new(None)),
+            retired: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -272,17 +291,20 @@ impl<'a, Message: Clone + 'a> Overlay<'a, Message> {
         let Some(keyboard) = &self.keyboard else {
             return;
         };
-        if !keyboard.valid() || !keyboard.reveal.swap(false, Ordering::SeqCst) {
+        if !keyboard.valid() {
             return;
         }
         let Some(index) = *self.hovered_option.lock().unwrap() else {
             return;
         };
-        struct Reveal {
+        struct Reveal<'a> {
             top: f32,
             bottom: f32,
+            requested: bool,
+            follow_highlight: bool,
+            viewport_size: &'a Mutex<Option<Size>>,
         }
-        impl iced_core::widget::Operation for Reveal {
+        impl iced_core::widget::Operation for Reveal<'_> {
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn iced_core::widget::Operation)) {
                 visit(self);
             }
@@ -294,6 +316,14 @@ impl<'a, Message: Clone + 'a> Overlay<'a, Message> {
                 translation: Vector,
                 state: &mut dyn iced_core::widget::operation::Scrollable,
             ) {
+                // A shorter native viewport must keep keyboard navigation visible.
+                // Merely reconstructing a view, or browsing with the wheel,
+                // must not pull the user back to the highlighted row.
+                let geometry_changed = self.viewport_size.lock().unwrap().replace(bounds.size())
+                    != Some(bounds.size());
+                if !self.requested && !(self.follow_highlight && geometry_changed) {
+                    return;
+                }
                 let delta = if self.top < translation.y {
                     self.top - translation.y
                 } else if self.bottom > translation.y + bounds.height {
@@ -317,6 +347,9 @@ impl<'a, Message: Clone + 'a> Overlay<'a, Message> {
                 &mut Reveal {
                     top,
                     bottom: top + self.row_height,
+                    requested: keyboard.reveal.swap(false, Ordering::SeqCst),
+                    follow_highlight: keyboard.follow_highlight.load(Ordering::SeqCst),
+                    viewport_size: &keyboard.viewport_size,
                 },
             )
         });
@@ -363,6 +396,24 @@ impl<'a, Message: Clone + 'a> Overlay<'a, Message> {
         shell: &mut Shell<'_, Message>,
     ) {
         let bounds = layout.bounds();
+        if cursor.is_over(bounds)
+            && matches!(
+                event,
+                Event::Mouse(
+                    mouse::Event::WheelScrolled { .. }
+                        | mouse::Event::CursorMoved { .. }
+                        | mouse::Event::ButtonPressed(_)
+                ) | Event::Touch(
+                    touch::Event::FingerPressed { .. } | touch::Event::FingerMoved { .. }
+                )
+            )
+        {
+            if let Some(keyboard) = &self.keyboard {
+                if keyboard.valid() {
+                    keyboard.follow_highlight.store(false, Ordering::SeqCst);
+                }
+            }
+        }
 
         self.state.with_data_mut(|tree| {
             self.container.update(
@@ -641,7 +692,9 @@ where
                     && (modifiers.is_empty() || *modifiers == keyboard::Modifiers::SHIFT)
                 {
                     keyboard.open.store(false, Ordering::SeqCst);
-                    keyboard.retired.store(true, Ordering::SeqCst);
+                    if self.close_on_selected.is_some() {
+                        keyboard.retired.store(true, Ordering::SeqCst);
+                    }
                     if let Some(close) = &self.close_on_selected {
                         shell.publish(close.clone());
                     }
@@ -652,7 +705,9 @@ where
                 if modifiers.is_empty() {
                     if matches!(key, keyboard::Key::Named(Named::Escape)) {
                         keyboard.open.store(false, Ordering::SeqCst);
-                        keyboard.retired.store(true, Ordering::SeqCst);
+                        if self.close_on_selected.is_some() {
+                            keyboard.retired.store(true, Ordering::SeqCst);
+                        }
                         if let Some(close) = &self.close_on_selected {
                             shell.publish(close.clone());
                         }
@@ -664,7 +719,9 @@ where
                         if !repeat {
                             let index = *self.hovered_option.lock().unwrap();
                             if let Some(index) = index.filter(|index| *index < self.options.len()) {
-                                keyboard.retired.store(true, Ordering::SeqCst);
+                                if self.close_on_selected.is_some() {
+                                    keyboard.retired.store(true, Ordering::SeqCst);
+                                }
                                 shell.publish((self.on_selected)(index));
                                 if let Some(close) = &self.close_on_selected {
                                     shell.publish(close.clone());
@@ -690,6 +747,7 @@ where
                     };
                     if let Some(next) = next {
                         *hovered = Some(next);
+                        keyboard.follow_highlight.store(true, Ordering::SeqCst);
                         keyboard.reveal.store(true, Ordering::SeqCst);
                         shell.request_redraw();
                         shell.capture_event();
@@ -711,7 +769,9 @@ where
                         (*hovered_guard).filter(|index| *index < self.options.len())
                     {
                         if let Some(keyboard) = &self.keyboard {
-                            keyboard.retired.store(true, Ordering::SeqCst);
+                            if self.close_on_selected.is_some() {
+                                keyboard.retired.store(true, Ordering::SeqCst);
+                            }
                         }
                         shell.publish((self.on_selected)(index));
                         if let Some(close_on_selected) = self.close_on_selected.as_ref() {
@@ -778,7 +838,9 @@ where
                         (*hovered_guard).filter(|index| *index < self.options.len())
                     {
                         if let Some(keyboard) = &self.keyboard {
-                            keyboard.retired.store(true, Ordering::SeqCst);
+                            if self.close_on_selected.is_some() {
+                                keyboard.retired.store(true, Ordering::SeqCst);
+                            }
                         }
                         shell.publish((self.on_selected)(index));
                         if let Some(close_on_selected) = self.close_on_selected.as_ref() {

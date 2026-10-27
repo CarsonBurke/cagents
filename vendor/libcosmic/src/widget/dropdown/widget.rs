@@ -446,6 +446,7 @@ pub struct State {
     source: Vec<String>,
     selected: Option<usize>,
     source_epoch: Arc<AtomicU64>,
+    opening_epoch: u64,
 }
 
 impl State {
@@ -469,6 +470,7 @@ impl State {
             source: Vec::new(),
             selected: None,
             source_epoch: Arc::new(AtomicU64::new(0)),
+            opening_epoch: 0,
         }
     }
 }
@@ -625,8 +627,11 @@ pub fn update<
         if selections.is_empty() {
             return;
         }
-        state.source_epoch.fetch_add(1, Ordering::SeqCst);
-        state.menu.reveal();
+        state.opening_epoch = state
+            .source_epoch
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        state.menu.begin_open();
         state.is_open.store(true, Ordering::Relaxed);
         shell.request_redraw();
         let mut hovered_guard = state.hovered_option.lock().unwrap();
@@ -873,7 +878,11 @@ where
         None,
         close_on_selected,
     )
-    .keyboard(state.is_open.clone(), state.source_epoch.clone())
+    .keyboard(
+        state.is_open.clone(),
+        state.source_epoch.clone(),
+        state.opening_epoch,
+    )
     .width(width)
     .padding(padding)
     .text_size(text_size);
@@ -927,7 +936,11 @@ where
             None,
             close_on_selected,
         )
-        .keyboard(state.is_open.clone(), state.source_epoch.clone())
+        .keyboard(
+            state.is_open.clone(),
+            state.source_epoch.clone(),
+            state.opening_epoch,
+        )
         .width({
             let measure = |_label: &str, selection_paragraph: &crate::Paragraph| -> f32 {
                 selection_paragraph.min_width().round()

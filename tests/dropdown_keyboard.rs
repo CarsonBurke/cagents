@@ -104,6 +104,15 @@ impl Fixture {
         );
     }
 
+    fn resize(&mut self, size: Size) {
+        self.viewport = Rectangle::with_size(size);
+        self.node = self.element.as_widget_mut().layout(
+            &mut self.tree,
+            &self.renderer,
+            &layout::Limits::new(Size::ZERO, size),
+        );
+    }
+
     fn operate(&mut self, mut operation: Box<dyn Operation>) {
         loop {
             self.element.as_widget_mut().operate(
@@ -255,24 +264,36 @@ impl Fixture {
         options: Vec<String>,
         selected: Option<usize>,
     ) -> Element<'static, Message> {
+        self.retained_popup_provider(options, selected)()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn retained_popup_provider(
+        &self,
+        options: Vec<String>,
+        selected: Option<usize>,
+    ) -> Box<dyn Fn() -> Element<'static, Message>> {
         // This is the public ordinary popup widget used by the Wayland path,
-        // not a compositor/native-window execution claim.
+        // with the same State clone and owned choices as its real retained
+        // view provider. It is not a compositor/native-window execution claim.
         let state = self.tree.children[1]
             .state
             .downcast_ref::<widget::dropdown::State>()
             .clone();
-        widget::dropdown::menu_widget(
-            Rectangle::with_size(Size::new(200.0, 32.0)),
-            &state,
-            4.0,
-            8.0.into(),
-            14.0,
-            options.into(),
-            Vec::new().into(),
-            selected,
-            std::sync::Arc::new(Message::Selected),
-            Some(Message::SurfaceClosed),
-        )
+        Box::new(move || {
+            widget::dropdown::menu_widget(
+                Rectangle::with_size(Size::new(200.0, 32.0)),
+                &state,
+                4.0,
+                8.0.into(),
+                14.0,
+                options.clone().into(),
+                Vec::new().into(),
+                selected,
+                std::sync::Arc::new(Message::Selected),
+                Some(Message::SurfaceClosed),
+            )
+        })
     }
 }
 
@@ -327,7 +348,14 @@ fn dropdown_keyboard_focus_commit_abort_and_tab_use_real_retained_overlay() {
         (Vec::new(), event::Status::Captured)
     );
     assert!(!fixture.open());
-    fixture.key(Named::Space);
+    fixture.event(
+        press(
+            keyboard::Key::Character(" ".into()),
+            keyboard::Modifiers::empty(),
+            false,
+        ),
+        mouse::Cursor::Unavailable,
+    );
     assert_eq!(
         fixture.event(
             press(
@@ -426,11 +454,33 @@ fn dropdown_long_menu_reveals_keyboard_row_without_resetting_pointer_scroll() {
         scrolled,
         "successive native overlay layouts retain pointer browsing"
     );
+    fixture.resize(Size::new(300.0, 180.0));
+    assert_eq!(
+        fixture.scroll().2,
+        scrolled,
+        "resize preserves pointer wheel browsing"
+    );
+    fixture.resize(Size::new(360.0, 220.0));
     fixture.key(Named::End);
     let (bounds, content, offset) = fixture.scroll();
     assert!(
         offset >= content - bounds.height - 20.0,
         "last keyboard row revealed"
+    );
+    fixture.resize(Size::new(300.0, 145.0));
+    let (short_bounds, short_content, short_offset) = fixture.scroll();
+    assert!(
+        short_bounds.height < bounds.height,
+        "actual overlay viewport shrinks"
+    );
+    assert!(
+        short_offset >= short_content - short_bounds.height - 20.0,
+        "resizing keeps the keyboard-highlighted last row visible before Enter"
+    );
+    assert_eq!(
+        fixture.scroll().2,
+        short_offset,
+        "unchanged layouts retain the revealed offset"
     );
     fixture.key(Named::ArrowUp);
     assert_eq!(fixture.key(Named::Enter).0, [Message::Selected(98)]);
@@ -498,6 +548,21 @@ fn dropdown_retained_popup_rejects_replaced_source_and_old_open_phase() {
         tree: &mut Tree,
         renderer: &Renderer,
     ) -> Vec<Message> {
+        update_event(
+            popup,
+            tree,
+            renderer,
+            named(Named::Enter),
+            mouse::Cursor::Unavailable,
+        )
+    }
+    fn update_event(
+        popup: &mut Element<'static, Message>,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        event: Event,
+        cursor: mouse::Cursor,
+    ) -> Vec<Message> {
         let node = popup.as_widget_mut().layout(
             tree,
             renderer,
@@ -506,9 +571,9 @@ fn dropdown_retained_popup_rejects_replaced_source_and_old_open_phase() {
         let mut messages = Vec::new();
         popup.as_widget_mut().update(
             tree,
-            &named(Named::Enter),
+            &event,
             Layout::new(&node),
-            mouse::Cursor::Unavailable,
+            cursor,
             renderer,
             &mut clipboard::Null,
             &mut Shell::new(&mut messages),
@@ -547,6 +612,72 @@ fn dropdown_retained_popup_rejects_replaced_source_and_old_open_phase() {
             fixture.key(Named::Enter).0,
             [Message::Selected(if replace { 0 } else { 1 })]
         );
+    }
+
+    // The Wayland owner keeps a view provider, not just one built Element.
+    // Reconstruct it only AFTER invalidation to catch borrowing a new epoch
+    // while still carrying the old options and callback.
+    for replace in [false, true] {
+        for pointer in [false, true] {
+            let mut fixture = Fixture::new(choices(3), Some(1));
+            fixture.tab(false);
+            fixture.tab(false);
+            fixture.key(Named::Enter);
+            let old_provider = fixture.retained_popup_provider(choices(3), Some(1));
+            if replace {
+                fixture.replace(vec!["replacement".into()], Some(0));
+                fixture.key(Named::Enter);
+            } else {
+                fixture.key(Named::Escape);
+                fixture.key(Named::Enter);
+            }
+            let mut rebuilt_old = old_provider();
+            let mut old_tree = Tree::new(rebuilt_old.as_widget());
+            let (event, cursor) = if pointer {
+                (
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    mouse::Cursor::Available(cosmic::iced::Point::new(24.0, 48.0)),
+                )
+            } else {
+                (named(Named::Enter), mouse::Cursor::Unavailable)
+            };
+            assert_eq!(
+                update_event(
+                    &mut rebuilt_old,
+                    &mut old_tree,
+                    &fixture.renderer,
+                    event,
+                    cursor
+                ),
+                [Message::SurfaceClosed],
+                "rebuilding an obsolete native provider cannot select its old choices"
+            );
+            let mut rebuilt_again = old_provider();
+            let mut again_tree = Tree::new(rebuilt_again.as_widget());
+            assert!(
+                update(&mut rebuilt_again, &mut again_tree, &fixture.renderer).is_empty(),
+                "the old opening's close receipt survives native view reconstruction"
+            );
+            assert!(fixture.open(), "the current dropdown must remain open");
+            let mut current = fixture.retained_popup(
+                if replace {
+                    vec!["replacement".into()]
+                } else {
+                    choices(3)
+                },
+                Some(if replace { 0 } else { 1 }),
+            );
+            let mut current_tree = Tree::new(current.as_widget());
+            assert_eq!(
+                update(&mut current, &mut current_tree, &fixture.renderer),
+                [
+                    Message::Selected(if replace { 0 } else { 1 }),
+                    Message::SurfaceClosed
+                ],
+                "the current opening still selects and retires its own popup"
+            );
+            assert!(!fixture.open());
+        }
     }
 }
 
