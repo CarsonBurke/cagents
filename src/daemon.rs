@@ -30,9 +30,10 @@ use std::{
         net::UnixListener,
     },
     sync::{
-        LazyLock,
+        Arc, LazyLock,
         atomic::{AtomicBool, AtomicI32, Ordering},
     },
+    time::Instant,
 };
 
 use serde::Deserialize;
@@ -130,9 +131,31 @@ pub(crate) fn wait_for_activity(listener: &UnixListener) -> io::Result<()> {
     wait_for_activity_with(listener, wakeup()?)
 }
 
+/// Wait for ordinary activity, an absolute lifecycle deadline, or the exact
+/// original holder descriptors retained by a pending retirement. No periodic
+/// timer is armed; callers revalidate ownership after every returned edge.
+#[cfg(feature = "host")]
+pub(crate) fn wait_for_activity_until(
+    listener: &UnixListener,
+    deadline: Option<Instant>,
+    holders: &[Arc<File>],
+) -> io::Result<()> {
+    wait_for_activity_until_with(listener, wakeup()?, deadline, holders)
+}
+
 #[cfg(feature = "host")]
 fn wait_for_activity_with(listener: &UnixListener, wakeup: &Wakeup) -> io::Result<()> {
-    let mut fds = [
+    wait_for_activity_until_with(listener, wakeup, None, &[])
+}
+
+#[cfg(feature = "host")]
+fn wait_for_activity_until_with(
+    listener: &UnixListener,
+    wakeup: &Wakeup,
+    deadline: Option<Instant>,
+    holders: &[Arc<File>],
+) -> io::Result<()> {
+    let mut fds = vec![
         libc::pollfd {
             fd: listener.as_raw_fd(),
             events: libc::POLLIN,
@@ -144,9 +167,22 @@ fn wait_for_activity_with(listener: &UnixListener, wakeup: &Wakeup) -> io::Resul
             revents: 0,
         },
     ];
-    // SAFETY: fds is a live, fully initialised array of the length passed to
-    // poll, and both descriptors are owned for the duration of the call.
-    let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, POLL_FOREVER) };
+    fds.extend(holders.iter().map(|holder| libc::pollfd {
+        fd: holder.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    }));
+    let timeout = deadline.map_or(POLL_FOREVER, |deadline| {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .min(c_int::MAX as u128) as c_int
+    });
+    // SAFETY: every entry is initialized, and the listener, wake channel and
+    // borrowed Arc-held original pidfds all outlive this single poll call.
+    // Rounding upward avoids an early submillisecond deadline/spinning loop.
+    let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
     if ready < 0 {
         let error = io::Error::last_os_error();
         // A signal handler ran. The caller re-reads the termination flag, so an
@@ -1032,6 +1068,231 @@ mod tests {
         let _client = UnixStream::connect(&path).unwrap();
         wait_for_activity_with(&listener, &channel).unwrap();
         let _accepted = listener.accept().unwrap();
+    }
+
+    #[cfg(all(feature = "host", target_os = "linux"))]
+    struct ActivityWaitChild {
+        child: std::process::Child,
+        original: Arc<File>,
+    }
+
+    #[cfg(all(feature = "host", target_os = "linux"))]
+    impl ActivityWaitChild {
+        fn start() -> Self {
+            use std::process::Stdio;
+            let mut child = std::process::Command::new("/bin/sh")
+                .args(["-c", "IFS= read -r release"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            // The original is still our unreaped Child and waits on its own
+            // stdin. Capture once, before any release; never reopen a saved PID.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
+            if fd < 0 {
+                let error = io::Error::last_os_error();
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("capture original activity child: {error}");
+            }
+            Self {
+                child,
+                // SAFETY: successful pidfd_open returned this fresh owned fd.
+                original: Arc::new(unsafe { File::from_raw_fd(fd as c_int) }),
+            }
+        }
+
+        fn finish(&mut self) {
+            use std::time::Duration;
+            self.child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"release\n")
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "original activity child did not exit"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[cfg(all(feature = "host", target_os = "linux"))]
+    impl Drop for ActivityWaitChild {
+        fn drop(&mut self) {
+            // Failure-only cleanup acts on the original owned Child; normal
+            // completion was consumed by try_wait above and sends no signal.
+            if !matches!(self.child.try_wait(), Ok(Some(_))) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+
+    #[cfg(all(feature = "host", target_os = "linux"))]
+    #[test]
+    fn lifecycle_activity_wait_observes_absolute_deadline_without_other_activity() {
+        use std::{sync::mpsc, time::Duration};
+        let directory = tempdir().unwrap();
+        let listener = UnixListener::bind(directory.path().join("deadline.sock")).unwrap();
+        let channel = Arc::new(Wakeup::channel().unwrap());
+        let owned_channel = channel.clone();
+        let (sent, received) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let start = Instant::now();
+            let deadline = start + Duration::from_millis(80);
+            let result =
+                wait_for_activity_until_with(&listener, &owned_channel, Some(deadline), &[]);
+            sent.send((result, start, deadline, Instant::now()))
+                .unwrap();
+        });
+        let outcome = received.recv_timeout(Duration::from_secs(2));
+        if outcome.is_err() {
+            channel.wake(); // bounded cleanup is not a successful deadline
+        }
+        waiter.join().unwrap();
+        let (result, start, deadline, finished) =
+            outcome.expect("absolute deadline did not return");
+        result.unwrap();
+        assert!(
+            finished >= deadline,
+            "millisecond truncation returned before the absolute boundary"
+        );
+        assert!(finished.duration_since(start) >= Duration::from_millis(80));
+        let mut wake = libc::pollfd {
+            fd: channel.reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut wake, 1, 0) },
+            0,
+            "the deadline itself did not enqueue a periodic wake"
+        );
+    }
+
+    #[cfg(all(feature = "host", target_os = "linux"))]
+    #[test]
+    fn lifecycle_activity_wait_wakes_on_original_holder_exit_with_quiet_listener_and_wake() {
+        use std::{sync::mpsc, time::Duration};
+        let directory = tempdir().unwrap();
+        let listener = UnixListener::bind(directory.path().join("holder.sock")).unwrap();
+        let inspect_listener = listener.try_clone().unwrap();
+        let channel = Arc::new(Wakeup::channel().unwrap());
+        let owned_channel = channel.clone();
+        let mut child = ActivityWaitChild::start();
+        let original = child.original.clone();
+        let (started, ready) = mpsc::channel();
+        let (sent, received) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let holders = [original];
+            started.send(()).unwrap();
+            let result = wait_for_activity_until_with(&listener, &owned_channel, None, &holders);
+            sent.send(result).unwrap();
+        });
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        let early = received.recv_timeout(Duration::from_millis(30));
+        let returned_early = early.is_ok();
+        child.finish();
+        let outcome = if early.is_err() {
+            received.recv_timeout(Duration::from_secs(2))
+        } else {
+            early
+        };
+        if outcome.is_err() {
+            channel.wake();
+        }
+        waiter.join().unwrap();
+        assert!(
+            !returned_early,
+            "wait returned while the original was still live"
+        );
+        outcome
+            .expect("exact original exit did not wake wait")
+            .unwrap();
+        // Neither private source could have produced the returned event. The
+        // same held pidfd is readable after actual exit/reaping, without new PID lookup.
+        let mut quiet = [
+            libc::pollfd {
+                fd: inspect_listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: channel.reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        assert_eq!(
+            unsafe { libc::poll(quiet.as_mut_ptr(), quiet.len() as _, 0) },
+            0
+        );
+        let mut exited = libc::pollfd {
+            fd: child.original.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert!(unsafe { libc::poll(&mut exited, 1, 0) } > 0 && exited.revents & libc::POLLIN != 0);
+    }
+
+    #[cfg(all(feature = "host", target_os = "linux"))]
+    #[test]
+    fn lifecycle_activity_wait_preserves_local_wake_with_pending_holder_and_deadline() {
+        use std::{sync::mpsc, time::Duration};
+        let directory = tempdir().unwrap();
+        let listener = UnixListener::bind(directory.path().join("wake-holder.sock")).unwrap();
+        let channel = Arc::new(Wakeup::channel().unwrap());
+        let owned_channel = channel.clone();
+        let mut child = ActivityWaitChild::start();
+        let original = child.original.clone();
+        let (started, ready) = mpsc::channel();
+        let (sent, received) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let result = wait_for_activity_until_with(
+                &listener,
+                &owned_channel,
+                Some(Instant::now() + Duration::from_secs(30)),
+                &[original],
+            );
+            sent.send(result).unwrap();
+        });
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(child.child.try_wait().unwrap().is_none());
+        channel.wake();
+        let outcome = received.recv_timeout(Duration::from_secs(2));
+        if outcome.is_err() {
+            child.finish(); // exact exit can release a broken wake-path test
+        }
+        waiter.join().unwrap();
+        outcome
+            .expect("local wake lost with extra holder/deadline")
+            .unwrap();
+        let mut wake = libc::pollfd {
+            fd: channel.reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut wake, 1, 0) },
+            0,
+            "delivered local wake must still drain"
+        );
+        assert!(
+            child.child.try_wait().unwrap().is_none(),
+            "local wake must not wait for the original to exit"
+        );
+        child.finish();
     }
 
     fn proof() -> HostSessionProof {
