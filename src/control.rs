@@ -6427,12 +6427,16 @@ mod tests {
                     }
                     _ => return,
                 }
-                assert!(
-                    read_frame::<ClientEnvelope>(&mut server_stream)
-                        .unwrap()
-                        .is_none(),
-                    "no automatic request replay"
-                );
+                // Timing out with unread response bytes can reset a Unix
+                // socket when the client closes it. Inspect the first byte
+                // directly: even an incomplete replay must fail this guard,
+                // rather than being hidden by a frame reader's later reset.
+                let mut replay = [0];
+                match server_stream.read(&mut replay) {
+                    Ok(0) => {}
+                    Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+                    result => panic!("no automatic request replay (case {case}): {result:?}"),
+                }
             });
             let mut client = ControlClient::from_stream(client_stream).unwrap();
             let started = Instant::now();
