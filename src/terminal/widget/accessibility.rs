@@ -131,6 +131,8 @@ struct OwnedKey {
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ActionPhase {
+    // A native key was consumed without admitting a logical action.
+    Consumed,
     PendingQuery,
     Claimed,
 }
@@ -323,7 +325,42 @@ impl ReviewInputBarrier {
         inputs.prune();
         let already = ConsumedInputs::physical(event)
             .is_some_and(|(key, role)| inputs.exact(key, role, &source).is_some());
-        already || inputs.record(event, &source, false)
+        let accepted = already || inputs.record(event, &source, false);
+        if accepted
+            && let Some((key, Transition::Press)) = ConsumedInputs::physical(event)
+            && let Some(cycle) = ConsumedInputs::cycle(key, Transition::Press, &source)
+        {
+            let weak = Arc::downgrade(cycle);
+            if !inputs
+                .actions
+                .iter()
+                .any(|ticket| ticket.cycle.ptr_eq(&weak))
+            {
+                inputs.actions.push(ClaimedAction {
+                    physical: *key,
+                    cycle: weak,
+                    phase: ActionPhase::Consumed,
+                });
+            }
+        }
+        accepted
+    }
+    /// Native consumption/action tickets outlive key-up while queued copies keep the cycle
+    /// alive. Reading one never acquires ownership or keeps the cycle alive.
+    pub fn has_native_action(&self, event: &keyboard::Event, source: &Source) -> bool {
+        let Some((key, Transition::Press)) = ConsumedInputs::physical(event) else {
+            return false;
+        };
+        let Some(cycle) = ConsumedInputs::cycle(key, Transition::Press, source) else {
+            return false;
+        };
+        let weak = Arc::downgrade(cycle);
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .actions
+            .iter()
+            .any(|action| action.cycle.ptr_eq(&weak))
     }
     pub fn consume_keyboard(&self, event: &keyboard::Event) -> bool {
         self.consume_keyboard_with_source(event, &current_source())

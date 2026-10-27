@@ -14178,8 +14178,11 @@ impl Application for Cagents {
         #[rustfmt::skip]
         let task = (|| {
         if let Message::KeyEvent { event, .. } = &message
-            && matches!(event, keyboard::Event::KeyReleased { .. } | keyboard::Event::KeyPressed { repeat: true, .. })
-            && self.terminal_review_input.consume_keyboard_with_source(event, &key_source)
+            // An already owned physical cycle may be reported repeat:false.
+            && (key_source.cycle().is_some()
+                || matches!(event, keyboard::Event::KeyReleased { .. } | keyboard::Event::KeyPressed { repeat: true, .. }))
+            && (self.terminal_review_input.consume_keyboard_with_source(event, &key_source)
+                || self.terminal_review_input.has_native_action(event, &key_source))
         {
             return Task::none();
         }
