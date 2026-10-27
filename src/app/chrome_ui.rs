@@ -1520,7 +1520,23 @@ mod tests {
     #[test]
     fn notice_details_real_controls_keep_original_press_owner_and_current_keyboard_ring() {
         use iced::{Event, mouse, runtime::user_interface::Cache};
-        const DETAILS: &str = "NEW_REASON\nline2\nline3\nline4\nline5\nNEW_TAIL";
+        // The engine applies the line limit separately to each hard-newline
+        // paragraph. Exercise the native failure's single wrapped diagnostic,
+        // long enough to exceed four visual lines at both tested widths.
+        const DETAILS: &str = concat!(
+            "NEW_REASON: workspace could not be saved because storage refused the window's current state. ",
+            "The original window and its unsent draft remain available while this refusal is investigated. ",
+            "Changing or closing the affected item saves it again without replacing another conversation's identity. ",
+            "The current diagnostic belongs to this incident and must remain readable when other warnings arrive. ",
+            "Opening Details reveals the remaining reason without changing its source text or native widget owner. ",
+            "Hiding Details restores the collapsed layout and retains the same keyboard and dismissal controls. ",
+            "An already held pointer press must not activate a replacement incident when its content changes. ",
+            "Both the narrow and wide retained layouts must reveal this complete reason after expansion. ",
+            "The saved draft, original window, writer and settings generation stay fenced throughout the refusal. ",
+            "Copy unsent drafts before resolving the storage error; this message does not authorize a forced save. ",
+            "Additional context remains part of the same paragraph so the visual line limit is actually exercised. ",
+            "NEW_TAIL: this final part must have layout space after the current incident's Details action."
+        );
 
         fn diagnostic_height(nodes: &iced_accessibility::A11yTree) -> f64 {
             let mut diagnostic = nodes.root().iter().chain(nodes.children()).filter(|node| {
@@ -1727,6 +1743,16 @@ mod tests {
         assert!(paragraph.update(config(text::Ellipsize::None)));
         assert_eq!(paragraph.min_height(), full_height);
         assert!(!paragraph.update(config(text::Ellipsize::None)));
+        // Hard newlines are separate BufferLines: six short paragraphs do not
+        // exercise a per-paragraph four-line cap, unlike the wrapped reason.
+        let hard_lines = |policy| config(policy).with_content("one\ntwo\nthree\nfour\nfive\nsix");
+        assert!(paragraph.update(hard_lines(text::Ellipsize::None)));
+        let hard_lines_height = paragraph.min_height();
+        assert!(paragraph.update(hard_lines(limited(4))));
+        assert_eq!(paragraph.min_height(), hard_lines_height);
+        assert!(paragraph.update(hard_lines(limited(2))));
+        assert_eq!(paragraph.min_height(), hard_lines_height);
+        assert!(!paragraph.update(hard_lines(limited(2))));
         // Renderer primitive equality must also distinguish the policy even
         // when this particular short text fits both limits at the same size.
         let short = |policy| config(policy).with_content("one line");
