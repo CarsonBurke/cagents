@@ -16,7 +16,7 @@ use std::{
 
 const MAX_FRAME: usize = 4 * 1024 * 1024;
 
-pub(super) struct Client {
+pub(in crate::host) struct Client {
     stream: UnixStream,
     proof: HostSessionProof,
     next: u64,
@@ -108,8 +108,6 @@ impl Client {
                 | ClientRequest::ChatAttach { .. }
                 | ClientRequest::ChatVisibility { .. }
                 | ClientRequest::ChatRead { .. }
-                | ClientRequest::ChatReleaseInspect { .. }
-                | ClientRequest::ChatRelease { .. }
         ) && !matches!(&request, ClientRequest::ChatStart { session, source: None, terminate_source: false, execution_environment }
             if self.protocol == 119 && session.native_continuity.retains_provider() && execution_environment.0.is_empty())
         {
@@ -120,9 +118,7 @@ impl Client {
             ClientRequest::ChatAttach { session } => Some(session.id),
             ClientRequest::ChatDetach { chat_id }
             | ClientRequest::ChatVisibility { chat_id, .. }
-            | ClientRequest::ChatRead { chat_id, .. }
-            | ClientRequest::ChatReleaseInspect { chat_id } => Some(*chat_id),
-            ClientRequest::ChatRelease { proof, .. } => Some(proof.session.id),
+            | ClientRequest::ChatRead { chat_id, .. } => Some(*chat_id),
             _ => None,
         };
         let request_id = self.next;
@@ -258,10 +254,38 @@ impl Client {
         }
     }
 
+    #[cfg(test)]
+    pub(in crate::host) fn fixture_inspect_history(
+        stream: UnixStream,
+        source: &Session,
+        proof: HostSessionProof,
+    ) -> Result<(), String> {
+        let mut client = Self {
+            stream,
+            proof: proof.clone(),
+            next: 1,
+            protocol: ipc::PROTOCOL_VERSION,
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+        match client.request(
+            ClientRequest::Connect {
+                expected_host: Some(proof.clone()),
+                resume: Vec::new(),
+            },
+            false,
+        )? {
+            ServerResponse::Connected {
+                proof: connected,
+                resumed,
+            } if connected == proof && resumed.is_empty() => client.inspect_saved_history(source),
+            _ => Err("History fixture handshake did not authenticate the current owner".into()),
+        }
+    }
+
     /// Use only the existing forced-history Attach API. The request's current
     /// proof addresses that read-only API; it is never persisted as a recovered
     /// descriptor or presented as evidence of an old provider's execution.
-    /// Both the host's owner fences and exact release/coverage checks remain.
+    /// The host's normal owner/managed-work fences remain. No resident data is evicted.
     pub(super) fn inspect_saved_history(&mut self, source: &Session) -> Result<(), String> {
         if ![119, ipc::PROTOCOL_VERSION].contains(&self.protocol)
             || !source.is_saved_claude_history()
@@ -344,30 +368,11 @@ impl Client {
         if !matches!(detached, ServerResponse::Detached) {
             return Err("Saved history inspection could not detach its reader".into());
         }
-        inspection?;
-        let ServerResponse::ChatReleaseInspected { inspection } = self.request(
-            ClientRequest::ChatReleaseInspect { chat_id: source.id },
-            true,
-        )?
-        else {
-            return Err("Saved history did not return its release inspection".into());
-        };
-        if inspection.proof.session != requested || inspection.release_blocked.is_some() {
-            return Err("Saved history still owns protected state; its reader was retained".into());
-        }
-        match self.request(
-            ClientRequest::ChatRelease {
-                proof: inspection.proof.clone(),
-                dry_run: false,
-            },
-            true,
-        )? {
-            ServerResponse::ChatReleased {
-                inspection: released,
-                dry_run: false,
-            } if released == inspection => Ok(()),
-            _ => Err("Saved history release changed its exact witness".into()),
-        }
+        // Keep the reader through consent and normal source shutdown. Removing
+        // and reconstructing a pager advances legacy119's global inventory
+        // generation and invalidates every unrelated live owner's consent.
+        // Other attached history views remain attached; no cache is evicted.
+        inspection
     }
 }
 
@@ -946,22 +951,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_history_preview_only_attaches_reads_detaches_and_releases_actual_witness() {
+    fn legacy_history_preview_only_attaches_reads_and_detaches_without_execution_or_eviction() {
         let (stream, mut peer) = UnixStream::pair().unwrap();
         let source = super::super::tests::session();
         let mut requested = source.clone();
         requested.proof = Some(proof());
         let expected = requested.clone();
         let worker = std::thread::spawn(move || {
-            let witness = crate::terminal_ipc::ChatReleaseInspection {
-                proof: crate::terminal_ipc::ChatReleaseProof {
-                    session: expected.clone(),
-                    execution_instance: uuid::Uuid::new_v4(),
-                    generation: 7,
-                },
-                release_blocked: None,
-            };
-            for step in 0..5 {
+            for step in 0..3 {
                 let request: ClientEnvelope = ipc::read_frame(&mut peer).unwrap().unwrap();
                 assert_eq!(request.version, 119);
                 assert_eq!(request.proof, Some(proof()));
@@ -976,9 +973,7 @@ mod tests {
                     },
                     (1, ClientRequest::ChatVisibility { chat_id, visible: true }) if chat_id == expected.id => ServerResponse::Accepted,
                     (2, ClientRequest::ChatDetach { chat_id }) if chat_id == expected.id => ServerResponse::Detached,
-                    (3, ClientRequest::ChatReleaseInspect { chat_id }) if chat_id == expected.id => ServerResponse::ChatReleaseInspected { inspection: witness.clone() },
-                    (4, ClientRequest::ChatRelease { proof, dry_run: false }) if proof == witness.proof => ServerResponse::ChatReleased { inspection: witness.clone(), dry_run: false },
-                    other => panic!("Unexpected history request (no Start or Close permitted): {other:?}"),
+                    other => panic!("Unexpected history request (no Start, Close or Release permitted): {other:?}"),
                 };
                 // Only exact target-chat events may interleave with the reply.
                 ipc::write_frame(

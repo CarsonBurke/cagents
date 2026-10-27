@@ -148,6 +148,9 @@ pub(in crate::host) fn resolve(
             super::capacity::recover_saved_history(host, source)?;
         }
     }
+    if source.is_saved_claude_history() {
+        super::capacity::register_saved_history_alias(host, source)?;
+    }
     let resolved = super::resolve_upgrade(host, source)?;
     let mut grant = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());

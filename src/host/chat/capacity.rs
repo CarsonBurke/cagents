@@ -1405,6 +1405,27 @@ mod tests {
                 assert!(!reader.observations.contains_key(&0));
             }
             assert!(!marker.exists(), "automatic restore launched a provider");
+            if index == 0 {
+                let mut older_alias = source.clone();
+                older_alias.proof.as_mut().unwrap().host_incarnation =
+                    HostIncarnation::new("still-older-window");
+                let (second, second_server) = restore_client(&host, older_alias.clone(), 301);
+                let second = second.unwrap();
+                wait_for_client_history(&second, true);
+                assert_eq!(second.session(), expected);
+                let second_witness = second.authenticated_upgrade_recovery().unwrap();
+                assert!(second_witness.validate());
+                assert_eq!(second_witness.source(), &older_alias);
+                let mut changed_account = older_alias.clone();
+                changed_account
+                    .launch
+                    .recipe
+                    .environment
+                    .insert("CLAUDE_CONFIG_DIR".into(), "/different-account".into());
+                assert!(register_saved_history_alias(&host, &changed_account).is_err());
+                drop(second);
+                second_server.join().unwrap();
+            }
             drop(client);
             server.join().unwrap();
             let release_proof = inspect(&host, source.id).unwrap();
@@ -1417,6 +1438,101 @@ mod tests {
             "65 exact history handshakes and releases: {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn history_preview_preserves_an_attached_view_and_unrelated_live_consent() {
+        struct Idle;
+        impl chat::protocol::Adapter for Idle {
+            fn initialize(&mut self) -> Result<chat::protocol::Step, String> {
+                Ok(Default::default())
+            }
+            fn command(&mut self, _: chat::Command) -> Result<chat::protocol::Step, String> {
+                Ok(Default::default())
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<chat::protocol::Step, String> {
+                Ok(Default::default())
+            }
+        }
+        let host = host();
+        let (directory, source, _) = history_reader(&host, false);
+        let (view, server) = restore_client(&host, source.clone(), 71);
+        let view = view.unwrap();
+        wait_for_client_history(&view, true);
+        // A genuine fixture-owned pipe process supplies unrelated live work.
+        let mut live = session();
+        live.proof = Some(host.lock().unwrap().proof().clone());
+        live.launch.recipe.program = "/bin/cat".into();
+        live.launch.recipe.working_directory = directory.path().to_path_buf();
+        let spec = chat::protocol::ProcessSpec::from(&live.launch.recipe);
+        let mut initial = chat::protocol::Step::default();
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, Box::new(Idle), initial, store, None, |_| {}).unwrap();
+        host.lock().unwrap().chats.insert(
+            live.id,
+            Record {
+                execution_instance: uuid::Uuid::new_v4(),
+                console_recipe: None,
+                paired_terminal: None,
+                session: live.clone(),
+                handle: handle.clone(),
+                source_process: None,
+                subscribers: BTreeMap::new(),
+                observations: BTreeMap::new(),
+                completion_observed: false,
+                returning_terminal: false,
+            },
+        );
+        let preview = |client_id| {
+            let (stream, socket) = std::os::unix::net::UnixStream::pair().unwrap();
+            let server_host = host.clone();
+            let worker = thread::spawn(move || {
+                super::super::super::client::serve(socket, client_id, server_host)
+            });
+            let proof = host.lock().unwrap().proof().clone();
+            crate::host::upgrade_inspect::InspectionClient::fixture_inspect_history(
+                stream, &source, proof,
+            )
+            .unwrap();
+            worker.join().unwrap();
+        };
+        preview(72);
+        let generation = host.lock().unwrap().inventory_generation;
+        let before = host
+            .lock()
+            .unwrap()
+            .upgrade_impact(crate::update::impact::Policy::WhenIdle)
+            .unwrap();
+        assert!(before.sessions.iter().any(|session| session.id == live.id));
+        preview(73);
+        let after = host
+            .lock()
+            .unwrap()
+            .upgrade_impact(crate::update::impact::Policy::WhenIdle)
+            .unwrap();
+        assert_eq!(host.lock().unwrap().inventory_generation, generation);
+        assert!(before.preserves_consent(&after));
+        assert!(!handle.is_completed());
+        assert!(view.is_connected());
+        assert_eq!(view.session(), source);
+        assert!(
+            host.lock().unwrap().chats[&source.id]
+                .subscribers
+                .contains_key(&71)
+        );
+        assert!(
+            inspect(&host, source.id)
+                .unwrap()
+                .release_blocked
+                .unwrap()
+                .contains("attached")
+        );
+        drop(view);
+        server.join().unwrap();
+        handle.close().unwrap();
+        host.lock().unwrap().chats.remove(&live.id);
+        let inspection = inspect(&host, source.id).unwrap();
+        release(&host, &inspection.proof, false).unwrap();
     }
 }
 
@@ -1782,21 +1898,41 @@ pub(super) fn recover_saved_history(
             .clone(),
     );
     restore_saved_history(host, 0, session.clone())?;
+    register_saved_history_alias(host, source)
+}
+
+/// An inactive window may retain a different former proof for this same
+/// paging allocation. Admit that alias independently against the complete
+/// current reader; an earlier alias cannot authenticate different content.
+pub(super) fn register_saved_history_alias(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<(), ProtocolError> {
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let record = state
         .chats
         .get(&source.id)
         .ok_or_else(|| unavailable("Saved history changed during recovery"))?;
-    if record.session != session
+    if !source.is_saved_claude_history()
         || !record.handle.is_read_only_history()
         || record.handle.owns_work()
     {
+        return Ok(()); // native execution keeps its separate lineage contract
+    }
+    let mut expected = source.clone();
+    expected.proof = Some(state.proof().clone());
+    if record.session != expected {
         return Err(unavailable(
             "Saved history did not confirm a read-only attachment",
         ));
     }
     let sources = state.upgrade_chats.entry(source.id).or_default();
     if !sources.iter().any(|previous| previous.source == *source) {
+        if sources.len() >= crate::upgrade::handoff::MAX_CHATS {
+            return Err(unavailable(
+                "Saved history aliases exceed the bounded recovery limit",
+            ));
+        }
         sources.push(crate::upgrade::handoff::ChatSource {
             source: source.clone(),
             launch: source.launch.clone(),

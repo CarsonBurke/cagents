@@ -4,6 +4,8 @@
 mod current;
 mod v68;
 mod v77;
+#[cfg(test)]
+pub(super) use current::Client as InspectionClient;
 
 use crate::install_guard::SourceInspectionRequest as Request;
 use crate::{
