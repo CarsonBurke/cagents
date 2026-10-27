@@ -2126,6 +2126,206 @@ mod tests {
     }
 
     #[test]
+    fn archived_history_resume_witness_rechecks_only_exact_retired_history() {
+        use crate::daemon::holder_registry::{Kind, Process, Record};
+        use crate::workspace_model::views::{Pane, Scope};
+        use std::os::unix::fs::MetadataExt;
+        // Typed durable-model qualification only. Runtime still requires the
+        // independently authenticated private VerifiedRetirement and account.
+        for pending_only in [false, true] {
+            for case in 0..9 {
+                let (mut registry, directory, request) = fixture();
+                let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+                let HostedSession::Chat(mut current) = source() else {
+                    unreachable!()
+                };
+                current.native_continuity =
+                    crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+                current.launch.recipe.working_directory = directory.path().into();
+                let boot = current.proof.as_ref().unwrap().boot_id.clone();
+                let mut historical = current.clone();
+                historical.proof.as_mut().unwrap().boot_id = "previous-kernel-boot".into();
+                historical.launch.session_id = None;
+                registry
+                    .bind_agent(accepted.agent.id, None, HostedSession::Chat(historical))
+                    .unwrap();
+                let started = registry
+                    .update_agent_run(
+                        accepted.run.id,
+                        accepted.run.revision,
+                        Update::Started {
+                            provider_key: "model-fixture-completed-turn".into(),
+                        },
+                        2,
+                    )
+                    .unwrap();
+                registry
+                    .update_agent_run(
+                        accepted.run.id,
+                        started.revision,
+                        Update::Finished {
+                            state: State::Succeeded,
+                            result: ResultSummary::default(),
+                        },
+                        3,
+                    )
+                    .unwrap();
+                let metadata = std::fs::metadata(directory.path()).unwrap();
+                let scope = crate::account::scope::LaunchAccountScope {
+                    provider: Provider::Claude,
+                    canonical_home: directory.path().canonicalize().unwrap(),
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                    registered_id: None,
+                    purge_ids: vec![],
+                };
+                let actor = uuid::Uuid::new_v4();
+                let owner = Record {
+                    version: 4,
+                    build: None,
+                    kind: Kind::Native,
+                    application: crate::instance::APPLICATION_ID.into(),
+                    boot: boot.clone(),
+                    terminal: current.id,
+                    holder: Process { pid: 42, start: 1 },
+                    root: Process { pid: 43, start: 2 },
+                };
+                let mut pending = current.clone();
+                if pending_only {
+                    pending.native_continuity = crate::chat::NativeContinuity::ReconnectOnly;
+                }
+                registry
+                    .register_pending_native_actor_ownership(actor, &owner, &pending, Ok(&scope))
+                    .unwrap();
+                registry
+                    .fresh_agent_authority(&HostedSession::Chat(pending.clone()))
+                    .unwrap();
+                let ownership = registry.native_actor_ownership(actor).unwrap().unwrap();
+                assert!(
+                    registry
+                        .archive_previous_boot_execution(
+                            &ownership,
+                            &boot,
+                            &[current.clone(), pending.clone()],
+                            &current
+                        )
+                        .unwrap()
+                );
+                registry
+                    .commit_native_actor_retirement(
+                        actor,
+                        &owner,
+                        &current,
+                        Ok(&scope),
+                        current.launch.session_id.as_deref(),
+                    )
+                    .unwrap();
+                let retirement = registry.native_actor_retirement(actor).unwrap().unwrap();
+                assert!(
+                    registry
+                        .archived_history(&current, &ownership, &retirement, &boot)
+                        .unwrap()
+                        .is_none(),
+                    "current authority must retire separately"
+                );
+                registry
+                    .retire_agent_process(&HostedSession::Chat(current.clone()), 4)
+                    .unwrap();
+                let witness = registry
+                    .archived_history(&current, &ownership, &retirement, &boot)
+                    .unwrap()
+                    .unwrap();
+                assert!(witness.matches(&current, &ownership, &retirement));
+                match case {
+                    0 => {}
+                    1 => {
+                        registry
+                            .fresh_agent_authority(&HostedSession::Chat(current.clone()))
+                            .unwrap();
+                    }
+                    2 => {
+                        let mut agent = registry.agent(accepted.agent.id).unwrap();
+                        agent.closed = false;
+                        registry
+                            .db
+                            .execute(
+                                "UPDATE agents SET closed=0,record=?1 WHERE id=?2",
+                                params![encode(&agent).unwrap(), agent.id.to_string()],
+                            )
+                            .unwrap();
+                    }
+                    3 => {
+                        let mut run = registry.agent_run(accepted.run.id).unwrap();
+                        run.state = State::Running;
+                        registry
+                            .db
+                            .execute(
+                                "UPDATE agent_runs SET state='running',record=?1 WHERE id=?2",
+                                params![encode(&run).unwrap(), run.id.to_string()],
+                            )
+                            .unwrap();
+                    }
+                    4 => {
+                        registry
+                            .apply(&ModelEdit::SeedView {
+                                scope: Scope::Channel(accepted.agent.channel().unwrap()),
+                                panes: vec![Pane {
+                                    id: crate::model::CardId::new(),
+                                    title: "Restored history".into(),
+                                    user_title: None,
+                                    pending_terminal_start: false,
+                                    width_fraction: 0.5,
+                                    kind: crate::model::CardKind::Chat(current.clone()),
+                                    scope: None,
+                                }],
+                                closed: vec![],
+                            })
+                            .unwrap();
+                    }
+                    5 => {
+                        registry
+                            .db
+                            .execute(
+                                "DELETE FROM native_actor_retirements WHERE actor=?1",
+                                [actor.to_string()],
+                            )
+                            .unwrap();
+                    }
+                    6 => {
+                        registry
+                            .db
+                            .execute("UPDATE metadata SET sequence=sequence+1", [])
+                            .unwrap();
+                    }
+                    7 | 8 => {
+                        let mut other = owner.clone();
+                        other.holder.start += 1;
+                        let mut other_source = pending.clone();
+                        if case == 8 {
+                            other.terminal = crate::model::TerminalId::new();
+                            other_source.id = other.terminal;
+                        }
+                        registry
+                            .register_pending_native_actor_ownership(
+                                uuid::Uuid::new_v4(),
+                                &other,
+                                &other_source,
+                                Ok(&scope),
+                            )
+                            .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    registry.recheck_archived_history(&witness).is_ok(),
+                    case == 0 || case == 6,
+                    "pending_only={pending_only} case={case}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn startup_preserves_only_exact_helper_proven_run_and_session_pairs() {
         for mismatch in 0..6 {
             let (mut registry, _directory, request) = fixture();
