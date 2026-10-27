@@ -441,7 +441,10 @@ fn prune_scratch(common: &Path) {
     };
     let now = SystemTime::now();
     for entry in entries.flatten() {
-        let stale = entry.file_name().as_bytes().starts_with(SCRATCH_PREFIX.as_bytes())
+        let stale = entry
+            .file_name()
+            .as_bytes()
+            .starts_with(SCRATCH_PREFIX.as_bytes())
             && entry
                 .metadata()
                 .and_then(|metadata| metadata.modified())
@@ -561,8 +564,13 @@ pub(super) fn filesystem(path: &Path) -> std::io::Result<Option<(u64, u64, Optio
             Some(libc::ENOENT | libc::ENOTDIR) => Ok(None),
             // A sandbox may filter statx; the device still finds most mounts.
             Some(libc::ENOSYS | libc::EPERM) => {
-                let metadata = std::fs::symlink_metadata(std::ffi::OsStr::from_bytes(path.as_bytes()))?;
-                Ok(Some((libc::major(metadata.dev()).into(), libc::minor(metadata.dev()).into(), None)))
+                let metadata =
+                    std::fs::symlink_metadata(std::ffi::OsStr::from_bytes(path.as_bytes()))?;
+                Ok(Some((
+                    libc::major(metadata.dev()).into(),
+                    libc::minor(metadata.dev()).into(),
+                    None,
+                )))
             }
             _ => Err(error),
         };
@@ -840,11 +848,8 @@ fn analyze(
         return Err(ContentError::NotTopLevel(path.to_owned()));
     }
     let admin = PathBuf::from(plain.line(["rev-parse", "--path-format=absolute", "--git-dir"])?);
-    let common = PathBuf::from(plain.line([
-        "rev-parse",
-        "--path-format=absolute",
-        "--git-common-dir",
-    ])?);
+    let common =
+        PathBuf::from(plain.line(["rev-parse", "--path-format=absolute", "--git-common-dir"])?);
     // Files-backend locks fence removal; reftable needs its own guarantee.
     if plain
         .answer(["config", "--get", "extensions.refStorage"])?
@@ -877,9 +882,7 @@ fn analyze(
         return Ok(blocked(path, blocker));
     }
 
-    let symref = plain
-        .answer(["symbolic-ref", "-q", "HEAD"])?
-        .map(oid);
+    let symref = plain.answer(["symbolic-ref", "-q", "HEAD"])?.map(oid);
     let Some(head) = plain
         .answer(["rev-parse", "-q", "--verify", "HEAD^{commit}"])?
         .map(oid)
@@ -1101,7 +1104,12 @@ fn analyze(
             break;
         }
         let Some(target_oid) = git
-            .answer(["rev-parse", "-q", "--verify", &format!("{target}^{{commit}}")])?
+            .answer([
+                "rev-parse",
+                "-q",
+                "--verify",
+                &format!("{target}^{{commit}}"),
+            ])?
             .map(oid)
         else {
             continue;
@@ -1180,7 +1188,11 @@ fn analyze(
             modified: count(modified),
             untracked: count(untracked.len()),
             untracked_bytes,
-            filtered: lossy.iter().take(LISTED).map(|path| display(path)).collect(),
+            filtered: lossy
+                .iter()
+                .take(LISTED)
+                .map(|path| display(path))
+                .collect(),
             nested: walk.nested.into_iter().take(LISTED).collect(),
             ignored,
             ignored_total,
@@ -1255,7 +1267,11 @@ impl Content {
                     .stdin(input),
             )?;
             let tree = only.line(["write-tree"])?;
-            Some(commit(&tree, &[], &format!("untracked files on {subject}"))?)
+            Some(commit(
+                &tree,
+                &[],
+                &format!("untracked files on {subject}"),
+            )?)
         };
         let mut parents = vec![self.head.as_str(), index.as_str()];
         parents.extend(untracked.as_deref());
