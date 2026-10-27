@@ -30,14 +30,35 @@ fn renderer() -> Renderer {
 }
 
 fn view(options: Vec<String>, selected: Option<usize>) -> Element<'static, Message> {
+    view_with_typography(
+        options,
+        selected,
+        14.0,
+        None,
+        cosmic::iced::widget::text::LineHeight::Relative(1.2),
+    )
+}
+
+fn view_with_typography(
+    options: Vec<String>,
+    selected: Option<usize>,
+    size: f32,
+    font: Option<Font>,
+    line_height: cosmic::iced::widget::text::LineHeight,
+) -> Element<'static, Message> {
+    let mut dropdown = widget::dropdown(options, selected, Message::Selected)
+        .width(200)
+        .text_size(size)
+        .text_line_height(line_height);
+    if let Some(font) = font {
+        dropdown = dropdown.font(font);
+    }
     widget::column::with_children(vec![
         widget::button::text("Before")
             .on_press(Message::Before)
             .into(),
         // Ordinary Settings callers do not supply an explicit dropdown ID.
-        widget::dropdown(options, selected, Message::Selected)
-            .width(200)
-            .into(),
+        dropdown.into(),
         widget::button::text("After")
             .on_press(Message::After)
             .into(),
@@ -75,8 +96,11 @@ struct Fixture {
 
 impl Fixture {
     fn new(options: Vec<String>, selected: Option<usize>) -> Self {
+        Self::from_element(view(options, selected))
+    }
+
+    fn from_element(mut element: Element<'static, Message>) -> Self {
         let renderer = renderer();
-        let mut element = view(options, selected);
         let mut tree = Tree::new(element.as_widget());
         tree.diff(element.as_widget_mut());
         let viewport = Rectangle::with_size(Size::new(360.0, 220.0));
@@ -95,7 +119,11 @@ impl Fixture {
     }
 
     fn replace(&mut self, options: Vec<String>, selected: Option<usize>) {
-        self.element = view(options, selected);
+        self.replace_element(view(options, selected));
+    }
+
+    fn replace_element(&mut self, element: Element<'static, Message>) {
+        self.element = element;
         self.tree.diff(self.element.as_widget_mut());
         self.node = self.element.as_widget_mut().layout(
             &mut self.tree,
@@ -273,6 +301,16 @@ impl Fixture {
         options: Vec<String>,
         selected: Option<usize>,
     ) -> Box<dyn Fn() -> Element<'static, Message>> {
+        self.retained_popup_provider_with_size(options, selected, 14.0)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn retained_popup_provider_with_size(
+        &self,
+        options: Vec<String>,
+        selected: Option<usize>,
+        text_size: f32,
+    ) -> Box<dyn Fn() -> Element<'static, Message>> {
         // This is the public ordinary popup widget used by the Wayland path,
         // with the same State clone and owned choices as its real retained
         // view provider. It is not a compositor/native-window execution claim.
@@ -286,7 +324,7 @@ impl Fixture {
                 &state,
                 4.0,
                 8.0.into(),
-                14.0,
+                text_size,
                 options.clone().into(),
                 Vec::new().into(),
                 selected,
@@ -755,6 +793,124 @@ fn dropdown_popup_abort_and_commit_retire_only_its_own_surface_once() {
                 messages, expected,
                 "retained popup must retire exactly once"
             );
+        }
+    }
+}
+
+#[test]
+fn dropdown_rebuild_refreshes_unselected_option_metrics_after_typography_changes() {
+    use cosmic::iced::widget::text::LineHeight;
+    use keyboard::key::Named;
+    let options = vec![
+        "x".to_owned(),
+        "A much wider unselected option with iii and WWW".to_owned(),
+    ];
+    let build = |size, font, line_height| {
+        view_with_typography(options.clone(), Some(0), size, Some(font), line_height)
+    };
+    let mut retained = Fixture::from_element(build(13.0, Font::DEFAULT, LineHeight::Relative(1.2)));
+    retained.resize(Size::new(1600.0, 900.0));
+    retained.tab(false);
+    retained.tab(false);
+    retained.key(Named::Enter);
+    let original_width = retained.scroll().0.width;
+    retained.replace_element(build(13.0, Font::DEFAULT, LineHeight::Relative(1.2)));
+    assert!(
+        retained.open(),
+        "unchanged metrics preserve the live opening"
+    );
+    assert_eq!(retained.scroll().0.width, original_width);
+    retained.key(Named::Escape);
+    let original_id = retained.focused()[1].0.clone();
+    #[cfg(target_os = "linux")]
+    let mut prior_size = 13.0;
+
+    // The labels and short selection are unchanged. Closed layout only updates
+    // that selected paragraph; the open menu must refresh the long other row.
+    for (size, font, line_height) in [
+        (24.0, Font::DEFAULT, LineHeight::Relative(1.2)),
+        (24.0, Font::MONOSPACE, LineHeight::Relative(1.2)),
+        (24.0, Font::MONOSPACE, LineHeight::Absolute(Pixels(36.0))),
+        (13.0, Font::DEFAULT, LineHeight::Relative(1.2)),
+    ] {
+        retained.key(Named::Enter);
+        #[cfg(target_os = "linux")]
+        let old_provider =
+            retained.retained_popup_provider_with_size(options.clone(), Some(0), prior_size);
+        retained.replace_element(build(size, font, line_height));
+        assert_eq!(retained.focused()[1], (original_id.clone(), true));
+        assert!(
+            !retained.open(),
+            "changed metrics retire the old opening before it can reuse captured dimensions"
+        );
+        retained.key(Named::Enter);
+        #[cfg(target_os = "linux")]
+        {
+            let mut old = old_provider();
+            let mut tree = Tree::new(old.as_widget());
+            let viewport = Rectangle::with_size(Size::new(1600.0, 900.0));
+            let node = old.as_widget_mut().layout(
+                &mut tree,
+                &retained.renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            let mut messages = Vec::new();
+            old.as_widget_mut().update(
+                &mut tree,
+                &named(Named::Enter),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &retained.renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            assert_eq!(
+                messages,
+                [Message::SurfaceClosed],
+                "a reconstructed old metric provider cannot activate its old choice"
+            );
+            assert!(
+                retained.open(),
+                "old retirement leaves the current opening live"
+            );
+        }
+        let retained_bounds = retained.scroll().0;
+        retained.replace_element(build(size, font, line_height));
+        assert!(
+            retained.open(),
+            "a second unchanged reconstruction must not retire the current opening"
+        );
+        assert_eq!(retained.scroll().0.width, retained_bounds.width);
+
+        let mut fresh = Fixture::from_element(build(size, font, line_height));
+        fresh.resize(Size::new(1600.0, 900.0));
+        fresh.tab(false);
+        fresh.tab(false);
+        fresh.key(Named::Enter);
+        let fresh_bounds = fresh.scroll().0;
+        assert_eq!(
+            retained_bounds.width, fresh_bounds.width,
+            "retained option width must match a newly constructed menu at current metrics"
+        );
+        if size == 24.0 && font == Font::DEFAULT {
+            assert!(
+                retained_bounds.width > original_width * 1.4,
+                "the long unselected option must grow with the interface text size"
+            );
+        }
+        assert_eq!(retained.key(Named::End).0, Vec::<Message>::new());
+        assert_eq!(
+            retained.key(Named::Enter).0,
+            [Message::Selected(1)],
+            "reflow preserves keyboard selection"
+        );
+        assert!(!retained.open());
+        retained.key(Named::Enter);
+        retained.key(Named::Escape);
+        #[cfg(target_os = "linux")]
+        {
+            prior_size = size;
         }
     }
 }

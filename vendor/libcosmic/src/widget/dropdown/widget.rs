@@ -18,7 +18,6 @@ use iced_core::{
 use iced_widget::pick_list::{self, Catalog};
 use std::borrow::Cow;
 use std::ffi::OsStr;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -183,9 +182,17 @@ where
     fn diff(&mut self, tree: &mut Tree) {
         let state = tree.state.downcast_mut::<State>();
 
-        // Retained menus belong to the exact choices and selected source.
-        // An index must never migrate to a replacement/reordered list.
-        if state.selected != self.selected
+        let font = self.font.unwrap_or_else(crate::font::default);
+        let metrics = (
+            font,
+            Pixels(self.text_size.unwrap_or(14.0)),
+            self.text_line_height,
+        );
+        // Retained menus belong to the exact choices, selection and metrics.
+        // In particular, a native provider captures the old text size and must
+        // retire rather than reuse its old dimensions after typography changes.
+        if state.selection_metrics != Some(metrics)
+            || state.selected != self.selected
             || state
                 .source
                 .iter()
@@ -199,6 +206,7 @@ where
                 .map(|value| value.as_ref().to_owned())
                 .collect();
             state.selected = self.selected;
+            state.selection_metrics = Some(metrics);
             if self.selections.is_empty() {
                 state.focused = false;
             }
@@ -211,25 +219,18 @@ where
         state
             .selections
             .resize_with(self.selections.len(), crate::Plain::default);
-        state.hashes.resize(self.selections.len(), 0);
-
-        for (i, selection) in self.selections.iter().enumerate() {
-            let mut hasher = DefaultHasher::new();
-            selection.as_ref().hash(&mut hasher);
-            let text_hash = hasher.finish();
-
-            if state.hashes[i] == text_hash {
-                continue;
-            }
-
-            state.hashes[i] = text_hash;
-            state.selections[i].update(Text {
+        // Plain::update already compares the content and all shaping metrics.
+        // A label-only shortcut leaves unselected option widths stale after
+        // the interface font, text size, or line height changes.
+        for (selection, paragraph) in self.selections.iter().zip(&mut state.selections) {
+            paragraph.update(Text {
                 content: selection.as_ref(),
-                bounds: Size::INFINITE,
-                // TODO use the renderer default size
-                size: iced::Pixels(self.text_size.unwrap_or(14.0)),
+                // Match closed layout so unchanged frames do not bounce
+                // selected paragraphs between infinite and finite bounds.
+                bounds: Size::new(f32::MAX, f32::MAX),
+                size: metrics.1,
                 line_height: self.text_line_height,
-                font: self.font.unwrap_or_else(crate::font::default),
+                font,
                 align_x: text::Alignment::Left,
                 align_y: alignment::Vertical::Top,
                 shaping: text::Shaping::Advanced,
@@ -439,12 +440,12 @@ pub struct State {
     close_operation: bool,
     open_operation: bool,
     hovered_option: Arc<Mutex<Option<usize>>>,
-    hashes: Vec<u64>,
     selections: Vec<crate::Plain>,
     popup_id: window::Id,
     focused: bool,
     source: Vec<String>,
     selected: Option<usize>,
+    selection_metrics: Option<(crate::font::Font, Pixels, text::LineHeight)>,
     source_epoch: Arc<AtomicU64>,
     opening_epoch: u64,
 }
@@ -462,13 +463,13 @@ impl State {
             is_open: Arc::new(AtomicBool::new(false)),
             hovered_option: Arc::new(Mutex::new(None)),
             selections: Vec::new(),
-            hashes: Vec::new(),
             popup_id: window::Id::unique(),
             close_operation: false,
             open_operation: false,
             focused: false,
             source: Vec::new(),
             selected: None,
+            selection_metrics: None,
             source_epoch: Arc::new(AtomicU64::new(0)),
             opening_epoch: 0,
         }
