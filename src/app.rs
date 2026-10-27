@@ -36,6 +36,7 @@ mod resume_ui;
 mod review_request_ui;
 #[cfg(test)]
 mod safety_tests;
+mod saved_terminal;
 mod session_recovery;
 mod settings_ui;
 mod shared_views;
@@ -2676,6 +2677,7 @@ fn join_failures(failures: &[crate::repository::MutationFailure]) -> String {
 fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
     match message {
         Message::TerminalFailure(action) => action.is_user_action(),
+        Message::SavedTerminal(action) => action.is_user_action(),
         Message::NewTerminal
         | Message::OpenRepository
         | Message::FocusCard(_)
@@ -2810,6 +2812,9 @@ fn resolve_restore_card(
 }
 
 fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
+    if let Message::SavedTerminal(action) = message {
+        return action.is_user_action();
+    }
     // The channel deletion dialog is the one channel command that navigates
     // nowhere, so a save in flight must not strand it with no way out.
     if let Message::ChannelUi(action) = message {
@@ -4218,6 +4223,7 @@ pub enum Message {
     },
     NewTerminal,
     TerminalFailure(terminal_failure::Action),
+    SavedTerminal(saved_terminal::Action),
     TerminalStarted {
         card: CardId,
         terminal: TerminalId,
@@ -5120,6 +5126,7 @@ pub struct Cagents {
     /// concurrency: every mutation happens on the update thread.
     terminal_starts: std::sync::Mutex<HashMap<CardId, usize>>,
     terminal_failure: terminal_failure::State,
+    saved_terminals: saved_terminal::State,
     /// Observations held back while a start was outstanding.
     pending_adoptions: Vec<TerminalSession>,
     /// Restored agent terminals that are not on screen, attached one at a
@@ -5629,6 +5636,10 @@ impl Cagents {
                 restored_runtime_residency(&card.kind, card.exposure, &card.residency);
             match card.kind {
                 CardKind::Terminal(session) => {
+                    if self.prepare_saved_terminal(card.id, &session) {
+                        repository_tasks.push(self.inspect_saved_terminal(card.id));
+                        continue;
+                    }
                     let terminal_residency =
                         terminal_residency.expect("terminal restore has lifecycle residency");
                     self.lifecycle.register(
@@ -5744,6 +5755,11 @@ impl Cagents {
                 && self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
                 && !explicit_retry)
         {
+            return Task::none();
+        }
+        // A restored recipe is presentation until its exact attachment has
+        // been resolved; visibility alone must never execute it.
+        if !explicit_retry && self.saved_terminal_current(card).is_some() {
             return Task::none();
         }
         // Recovery can replace the identity this start ends up with, so
@@ -8364,6 +8380,10 @@ impl Cagents {
             self.cards.insert(card, CardRuntime::utility(&state.kind));
             return Task::none();
         }
+        if self.saved_terminal_current(card).is_some() {
+            return self.inspect_saved_terminal(card);
+        }
+        self.saved_terminals.entries.remove(&card);
         let retry_details = self.terminal_details(card);
         let terminal_replacement = if let CardKind::Terminal(session) = &mut state.kind
             && session.continuity.live_proof().is_none()
@@ -9769,7 +9789,10 @@ impl Cagents {
         } else {
             "Retry"
         };
-        let content: Element<'a, Message> = match self.cards.get(&id) {
+        let content: Element<'a, Message> = if let Some(view) = self.saved_terminal_view(id) {
+            view
+        } else {
+            match self.cards.get(&id) {
             Some(CardRuntime::Chat(_)) => self.chat_view(id).map(move |message| match message {
                 Message::ChatUi(chat_ui::Action::OpenUrl(uri)) => {
                     Message::OpenDocumentLink(id, uri)
@@ -10068,6 +10091,7 @@ impl Cagents {
             .center(Length::Fill)
             .padding(space::XL)
             .into(),
+        }
         };
 
         let mut rows: Vec<Element<'a, Message>> = Vec::with_capacity(3);
@@ -12366,6 +12390,16 @@ impl Cagents {
     }
 
     fn inspector_runtime_status(&self, card: CardId) -> InspectorRuntimeStatus {
+        if self.saved_terminal_current(card).is_some() {
+            return if self
+                .saved_terminal_status(card)
+                .is_some_and(|(_, busy)| busy)
+            {
+                InspectorRuntimeStatus::Starting
+            } else {
+                InspectorRuntimeStatus::Unavailable
+            };
+        }
         match self.cards.get(&card) {
             Some(CardRuntime::Loading) | None => InspectorRuntimeStatus::Starting,
             Some(CardRuntime::Failed(_)) => InspectorRuntimeStatus::Unavailable,
@@ -13862,6 +13896,7 @@ impl Application for Cagents {
             hosted_terminals_rx,
             terminal_starts: std::sync::Mutex::new(HashMap::new()),
             terminal_failure: terminal_failure::State::default(),
+            saved_terminals: saved_terminal::State::default(),
             pending_adoptions: Vec::new(),
             restored_agent_attaches: VecDeque::new(),
             relaunched_terminals: HashSet::new(),
@@ -14276,6 +14311,7 @@ impl Application for Cagents {
         let mut terminal_metadata_unchanged = false;
         let task = match message {
             Message::TerminalFailure(action) => self.update_terminal_failure(action),
+            Message::SavedTerminal(action) => self.update_saved_terminal(action),
             Message::Device(action) => self.update_device(action),
             Message::Palette(action) => self.update_palette(action),
             Message::RunCommand(command) => {
@@ -28477,6 +28513,7 @@ mod tests {
             hosted_terminals_rx: async_channel::unbounded().1,
             terminal_starts: std::sync::Mutex::new(HashMap::new()),
             terminal_failure: terminal_failure::State::default(),
+            saved_terminals: saved_terminal::State::default(),
             pending_adoptions: Vec::new(),
             restored_agent_attaches: VecDeque::new(),
             relaunched_terminals: HashSet::new(),
