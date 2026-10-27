@@ -140,6 +140,235 @@ mod tests {
         assert!(Arc::ptr_eq(original, main_sources[0].cycle().unwrap()));
         assert!(Arc::ptr_eq(original, main_sources[1].cycle().unwrap()));
         assert!(!original.is_down());
+
+        #[cfg(wayland_platform)]
+        {
+            use crate::platform_specific::wayland::sctk_event::KeyboardEventVariant;
+            use cctk::sctk::seat::keyboard::{KeyEvent, Modifiers as SctkModifiers};
+            use winit::platform::scancode::PhysicalKeyExtScancode;
+            use xkeysym::{Keysym, key as sym};
+
+            let modifiers = SctkModifiers {
+                ctrl: true,
+                shift: true,
+                ..SctkModifiers::default()
+            };
+            for (raw, keysym, expected_physical, key, location, text) in [
+                (
+                    1,
+                    sym::Escape,
+                    key::Physical::Code(key::Code::Escape),
+                    Key::Named(key::Named::Escape),
+                    Location::Standard,
+                    None,
+                ),
+                (
+                    15,
+                    sym::Tab,
+                    key::Physical::Code(key::Code::Tab),
+                    Key::Named(key::Named::Tab),
+                    Location::Standard,
+                    Some("\t"),
+                ),
+                (
+                    28,
+                    sym::Return,
+                    key::Physical::Code(key::Code::Enter),
+                    Key::Named(key::Named::Enter),
+                    Location::Standard,
+                    Some("\r"),
+                ),
+                (
+                    57,
+                    sym::space,
+                    key::Physical::Code(key::Code::Space),
+                    Key::Character(" ".into()),
+                    Location::Standard,
+                    Some(" "),
+                ),
+                (
+                    96,
+                    sym::KP_Enter,
+                    key::Physical::Code(key::Code::NumpadEnter),
+                    Key::Named(key::Named::Enter),
+                    Location::Numpad,
+                    Some("\r"),
+                ),
+                (
+                    103,
+                    sym::Up,
+                    key::Physical::Code(key::Code::ArrowUp),
+                    Key::Named(key::Named::ArrowUp),
+                    Location::Standard,
+                    None,
+                ),
+                (
+                    105,
+                    sym::Left,
+                    key::Physical::Code(key::Code::ArrowLeft),
+                    Key::Named(key::Named::ArrowLeft),
+                    Location::Standard,
+                    None,
+                ),
+                (
+                    106,
+                    sym::Right,
+                    key::Physical::Code(key::Code::ArrowRight),
+                    Key::Named(key::Named::ArrowRight),
+                    Location::Standard,
+                    None,
+                ),
+                (
+                    108,
+                    sym::Down,
+                    key::Physical::Code(key::Code::ArrowDown),
+                    Key::Named(key::Named::ArrowDown),
+                    Location::Standard,
+                    None,
+                ),
+                (
+                    30,
+                    sym::eacute,
+                    key::Physical::Code(key::Code::KeyA),
+                    Key::Character("é".into()),
+                    Location::Standard,
+                    Some("é"),
+                ),
+                (
+                    20,
+                    sym::t,
+                    key::Physical::Code(key::Code::KeyT),
+                    Key::Character("t".into()),
+                    Location::Standard,
+                    Some("t"),
+                ),
+                (
+                    46,
+                    sym::c,
+                    key::Physical::Code(key::Code::KeyC),
+                    Key::Character("c".into()),
+                    Location::Standard,
+                    Some("c"),
+                ),
+                (
+                    133,
+                    sym::XF86_Copy,
+                    key::Physical::Code(key::Code::Copy),
+                    Key::Named(key::Named::Copy),
+                    Location::Standard,
+                    None,
+                ),
+                (
+                    137,
+                    sym::XF86_Cut,
+                    key::Physical::Code(key::Code::Cut),
+                    Key::Named(key::Named::Cut),
+                    Location::Standard,
+                    None,
+                ),
+                (
+                    131,
+                    sym::Undo,
+                    key::Physical::Code(key::Code::Undo),
+                    Key::Named(key::Named::Undo),
+                    Location::Standard,
+                    None,
+                ),
+                (
+                    158,
+                    sym::XF86_Back,
+                    key::Physical::Code(key::Code::BrowserBack),
+                    Key::Named(key::Named::BrowserBack),
+                    Location::Standard,
+                    None,
+                ),
+                (
+                    0,
+                    sym::Escape,
+                    key::Physical::Unidentified(key::NativeCode::Xkb(0)),
+                    Key::Named(key::Named::Escape),
+                    Location::Standard,
+                    None,
+                ),
+                (
+                    u32::MAX,
+                    sym::Escape,
+                    key::Physical::Unidentified(key::NativeCode::Xkb(u32::MAX)),
+                    Key::Named(key::Named::Escape),
+                    Location::Standard,
+                    None,
+                ),
+            ] {
+                let native = KeyEvent {
+                    time: 7,
+                    raw_code: raw,
+                    keysym: Keysym::new(keysym),
+                    utf8: text.map(str::to_owned),
+                };
+                // This is winit's selected Linux scancode mapper, not a copy
+                // of the SCTK mapping table or a test-only offset adapter.
+                let physical = crate::conversion::physical_key(
+                    winit::keyboard::PhysicalKey::from_scancode(raw),
+                );
+                assert_eq!(physical, expected_physical);
+                let expected_press = keyboard::Event::KeyPressed {
+                    key: key.clone(),
+                    modified_key: key.clone(),
+                    physical_key: physical,
+                    location,
+                    modifiers: Modifiers::CTRL | Modifiers::SHIFT,
+                    text: text.map(Into::into),
+                    repeat: false,
+                };
+                let mut expected_repeat = expected_press.clone();
+                let keyboard::Event::KeyPressed { repeat, .. } = &mut expected_repeat else {
+                    unreachable!();
+                };
+                *repeat = true;
+                let expected_release = keyboard::Event::KeyReleased {
+                    key: key.clone(),
+                    modified_key: key,
+                    physical_key: physical,
+                    location,
+                    modifiers: Modifiers::CTRL | Modifiers::SHIFT,
+                };
+                // The same conversion method is called by SctkEvent::process
+                // for the three real producer variants.
+                let sctk_press = KeyboardEventVariant::Press(native.clone())
+                    .into_key_event(modifiers)
+                    .unwrap();
+                let sctk_repeat = KeyboardEventVariant::Repeat(native.clone())
+                    .into_key_event(modifiers)
+                    .unwrap();
+                let sctk_release = KeyboardEventVariant::Release(native)
+                    .into_key_event(modifiers)
+                    .unwrap();
+                assert_eq!(sctk_press, expected_press);
+                assert_eq!(sctk_repeat, expected_repeat);
+                assert_eq!(sctk_release, expected_release);
+
+                let mut queue = NativeEvents::default();
+                queue.push((Some(popup), Event::Keyboard(sctk_press)));
+                queue.push((Some(main), Event::Keyboard(expected_repeat)));
+                queue.push((Some(popup), Event::Keyboard(sctk_repeat)));
+                queue.push((Some(popup), Event::Keyboard(sctk_release)));
+                queue.push((Some(main), Event::Keyboard(expected_press)));
+                queue.push((Some(main), Event::Keyboard(expected_release)));
+                // Drain main first to retain the real cross-window delivery
+                // permutation: its held repeat must still use popup's C1.
+                let (_, main_sources) = queue.take_window(main);
+                let (_, popup_sources) = queue.take_window(popup);
+                let first = popup_sources[0].cycle().unwrap();
+                assert!(Arc::ptr_eq(first, popup_sources[1].cycle().unwrap()));
+                assert!(Arc::ptr_eq(first, popup_sources[2].cycle().unwrap()));
+                assert!(Arc::ptr_eq(first, main_sources[0].cycle().unwrap()));
+                let fresh = main_sources[1].cycle().unwrap();
+                assert!(!Arc::ptr_eq(first, fresh));
+                assert!(Arc::ptr_eq(fresh, main_sources[2].cycle().unwrap()));
+                assert!(!first.is_down() && !fresh.is_down());
+                assert!(queue.is_empty());
+            }
+        }
     }
 
     #[test]
