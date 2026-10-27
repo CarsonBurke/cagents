@@ -19287,9 +19287,9 @@ mod tests {
         .unwrap();
         source.launch.session_id = Some("f0e49307-af96-4edd-b23f-60b185fe4fea".into());
         source.proof = Some(crate::model::HostSessionProof {
-            host_session_id: "saved-owner".into(),
+            host_session_id: "fixture-host".into(),
             boot_id: "fixture-boot".into(),
-            host_incarnation: "saved-incarnation".into(),
+            host_incarnation: "fixture-incarnation".into(),
         });
         source.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
         drop(app.insert_chat_card(source.clone(), None, None));
