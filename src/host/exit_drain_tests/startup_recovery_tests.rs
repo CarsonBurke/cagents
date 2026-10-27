@@ -20,6 +20,100 @@ fn registry_path() -> PathBuf {
         .join("workspace-model.sqlite3")
 }
 
+struct AuthoritySchemaFault {
+    connection: rusqlite::Connection,
+    published_sql: String,
+    rows: Vec<(String, String, String)>,
+}
+
+impl AuthoritySchemaFault {
+    fn rows(connection: &rusqlite::Connection) -> Vec<(String, String, String)> {
+        let mut statement = connection
+            .prepare("SELECT token,session_id,source FROM agent_authorities ORDER BY token")
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn inject() -> Self {
+        let connection = rusqlite::Connection::open(registry_path()).unwrap();
+        let published_sql = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name='agent_authorities'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let rows = Self::rows(&connection);
+        connection
+            .execute_batch("ALTER TABLE agent_authorities RENAME TO unavailable_agent_authorities")
+            .unwrap();
+        Self {
+            connection,
+            published_sql,
+            rows,
+        }
+    }
+
+    fn restore(&self, host: &SharedHost) {
+        let transaction = self.connection.unchecked_transaction().unwrap();
+        transaction.execute_batch(&self.published_sql).unwrap();
+        transaction
+            .execute_batch(
+                "INSERT INTO agent_authorities(token,session_id,source)
+                 SELECT token,session_id,source FROM unavailable_agent_authorities;
+                 DROP TABLE unavailable_agent_authorities;",
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        let restored_sql: String = self
+            .connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name='agent_authorities'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(restored_sql, self.published_sql);
+        // Compare the actual fixture rows without printing their opaque tokens.
+        assert!(Self::rows(&self.connection) == self.rows);
+        // Real published-schema admission must succeed; no private connection
+        // or fake ownership acknowledgement is installed in HostState.
+        host.lock()
+            .unwrap()
+            .install_model(model::Registry::open().unwrap());
+    }
+}
+
+fn unknown_pin_close_retains_original(
+    rpc: &mut Rpc,
+    host: &SharedHost,
+    original: &Original,
+    handle: &crate::terminal::TerminalHandle,
+) {
+    let failure = rpc
+        .request(ClientRequest::CloseTerminalChecked {
+            terminal_id: original.session.id,
+            allow_active: true,
+        })
+        .unwrap_err();
+    assert_eq!(failure.code, ProtocolErrorCode::TerminalUnavailable);
+    assert!(
+        failure
+            .message
+            .contains("Saved terminal ownership was unknown before close")
+    );
+    assert!(
+        host.lock().unwrap().terminals[&original.session.id]
+            .handle
+            .same_worker(handle)
+    );
+    assert!(original.owner.root.is_current() && original.owner.holder.is_current());
+}
+
 fn origin_body(root: &Path, count: usize) {
     assert!((1..=2).contains(&count));
     let paths = RuntimePaths::discover().unwrap();
@@ -339,10 +433,7 @@ fn startup_recovery_and_exit_pending_keep_exact_close_available_until_foreign_ow
     // Real SQLite layout damage makes the actual successor's model admission
     // unavailable; orphan adoption has already installed its exact live owner
     // before execution-authority restoration refuses. No fake error seam.
-    let fault = rusqlite::Connection::open(registry_path()).unwrap();
-    fault
-        .execute_batch("ALTER TABLE agent_authorities RENAME TO unavailable_agent_authorities")
-        .unwrap();
+    let fault = AuthoritySchemaFault::inject();
     let paths = RuntimePaths::discover().unwrap();
     let (host, completed, running) = run_host();
     let handle = same_original(&host, original);
@@ -363,6 +454,8 @@ fn startup_recovery_and_exit_pending_keep_exact_close_available_until_foreign_ow
     let mut rpc = Rpc::connect(&paths.socket);
     inspect_and_refuse_mutation(&mut rpc, original, &root);
     stale_close_is_refused(&paths, original);
+    unknown_pin_close_retains_original(&mut rpc, &host, original, &handle);
+    fault.restore(&host);
     assert!(
         host.lock().unwrap().terminals[&original.session.id]
             .handle
@@ -421,10 +514,7 @@ fn final_foreign_worker_completion_wakes_exit_after_other_recovery_owner_checked
         .unwrap()
         .retire_terminal(originals[1].session.id)
         .unwrap();
-    let fault = rusqlite::Connection::open(registry_path()).unwrap();
-    fault
-        .execute_batch("ALTER TABLE agent_authorities RENAME TO unavailable_agent_authorities")
-        .unwrap();
+    let fault = AuthoritySchemaFault::inject();
     assert!(state::restore_orphaned_holders(&host).is_err());
     let retained = same_original(&host, &originals[1]);
     assert!(host.lock().unwrap().startup_blocks_shutdown());
@@ -439,6 +529,8 @@ fn final_foreign_worker_completion_wakes_exit_after_other_recovery_owner_checked
     let mut rpc = Rpc::connect(&paths.socket);
     inspect_and_refuse_mutation(&mut rpc, &originals[1], &root);
     stale_close_is_refused(&paths, &originals[1]);
+    unknown_pin_close_retains_original(&mut rpc, &host, &originals[1], &retained);
+    fault.restore(&host);
     assert!(matches!(rpc.request(ClientRequest::CloseTerminalChecked {
         terminal_id: originals[1].session.id, allow_active: true,
     }).unwrap(), ServerResponse::TerminalCloseChecked {
@@ -484,4 +576,177 @@ fn final_foreign_worker_completion_wakes_exit_after_other_recovery_owner_checked
     prove_reply_admission_closed(&host);
     drop(rpc);
     drop(before_recovery);
+}
+
+#[test]
+fn completed_failed_startup_metadata_waits_for_exact_host_close_before_retirement() {
+    const NAME: &str = "host::exit_drain_tests::startup_recovery_tests::completed_failed_startup_metadata_waits_for_exact_host_close_before_retirement";
+    let Some(root) = private_runtime(NAME) else {
+        return;
+    };
+    if let Ok(count) = std::env::var(ORIGIN) {
+        origin_body(&root, count.parse().unwrap());
+        return;
+    }
+    // SAFETY: configure only this exact isolated child before its HOST threads.
+    // The foreign-origin child and opaque authority remain inherited unchanged.
+    unsafe {
+        std::env::set_var("CAGENTS_EXITED_TERMINAL_RETENTION_SECS", "0");
+    }
+    let (originals, mut pins) = foreign_originals(&root, NAME, 1);
+    let original = &originals[0];
+    let paths = RuntimePaths::discover().unwrap();
+    let (host, completed, running) = run_host();
+    let first = same_original(&host, original);
+    let holders = crate::terminal::holder::directory().unwrap();
+    first
+        .carry(crate::terminal::holder::socket(
+            &holders,
+            original.session.id,
+        ))
+        .unwrap();
+    host.lock()
+        .unwrap()
+        .retire_terminal(original.session.id)
+        .unwrap();
+    let current_proof = host.lock().unwrap().proof().clone();
+    let (authenticated, _) = crate::terminal::inspect_holder(
+        &crate::terminal::holder::socket(&holders, original.session.id),
+        &original.owner,
+        &current_proof,
+    )
+    .unwrap();
+    host.lock().unwrap().test_fail_startup_commit = Some(original.session.id);
+    let failure = state::restore_orphaned_holders(&host).unwrap_err();
+    assert!(failure.contains("original ownership"));
+    let retained = same_original(&host, original);
+    assert!(retained.startup_unresolved());
+    assert!(host.lock().unwrap().startup_blocks_shutdown());
+    let retained_source = host.lock().unwrap().terminals[&original.session.id]
+        .session
+        .clone();
+    assert_eq!(retained_source.id, authenticated.source.id);
+    assert_eq!(retained_source.launch, authenticated.source.launch);
+    assert_eq!(
+        retained_source.continuity.live_proof(),
+        authenticated.source.continuity.live_proof()
+    );
+    assert!(retained_source.continuity.live_proof().is_some());
+
+    // Exercise the real physical-worker/Host-metadata boundary: this existing
+    // exact-owner API closes the failed-startup worker, while its independently
+    // installed Host custody has not received its final metadata completion.
+    // This is NOT a claim that retained startup naturally publishes Completed;
+    // the normal RPC also has a separate explicit-retirement ticket fence.
+    assert_eq!(
+        retained.close_checked(true),
+        crate::terminal_ipc::TerminalCloseResult::Closed
+    );
+    wait_for(|| retained.is_completed());
+    prove_foreign_reaped(&mut pins[0].0);
+    prove_foreign_reaped(&mut pins[0].1);
+    // The real receipt admits only the captured issued source. A descriptor
+    // without proof or with a different proof cannot authorize its retirement.
+    assert!(
+        crate::terminal::holder::cleanup::confirmed(
+            &retained_source,
+            &original.owner,
+            &current_proof,
+        )
+        .unwrap()
+    );
+    let mut proofless = retained_source.clone();
+    proofless.continuity = TerminalContinuity::RelaunchAvailable {
+        recipe: proofless.launch.clone(),
+        last_exit: None,
+    };
+    assert!(
+        crate::terminal::holder::cleanup::confirmed(&proofless, &original.owner, &current_proof,)
+            .is_err()
+    );
+    let mut wrong_source = retained_source.clone();
+    wrong_source.continuity = TerminalContinuity::DetachedSameBoot {
+        host_session_id: "unissued-startup-source".into(),
+        boot_id: current_proof.boot_id.clone(),
+        host_incarnation: current_proof.host_incarnation.clone(),
+    };
+    assert!(
+        !crate::terminal::holder::cleanup::confirmed(
+            &wrong_source,
+            &original.owner,
+            &current_proof,
+        )
+        .unwrap()
+    );
+    let registry = {
+        let mut state = host.lock().unwrap();
+        assert!(!state.recovery_owns_work());
+        assert!(state.startup_blocks_shutdown());
+        assert!(state.terminal_retirements.is_empty());
+        state.detach(0, original.session.id).unwrap();
+        assert!(!state.descriptor(0, original.session.id).unwrap().attached);
+        state.execution_registry.clone().unwrap()
+    };
+    assert!(
+        registry
+            .lock()
+            .unwrap()
+            .pinned_terminals(&std::collections::BTreeSet::from([original.session.id]))
+            .unwrap()
+            .is_empty()
+    );
+    let mut lifecycle = crate::host::lifecycle::Lifecycle::new();
+    // Observe several actual maintenance passes, including after completion.
+    // Without the startup-custody guard, zero retention submits/removes this
+    // result despite the outstanding independently installed custody slot.
+    for _ in 0..3 {
+        lifecycle.maintain(&host, false);
+        let state = host.lock().unwrap();
+        assert!(state.startup_blocks_shutdown());
+        assert!(!state.recovery_owns_work());
+        assert!(state.terminal_retirements.is_empty());
+        assert!(
+            state.terminals[&original.session.id]
+                .handle
+                .same_worker(&retained)
+        );
+    }
+    assert!(completed.try_recv().is_err());
+    assert_lease_held(&paths);
+
+    let mut rpc = Rpc::connect(&paths.socket);
+    assert!(matches!(rpc.request(ClientRequest::Attach {
+            terminal_id: original.session.id, after_generation: 0, after_event_sequence: 0,
+        }).unwrap(), ServerResponse::Attached { terminal } if terminal.session.id == original.session.id));
+    assert!(matches!(rpc.request(ClientRequest::CloseTerminalChecked {
+        terminal_id: original.session.id, allow_active: true,
+    }).unwrap(), ServerResponse::TerminalCloseChecked {
+        terminal_id, outcome: crate::terminal_ipc::TerminalCloseResult::Closed,
+    } if terminal_id == original.session.id));
+    {
+        let state = host.lock().unwrap();
+        assert!(!state.startup_blocks_shutdown());
+        assert!(!state.terminals.contains_key(&original.session.id));
+        assert!(state.terminal_retirements.is_empty());
+    }
+    assert!(matches!(
+        rpc.request(ClientRequest::Shutdown).unwrap(),
+        ServerResponse::ShutdownAccepted
+    ));
+    assert!(
+        completed
+            .recv_timeout(Duration::from_secs(8))
+            .unwrap()
+            .is_ok()
+    );
+    running.join().unwrap();
+    assert_eq!(
+        fs::read_to_string(original.session.launch.working_directory.join("launches")).unwrap(),
+        "launch\n",
+        "no replacement process was launched"
+    );
+    prove_released(&paths);
+    prove_reply_admission_closed(&host);
+    drop(rpc);
+    drop(first);
 }

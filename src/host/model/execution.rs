@@ -2014,25 +2014,10 @@ mod tests {
             if !proven {
                 // Upgrade an older store containing only the already-ended
                 // descriptor. Migration must not invent historical proof.
-                registry
-                    .db
-                    .execute_batch(
-                        "DROP TABLE automation_notifications;
-                         DROP TABLE channel_work_placement_epochs;
-                         DROP TABLE channel_work_placement_clock;
-                         DROP TABLE channel_work_operations;
-                         DROP TABLE channel_work_entries;
-                         DROP TABLE channel_work_homes;
-                         DROP TABLE automation_lifecycle;
-                         DROP TABLE native_actor_retirements;
-                         DROP TABLE native_actor_ownerships;
-                         DROP TABLE native_actor_cursors;
-                         DROP TABLE shared_view_terminal_sources;
-                         PRAGMA user_version=12;",
-                    )
-                    .unwrap();
+                let legacy =
+                    super::super::automation_proposals::published_fixture_from_rows(&registry, 12);
                 drop(registry);
-                registry = Registry::at(&_directory.path().join("model.sqlite3")).unwrap();
+                registry = Registry::at(&legacy).unwrap();
             }
             let before = registry.model().unwrap();
             let run = registry.agent_run(accepted.run.id).unwrap();
@@ -2975,7 +2960,7 @@ mod tests {
 
     #[test]
     fn legacy_registry_migrates_names_and_enforces_uniqueness_at_the_store() {
-        let (mut registry, directory, request) = fixture();
+        let (mut registry, _directory, request) = fixture();
         let first = registry.submit_agent(&Origin::User, &request, 1).unwrap();
         let mut legacy = serde_json::to_value(&first.agent).unwrap();
         legacy.as_object_mut().unwrap().remove("name");
@@ -2986,21 +2971,9 @@ mod tests {
                 params![first.agent.id.to_string(), legacy.to_string()],
             )
             .unwrap();
-        registry
-            .db
-            .execute_batch(
-                "DROP TABLE automation_notifications;
-                 DROP TABLE channel_work_placement_epochs;
-                 DROP TABLE channel_work_placement_clock;
-                 DROP TABLE channel_work_operations;
-                 DROP TABLE channel_work_entries;
-                 DROP TABLE channel_work_homes;
-                 DROP TABLE automation_lifecycle;
-                 DROP INDEX agents_by_name; PRAGMA user_version=9;",
-            )
-            .unwrap();
+        let legacy = super::super::automation_proposals::published_fixture_from_rows(&registry, 9);
         drop(registry);
-        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let mut registry = Registry::at(&legacy).unwrap();
         assert_eq!(registry.agent(first.agent.id).unwrap().name, None);
         let mut named = request;
         named.name = Some("reviewer".into());

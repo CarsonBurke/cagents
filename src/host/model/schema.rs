@@ -275,6 +275,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static SEVENTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static EIGHTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static NINETEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -284,6 +285,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         17 => &SEVENTEEN,
         18 => &EIGHTEEN,
         19 => &NINETEEN,
+        20 => &TWENTY,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -1004,7 +1006,7 @@ mod tests {
         for _ in 0..2 {
             let registry = Registry::at(&path).unwrap();
             require_current(&registry.db).unwrap();
-            assert_eq!(inspect(&registry.db).unwrap().version, 19);
+            assert_eq!(inspect(&registry.db).unwrap().version, 20);
             let mut inventory = inspect(&registry.db).unwrap().objects;
             let outbox = inventory
                 .iter()
@@ -1019,7 +1021,35 @@ mod tests {
                     tokens(super::super::automation_notifications::SCHEMA_SQL).unwrap(),
                 )
             );
-            assert_eq!(inventory, old_layout, "only the outbox table may be added");
+            // This current opener also applies the separately allocated
+            // retention20 migration. Admit only its three known objects here;
+            // every predecessor object and the outbox assertion stay exact.
+            let retention_names = [
+                "terminal_retention_pins",
+                "shared_terminal_retention_pins",
+                "shared_terminal_retention_by_terminal",
+            ];
+            for name in retention_names {
+                let index = inventory
+                    .iter()
+                    .position(|object| object.1 == name)
+                    .unwrap();
+                inventory.remove(index);
+            }
+            for table in ["terminal_retention_pins", "shared_terminal_retention_pins"] {
+                assert_eq!(
+                    registry
+                        .db
+                        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                            .get::<_, u32>(0))
+                        .unwrap(),
+                    0
+                );
+            }
+            assert_eq!(
+                inventory, old_layout,
+                "only the outbox and retention objects may be added"
+            );
             assert!(
                 registry
                     .pending_automation_notifications(100)
@@ -1289,7 +1319,7 @@ mod tests {
     fn each_actual_migration_failure_rolls_back_all_prior_steps_and_header() {
         let _clear = Clear;
         for step in [
-            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("rollback.sqlite3");

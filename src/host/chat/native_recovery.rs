@@ -92,6 +92,7 @@ pub(super) fn restore_with_admission(
     super::super::account_lifecycle::ensure_idle(host).map_err(|error| error.message)?;
     let proof = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        require_unreserved_terminals(&state, source).map_err(|error| error.message)?;
         if state.shutting_down
             || (state.chat_spawning.contains_key(&source.id) && admission.is_none())
             || state.native_closing.contains_key(&source.id)
@@ -231,21 +232,7 @@ fn restore_authenticated(
         store,
         recovery,
         holder,
-        move |update| {
-            if let Update::Execution { run, update } = update {
-                if let Some(host) = weak.upgrade() {
-                    super::super::agent_execution::observed(
-                        &host,
-                        id,
-                        execution_instance,
-                        run,
-                        update,
-                    );
-                }
-            } else {
-                changed(&weak, id, update);
-            }
-        },
+        move |update| changed_owned(&weak, id, execution_instance, update),
     )?;
     // Installation is still reversible: close drops only this new connection
     // until the exact server confirms the retained thread and the host owns it.
@@ -359,7 +346,10 @@ fn restore_authenticated(
         }
         _ => false,
     };
-    if state.shutting_down || !pair_unchanged {
+    if state.shutting_down
+        || !pair_unchanged
+        || require_unreserved_terminals(&state, &session).is_err()
+    {
         drop(state);
         let _ = handle.close();
         return Err(
@@ -397,6 +387,7 @@ fn restore_authenticated(
     record.handle.commit_native_installation()?;
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     if state.shutting_down
+        || require_unreserved_terminals(&state, &record.session).is_err()
         || state.proof() != proof
         || state
             .chats
