@@ -7,15 +7,82 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = "9.9.9"
 
 
-@unittest.skipUnless(platform.system() == "Linux" and shutil.which("dpkg-deb"),
-                     "Linux and dpkg-deb are required")
+def native_package_host_supported():
+    if (platform.system() != "Linux" or platform.machine() != "x86_64"
+            or not shutil.which("dpkg-deb")):
+        return False
+    try:
+        result = subprocess.run(
+            ["getconf", "GNU_LIBC_VERSION"], stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, check=False, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    # Match package-linux.sh's `getconf ... || :`: stdout decides support,
+    # including when getconf returns nonzero. Do not impose a glibc version.
+    return result.stdout.startswith("glibc ")
+
+
+class HostRequirements(unittest.TestCase):
+    def test_host_requirements_match_native_packager(self):
+        query = ["getconf", "GNU_LIBC_VERSION"]
+
+        def output(version, returncode=0):
+            return subprocess.CompletedProcess(query, returncode, version, "")
+
+        cases = (
+            ("glibc", "Linux", "x86_64", "/fixture/dpkg-deb", output("glibc 2.35\n"), True),
+            ("newer glibc", "Linux", "x86_64", "/fixture/dpkg-deb", output("glibc 2.39\n"), True),
+            ("non-Linux", "Darwin", "x86_64", "/fixture/dpkg-deb", None, False),
+            ("aarch64", "Linux", "aarch64", "/fixture/dpkg-deb", None, False),
+            ("no dpkg-deb", "Linux", "x86_64", None, None, False),
+            ("musl", "Linux", "x86_64", "/fixture/dpkg-deb", output("musl 1.2.5\n"), False),
+            ("empty failed query", "Linux", "x86_64", "/fixture/dpkg-deb", output("", 1), False),
+            ("failed query with glibc stdout", "Linux", "x86_64", "/fixture/dpkg-deb",
+             output("glibc 2.35\n", 1), True),
+            ("unavailable query", "Linux", "x86_64", "/fixture/dpkg-deb", FileNotFoundError(), False),
+            ("timed-out query", "Linux", "x86_64", "/fixture/dpkg-deb",
+             subprocess.TimeoutExpired(query, 5), False),
+        )
+        for name, system, machine, dpkg, result, expected in cases:
+            with self.subTest(host=name), \
+                    mock.patch.object(platform, "system", return_value=system), \
+                    mock.patch.object(platform, "machine", return_value=machine), \
+                    mock.patch.object(shutil, "which", return_value=dpkg), \
+                    mock.patch.object(subprocess, "run") as run:
+                if isinstance(result, Exception):
+                    run.side_effect = result
+                else:
+                    run.return_value = result
+                self.assertEqual(native_package_host_supported(), expected)
+                if result is None:
+                    run.assert_not_called()
+                else:
+                    run.assert_called_once_with(
+                        query, stdin=subprocess.DEVNULL, capture_output=True,
+                        text=True, check=False, timeout=5,
+                    )
+
+        with mock.patch(f"{__name__}.native_package_host_supported", return_value=False):
+            with self.assertRaisesRegex(unittest.SkipTest, "Linux x86_64 glibc and dpkg-deb"):
+                PackageDependencies.setUpClass()
+        with mock.patch(f"{__name__}.native_package_host_supported", return_value=True):
+            PackageDependencies.setUpClass()
+
+
 class PackageDependencies(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not native_package_host_supported():
+            raise unittest.SkipTest("Linux x86_64 glibc and dpkg-deb are required")
+
     def test_only_integrated_package_requires_egl(self):
         with tempfile.TemporaryDirectory(dir="/var/tmp", prefix="cagents-package-deps-") as temporary:
             work = Path(temporary)
