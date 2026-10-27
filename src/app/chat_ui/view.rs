@@ -1218,6 +1218,48 @@ impl Runtime {
             chat::failure::FailureKind::Connection => "Connection interrupted",
             chat::failure::FailureKind::Interrupted => "Interrupted",
         });
+        // A completed turn does not complete its native goal. Keep the two
+        // observations distinct without changing turn activity or admission.
+        if !snapshot.busy
+            && !snapshot.waiting
+            && snapshot.requests.is_empty()
+            && working == 0
+            && waiting == 0
+            && let Some((goal_glyph, goal_label)) = self.observed_goal_status()
+        {
+            let last_turn = failure_label.or_else(|| {
+                if self.error.is_some() || snapshot.error.is_some() {
+                    Some("Conversation has an error")
+                } else if snapshot.finished_at.is_some() {
+                    Some(match snapshot.detail.as_str() {
+                        "Turn interrupted" => "Last turn interrupted",
+                        "Turn failed" => "Last turn failed",
+                        _ => "Last turn finished",
+                    })
+                } else {
+                    None
+                }
+            });
+            let mut label = last_turn.map_or_else(
+                || goal_label.to_owned(),
+                |last_turn| format!("{goal_label} · {last_turn}"),
+            );
+            if failed > 0 {
+                label.push_str(&format!(" · {failed} failed"));
+            }
+            return (
+                if failure_label.is_some()
+                    || self.error.is_some()
+                    || snapshot.error.is_some()
+                    || failed > 0
+                {
+                    Some(Icon::Warning)
+                } else {
+                    goal_glyph
+                },
+                label,
+            );
+        }
         let mut parts = Vec::new();
         if let Some(label) = failure_label {
             parts.push(label.to_owned());
@@ -1255,6 +1297,35 @@ impl Runtime {
             }
         }
         (glyph, Self::short_description(label, 100))
+    }
+
+    fn observed_goal_status(&self) -> Option<(Option<Icon>, &'static str)> {
+        use chat::goal::{ReadState, Status, Support};
+        let goal = self.snapshot.goal.as_ref()?;
+        if goal.support == Support::Unsupported {
+            return None;
+        }
+        Some(if goal.pending || self.goal_pending.is_some() {
+            (Some(Icon::AgentWorking), "Goal updating")
+        } else if goal.uncertain
+            || goal.support == Support::Unknown
+            || matches!(goal.read, ReadState::Unknown)
+        {
+            (Some(Icon::Warning), "Goal unconfirmed")
+        } else {
+            match &goal.read {
+                ReadState::Known(Some(goal)) => match goal.status {
+                    Status::Active => (Some(Icon::AgentWorking), "Goal active"),
+                    Status::Blocked => (Some(Icon::Warning), "Goal blocked"),
+                    Status::UsageLimited => (Some(Icon::Warning), "Goal usage limited"),
+                    Status::BudgetLimited => (Some(Icon::Warning), "Goal budget limited"),
+                    Status::Paused => (None, "Goal paused"),
+                    Status::Complete => (Some(Icon::Check), "Goal complete"),
+                },
+                ReadState::Known(None) => return None,
+                ReadState::Unknown => unreachable!("unknown observations are qualified above"),
+            }
+        })
     }
 
     fn conversation_status_base(&self, transitioning: bool) -> (Option<Icon>, &str) {
