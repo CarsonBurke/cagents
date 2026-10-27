@@ -966,12 +966,15 @@ pub struct AppSettings {
     pub keyboard_shortcuts: KeyboardShortcuts,
     #[serde(default)]
     pub notifications: crate::notifications::Preferences,
+    #[serde(default)]
+    pub agent_concurrency: crate::agent_execution::ConcurrencyLimits,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             notifications: crate::notifications::Preferences::default(),
+            agent_concurrency: crate::agent_execution::ConcurrencyLimits::default(),
             schema_version: SETTINGS_SCHEMA_VERSION,
             palette_recents: Vec::new(),
             max_hot_cards: 6,
@@ -1778,6 +1781,9 @@ impl AppSettings {
                 "default_column_fraction must be between 0.25 and 1.0",
             ));
         }
+        self.agent_concurrency
+            .validate()
+            .map_err(SettingsError::Invalid)?;
         if self.terminal_scrollback_mib > MAX_TERMINAL_SCROLLBACK_MIB {
             return Err(SettingsError::Invalid(
                 "terminal_scrollback_mib must be between 0 and 1024",
@@ -2924,6 +2930,58 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agent_concurrency_settings_keep_defaults_and_validate_both_limits() {
+        use crate::agent_execution::ConcurrencyLimits;
+        assert_eq!(
+            AppSettings::default().agent_concurrency,
+            ConcurrencyLimits {
+                caller: 8,
+                global: 32
+            }
+        );
+        for limits in [
+            ConcurrencyLimits {
+                caller: 0,
+                global: 32,
+            },
+            ConcurrencyLimits {
+                caller: 8,
+                global: 0,
+            },
+            ConcurrencyLimits {
+                caller: 4097,
+                global: 32,
+            },
+            ConcurrencyLimits {
+                caller: 8,
+                global: 4097,
+            },
+        ] {
+            assert!(
+                AppSettings {
+                    agent_concurrency: limits,
+                    ..Default::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        let settings = AppSettings {
+            agent_concurrency: ConcurrencyLimits {
+                caller: 12,
+                global: 64,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            toml::from_str::<AppSettings>(&toml::to_string(&settings).unwrap())
+                .unwrap()
+                .agent_concurrency,
+            settings.agent_concurrency
+        );
+    }
+
     #[test]
     fn language_server_initialization_options_round_trip_and_are_bounded() {
         let mut settings = AppSettings::default();

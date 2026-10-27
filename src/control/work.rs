@@ -185,6 +185,7 @@ impl ControlClient {
                         code: error.code,
                         message: error.message,
                         retryable: error.retryable,
+                        details: error.details,
                     });
                 }
                 _ => {}
