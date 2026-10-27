@@ -23,6 +23,8 @@ mod browser_host;
 mod file_ui;
 mod git_ui;
 mod history_ui;
+#[cfg(test)]
+mod keyboard_focus_tests;
 #[cfg(feature = "latency-harness")]
 mod latency_ui;
 mod notification_ui;
@@ -4534,6 +4536,16 @@ pub enum Message {
         /// clear a terminal selection also closes the inspector behind it.
         captured: bool,
     },
+    NativeKeyEvent {
+        event: keyboard::Event,
+        captured: bool,
+        owner: crate::input_trace::KeyboardOwner,
+        generation: u64,
+    },
+    KeyEventFallback {
+        event: keyboard::Event,
+        captured: bool,
+    },
     FocusAdjacent(crate::workspace::FocusDirection),
     FocusProjectSearch,
     TerminalFind(terminal_ui::Action),
@@ -6807,8 +6819,80 @@ impl Cagents {
             Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() => {
                 workspace_widget::FocusedPane::Review
             }
+            Some(CardRuntime::Repository(runtime))
+                if runtime.editor_focus_target(card).is_some() =>
+            {
+                workspace_widget::FocusedPane::Editor
+            }
             _ => workspace_widget::FocusedPane::Other,
         }
+    }
+
+    fn keyboard_regions(&self) -> Vec<(widget::Id, crate::input_trace::KeyboardOwner)> {
+        use crate::input_trace::KeyboardOwner;
+        use workspace_widget::FocusedPane;
+        let mut regions = Vec::new();
+        for (&card, runtime) in &self.cards {
+            if self.workspace.card(card).is_none() {
+                continue;
+            }
+            let pane = match runtime {
+                CardRuntime::Terminal(_)
+                    if ended_terminal(self.card_state(card)).is_none()
+                        && !self.terminal_close_pending(card) =>
+                {
+                    FocusedPane::Terminal
+                }
+                CardRuntime::Chat(_) => FocusedPane::Chat,
+                CardRuntime::PullRequests(_) => FocusedPane::Review,
+                CardRuntime::Repository(runtime) if runtime.shows_diff() => FocusedPane::Review,
+                _ => FocusedPane::Other,
+            };
+            let owner = KeyboardOwner {
+                pane,
+                card: Some(card),
+                generation: self.card_state(card).map(|state| state.generation),
+            };
+            if let Some(chrome) = self.card_chrome.get(&card) {
+                regions.push((chrome.container_id.clone(), owner));
+            }
+            // A terminal is a raw focusable; its Find field is classified as
+            // TextInput by the operation instead of inheriting Terminal.
+            if pane == FocusedPane::Terminal {
+                regions.push((self.card_keyboard_focus(card), owner));
+            }
+            if let CardRuntime::Repository(runtime) = runtime
+                && let Some(id) = runtime.editor_focus_target(card)
+            {
+                regions.push((
+                    id,
+                    KeyboardOwner {
+                        pane: FocusedPane::Editor,
+                        ..owner
+                    },
+                ));
+            }
+            if matches!(runtime, CardRuntime::Chat(_)) {
+                regions.push((card_control_id(card, "chat-composer"), owner));
+            }
+        }
+        regions
+    }
+
+    fn raw_browser_keyboard_owner(&self) -> Option<crate::input_trace::KeyboardOwner> {
+        #[cfg(feature = "integrated-browser")]
+        if self.refresh_ui.focused
+            && !self.workspace_inputs_blocked()
+            && let Some(card) = self.workspace.focused()
+            && matches!(self.cards.get(&card), Some(CardRuntime::Browser(_)))
+        {
+            return Some(crate::input_trace::KeyboardOwner {
+                pane: workspace_widget::FocusedPane::Other,
+                card: Some(card),
+                generation: self.card_state(card).map(|state| state.generation),
+            });
+        }
+        None
     }
 
     /// [`Self::handle_pull_request_review`] without the modal gate, for
@@ -14195,6 +14279,53 @@ impl Application for Cagents {
             Message::UtilityPaneUi(message) => (*message, true),
             message => (message, false),
         };
+        // Preserve each event's native owner through batched widget messages;
+        // reading the observer's latest focus here would race later events.
+        let mut unobserved_key = false;
+        let mut refused_native_key = false;
+        let (message, native_owner) = match message {
+            Message::NativeKeyEvent {
+                event,
+                captured,
+                owner,
+                generation,
+            } => {
+                // A modal outside this observer may have opened since the
+                // body view. Native body input never answers that dialog.
+                let current_owner = generation == self.workspace_view_generation
+                    && owner.card.is_none_or(|card| {
+                        self.workspace.focused() == Some(card)
+                            && self.workspace.order().any(|id| id == card)
+                            && self.card_state(card).map(|state| state.generation)
+                                == owner.generation
+                    });
+                refused_native_key = self.modal_is_open() || !current_owner;
+                let owner = if current_owner {
+                    owner
+                } else {
+                    crate::input_trace::KeyboardOwner::UNKNOWN
+                };
+                (Message::KeyEvent { event, captured }, Some(owner))
+            }
+            Message::KeyEventFallback { event, captured } => {
+                let legacy = crate::input_trace::keyboard_uses_legacy_fallback(&event)
+                    || self.modal_is_open();
+                // Non-special observed input is captured only after its child
+                // update and dispatched by NativeKeyEvent. A lossy subscription
+                // cannot leave stale bookkeeping behind: there is no ledger.
+                refused_native_key = captured && !legacy;
+                unobserved_key = !legacy;
+                (
+                    Message::KeyEvent { event, captured },
+                    if legacy {
+                        None
+                    } else {
+                        Some(crate::input_trace::KeyboardOwner::UNKNOWN)
+                    },
+                )
+            }
+            message => (message, None),
+        };
         let notice_control = self.notice_control_severity();
         let attention_scope_changed = matches!(
             &message,
@@ -14207,6 +14338,9 @@ impl Application for Cagents {
         // through the lightweight visibility/presence postlude below.
         #[rustfmt::skip]
         let task = (|| {
+        if refused_native_key {
+            return Task::none();
+        }
         if pane_origin && self.channel_work_is_main() {
             return Task::none();
         }
@@ -16876,7 +17010,9 @@ impl Application for Cagents {
                 }
             },
             Message::CancelDialog => self.cancel_form_dialog(),
+            Message::NativeKeyEvent { .. } | Message::KeyEventFallback { .. } => unreachable!("native keyboard messages are normalized before dispatch"),
             Message::KeyEvent { event, captured } => {
+                let focused_pane = native_owner.map_or_else(|| self.focused_pane(), |owner| owner.pane);
                 if let keyboard::Event::KeyPressed { key: keyboard::Key::Character(key), modifiers, .. } = &event
                     && modifiers.command() && (key.eq_ignore_ascii_case("c") || key.eq_ignore_ascii_case("x"))
                 {
@@ -16920,7 +17056,7 @@ impl Application for Cagents {
                     && workspace_widget::global_shortcut(
                         &event,
                         &self.settings.keyboard_shortcuts,
-                        self.focused_pane(),
+                        focused_pane,
                     )
                     .is_none()
                     && let keyboard::Event::KeyPressed {
@@ -16933,6 +17069,7 @@ impl Application for Cagents {
                     && !modifiers.alt()
                     && !modifiers.logo()
                     && key.eq_ignore_ascii_case("s")
+                    && native_owner.is_none_or(|owner| matches!(owner.pane, workspace_widget::FocusedPane::Editor | workspace_widget::FocusedPane::Review))
                     && let Some(card) = self.workspace.focused()
                     && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card)
                 {
@@ -16964,6 +17101,7 @@ impl Application for Cagents {
                     return self.workspace_switcher_key(&event);
                 }
                 if !self.workspace_inputs_blocked()
+                    && focused_pane != workspace_widget::FocusedPane::OutsideWorkspace
                     && !self.focused_repository_is_saving()
                     && let Some(backwards) = crate::tab_history::step_direction(&event)
                 {
@@ -16990,6 +17128,7 @@ impl Application for Cagents {
                     return task;
                 }
                 if !self.workspace_inputs_blocked()
+                    && native_owner.is_none_or(|owner| owner.card == self.workspace.focused())
                     && let Some(task) = self.chat_find_key(&event)
                 {
                     return task;
@@ -17119,10 +17258,12 @@ impl Application for Cagents {
                 if self.workspace_inputs_blocked() {
                     return Task::none();
                 }
-                if let Some(task) = self.chat_picker_key(&event) {
+                if native_owner.is_none_or(|owner| owner.card == self.workspace.focused())
+                    && let Some(task) = self.chat_picker_key(&event) {
                     return task;
                 }
-                if let Some(card) = self.workspace.focused()
+                if native_owner.is_none_or(|owner| owner.card == self.workspace.focused())
+                    && let Some(card) = self.workspace.focused()
                     && self.terminal_find.get(&card).is_some_and(|find| find.open)
                     && let keyboard::Event::KeyPressed {
                         key: keyboard::Key::Named(key),
@@ -17154,6 +17295,7 @@ impl Application for Cagents {
                     && !modifiers.alt()
                     && !modifiers.logo()
                     && let Some(card) = self.focused_repository_card_with_find()
+                    && native_owner.is_none_or(|owner| owner.card == Some(card))
                 {
                     return cosmic::task::message(Message::Repository(if modifiers.shift() {
                         RepositoryAction::FindPrevious { card }
@@ -17163,16 +17305,20 @@ impl Application for Cagents {
                 }
                 #[cfg(feature = "integrated-browser")]
                 if !captured
+                    && native_owner.is_none_or(|owner| owner.card == self.workspace.focused())
                     && let Some(card) = self.workspace.focused()
                     && matches!(self.cards.get(&card), Some(CardRuntime::Browser(_)))
                     && let Some(message) = browser_shortcut(card, &event)
                 {
                     return cosmic::task::message(message);
                 }
-                if !captured && let Some(task) = self.chat_scroll_key(&event) {
+                if !captured
+                    && native_owner.is_none_or(|owner| owner.card == self.workspace.focused())
+                    && let Some(task) = self.chat_scroll_key(&event) {
                     return task;
                 }
                 if is_save_press(&event)
+                    && native_owner.is_none_or(|owner| owner.pane == workspace_widget::FocusedPane::Editor)
                     && let Some(card) = self.workspace.focused()
                     && matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))
                 {
@@ -17181,10 +17327,11 @@ impl Application for Cagents {
                         overwrite: false,
                     }));
                 }
+                if unobserved_key { return Task::none(); }
                 match workspace_widget::global_shortcut(
                     &event,
                     &self.settings.keyboard_shortcuts,
-                    self.focused_pane(),
+                    focused_pane,
                 ) {
                     Some(command) => {
                         let modifiers = match event {
@@ -17817,7 +17964,7 @@ impl Application for Cagents {
                 },
             }),
             event::listen_with(|event, status, event_window| match event {
-                iced::Event::Keyboard(event) => Some(Message::KeyEvent {
+                iced::Event::Keyboard(event) => Some(Message::KeyEventFallback {
                     event,
                     captured: matches!(status, event::Status::Captured),
                 }),
@@ -18639,7 +18786,22 @@ impl Application for Cagents {
             surface,
             self.workspace.is_animating() || self.context_inspector_transition.is_some(),
         );
-        let surface = crate::input_trace::observe(surface, &self.input_trace);
+        let surface = crate::input_trace::observe_keyboard(
+            surface,
+            &self.input_trace,
+            self.keyboard_regions(),
+            self.raw_browser_keyboard_owner(),
+            !self.modal_is_open(),
+            {
+                let generation = self.workspace_view_generation;
+                move |event, captured, owner| Message::NativeKeyEvent {
+                    event,
+                    captured,
+                    owner,
+                    generation,
+                }
+            },
+        );
         let surface = crate::file_drop::surface(surface, self.core.scale_factor());
         let surface = crate::reorder::channel_scope(
             surface,
