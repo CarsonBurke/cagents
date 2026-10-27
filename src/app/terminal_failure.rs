@@ -329,6 +329,7 @@ impl Cagents {
                     self.cards.get(&state.id),
                     Some(CardRuntime::Failed(Failure::Terminal(_)) | CardRuntime::Completed)
                 ) || ended_terminal(Some(state)).is_some()
+                    || self.saved_terminal_current(state.id).is_some()
             })
             .filter_map(|state| {
                 if let CardKind::Terminal(session) = &state.kind {
@@ -405,6 +406,22 @@ impl Cagents {
             .into()
     }
     pub(super) fn terminal_diagnostic_controls(&self, card: CardId) -> Element<'static, Message> {
+        widget::row::with_children(vec![
+            crate::ui_controls::button::secondary("Copy details")
+                .id(card_control_id(card, "failure.copy"))
+                .on_press(Message::TerminalFailure(Action::Copy(card)))
+                .into(),
+            self.terminal_transcript_control(card, Message::TerminalFailure(Action::Reveal(card))),
+        ])
+        .spacing(space::S)
+        .wrap()
+        .into()
+    }
+    pub(super) fn terminal_transcript_control(
+        &self,
+        card: CardId,
+        action: Message,
+    ) -> Element<'static, Message> {
         let probe = self.terminal_failure.probes.get(&card);
         let remote = crate::device::is_remote();
         let available = !remote && probe.is_some_and(|probe| probe.available && !probe.pending);
@@ -419,21 +436,13 @@ impl Cagents {
         )
         .id(card_control_id(card, "failure.folder"));
         let folder = if available {
-            folder.on_press(Message::TerminalFailure(Action::Reveal(card)))
+            folder.on_press(action)
         } else {
             folder
         };
-        widget::row::with_children(vec![
-            crate::ui_controls::button::secondary("Copy details")
-                .id(card_control_id(card, "failure.copy"))
-                .on_press(Message::TerminalFailure(Action::Copy(card)))
-                .into(),
-            folder.into(),
-        ])
-        .spacing(space::S)
-        .wrap()
-        .into()
+        folder.into()
     }
+
     pub(super) fn terminal_runtime_claims(&self, terminal: TerminalId) -> bool {
         self.durable.cards.iter().filter(|state| state.existence.is_open()).any(|state| match &state.kind {
             CardKind::Terminal(session) if session.id == terminal => {
