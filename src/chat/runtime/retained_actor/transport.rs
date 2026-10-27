@@ -783,6 +783,9 @@ impl RemoteActor {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        // Exec resets the process-local saved limit. Restore it before the
+        // helper starts, so its provider and tools inherit the caller's limit.
+        crate::host::descriptor_limit::inherit(&mut command);
         unsafe {
             command.pre_exec(move || {
                 crate::daemon::seal_inherited_descriptors()?;
@@ -4097,6 +4100,7 @@ exec /bin/sleep 60
             .unwrap();
         let mut spec = ProcessSpec::from(&source.launch.recipe);
         spec.execution = Some(context.clone());
+        let limit = crate::host::descriptor_limit::tests::raise_with_fixture_limit();
         // This execs the real retained-helper entry and its real provider
         // spawning path. Omitting the entry seal leaks both inherited FDs.
         let actor = RemoteActor::spawn(spec, source, prepared, BTreeMap::new(), |_| {}).unwrap();
@@ -4112,6 +4116,12 @@ exec /bin/sleep 60
         actor.commit_installation().unwrap();
         let provider = actor.state().provider_process.clone().unwrap();
         assert!(provider.is_current());
+        crate::host::descriptor_limit::tests::assert_process_limit(provider.pid as u32, &limit);
+        crate::host::descriptor_limit::tests::assert_process_limit(
+            actor.native_holder_record().holder.pid as u32,
+            &limit,
+        );
+        crate::host::descriptor_limit::tests::assert_daemon_limit_remains_raised(&limit);
         let inherited = std::fs::read_dir(format!("/proc/{}/fd", provider.pid))
             .unwrap()
             .filter_map(|entry| {
