@@ -503,6 +503,7 @@ impl SetupCustody {
     /// Call while the original host SQLite writer guard is held, immediately
     /// before child creation. Reserved survives holder/daemon loss; neither a
     /// free flock nor a new UI may turn it back into NeverStarted.
+    #[cfg(test)]
     pub(crate) fn reserve<E: ProcessExecutor>(
         &self,
         service: &RepositoryService<E>,
@@ -513,6 +514,7 @@ impl SetupCustody {
         self.verify(service, store)?;
         self.reserve_phase(terminal, recipe)
     }
+    #[cfg(test)]
     fn reserve_phase(
         &self,
         terminal: crate::model::TerminalId,
@@ -558,18 +560,18 @@ impl SetupCustody {
             .journaled_worktree_operation(self.creation)
             .map_err(|error| error.to_string())?
             .ok_or("Setup creation disappeared")?;
-        // Prepare independent protection descriptions before publishing Reserved.
+        // Authority is prepared first; only the existing ready holder may
+        // publish Reserved, after its exact Commit and before creating a PTY.
         let authority = self.holder_authority(terminal)?;
         store.with_worktree_operation_writer(&row, || {
             self.verify_checkout(service)?;
-            let predecessor =
-                read_disposition(&self.admin, self.creation).map_err(|error| error.to_string())?;
+            if !self.expected.copy_done || !self.matches_recipe(recipe) {
+                return Err("Setup recipe or copied intent does not match the reviewed run".into());
+            }
+            verify_prepared_setup_holder(&self.admin, &authority.binding)?;
             let _no_launch = NoLaunchGuard {
-                custody: self,
                 authority: &authority,
-                predecessor,
             };
-            self.reserve_phase(terminal, recipe)?;
             spawn(authority.clone())
         })
     }
@@ -581,6 +583,70 @@ impl SetupCustody {
     }
 }
 
+/// Validate inactive startup authority before the holder announces Ready.
+#[cfg(feature = "host")]
+pub(crate) fn verify_prepared_setup_holder(
+    admin: &fs_safety::Root,
+    binding: &crate::terminal::holder::setup::Binding,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(&binding.admin_path).map_err(|error| error.to_string())?;
+    let held = admin.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_dir()
+        || (metadata.dev(), metadata.ino()) != binding.admin
+        || (held.dev(), held.ino()) != binding.admin
+    {
+        return Err("Original prepared setup administrative generation changed".into());
+    }
+    let predecessor = prepared_predecessor(binding)?;
+    if read_disposition(admin, binding.creation).map_err(|error| error.to_string())? != predecessor
+    {
+        return Err("Original prepared setup disposition changed before holder commit".into());
+    }
+    Ok(())
+}
+#[cfg(feature = "host")]
+fn prepared_predecessor(
+    binding: &crate::terminal::holder::setup::Binding,
+) -> Result<Disposition, String> {
+    if binding.predecessor.is_empty() || binding.predecessor.len() > 8192 {
+        return Err("Invalid prepared setup predecessor bound".into());
+    }
+    let predecessor: Disposition =
+        serde_json::from_slice(&binding.predecessor).map_err(|error| error.to_string())?;
+    if predecessor.creation != binding.creation
+        || predecessor.admin != binding.admin
+        || !match predecessor.phase {
+            Phase::NeverStarted => true,
+            Phase::FamilyReaped { run, .. } | Phase::NotLaunched { run, .. } => run != binding.run,
+            _ => false,
+        }
+    {
+        return Err("Setup predecessor does not prove an inactive original generation".into());
+    }
+    Ok(predecessor)
+}
+/// Called only after Commit by the already-existing sole-reaper holder.
+#[cfg(feature = "host")]
+pub(crate) fn reserve_setup_holder(
+    admin: &fs_safety::Root,
+    binding: &crate::terminal::holder::setup::Binding,
+) -> Result<(), String> {
+    verify_prepared_setup_holder(admin, binding)?;
+    let mut state = prepared_predecessor(binding)?;
+    state.phase = Phase::Reserved {
+        run: binding.run,
+        terminal: binding.terminal,
+        lease: binding.lease,
+    };
+    publish(
+        admin,
+        EXECUTION,
+        &serde_json::to_vec(&state).map_err(|error| error.to_string())?,
+        false,
+    )
+    .map_err(|error| error.to_string())?;
+    verify_reserved_setup_holder(admin, binding)
+}
 /// Called only by the exact execed holder after typed descriptor validation.
 #[cfg(feature = "host")]
 pub(crate) fn verify_reserved_setup_holder(
@@ -630,6 +696,15 @@ fn publish_reaped_disposition(
         return Err("Original setup administrative identity changed".into());
     }
     let mut state = read_disposition(admin, binding.creation).map_err(|error| error.to_string())?;
+    if state == prepared_predecessor(binding)? {
+        // No Commit/reservation occurred: this existing holder proved ECHILD
+        // and must leave the exact inactive predecessor unchanged.
+        fs_safety::sync_directory(admin).map_err(|error| error.to_string())?;
+        if read_disposition(admin, binding.creation).map_err(|error| error.to_string())? != state {
+            return Err("Prepared setup changed during empty-family cleanup".into());
+        }
+        return Ok(());
+    }
     let completed = Phase::FamilyReaped {
         run: binding.run,
         terminal: binding.terminal,
@@ -736,6 +811,12 @@ impl SetupCustody {
             admin_path: self.admin.path().to_owned(),
             admin: lease_file_identity(&admin).map_err(|error| error.to_string())?,
             lease: lease_file_identity(&lease).map_err(|error| error.to_string())?,
+            predecessor: serde_json::to_vec(
+                &read_disposition(&self.admin, self.creation).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?,
+            #[cfg(test)]
+            fail_reservation_sync: false,
             protection: protection
                 .iter()
                 .map(|file| lease_file_identity(file).map_err(|error| error.to_string()))
@@ -748,60 +829,16 @@ impl SetupCustody {
 }
 
 /// Scoped to the original canonical writer/start attempt, including panic
-/// unwinding. A future worker first claims the same delivery CAS; after a
-/// successful cancellation it cannot send an authority-bearing Spawn.
+/// unwinding. A worker and pane withdrawal share the same delivery CAS; a
+/// cancelled original attempt can never commit its prepared holder.
 #[cfg(feature = "host")]
 struct NoLaunchGuard<'a> {
-    custody: &'a SetupCustody,
     authority: &'a crate::terminal::holder::setup::Authority,
-    predecessor: Disposition,
 }
 #[cfg(feature = "host")]
 impl Drop for NoLaunchGuard<'_> {
     fn drop(&mut self) {
-        let Some(proof) = self.authority.cancel_before_commit() else {
-            return;
-        };
-        let binding = proof.binding();
-        let result = (|| -> Result<(), String> {
-            let (_pin, admin) =
-                held_admin_root(&self.custody.admin).map_err(|error| error.to_string())?;
-            let held = admin.metadata().map_err(|error| error.to_string())?;
-            if (held.dev(), held.ino()) != binding.admin {
-                return Err("Original no-launch administrative identity changed".into());
-            }
-            if read_disposition(&admin, binding.creation).map_err(|error| error.to_string())?
-                == self.predecessor
-            {
-                return Ok(());
-            }
-            let mut state =
-                read_disposition(&admin, binding.creation).map_err(|error| error.to_string())?;
-            if state.phase
-                != (Phase::Reserved {
-                    run: binding.run,
-                    terminal: binding.terminal,
-                    lease: binding.lease,
-                })
-            {
-                return Err("Another setup execution owns this no-launch disposition".into());
-            }
-            state.phase = Phase::NotLaunched {
-                run: binding.run,
-                terminal: binding.terminal,
-                lease: binding.lease,
-            };
-            publish(
-                &admin,
-                EXECUTION,
-                &serde_json::to_vec(&state).map_err(|error| error.to_string())?,
-                false,
-            )
-            .map_err(|error| error.to_string())
-        })();
-        if let Err(error) = result {
-            tracing::warn!(%error, "Setup startup was cancelled before delivery but disposition publication remains uncertain; original Reserved evidence is retained");
-        }
+        let _ = self.authority.cancel_before_commit();
     }
 }
 
@@ -833,6 +870,8 @@ mod tests {
             admin: lease_file_identity(&admin.retained_directory().unwrap()).unwrap(),
             lease: lease_file_identity(&lease).unwrap(),
             protection: vec![lease_file_identity(&lease).unwrap()],
+            predecessor: serde_json::to_vec(&read_disposition(&admin, creation).unwrap()).unwrap(),
+            fail_reservation_sync: false,
         };
         let state = Disposition {
             creation,

@@ -1030,6 +1030,9 @@ pub enum ProtocolErrorCode {
     Internal,
     ViewConflict,
     ChatCapacity,
+    /// Dedicated worktree admission ended before Git/setup effects began.
+    /// Generic remote errors do not carry this no-start guarantee.
+    WorktreeNotStarted,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -26,6 +26,10 @@ fn refused(error: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::InvalidRequest, error, false)
 }
 
+fn not_started(error: impl Into<String>) -> ProtocolError {
+    ProtocolError::new(ProtocolErrorCode::WorktreeNotStarted, error, false)
+}
+
 /// RAII ownership outside global admission. Registration happens under a short
 /// read fence; shutdown/upgrade's writer sees this until publication finishes.
 pub(super) struct Active {
@@ -144,6 +148,8 @@ struct Caller {
     source: Option<crate::model::LaunchRecipe>,
     accepted_project: Option<PathBuf>,
     accepted_agent: Option<crate::model::AgentId>,
+    accepted_target: Option<crate::agent_execution::Target>,
+    accepted_placement: Option<crate::agent_execution::Placement>,
     root: Option<crate::fs_safety::Root>,
     common: Option<crate::fs_safety::Root>,
     handle: Option<LiveHandle>,
@@ -215,7 +221,7 @@ impl Caller {
             let registry = agent_execution::registry(host)?;
             let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
             Some(registry.agent_for_session(id)?.ok_or(
-                "This issuing session has no accepted project scope for worktree operations",
+                "This issuing session has no accepted project scope for worktree operations; ask the user or an agent already bound to that project to perform this request",
             )?)
         } else {
             None
@@ -224,6 +230,8 @@ impl Caller {
             .as_ref()
             .map(|agent| agent.spec.target.repository.clone());
         let accepted_agent = accepted.as_ref().map(|agent| agent.id);
+        let accepted_target = accepted.as_ref().map(|agent| agent.spec.target.clone());
+        let accepted_placement = accepted.as_ref().map(|agent| agent.placement.clone());
         let handle = if let Some(id) = issuing {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             Some(if let Some(record) = state.chats.get(&id) {
@@ -264,6 +272,8 @@ impl Caller {
             source,
             accepted_project,
             accepted_agent,
+            accepted_target,
+            accepted_placement,
             root,
             common,
             handle,
@@ -285,6 +295,8 @@ impl Caller {
                 .agent_for_session(id)?
                 .ok_or("The issuing session no longer has an accepted project scope")?;
             if self.accepted_agent != Some(accepted.id)
+                || self.accepted_target.as_ref() != Some(&accepted.spec.target)
+                || self.accepted_placement.as_ref() != Some(&accepted.placement)
                 || self.accepted_project.as_ref() != Some(&accepted.spec.target.repository)
             {
                 return Err("The issuing session's accepted project scope changed".into());
@@ -460,20 +472,20 @@ pub(super) fn process(
     active: Option<Active>,
 ) -> Result<Reply, ProtocolError> {
     let _active = active;
-    let caller = Caller::resolve(host, client, authority).map_err(refused)?;
+    let caller = Caller::resolve(host, client, authority).map_err(not_started)?;
     let common = if let Some(path) = selected(&mut operation) {
         let common = RepositoryService::system("git")
             .common_dir(path, &CancellationToken::new())
-            .map_err(|e| refused(e.to_string()))?;
-        let root = crate::fs_safety::Root::open(&common).map_err(|e| refused(e.to_string()))?;
-        caller.permits(&root).map_err(refused)?;
+            .map_err(|e| not_started(e.to_string()))?;
+        let root = crate::fs_safety::Root::open(&common).map_err(|e| not_started(e.to_string()))?;
+        caller.permits(&root).map_err(not_started)?;
         *path = common;
         Some(Arc::new(root))
     } else {
         None
     };
-    caller.verify(host, client).map_err(refused)?;
-    let store = journal().map_err(refused)?;
+    caller.verify(host, client).map_err(not_started)?;
+    let store = journal().map_err(not_started)?;
     let execution = match &common {
         Some(common) => service::execute(
             &RepositoryService::new(
@@ -918,6 +930,74 @@ mod tests {
     use crate::process::{ProcessExecutor, SystemProcessExecutor};
 
     #[test]
+    fn unbound_script_scope_and_authenticated_user_downgrade_are_refused() {
+        // A remote attachment fixture observes identity only: it launches no
+        // provider/process and must not be closed or signalled as a process.
+        let directory = tempfile::tempdir().unwrap();
+        let proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("worktree-caller-fixture"),
+            host_incarnation: crate::model::HostIncarnation::new("worktree-caller-fixture"),
+            boot_id: crate::model::BootId::new("worktree-caller-fixture"),
+        };
+        let source = crate::chat::Session {
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: crate::model::LaunchRecipe {
+                    program: "fixture-no-process".into(),
+                    arguments: Vec::new(),
+                    working_directory: directory.path().to_owned(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                session_id: None,
+            },
+            proof: Some(proof.clone()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        let mut registry =
+            crate::host::model::Registry::at(&directory.path().join("registry.sqlite3")).unwrap();
+        let authority = registry
+            .register_agent_authority(&HostedSession::Chat(source.clone()))
+            .unwrap();
+        let mut state = crate::host::state::HostState::new(proof);
+        state.install_model(registry);
+        let (handle, _peer) = crate::chat::runtime::Handle::fixture_remote_attachment_pair();
+        state.chats.insert(
+            source.id,
+            crate::host::chat::Record {
+                execution_instance: uuid::Uuid::new_v4(),
+                console_recipe: None,
+                paired_terminal: None,
+                session: source,
+                handle,
+                source_process: None,
+                subscribers: Default::default(),
+                observations: Default::default(),
+                completion_observed: false,
+                returning_terminal: false,
+            },
+        );
+        let client = 41;
+        state.register_client(client);
+        let host = Arc::new(crate::host::state::HostLock::new(state));
+        let error = Caller::resolve(&host, client, authority.clone())
+            .err()
+            .expect("unbound script must not gain project scope");
+        assert!(error.contains("no accepted project scope"), "{error}");
+        agent_execution::terminals::authenticate(&host, client, &authority).unwrap();
+        let error = Caller::resolve(&host, client, Authority::default())
+            .err()
+            .expect("authenticated socket must not fall back to User");
+        assert!(
+            error.contains("cannot change its authenticated worktree caller"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn accepted_project_refuses_an_original_checkout_redirected_to_another_repo() {
         if crate::repository::test_fixture::isolated_fixture_case(concat!(
             module_path!(),
@@ -957,6 +1037,10 @@ mod tests {
             .unwrap();
         let held = crate::fs_safety::Root::open(&original_common).unwrap();
         verify_project_scope(&common_a, &held).unwrap();
+        assert!(
+            verify_project_scope(&a, &held).is_err(),
+            "an accepted Folder key is not Git-common authority"
+        );
         let before = original_directory.metadata().unwrap();
         std::fs::write(a.join(".git"), format!("gitdir: {}\n", common_b.display())).unwrap();
         let after = original_directory.metadata().unwrap();
@@ -976,6 +1060,10 @@ mod tests {
             verify_project_scope(&common_a, &redirected)
                 .unwrap_err()
                 .contains("accepted project scope")
+        );
+        assert!(
+            verify_project_scope(&a, &redirected).is_err(),
+            "redirecting an accepted Folder checkout must not grant its new repository"
         );
         verify_project_scope(&common_a, &held).unwrap();
         let parked = fixture.path().join("parked-a.git");

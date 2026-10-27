@@ -1,4 +1,4 @@
-//! Isolated real-Git service contracts, including two controlled setup-holder
+//! Isolated real-Git service contracts, including controlled setup-holder
 //! PTY cases. No application, UI or provider is launched.
 use super::*;
 use crate::process::{CommandSpec, ProcessExecutor, ProcessFailure, ProcessOutput};
@@ -905,30 +905,52 @@ fn reserved_rename_sync_failure_proves_no_launch_and_allows_fresh_review() {
     )) {
         return;
     }
-    let fixture = Fixture::new();
+    let mut fixture = Fixture::new();
+    fixture._root.disable_cleanup(true);
     let (created, prepared) =
         prepared_setup(&fixture, "reserve-fault", "printf forbidden > executed");
     let run = prepared.custody.run;
-    let invoked = std::cell::Cell::new(false);
-    crate::repository::fail_next_setup_publication_sync_for_test();
+    let proof = holder_proof();
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let _owner = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let terminal = crate::model::TerminalId::new();
+    let recipe = prepared.recipe.as_ref().unwrap();
+    let source = registered_source(recipe.clone(), terminal, &proof);
     let result = prepared.custody.start(
         &RepositoryService::system("git"),
         &fixture.store,
-        crate::model::TerminalId::new(),
-        prepared.recipe.as_ref().unwrap(),
-        |_| {
-            invoked.set(true);
-            Ok(())
+        terminal,
+        recipe,
+        |authority| {
+            crate::terminal::TerminalHandle::spawn(
+                source.clone(),
+                setup_config(&source, authority.with_reservation_sync_failure()),
+                |_| {},
+            )
+            .map_err(|error| error.to_string())
         },
     );
     assert!(result.unwrap_err().contains("after rename"));
     assert!(
-        !invoked.get(),
-        "no child callback may cross failed Reserved publication"
+        !created.path.join("executed").exists(),
+        "failed holder reservation must leave no setup command artifact"
     );
-    assert!(!created.path.join("executed").exists());
+    await_original_helpers_reaped(&fixture);
     drop(prepared);
     skip_original(&fixture, &created, run);
+    fixture._root.disable_cleanup(false);
+}
+
+fn await_original_helpers_reaped(fixture: &Fixture) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while crate::daemon::child_reaper::has_outstanding_ownership() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "original setup holder ownership remains; fixture retained at {}",
+            fixture._root.path().display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 fn registered_source(
@@ -996,6 +1018,8 @@ fn ready_setup_cancelled_before_commit_cannot_create_a_root_and_releases_origina
     let terminal = crate::model::TerminalId::new();
     let recipe = prepared.recipe.as_ref().unwrap();
     let source = registered_source(recipe.clone(), terminal, &proof);
+    let prepared_binding = prepared.custody.holder_authority(terminal).unwrap().binding;
+
     let (ready, observed) = crossbeam_channel::bounded(1);
     let (resume, proceed) = crossbeam_channel::bounded(1);
     std::thread::scope(|scope| {
@@ -1015,6 +1039,7 @@ fn ready_setup_cancelled_before_commit_cannot_create_a_root_and_releases_origina
                 observed
                     .recv_timeout(std::time::Duration::from_secs(10))
                     .map_err(|_| "actual original holder never reached Ready".to_owned())?;
+                assert_eq!(fs::read(prepared_binding.admin_path.join("cagents-setup-execution")).unwrap(), prepared_binding.predecessor, "Ready must retain the exact inactive predecessor, not orphan Reserved before an owner commits");
                 // Ready proves actual typed descriptors/subreaper exist, but no
                 // PTY/root does. This original attempt must permanently cancel a
                 // late worker before its CommitSetup CAS and private wire send.
@@ -1029,17 +1054,9 @@ fn ready_setup_cancelled_before_commit_cannot_create_a_root_and_releases_origina
         !created.path.join("executed").exists(),
         "cancelled worker executed a late shell"
     );
+    await_original_helpers_reaped(&fixture);
     drop(prepared);
     skip_original(&fixture, &created, run);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while crate::daemon::child_reaper::has_outstanding_ownership() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "original Ready holder ownership remains; fixture retained at {}",
-            fixture._root.path().display()
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
     fixture._root.disable_cleanup(false);
 }
 

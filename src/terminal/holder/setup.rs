@@ -22,6 +22,11 @@ pub(crate) struct Binding {
     pub(crate) admin: (u64, u64),
     pub(crate) lease: (u64, u64),
     pub(crate) protection: Vec<(u64, u64)>,
+    /// Exact inactive disposition accepted under the canonical journal writer.
+    /// The existing holder owns all authority before making this Reserved.
+    pub(crate) predecessor: Vec<u8>,
+    #[cfg(test)]
+    pub(crate) fail_reservation_sync: bool,
 }
 #[derive(Clone, Debug)]
 pub(crate) struct Authority {
@@ -95,6 +100,11 @@ impl Authority {
         }
         Ok(())
     }
+    #[cfg(test)]
+    pub(crate) fn with_reservation_sync_failure(mut self) -> Self {
+        self.binding.fail_reservation_sync = true;
+        self
+    }
     pub(crate) fn claim_commit(&self) -> Result<(), String> {
         if self
             .pane_withdrawal
@@ -116,7 +126,7 @@ impl Authority {
                     .into()
             })
     }
-    pub(crate) fn cancel_before_commit(&self) -> Option<NoLaunch> {
+    pub(crate) fn cancel_before_commit(&self) -> bool {
         // Request receipt alone cannot start a shell. Only the exact holder's
         // Ready followed by this worker's commit CAS crosses that boundary.
         match self.delivery.fetch_update(
@@ -124,8 +134,8 @@ impl Authority {
             std::sync::atomic::Ordering::Acquire,
             |state| matches!(state, 0 | 1).then_some(3),
         ) {
-            Ok(_) | Err(3) => Some(NoLaunch(self.binding.clone())),
-            Err(_) => None, // An attempted exact holder commit is uncertain.
+            Ok(_) | Err(3) => true,
+            Err(_) => false, // An attempted exact holder commit is uncertain.
         }
     }
     /// Typed Spawn order only. Started/Attached preserve their original3slots.
@@ -135,15 +145,6 @@ impl Authority {
             .chain(&self.protection)
     }
 }
-/// A positive no-authority-delivery proof. A generic timeout or free lease
-/// cannot create this; the same worker's delivery CAS is permanently cancelled.
-pub(crate) struct NoLaunch(Binding);
-impl NoLaunch {
-    pub(crate) fn binding(&self) -> &Binding {
-        &self.0
-    }
-}
-
 /// Actual transferred descriptors, retained until original family proof.
 /// Only the freshly execed holder constructs this after validating the wire.
 pub(crate) struct Execution {
@@ -173,6 +174,8 @@ impl Binding {
                 == Some(&self.run.to_string())
             && self.admin_path.is_absolute()
             && self.protection.len() + 2 <= MAX_FILES
+            && !self.predecessor.is_empty()
+            && self.predecessor.len() <= 8192
     }
 }
 impl Execution {
@@ -218,7 +221,7 @@ impl Execution {
             admin.as_raw_fd()
         )))
         .map_err(|e| e.to_string())?;
-        crate::repository::verify_reserved_setup_holder(&admin_root, &binding)?;
+        crate::repository::verify_prepared_setup_holder(&admin_root, &binding)?;
         // Sole reaper, checked before PTY/root creation. An inherited setting
         // is insufficient; failing this never starts repository shell effects.
         if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
@@ -235,6 +238,16 @@ impl Execution {
             root: None,
             root_status: None,
         })
+    }
+    /// Only this exact ready holder may make its inactive generation durable
+    /// as Reserved. Any publication failure is settled by this same owner's
+    /// ECHILD path before its descriptors can be released.
+    pub(crate) fn commit(&mut self) -> Result<(), String> {
+        #[cfg(test)]
+        if self.binding.fail_reservation_sync {
+            crate::repository::fail_next_setup_publication_sync_for_test();
+        }
+        crate::repository::reserve_setup_holder(&self.admin_root, &self.binding)
     }
     pub(crate) fn set_root(&mut self, pid: i32) {
         self.root = Some(pid);
@@ -283,6 +296,16 @@ impl Execution {
 /// cannot mint this proof. Only this dedicated sole reaper's ECHILD can.
 pub(crate) struct ReapedFamily(());
 fn require_sole_subreaper() -> io::Result<()> {
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &raw mut action) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if action.sa_sigaction != libc::SIG_DFL || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Setup cleanup requires retained waitable children and default SIGCHLD",
+        ));
+    }
     let mut subreaper = 0i32;
     if unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &raw mut subreaper, 0, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());

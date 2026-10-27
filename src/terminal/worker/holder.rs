@@ -1415,7 +1415,7 @@ fn serve(control: UnixStream) -> i32 {
         Ok(pin) => pin,
         Err(error) => return fail(error),
     };
-    if let Some(authority) = &setup {
+    if let Some(authority) = &mut setup {
         let ready = Report::SetupReady {
             binding: authority.binding().clone(),
         };
@@ -1441,6 +1441,9 @@ fn serve(control: UnixStream) -> i32 {
         if !matches!(commit, Ok((Request::CommitSetup { binding }, descriptors)) if descriptors.is_empty() && &binding == authority.binding())
         {
             return fail("Setup startup was cancelled before its original holder commit; no shell was started".into());
+        }
+        if let Err(error) = authority.commit() {
+            return fail(format!("reserve original setup holder: {error}"));
         }
     }
     // Isolate this execed keeper before the PTY root and all of its tools

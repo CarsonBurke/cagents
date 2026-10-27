@@ -110,10 +110,29 @@ fn checkout_path(path: PathBuf) -> Result<PathBuf, AppError> {
     }
 }
 fn request(client: &mut ControlClient, operation: Operation) -> Result<Reply, AppError> {
-    // This uses the dedicated finite deadline in the CLI activation seam.
-    // A lost response never triggers a mutation retry.
-    client.worktree_operation(operation).map_err(protocol_error)
+    let known = operation.clone();
+    client.worktree_operation(operation).map_err(|error| {
+        // Only the dedicated pre-effect admission code proves no worktree
+        // mutation started. A generic remote error may follow trust/run/copy
+        // publication, even though its response arrived successfully.
+        let uncertain = known.mutates() && !matches!(&error, ControlError::Remote { code: ProtocolErrorCode::WorktreeNotStarted, .. });
+        let cause = protocol_error(error);
+        if !uncertain { return cause; }
+        let verb = match &known {
+            Operation::Create { .. } => "worktree.create",
+            Operation::Remove { .. } => "worktree.remove",
+            Operation::ResumeSetup { skip: true, .. } => "worktree.setup.skip",
+            Operation::ResumeSetup { .. } => "worktree.setup.resume",
+            _ => unreachable!("mutating operation"),
+        };
+        AppError {
+            kind: "worktree_outcome_unknown",
+            message: format!("{verb} did not return a confirmed outcome; effects may have committed: {}. Do not retry the mutation. Inspect `worktree list` and `worktree setup list` for the same project, then `worktree setup review` for any retained checkout", cause.message),
+            details: Some(json!({"schema_version":1,"outcome_unknown":true,"may_have_effects":true,"retryable":false,"verb":verb,"request":known,"cause":{"kind":cause.kind,"message":cause.message,"details":cause.details},"recovery":["worktree list","worktree setup list","worktree setup review"]})),
+        }
+    })
 }
+
 fn resolve(client: &mut ControlClient, path: PathBuf) -> Result<PathBuf, AppError> {
     match request(client, Operation::ResolveRepository { path })? {
         Reply::ResolvedRepository { repository } => Ok(repository),
@@ -329,7 +348,18 @@ pub(super) fn execute(command: WorktreeCommand) -> Result<CommandOutput, AppErro
             )
         }
     };
-    match request(&mut client, operation)? {
+    let reply = request(&mut client, operation)?;
+    finish_reply(&mut client, repository, spawn, reply)
+}
+
+type AgentStart = (Provider, String, Option<String>, Option<String>);
+fn finish_reply(
+    client: &mut ControlClient,
+    repository: PathBuf,
+    spawn: Option<AgentStart>,
+    reply: Reply,
+) -> Result<CommandOutput, AppError> {
+    match reply {
         Reply::CreationFailed(failure) => Err(AppError {
             kind: "worktree_create",
             message: format!(
@@ -344,7 +374,7 @@ pub(super) fn execute(command: WorktreeCommand) -> Result<CommandOutput, AppErro
             ),
         }),
         Reply::Created(created) => {
-            let mut data = json!({"schema_version":1,"operation_id":created.operation_id,"path":created.path,"branch":created.branch,"worktree":created.worktree,"warnings":created.warnings,"setup":created.setup,"error":created.error});
+            let mut data = json!({"schema_version":1,"state":"created","committed":true,"operation_id":created.operation_id,"path":created.path,"branch":created.branch,"worktree":created.worktree,"warnings":created.warnings,"setup":created.setup,"error":created.error});
             let failure = created.error.as_ref().or_else(|| {
                 created
                     .setup
@@ -354,7 +384,11 @@ pub(super) fn execute(command: WorktreeCommand) -> Result<CommandOutput, AppErro
             if let Some(error) = failure {
                 return Err(AppError {
                     kind: "worktree_create",
-                    message: format!("Worktree retained at {}: {error}", created.path.display()),
+                    message: format!(
+                        "Worktree creation {} committed at {}; no create retry is needed: {error}",
+                        created.operation_id,
+                        created.path.display()
+                    ),
                     details: Some(data),
                 });
             }
@@ -369,7 +403,7 @@ pub(super) fn execute(command: WorktreeCommand) -> Result<CommandOutput, AppErro
             if let Some((provider, prompt, model, reasoning_effort)) = spawn {
                 if let Some(setup) = &created.setup {
                     let terminal = setup.terminal.as_ref().ok_or_else(|| AppError { kind: "worktree_setup", message: format!("Worktree retained at {}; its reviewed setup has no accepted terminal, so no agent was started", created.path.display()), details: Some(data.clone()) })?;
-                    wait_for_setup(&mut client, terminal.id).map_err(|error| AppError {
+                    wait_for_setup(client, terminal).map_err(|error| AppError {
                         kind: "worktree_setup",
                         message: format!(
                             "Worktree retained at {}; no agent was started: {error}",
@@ -491,7 +525,13 @@ pub(super) fn execute(command: WorktreeCommand) -> Result<CommandOutput, AppErro
             if let Some(error) = &review.current_error {
                 human.push_str(&format!("Review unavailable: {error}\n"));
             }
-            human.push_str("Use setup resume or setup skip with this creation, expected run and current fingerprint. An uncertain previous execution remains blocked.");
+            human.push_str("Use setup skip with --creation; skip needs no fingerprint or valid setup file. Use setup resume with --creation and the current valid plan's --fingerprint (and --trust only after review). ");
+            if review.intent.run_id.is_some() {
+                human.push_str("Supply this run as --expected-run for either action. ");
+            } else {
+                human.push_str("No prior run exists; omit --expected-run. ");
+            }
+            human.push_str("An uncertain previous execution remains blocked.");
             Ok(CommandOutput {
                 command: "worktree.setup.review",
                 data: json!({"schema_version":1,"review":review}),
@@ -521,7 +561,11 @@ pub(super) fn execute(command: WorktreeCommand) -> Result<CommandOutput, AppErro
                 });
             }
             Ok(CommandOutput {
-                command: "worktree.setup.resume",
+                command: if skip {
+                    "worktree.setup.skip"
+                } else {
+                    "worktree.setup.resume"
+                },
                 data,
                 human: format!(
                     "{} setup for {} (run {})",
@@ -565,29 +609,62 @@ pub(super) fn execute(command: WorktreeCommand) -> Result<CommandOutput, AppErro
             })
         }
         Reply::Removed(removed) => {
-            let data = json!({"schema_version":1,"path":removed.path,"branch_deleted":removed.branch_deleted,"rescue_branch":removed.rescue_branch,"warnings":removed.warnings,"branch_error":removed.branch_error});
+            let data = json!({"schema_version":1,"state":"removed","committed":true,"path":removed.path,"branch_deleted":removed.branch_deleted,"rescue_branch":removed.rescue_branch,"warnings":removed.warnings,"branch_error":removed.branch_error});
+            let mut human = format!("Removed {}", removed.path.display());
+            if let Some(branch) = &removed.rescue_branch {
+                human.push_str(&format!("\nPreserved detached history on {branch}"));
+            }
+            if let Some(branch) = &removed.branch_deleted {
+                human.push_str(&format!("\nDeleted branch {branch}"));
+            } else {
+                human.push_str("\nBranch was not deleted");
+            }
+            for warning in &removed.warnings {
+                human.push_str(&format!("\nWarning: {warning}"));
+            }
             if let Some(error) = removed.branch_error {
                 return Err(AppError {
                     kind: "worktree_branch",
-                    message: error,
+                    message: format!(
+                        "{human}\nBranch retained: {error}. The worktree removal is already committed"
+                    ),
                     details: Some(data),
                 });
             }
             Ok(CommandOutput {
                 command: "worktree.remove",
-                human: format!("Removed {}", removed.path.display()),
+                human,
                 data,
             })
         }
         Reply::RemovalFailed(failure) => Err(AppError {
-            kind: "worktree_remove_unknown",
+            kind: if failure.outcome_unknown {
+                "worktree_remove_unknown"
+            } else {
+                "worktree_remove_refused"
+            },
             message: format!(
-                "Removal at {} was not confirmed: {}. Inspect its current registration and files before any retry",
+                "Removal at {} {}: {}. {}{}",
                 failure.path.display(),
-                failure.error
+                if failure.outcome_unknown {
+                    "was not confirmed"
+                } else {
+                    "was refused; checkout retained"
+                },
+                failure.error,
+                if failure.outcome_unknown {
+                    "Inspect current registration and files before any retry"
+                } else {
+                    "Resolve the retained checkout's reported condition before another request"
+                },
+                failure
+                    .rescue_branch
+                    .as_ref()
+                    .map(|branch| format!(". Detached history is preserved on {branch}"))
+                    .unwrap_or_default()
             ),
             details: Some(
-                json!({"schema_version":1,"path":failure.path,"rescue_branch":failure.rescue_branch,"outcome_unknown":failure.outcome_unknown}),
+                json!({"schema_version":1,"path":failure.path,"rescue_branch":failure.rescue_branch,"outcome_unknown":failure.outcome_unknown,"may_have_effects":failure.outcome_unknown}),
             ),
         }),
         Reply::ResolvedRepository { .. } => {
@@ -596,10 +673,19 @@ pub(super) fn execute(command: WorktreeCommand) -> Result<CommandOutput, AppErro
     }
 }
 
-fn wait_for_setup(client: &mut ControlClient, id: TerminalId) -> Result<(), String> {
+fn wait_for_setup(client: &mut ControlClient, expected: &TerminalSession) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(120);
+    wait_for_setup_until(client, expected, deadline, Instant::now)
+}
+
+fn wait_for_setup_until(
+    client: &mut ControlClient,
+    expected: &TerminalSession,
+    deadline: Instant,
+    mut now: impl FnMut() -> Instant,
+) -> Result<(), String> {
     loop {
-        if Instant::now() >= deadline {
+        if now() >= deadline {
             return Err("Setup is still running; inspect it before starting an agent".into());
         }
         let terminals = match client
@@ -609,13 +695,16 @@ fn wait_for_setup(client: &mut ControlClient, id: TerminalId) -> Result<(), Stri
             ServerResponse::Listed { terminals } => terminals,
             _ => return Err("Unexpected setup terminal inventory response".into()),
         };
-        if Instant::now() >= deadline {
+        if now() >= deadline {
             return Err(
                 "Setup did not complete within the waiting deadline; inspect its original terminal"
                     .into(),
             );
         }
-        let terminal = terminals.into_iter().find(|terminal| terminal.session.id == id).ok_or("The original setup terminal is unavailable; inspect its card before starting an agent")?;
+        let terminal = terminals.into_iter().find(|terminal| terminal.session.id == expected.id).ok_or("The original setup terminal is unavailable; inspect its card before starting an agent")?;
+        if terminal.session.launch != expected.launch {
+            return Err("The original setup terminal source changed; no agent was started. Inspect its retained setup card".into());
+        }
         let exit = match terminal.session.continuity {
             TerminalContinuity::Exited { last_exit } => Some(last_exit),
             TerminalContinuity::RelaunchAvailable { last_exit, .. } => last_exit,
@@ -625,6 +714,9 @@ fn wait_for_setup(client: &mut ControlClient, id: TerminalId) -> Result<(), Stri
             _ => None,
         };
         if let Some(exit) = exit {
+            if now() >= deadline {
+                return Err("Setup success arrived after the waiting deadline; inspect its original terminal before starting an agent".into());
+            }
             return if exit.code == Some(0) && exit.signal.is_none() {
                 Ok(())
             } else {
@@ -634,11 +726,305 @@ fn wait_for_setup(client: &mut ControlClient, id: TerminalId) -> Result<(), Stri
                 ))
             };
         }
-        if Instant::now() >= deadline {
+        if now() >= deadline {
             return Err("Setup is still running; inspect it before starting an agent".into());
         }
-        thread::sleep(
-            Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
-        );
+        thread::sleep(Duration::from_millis(100).min(deadline.saturating_duration_since(now())));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn connected_client(
+        after: impl FnOnce(&mut UnixStream, &HostSessionProof) + Send + 'static,
+    ) -> (ControlClient, thread::JoinHandle<()>) {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let proof = HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("worktree-cli-fixture"),
+            boot_id: crate::model::BootId::new("fixture"),
+            host_incarnation: crate::model::HostIncarnation::new("fixture"),
+        };
+        let server = thread::spawn(move || {
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let connected: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            write_frame(
+                &mut peer,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(connected.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof: proof.clone(),
+                            resumed: Vec::new(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+            after(&mut peer, &proof);
+        });
+        (ControlClient::from_stream(stream).unwrap(), server)
+    }
+    #[test]
+    fn lost_mutation_response_is_unknown_and_never_replayed_but_remote_refusal_stays_known() {
+        for response in [
+            None,
+            Some(ProtocolErrorCode::WorktreeNotStarted),
+            Some(ProtocolErrorCode::InvalidRequest),
+        ] {
+            let (mut client, server) = connected_client(move |peer, proof| {
+                let received: ClientEnvelope = read_frame(peer).unwrap().unwrap();
+                assert!(
+                    matches!(received.request, ClientRequest::Worktree { operation: Operation::Create { branch, .. }, .. } if branch == "topic")
+                );
+                if let Some(code) = response {
+                    write_frame(
+                        peer,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(received.request_id),
+                            proof: proof.clone(),
+                            message: ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
+                                code,
+                                "authoritative remote response",
+                                false,
+                            )),
+                        },
+                    )
+                    .unwrap();
+                    assert!(read_frame::<ClientEnvelope>(peer).unwrap().is_none());
+                }
+                // Otherwise EOF immediately after accepting exactly one request.
+            });
+            let error = request(
+                &mut client,
+                Operation::Create {
+                    repository: "/fixture/project.git".into(),
+                    branch: "topic".into(),
+                    base: Some("main".into()),
+                    linear: None,
+                    no_setup: true,
+                },
+            )
+            .unwrap_err();
+            if response == Some(ProtocolErrorCode::WorktreeNotStarted) {
+                assert_ne!(error.kind, "worktree_outcome_unknown");
+                assert_eq!(error.details.as_ref().unwrap()["retryable"], false);
+                assert!(error.message.contains("authoritative remote response"));
+            } else {
+                assert_eq!(error.kind, "worktree_outcome_unknown");
+                let data = error.details.as_ref().unwrap();
+                assert_eq!(data["outcome_unknown"], true);
+                assert_eq!(data["may_have_effects"], true);
+                assert_eq!(data["retryable"], false);
+                assert_eq!(data["request"]["Create"]["branch"], "topic");
+                assert!(
+                    data.get("operation_id").is_none(),
+                    "missing response must not fabricate a durable ID"
+                );
+                assert!(error.message.contains("Do not retry"));
+            }
+            drop(client);
+            server.join().unwrap();
+        }
+    }
+    #[test]
+    fn formatted_retained_outcomes_keep_committed_ids_rescue_refs_and_exact_verbs() {
+        use crate::worktree_control::{Created, RemovalFailure, Removed};
+        let (mut client, server) = connected_client(|peer, _| {
+            assert!(read_frame::<ClientEnvelope>(peer).unwrap().is_none())
+        });
+        let repository = PathBuf::from("/fixture/project.git");
+        let path = PathBuf::from("/fixture/topic");
+        let creation = crate::model::OperationId::new();
+        let error = finish_reply(
+            &mut client,
+            repository.clone(),
+            None,
+            Reply::Created(Created {
+                operation_id: creation,
+                path: path.clone(),
+                branch: Some("topic".into()),
+                worktree: None,
+                warnings: Vec::new(),
+                setup: None,
+                error: Some("status unavailable".into()),
+            }),
+        )
+        .err()
+        .unwrap();
+        assert!(error.message.contains(&creation.to_string()));
+        assert!(error.message.contains("committed") && error.message.contains("/fixture/topic"));
+        assert_eq!(error.details.as_ref().unwrap()["state"], "created");
+        assert_eq!(error.details.as_ref().unwrap()["committed"], true);
+        for branch_error in [None, Some("unmerged branch retained".to_owned())] {
+            let outcome = finish_reply(
+                &mut client,
+                repository.clone(),
+                None,
+                Reply::Removed(Removed {
+                    path: path.clone(),
+                    branch_deleted: None,
+                    rescue_branch: Some("rescue/topic".into()),
+                    warnings: vec!["receipt retirement needs inspection".into()],
+                    branch_error: branch_error.clone(),
+                }),
+            );
+            let human = if branch_error.is_some() {
+                let error = outcome.err().unwrap();
+                assert_eq!(error.details.as_ref().unwrap()["committed"], true);
+                error.message
+            } else {
+                outcome.ok().unwrap().human
+            };
+            assert!(
+                human.contains("rescue/topic")
+                    && human.contains("receipt retirement needs inspection")
+                    && human.contains("not deleted")
+            );
+        }
+        for unknown in [false, true] {
+            let error = finish_reply(
+                &mut client,
+                repository.clone(),
+                None,
+                Reply::RemovalFailed(RemovalFailure {
+                    path: path.clone(),
+                    rescue_branch: None,
+                    error: "original owner remains".into(),
+                    outcome_unknown: unknown,
+                }),
+            )
+            .err()
+            .unwrap();
+            assert_eq!(
+                error.kind,
+                if unknown {
+                    "worktree_remove_unknown"
+                } else {
+                    "worktree_remove_refused"
+                }
+            );
+            assert_eq!(error.details.unwrap()["outcome_unknown"], unknown);
+        }
+        let result = finish_reply(
+            &mut client,
+            repository,
+            None,
+            Reply::SetupPrepared {
+                path,
+                creation_id: creation,
+                run_id: crate::model::OperationId::new(),
+                skip: true,
+                setup: None,
+                error: None,
+            },
+        )
+        .ok()
+        .unwrap();
+        assert_eq!(result.command, "worktree.setup.skip");
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn setup_wait_rejects_late_or_replaced_success_without_starting_an_agent() {
+        for (expires_at, replaced) in [(2, false), (3, false), (usize::MAX, true)] {
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            let proof = HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("worktree-wait"),
+                boot_id: crate::model::BootId::new("fixture"),
+                host_incarnation: crate::model::HostIncarnation::new("fixture"),
+            };
+            let id = TerminalId::new();
+            let mut descriptor = TerminalDescriptor::relaunchable(
+                id,
+                LaunchRecipe {
+                    program: "/bin/sh".into(),
+                    arguments: Vec::new(),
+                    working_directory: "/".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                None,
+            );
+            descriptor.session.continuity = TerminalContinuity::Exited {
+                last_exit: crate::model::TerminalExit {
+                    code: Some(0),
+                    signal: None,
+                    occurred_at_unix_ms: 1,
+                },
+            };
+            let expected = descriptor.session.clone();
+            if replaced {
+                descriptor.session.launch.program = "/different-setup-source".into();
+            }
+            let server = thread::spawn(move || {
+                peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let connected: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(connected.request_id),
+                        proof: proof.clone(),
+                        message: ServerMessage::Response {
+                            response: ServerResponse::Connected {
+                                proof: proof.clone(),
+                                resumed: Vec::new(),
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+                let request: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                assert!(matches!(request.request, ClientRequest::List));
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof,
+                        message: ServerMessage::Response {
+                            response: ServerResponse::Listed {
+                                terminals: vec![descriptor],
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+                assert!(
+                    read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none(),
+                    "expired waiting path must end without submitting another request"
+                );
+            });
+            let mut client = ControlClient::from_stream(stream).unwrap();
+            let before = Instant::now();
+            let deadline = before + Duration::from_secs(5);
+            let mut observations = 0;
+            let error = wait_for_setup_until(&mut client, &expected, deadline, || {
+                observations += 1;
+                if observations < expires_at {
+                    before
+                } else {
+                    deadline
+                }
+            })
+            .unwrap_err();
+            if replaced {
+                assert!(error.contains("source changed"), "{error}");
+                assert_eq!(observations, 2);
+            } else {
+                assert!(error.contains("waiting deadline"), "{error}");
+                assert_eq!(
+                    observations, expires_at,
+                    "the same original deadline is checked after RPC and before accepting success"
+                );
+            }
+            drop(client);
+            server.join().unwrap();
+        }
     }
 }

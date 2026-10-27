@@ -15,7 +15,8 @@ pub(crate) use worktree_control::fail_next_setup_publication_sync_for_test;
 #[cfg(feature = "host")]
 pub(crate) use worktree_control::{
     SetupCustody, creation_marker as worktree_creation_marker, publish_setup_family_reaped,
-    removal_is_quiescent as worktree_setup_removal_is_quiescent, verify_reserved_setup_holder,
+    removal_is_quiescent as worktree_setup_removal_is_quiescent, reserve_setup_holder,
+    verify_prepared_setup_holder,
 };
 pub use worktree_setup_intent::{WorktreeSetupIntent, WorktreeSetupPlan};
 
