@@ -2767,7 +2767,7 @@ mod tests {
             ClientRequest::EditWorkspaceModel {
                 edit: ModelEdit::SeedView {
                     scope: Scope::Channel(channel),
-                    panes: vec![pane.clone()],
+                    panes: vec![],
                     closed: vec![],
                 },
             },
