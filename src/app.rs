@@ -20934,6 +20934,56 @@ mod tests {
     }
 
     #[test]
+    fn stale_settings_save_lane_preserves_cleared_editor_overrides() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let original = AppSettings {
+            editor_font_family: Some("Editor Mono".into()),
+            editor_font_size: Some(18.0),
+            ..AppSettings::default()
+        };
+        settings::save(&path, &original).unwrap();
+        let mut clearing_window = context_inspector_test_app(false);
+        let mut stale_window = context_inspector_test_app(false);
+        for window in [&mut clearing_window, &mut stale_window] {
+            window.settings_path = Some(path.clone());
+            window.settings_write_blocked = false;
+            window.settings = original.clone();
+            window.settings_base = original.clone();
+        }
+
+        clearing_window.settings.editor_font_family = None;
+        clearing_window.settings.editor_font_size = None;
+        clearing_window.save_settings_now().unwrap();
+
+        // Both saves capture the stale snapshot before either acknowledgment.
+        // The second save must use the lane's first successful baseline without
+        // treating either old editor override as a deliberate local change.
+        stale_window.settings.terminal_font_size = 21.0;
+        let first = stale_window.capture_settings_save().unwrap();
+        stale_window.settings.terminal_font_family = "Terminal Mono".into();
+        let second = stale_window.capture_settings_save().unwrap();
+        let first_ack = first.run().unwrap();
+        let second_ack = second.run().unwrap();
+        stale_window.acknowledge_settings_save(second_ack);
+        stale_window.acknowledge_settings_save(first_ack);
+
+        let reopened = settings::load(&path).unwrap();
+        assert_eq!(reopened.editor_font_family, None);
+        assert_eq!(reopened.editor_font_size, None);
+        assert_eq!(reopened.editor_font_family(), "Terminal Mono");
+        assert_eq!(reopened.editor_font_size(), 21.0);
+
+        // A later intentional override must still win after the stale saves.
+        stale_window.settings.editor_font_size = Some(22.0);
+        stale_window.save_settings_now().unwrap();
+        let reopened = settings::load(&path).unwrap();
+        assert_eq!(reopened.editor_font_size(), 22.0);
+        assert_eq!(reopened.editor_font_family(), "Terminal Mono");
+        assert_eq!(reopened.editor_font_family, None);
+    }
+
+    #[test]
     fn reverting_an_edit_before_save_acknowledgment_persists_the_revert() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
