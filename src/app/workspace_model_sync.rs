@@ -1867,7 +1867,14 @@ mod tests {
         let mut session = app.session.take().unwrap();
         session.shutdown();
         assert_eq!(session.last_error(), None);
-        let (mut restored, _) = crate::session::SessionRuntime::open(&database, boot).unwrap();
+        let (mut restored, workspace) =
+            crate::session::SessionRuntime::open(&database, boot).unwrap();
+        assert_eq!(
+            workspace
+                .expect("device adoption saved its sidebar rank")
+                .project_order,
+            vec![id]
+        );
         let (projects, _) = restored.take_catalog();
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].id, id);
@@ -3324,6 +3331,11 @@ mod tests {
     #[test]
     fn adopted_projects_append_to_durable_order_and_restore_after_shuffled_loading() {
         let mut app = super::super::tests::context_inspector_test_app(false);
+        let storage = tempfile::tempdir().unwrap();
+        let database = storage.path().join("project-order.sqlite3");
+        let boot = crate::model::BootId::new("project-order-adoption");
+        let (session, _) = crate::session::SessionRuntime::open(&database, boot.clone()).unwrap();
+        app.session = Some(session);
         let mut checkouts = Vec::new();
         let mut adopt = |app: &mut Cagents, name: &str, ordinal| {
             let checkout =
@@ -3386,6 +3398,21 @@ mod tests {
             );
             assert_eq!(app.workspace.focused(), None);
         }
+        // No manual persist/snapshot here: the load-completion path must save
+        // each new rank itself. Reopening only after shutdown drains its writer
+        // and distinguishes a remembered in-memory rank from a durable one.
+        let mut session = app.session.take().unwrap();
+        session.shutdown();
+        assert_eq!(session.last_error(), None);
+        let (session, saved) = crate::session::SessionRuntime::open(&database, boot).unwrap();
+        let saved = saved.expect("adoption saved a workspace without opening a pane");
+        assert_eq!(saved.id, app.durable.id);
+        assert_eq!(saved.project_order, expected);
+        assert!(saved.cards.is_empty());
+        assert_eq!(saved.focused, None);
+        app.durable = Arc::new(saved);
+        app.session = Some(session);
+
         // A saved project absent during those adoptions keeps its custom rank
         // when its real repository load eventually arrives with that same ID.
         let returning = git_checkout().expect("Git initialization must succeed for this fixture");
@@ -3428,6 +3455,9 @@ mod tests {
             Arc::ptr_eq(&before, &app.durable),
             "unchanged order does not clone the workspace"
         );
+        let mut session = app.session.take().unwrap();
+        session.shutdown();
+        assert_eq!(session.last_error(), None);
     }
 
     #[test]
