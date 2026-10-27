@@ -9791,7 +9791,7 @@ mod tests {
         #[test]
         fn snapshot_metadata_symlink_layouts_remain_git_compatible() {
             const TEST: &str = "repository::tests::git_contracts::snapshot_metadata_symlink_layouts_remain_git_compatible";
-            if !crate::git_watch::tests::fixture_isolated(TEST) {
+            if crate::repository::test_fixture::isolated_fixture_case(TEST) {
                 return;
             }
             use std::os::unix::fs::symlink;

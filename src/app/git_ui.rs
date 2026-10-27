@@ -1319,12 +1319,12 @@ fn read_local_with_plan(
             }
         };
         // Existing file edits cannot introduce index membership. On an index
-        // edge, ordinary covered paths keep their plan; a force-added ignored
-        // path or incomplete status needs a fresh complete index census.
+        // edge, ordinary covered paths keep their plan. Observed uncovered
+        // paths repair it; capped uncertainty retains an explicit polling
+        // fallback rather than repeatedly rebuilding an equally capped plan.
         if change.metadata
             && change.untracked
-            && (previous_plan.is_some_and(|plan| plan.status_needs_replan(record, &current))
-                || current.listing_truncated)
+            && previous_plan.is_some_and(|plan| plan.status_needs_replan(record, &current))
         {
             coverage_updates.insert(record.id);
         }
@@ -1765,6 +1765,98 @@ mod tests {
         }
     }
 
+    #[test]
+    fn capped_large_index_updates_keep_the_existing_polling_plan() {
+        const TEST: &str =
+            "app::git_ui::tests::capped_large_index_updates_keep_the_existing_polling_plan";
+        if crate::repository::test_fixture::isolated_fixture_case(TEST) {
+            return;
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repo");
+        let snapshot = fixture(&root);
+        let bulk = root.join("bulk");
+        fs::create_dir(&bulk).unwrap();
+        // Match the reported workload: real tracked files, all changed, not
+        // forty thousand clean or sparse index entries standing in for it.
+        const FILES: usize = 40_000;
+        for index in 0..FILES {
+            fs::write(bulk.join(format!("file{index:05}.txt")), "original\n").unwrap();
+        }
+        git(&root, &["add", "bulk"]);
+        git(&root, &["commit", "-m", "large fixture"]);
+        let project = ProjectId::new();
+        let token = CancellationToken::default();
+        let id = snapshot.worktrees[0].0.id;
+        let (mut snapshot, plan) = read_local(
+            project,
+            snapshot,
+            git_watch::Change {
+                topology: true,
+                ..Default::default()
+            },
+            token.clone(),
+        )
+        .unwrap();
+        let plan = plan.unwrap();
+        let retained = plan.clone();
+        // Observe the actual registration acknowledgment: bounded directory
+        // discovery must retain fallback, even though this flat fixture needs
+        // few native watches. No assertion promotes it to complete coverage.
+        let monitor = git_watch::Monitor::start(|| {}).unwrap();
+        monitor.configure(vec![Arc::new(plan.clone())]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(change) = monitor.drain().get(&project)
+                && let Some(covered) = change.coverage
+            {
+                assert!(!covered, "large bounded inventory must expose its fallback");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fallback acknowledgment did not arrive"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(monitor);
+        for index in 0..FILES {
+            fs::write(bulk.join(format!("file{index:05}.txt")), "changed\n").unwrap();
+        }
+        let service = RepositoryService::system("git");
+        for paths in [&["add", "bulk/file00000.txt"][..], &["add", "bulk"][..]] {
+            git(&root, paths);
+            let current = service
+                .status_projection(&root, true, sidebar::STATUS_DISPLAY_LIMIT, &token)
+                .unwrap();
+            assert!(
+                current.listing_truncated,
+                "exercise the actual capped status path"
+            );
+            assert!(current.entries.len() < FILES);
+            let (updated, replacement) = read_local_with_plan(
+                project,
+                snapshot,
+                git_watch::Change {
+                    worktrees: [id].into(),
+                    metadata: true,
+                    untracked: true,
+                    ..Default::default()
+                },
+                token.clone(),
+                Some(&plan),
+            )
+            .unwrap();
+            assert!(
+                replacement.is_none(),
+                "ordinary large git add must not repeat index/directory planning"
+            );
+            assert!(updated.status_errors.is_empty());
+            assert_eq!(plan, retained, "existing polling policy remains intact");
+            snapshot = updated;
+        }
+    }
+
     fn app_with_status_snapshot(snapshot: Snapshot, key: &ActiveWorktreeKey) -> Cagents {
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.sidebar_model.projects = vec![SidebarProject::new(
@@ -1827,7 +1919,7 @@ mod tests {
     #[test]
     fn failed_worktree_status_is_last_known_and_sibling_reads_cannot_replay_it_after_recovery() {
         const TEST: &str = "app::git_ui::tests::failed_worktree_status_is_last_known_and_sibling_reads_cannot_replay_it_after_recovery";
-        if !crate::git_watch::tests::fixture_isolated(TEST) {
+        if crate::repository::test_fixture::isolated_fixture_case(TEST) {
             return;
         }
         let directory = tempfile::tempdir().unwrap();
@@ -2636,7 +2728,7 @@ mod tests {
     #[test]
     fn partial_watcher_recovery_repairs_missed_branch_routing_without_a_census() {
         const TEST: &str = "app::git_ui::tests::partial_watcher_recovery_repairs_missed_branch_routing_without_a_census";
-        if !crate::git_watch::tests::fixture_isolated(TEST) {
+        if crate::repository::test_fixture::isolated_fixture_case(TEST) {
             return;
         }
         let directory = tempfile::tempdir().unwrap();
@@ -3575,7 +3667,7 @@ mod tests {
     #[test]
     fn initial_and_watcher_sidebar_statuses_keep_counts_without_retaining_paths() {
         const TEST: &str = "app::git_ui::tests::initial_and_watcher_sidebar_statuses_keep_counts_without_retaining_paths";
-        if !crate::git_watch::tests::fixture_isolated(TEST) {
+        if crate::repository::test_fixture::isolated_fixture_case(TEST) {
             return;
         }
         let files = tempfile::tempdir().unwrap();
@@ -3630,7 +3722,7 @@ mod tests {
     #[test]
     fn duplicate_repository_load_preserves_new_linked_row_status_error_detail() {
         const TEST: &str = "app::git_ui::tests::duplicate_repository_load_preserves_new_linked_row_status_error_detail";
-        if !crate::git_watch::tests::fixture_isolated(TEST) {
+        if crate::repository::test_fixture::isolated_fixture_case(TEST) {
             return;
         }
         let directory = tempfile::tempdir().unwrap();
@@ -3703,7 +3795,7 @@ mod tests {
     #[test]
     fn repository_reload_and_bound_tasks_publish_the_newest_sample_in_either_delivery_order() {
         const TEST: &str = "app::git_ui::tests::repository_reload_and_bound_tasks_publish_the_newest_sample_in_either_delivery_order";
-        if !crate::git_watch::tests::fixture_isolated(TEST) {
+        if crate::repository::test_fixture::isolated_fixture_case(TEST) {
             return;
         }
         for no_entry in [false, true] {
@@ -3805,7 +3897,7 @@ mod tests {
     #[test]
     fn repository_reload_keeps_listed_lock_metadata_and_newer_recovered_checkout() {
         const TEST: &str = "app::git_ui::tests::repository_reload_keeps_listed_lock_metadata_and_newer_recovered_checkout";
-        if !crate::git_watch::tests::fixture_isolated(TEST) {
+        if crate::repository::test_fixture::isolated_fixture_case(TEST) {
             return;
         }
         for omitted in [false, true] {
@@ -3911,7 +4003,7 @@ mod tests {
     #[test]
     fn repository_reload_preserves_newer_status_failures_and_clears_older_failures() {
         const TEST: &str = "app::git_ui::tests::repository_reload_preserves_newer_status_failures_and_clears_older_failures";
-        if !crate::git_watch::tests::fixture_isolated(TEST) {
+        if crate::repository::test_fixture::isolated_fixture_case(TEST) {
             return;
         }
         for newer_failure in [false, true] {
@@ -4019,7 +4111,7 @@ mod tests {
     #[test]
     fn bound_status_failure_marks_last_known_and_retries_without_a_watch_event() {
         const TEST: &str = "app::git_ui::tests::bound_status_failure_marks_last_known_and_retries_without_a_watch_event";
-        if !crate::git_watch::tests::fixture_isolated(TEST) {
+        if crate::repository::test_fixture::isolated_fixture_case(TEST) {
             return;
         }
         for delayed in [false, true] {
