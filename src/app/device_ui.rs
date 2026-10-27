@@ -2112,11 +2112,11 @@ mod tests {
             drop(app.update(Message::ResetSettings));
             app.device_ui.open = true;
             let delayed = app.update_device(Action::Close);
-            let old_instance = app.settings_reset_focus_instance;
+            let old_instance = app.settings_reset_presentation;
             let newer = if reopen {
                 drop(app.update(Message::CancelResetSettings));
                 drop(app.update(Message::ResetSettings));
-                assert_ne!(app.settings_reset_focus_instance, old_instance);
+                assert_ne!(app.settings_reset_presentation, old_instance);
                 iced::widget::operation::focus(widget::Id::new("dialog.reset-settings.confirm"))
                     .map(cosmic::Action::App)
             } else {
