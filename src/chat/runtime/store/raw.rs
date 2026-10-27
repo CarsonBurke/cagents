@@ -76,7 +76,7 @@ pub(super) fn initialize(db: &mut Connection) -> Result<State, String> {
     let mut open_bytes = 0usize;
     {
         let mut query = tx
-            .prepare("SELECT agent,id,input_len FROM raw_tool_sources WHERE state=0 LIMIT 513")
+            .prepare("SELECT agent,id,input_len FROM raw_tool_sources s WHERE state=0 AND NOT EXISTS(SELECT 1 FROM raw_tool_revoked r WHERE r.agent=s.agent AND r.id=s.id) LIMIT 513")
             .map_err(err)?;
         let rows = query
             .query_map([], |row| {
@@ -305,12 +305,15 @@ impl Store {
         }
         let hash = digest(input.as_bytes());
         let previous:Option<(i64,Option<Vec<u8>>,String,usize,usize)>=self.db.query_row("SELECT state,hash,name,cost,(SELECT count(*) FROM raw_tool_chunks c WHERE c.agent=s.agent AND c.id=s.id) FROM raw_tool_sources s WHERE agent=?1 AND id=?2",params![agent(source),source.source_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).optional().map_err(err)?;
-        if let Some((SEALED, old_hash, old_name, ..)) = &previous {
-            if old_hash.as_deref() == Some(hash.as_slice()) && old_name == name {
+        if let Some((state, old_hash, old_name, ..)) = &previous {
+            if *state == SEALED && old_hash.as_deref() == Some(hash.as_slice()) && old_name == name
+            {
                 return Ok(None);
             }
-            self.raw_fence_identity(source)?;
-            return Ok(Some("A provider reused an original tool identity with different arguments; the ambiguous update was discarded".into()));
+            if *state == SEALED || old_name != name {
+                self.raw_fence_identity(source)?;
+                return Ok(Some("A provider reused an original tool identity with a different name or arguments; the ambiguous update was discarded".into()));
+            }
         }
         let command = command_bytes(command)?;
         if input.len().saturating_add(command.len()) > RAW_SOURCE_BYTES {
@@ -1565,6 +1568,140 @@ mod identity_reuse_tests {
             store.raw_original(&key("", "unrelated")).unwrap(),
             Some(("Write".into(), "{}".into()))
         );
+    }
+
+    #[test]
+    fn a_full_completion_cannot_rename_an_unfinished_original_call() {
+        let mut store = Store::new().unwrap();
+        let source = key("", "full-open");
+        store
+            .apply(Event::RawToolCapture(RawToolCapture::Start {
+                source: source.clone(),
+                name: "Write".into(),
+            }))
+            .unwrap();
+        let warning = store
+            .apply(Event::RawToolCapture(RawToolCapture::Full {
+                source: source.clone(),
+                name: "Bash".into(),
+                input: "{}".into(),
+                command: None,
+            }))
+            .unwrap();
+        assert!(
+            warning
+                .iter()
+                .any(|event| matches!(event, Event::Error { fatal: false, .. }))
+        );
+        assert!(store.raw_revoked(&source).unwrap());
+        assert!(store.raw_original(&source).is_err());
+        assert!(store.raw_parts("full-open").unwrap().is_empty());
+        assert_eq!(
+            store
+                .db
+                .query_row(
+                    "SELECT name FROM raw_tool_sources WHERE id='full-open'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "Write"
+        );
+
+        let legitimate = key("", "same-name");
+        store
+            .apply(Event::RawToolCapture(RawToolCapture::Start {
+                source: legitimate.clone(),
+                name: "Write".into(),
+            }))
+            .unwrap();
+        assert!(
+            store
+                .apply(Event::RawToolCapture(RawToolCapture::Full {
+                    source: legitimate.clone(),
+                    name: "Write".into(),
+                    input: "{}".into(),
+                    command: None,
+                }))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!store.raw_revoked(&legitimate).unwrap());
+        assert_eq!(
+            store.raw_original(&legitimate).unwrap(),
+            Some(("Write".into(), "{}".into()))
+        );
+    }
+
+    #[test]
+    fn reopening_raw_capture_recovers_live_streams_without_revoked_open_identities() {
+        let mut store = Store::new().unwrap();
+        for index in 0..=OPEN_KEYS {
+            let source = key("", &format!("revoked-{index}"));
+            for name in ["Write", "Bash"] {
+                store
+                    .apply(Event::RawToolCapture(RawToolCapture::Start {
+                        source: source.clone(),
+                        name: name.into(),
+                    }))
+                    .unwrap();
+            }
+            assert!(store.raw_revoked(&source).unwrap());
+        }
+        assert!(store.raw_sources.open.is_empty());
+        let live = key("", "still-live");
+        store
+            .apply(Event::RawToolCapture(RawToolCapture::Start {
+                source: live.clone(),
+                name: "Write".into(),
+            }))
+            .unwrap();
+        let path: String = store
+            .db
+            .query_row(
+                "SELECT file FROM pragma_database_list WHERE name='main'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut reopened = Connection::open(path).unwrap();
+        let state = initialize(&mut reopened)
+            .expect("revoked unfinished calls must not consume reopened live capture slots");
+        assert!(guard(&store.db, store.raw_sources.nonce).is_err());
+        store.db = reopened;
+        store.raw_sources = state;
+        assert_eq!(store.raw_sources.open.len(), 1);
+        assert_eq!(store.raw_sources.open.get(&live), Some(&0));
+        assert_eq!(store.raw_sources.open_bytes, 0);
+
+        let removed = key("", "revoked-0");
+        let warning = store
+            .apply(Event::RawToolCapture(RawToolCapture::Full {
+                source: removed.clone(),
+                name: "Write".into(),
+                input: "{}".into(),
+                command: None,
+            }))
+            .unwrap();
+        assert!(
+            warning
+                .iter()
+                .any(|event| matches!(event, Event::Error { fatal: false, .. }))
+        );
+        assert!(store.raw_original(&removed).is_err());
+        store
+            .apply(Event::RawToolCapture(RawToolCapture::Full {
+                source: live.clone(),
+                name: "Write".into(),
+                input: "{}".into(),
+                command: None,
+            }))
+            .unwrap();
+        assert_eq!(
+            store.raw_original(&live).unwrap(),
+            Some(("Write".into(), "{}".into()))
+        );
+        assert!(store.raw_sources.open.is_empty());
     }
 
     #[test]
