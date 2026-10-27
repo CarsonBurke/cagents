@@ -111,7 +111,35 @@ fn checkout_path(path: PathBuf) -> Result<PathBuf, AppError> {
 }
 fn request(client: &mut ControlClient, operation: Operation) -> Result<Reply, AppError> {
     let known = operation.clone();
-    client.worktree_operation(operation).map_err(|error| {
+    let result = client.worktree_operation(operation).and_then(|reply| {
+        let matching = match (&known, &reply) {
+            (
+                Operation::ResolveProject { .. } | Operation::ResolveRepository { .. },
+                Reply::ResolvedRepository { .. },
+            )
+            | (Operation::Create { .. }, Reply::Created(_) | Reply::CreationFailed(_))
+            | (Operation::List { .. }, Reply::Listed { .. })
+            | (Operation::Remove { .. }, Reply::Removed(_) | Reply::RemovalFailed(_))
+            | (Operation::SetupIntents { .. }, Reply::SetupIntents { .. })
+            | (Operation::ReviewSetup { .. }, Reply::SetupReview(_)) => true,
+            (
+                Operation::ResumeSetup {
+                    skip: requested, ..
+                },
+                Reply::SetupPrepared { skip: actual, .. },
+            ) => requested == actual,
+            _ => false,
+        };
+        if matching {
+            Ok(reply)
+        } else {
+            Err(ControlError::UnexpectedResponse {
+                expected: "matching worktree operation result",
+                actual: "different worktree result",
+            })
+        }
+    });
+    result.map_err(|error| {
         // Only the dedicated pre-effect admission code proves no worktree
         // mutation started. A generic remote error may follow trust/run/copy
         // publication, even though its response arrived successfully.
@@ -402,12 +430,12 @@ fn finish_reply(
             }
             if let Some((provider, prompt, model, reasoning_effort)) = spawn {
                 if let Some(setup) = &created.setup {
-                    let terminal = setup.terminal.as_ref().ok_or_else(|| AppError { kind: "worktree_setup", message: format!("Worktree retained at {}; its reviewed setup has no accepted terminal, so no agent was started", created.path.display()), details: Some(data.clone()) })?;
+                    let terminal = setup.terminal.as_ref().ok_or_else(|| AppError { kind: "worktree_setup", message: format!("Worktree creation {} remains committed at {}; its reviewed setup has no accepted terminal, so no agent was started. Do not retry creation", created.operation_id, created.path.display()), details: Some(data.clone()) })?;
                     wait_for_setup(client, terminal).map_err(|error| AppError {
                         kind: "worktree_setup",
                         message: format!(
-                            "Worktree retained at {}; no agent was started: {error}",
-                            created.path.display()
+                            "Worktree creation {} remains committed at {}; no agent was started: {error}. Do not retry creation",
+                            created.operation_id, created.path.display()
                         ),
                         details: Some(data.clone()),
                     })?;
@@ -446,15 +474,19 @@ fn finish_reply(
                     .map_err(|error| AppError {
                         kind: "worktree_agent",
                         message: format!(
-                            "Worktree retained at {}; agent startup was not confirmed: {error}",
-                            created.path.display()
+                            "Worktree creation {} remains committed at {}; agent startup was not confirmed: {error}. Inspect existing agents before another submission; do not retry creation",
+                            created.operation_id, created.path.display()
                         ),
                         details: Some(data.clone()),
                     })?;
                 let AgentReply::Accepted(accepted) = accepted else {
                     return Err(AppError {
                         kind: "protocol",
-                        message: "Unexpected agent result; the worktree remains created".into(),
+                        message: format!(
+                            "Unexpected agent result; worktree creation {} remains committed at {}. Inspect existing agents; do not retry creation",
+                            created.operation_id,
+                            created.path.display()
+                        ),
                         details: Some(data),
                     });
                 };
@@ -769,17 +801,34 @@ mod tests {
     }
     #[test]
     fn lost_mutation_response_is_unknown_and_never_replayed_but_remote_refusal_stays_known() {
-        for response in [
-            None,
-            Some(ProtocolErrorCode::WorktreeNotStarted),
-            Some(ProtocolErrorCode::InvalidRequest),
+        for (response, wrong_reply) in [
+            (None, false),
+            (Some(ProtocolErrorCode::WorktreeNotStarted), false),
+            (Some(ProtocolErrorCode::InvalidRequest), false),
+            (None, true),
         ] {
             let (mut client, server) = connected_client(move |peer, proof| {
                 let received: ClientEnvelope = read_frame(peer).unwrap().unwrap();
                 assert!(
                     matches!(received.request, ClientRequest::Worktree { operation: Operation::Create { branch, .. }, .. } if branch == "topic")
                 );
-                if let Some(code) = response {
+                if wrong_reply {
+                    write_frame(
+                        peer,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(received.request_id),
+                            proof: proof.clone(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::Worktree(Reply::Listed {
+                                    worktrees: Vec::new(),
+                                }),
+                            },
+                        },
+                    )
+                    .unwrap();
+                    assert!(read_frame::<ClientEnvelope>(peer).unwrap().is_none());
+                } else if let Some(code) = response {
                     write_frame(
                         peer,
                         &ServerEnvelope {
@@ -858,6 +907,35 @@ mod tests {
         assert!(error.message.contains(&creation.to_string()));
         assert!(error.message.contains("committed") && error.message.contains("/fixture/topic"));
         assert_eq!(error.details.as_ref().unwrap()["state"], "created");
+        assert_eq!(error.details.as_ref().unwrap()["committed"], true);
+        let error = finish_reply(
+            &mut client,
+            repository.clone(),
+            Some((Provider::Claude, "fixture only".into(), None, None)),
+            Reply::Created(Created {
+                operation_id: creation,
+                path: path.clone(),
+                branch: Some("topic".into()),
+                worktree: None,
+                warnings: Vec::new(),
+                error: None,
+                setup: Some(crate::worktree_control::Setup {
+                    command: "fixture setup".into(),
+                    run_id: crate::model::OperationId::new(),
+                    terminal: None,
+                    attempted_terminal: None,
+                    error: None,
+                }),
+            }),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error.message.contains(&creation.to_string())
+                && error.message.contains("/fixture/topic")
+                && error.message.contains("no agent was started")
+                && error.message.contains("Do not retry creation")
+        );
         assert_eq!(error.details.as_ref().unwrap()["committed"], true);
         for branch_error in [None, Some("unmerged branch retained".to_owned())] {
             let outcome = finish_reply(
