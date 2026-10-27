@@ -25817,6 +25817,7 @@ mod tests {
 
     mod repository_clone_navigation {
         use super::*;
+        use crate::model::ProjectChannel;
 
         struct Fixture {
             _directory: tempfile::TempDir,
