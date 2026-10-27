@@ -119,47 +119,50 @@ fn glob_with_budget(pattern: &str, text: &str, budget: &mut usize) -> bool {
     // Recursion and later sections share this budget, so individually small
     // brace groups cannot multiply into unbounded worker CPU time.
     if !charge_glob(budget, pattern.len().saturating_mul(text.len().saturating_add(1))) { return false; }
-    let (pattern, text) = (pattern.as_bytes(), text.as_bytes());
+    // EditorConfig wildcards consume characters, not UTF-8 code units.
+    // Charge the byte-sized grid above before allocating; that remains an
+    // upper bound on the smaller character grid for non-ASCII paths.
+    let (pattern, text): (Vec<char>, Vec<char>) = (pattern.chars().collect(), text.chars().collect());
     let mut current = vec![false; text.len()+1]; current[0] = true;
     let mut index = 0;
     while index < pattern.len() {
-        let byte = pattern[index];
-        let double = byte == b'*' && pattern.get(index+1) == Some(&b'*');
+        let character = pattern[index];
+        let double = character == '*' && pattern.get(index+1) == Some(&'*');
         let mut next = vec![false; text.len()+1];
-        if byte == b'*' {
-            if double && pattern.get(index+2) == Some(&b'/') {
+        if character == '*' {
+            if double && pattern.get(index+2) == Some(&'/') {
                 let mut reachable = false;
                 for at in 0..=text.len() {
                     reachable |= current[at];
-                    next[at] = current[at] || (reachable && at > 0 && text[at-1] == b'/');
+                    next[at] = current[at] || (reachable && at > 0 && text[at-1] == '/');
                 }
                 index += 2;
             } else {
                 for at in 0..=text.len() {
-                    next[at] = current[at] || (at > 0 && next[at-1] && (double || text[at-1] != b'/'));
+                    next[at] = current[at] || (at > 0 && next[at-1] && (double || text[at-1] != '/'));
                 }
                 if double { index += 1; }
             }
-        } else if byte == b'[' && let Some(close) = pattern[index+1..].iter().position(|byte| *byte == b']').map(|at| index+1+at) {
+        } else if character == '[' && let Some(close) = pattern[index+1..].iter().position(|character| *character == ']').map(|at| index+1+at) {
             let class = &pattern[index+1..close];
-            let negated = class.first().is_some_and(|byte| matches!(byte, b'!' | b'^'));
+            let negated = class.first().is_some_and(|character| matches!(*character, '!' | '^'));
             let class = if negated { &class[1..] } else { class };
             for at in 0..text.len() {
                 let mut found = false;
                 let mut item = 0;
                 while item < class.len() {
-                    if class.get(item+1) == Some(&b'-') && item+2 < class.len() {
+                    if class.get(item+1) == Some(&'-') && item+2 < class.len() {
                         found |= (class[item]..=class[item+2]).contains(&text[at]); item += 3;
                     } else { found |= class[item] == text[at]; item += 1; }
                 }
-                next[at+1] = current[at] && text[at] != b'/' && (found != negated);
+                next[at+1] = current[at] && text[at] != '/' && (found != negated);
             }
             index = close;
-        } else if byte == b'\\' && index+1 < pattern.len() {
+        } else if character == '\\' && index+1 < pattern.len() {
             index += 1;
             for at in 0..text.len() { next[at+1] = current[at] && pattern[index] == text[at]; }
         } else {
-            for at in 0..text.len() { next[at+1] = current[at] && (byte == text[at] || (byte == b'?' && text[at] != b'/')); }
+            for at in 0..text.len() { next[at+1] = current[at] && (character == text[at] || (character == '?' && text[at] != '/')); }
         }
         current = next; index += 1;
     }
@@ -194,6 +197,31 @@ mod tests {
         for path in ["src/a.rs", "src/deep/b.rs"] { assert!(glob("src/**/[ab].{rs,py}", path)); }
         assert!(!glob("src/**/[!ab].rs", "src/a.rs"));
         assert!(glob("src/**/[!ab].rs", "src/c.rs"));
+    }
+
+    #[test]
+    fn editorconfig_single_character_globs_apply_to_unicode_file_names() {
+        let directory = tempfile::tempdir().unwrap();
+        for (pattern, cases) in [
+            ("?.rs", [("a.rs", 2), ("é.rs", 2), ("漢.rs", 2), ("éé.rs", 4)]),
+            ("[é漢].rs", [("é.rs", 2), ("漢.rs", 2), ("a.rs", 4), ("ç.rs", 4)]),
+            ("[!é].rs", [("a.rs", 2), ("漢.rs", 2), ("é.rs", 4), ("éé.rs", 4)]),
+        ] {
+            std::fs::write(
+                directory.path().join(".editorconfig"),
+                format!("root=true\n[*]\nindent_size=4\n[{pattern}]\nindent_size=2\n"),
+            )
+            .unwrap();
+            for (name, expected) in cases {
+                std::fs::write(directory.path().join(name), "source\n").unwrap();
+                let config = read(directory.path(), Path::new(name));
+                assert_eq!(
+                    Indentation::detect("source\n", 8, config).size,
+                    expected,
+                    "{pattern:?} must match characters in {name:?}"
+                );
+            }
+        }
     }
 
     #[test]
