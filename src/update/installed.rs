@@ -117,7 +117,7 @@ pub(super) fn perform(
                 "the installed application changed; review the new build before updating",
             ));
         }
-        staged.preview(policy)
+        observe_installed_source(&layout, root, &staged, policy)
     };
     if staged.identity.protocol == source_protocol {
         staged.verify_compatible_handshake(&cancellation)?;
@@ -217,6 +217,67 @@ pub(super) fn perform(
         .map_err(UpdateError::from);
     result?;
     reopened
+}
+
+/// A compatible protocol is not proof that the daemon already runs the
+/// selected executable. Replacing an older installed build still needs its
+/// exact impact, consent and ordinary checkpoint; never use the candidate's
+/// compatible-handshake fallback to turn a failed inspection into UI-only.
+fn observe_installed_source(
+    layout: &InstallLayout,
+    root: &Path,
+    staged: &candidate::Staged,
+    policy: impact::Policy,
+) -> Result<impact::Preview, UpdateError> {
+    let source = source::inspect_installed_identity()?;
+    let owner = installed_daemon_owner(layout)?;
+    let executable = owner
+        .as_ref()
+        .map(|owner| owner.version_root.join("bin/cagentsd"));
+    source.verify_owner(executable.as_deref())?;
+    let older_compatible = source.proof.is_some()
+        && source.protocol == staged.identity.protocol
+        && owner
+            .as_ref()
+            .is_some_and(|owner| owner.version_root != root);
+    if !older_compatible {
+        return staged.preview(policy);
+    }
+    let socket = crate::terminal_ipc::daemon_socket_path()?;
+    let mut client =
+        source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
+    if Some(client.proof()) != source.proof.as_ref() || client.protocol() != source.protocol {
+        return Err(invalid(
+            "The installed source changed before update inspection",
+        ));
+    }
+    let daemon = client.upgrade_impact(policy)?;
+    if Some(&daemon.capability.proof) != source.proof.as_ref() {
+        return Err(invalid(
+            "Update impact belongs to a different installed source",
+        ));
+    }
+    // Inspection may take longer than entry routing's short observation TTL.
+    // Reauthenticate a fresh observation instead of extending that old grant.
+    let after = source::inspect_installed_identity()?;
+    let after_owner = installed_daemon_owner(layout)?;
+    let after_executable = after_owner
+        .as_ref()
+        .map(|owner| owner.version_root.join("bin/cagentsd"));
+    after.verify_owner(after_executable.as_deref())?;
+    if after.protocol != source.protocol
+        || after.proof != source.proof
+        || after_executable != executable
+    {
+        return Err(invalid(
+            "The installed source changed while inspecting update impact",
+        ));
+    }
+    Ok(impact::Preview {
+        candidate: staged.identity.clone(),
+        replaces_daemon: true,
+        daemon: Some(daemon),
+    })
 }
 
 const WAITING_FOR_STARTUP: &str = "Restoring sessions is taking longer. Saved windows will reopen after terminal startup settles.";
