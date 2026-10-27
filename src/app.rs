@@ -744,11 +744,22 @@ fn notice_surface_details<'a>(
     severity: NoticeSeverity,
     text: impl Into<Cow<'a, str>> + 'a,
 ) -> Element<'a, Message> {
-    notice_detail_text(severity, text)
-        .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-            EllipsizeHeightLimit::Lines(NOTICE_DETAIL_LINES),
-        ))
-        .into()
+    // The renderer applies its line limit to each hard-newline paragraph.
+    // Bound the whole preview as well, retaining the original selectable text
+    // and leaving expanded diagnostics unchanged.
+    let preview_height = iced::advanced::text::LineHeight::default()
+        .to_absolute(iced::Pixels(design::TEXT_CAPTION))
+        .0
+        * NOTICE_DETAIL_LINES as f32;
+    widget::container(notice_detail_text(severity, text).ellipsize(
+        cosmic::iced::widget::text::Ellipsize::End(EllipsizeHeightLimit::Lines(
+            NOTICE_DETAIL_LINES,
+        )),
+    ))
+    .width(Length::Fill)
+    .max_height(preview_height)
+    .clip(true)
+    .into()
 }
 
 const NOTICE_DETAIL_LINES: usize = 4;

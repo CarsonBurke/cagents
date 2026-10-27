@@ -1769,6 +1769,242 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_notice_preview_bounds_all_paragraphs_and_expands_exact_copy_source() {
+        use iced::{
+            Event, Point, Size,
+            advanced::clipboard,
+            keyboard, mouse,
+            runtime::user_interface::{Cache, UserInterface},
+        };
+
+        fn height(nodes: &iced_accessibility::A11yTree, source: &str) -> f64 {
+            let mut matching = nodes.root().iter().chain(nodes.children()).filter(|node| {
+                node.node().label() == Some(source) || node.node().value() == Some(source)
+            });
+            let bounds = matching
+                .next()
+                .expect("exact original diagnostic remains the selectable text source")
+                .node()
+                .bounds()
+                .unwrap();
+            assert!(matching.next().is_none());
+            assert!(bounds.y1 > bounds.y0 && bounds.y1.is_finite());
+            bounds.y1 - bounds.y0
+        }
+
+        fn copy_source(
+            app: &Cagents,
+            renderer: &mut cosmic::Renderer,
+            cache: Cache,
+            width: f32,
+            source: &str,
+        ) -> Cache {
+            #[derive(Default)]
+            struct ClipboardText(String);
+            impl iced::advanced::Clipboard for ClipboardText {
+                fn read(&self, _: clipboard::Kind) -> Option<String> {
+                    Some(self.0.clone())
+                }
+                fn write(&mut self, _: clipboard::Kind, value: String) {
+                    self.0 = value;
+                }
+            }
+            let entry = app.ordered_chrome_notices()[0];
+            let mut ui = UserInterface::build(
+                app.chrome_notice_view(entry),
+                Size::new(width, 5000.0),
+                cache,
+                renderer,
+            );
+            let mut messages = Vec::new();
+            let mut clipboard = ClipboardText::default();
+            ui.update(
+                &[],
+                mouse::Cursor::Unavailable,
+                renderer,
+                &mut clipboard,
+                &mut messages,
+            );
+            ui.draw(
+                renderer,
+                &cosmic::theme::active(),
+                &iced::advanced::renderer::Style::default(),
+                mouse::Cursor::Unavailable,
+            );
+            let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+            let bounds = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|node| node.node().label() == Some(source))
+                .unwrap()
+                .node()
+                .bounds()
+                .unwrap();
+            let cursor = mouse::Cursor::Available(Point::new(
+                bounds.x0 as f32 + 2.0,
+                bounds.y0 as f32 + 2.0,
+            ));
+            let command = |character: &str, code| {
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(character.into()),
+                    modified_key: keyboard::Key::Character(character.into()),
+                    physical_key: keyboard::key::Physical::Code(code),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::CTRL,
+                    text: None,
+                    repeat: false,
+                })
+            };
+            ui.update(
+                &[
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                    command("a", keyboard::key::Code::KeyA),
+                    command("c", keyboard::key::Code::KeyC),
+                ],
+                cursor,
+                renderer,
+                &mut clipboard,
+                &mut messages,
+            );
+            assert!(messages.is_empty(), "copy never activates notice actions");
+            assert_eq!(
+                clipboard.0, source,
+                "copy retains exact bytes and line endings"
+            );
+            ui.into_cache()
+        }
+
+        let cap = f64::from(
+            iced::advanced::text::LineHeight::default()
+                .to_absolute(iced::Pixels(design::TEXT_CAPTION))
+                .0
+                * super::super::NOTICE_DETAIL_LINES as f32,
+        );
+        let many = (0..64)
+            .map(|i| format!("line{i} λ🦀"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cases = [
+            ("short reason", false),
+            ("one\ntwo\nthree", false),
+            ("one\ntwo\nthree\nfour\nfive\nSIXTH_TAIL λ🦀", true),
+            (
+                "one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nSIXTH_TAIL λ🦀",
+                true,
+            ),
+            ("one\rtwo\rthree\rfour\rfive\rSIXTH_TAIL λ🦀", true),
+            (many.as_str(), true),
+        ];
+        let mut renderer = super::super::tests::headless_renderer();
+        for (source, needs_expansion) in cases {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            app.notices.record(
+                TransientNotice::error("Save refused")
+                    .with_details(source)
+                    .with_key(NoticeKey::AccountLink),
+            );
+            drop(app.update_chrome(Action::ToggleNotices));
+            let id = app.notices.recent().next().unwrap().id;
+            let mut cache = Cache::default();
+            for width in [300.0, 900.0] {
+                let (next, messages, _, nodes) = notice_row_step(
+                    &app,
+                    &mut renderer,
+                    cache,
+                    mouse::Cursor::Unavailable,
+                    &[],
+                    width,
+                );
+                cache = next;
+                assert!(messages.is_empty());
+                let collapsed = height(&nodes, source);
+                assert!(
+                    collapsed <= cap + 0.5,
+                    "whole preview at {width}: {collapsed} > {cap}"
+                );
+                if !needs_expansion {
+                    assert!(
+                        collapsed < cap,
+                        "short diagnostics retain their natural height"
+                    );
+                }
+                cache = copy_source(&app, &mut renderer, cache, width, source);
+                drop(app.update_chrome(Action::ToggleNoticeDetails(id)));
+                let (next, messages, _, nodes) = notice_row_step(
+                    &app,
+                    &mut renderer,
+                    cache,
+                    mouse::Cursor::Unavailable,
+                    &[],
+                    width,
+                );
+                cache = next;
+                assert!(messages.is_empty());
+                if needs_expansion {
+                    assert!(
+                        height(&nodes, source) > collapsed + 1.0,
+                        "full tail gains real layout space"
+                    );
+                }
+                assert_eq!(
+                    app.notices
+                        .recent()
+                        .next()
+                        .unwrap()
+                        .notice
+                        .details
+                        .as_deref(),
+                    Some(source)
+                );
+                cache = copy_source(&app, &mut renderer, cache, width, source);
+                drop(app.update_chrome(Action::ToggleNoticeDetails(id)));
+                let (next, messages, _, nodes) = notice_row_step(
+                    &app,
+                    &mut renderer,
+                    cache,
+                    mouse::Cursor::Unavailable,
+                    &[],
+                    width,
+                );
+                cache = next;
+                assert!(messages.is_empty());
+                assert!((height(&nodes, source) - collapsed).abs() <= 0.5);
+            }
+        }
+
+        // Check actual tiny-skia drawing too: hidden hard-line glyphs must not
+        // spill below the capped text bounds even with a taller outer viewport.
+        use iced::advanced::renderer::Headless as _;
+        for width in [300_u32, 900_u32] {
+            let mut ui = UserInterface::build(
+                super::super::notice_surface_details(NoticeSeverity::Error, many.as_str()),
+                Size::new(width as f32, 160.0),
+                Cache::default(),
+                &mut renderer,
+            );
+            ui.draw(
+                &mut renderer,
+                &cosmic::theme::active(),
+                &iced::advanced::renderer::Style::default(),
+                mouse::Cursor::Unavailable,
+            );
+            let pixels = renderer.screenshot(Size::new(width, 160), 1.0, iced::Color::TRANSPARENT);
+            assert_eq!(pixels.len(), width as usize * 160 * 4);
+            let below = (cap.ceil() as usize + 1) * width as usize * 4;
+            assert!(
+                pixels[..below].chunks_exact(4).any(|pixel| pixel[3] != 0),
+                "actual visible preview pixels"
+            );
+            assert!(
+                pixels[below..].chunks_exact(4).all(|pixel| pixel[3] == 0),
+                "collapsed glyphs stay inside the whole-preview clip"
+            );
+        }
+    }
+
+    #[test]
     fn expanded_notice_diagnostics_borrow_a_bounded_utf8_prefix() {
         let details = format!(
             "{}{}PRIVATE_AFTER_LIMIT",
