@@ -4943,10 +4943,15 @@ mod tests {
             let error = before.save_error().map(str::to_owned);
             assert!(!before.is_dirty() && !before.is_saving());
             let sequence = app.workspace_model.sequence + 1;
-            drop(app.apply_workspace_model_update(ModelUpdate::Edited {
-                sequence,
-                edit: ModelEdit::DeleteChannel { id: channel },
-            }));
+            // Use the production App boundary: channel retirement publishes
+            // its warning through status, which the update postlude records in
+            // notice history. Calling only the reducer bypasses that handoff.
+            drop(
+                app.update(Message::WorkspaceModelObserved(ModelUpdate::Edited {
+                    sequence,
+                    edit: ModelEdit::DeleteChannel { id: channel },
+                })),
+            );
             assert!(app.channel_ui.was_deleted(channel));
             assert!(
                 !app.durable
@@ -4972,7 +4977,11 @@ mod tests {
                 .views
                 .retain(|view| view.scope != Scope::Channel(channel));
             for _ in 0..2 {
-                drop(app.apply_workspace_model_update(ModelUpdate::Read(canonical.clone())));
+                drop(
+                    app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+                        canonical.clone(),
+                    ))),
+                );
                 let Some(CardRuntime::Repository(current)) = app.cards.get(&pane.id) else {
                     panic!(
                         "{state}: peer deletion must retain recovery through fallback projection"
