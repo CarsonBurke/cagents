@@ -296,7 +296,9 @@ pub(crate) struct HostState {
     /// Seals the messages the courier delivers and recognizes them in
     /// transcripts. Absent without the registry that keeps its key.
     pub(super) mailbox_seal: Option<Arc<crate::agent_execution::mailbox::Seal>>,
-    pub(super) execution_gates: BTreeMap<crate::model::AgentId, Arc<Mutex<()>>>,
+    /// Operations own their gates, including while waiting to acquire them.
+    /// Weak entries let later lookups reclaim gates after every caller leaves.
+    pub(super) execution_gates: BTreeMap<crate::model::AgentId, Weak<Mutex<()>>>,
     pub(super) execution_startups: BTreeMap<
         crate::model::AgentId,
         (

@@ -4188,3 +4188,111 @@ fn unavailable_retained_startup_snapshot_preserves_owner_and_returns_interrupted
     assert!(handle.owns_work());
     assert!(!handle.is_completed());
 }
+
+#[test]
+fn execution_gates_reclaim_failed_and_repeated_close_churn() {
+    if isolated("execution_gates_reclaim_failed_and_repeated_close_churn").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    // Accept without dispatch: closing this agent exercises durable retirement
+    // without starting a provider, and subsequent closes use the repair path.
+    let accepted = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .submit_agent(&Origin::User, &request, now())
+        .unwrap();
+    assert!(
+        close(&host, &Authority::default(), accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    for _ in 0..256 {
+        assert!(close(&host, &Authority::default(), AgentId::new()).is_err());
+        assert!(
+            close(&host, &Authority::default(), accepted.agent.id)
+                .unwrap()
+                .closed
+        );
+        assert!(host.lock().unwrap().execution_gates.len() <= 1);
+    }
+    assert!(
+        host.lock()
+            .unwrap()
+            .execution_gates
+            .values()
+            .all(|gate| gate.upgrade().is_none())
+    );
+    assert!(!path.parent().unwrap().join("spawns").exists());
+}
+
+#[test]
+fn execution_gates_preserve_waiters_during_reclamation() {
+    if isolated("execution_gates_preserve_waiters_during_reclamation").is_some() {
+        return;
+    }
+    let (host, _, _) = fixture();
+    let agent = AgentId::new();
+    let holder = agent_gate(&host, agent);
+    let held = holder.lock().unwrap();
+    let (ready, waiting) = std::sync::mpsc::channel();
+    let (finish, finished) = std::sync::mpsc::channel();
+    let other = host.clone();
+    let thread = std::thread::spawn(move || {
+        let gate = agent_gate(&other, agent);
+        ready.send(Arc::downgrade(&gate)).unwrap();
+        let _held = gate.lock().unwrap();
+        finished.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
+    let waiter = waiting.recv_timeout(Duration::from_secs(10)).unwrap();
+    for _ in 0..256 {
+        drop(agent_gate(&host, AgentId::new()));
+        let current = agent_gate(&host, agent);
+        assert!(Arc::ptr_eq(&holder, &current));
+        assert!(current.try_lock().is_err());
+        assert!(host.lock().unwrap().execution_gates.len() <= 2);
+    }
+    drop(held);
+    drop(holder);
+    // Only the waiter now owns the gate. A fresh lookup must still join it.
+    let current = agent_gate(&host, agent);
+    assert!(Arc::ptr_eq(&waiter.upgrade().unwrap(), &current));
+    finish.send(()).unwrap();
+    thread.join().unwrap();
+    drop(current);
+    assert!(waiter.upgrade().is_none());
+    drop(agent_gate(&host, AgentId::new()));
+    assert!(!host.lock().unwrap().execution_gates.contains_key(&agent));
+}
+
+#[test]
+fn execution_gates_keep_existing_callers_after_successful_close() {
+    if isolated("execution_gates_keep_existing_callers_after_successful_close").is_some() {
+        return;
+    }
+    let (host, request, _) = fixture();
+    let accepted = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .submit_agent(&Origin::User, &request, now())
+        .unwrap();
+    let pending = agent_gate(&host, accepted.agent.id);
+    assert!(
+        close(&host, &Authority::default(), accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    let next = agent_gate(&host, accepted.agent.id);
+    assert!(Arc::ptr_eq(&pending, &next));
+    let held = pending.lock().unwrap();
+    assert!(next.try_lock().is_err());
+    drop(held);
+    assert!(
+        close(&host, &Authority::default(), accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    assert!(Arc::ptr_eq(&pending, &agent_gate(&host, accepted.agent.id)));
+}
