@@ -22,6 +22,7 @@ use std::{
 pub(crate) enum Client {
     Current { client: ControlClient, peer: Peer },
     V77(v77::Client),
+    V119(v77::Client),
 }
 
 pub(crate) struct Peer {
@@ -204,6 +205,9 @@ impl Client {
             77 => v77::Client::connect(socket, deadline)
                 .map(Self::V77)
                 .map_err(|error| ControlError::Configure(io::Error::other(error.to_string()))),
+            119 => v77::Client::connect_at_protocol(socket, deadline, 119)
+                .map(Self::V119)
+                .map_err(|error| ControlError::Configure(io::Error::other(error.to_string()))),
             actual => Err(ControlError::UnsupportedVersion { actual }),
         }
     }
@@ -212,13 +216,14 @@ impl Client {
         match self {
             Self::Current { .. } => crate::terminal_ipc::PROTOCOL_VERSION,
             Self::V77(_) => 77,
+            Self::V119(_) => 119,
         }
     }
 
     pub(crate) fn proof(&self) -> &HostSessionProof {
         match self {
             Self::Current { client, .. } => client.proof(),
-            Self::V77(client) => client.proof(),
+            Self::V77(client) | Self::V119(client) => client.proof(),
         }
     }
 
@@ -234,7 +239,7 @@ impl Client {
                     .upgrade_impact_with_deadline(policy, deadline)
                     .map_err(|error| invalid(error.to_string()))
             }
-            Self::V77(client) => client.upgrade_impact(policy),
+            Self::V77(client) | Self::V119(client) => client.upgrade_impact(policy),
         }
     }
 
@@ -255,7 +260,9 @@ impl Client {
                     .prepare_confirmed_upgrade(impact, relaunch_agents)
                     .map_err(|error| invalid(error.to_string()))
             }
-            Self::V77(client) => client.prepare_confirmed_upgrade(impact, relaunch_agents),
+            Self::V77(client) | Self::V119(client) => {
+                client.prepare_confirmed_upgrade(impact, relaunch_agents)
+            }
         }
     }
 }
@@ -319,7 +326,7 @@ pub(super) fn inspect_installed_identity() -> Result<InstalledIdentity, UpdateEr
     let deadline = Instant::now() + Duration::from_secs(5);
     match v77::discover_installed_protocol(&socket, deadline) {
         Ok((protocol, peer)) => {
-            if matches!(protocol, 77 | crate::terminal_ipc::PROTOCOL_VERSION) {
+            if matches!(protocol, 77 | 119 | crate::terminal_ipc::PROTOCOL_VERSION) {
                 let client = Client::connect_selected(&socket, deadline, protocol)
                     .map_err(|error| invalid(error.to_string()))?;
                 peer.verify(client.proof())?;

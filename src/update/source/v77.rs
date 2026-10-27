@@ -1,4 +1,4 @@
-//! Frozen protocol77 update subset. This module deliberately does not decode
+//! Frozen protocol77/119 update subset. This module deliberately does not decode
 //! current ServerEnvelope/Request layouts or permit ordinary session controls.
 use super::{Peer, UpdateError, impact, invalid};
 use crate::model::{BootId, HostIncarnation, HostSessionId, HostSessionProof};
@@ -64,7 +64,7 @@ fn discovery_error(error: UpdateError) -> crate::control::ControlError {
 fn discovered_version(bytes: &[u8]) -> Result<u16, UpdateError> {
     let (version, _) = postcard::take_from_bytes::<u16>(bytes)
         .map_err(|_| invalid("Malformed source version header"))?;
-    if !matches!(version, 77 | crate::terminal_ipc::PROTOCOL_VERSION) {
+    if !matches!(version, 77 | 119 | crate::terminal_ipc::PROTOCOL_VERSION) {
         return Err(invalid(
             "Source protocol has no qualified upgrade coordinator",
         ));
@@ -251,9 +251,23 @@ pub(crate) struct Client {
     peer: Peer,
     proof: HostSessionProof,
     next: u64,
+    protocol: u16,
 }
 impl Client {
     pub(super) fn connect(socket: &Path, deadline: Instant) -> Result<Self, UpdateError> {
+        Self::connect_at_protocol(socket, deadline, 77)
+    }
+
+    // Protocol119 changed neither this frozen request subset nor its DTOs.
+    // No ordinary requests, spawn budgets or notification DTOs are admitted.
+    pub(super) fn connect_at_protocol(
+        socket: &Path,
+        deadline: Instant,
+        protocol: u16,
+    ) -> Result<Self, UpdateError> {
+        if !matches!(protocol, 77 | 119) {
+            return Err(invalid("Unsupported source update protocol"));
+        }
         let mut stream = crate::control::connect_control_socket(
             socket,
             deadline.saturating_duration_since(Instant::now()),
@@ -264,7 +278,7 @@ impl Client {
         // Postcard structs/tuples concatenate fields; enum tags are u32 varints.
         // Connect0 has exactly expected_host and an empty resume cursor vector.
         let bytes = postcard::to_stdvec(&(
-            77u16,
+            protocol,
             1u64,
             None::<Proof>,
             0u32,
@@ -274,7 +288,7 @@ impl Client {
         .map_err(|_| invalid("Cannot encode the protocol77 source handshake"))?;
         write(&mut stream, &bytes, deadline)?;
         let bytes = read(&mut stream, deadline)?;
-        let (header, body) = header(&bytes, 1, None)?;
+        let (header, body) = header_at_protocol(&bytes, 1, None, protocol)?;
         if header.response != 0 {
             return Err(invalid(
                 "The source did not complete its protocol77 upgrade handshake",
@@ -300,6 +314,7 @@ impl Client {
             peer,
             proof,
             next: 2,
+            protocol,
         })
     }
 
@@ -320,8 +335,14 @@ impl Client {
         self.next = id
             .checked_add(1)
             .ok_or_else(|| invalid("Source request identity exhausted"))?;
-        let bytes = postcard::to_stdvec(&(77u16, id, Some(Proof::from(&self.proof)), tag, fields))
-            .map_err(|_| invalid("Cannot encode the protocol77 source upgrade request"))?;
+        let bytes = postcard::to_stdvec(&(
+            self.protocol,
+            id,
+            Some(Proof::from(&self.proof)),
+            tag,
+            fields,
+        ))
+        .map_err(|_| invalid("Cannot encode the protocol77 source upgrade request"))?;
         write(&mut self.stream, &bytes, deadline)?;
         // Never repeat a partially written or unacknowledged preparation.
         let bytes = read(&mut self.stream, deadline).map_err(|error| {
@@ -331,7 +352,7 @@ impl Client {
                 invalid("The source upgrade response was not confirmed. Its checkpoint and ownership require inspection; the request was not retried")
             }
         })?;
-        let (header, body) = header(&bytes, id, Some(&self.proof))?;
+        let (header, body) = header_at_protocol(&bytes, id, Some(&self.proof), self.protocol)?;
         if header.response != response {
             return Err(invalid(
                 "The protocol77 source returned an unexpected upgrade response",
@@ -381,14 +402,15 @@ impl Client {
     }
 }
 
-fn header<'a>(
+fn header_at_protocol<'a>(
     bytes: &'a [u8],
     id: u64,
     proof: Option<&HostSessionProof>,
+    protocol: u16,
 ) -> Result<(ReplyHeader, &'a [u8]), UpdateError> {
     let (header, body) = postcard::take_from_bytes::<ReplyHeader>(bytes)
         .map_err(|_| invalid("Malformed protocol77 source upgrade response"))?;
-    if header.version != 77 || header.request_id != Some(id) || header.message != 0 {
+    if header.version != protocol || header.request_id != Some(id) || header.message != 0 {
         return Err(invalid(
             "The source upgrade response changed its protocol or request identity",
         ));
@@ -400,6 +422,15 @@ fn header<'a>(
         ));
     }
     Ok((header, body))
+}
+
+#[cfg(test)]
+fn header<'a>(
+    bytes: &'a [u8],
+    id: u64,
+    proof: Option<&HostSessionProof>,
+) -> Result<(ReplyHeader, &'a [u8]), UpdateError> {
+    header_at_protocol(bytes, id, proof, 77)
 }
 
 struct DeadlineStream<'a> {
@@ -505,7 +536,7 @@ mod tests {
     fn source_version_header_precedes_old_error_dto_and_rejects_unknown_versions() {
         // A version-mismatch reply from the immutable source may contain an
         // error variant/layout the new normal client cannot decode at all.
-        for version in [77u16, crate::terminal_ipc::PROTOCOL_VERSION] {
+        for version in [77u16, 119, crate::terminal_ipc::PROTOCOL_VERSION] {
             let mut bytes = postcard::to_stdvec(&version).unwrap();
             bytes.extend_from_slice(&[255, 255, 255, 255, 255]);
             assert_eq!(discovered_version(&bytes).unwrap(), version);
@@ -523,13 +554,15 @@ mod tests {
     #[cfg(feature = "host")]
     #[test]
     fn authenticated_legacy_preview_keeps_consent_and_preparation_separate() {
-        for (ready, fail_preview) in [(false, false), (true, false), (false, true)] {
-            authenticated_legacy_preview(ready, fail_preview);
+        for protocol in [77, 119] {
+            for (ready, fail_preview) in [(false, false), (true, false), (false, true)] {
+                authenticated_legacy_preview(protocol, ready, fail_preview);
+            }
         }
     }
 
     #[cfg(feature = "host")]
-    fn authenticated_legacy_preview(ready: bool, fail_preview: bool) {
+    fn authenticated_legacy_preview(protocol: u16, ready: bool, fail_preview: bool) {
         use std::os::unix::net::UnixListener;
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("cagentsd.sock");
@@ -564,7 +597,7 @@ mod tests {
             );
             // Header only is sufficient for discovery; a deliberately foreign
             // error body must never be decoded as a current error DTO.
-            let mut old_error = postcard::to_stdvec(&77u16).unwrap();
+            let mut old_error = postcard::to_stdvec(&protocol).unwrap();
             old_error.extend_from_slice(&[255, 255, 255]);
             write(
                 &mut discovery,
@@ -577,10 +610,10 @@ mod tests {
             let bytes = read(&mut stream, Instant::now() + Duration::from_secs(2)).unwrap();
             let connect: (u16, u64, Option<Proof>, u32, Option<Proof>, Vec<()>) =
                 postcard::from_bytes(&bytes).unwrap();
-            assert_eq!((connect.0, connect.1, connect.3), (77, 1, 0));
+            assert_eq!((connect.0, connect.1, connect.3), (protocol, 1, 0));
             assert!(connect.2.is_none() && connect.4.is_none() && connect.5.is_empty());
             let connected = postcard::to_stdvec(&(
-                77u16,
+                protocol,
                 Some(1u64),
                 Proof::from(&pinned),
                 0u32,
@@ -598,14 +631,14 @@ mod tests {
             let bytes = read(&mut stream, Instant::now() + Duration::from_secs(2)).unwrap();
             let request: (u16, u64, Option<Proof>, u32, Policy) =
                 postcard::from_bytes(&bytes).unwrap();
-            assert_eq!((request.0, request.1, request.3), (77, 2, 36));
+            assert_eq!((request.0, request.1, request.3), (protocol, 2, 36));
             assert_eq!(HostSessionProof::from(request.2.unwrap()), pinned);
             assert!(matches!(request.4, Policy::WhenIdle));
             if fail_preview {
                 return;
             }
             let response = postcard::to_stdvec(&(
-                77u16,
+                protocol,
                 Some(2u64),
                 Proof::from(&pinned),
                 0u32,
@@ -623,7 +656,7 @@ mod tests {
                 let bytes = read(&mut stream, Instant::now() + Duration::from_secs(2)).unwrap();
                 let request: (u16, u64, Option<Proof>, u32, Impact, bool) =
                     postcard::from_bytes(&bytes).unwrap();
-                assert_eq!((request.0, request.1, request.3), (77, 3, 37));
+                assert_eq!((request.0, request.1, request.3), (protocol, 3, 37));
                 assert_eq!(HostSessionProof::from(request.2.unwrap()), pinned);
                 assert_eq!(impact::DaemonImpact::from(request.4), reviewed);
                 assert!(
@@ -631,7 +664,7 @@ mod tests {
                     "the coordinator never requests an unsolicited relaunch"
                 );
                 let receipt = postcard::to_stdvec(&(
-                    77u16,
+                    protocol,
                     Some(3u64),
                     Proof::from(&pinned),
                     0u32,
@@ -658,7 +691,7 @@ mod tests {
             );
         });
         let mut client = super::super::Client::connect(&socket).unwrap();
-        assert_eq!(client.protocol(), 77);
+        assert_eq!(client.protocol(), protocol);
         assert_eq!(client.proof(), &expected_proof);
         // Exercise the same production entry decision used by apply_installed,
         // including its formerly earlier already-running branch, using the

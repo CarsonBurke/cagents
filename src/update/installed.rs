@@ -77,7 +77,7 @@ pub(super) fn perform(
     // Retain the existing exact installation boundary even for a legacy peer.
     let _source_owner = installed_daemon_owner(&layout)?;
     let legacy_source = source_proof.is_some()
-        && source_protocol == 77
+        && matches!(source_protocol, 77 | 119)
         && crate::terminal_ipc::PROTOCOL_VERSION > 77;
     if served_version_root(&layout)? != root || (root == layout.version_root && !legacy_source) {
         return Err(invalid(
@@ -119,6 +119,7 @@ pub(super) fn perform(
     if staged.identity.protocol == source_protocol {
         staged.verify_compatible_handshake(&cancellation)?;
     }
+    reconcile_saved_sources(staged.identity.protocol)?;
     let confirmed = confirmation::wait(state, job, observe)?;
     set_phase(
         state,

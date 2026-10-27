@@ -484,7 +484,7 @@ fn installed_update_worker(
         return Err(invalid("the installed application is already running"));
     }
     let legacy_source = source_proof.is_some()
-        && source_protocol == 77
+        && matches!(source_protocol, 77 | 119)
         && crate::terminal_ipc::PROTOCOL_VERSION > 77;
     let worker = installation_worker_version(window, served, daemon, legacy_source);
     if !legacy_source && served == window.prefix.join("versions").join(&worker) {
@@ -1046,6 +1046,7 @@ fn perform_update(
     if staged.identity.protocol == source_protocol {
         staged.verify_compatible_handshake(&cancellation)?;
     }
+    reconcile_saved_sources(staged.identity.protocol)?;
     let confirmed = confirmation::wait(state, job, |policy| {
         Installation::detect()?;
         observe_impact(&staged.identity, policy)
@@ -1124,6 +1125,38 @@ pub(crate) fn inspect_source_panes(
     proof: Option<crate::model::HostSessionProof>,
     require_resumable: bool,
 ) -> Result<(), UpdateError> {
+    inspect_source_panes_mode(guard, proof, require_resumable, false)
+}
+
+// Recover only already-owned providers before publishing the inventory the
+// user will consent to. Never expand consent after windows have prepared.
+fn reconcile_saved_sources(destination_protocol: u16) -> Result<(), UpdateError> {
+    let guard = crate::instance::UiUpdateGuard::acquire()?;
+    let (protocol, proof) = source::inspect_identity(None)?;
+    let mut problems = Vec::new();
+    if let Err(error) =
+        crate::install_guard::preflight_editor_companions(Some(destination_protocol))
+    {
+        problems.push(error.to_string());
+    }
+    if let Err(error) =
+        inspect_source_panes_mode(&guard, proof, protocol != destination_protocol, true)
+    {
+        problems.push(error.to_string());
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(invalid(problems.join("\n")))
+    }
+}
+
+fn inspect_source_panes_mode(
+    guard: &crate::instance::UiUpdateGuard,
+    proof: Option<crate::model::HostSessionProof>,
+    require_resumable: bool,
+    reconcile_retained: bool,
+) -> Result<(), UpdateError> {
     let (protocol, proof) = source::inspect_identity(proof.as_ref())?;
     let helper = crate::companion::Product::Daemon.beside(&std::env::current_exe()?)?;
     let before = fs::symlink_metadata(&helper)?;
@@ -1139,6 +1172,7 @@ pub(crate) fn inspect_source_panes(
         protocol,
         proof,
         require_resumable,
+        reconcile_retained,
     };
     let mut command = Command::new(&helper);
     crate::install_guard::sanitize_child_environment(&mut command);

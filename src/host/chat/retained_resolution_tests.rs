@@ -213,7 +213,7 @@ impl Fixture {
             .clone()
     }
 
-    fn rotate_host(&mut self) {
+    fn rotate_host_without_discovery(&mut self) {
         let mut proof = self.host.lock().unwrap().proof().clone();
         proof.host_incarnation = "successor".into();
         let mut state = HostState::new(proof.clone());
@@ -235,12 +235,16 @@ impl Fixture {
         .unwrap();
         self.host.lock().unwrap().notifications = Some(broker.handle());
         self.broker = Some(broker);
-        restore_orphaned_native(&self.host, &[]).unwrap();
-        assert_eq!(self.handle().actor_identity(), Some(self.identity.clone()));
         assert_ne!(self.original.proof.as_ref(), Some(&proof));
         for client in [11, 12] {
             self.host.lock().unwrap().register_client(client);
         }
+    }
+
+    fn rotate_host(&mut self) {
+        self.rotate_host_without_discovery();
+        restore_orphaned_native(&self.host, &[]).unwrap();
+        assert_eq!(self.handle().actor_identity(), Some(self.identity.clone()));
     }
 
     fn resolve(&self, client: ClientId, source: &Session) -> Result<Session, ProtocolError> {
@@ -367,6 +371,56 @@ impl Drop for Fixture {
             }
         }
     }
+}
+
+#[test]
+fn real_helper_resolution_adopts_an_unregistered_retained_owner_without_launching() {
+    let Some(root) = isolated() else { return };
+    let mut fixture = Fixture::new(root);
+    fixture.rotate_host_without_discovery();
+    assert!(fixture.host.lock().unwrap().chats.is_empty());
+    let mut changed = fixture.original.clone();
+    changed
+        .launch
+        .recipe
+        .arguments
+        .push("--different-account-or-options".into());
+    assert!(fixture.resolve(11, &changed).is_err());
+    assert!(fixture.host.lock().unwrap().chats.is_empty());
+    assert!(fixture.spent(11));
+    assert!(fixture.identity.record.root.is_current());
+    assert!(fixture.identity.record.holder.is_current());
+    let resolved = fixture.resolve(11, &fixture.original).unwrap();
+    assert_eq!(
+        fixture.handle().actor_identity(),
+        Some(fixture.identity.clone())
+    );
+    assert_eq!(resolved.id, fixture.original.id);
+    assert_eq!(resolved.launch.recipe, fixture.original.launch.recipe);
+    assert_ne!(resolved.proof, fixture.original.proof);
+    {
+        let state = fixture.host.lock().unwrap();
+        let record = &state.chats[&fixture.original.id];
+        assert!(
+            record.subscribers.is_empty(),
+            "Resolve authenticates but must not subscribe before Attach"
+        );
+        assert!(record.observations.is_empty());
+    }
+    let response = fixture.attach(11, &resolved).unwrap();
+    let ServerResponse::ChatAttached { session, snapshot } = response else {
+        panic!("expected actual hydrated attachment")
+    };
+    assert_eq!(session, resolved);
+    assert!(snapshot.ready);
+    assert_eq!(snapshot.session_id, session.launch.session_id);
+    assert!(
+        fixture.attach(11, &resolved).is_err(),
+        "resolution grant is single-use"
+    );
+    fixture.no_prompt();
+    assert!(fixture.identity.record.root.is_current());
+    assert!(fixture.identity.record.holder.is_current());
 }
 
 #[test]
