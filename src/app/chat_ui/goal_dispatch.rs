@@ -487,6 +487,9 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
+        if !runtime.goal_open {
+            return Task::none();
+        }
         if let Err(error) = control.intent.operation.validate() {
             runtime.error = Some(error.to_string());
             return Task::none();
@@ -1280,6 +1283,7 @@ mod tests {
         }
         let (mut app, card, target) = live();
         write(&mut app, target, "keep the unsent draft");
+        drop(app.handle_chat_ui(Action::GoalPanel(target, true)));
         let old = control(runtime(&app, card), Operation::Get);
         let mut newer = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
         newer.goal.as_mut().unwrap().revision += 1;
@@ -1351,7 +1355,8 @@ mod tests {
         ui.operate(&renderer, &mut focused);
         assert_eq!(focused.0, Some(search_id));
 
-        // A current callback still opens its panel and submits the native read.
+        // A fresh control from the explicitly reopened panel submits its read.
+        drop(app.handle_chat_ui(Action::GoalPanel(target, true)));
         let fresh = control(runtime(&app, card), Operation::Get);
         let accepted = app.handle_chat_ui(Action::GoalIntent(target, fresh));
         assert!(accepted.units() > 0);
@@ -1370,9 +1375,223 @@ mod tests {
     }
 
     #[test]
+    fn retained_goal_control_cannot_dismiss_a_same_revision_model_picker() {
+        use iced::advanced::widget::{Operation as WidgetOperation, operation};
+        use iced::futures::StreamExt;
+
+        struct Focused(Option<widget::Id>);
+        impl WidgetOperation for Focused {
+            fn traverse(&mut self, children: &mut dyn FnMut(&mut dyn WidgetOperation)) {
+                children(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if state.is_focused() {
+                    self.0 = id.cloned();
+                }
+            }
+        }
+        let (mut app, card, target) = live();
+        write(&mut app, target, "keep selected draft and attachment");
+        attachment_draft::move_to(
+            &mut app.chat_runtime_mut(target).unwrap().composer,
+            text_editor::Cursor {
+                position: text_editor::Position { line: 0, column: 4 },
+                selection: Some(text_editor::Position { line: 0, column: 0 }),
+            },
+        );
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .attachments
+            .push(Attachment::file("retained-picker-file.txt"));
+        drop(app.handle_chat_ui(Action::GoalPanel(target, true)));
+        let held = control(runtime(&app, card), Operation::Get);
+        let revision = held.intent.observation_revision;
+        let original = runtime(&app, card).handle().unwrap().clone();
+
+        let open = app.handle_chat_ui(Action::ModelPicker(target, true));
+        drop(app.handle_chat_ui(Action::ModelQuery(target, "newer picker query".into())));
+        app.chat_runtime_mut(target).unwrap().error = Some("newer picker feedback".into());
+        let before = {
+            let rt = runtime(&app, card);
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision,
+                rt.error.clone(),
+                rt.session.clone(),
+                rt.target,
+                rt.picker_keyboard,
+                rt.picker_focus,
+            )
+        };
+        let search_id = card_control_id(card, "chat-model-search");
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let search = widget::text_input("Model", "newer picker query")
+            .id(search_id.clone())
+            .on_input(move |query| Message::ChatUi(Action::ModelQuery(target, query)));
+        let mut ui = iced::runtime::UserInterface::build(
+            search,
+            iced::Size::new(360.0, 120.0),
+            iced::runtime::user_interface::Cache::new(),
+            &mut renderer,
+        );
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let mut stream = iced::runtime::task::into_stream(open).unwrap();
+            while let Some(action) = stream.next().await {
+                match action {
+                    iced::runtime::Action::Widget(mut operation) => {
+                        ui.operate(&renderer, operation.as_mut());
+                    }
+                    _ => panic!("opening the model picker must only focus its search field"),
+                }
+            }
+        });
+        let mut focused = Focused(None);
+        ui.operate(&renderer, &mut focused);
+        assert_eq!(focused.0, Some(search_id.clone()));
+        assert_eq!(
+            runtime(&app, card)
+                .handle()
+                .unwrap()
+                .snapshot()
+                .goal
+                .as_ref()
+                .unwrap()
+                .revision,
+            revision,
+            "the newer picker does not change the native Goal observation"
+        );
+        assert!(!runtime(&app, card).goal_open);
+
+        let rejected = app.handle_chat_ui(Action::GoalIntent(target, held));
+        assert_eq!(
+            rejected.units(),
+            0,
+            "a retained same-revision Goal control must preserve the newer model picker"
+        );
+        let rt = runtime(&app, card);
+        assert_eq!(rt.model_picker.as_deref(), Some("newer picker query"));
+        assert!(!rt.goal_open);
+        assert!(rt.goal_pending.is_none() && rt.pending.is_none());
+        assert!(Arc::ptr_eq(rt.handle().unwrap(), &original));
+        assert_eq!(
+            rt.handle()
+                .unwrap()
+                .snapshot()
+                .goal
+                .as_ref()
+                .unwrap()
+                .revision,
+            revision
+        );
+        assert_eq!(
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision,
+                rt.error.clone(),
+                rt.session.clone(),
+                rt.target,
+                rt.picker_keyboard,
+                rt.picker_focus
+            ),
+            before
+        );
+        let mut focused = Focused(None);
+        ui.operate(&renderer, &mut focused);
+        assert_eq!(focused.0, Some(search_id));
+    }
+
+    #[test]
+    fn retained_goal_control_cannot_reopen_a_publicly_closed_panel() {
+        let (mut app, card, target) = live();
+        write(&mut app, target, "keep the closed panel draft");
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .attachments
+            .push(Attachment::file("retained-closed-file.txt"));
+        drop(app.handle_chat_ui(Action::GoalPanel(target, true)));
+        let held = control(runtime(&app, card), Operation::Get);
+        let revision = held.intent.observation_revision;
+        drop(app.handle_chat_ui(Action::GoalPanel(target, false)));
+        app.chat_runtime_mut(target).unwrap().error = Some("keep current feedback".into());
+        let before = {
+            let rt = runtime(&app, card);
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision,
+                rt.error.clone(),
+                rt.focus_control(),
+            )
+        };
+        assert!(!runtime(&app, card).goal_open);
+        assert_eq!(
+            runtime(&app, card)
+                .handle()
+                .unwrap()
+                .snapshot()
+                .goal
+                .as_ref()
+                .unwrap()
+                .revision,
+            revision,
+            "closing the panel does not change the native Goal observation"
+        );
+        let rejected = app.handle_chat_ui(Action::GoalIntent(target, held));
+        assert_eq!(
+            rejected.units(),
+            0,
+            "a retained same-revision Goal control must not reopen a closed panel"
+        );
+        let rt = runtime(&app, card);
+        assert!(!rt.goal_open && rt.model_picker.is_none());
+        assert!(rt.goal_pending.is_none() && rt.pending.is_none());
+        assert_eq!(
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision,
+                rt.error.clone(),
+                rt.focus_control()
+            ),
+            before
+        );
+
+        // The public reopen creates a genuinely current button presentation.
+        drop(app.handle_chat_ui(Action::GoalPanel(target, true)));
+        let fresh = control(runtime(&app, card), Operation::Get);
+        let accepted = app.handle_chat_ui(Action::GoalIntent(target, fresh));
+        assert!(accepted.units() > 0);
+        drop(accepted);
+        assert!(runtime(&app, card).goal_pending.is_some());
+        assert!(runtime(&app, card).pending.is_some());
+        acknowledge(&mut app, card, Ok(()));
+        finish_native(&mut app, card, revision, Outcome::Confirmed);
+        assert!(runtime(&app, card).goal_pending.is_none());
+        assert!(runtime(&app, card).pending.is_none());
+        assert_eq!(runtime(&app, card).composer.text(), before.0);
+        assert_eq!(runtime(&app, card).composer.cursor(), before.1);
+        assert_eq!(runtime(&app, card).attachments, before.2);
+    }
+
+    #[test]
     fn goal_callbacks_cannot_retarget_actor_thread_observation_or_selected_child() {
         let (mut app, card, target) = live();
         write(&mut app, target, "unrelated draft and caret");
+        drop(app.handle_chat_ui(Action::GoalPanel(target, true)));
         let old = control(runtime(&app, card), Operation::Get);
         let held_original = runtime(&app, card).handle().unwrap().clone();
         let replacement = Arc::new(ClientHandle::fixture(
@@ -1402,6 +1621,7 @@ mod tests {
         app.chat_runtime_mut(target).unwrap().selected_subagent = None;
         write(&mut app, target, "unrelated draft and caret");
         let before = runtime(&app, card).composer.cursor();
+        drop(app.handle_chat_ui(Action::GoalPanel(target, true)));
         let fresh = control(runtime(&app, card), Operation::Get);
         drop(app.handle_chat_ui(Action::GoalIntent(target, fresh)));
         acknowledge(&mut app, card, Ok(()));
@@ -1442,6 +1662,7 @@ mod tests {
                 .contains("not ready for goal work")
         );
         for operation in [Operation::Get, Operation::Pause, Operation::Clear] {
+            drop(app.handle_chat_ui(Action::GoalPanel(target, true)));
             let requested = control(runtime(&app, card), operation);
             let revision = requested.intent.observation_revision;
             drop(app.handle_chat_ui(Action::GoalIntent(target, requested)));
