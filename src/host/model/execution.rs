@@ -2428,15 +2428,14 @@ mod tests {
                 let authority = registry.register_agent_authority(source).unwrap();
                 let before = registry.model().unwrap();
                 let run = registry.agent_run(accepted.run.id).unwrap();
-                let provenance =
-                    || {
-                        registry.db.query_row(
-                    "SELECT source, ended FROM shared_view_terminal_sources WHERE pane=?1",
-                    [crate::model::CardId::from_uuid(agent.id.as_uuid()).to_string()],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-                ).unwrap()
-                    };
-                let proof = provenance();
+                let proof: (String, Option<String>) = registry
+                    .db
+                    .query_row(
+                        "SELECT source, ended FROM shared_view_terminal_sources WHERE pane=?1",
+                        [crate::model::CardId::from_uuid(agent.id.as_uuid()).to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
                 let other = Connection::open(&registry.path).unwrap();
                 if future {
                     other
