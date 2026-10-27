@@ -25,7 +25,7 @@ loader.exec_module(hot)
 
 class HotRunner(unittest.TestCase):
     @contextmanager
-    def orchestration(self, arguments, *, failed_build=None, failed_metadata=False):
+    def orchestration(self, arguments, *, failed_build=None, failed_metadata=False, missing_artifact=None):
         fixtures = source.parents[1] / ".worktrees"
         fixtures.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="hot-run-test-", dir=fixtures) as directory, ExitStack() as stack:
@@ -38,7 +38,7 @@ class HotRunner(unittest.TestCase):
                 name = command[command.index("--bin") + 1]
                 child = mock.MagicMock()
                 child.__enter__.return_value = child
-                child.stdout = [json.dumps({
+                child.stdout = [] if name == missing_artifact else [json.dumps({
                     "reason": "compiler-artifact", "target": {"name": name},
                     "executable": str(root / "products" / name),
                 }) + "\n"]
@@ -124,6 +124,31 @@ class HotRunner(unittest.TestCase):
                     "cagents": ["build"], "cagentsd": ["build", "build"],
                     "metadata": ["build", "build", "metadata"],
                 }[failure])
+
+    def test_missing_companion_artifact_never_resolves_stages_or_launches(self):
+        for missing in ("cagents", "cagentsd"):
+            with self.subTest(missing=missing), self.orchestration(
+                    ["--fresh-daemon"], missing_artifact=missing) as state:
+                with self.assertRaises(RuntimeError) as failure:
+                    hot.main()
+                self.assertEqual(str(failure.exception),
+                                 f"Locked {missing} build failed; development daemon was not stopped")
+                state.prerequisites.assert_called_once_with()
+                names = ["cagents"] if missing == "cagents" else ["cagents", "cagentsd"]
+                self.assertEqual([call[0] for call in state.calls], ["build"] * len(names))
+                for call, name in zip(state.calls, names):
+                    command = self.assert_locked_sandbox(call[1], state.root)
+                    self.assertEqual(command, [
+                        "cargo", "build", "--locked", "--profile", "dev-runtime",
+                        "--target", "x86_64-unknown-linux-gnu", "--no-default-features",
+                        "--features", "development,full" + (",host" if name == "cagentsd" else ""),
+                        "--bin", name, "--message-format", "json-render-diagnostics",
+                    ])
+                state.metadata.assert_called_once_with(["rustc", "-vV"], text=True)
+                state.stage.assert_not_called()
+                state.execute.assert_not_called()
+                state.run.assert_not_called()
+                self.assertFalse(state.target.exists())
 
     def test_fresh_daemon_and_ui_arguments_are_forwarded_only_to_hot_launch(self):
         arguments = ["--device", "device with spaces", "--new-window", "--log-file", "ui.log"]
