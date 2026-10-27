@@ -726,6 +726,15 @@ impl Session {
             .map_err(protocol_error)
     }
 
+    fn status(&mut self, agent: AgentId) -> Result<(Agent, Run), AppError> {
+        let authority = self.authority.clone();
+        let reply = self
+            .client()?
+            .agent(authority, Operation::Status(agent))
+            .map_err(status_request_error)?;
+        status_reply(reply)
+    }
+
     /// Waits for `runs`; an agent's wait also ends when a message arrives
     /// for it. The user's shell has `cagents inbox` and is never busy.
     fn wait(&mut self, runs: &[RunId], any: bool, timeout: f64) -> Result<Waited, AppError> {
@@ -1017,8 +1026,7 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
         }
         AgentCommand::Status { agent, show } => {
             let agent = session.agent(&agent)?;
-            let reply = session.call(Operation::Status(agent))?;
-            let (agent, run) = status_reply(reply)?;
+            let (agent, run) = session.status(agent)?;
             let human = status_lines(&agent, &run, false, show);
             Ok(CommandOutput {
                 command: "agent.status",
@@ -1289,6 +1297,24 @@ fn wait_data(statuses: &[(Agent, Run)], any: bool, timed_out: bool, ended_by: &s
         "ended_by": ended_by,
         "outcome": wait_outcome(&states, any, timed_out, ended_by == "messages"),
     })
+}
+
+fn status_request_error(error: ControlError) -> AppError {
+    let ownership_refusal = matches!(
+        &error,
+        ControlError::Remote {
+            code: ProtocolErrorCode::InvalidRequest,
+            message,
+            ..
+        } if message == "This caller does not own the agent"
+    );
+    let mut error = protocol_error(error);
+    if ownership_refusal {
+        error.message.push_str(
+            "\nFor read-only cached conversation access from an authenticated agent in the same channel, use cagents chat read <full-session-id>. Find the full session ID with cagents ls --json. Agent status and controls remain owner-only.",
+        );
+    }
+    error
 }
 
 fn status_reply(reply: Reply) -> Result<(Agent, Run), AppError> {
@@ -1630,6 +1656,129 @@ mod tests {
         ServerResponse::Connected {
             proof: proof(),
             resumed: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn foreign_status_suggests_peer_reader_without_retrying_or_changing_owned_status() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let (_, mut current) = running();
+        let Reply::Status { run, .. } = &mut current else {
+            unreachable!("running fixture returns a status")
+        };
+        run.result.text = "current result: This caller does not own the agent".into();
+        let expected = status_reply(current.clone()).unwrap();
+        let owned = expected.0.id;
+        let foreign = AgentId::new();
+        let authority = Authority::session("inert-status-discovery-fixture".into());
+        let expected_authority = authority.clone();
+        let original = ControlError::Remote {
+            code: ProtocolErrorCode::InvalidRequest,
+            message: "This caller does not own the agent".into(),
+            retryable: false,
+        }
+        .to_string();
+        let server = thread::spawn(move || {
+            answer(&mut server_stream, |_| true, connected());
+            answer(
+                &mut server_stream,
+                |request| {
+                    matches!(request, ClientRequest::Agent { authority, operation: Operation::List }
+                    if authority == &expected_authority)
+                },
+                ServerResponse::Agent(Reply::Listed(Vec::new())),
+            );
+            let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(
+                matches!(request.request, ClientRequest::Agent { authority, operation: Operation::Status(id) }
+                if authority == expected_authority && id == foreign)
+            );
+            write_frame(
+                &mut server_stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request.request_id),
+                    proof: proof(),
+                    message: ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "This caller does not own the agent",
+                        false,
+                    )),
+                },
+            )
+            .unwrap();
+            answer(
+                &mut server_stream,
+                |request| {
+                    matches!(request, ClientRequest::Agent { authority, operation: Operation::Status(id) }
+                    if authority == &expected_authority && *id == owned)
+                },
+                ServerResponse::Agent(current),
+            );
+            assert!(
+                read_frame::<ClientEnvelope>(&mut server_stream)
+                    .unwrap()
+                    .is_none(),
+                "a hint must not issue a peer read, retry, or management request"
+            );
+        });
+        let client = ControlClient::from_stream(client_stream).unwrap();
+        let mut session = Session {
+            authority,
+            connection: Some((client, PathBuf::from("unused-status-fixture-socket"))),
+            summaries: None,
+        };
+        let id = session.agent(&foreign.to_string()).unwrap();
+        let error = session.status(id).unwrap_err();
+        assert_eq!(error.kind, "protocol");
+        assert_eq!(
+            error.details,
+            Some(json!({"code": "invalid_request", "retryable": false}))
+        );
+        assert!(error.message.starts_with(&original));
+        assert!(
+            error
+                .message
+                .contains("cagents chat read <full-session-id>")
+        );
+        assert!(error.message.contains("cagents ls --json"));
+        assert!(
+            error
+                .message
+                .contains("authenticated agent in the same channel")
+        );
+        assert!(!error.message.contains("inert-status-discovery-fixture"));
+        assert!(!error.message.contains(&foreign.to_string()));
+        let id = session.agent(&owned.to_string()).unwrap();
+        assert_eq!(session.status(id).unwrap(), expected);
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn status_reader_hint_is_not_added_to_other_protocol_or_transport_errors() {
+        for error in [
+            ControlError::Remote {
+                code: ProtocolErrorCode::InvalidRequest,
+                message: "The issuing session is no longer live".into(),
+                retryable: false,
+            },
+            ControlError::Remote {
+                code: ProtocolErrorCode::Internal,
+                message: "This caller does not own the agent".into(),
+                retryable: true,
+            },
+            ControlError::ConnectionRejected {
+                code: ProtocolErrorCode::InvalidRequest,
+                message: "This caller does not own the agent".into(),
+                retryable: false,
+            },
+            ControlError::ConnectionClosed,
+        ] {
+            let message = error.to_string();
+            let actual = status_request_error(error);
+            assert_eq!(actual.message, message);
+            assert!(!actual.message.contains("cagents chat read"));
         }
     }
 
