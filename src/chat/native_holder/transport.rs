@@ -485,6 +485,7 @@ pub(crate) fn spawn_with_account_scope(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    crate::host::descriptor_limit::inherit(&mut holder);
     unsafe {
         holder.pre_exec(move || {
             crate::daemon::seal_inherited_descriptors()?;
@@ -1457,7 +1458,20 @@ extern "C" fn serve_if_requested() {
         // This is an execed holder, not a post-fork pre_exec hook. Complete
         // scope enrollment before the provider's first process can exist.
         let _ = crate::daemon::process_scope::enroll_holder();
-        let mut residence = Residence::start(spawn)?;
+        let mut residence = match Residence::start(spawn) {
+            Ok(residence) => residence,
+            Err(error) => {
+                // Only startup has no Started response yet. Preserve the
+                // original failure on its existing control channel; sending
+                // diagnostics grants no ownership or cleanup authority.
+                let _ = send(
+                    &control,
+                    &Report::Failed(format!("Native holder startup failed: {error}")),
+                    START_TIMEOUT,
+                );
+                return Err(error);
+            }
+        };
         send(
             &control,
             &Report::Started {
@@ -2085,6 +2099,7 @@ exec /bin/sleep 60
         let paths = crate::daemon::RuntimePaths::discover().unwrap();
         let first = source.proof.clone().unwrap();
         let lease = crate::daemon::HostLease::acquire(&paths, &first).unwrap();
+        let limit = crate::host::descriptor_limit::tests::raise_with_fixture_limit();
         let mut holder = spawn(spec.clone(), source.clone()).unwrap();
         assert!(
             context.outcome() == LaunchOutcome::Uncertain,
@@ -2098,6 +2113,12 @@ exec /bin/sleep 60
         .unwrap()
         .unwrap();
         assert!(record.root.is_current());
+        crate::host::descriptor_limit::tests::assert_process_limit(record.root.pid as u32, &limit);
+        crate::host::descriptor_limit::tests::assert_process_limit(
+            record.holder.pid as u32,
+            &limit,
+        );
+        crate::host::descriptor_limit::tests::assert_daemon_limit_remains_raised(&limit);
         crate::daemon::process_scope::tests::assert_separate(
             record.holder.pid as u32,
             record.root.pid as u32,
@@ -2605,7 +2626,9 @@ exec /bin/sleep 60
             environment: Default::default(),
             unset_environment: Default::default(),
         };
-        assert!(spawn(spec, source).is_err());
+        let startup_error = spawn(spec, source)
+            .err()
+            .expect("the missing provider must fail in the actual helper");
         let deadline = Instant::now() + Duration::from_secs(3);
         while context.reconcile_cleanup().unwrap() == LaunchOutcome::Uncertain {
             assert!(
@@ -2627,6 +2650,14 @@ exec /bin/sleep 60
             )
             .unwrap()
             .is_empty()
+        );
+        assert_eq!(
+            startup_error,
+            format!(
+                "Native holder startup failed: {}",
+                io::Error::from_raw_os_error(libc::ENOENT)
+            ),
+            "the real helper must expose its original spawn failure, not an EOF acknowledgement"
         );
     }
 
