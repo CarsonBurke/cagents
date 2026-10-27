@@ -4627,3 +4627,219 @@ fn saved_concurrency_settings_change_admission_without_a_daemon_restart() {
     close(&host, &Authority::default(), second.agent.id).unwrap();
     super::super::finish_chat_shutdown(&host).unwrap();
 }
+
+#[test]
+fn console_submit_reloads_limits_without_claiming_refused_interaction() {
+    if isolated("console_submit_reloads_limits_without_claiming_refused_interaction").is_some() {
+        return;
+    }
+    use crate::{
+        agent_execution::{CapacityScope, ConcurrencyLimits, ConsoleCommand},
+        model::{TerminalContinuity, TerminalExit, TerminalSession},
+        terminal_ipc::{ProtocolErrorCode, ProtocolErrorDetails},
+    };
+    let (host, mut request, path) = fixture();
+    let first = submit(&host, &Authority::default(), request.clone()).unwrap();
+    let initial_run = settled(&host, first.run.id);
+    assert_eq!(initial_run.state, State::Succeeded);
+    let store = registry(&host).unwrap();
+    let agent = store.lock().unwrap().agent(first.agent.id).unwrap();
+    let source = agent.session.as_ref().unwrap().clone();
+    let HostedSession::Chat(chat) = &source else {
+        unreachable!()
+    };
+    // Supply only the execution service's private console descriptor. The
+    // provider is the existing real fixture process; this contract exercises
+    // Console Submit admission, not a PTY, native input or console rendering.
+    let mut recipe = chat.launch.recipe.clone();
+    recipe.program = "/bin/cat".into();
+    recipe.arguments.clear();
+    let terminal = TerminalSession {
+        id: chat.id,
+        owned_codex_listener: None,
+        recovery_origin: None,
+        predecessor: None,
+        launch: recipe,
+        transcript_path: None,
+        resume_hint: None,
+        continuity: TerminalContinuity::Exited {
+            last_exit: TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 1,
+            },
+        },
+    };
+    store
+        .lock()
+        .unwrap()
+        .bind_agent_console(agent.id, &source, terminal.clone())
+        .unwrap();
+    {
+        let mut state = host.lock().unwrap();
+        state.register_client(37);
+        let record = state.chats.get_mut(&chat.id).unwrap();
+        record.console_recipe = Some(terminal.launch.clone());
+        record.session.terminal = Some(terminal);
+        assert!(record.owns_execution_console());
+    }
+    let authority = store
+        .lock()
+        .unwrap()
+        .retained_agent_authority(chat.id)
+        .unwrap();
+    request.idempotency_key = "console-capacity-holder".into();
+    let holder = store
+        .lock()
+        .unwrap()
+        .submit_agent(&agent.origin, &request, now())
+        .unwrap();
+    let operation = || Operation::Console {
+        agent: agent.id,
+        command: ConsoleCommand::Submit {
+            prompt: "CONFIGURED_CONSOLE_FOLLOWUP".into(),
+            idempotency_key: "configured-console-followup".into(),
+        },
+    };
+    let invoke = |authority| {
+        super::super::client::process_request(
+            &host,
+            37,
+            ClientRequest::Agent {
+                authority,
+                operation: operation(),
+            },
+        )
+        .map(|(reply, _, _)| reply)
+    };
+    let settings_path = crate::settings::default_path().unwrap();
+    let save_limits = |limits| {
+        crate::settings::save(
+            &settings_path,
+            &crate::settings::AppSettings {
+                agent_concurrency: limits,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    };
+    let before = store.lock().unwrap().model().unwrap();
+    let prompts = std::fs::read(path.parent().unwrap().join("prompts")).unwrap();
+    assert!(
+        !store
+            .lock()
+            .unwrap()
+            .agent_is_interactive(agent.id)
+            .unwrap()
+    );
+    assert!(
+        invoke(Authority::default())
+            .unwrap_err()
+            .message
+            .contains("does not own the requested agent console")
+    );
+    for (limits, scope) in [
+        (
+            ConcurrencyLimits {
+                caller: 1,
+                global: 2,
+            },
+            CapacityScope::Caller,
+        ),
+        (
+            ConcurrencyLimits {
+                caller: 2,
+                global: 1,
+            },
+            CapacityScope::Global,
+        ),
+    ] {
+        save_limits(limits);
+        let error = invoke(authority.clone()).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::LimitReached);
+        assert!(error.retryable);
+        let Some(ProtocolErrorDetails::AgentLimitReached(details)) = error.details else {
+            panic!("console refusal lost typed capacity details")
+        };
+        assert_eq!(details.capacity.scope, scope);
+        assert_eq!((details.capacity.running, details.capacity.limit), (1, 1));
+        assert_eq!(details.capacity.holders[0].id, holder.agent.id);
+        assert_eq!(store.lock().unwrap().model().unwrap(), before);
+        assert_eq!(
+            store.lock().unwrap().latest_agent_run(agent.id).unwrap(),
+            initial_run
+        );
+        assert!(
+            !store
+                .lock()
+                .unwrap()
+                .agent_is_interactive(agent.id)
+                .unwrap()
+        );
+        assert_eq!(
+            std::fs::read(path.parent().unwrap().join("prompts")).unwrap(),
+            prompts
+        );
+    }
+    save_limits(ConcurrencyLimits {
+        caller: 2,
+        global: 3,
+    });
+    let ServerResponse::Agent(Reply::Accepted(followup)) = invoke(authority.clone()).unwrap()
+    else {
+        panic!("raised saved policy must accept the same console request")
+    };
+    assert!(followup.created);
+    assert_eq!(followup.agent.id, agent.id);
+    assert_eq!(settled(&host, followup.run.id).state, State::Succeeded);
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .agent_is_interactive(agent.id)
+            .unwrap()
+    );
+    let after_prompts = std::fs::read(path.parent().unwrap().join("prompts")).unwrap();
+    let mut expected_prompts = prompts.clone();
+    expected_prompts.extend_from_slice(b"prompt\n");
+    assert_eq!(after_prompts, expected_prompts);
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .agent_request(followup.run.id)
+            .unwrap()
+            .prompt,
+        "CONFIGURED_CONSOLE_FOLLOWUP"
+    );
+    // An exact retry remains the same acceptance after lowering the limit,
+    // and must not dispatch a third prompt or claim another reservation.
+    save_limits(ConcurrencyLimits {
+        caller: 1,
+        global: 1,
+    });
+    let ServerResponse::Agent(Reply::Accepted(retried)) = invoke(authority).unwrap() else {
+        panic!("accepted console request must remain idempotent at capacity")
+    };
+    assert!(!retried.created);
+    assert_eq!(retried.run.id, followup.run.id);
+    assert_eq!(
+        std::fs::read(path.parent().unwrap().join("prompts")).unwrap(),
+        after_prompts
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.parent().unwrap().join("spawns")).unwrap(),
+        "spawn\n"
+    );
+    // Remove only fixture-added descriptor metadata before the original
+    // owning close; there was no console PTY to stop or retire.
+    {
+        let mut state = host.lock().unwrap();
+        let record = state.chats.get_mut(&chat.id).unwrap();
+        record.session.terminal = None;
+        record.console_recipe = None;
+    }
+    close(&host, &Authority::default(), holder.agent.id).unwrap();
+    close(&host, &Authority::default(), agent.id).unwrap();
+    super::super::finish_chat_shutdown(&host).unwrap();
+}

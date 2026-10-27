@@ -889,6 +889,9 @@ pub(super) fn process_request(
             submit_with_limits(host, &authority, request)
                 .map(crate::agent_execution::Reply::Accepted)
         }
+        crate::agent_execution::Operation::Console { agent, command } => {
+            console_with_limits(host, &authority, agent, command)
+        }
         other => process(host, authority, other).map_err(Into::into),
     }
 }
@@ -1383,6 +1386,17 @@ fn console(
     id: AgentId,
     command: crate::agent_execution::ConsoleCommand,
 ) -> Result<crate::agent_execution::Reply, String> {
+    console_with_limits(host, authority, id, command).map_err(|error| error.to_string())
+}
+
+/// Keep policy refusals typed at the wire boundary without changing the
+/// console's existing ownership, per-agent gate or interaction sequencing.
+fn console_with_limits(
+    host: &SharedHost,
+    authority: &Authority,
+    id: AgentId,
+    command: crate::agent_execution::ConsoleCommand,
+) -> Result<crate::agent_execution::Reply, crate::agent_execution::AcceptanceError> {
     use crate::agent_execution::{ConsoleCommand, ConsoleView, Reply};
     let (_, caller) = caller(host, authority)?;
     let registry = registry(host)?;
@@ -1423,10 +1437,11 @@ fn console(
         } => {
             let gate = agent_gate(host, id);
             let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+            let limits = concurrency_limits()?;
             let accepted = registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .submit_agent(
+                .submit_agent_with_limits(
                     &agent.origin,
                     &Submit {
                         name: None,
@@ -1434,6 +1449,8 @@ fn console(
                         prompt,
                         idempotency_key,
                     },
+                    None,
+                    limits,
                     now(),
                 )?;
             registry
