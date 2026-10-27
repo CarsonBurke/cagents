@@ -630,10 +630,14 @@ impl ControlClient {
     pub fn connect(socket_path: &Path) -> Result<Self, ControlError> {
         #[cfg(feature = "ui")]
         let health_request = crate::daemon_health::begin();
+        let deadline = Instant::now() + Self::handshake_timeout();
         let result = (|| {
-            let stream =
-                connect_control_socket(socket_path, IO_TIMEOUT).map_err(ControlError::Connect)?;
-            Self::from_stream(stream)
+            let stream = connect_control_socket(
+                socket_path,
+                IO_TIMEOUT.min(deadline.saturating_duration_since(Instant::now())),
+            )
+            .map_err(ControlError::Connect)?;
+            Self::from_stream_inner(stream, deadline, deadline.min(Instant::now() + IO_TIMEOUT))
         })();
         #[cfg(feature = "ui")]
         crate::daemon_health::connection(socket_path, &result, health_request);
@@ -641,26 +645,32 @@ impl ControlClient {
     }
 
     pub(crate) fn from_stream(stream: UnixStream) -> Result<Self, ControlError> {
-        Self::from_stream_inner(stream, None)
+        let deadline = Instant::now() + Self::handshake_timeout();
+        Self::from_stream_inner(stream, deadline, deadline.min(Instant::now() + IO_TIMEOUT))
+    }
+
+    fn handshake_timeout() -> Duration {
+        if crate::device::is_remote() {
+            Duration::from_secs(30)
+        } else {
+            IO_TIMEOUT
+        }
     }
 
     pub(crate) fn from_stream_with_deadline(
         stream: UnixStream,
         deadline: Instant,
     ) -> Result<Self, ControlError> {
-        Self::from_stream_inner(stream, Some(deadline))
+        Self::from_stream_inner(stream, deadline, deadline)
     }
 
     fn from_stream_inner(
         stream: UnixStream,
-        deadline: Option<Instant>,
+        deadline: Instant,
+        write_deadline: Instant,
     ) -> Result<Self, ControlError> {
         stream
-            .set_read_timeout(Some(if crate::device::is_remote() {
-                Duration::from_secs(30)
-            } else {
-                IO_TIMEOUT
-            }))
+            .set_read_timeout(Some(Self::handshake_timeout()))
             .map_err(ControlError::Configure)?;
         stream
             .set_write_timeout(Some(IO_TIMEOUT))
@@ -669,10 +679,14 @@ impl ControlClient {
             stream,
             next_request_id: 1,
         };
-        let proof = client.handshake(deadline)?;
+        let proof = client.handshake(deadline, write_deadline)?;
         client
             .stream
             .set_read_timeout(Some(IO_TIMEOUT))
+            .map_err(ControlError::Configure)?;
+        client
+            .stream
+            .set_write_timeout(Some(IO_TIMEOUT))
             .map_err(ControlError::Configure)?;
         Ok(Self {
             stream: client.stream,
@@ -1824,7 +1838,11 @@ struct HandshakeClient {
 }
 
 impl HandshakeClient {
-    fn handshake(&mut self, deadline: Option<Instant>) -> Result<HostSessionProof, ControlError> {
+    fn handshake(
+        &mut self,
+        deadline: Instant,
+        write_deadline: Instant,
+    ) -> Result<HostSessionProof, ControlError> {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         let request = ClientEnvelope {
@@ -1836,25 +1854,22 @@ impl HandshakeClient {
                 resume: Vec::new(),
             },
         };
-        match deadline {
-            Some(deadline) => write_frame(
-                &mut DeadlineWriter {
-                    stream: &mut self.stream,
-                    deadline,
-                },
-                &request,
-            )?,
-            None => write_frame(&mut self.stream, &request)?,
-        }
-        let timeout = self.stream.read_timeout().ok().flatten();
-        let envelope: ServerEnvelope = match deadline {
-            Some(deadline) => read_frame(&mut DeadlineReader {
+        // Defaults keep the original five-second write budget, including when
+        // remote handshakes allow longer reads. Explicit callers retain their
+        // own complete operation deadline for both directions.
+        write_frame(
+            &mut DeadlineWriter {
                 stream: &mut self.stream,
-                deadline,
-            }),
-            None => read_frame(&mut self.stream),
-        }
-        .map_err(|error| reply_error(error, timeout))?
+                deadline: write_deadline,
+            },
+            &request,
+        )?;
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        let envelope: ServerEnvelope = read_frame(&mut DeadlineReader {
+            stream: &mut self.stream,
+            deadline,
+        })
+        .map_err(|error| reply_error(error, Some(timeout)))?
         .ok_or(ControlError::ConnectionClosed)?;
         if envelope.version != PROTOCOL_VERSION {
             return Err(ControlError::UnsupportedVersion {
@@ -4622,6 +4637,10 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(error.details.unwrap()["outcome"], "inventory_changed");
+    }
+
+    mod handshake_deadline_tests {
+        include!("control/handshake_deadline_tests.rs");
     }
 
     fn saturated_control_listener(
