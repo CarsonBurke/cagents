@@ -36,6 +36,7 @@ impl Cagents {
         };
         match effect {
             Effect::Refresh => control(
+                transport::Purpose::Read,
                 |client| client.refresh_work_board(),
                 |result| Action::Refreshed(result),
             ),
@@ -44,6 +45,7 @@ impl Cagents {
                 item,
                 column,
             } => control(
+                transport::Purpose::Mutation,
                 move |client| client.pin_work_card(project, item, column),
                 |result| Action::Pinned(result),
             ),
@@ -112,6 +114,7 @@ impl Cagents {
 
 /// Runs one blocking daemon request off the UI thread.
 fn control(
+    purpose: transport::Purpose,
     request: impl FnOnce(&mut crate::control::ControlClient) -> Result<(), crate::control::ControlError>
     + Send
     + 'static,
@@ -120,7 +123,7 @@ fn control(
     let context = transport::Context::capture();
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || {
-            let mut client = context.connect(true)?;
+            let mut client = context.connect(true, purpose)?;
             request(&mut client).map_err(|error| error.to_string())
         })
         .await
@@ -183,7 +186,7 @@ fn watch(
 ) -> Result<(), String> {
     // Never start a daemon merely to watch it; the window starts one as soon
     // as it needs one, and this reconnects then.
-    let mut client = context.connect(false)?;
+    let mut client = context.connect(false, transport::Purpose::Read)?;
     *hangup.lock().unwrap_or_else(|p| p.into_inner()) =
         Some(client.hangup().map_err(|error| error.to_string())?);
     // The pane closed while this connected.

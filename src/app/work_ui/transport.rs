@@ -4,6 +4,12 @@
 use crate::{agent_execution::Authority, control::ControlClient};
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Copy)]
+pub(super) enum Purpose {
+    Read,
+    Mutation,
+}
+
 pub(super) struct Context {
     authority: Authority,
     remote: bool,
@@ -22,9 +28,14 @@ impl Context {
         }
     }
 
-    pub(super) fn connect(&self, may_start: bool) -> Result<ControlClient, String> {
+    pub(super) fn connect(
+        &self,
+        may_start: bool,
+        purpose: Purpose,
+    ) -> Result<ControlClient, String> {
         self.connect_with(
             may_start,
+            purpose,
             || crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string()),
             || crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string()),
             |socket| ControlClient::connect(socket).map_err(|error| error.to_string()),
@@ -34,6 +45,7 @@ impl Context {
     fn connect_with(
         &self,
         may_start: bool,
+        purpose: Purpose,
         existing: impl FnOnce() -> Result<PathBuf, String>,
         start: impl FnOnce() -> Result<PathBuf, String>,
         connect: impl FnOnce(&Path) -> Result<ControlClient, String>,
@@ -50,10 +62,10 @@ impl Context {
             existing()?
         };
         let mut client = connect(&socket)?;
-        if scoped {
-            // Pin retains the unchanged authority-free Work envelope. Binding
-            // its connection first reaches the daemon's existing refusal;
-            // global Board/WatchWork reads remain intentionally permitted.
+        if scoped && matches!(purpose, Purpose::Mutation) {
+            // Only Pin binds its connection before the unchanged Work envelope.
+            // Board/Refresh/WatchWork intentionally stay open even for invalid
+            // or empty inherited scope, matching the existing CLI read policy.
             client
                 .authenticate(self.authority.clone())
                 .map_err(|error| error.to_string())?;
@@ -146,9 +158,14 @@ mod tests {
         );
     }
 
-    fn captured_client(context: &Context, stream: UnixStream) -> Result<ControlClient, String> {
+    fn captured_client(
+        context: &Context,
+        purpose: Purpose,
+        stream: UnixStream,
+    ) -> Result<ControlClient, String> {
         context.connect_with(
             false,
+            purpose,
             || Ok("/fixture/existing.sock".into()),
             || panic!("watch/scoped request must not start"),
             |path| {
@@ -171,13 +188,16 @@ mod tests {
     #[test]
     fn scoped_remote_refuses_before_resolver_start_or_connect_for_requests_and_watchers() {
         for may_start in [false, true] {
-            let result = context(true, true, false).connect_with(
-                may_start,
-                || panic!("must not resolve remote socket/SSH"),
-                || panic!("must not start remote daemon"),
-                |_| panic!("must not connect remote endpoint"),
-            );
-            assert!(result.err().unwrap().contains("remote Work board"));
+            for purpose in [Purpose::Read, Purpose::Mutation] {
+                let result = context(true, true, false).connect_with(
+                    may_start,
+                    purpose,
+                    || panic!("must not resolve remote socket/SSH"),
+                    || panic!("must not start remote daemon"),
+                    |_| panic!("must not connect remote endpoint"),
+                );
+                assert!(result.err().unwrap().contains("remote Work board"));
+            }
         }
     }
 
@@ -198,6 +218,7 @@ mod tests {
             let context = context(scoped, remote, no_start);
             let result = context.connect_with(
                 may_start,
+                Purpose::Read,
                 || {
                     resolved.set(resolved.get() + 1);
                     Err("existing socket unavailable".into())
@@ -251,7 +272,8 @@ mod tests {
                 "no User retry after refusal"
             );
         });
-        let mut client = captured_client(&context(true, false, false), stream).unwrap();
+        let mut client =
+            captured_client(&context(true, false, false), Purpose::Mutation, stream).unwrap();
         let failure = client
             .pin_work_card(
                 "/fixture/project".into(),
@@ -286,7 +308,7 @@ mod tests {
             );
         });
         assert!(
-            captured_client(&context(true, false, false), stream)
+            captured_client(&context(true, false, false), Purpose::Mutation, stream)
                 .err()
                 .unwrap()
                 .contains("original capability unavailable")
@@ -295,19 +317,19 @@ mod tests {
     }
 
     #[test]
-    fn global_refresh_and_watch_keep_their_wire_scope_for_authenticated_sessions_and_ordinary_users()
-     {
-        for scoped in [false, true] {
+    fn global_refresh_and_watch_never_authenticate_even_invalid_or_empty_scope_and_keep_user_pin() {
+        for authority in [
+            Authority::default(),
+            Authority::session("fixture-original-scope".into()),
+            Authority::session("invalid-present-scope".into()),
+            Authority::session(String::new()),
+        ] {
+            let scoped = authority.token().is_some();
             let (stream, mut peer) = streams();
             let server = thread::spawn(move || {
                 handshake(&mut peer);
-                if scoped {
-                    let auth = read(&mut peer);
-                    assert!(
-                        matches!(&auth.request, ClientRequest::Authenticate { authority } if authority == &context(true,false,false).authority)
-                    );
-                    response(&mut peer, &auth, ServerResponse::Accepted);
-                }
+                // Any Authenticate would be the first frame here and fail:
+                // read compatibility does not require a valid capability.
                 let refresh = read(&mut peer);
                 assert!(matches!(
                     refresh.request,
@@ -364,7 +386,12 @@ mod tests {
                     "existing hangup closes the same scoped/user stream"
                 );
             });
-            let mut client = captured_client(&context(scoped, false, false), stream).unwrap();
+            let context = Context {
+                authority,
+                remote: false,
+                no_start: false,
+            };
+            let mut client = captured_client(&context, Purpose::Read, stream).unwrap();
             client.refresh_work_board().unwrap();
             if !scoped {
                 client
