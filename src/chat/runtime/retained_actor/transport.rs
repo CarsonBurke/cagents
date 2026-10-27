@@ -1119,6 +1119,13 @@ impl RemoteActor {
                     && resident.close.completed))
                 || resident.changed < state.changed
                 || resident.generation < state.generation
+                // Installation is acknowledged independently of observer
+                // revisions. A state RPC issued before commit can arrive
+                // after its ACK with equal changed/generation values.
+                || (state.installed && !resident.installed)
+                || (matches!(state.native_continuity,
+                    chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL })
+                    && resident.native_continuity != state.native_continuity)
             {
                 return false;
             }
@@ -1187,7 +1194,14 @@ impl RemoteActor {
             .unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(snapshot));
         self.0.stop.store(true, Ordering::Release);
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(resident) = resident {
+        if let Some(mut resident) = resident {
+            // A close response may also have been issued before installation
+            // was acknowledged. Keep that actor-scoped fact monotonic while
+            // retaining the exact final snapshot/receipt above unchanged.
+            if state.installed {
+                resident.installed = true;
+                resident.native_continuity = state.native_continuity.clone();
+            }
             *state = Arc::new(resident);
         }
         let state = Arc::make_mut(&mut state);
@@ -1625,8 +1639,11 @@ impl RemoteActor {
     }
     pub fn commit_installation(&self) -> Result<(), String> {
         self.call::<()>("commit", Value::Null)?;
-        self.0.installed.store(true, Ordering::Release);
+        // Use the same publication fence as the observer. No local revision
+        // is invented: the next authentic helper publication owns its clocks.
         {
+            let _publication = self.0.publication.lock().unwrap_or_else(|p| p.into_inner());
+            self.0.installed.store(true, Ordering::Release);
             let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
             let state = Arc::make_mut(&mut state);
             state.installed = true;
@@ -5065,6 +5082,65 @@ exec /bin/sleep 60
             actor.state().native_continuity,
             chat::NativeContinuity::ReconnectOnly
         );
+    }
+    #[test]
+    fn acknowledged_install_cannot_be_reversed_by_an_inflight_precommit_observation() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = root.path().join("install.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut actor = RemoteActor::fixture();
+        Arc::get_mut(&mut actor.0).unwrap().socket = socket;
+        actor.0.installed.store(false, Ordering::Release);
+        let before = {
+            let mut state = actor.0.state.lock().unwrap();
+            let state = Arc::make_mut(&mut state);
+            state.installed = false;
+            state.native_continuity = chat::NativeContinuity::ReconnectOnly;
+            state.clone()
+        };
+        let proof = actor.0.proof.clone();
+        let epoch = actor.0.epoch;
+        let peer = thread::spawn(move || {
+            let (control, _) = listener.accept().unwrap();
+            let request: Invocation = receive(&control, TIMEOUT).unwrap();
+            assert_eq!(request.method, "commit");
+            assert_eq!(request.proof, proof);
+            assert_eq!(request.epoch, Some(epoch));
+            send(&control, &Ok::<Value, String>(Value::Null), TIMEOUT).unwrap();
+        });
+        actor.commit_installation().unwrap();
+        peer.join().unwrap();
+        // This is the exact precommit response an already-issued observer
+        // RPC can return. Equal revisions cannot revoke a successful ACK.
+        assert!(!actor.publish_resident(before.clone()));
+        let installed = actor.state();
+        assert!(installed.installed);
+        assert_eq!(installed.changed, before.changed);
+        assert_eq!(installed.generation, before.generation);
+        assert_eq!(installed.confirmed_session, before.confirmed_session);
+        assert_eq!(
+            installed.native_continuity,
+            chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL }
+        );
+        let mut contradictory = installed.as_ref().clone();
+        contradictory.changed += 1;
+        contradictory.generation += 1;
+        contradictory.native_continuity = chat::NativeContinuity::ReconnectOnly;
+        assert!(!actor.publish_resident(contradictory));
+        let mut next = installed.as_ref().clone();
+        next.changed += 1;
+        next.generation += 1;
+        assert!(actor.publish_resident(next));
+        assert_eq!(actor.state().generation, before.generation + 1);
+        let final_snapshot = Snapshot {
+            exited: true,
+            ..Default::default()
+        };
+        actor.publish_closed_inner(final_snapshot.clone(), Some(before));
+        assert!(actor.state().completed);
+        assert!(actor.state().installed);
+        assert_eq!(actor.state().native_continuity, installed.native_continuity);
+        assert_eq!(actor.snapshot(None), Some(final_snapshot));
     }
     #[test]
     fn synchronous_refresh_publishes_all_transitions_and_rejects_a_delayed_observer_response() {

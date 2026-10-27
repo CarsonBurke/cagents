@@ -488,20 +488,48 @@ pub fn window_database_path(slot: &str) -> io::Result<PathBuf> {
 }
 
 pub fn window_database_paths() -> io::Result<Vec<PathBuf>> {
-    let primary = window_database_path(PRIMARY_WINDOW)?;
+    window_database_paths_at(window_database_path(PRIMARY_WINDOW)?)
+}
+
+fn window_database_paths_at(primary: PathBuf) -> io::Result<Vec<PathBuf>> {
+    // Old inactive snapshots are retained for ordinary reopening/migration.
+    // Bound enumeration before allocating paths or opening SQLite stores.
+    const MAX_STORES: usize = 1024;
+    const MAX_ENTRIES: usize = 8192;
     let mut paths = vec![primary.clone()];
     let windows = primary.parent().unwrap().join("windows");
     match fs::read_dir(windows) {
         Ok(entries) => {
-            for entry in entries {
+            for (index, entry) in entries.enumerate() {
+                if index >= MAX_ENTRIES {
+                    return Err(io::Error::other(
+                        "Saved window enumeration exceeds its bounded entry limit",
+                    ));
+                }
                 let entry = entry?;
                 if entry.file_type()?.is_dir()
                     && let Some(slot) = entry.file_name().to_str()
                     && validate_window_slot(slot).is_ok()
                 {
                     let path = entry.path().join("sessions.sqlite3");
-                    if path.is_file() {
-                        paths.push(path);
+                    match fs::symlink_metadata(&path) {
+                        Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                            if paths.len() >= MAX_STORES {
+                                return Err(io::Error::other(
+                                    "Saved window inventory exceeds its bounded store limit",
+                                ));
+                            }
+                            // Include symlinks so the NOFOLLOW reader reports
+                            // a refusal instead of silently omitting a store.
+                            paths.push(path);
+                        }
+                        Ok(_) => {
+                            return Err(io::Error::other(
+                                "Saved window store is not a regular database file",
+                            ));
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
                     }
                 }
             }
@@ -2370,6 +2398,33 @@ mod tests {
             window_device_identity(runtime.path(), "build-host-primary", &[device]).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn saved_window_enumeration_retains_inactive_stores_and_refuses_excess() {
+        let root = tempdir().unwrap();
+        let primary = root.path().join("sessions.sqlite3");
+        let old = root.path().join("windows/september-copy/sessions.sqlite3");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::write(&old, "original legacy store bytes").unwrap();
+        let mut expected = vec![primary.clone(), old.clone()];
+        expected.sort();
+        assert_eq!(window_database_paths_at(primary.clone()).unwrap(), expected);
+        assert_eq!(fs::read(&old).unwrap(), b"original legacy store bytes");
+        for index in 0..1023 {
+            let path = root
+                .path()
+                .join(format!("windows/old-{index}/sessions.sqlite3"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, []).unwrap();
+        }
+        assert!(
+            window_database_paths_at(primary)
+                .unwrap_err()
+                .to_string()
+                .contains("bounded store limit")
+        );
+        assert_eq!(fs::read(&old).unwrap(), b"original legacy store bytes");
     }
 
     #[test]

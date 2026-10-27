@@ -165,13 +165,13 @@ fn inspect(request: Request) -> Result<(), String> {
     let mut saved = Vec::new();
     for (window, path) in paths.into_iter().enumerate() {
         check_deadline(deadline)?;
-        match path.try_exists() {
-            Ok(false) => continue,
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(_) => {
                 failures.push(format!("Saved window {} cannot be read.", window + 1));
                 continue;
             }
-            Ok(true) => {}
+            Ok(_) => {}
         }
         match crate::persistence::read_open_migration_sessions_with_budget(&path, &mut budget) {
             Ok(panes) => saved.extend(panes),
