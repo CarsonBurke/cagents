@@ -477,6 +477,13 @@ mod tests {
                 .unwrap(),
         ];
         assert!(over.validate_for(over.session).is_err());
+        let mut refused = Page::new(page.session, Coverage::Cached);
+        let before = refused.clone();
+        assert!(!refused.try_push(over.parts[0].clone()).unwrap());
+        assert_eq!(
+            refused, before,
+            "encoded-budget refusal must retain source position"
+        );
         let mut small = Page::new(page.session, Coverage::Cached);
         for _ in 0..MAX_PARTS {
             assert!(
