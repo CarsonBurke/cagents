@@ -5,7 +5,11 @@
 //! The daemon owns the board and pushes each changed one; this state only
 //! filters and presents it. A pin is shown at once and confirmed by the next
 //! board, so a card moves the moment it is moved.
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use cosmic::{
     Element, Theme,
@@ -53,6 +57,31 @@ impl CardRef {
     }
 }
 
+/// Local callback ownership, not a backend ordering or mutation permit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinTicket {
+    lifetime: uuid::Uuid,
+    operation: uuid::Uuid,
+    card: CardRef,
+}
+
+#[derive(Debug)]
+struct Pins {
+    lifetime: uuid::Uuid,
+    latest: HashMap<CardRef, uuid::Uuid>,
+    error: Option<String>,
+}
+
+impl Default for Pins {
+    fn default() -> Self {
+        Self {
+            lifetime: uuid::Uuid::new_v4(),
+            latest: HashMap::new(),
+            error: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Layout {
     /// Columns of cards, one per [`Column`].
@@ -89,17 +118,15 @@ pub enum Action {
     /// Rescans every project and polls GitHub now.
     Refresh,
     Refreshed(Result<(), String>),
-    /// The card's main action: its worktree, else its pull request.
-    Open(CardRef),
+    /// The exact rendered destination, checked again against the current card.
+    Activate(Activation),
     Menu(Option<CardRef>),
-    OpenWorktree(CardRef),
-    OpenPullRequest(CardRef),
-    OpenUrl(String),
-    FocusSession(TerminalId),
-    Copy(String),
     /// Pins a card to a column, or unpins it with `None`.
     Pin(CardRef, Option<Column>),
-    Pinned(Result<(), String>),
+    Pinned {
+        ticket: PinTicket,
+        result: Result<(), String>,
+    },
 }
 
 impl Action {
@@ -108,8 +135,101 @@ impl Action {
     pub fn background(&self) -> bool {
         matches!(
             self,
-            Self::Watched(_) | Self::Tick | Self::Refreshed(_) | Self::Pinned(_)
+            Self::Watched(_) | Self::Tick | Self::Refreshed(_) | Self::Pinned { .. }
         )
+    }
+}
+
+/// Immutable semantic ownership shared by queued callbacks and native buttons.
+/// Paths identify UI destinations; this is not a filesystem identity proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Activation {
+    lifetime: ActivationLifetime,
+    card: CardRef,
+    destination: Destination,
+    primary: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActivationLifetime(uuid::Uuid);
+
+impl Default for ActivationLifetime {
+    fn default() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Destination {
+    Worktree(PathBuf),
+    PullRequest { number: u64, url: String },
+    Linear(String),
+    Session(TerminalId),
+    Branch(String),
+}
+
+impl Activation {
+    fn new(item: &Item, destination: Destination, lifetime: ActivationLifetime) -> Self {
+        Self {
+            lifetime,
+            card: CardRef::of(item),
+            destination,
+            primary: false,
+        }
+    }
+
+    fn primary(item: &Item, lifetime: ActivationLifetime) -> Option<Self> {
+        let destination = if let Some(worktree) = &item.worktree {
+            Destination::Worktree(worktree.path.clone())
+        } else {
+            let request = item.pull_request.as_ref()?;
+            Destination::PullRequest {
+                number: request.number,
+                url: request.url.clone(),
+            }
+        };
+        Some(Self {
+            primary: true,
+            ..Self::new(item, destination, lifetime)
+        })
+    }
+
+    fn matches(&self, item: &Item) -> bool {
+        if !self.card.names(item) {
+            return false;
+        }
+        if self.primary {
+            return Self::primary(item, self.lifetime).as_ref() == Some(self);
+        }
+        match &self.destination {
+            Destination::Worktree(path) => item.worktree.as_ref().is_some_and(|w| w.path == *path),
+            Destination::PullRequest { number, url } => item
+                .pull_request
+                .as_ref()
+                .is_some_and(|request| request.number == *number && request.url == *url),
+            Destination::Linear(url) => {
+                item.linear.as_ref().and_then(|ticket| ticket.url.as_ref()) == Some(url)
+            }
+            Destination::Session(id) => item.sessions.iter().any(|session| session.id == *id),
+            Destination::Branch(branch) => item.branch.as_ref() == Some(branch),
+        }
+    }
+
+    fn effect(self) -> Effect {
+        match self.destination {
+            Destination::Worktree(path) => Effect::OpenWorktree {
+                project: self.card.project,
+                path,
+            },
+            Destination::PullRequest { number, url } => Effect::OpenPullRequest {
+                project: self.card.project,
+                number,
+                url,
+            },
+            Destination::Linear(url) => Effect::OpenUrl(url),
+            Destination::Session(id) => Effect::FocusSession(id),
+            Destination::Branch(branch) => Effect::Copy(branch),
+        }
     }
 }
 
@@ -118,6 +238,7 @@ impl Action {
 pub enum Effect {
     Refresh,
     Pin {
+        ticket: PinTicket,
         project: PathBuf,
         item: String,
         column: Option<Column>,
@@ -138,9 +259,11 @@ pub enum Effect {
 
 #[derive(Debug, Default)]
 pub struct State {
+    /// Retires queued/native activations when this pane is reset, not on redraw.
+    lifetime: ActivationLifetime,
     /// The board shown: the daemon's, with the pins not yet confirmed.
     board: Option<Arc<Board>>,
-    /// The daemon's last board, which a refused pin reverts to.
+    /// The daemon's last board, from which one unconfirmed pin is restored.
     confirmed: Option<Arc<Board>>,
     /// Each card's searchable text, lowercase, in board order.
     search: Vec<String>,
@@ -153,8 +276,9 @@ pub struct State {
     layout: Layout,
     menu: Option<CardRef>,
     refreshing: bool,
-    /// The last refresh or pin that failed.
+    /// The last refresh that failed, independent of pin feedback.
     error: Option<String>,
+    pins: Pins,
     now_unix_ms: u64,
 }
 
@@ -181,6 +305,23 @@ impl State {
                 // A board pushed while the subscription was answered can
                 // arrive before the answer; the newer one stands.
                 if first || revision > self.revision {
+                    if first {
+                        // A new watch connection owns a fresh callback lifetime.
+                        // This neither cancels nor resends earlier server work.
+                        self.pins = Pins::default();
+                    }
+                    if !self.pins.latest.is_empty() {
+                        // A removed card can later reuse its branch key. Its
+                        // earlier request must not acquire that new lifetime.
+                        let present: HashSet<_> = board
+                            .items
+                            .iter()
+                            .map(|item| (&item.project, &item.key))
+                            .collect();
+                        self.pins
+                            .latest
+                            .retain(|card, _| present.contains(&(&card.project, &card.key)));
+                    }
                     self.revision = revision;
                     self.now_unix_ms = board.generated_at_unix_ms.max(now_unix_ms());
                     self.search = board.items.iter().map(search_text).collect();
@@ -206,6 +347,7 @@ impl State {
                 None
             }
             Action::Watched(Watch::Lost(error)) => {
+                self.pins = Pins::default();
                 self.lost = Some(error);
                 None
             }
@@ -218,6 +360,16 @@ impl State {
                 None
             }
             Action::Scope(scope) => {
+                if let Some(repository) = &scope
+                    && !self.board.as_ref().is_some_and(|board| {
+                        board
+                            .projects
+                            .iter()
+                            .any(|project| project.repository == *repository)
+                    })
+                {
+                    return None;
+                }
                 self.scope = scope;
                 self.scope_menu = false;
                 None
@@ -243,47 +395,18 @@ impl State {
                 self.error = result.err();
                 None
             }
-            Action::Open(card) => {
-                let item = self.item(&card)?;
-                if item.worktree.is_some() {
-                    self.update(Action::OpenWorktree(card))
-                } else {
-                    self.update(Action::OpenPullRequest(card))
+            Action::Activate(activation) => {
+                if activation.lifetime != self.lifetime
+                    || !activation.matches(self.item(&activation.card)?)
+                {
+                    return None;
                 }
+                self.menu = None;
+                Some(activation.effect())
             }
             Action::Menu(menu) => {
                 self.menu = menu;
                 None
-            }
-            Action::OpenWorktree(card) => {
-                self.menu = None;
-                let item = self.item(&card)?;
-                Some(Effect::OpenWorktree {
-                    project: item.project.clone(),
-                    path: item.worktree.as_ref()?.path.clone(),
-                })
-            }
-            Action::OpenPullRequest(card) => {
-                self.menu = None;
-                let item = self.item(&card)?;
-                let pull_request = item.pull_request.as_ref()?;
-                Some(Effect::OpenPullRequest {
-                    project: item.project.clone(),
-                    number: pull_request.number,
-                    url: pull_request.url.clone(),
-                })
-            }
-            Action::OpenUrl(url) => {
-                self.menu = None;
-                Some(Effect::OpenUrl(url))
-            }
-            Action::FocusSession(id) => {
-                self.menu = None;
-                Some(Effect::FocusSession(id))
-            }
-            Action::Copy(text) => {
-                self.menu = None;
-                Some(Effect::Copy(text))
             }
             Action::Pin(card, column) => {
                 self.menu = None;
@@ -291,18 +414,48 @@ impl State {
                 let stale_after_days = board.stale_after_days;
                 let item = board.items.iter_mut().find(|item| card.names(item))?;
                 crate::work::place(item, column, self.now_unix_ms, stale_after_days);
+                let ticket = PinTicket {
+                    lifetime: self.pins.lifetime,
+                    operation: uuid::Uuid::new_v4(),
+                    card: card.clone(),
+                };
+                self.pins.latest.insert(card.clone(), ticket.operation);
+                self.pins.error = None;
                 Some(Effect::Pin {
+                    ticket,
                     project: card.project,
                     item: card.key.storage_key(),
                     column,
                 })
             }
-            Action::Pinned(result) => {
-                // A pin the daemon took arrives with its next board; one it
-                // refused changed nothing there, so no board will undo it.
+            Action::Pinned { ticket, result } => {
+                if ticket.lifetime != self.pins.lifetime
+                    || self.pins.latest.get(&ticket.card) != Some(&ticket.operation)
+                {
+                    return None;
+                }
+                self.pins.latest.remove(&ticket.card);
                 if let Err(error) = result {
-                    self.board = self.confirmed.clone();
-                    self.error = Some(error);
+                    // Transport loss need not mean the daemon changed nothing.
+                    // Restore only this card's placement from the latest
+                    // observation, preserving other pending pins and new facts.
+                    let (column, derived, pinned) = self
+                        .confirmed
+                        .as_ref()?
+                        .items
+                        .iter()
+                        .find(|item| ticket.card.names(item))
+                        .map(|item| (item.column, item.derived, item.pinned))?;
+                    let board = Arc::make_mut(self.board.as_mut()?);
+                    let item = board
+                        .items
+                        .iter_mut()
+                        .find(|item| ticket.card.names(item))?;
+                    item.column = column;
+                    item.derived = derived;
+                    item.pinned = pinned;
+                    self.pins.error =
+                        Some(format!("Pin not confirmed for {}: {error}", item.label()));
                 }
                 None
             }
@@ -463,20 +616,20 @@ impl State {
         .padding([space::XS, space::S])
         .on_press_maybe((!projects.is_empty()).then_some(Action::ScopeMenu(!self.scope_menu)));
         let content = self.scope_menu.then(|| {
-            let count = |scope: Option<&PathBuf>| {
-                self.board.as_ref().map_or(0, |board| {
-                    board
-                        .items
-                        .iter()
-                        .filter(|item| scope.is_none_or(|scope| item.project == *scope))
-                        .count()
-                })
-            };
+            let cards_in_board = self
+                .board
+                .as_ref()
+                .map(|board| board.items.as_slice())
+                .unwrap_or_default();
+            let mut counts: HashMap<&PathBuf, usize> = HashMap::new();
+            for item in cards_in_board {
+                *counts.entry(&item.project).or_default() += 1;
+            }
             let mut items = vec![
                 popover_item(
                     Icon::Grid.handle(),
                     "All projects",
-                    cards(count(None)),
+                    cards(cards_in_board.len()),
                     Action::Scope(None),
                 )
                 .selected(self.scope.is_none())
@@ -486,7 +639,7 @@ impl State {
                 popover_item(
                     Icon::Branch.handle(),
                     project.name.as_str(),
-                    cards(count(Some(&project.repository))),
+                    cards(counts.get(&project.repository).copied().unwrap_or_default()),
                     Action::Scope(Some(project.repository.clone())),
                 )
                 .selected(self.scope.as_ref() == Some(&project.repository))
@@ -518,6 +671,9 @@ impl State {
             parts.push(warning(format!("Disconnected: {error}")));
         }
         if let Some(error) = &self.error {
+            parts.push(warning(error.clone()));
+        }
+        if let Some(error) = &self.pins.error {
             parts.push(warning(error.clone()));
         }
         let projects = board.projects.iter().filter(|project| {
@@ -748,15 +904,18 @@ impl State {
         lines.push(self.footer(item));
         let content = widget::column::with_children(lines).spacing(space::XS);
         let selected = self.menu.as_ref() == Some(&card);
+        let primary = Activation::primary(item, self.lifetime);
         let button = widget::button::custom(content)
             .name(format!("Open {}", item.label()))
             .class(card_style(selected))
             .padding(space::S)
             .width(Length::Fill)
-            .on_press(Action::Open(card.clone()));
-        widget::mouse_area(crate::interaction::hover(button))
-            .on_right_press(Action::Menu(Some(card)))
-            .into()
+            .on_press_maybe(primary.clone().map(Action::Activate));
+        crate::ui_controls::owned(
+            (card.clone(), primary),
+            widget::mouse_area(crate::interaction::hover(button))
+                .on_right_press(Action::Menu(Some(card))),
+        )
     }
 
     /// A list row: the same facts as a card, on one line where they fit.
@@ -827,16 +986,19 @@ impl State {
             );
         }
         let selected = self.menu.as_ref() == Some(&card);
+        let primary = Activation::primary(item, self.lifetime);
         let button =
             widget::button::custom(widget::column::with_children(lines).spacing(space::XS))
                 .name(format!("Open {}", item.label()))
                 .class(card_style(selected))
                 .padding([space::XS + space::XXS, space::S])
                 .width(Length::Fill)
-                .on_press(Action::Open(card.clone()));
-        widget::mouse_area(crate::interaction::hover(button))
-            .on_right_press(Action::Menu(Some(card)))
-            .into()
+                .on_press_maybe(primary.clone().map(Action::Activate));
+        crate::ui_controls::owned(
+            (card.clone(), primary),
+            widget::mouse_area(crate::interaction::hover(button))
+                .on_right_press(Action::Menu(Some(card))),
+        )
     }
 
     /// The pills that say what is true of a card now.
@@ -979,13 +1141,18 @@ impl State {
                     ActivityState::Waiting => "waiting for you",
                     _ => "idle",
                 };
-                crate::interaction::tooltip(
-                    widget::button::custom(glyph)
-                        .name(format!("Focus {label}"))
-                        .class(crate::ui_controls::control_style(false, None))
-                        .padding(space::XXS)
-                        .on_press(Action::FocusSession(session.id)),
-                    format!("{label}, {state}"),
+                let activation =
+                    Activation::new(item, Destination::Session(session.id), self.lifetime);
+                crate::ui_controls::owned(
+                    activation.clone(),
+                    crate::interaction::tooltip(
+                        widget::button::custom(glyph)
+                            .name(format!("Focus {label}"))
+                            .class(crate::ui_controls::control_style(false, None))
+                            .padding(space::XXS)
+                            .on_press(Action::Activate(activation)),
+                        format!("{label}, {state}"),
+                    ),
                 )
             })
             .collect::<Vec<_>>();
@@ -1018,50 +1185,67 @@ impl State {
         let content = open.then(|| {
             let mut items: Vec<Element<'a, Action>> = Vec::new();
             if let Some(worktree) = &item.worktree {
-                items.push(
+                let activation = Activation::new(
+                    item,
+                    Destination::Worktree(worktree.path.clone()),
+                    self.lifetime,
+                );
+                items.push(crate::ui_controls::owned(
+                    activation.clone(),
                     popover_item(
                         Icon::OpenFolder.handle(),
                         "Open worktree",
                         crate::app::display_path(&worktree.path),
-                        Action::OpenWorktree(card.clone()),
-                    )
-                    .into(),
-                );
+                        Action::Activate(activation),
+                    ),
+                ));
             }
             if let Some(pull_request) = &item.pull_request {
-                items.push(
+                let activation = Activation::new(
+                    item,
+                    Destination::PullRequest {
+                        number: pull_request.number,
+                        url: pull_request.url.clone(),
+                    },
+                    self.lifetime,
+                );
+                items.push(crate::ui_controls::owned(
+                    activation.clone(),
                     popover_item(
                         Icon::PullRequest.handle(),
                         "Open pull request",
                         format!("#{}", pull_request.number),
-                        Action::OpenPullRequest(card.clone()),
-                    )
-                    .into(),
-                );
+                        Action::Activate(activation),
+                    ),
+                ));
             }
             if let Some(ticket) = &item.linear
                 && let Some(url) = &ticket.url
             {
-                items.push(
+                let activation =
+                    Activation::new(item, Destination::Linear(url.clone()), self.lifetime);
+                items.push(crate::ui_controls::owned(
+                    activation.clone(),
                     popover_item(
                         Icon::WebBrowser.handle(),
                         "Open Linear issue",
                         ticket.identifier.clone().unwrap_or_default(),
-                        Action::OpenUrl(url.clone()),
-                    )
-                    .into(),
-                );
+                        Action::Activate(activation),
+                    ),
+                ));
             }
             if let Some(branch) = &item.branch {
-                items.push(
+                let activation =
+                    Activation::new(item, Destination::Branch(branch.clone()), self.lifetime);
+                items.push(crate::ui_controls::owned(
+                    activation.clone(),
                     popover_item(
                         Icon::Copy.handle(),
                         "Copy branch name",
                         branch.as_str(),
-                        Action::Copy(branch.clone()),
-                    )
-                    .into(),
-                );
+                        Action::Activate(activation),
+                    ),
+                ));
             }
             items.push(design::horizontal_rule());
             for column in Column::ALL {
@@ -1073,7 +1257,14 @@ impl State {
                 } else {
                     "Pin here"
                 };
-                items.push(
+                items.push(crate::ui_controls::owned(
+                    (
+                        self.lifetime,
+                        self.pins.lifetime,
+                        card.clone(),
+                        Some(column),
+                        !current,
+                    ),
                     popover_item(
                         if current {
                             Icon::Check.handle()
@@ -1084,20 +1275,25 @@ impl State {
                         description,
                         Action::Pin(card.clone(), Some(column)),
                     )
-                    .on_press_maybe((!current).then(|| Action::Pin(card.clone(), Some(column))))
-                    .into(),
-                );
+                    .on_press_maybe((!current).then(|| Action::Pin(card.clone(), Some(column)))),
+                ));
             }
             if item.pinned {
-                items.push(
+                items.push(crate::ui_controls::owned(
+                    (
+                        self.lifetime,
+                        self.pins.lifetime,
+                        card.clone(),
+                        None::<Column>,
+                        true,
+                    ),
                     popover_item(
                         Icon::Undo.handle(),
                         "Unpin",
                         format!("Return to {}", item.derived.label()),
                         Action::Pin(card.clone(), None),
-                    )
-                    .into(),
-                );
+                    ),
+                ));
             }
             widget::column::with_children(items)
                 .width(CARD_MENU_WIDTH)
@@ -1484,6 +1680,291 @@ mod tests {
         assert_eq!(state.scope, None);
     }
 
+    fn scope_menu_text(state: &State) -> Option<Vec<String>> {
+        use cosmic::iced::{
+            Rectangle, Size, Vector,
+            advanced::{
+                Layout, layout,
+                widget::{Operation, Tree},
+            },
+        };
+        #[derive(Default)]
+        struct Text(Vec<String>);
+        impl Operation for Text {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: Rectangle, text: &str) {
+                self.0.push(text.into());
+            }
+        }
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut element = state.scope_picker();
+        let mut tree = Tree::new(element.as_widget());
+        let viewport = Rectangle::with_size(Size::new(800.0, 700.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let mut overlay = element.as_widget_mut().overlay(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &viewport,
+            Vector::ZERO,
+        )?;
+        let popup = overlay.as_overlay_mut().layout(&renderer, viewport.size());
+        let mut text = Text::default();
+        overlay
+            .as_overlay_mut()
+            .operate(Layout::new(&popup), &renderer, &mut text);
+        Some(text.0)
+    }
+
+    #[test]
+    fn scope_menu_counts_all_cards_by_exact_project_and_tracks_accepted_boards() {
+        let mut initial = board(vec![
+            item("first", "sample"),
+            item("second", "sample"),
+            item("third", "sample-extra"),
+            item("unlisted", "orphan"),
+        ]);
+        let data = Arc::make_mut(&mut initial);
+        data.projects.retain(|project| project.name != "orphan");
+        for project in &mut data.projects {
+            project.name = "Same name".into();
+        }
+        let mut empty = data.projects[0].clone();
+        empty.repository = "/repos/empty/.git".into();
+        empty.name = "Empty project".into();
+        data.projects.push(empty.clone());
+        let mut state = State::default();
+        connected(&mut state, 2, initial.clone());
+        assert!(
+            scope_menu_text(&state).is_none(),
+            "closed menu has no popup"
+        );
+        state.update(Action::ScopeMenu(true));
+        let expected = [
+            "All projects",
+            "4 cards",
+            "Same name",
+            "2 cards",
+            "Same name",
+            "1 card",
+            "Empty project",
+            "0 cards",
+        ];
+        assert_eq!(scope_menu_text(&state).unwrap(), expected);
+        state.update(Action::Query("no matching cards".into()));
+        state.update(Action::Scope(Some("/repos/sample/.git".into())));
+        assert_eq!(state.visible().count(), 0);
+        state.update(Action::ScopeMenu(true));
+        assert_eq!(
+            scope_menu_text(&state).unwrap(),
+            expected,
+            "picker counts ignore current search and scope"
+        );
+
+        let mut updated = board(vec![item("new", "sample-extra")]);
+        let data = Arc::make_mut(&mut updated);
+        data.projects[0].name = "Same name".into();
+        data.projects.push(empty);
+        watched(&mut state, 3, updated);
+        assert!(
+            state.scope.is_none(),
+            "removed selected project leaves scope"
+        );
+        let updated_counts = [
+            "All projects",
+            "1 card",
+            "Same name",
+            "1 card",
+            "Empty project",
+            "0 cards",
+        ];
+        assert_eq!(scope_menu_text(&state).unwrap(), updated_counts);
+        watched(&mut state, 2, initial);
+        assert_eq!(
+            scope_menu_text(&state).unwrap(),
+            updated_counts,
+            "an older board must not restore obsolete counts"
+        );
+
+        state.reset();
+        state.update(Action::ScopeMenu(true));
+        assert_eq!(
+            scope_menu_text(&state).unwrap(),
+            ["All projects", "0 cards"]
+        );
+        connected(&mut state, 1, board(Vec::new()));
+        assert_eq!(
+            scope_menu_text(&state).unwrap(),
+            ["All projects", "0 cards"]
+        );
+    }
+
+    #[test]
+    fn queued_project_picker_choice_cannot_restore_a_removed_scope() {
+        use iced::runtime::user_interface::Cache;
+
+        fn build<'a>(
+            state: &'a State,
+            cache: Cache,
+            renderer: &mut cosmic::Renderer,
+        ) -> iced::runtime::UserInterface<'a, Action, Theme, cosmic::Renderer> {
+            let mut ui = iced::runtime::UserInterface::build(
+                state.layout_view(1600.0),
+                iced::Size::new(1600.0, 900.0),
+                cache,
+                renderer,
+            );
+            draw_work_ui(&mut ui, renderer);
+            ui
+        }
+
+        fn choose(state: &mut State, renderer: &mut cosmic::Renderer, label: &str) -> Action {
+            let cache = if !state.scope_menu {
+                let mut ui = build(state, Cache::new(), renderer);
+                let point = first_open_bounds(&ui, "Choose project").center();
+                let actions = click_work(&mut ui, renderer, point);
+                let cache = ui.into_cache();
+                assert!(matches!(actions.as_slice(), [Action::ScopeMenu(true)]));
+                state.update(actions.into_iter().next().unwrap());
+                cache
+            } else {
+                Cache::new()
+            };
+            let mut ui = build(state, cache, renderer);
+            // The selected project's text also appears in the anchor. Only
+            // choose a real overlay row below it, never that same-label anchor.
+            #[derive(Default)]
+            struct Rows {
+                text: Vec<(String, iced::Rectangle)>,
+                buttons: Vec<iced::Rectangle>,
+            }
+            impl iced::advanced::widget::Operation for Rows {
+                fn traverse(
+                    &mut self,
+                    visit: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation),
+                ) {
+                    visit(self);
+                }
+                fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                    self.text.push((text.into(), bounds));
+                }
+                fn focusable(
+                    &mut self,
+                    _: Option<&widget::Id>,
+                    bounds: iced::Rectangle,
+                    _: &mut dyn iced::advanced::widget::operation::Focusable,
+                ) {
+                    self.buttons.push(bounds);
+                }
+            }
+            let anchor = first_open_bounds(&ui, "Choose project");
+            let mut rows = Rows::default();
+            ui.operate(renderer, &mut rows);
+            let bounds = rows
+                .buttons
+                .iter()
+                .filter(|bounds| {
+                    bounds.y >= anchor.y + anchor.height
+                        && rows.text.iter().any(|(text, text_bounds)| {
+                            text == label && bounds.contains(text_bounds.center())
+                        })
+                })
+                .min_by(|a, b| (a.width * a.height).total_cmp(&(b.width * b.height)))
+                .copied()
+                .unwrap_or_else(|| panic!("missing actual scope row {label}"));
+            assert!(bounds.width > 0.0 && bounds.height > 0.0);
+            let point = bounds.center();
+            let actions = click_work(&mut ui, renderer, point);
+            assert!(
+                matches!(actions.as_slice(), [Action::Scope(_)]),
+                "{actions:?}"
+            );
+            actions.into_iter().next().unwrap()
+        }
+
+        for select_b in [false, true] {
+            let mut state = State::default();
+            let a = native_work_item("branch-a", "project-a");
+            let b = native_work_item("branch-b", "project-b");
+            let other_b = native_work_item("other-b", "project-b");
+            connected(
+                &mut state,
+                1,
+                board(vec![a.clone(), b.clone(), other_b.clone()]),
+            );
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let old_a = choose(&mut state, &mut renderer, "project-a");
+            assert!(matches!(&old_a, Action::Scope(Some(path)) if *path == a.project));
+            let current = choose(
+                &mut state,
+                &mut renderer,
+                if select_b {
+                    "project-b"
+                } else {
+                    "All projects"
+                },
+            );
+            state.update(current);
+            let scope = state.scope.clone();
+            assert_eq!(scope, select_b.then(|| b.project.clone()));
+            watched(&mut state, 2, board(vec![b.clone(), other_b]));
+
+            assert!(state.update(old_a).is_none());
+            assert_eq!(
+                state.scope, scope,
+                "late A must preserve the valid current scope"
+            );
+            assert!(!state.scope_menu);
+            assert_eq!(
+                state.visible().map(Item::label).collect::<Vec<_>>(),
+                ["branch-b", "other-b"]
+            );
+            // Inspect the rendered header/status/body, not just the scope field.
+            #[derive(Default)]
+            struct Text(Vec<String>);
+            impl iced::advanced::widget::Operation for Text {
+                fn traverse(
+                    &mut self,
+                    visit: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation),
+                ) {
+                    visit(self);
+                }
+                fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+                    self.0.push(text.into());
+                }
+            }
+            let mut ui = build(&state, Cache::new(), &mut renderer);
+            let mut text = Text::default();
+            ui.operate(&renderer, &mut text);
+            assert!(text.0.iter().any(|text| text
+                == if select_b {
+                    "project-b"
+                } else {
+                    "All projects"
+                }));
+            assert!(text.0.iter().any(|text| text == "2 cards"));
+            assert!(!text.0.iter().any(|text| text == "No cards match"));
+            assert!(first_open_bounds(&ui, "Open branch-b").width > 0.0);
+            drop(ui);
+
+            // Current project and All projects callbacks remain accepted.
+            let current_b = choose(&mut state, &mut renderer, "project-b");
+            state.update(current_b);
+            assert_eq!(state.scope, Some(b.project));
+            assert!(!state.scope_menu);
+            let all = choose(&mut state, &mut renderer, "All projects");
+            state.update(all);
+            assert!(state.scope.is_none());
+            assert!(!state.scope_menu);
+        }
+    }
+
     #[test]
     fn a_pin_moves_the_card_at_once_and_names_it_to_the_daemon() {
         let mut state = State::default();
@@ -1506,13 +1987,262 @@ mod tests {
         let mut state = State::default();
         watched(&mut state, 1, board(vec![item("feat/board", "cagents")]));
         let card = CardRef::of(&state.board.as_ref().unwrap().items[0]);
-        state.update(Action::Pin(card.clone(), Some(Column::Stale)));
-        state.update(Action::Pinned(Err(
-            "the Work board store is unavailable".into()
-        )));
+        let ticket = pin(&mut state, &card, Some(Column::Stale));
+        state.update(Action::Pinned {
+            ticket,
+            result: Err("the Work board store is unavailable".into()),
+        });
         let shown = state.item(&card).unwrap();
         assert_eq!((shown.column, shown.pinned), (Column::InProgress, false));
-        assert!(state.error.is_some());
+        assert!(state.pins.error.is_some());
+    }
+
+    fn pin(state: &mut State, card: &CardRef, column: Option<Column>) -> PinTicket {
+        let Some(Effect::Pin {
+            ticket,
+            project,
+            item,
+            column: actual,
+        }) = state.update(Action::Pin(card.clone(), column))
+        else {
+            panic!("the current card must emit a pin request")
+        };
+        assert_eq!(project, card.project);
+        assert_eq!(item, card.key.storage_key());
+        assert_eq!(actual, column);
+        ticket
+    }
+
+    fn pin_board() -> (State, CardRef, CardRef) {
+        let a = item("first", "cagents");
+        let b = item("second", "cagents");
+        let cards = (CardRef::of(&a), CardRef::of(&b));
+        let mut state = State::default();
+        connected(&mut state, 1, board(vec![a, b]));
+        (state, cards.0, cards.1)
+    }
+
+    fn complete_pin(state: &mut State, ticket: PinTicket, result: Result<(), String>) {
+        let action = Action::Pinned { ticket, result };
+        assert!(
+            action.background(),
+            "a modal cannot strand an issued completion"
+        );
+        assert!(
+            state.update(action).is_none(),
+            "completion must not issue or retry a request"
+        );
+    }
+
+    #[test]
+    fn a_pin_failure_preserves_other_cards_even_when_their_success_arrives_first() {
+        for success_first in [false, true] {
+            let (mut state, a, b) = pin_board();
+            state.update(Action::Refreshed(Err("current refresh failure".into())));
+            let first = pin(&mut state, &a, Some(Column::Stale));
+            let second = pin(&mut state, &b, Some(Column::Active));
+            if success_first {
+                complete_pin(&mut state, second.clone(), Ok(()));
+            }
+            complete_pin(&mut state, first, Err("first pin unavailable".into()));
+            let shown_a = state.item(&a).unwrap();
+            assert_eq!(
+                (shown_a.column, shown_a.pinned),
+                (Column::InProgress, false)
+            );
+            let shown_b = state.item(&b).unwrap();
+            assert_eq!((shown_b.column, shown_b.pinned), (Column::Active, true));
+            if !success_first {
+                complete_pin(&mut state, second, Ok(()));
+            }
+            assert_eq!(state.item(&b).unwrap().column, Column::Active);
+            assert!(state.pins.error.as_deref().unwrap().contains("first"));
+            assert_eq!(state.error.as_deref(), Some("current refresh failure"));
+            let next = pin(&mut state, &a, Some(Column::Landed));
+            assert!(
+                state.pins.error.is_none(),
+                "a new pin clears only old pin feedback"
+            );
+            assert_eq!(state.error.as_deref(), Some("current refresh failure"));
+            complete_pin(&mut state, next, Ok(()));
+        }
+    }
+
+    #[test]
+    fn a_pin_failure_uses_current_placement_and_keeps_new_board_facts() {
+        let (mut state, a, b) = pin_board();
+        let first = pin(&mut state, &a, Some(Column::Stale));
+        let mut newer_a = item("first", "cagents");
+        newer_a.project_name = "Fresh project name".into();
+        newer_a.comparison.as_mut().unwrap().ahead = 9;
+        newer_a.column = Column::InReview;
+        newer_a.derived = Column::Active;
+        newer_a.pinned = true;
+        let authoritative = board(vec![newer_a.clone(), item("second", "cagents")]);
+        watched(&mut state, 2, authoritative.clone());
+        assert_eq!(
+            state.board.as_deref(),
+            Some(authoritative.as_ref()),
+            "watcher state wins without replaying old optimistic intent"
+        );
+        let second = pin(&mut state, &b, Some(Column::Landed));
+        complete_pin(&mut state, first, Err("response missing".into()));
+        assert_eq!(
+            state.item(&a),
+            Some(&newer_a),
+            "restore current placement without copying old facts"
+        );
+        assert_eq!(state.item(&b).unwrap().column, Column::Landed);
+        assert_eq!(state.confirmed.as_deref(), Some(authoritative.as_ref()));
+        let new_pin = pin(&mut state, &a, Some(Column::Stale));
+        assert_ne!(state.item(&a).unwrap().derived, newer_a.derived);
+        complete_pin(&mut state, new_pin, Err("new response missing".into()));
+        assert_eq!(
+            state.item(&a),
+            Some(&newer_a),
+            "all three placement fields return to the current observation"
+        );
+        complete_pin(&mut state, second, Err("second response missing".into()));
+        assert_eq!(state.board.as_deref(), Some(authoritative.as_ref()));
+    }
+
+    #[test]
+    fn old_pin_completions_do_not_cross_reset_loss_or_watch_connection_lifetimes() {
+        for boundary in ["reset", "lost", "reconnect"] {
+            let (mut state, a, b) = pin_board();
+            let old = pin(&mut state, &a, Some(Column::Stale));
+            match boundary {
+                "reset" => state.reset(),
+                "lost" => {
+                    state.update(Action::Watched(Watch::Lost("disconnected".into())));
+                }
+                "reconnect" => connected(
+                    &mut state,
+                    1,
+                    board(vec![item("first", "cagents"), item("second", "cagents")]),
+                ),
+                _ => unreachable!(),
+            }
+            complete_pin(&mut state, old.clone(), Err("old request failure".into()));
+            assert!(state.pins.error.is_none());
+            if boundary == "reset" {
+                assert!(
+                    state.board.is_none(),
+                    "completion cannot reopen the closed board"
+                );
+            }
+            if boundary != "reconnect" {
+                connected(
+                    &mut state,
+                    1,
+                    board(vec![item("first", "cagents"), item("second", "cagents")]),
+                );
+            }
+            state.update(Action::Refreshed(Err("new refresh failure".into())));
+            let current = pin(&mut state, &b, Some(Column::Active));
+            complete_pin(&mut state, old.clone(), Err("late old failure".into()));
+            complete_pin(&mut state, old, Ok(()));
+            assert_eq!(state.item(&b).unwrap().column, Column::Active);
+            assert!(state.pins.error.is_none());
+            assert_eq!(state.error.as_deref(), Some("new refresh failure"));
+            complete_pin(&mut state, current, Err("current request missing".into()));
+            assert!(
+                state
+                    .pins
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("current request missing"),
+                "the current lifetime still accepts its matching callback"
+            );
+            connected(
+                &mut state,
+                1,
+                board(vec![item("first", "cagents"), item("second", "cagents")]),
+            );
+            assert!(
+                state.pins.error.is_none(),
+                "new watch lifetime clears only pin feedback"
+            );
+            assert_eq!(state.error.as_deref(), Some("new refresh failure"));
+        }
+    }
+
+    #[test]
+    fn superseded_pin_completions_cannot_undo_or_retire_the_latest_same_card_request() {
+        for latest_succeeds in [false, true] {
+            let (mut state, a, _) = pin_board();
+            let old = pin(&mut state, &a, Some(Column::Stale));
+            let latest = pin(&mut state, &a, Some(Column::Active));
+            complete_pin(&mut state, old.clone(), Err("superseded failure".into()));
+            complete_pin(&mut state, old.clone(), Ok(()));
+            assert_eq!(state.item(&a).unwrap().column, Column::Active);
+            assert!(state.pins.error.is_none());
+            complete_pin(
+                &mut state,
+                latest,
+                if latest_succeeds {
+                    Ok(())
+                } else {
+                    Err("latest failure".into())
+                },
+            );
+            let expected = if latest_succeeds {
+                Column::Active
+            } else {
+                Column::InProgress
+            };
+            assert_eq!(state.item(&a).unwrap().column, expected);
+            let feedback = state.pins.error.clone();
+            complete_pin(
+                &mut state,
+                old,
+                Err("superseded failure after latest".into()),
+            );
+            assert_eq!(state.item(&a).unwrap().column, expected);
+            assert_eq!(state.pins.error, feedback);
+        }
+    }
+
+    #[test]
+    fn a_missing_pinned_card_is_not_resurrected_by_its_late_failure() {
+        for reappears in [false, true] {
+            let (mut state, a, b) = pin_board();
+            let removed = pin(&mut state, &a, Some(Column::Stale));
+            watched(&mut state, 2, board(vec![item("second", "cagents")]));
+            if reappears {
+                let mut replacement = item("first", "cagents");
+                replacement.head = Some(crate::work::Head {
+                    oid: "replacement-head".into(),
+                    committed_at_unix_ms: None,
+                });
+                watched(
+                    &mut state,
+                    3,
+                    board(vec![replacement, item("second", "cagents")]),
+                );
+            }
+            let before_a = state.item(&a).cloned();
+            let retained = pin(&mut state, &b, Some(Column::Active));
+            complete_pin(&mut state, removed, Err("removed card failure".into()));
+            assert_eq!(
+                state.item(&a),
+                before_a.as_ref(),
+                "no resurrection or adoption by a reappeared card"
+            );
+            assert_eq!(state.item(&b).unwrap().column, Column::Active);
+            assert!(state.pins.error.is_none());
+            complete_pin(&mut state, retained, Err("retained card failure".into()));
+            assert_eq!(state.item(&b).unwrap().column, Column::InProgress);
+            assert!(
+                state
+                    .pins
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("retained card failure")
+            );
+        }
     }
 
     #[test]
@@ -1528,6 +2258,871 @@ mod tests {
         // A card that comes back does not reopen its menu.
         watched(&mut state, 4, board(vec![item("feat/board", "cagents")]));
         assert_eq!(state.menu, None);
+    }
+
+    // Keep the actual UserInterface cache across accepted watch updates. A
+    // new Tree for each click cannot expose a held press moving with a slot.
+    fn cached_work_ui<'a>(
+        state: &'a State,
+        cache: iced::runtime::user_interface::Cache,
+        renderer: &mut cosmic::Renderer,
+    ) -> iced::runtime::UserInterface<'a, Action, Theme, cosmic::Renderer> {
+        let element = match state.layout {
+            Layout::Board => state.board_view(1600.0),
+            Layout::List => state.list_view(),
+        };
+        let mut ui = iced::runtime::UserInterface::build(
+            element,
+            iced::Size::new(1600.0, 900.0),
+            cache,
+            renderer,
+        );
+        draw_work_ui(&mut ui, renderer);
+        ui
+    }
+
+    fn draw_work_ui(
+        ui: &mut iced::runtime::UserInterface<'_, Action, Theme, cosmic::Renderer>,
+        renderer: &mut cosmic::Renderer,
+    ) {
+        ui.draw(
+            renderer,
+            &cosmic::theme::active(),
+            &iced::advanced::renderer::Style::default(),
+            iced::mouse::Cursor::Unavailable,
+        );
+    }
+
+    fn first_open_bounds(
+        ui: &iced::runtime::UserInterface<'_, Action, Theme, cosmic::Renderer>,
+        label: &str,
+    ) -> iced::Rectangle {
+        let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+        let mut bounds = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter(|node| node.node().label() == Some(label))
+            .map(|node| {
+                let b = node.node().bounds().unwrap();
+                iced::Rectangle {
+                    x: b.x0 as f32,
+                    y: b.y0 as f32,
+                    width: (b.x1 - b.x0) as f32,
+                    height: (b.y1 - b.y0) as f32,
+                }
+            })
+            .collect::<Vec<_>>();
+        bounds.sort_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
+        let bounds = *bounds
+            .first()
+            .unwrap_or_else(|| panic!("missing actual card button {label}"));
+        assert!(
+            bounds.width > 0.0 && bounds.height > 0.0,
+            "{label}: {bounds:?}"
+        );
+        bounds
+    }
+
+    fn retained_work_events(
+        ui: &mut iced::runtime::UserInterface<'_, Action, Theme, cosmic::Renderer>,
+        renderer: &mut cosmic::Renderer,
+        point: iced::Point,
+        buttons: &[iced::mouse::Event],
+    ) -> Vec<Action> {
+        let events = std::iter::once(iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+            position: point,
+        }))
+        .chain(buttons.iter().cloned().map(iced::Event::Mouse))
+        .collect::<Vec<_>>();
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &events,
+            iced::mouse::Cursor::Available(point),
+            renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        draw_work_ui(ui, renderer);
+        messages
+    }
+
+    fn native_work_item(branch: &str, project: &str) -> Item {
+        let mut value = item(branch, project);
+        value.worktree = Some(crate::work::Worktree {
+            path: PathBuf::from(format!("/fixture/{project}/{branch}")),
+            primary: false,
+            locked: false,
+            created_at_unix_ms: None,
+        });
+        value
+    }
+
+    fn assert_native_open(state: &mut State, messages: Vec<Action>, expected: &Item) {
+        assert!(
+            matches!(messages.as_slice(), [Action::Activate(activation)] if Some(activation) == Activation::primary(expected, state.lifetime).as_ref()),
+            "expected current card, received {messages:?}"
+        );
+        let effect = state.update(messages.into_iter().next().unwrap());
+        assert!(
+            matches!(effect, Some(Effect::OpenWorktree{project,path}) if project == expected.project && path == expected.worktree.as_ref().unwrap().path)
+        );
+        // Inspect the reducer effect only; never open a real project or terminal.
+    }
+
+    #[test]
+    fn reordered_board_and_list_cards_cannot_adopt_another_cards_native_press() {
+        use iced::mouse::{Button, Event};
+        use iced::runtime::user_interface::Cache;
+        for layout in [Layout::Board, Layout::List] {
+            let a = native_work_item("branch-a", "workspace");
+            let b = native_work_item("branch-b", "workspace");
+            let mut state = State::default();
+            state.update(Action::Layout(layout));
+            watched(&mut state, 1, board(vec![a.clone(), b.clone()]));
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let mut ui = cached_work_ui(&state, Cache::new(), &mut renderer);
+            let point = first_open_bounds(&ui, "Open branch-a").center();
+            assert!(
+                retained_work_events(
+                    &mut ui,
+                    &mut renderer,
+                    point,
+                    &[Event::ButtonPressed(Button::Left)]
+                )
+                .is_empty()
+            );
+            let cache = ui.into_cache();
+            watched(&mut state, 2, board(vec![b.clone(), a]));
+            assert_eq!(state.visible().next().unwrap().key, b.key);
+            let mut ui = cached_work_ui(&state, cache, &mut renderer);
+            assert!(
+                first_open_bounds(&ui, "Open branch-b").contains(point),
+                "replacement must occupy the held hit area in {layout:?}"
+            );
+            let release = retained_work_events(
+                &mut ui,
+                &mut renderer,
+                point,
+                &[Event::ButtonReleased(Button::Left)],
+            );
+            assert!(
+                release.is_empty(),
+                "held A must not open B in {layout:?}: {release:?}"
+            );
+            let fresh = retained_work_events(
+                &mut ui,
+                &mut renderer,
+                point,
+                &[
+                    Event::ButtonPressed(Button::Left),
+                    Event::ButtonReleased(Button::Left),
+                ],
+            );
+            drop(ui);
+            assert_native_open(&mut state, fresh, &b);
+        }
+    }
+
+    #[test]
+    fn stable_board_and_list_card_identity_keeps_its_native_press_on_refresh() {
+        use iced::mouse::{Button, Event};
+        use iced::runtime::user_interface::Cache;
+        for layout in [Layout::Board, Layout::List] {
+            let a = native_work_item("branch-a", "workspace");
+            let b = native_work_item("branch-b", "workspace");
+            let mut refreshed = a.clone();
+            refreshed.comparison.as_mut().unwrap().ahead = 2;
+            let mut state = State::default();
+            state.update(Action::Layout(layout));
+            watched(&mut state, 1, board(vec![a.clone(), b.clone()]));
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let mut ui = cached_work_ui(&state, Cache::new(), &mut renderer);
+            let point = first_open_bounds(&ui, "Open branch-a").center();
+            assert!(
+                retained_work_events(
+                    &mut ui,
+                    &mut renderer,
+                    point,
+                    &[Event::ButtonPressed(Button::Left)]
+                )
+                .is_empty()
+            );
+            let cache = ui.into_cache();
+            watched(&mut state, 2, board(vec![refreshed.clone(), b]));
+            let mut ui = cached_work_ui(&state, cache, &mut renderer);
+            assert!(first_open_bounds(&ui, "Open branch-a").contains(point));
+            let release = retained_work_events(
+                &mut ui,
+                &mut renderer,
+                point,
+                &[Event::ButtonReleased(Button::Left)],
+            );
+            drop(ui);
+            assert_native_open(&mut state, release, &refreshed);
+        }
+    }
+
+    #[test]
+    fn equal_work_labels_in_different_projects_do_not_share_a_native_press() {
+        use iced::mouse::{Button, Event};
+        use iced::runtime::user_interface::Cache;
+        for layout in [Layout::Board, Layout::List] {
+            let mut a = native_work_item("shared", "project-a");
+            let mut b = native_work_item("shared", "project-b");
+            a.project_name = "Same name".into();
+            b.project_name = a.project_name.clone();
+            assert_eq!(a.key, b.key);
+            assert_eq!(a.label(), b.label());
+            assert_ne!(CardRef::of(&a), CardRef::of(&b));
+            let mut state = State::default();
+            state.update(Action::Layout(layout));
+            watched(&mut state, 1, board(vec![a.clone(), b.clone()]));
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let mut ui = cached_work_ui(&state, Cache::new(), &mut renderer);
+            let point = first_open_bounds(&ui, "Open shared").center();
+            assert!(
+                retained_work_events(
+                    &mut ui,
+                    &mut renderer,
+                    point,
+                    &[Event::ButtonPressed(Button::Left)]
+                )
+                .is_empty()
+            );
+            let cache = ui.into_cache();
+            watched(&mut state, 2, board(vec![b.clone(), a]));
+            let mut ui = cached_work_ui(&state, cache, &mut renderer);
+            assert!(first_open_bounds(&ui, "Open shared").contains(point));
+            let release = retained_work_events(
+                &mut ui,
+                &mut renderer,
+                point,
+                &[Event::ButtonReleased(Button::Left)],
+            );
+            assert!(
+                release.is_empty(),
+                "same labels must not transfer A's press to B in {layout:?}: {release:?}"
+            );
+            let fresh = retained_work_events(
+                &mut ui,
+                &mut renderer,
+                point,
+                &[
+                    Event::ButtonPressed(Button::Left),
+                    Event::ButtonReleased(Button::Left),
+                ],
+            );
+            drop(ui);
+            assert_native_open(&mut state, fresh, &b);
+        }
+    }
+
+    fn request(number: u64) -> PullRequest {
+        PullRequest {
+            number,
+            title: "Same title".into(),
+            url: format!("https://github.com/fixture/work/pull/{number}"),
+            state: PullRequestState::Open,
+            draft: false,
+            head_oid: "head".into(),
+            contains_local_head: true,
+            checks: None,
+            review: None,
+            updated_at: String::new(),
+        }
+    }
+
+    fn click_work(
+        ui: &mut iced::runtime::UserInterface<'_, Action, Theme, cosmic::Renderer>,
+        renderer: &mut cosmic::Renderer,
+        point: iced::Point,
+    ) -> Vec<Action> {
+        use iced::mouse::{Button, Event};
+        retained_work_events(
+            ui,
+            renderer,
+            point,
+            &[
+                Event::ButtonPressed(Button::Left),
+                Event::ButtonReleased(Button::Left),
+            ],
+        )
+    }
+
+    // a11y_nodes visits only the popover anchor. Operate traverses the actual
+    // overlay tree and exposes each real button's bounds after its text.
+    fn popup_button_bounds(
+        ui: &mut iced::runtime::UserInterface<'_, Action, Theme, cosmic::Renderer>,
+        renderer: &cosmic::Renderer,
+        label: &str,
+    ) -> iced::Rectangle {
+        use iced::advanced::widget::{Operation, operation};
+        #[derive(Default)]
+        struct Outline {
+            text: Vec<(String, iced::Rectangle)>,
+            buttons: Vec<iced::Rectangle>,
+        }
+        impl Operation for Outline {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                self.text.push((text.into(), bounds));
+            }
+            fn focusable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: &mut dyn operation::Focusable,
+            ) {
+                self.buttons.push(bounds);
+            }
+        }
+        let mut outline = Outline::default();
+        ui.operate(renderer, &mut outline);
+        let texts = outline
+            .text
+            .iter()
+            .filter(|(text, _)| text == label)
+            .map(|(_, bounds)| *bounds)
+            .collect::<Vec<_>>();
+        assert!(
+            !texts.is_empty(),
+            "missing actual popup text {label}: {:?}",
+            outline.text
+        );
+        let bounds = outline
+            .buttons
+            .iter()
+            .filter(|bounds| texts.iter().any(|text| bounds.contains(text.center())))
+            .min_by(|a, b| (a.width * a.height).total_cmp(&(b.width * b.height)))
+            .copied()
+            .unwrap_or_else(|| panic!("no actual popup button for {label}: {texts:?}"));
+        assert!(
+            bounds.width > 0.0 && bounds.height > 0.0,
+            "{label}: {bounds:?}"
+        );
+        bounds
+    }
+
+    fn open_native_menu(
+        state: &mut State,
+        renderer: &mut cosmic::Renderer,
+    ) -> iced::runtime::user_interface::Cache {
+        use iced::runtime::user_interface::Cache;
+        let mut ui = cached_work_ui(state, Cache::new(), renderer);
+        let point = first_open_bounds(&ui, "Card actions").center();
+        let actions = click_work(&mut ui, renderer, point);
+        let cache = ui.into_cache();
+        assert!(
+            matches!(actions.as_slice(), [Action::Menu(Some(_))]),
+            "menu anchor: {actions:?}"
+        );
+        state.update(actions.into_iter().next().unwrap());
+        cache
+    }
+
+    #[test]
+    fn same_card_changed_primary_destination_retires_board_and_list_native_press() {
+        use iced::mouse::{Button, Event};
+        use iced::runtime::user_interface::Cache;
+        for layout in [Layout::Board, Layout::List] {
+            for primary_pull_request in [false, true] {
+                let mut a = native_work_item("same-branch", "workspace");
+                if primary_pull_request {
+                    a.worktree = None;
+                    a.pull_request = Some(request(42));
+                }
+                let mut b = a.clone();
+                if primary_pull_request {
+                    b.pull_request = Some(request(43));
+                } else {
+                    b.worktree.as_mut().unwrap().path = "/fixture/workspace/new-target".into();
+                }
+                assert_eq!(CardRef::of(&a), CardRef::of(&b));
+                let mut state = State::default();
+                state.update(Action::Layout(layout));
+                watched(&mut state, 1, board(vec![a]));
+                let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+                let mut ui = cached_work_ui(&state, Cache::new(), &mut renderer);
+                let point = first_open_bounds(&ui, "Open same-branch").center();
+                assert!(
+                    retained_work_events(
+                        &mut ui,
+                        &mut renderer,
+                        point,
+                        &[Event::ButtonPressed(Button::Left)]
+                    )
+                    .is_empty()
+                );
+                let cache = ui.into_cache();
+                watched(&mut state, 2, board(vec![b.clone()]));
+                let mut ui = cached_work_ui(&state, cache, &mut renderer);
+                assert!(first_open_bounds(&ui, "Open same-branch").contains(point));
+                let release = retained_work_events(
+                    &mut ui,
+                    &mut renderer,
+                    point,
+                    &[Event::ButtonReleased(Button::Left)],
+                );
+                assert!(
+                    release.is_empty(),
+                    "same card retarget in {layout:?}: {release:?}"
+                );
+                let fresh = click_work(&mut ui, &mut renderer, point);
+                drop(ui);
+                assert!(
+                    matches!(fresh.as_slice(), [Action::Activate(a)] if Some(a) == Activation::primary(&b, state.lifetime).as_ref()),
+                    "{fresh:?}"
+                );
+                let effect = state.update(fresh.into_iter().next().unwrap());
+                if primary_pull_request {
+                    assert!(
+                        matches!(effect, Some(Effect::OpenPullRequest { number: 43, ref url, .. }) if url == &b.pull_request.as_ref().unwrap().url)
+                    );
+                } else {
+                    assert!(
+                        matches!(effect, Some(Effect::OpenWorktree { ref path, .. }) if path == &b.worktree.as_ref().unwrap().path)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn changed_secondary_menu_destinations_cannot_adopt_native_presses_or_queued_actions() {
+        use iced::mouse::{Button, Event};
+        for label in [
+            "Open worktree",
+            "Open pull request",
+            "Open Linear issue",
+            "Copy branch name",
+        ] {
+            let mut a = native_work_item("same-branch", "workspace");
+            a.pull_request = Some(request(42));
+            a.linear = Some(crate::work::LinearTicket {
+                identifier: Some("FIX-1".into()),
+                title: None,
+                url: Some("https://linear.app/fixture/issue/FIX-1".into()),
+                source: crate::work::TicketSource::Link,
+            });
+            let mut b = a.clone();
+            match label {
+                "Open worktree" => {
+                    b.worktree.as_mut().unwrap().path = "/fixture/workspace/other-target".into()
+                }
+                "Open pull request" => b.pull_request = Some(request(43)),
+                "Open Linear issue" => {
+                    b.linear.as_mut().unwrap().url =
+                        Some("https://linear.app/fixture/issue/FIX-2".into())
+                }
+                _ => b.branch = Some("new-branch-name".into()),
+            }
+            let lifetime = ActivationLifetime::default();
+            if label != "Open worktree" {
+                assert_eq!(
+                    Activation::primary(&a, lifetime),
+                    Activation::primary(&b, lifetime),
+                    "secondary change must not reset outer button"
+                );
+            }
+            let mut state = State::default();
+            watched(&mut state, 1, board(vec![a]));
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let cache = open_native_menu(&mut state, &mut renderer);
+            let mut ui = cached_work_ui(&state, cache, &mut renderer);
+            let point = popup_button_bounds(&mut ui, &renderer, label).center();
+            // Capture a real emitted action, but delay delivery to the reducer.
+            let queued = click_work(&mut ui, &mut renderer, point);
+            assert!(
+                matches!(queued.as_slice(), [Action::Activate(_)]),
+                "{label}: {queued:?}"
+            );
+            assert!(
+                retained_work_events(
+                    &mut ui,
+                    &mut renderer,
+                    point,
+                    &[Event::ButtonPressed(Button::Left)]
+                )
+                .is_empty()
+            );
+            let cache = ui.into_cache();
+            watched(&mut state, 2, board(vec![b.clone()]));
+            let mut ui = cached_work_ui(&state, cache, &mut renderer);
+            assert!(popup_button_bounds(&mut ui, &renderer, label).contains(point));
+            let release = retained_work_events(
+                &mut ui,
+                &mut renderer,
+                point,
+                &[Event::ButtonReleased(Button::Left)],
+            );
+            assert!(
+                release.is_empty(),
+                "{label} replacement adopted a press: {release:?}"
+            );
+            let fresh = click_work(&mut ui, &mut renderer, point);
+            drop(ui);
+            let menu = state.menu.clone();
+            assert!(state.update(queued.into_iter().next().unwrap()).is_none());
+            assert_eq!(
+                state.menu, menu,
+                "stale action must not close current popup"
+            );
+            assert!(
+                matches!(fresh.as_slice(), [Action::Activate(_)]),
+                "{label}: {fresh:?}"
+            );
+            let effect = state.update(fresh.into_iter().next().unwrap());
+            match label {
+                "Open worktree" => assert!(
+                    matches!(effect, Some(Effect::OpenWorktree {ref path,..}) if path == &b.worktree.as_ref().unwrap().path)
+                ),
+                "Open pull request" => assert!(matches!(
+                    effect,
+                    Some(Effect::OpenPullRequest { number: 43, .. })
+                )),
+                "Open Linear issue" => assert!(
+                    matches!(effect, Some(Effect::OpenUrl(ref url)) if Some(url) == b.linear.as_ref().unwrap().url.as_ref())
+                ),
+                _ => assert!(
+                    matches!(effect, Some(Effect::Copy(ref branch)) if Some(branch) == b.branch.as_ref())
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn reordered_footer_sessions_keep_native_press_and_queued_focus_with_exact_session() {
+        use iced::mouse::{Button, Event};
+        use iced::runtime::user_interface::Cache;
+        let mut a = native_work_item("same-branch", "workspace");
+        let one = TerminalId::new();
+        let two = TerminalId::new();
+        a.sessions = [one, two]
+            .into_iter()
+            .enumerate()
+            .map(|(i, id)| crate::work::Session {
+                id,
+                provider: None,
+                title: Some(format!("Session {}", i + 1)),
+                state: ActivityState::Waiting,
+            })
+            .collect();
+        let mut b = a.clone();
+        b.sessions.swap(0, 1);
+        let mut state = State::default();
+        watched(&mut state, 1, board(vec![a.clone()]));
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut ui = cached_work_ui(&state, Cache::new(), &mut renderer);
+        let point = first_open_bounds(&ui, "Focus Session 1").center();
+        let queued = click_work(&mut ui, &mut renderer, point);
+        assert!(
+            matches!(queued.as_slice(), [Action::Activate(a)] if a.destination == Destination::Session(one)),
+            "footer must not bubble Open: {queued:?}"
+        );
+        assert!(
+            retained_work_events(
+                &mut ui,
+                &mut renderer,
+                point,
+                &[Event::ButtonPressed(Button::Left)]
+            )
+            .is_empty()
+        );
+        let cache = ui.into_cache();
+        watched(&mut state, 2, board(vec![b.clone()]));
+        let mut ui = cached_work_ui(&state, cache, &mut renderer);
+        assert!(first_open_bounds(&ui, "Focus Session 2").contains(point));
+        let release = retained_work_events(
+            &mut ui,
+            &mut renderer,
+            point,
+            &[Event::ButtonReleased(Button::Left)],
+        );
+        assert!(
+            release.is_empty(),
+            "footer replacement adopted press/bubbled Open: {release:?}"
+        );
+        let fresh = click_work(&mut ui, &mut renderer, point);
+        drop(ui);
+        assert!(
+            matches!(fresh.as_slice(), [Action::Activate(a)] if a.destination == Destination::Session(two)),
+            "fresh exact session: {fresh:?}"
+        );
+        assert!(
+            matches!(state.update(fresh.into_iter().next().unwrap()), Some(Effect::FocusSession(id)) if id == two)
+        );
+        // Reorder preserves original membership; the queued S1 still names S1.
+        assert!(
+            matches!(state.update(queued[0].clone()), Some(Effect::FocusSession(id)) if id == one)
+        );
+        b.sessions.retain(|session| session.id != one);
+        watched(&mut state, 3, board(vec![b]));
+        assert!(state.update(queued.into_iter().next().unwrap()).is_none());
+    }
+
+    #[test]
+    fn queued_primary_actions_refuse_missing_or_changed_destinations_without_fallback() {
+        use iced::runtime::user_interface::Cache;
+        for kind in [0, 1, 2, 3, 4] {
+            let mut a = native_work_item("same-branch", "workspace");
+            if kind >= 2 {
+                a.worktree = None;
+                a.pull_request = Some(request(42));
+            }
+            let mut state = State::default();
+            watched(&mut state, 1, board(vec![a.clone()]));
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let mut ui = cached_work_ui(&state, Cache::new(), &mut renderer);
+            let point = first_open_bounds(&ui, "Open same-branch").center();
+            let queued = click_work(&mut ui, &mut renderer, point);
+            drop(ui);
+            assert!(
+                matches!(queued.as_slice(), [Action::Activate(_)]),
+                "{queued:?}"
+            );
+            let mut b = a.clone();
+            match kind {
+                0 => b.worktree.as_mut().unwrap().path = "/fixture/retarget".into(),
+                1 => {} // card removed below
+                2 => b
+                    .pull_request
+                    .as_mut()
+                    .unwrap()
+                    .url
+                    .push_str("?different-target"),
+                3 => b.worktree = native_work_item("other-target", "workspace").worktree,
+                _ => {
+                    b.comparison.as_mut().unwrap().ahead += 1;
+                    b.pull_request
+                        .as_mut()
+                        .unwrap()
+                        .title
+                        .push_str(" refreshed");
+                }
+            }
+            watched(
+                &mut state,
+                2,
+                board(if kind == 1 { vec![] } else { vec![b] }),
+            );
+            let effect = state.update(queued.into_iter().next().unwrap());
+            if kind == 4 {
+                assert!(
+                    matches!(effect, Some(Effect::OpenPullRequest { number: 42, .. })),
+                    "same target must survive unrelated metadata"
+                );
+            } else {
+                assert!(
+                    effect.is_none(),
+                    "queued kind {kind} redirected: {effect:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn queued_activations_cannot_cross_a_reset_and_identical_board_reopen() {
+        use iced::runtime::user_interface::Cache;
+        let a = native_work_item("same-branch", "workspace");
+        let mut state = State::default();
+        watched(&mut state, 1, board(vec![a.clone()]));
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut ui = cached_work_ui(&state, Cache::new(), &mut renderer);
+        let point = first_open_bounds(&ui, "Open same-branch").center();
+        let old = click_work(&mut ui, &mut renderer, point);
+        let cache = ui.into_cache();
+        assert!(matches!(old.as_slice(), [Action::Activate(_)]), "{old:?}");
+        let lifetime = state.lifetime;
+        state.reset();
+        watched(&mut state, 1, board(vec![a.clone()]));
+        assert_ne!(state.lifetime, lifetime);
+        assert!(state.update(old.into_iter().next().unwrap()).is_none());
+        let mut ui = cached_work_ui(&state, cache, &mut renderer);
+        let point = first_open_bounds(&ui, "Open same-branch").center();
+        let fresh = click_work(&mut ui, &mut renderer, point);
+        drop(ui);
+        assert_native_open(&mut state, fresh, &a);
+    }
+
+    #[test]
+    fn unchanged_secondary_destinations_keep_native_presses_through_metadata_updates() {
+        use iced::mouse::{Button, Event};
+        use iced::runtime::user_interface::Cache;
+        for popup in [false, true] {
+            let mut a = native_work_item("same-branch", "workspace");
+            a.pull_request = Some(request(42));
+            let id = TerminalId::new();
+            a.sessions.push(crate::work::Session {
+                id,
+                provider: None,
+                title: Some("Session".into()),
+                state: ActivityState::Waiting,
+            });
+            let mut b = a.clone();
+            b.pull_request
+                .as_mut()
+                .unwrap()
+                .title
+                .push_str(" refreshed");
+            b.sessions[0].title = Some("Renamed session".into());
+            b.sessions[0].state = ActivityState::Idle;
+            b.comparison.as_mut().unwrap().ahead += 1;
+            let mut state = State::default();
+            watched(&mut state, 1, board(vec![a]));
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let cache = if popup {
+                open_native_menu(&mut state, &mut renderer)
+            } else {
+                Cache::new()
+            };
+            let mut ui = cached_work_ui(&state, cache, &mut renderer);
+            let point = if popup {
+                popup_button_bounds(&mut ui, &renderer, "Open pull request").center()
+            } else {
+                first_open_bounds(&ui, "Focus Session").center()
+            };
+            assert!(
+                retained_work_events(
+                    &mut ui,
+                    &mut renderer,
+                    point,
+                    &[Event::ButtonPressed(Button::Left)]
+                )
+                .is_empty()
+            );
+            let cache = ui.into_cache();
+            watched(&mut state, 2, board(vec![b]));
+            let mut ui = cached_work_ui(&state, cache, &mut renderer);
+            let bounds = if popup {
+                popup_button_bounds(&mut ui, &renderer, "Open pull request")
+            } else {
+                first_open_bounds(&ui, "Focus Renamed session")
+            };
+            assert!(bounds.contains(point));
+            let release = retained_work_events(
+                &mut ui,
+                &mut renderer,
+                point,
+                &[Event::ButtonReleased(Button::Left)],
+            );
+            drop(ui);
+            assert!(
+                matches!(release.as_slice(), [Action::Activate(_)]),
+                "same target native state must survive: {release:?}"
+            );
+            let effect = state.update(release.into_iter().next().unwrap());
+            if popup {
+                assert!(matches!(
+                    effect,
+                    Some(Effect::OpenPullRequest { number: 42, .. })
+                ));
+            } else {
+                assert!(matches!(effect, Some(Effect::FocusSession(actual)) if actual == id));
+            }
+        }
+    }
+
+    #[test]
+    fn inserted_menu_rows_cannot_transfer_a_native_pin_to_another_column() {
+        use iced::mouse::{Button, Event};
+        for change in ["insert row", "reconnect", "lost", "metadata"] {
+            let a = native_work_item("same-branch", "workspace");
+            let mut b = a.clone();
+            if change == "insert row" {
+                b.pull_request = Some(request(42));
+            }
+            if change == "metadata" {
+                b.comparison.as_mut().unwrap().ahead += 1;
+            }
+            let mut state = State::default();
+            state.update(Action::Layout(Layout::List));
+            watched(&mut state, 1, board(vec![a]));
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let cache = open_native_menu(&mut state, &mut renderer);
+            let mut ui = cached_work_ui(&state, cache, &mut renderer);
+            let point = popup_button_bounds(&mut ui, &renderer, "In review").center();
+            assert!(
+                retained_work_events(
+                    &mut ui,
+                    &mut renderer,
+                    point,
+                    &[Event::ButtonPressed(Button::Left)]
+                )
+                .is_empty()
+            );
+            let cache = ui.into_cache();
+            let activation_lifetime = state.lifetime;
+            let pin_lifetime = state.pins.lifetime;
+            if change == "lost" {
+                state.update(Action::Watched(Watch::Lost("fixture watch lost".into())));
+            }
+            if change == "reconnect" {
+                connected(&mut state, 1, board(vec![b.clone()]));
+            } else {
+                watched(&mut state, 2, board(vec![b.clone()]));
+            }
+            assert_eq!(
+                state.lifetime, activation_lifetime,
+                "watch changes do not retire destination activations"
+            );
+            if matches!(change, "reconnect" | "lost") {
+                assert_ne!(state.pins.lifetime, pin_lifetime);
+            } else {
+                assert_eq!(state.pins.lifetime, pin_lifetime);
+            }
+            let mut ui = cached_work_ui(&state, cache, &mut renderer);
+            let replacement_column = if change == "insert row" {
+                Column::InProgress
+            } else {
+                Column::InReview
+            };
+            let replacement = popup_button_bounds(&mut ui, &renderer, replacement_column.label());
+            assert!(
+                replacement.contains(point),
+                "{change}: actual replacement must remain at oldpoint: {replacement:?} {point:?}"
+            );
+            let release = retained_work_events(
+                &mut ui,
+                &mut renderer,
+                point,
+                &[Event::ButtonReleased(Button::Left)],
+            );
+            if change == "metadata" {
+                assert!(
+                    matches!(release.as_slice(), [Action::Pin(card, Some(Column::InReview))] if card == &CardRef::of(&b)),
+                    "ordinary same-owner metadata Watch must keep held positive: {release:?}"
+                );
+            } else {
+                assert!(
+                    release.is_empty(),
+                    "{change}: retired pin native owner adopted press: {release:?}"
+                );
+            }
+            let fresh_replacement = click_work(&mut ui, &mut renderer, point);
+            assert!(
+                matches!(fresh_replacement.as_slice(), [Action::Pin(card, Some(column))] if card == &CardRef::of(&b) && *column == replacement_column),
+                "{fresh_replacement:?}"
+            );
+            let intended = popup_button_bounds(&mut ui, &renderer, "In review").center();
+            let fresh = click_work(&mut ui, &mut renderer, intended);
+            drop(ui);
+            assert!(
+                matches!(fresh.as_slice(), [Action::Pin(card, Some(Column::InReview))] if card == &CardRef::of(&b)),
+                "{fresh:?}"
+            );
+            assert!(matches!(
+                state.update(fresh.into_iter().next().unwrap()),
+                Some(Effect::Pin {
+                    column: Some(Column::InReview),
+                    ..
+                })
+            ));
+            // Existing Pin callbacks/reducer are unchanged. This checks local
+            // native ownership only, not queued Pin or server request ordering.
+        }
     }
 
     #[test]
