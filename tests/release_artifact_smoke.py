@@ -196,16 +196,20 @@ class SmokeBoundary(unittest.TestCase):
         cache.mkdir(mode=0o700)
         digest = "6bc2cde3930ad088b3bb46fa45279e96d25bc3810f209850ecbe4722711874f9"
         marker = cache / ".cagents-release-smoke-cache"
-        old = f"cagents-release-smoke-v1 ubuntu-24.04.3 amd64 {digest}\n"
+        old = f"cagents-release-smoke-v2 ubuntu-24.04.3 amd64 {digest}\n"
         marker.write_text(old)
         root = cache / "rootfs"
         root.mkdir()
+        (root / "opt").mkdir()
+        provision_marker = root / "opt/.cagents-release-smoke-provisioned-v2"
+        provision_marker.write_text(old)
         sentinel = root / "existing-data"
         sentinel.write_text("preserve\n")
         result = self.invoke(PREPARE, ["--cache", str(cache)])
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cache marker does not match", result.stderr)
         self.assertEqual(marker.read_text(), old)
+        self.assertEqual(provision_marker.read_text(), old)
         self.assertEqual(sentinel.read_text(), "preserve\n")
         self.assertEqual(self.recorded(), [])
         self.assertFalse(self.network_calls.exists())
@@ -215,7 +219,7 @@ class SmokeBoundary(unittest.TestCase):
         cache.mkdir(mode=0o700)
         digest = "6bc2cde3930ad088b3bb46fa45279e96d25bc3810f209850ecbe4722711874f9"
         (cache / ".cagents-release-smoke-cache").write_text(
-            f"cagents-release-smoke-v2 ubuntu-24.04.3 amd64 {digest}\n"
+            f"cagents-release-smoke-v3 ubuntu-24.04.3 amd64 {digest}\n"
         )
         with (cache / ".lock").open("w") as held:
             fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
