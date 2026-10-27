@@ -14,7 +14,11 @@ pub enum DocumentLink {
 /// Parse coding-agent coordinates on bare paths, preserving URI query and fragment data.
 pub fn file_position(target: &str) -> (&str, Option<String>) {
     if target.contains("://")
-        || target.starts_with("mailto:")
+        || target.split_once(':').is_some_and(|(scheme, _)| {
+            ["http", "https", "file", "mailto"]
+                .iter()
+                .any(|known| scheme.eq_ignore_ascii_case(known))
+        })
         || target.contains('#')
         || target.contains('?')
     {
@@ -93,6 +97,38 @@ mod tests {
             assert_eq!(file_position(target), (target, None));
         }
     }
+    #[test]
+    fn coding_agent_coordinates_preserve_explicit_schemes_without_authority() {
+        // These are URI schemes even without `://`. Numeric tail bytes belong
+        // to the URI, including a literal colon in an absolute file path.
+        for target in [
+            "http:example.test:8443",
+            "HTTPS:example.test:8443",
+            "file:/repo/report.txt:12:3",
+            "FILE:/repo/report.txt:12:3",
+            "mailto:person@example.test:42",
+            "MAILTO:person@example.test:42",
+        ] {
+            assert_eq!(file_position(target), (target, None), "{target}");
+        }
+        for target in ["file:/repo/report.txt:12:3", "FILE:/repo/report.txt:12:3"] {
+            assert_eq!(
+                resolve(Path::new("/repo/source.md"), target).unwrap(),
+                DocumentLink::Local {
+                    path: "/repo/report.txt:12:3".into(),
+                    fragment: None,
+                },
+                "{target}"
+            );
+        }
+        // Scheme-looking basename coordinates remain the supported bare-path
+        // grammar; recognizing every URL-parsable prefix would swallow these.
+        assert_eq!(
+            file_position("main.rs:12:3"),
+            ("main.rs", Some("L12:3".into()))
+        );
+    }
+
     #[test]
     fn coding_agent_coordinates_preserve_uri_query_and_fragment_boundaries() {
         for target in [

@@ -769,12 +769,14 @@ mod tests {
         let source = directory.path().join("source.md");
         let target = directory.path().join("target.txt");
         let encoded_name = directory.path().join("target#part?.txt");
+        let numeric_name = directory.path().join("target.txt:12:3");
         let text: String = (1..=16)
             .map(|line| format!("line {line:02} content\n"))
             .collect();
         std::fs::write(&source, "[target](target.txt#L12:3)\n").unwrap();
         std::fs::write(&target, &text).unwrap();
         std::fs::write(&encoded_name, &text).unwrap();
+        std::fs::write(&numeric_name, &text).unwrap();
         let file_url = Url::from_file_path(&target).unwrap();
         for (uri, expected_path, line, column) in [
             ("target.txt#L12:3".to_owned(), &target, 11, 2),
@@ -784,6 +786,18 @@ mod tests {
             ("target.txt?revision=7:3".to_owned(), &target, 0, 0),
             ("target.txt?revision=7:3#L12:3".to_owned(), &target, 11, 2),
             ("target%23part%3F.txt:12:3".to_owned(), &encoded_name, 11, 2),
+            (
+                format!("file:{}", numeric_name.display()),
+                &numeric_name,
+                0,
+                0,
+            ),
+            (
+                format!("FILE:{}", numeric_name.display()),
+                &numeric_name,
+                0,
+                0,
+            ),
         ] {
             let mut app = app();
             let terminal = app.workspace.focused().unwrap();

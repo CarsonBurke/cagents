@@ -181,6 +181,25 @@ mod tests {
     }
 
     #[test]
+    fn review_artifact_file_schemes_keep_literal_numeric_filename_suffixes() {
+        use crate::document_link::{self, DocumentLink};
+        let source = std::path::Path::new("/producer/worktree/.chat");
+        for uri in ["file:/repo/report.txt:12:3", "FILE:/repo/report.txt:12:3"] {
+            let extracted = links(&question(&format!("[source]({uri})")));
+            assert_eq!(extracted, [("source".to_owned(), uri.to_owned())]);
+            let (destination, position) = document_link::file_position(&extracted[0].1);
+            assert_eq!(position, None, "a URI filename suffix is not a caret jump");
+            assert_eq!(
+                document_link::resolve(source, destination).unwrap(),
+                DocumentLink::Local {
+                    path: "/repo/report.txt:12:3".into(),
+                    fragment: None,
+                }
+            );
+        }
+    }
+
+    #[test]
     fn review_artifact_coordinate_admission_preserves_url_and_shorthand_guards() {
         let web = "https://example.test:8443/report";
         let literal = "file:///producer/literal%2A.rs#L42";
