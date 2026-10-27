@@ -192,7 +192,11 @@ impl Cagents {
             Action::Cancel if self.session_recovery.open() && !self.session_recovery.pending => {
                 self.close_session_recovery()
             }
-            Action::Confirm if self.session_recovery.open() && !self.session_recovery.pending => {
+            Action::Confirm
+                if self.session_recovery.open()
+                    && !self.session_recovery.pending
+                    && !self.session_recovery_is_covered() =>
+            {
                 let Some(review) = self.session_recovery.review.clone() else {
                     return Task::none();
                 };
@@ -243,13 +247,26 @@ impl Cagents {
         }
     }
 
+    fn session_recovery_is_covered(&self) -> bool {
+        #[cfg(feature = "integrated-browser")]
+        if self.browser_import.open() {
+            return true;
+        }
+        self.automation_approval_open()
+            || self.transient_work_close.is_some()
+            || self.automation_ui.draft_dialog_open()
+            || self.device_ui.open
+            || self.chat_ui.image_viewer.is_some()
+            || self.terminal_paste.is_some()
+    }
+
     pub(super) fn focus_session_recovery_after_cover(&mut self) -> Task<Message> {
         self.session_recovery.focus = 0;
         self.focus_session_recovery_if_exposed()
     }
 
     fn focus_session_recovery_if_exposed(&self) -> Task<Message> {
-        if self.device_ui.open {
+        if self.session_recovery_is_covered() {
             Task::none()
         } else {
             recovery_focus(&self.session_recovery, 0)
@@ -264,7 +281,7 @@ impl Cagents {
         if let Some(restore) = self.session_recovery.restore_keyboard_nav.take() {
             self.core.set_keyboard_nav(restore);
         }
-        if self.device_ui.open {
+        if self.session_recovery_is_covered() {
             return Task::none();
         }
         let target = self
@@ -295,7 +312,7 @@ impl Cagents {
         event: &keyboard::Event,
         captured: bool,
     ) -> Option<Task<Message>> {
-        if !self.session_recovery.open() {
+        if !self.session_recovery.open() || self.session_recovery_is_covered() {
             return None;
         }
         let keyboard::Event::KeyPressed {
@@ -592,40 +609,116 @@ mod tests {
     }
 
     #[test]
-    fn session_recovery_completions_do_not_focus_beneath_device_files() {
-        let (_directory, mut app, card) = fixture();
-        drop(app.update_session_recovery(Action::Open(card)));
-        app.device_ui.open = true;
-        let task = app.update(Message::SessionRecovery(Action::Prepared {
-            generation: app.session_recovery.generation,
-            result: Err("fixture preparation error".into()),
-        }));
-        assert!(iced::runtime::task::into_stream(task).is_none());
-        assert_eq!(
-            app.session_recovery.error.as_deref(),
-            Some("fixture preparation error")
-        );
-        assert!(app.device_ui.open);
-        app.session_recovery.pending = true;
-        let task = app.update(Message::SessionRecovery(Action::Finished(Err(
-            "fixture write error".into(),
-        ))));
-        assert!(iced::runtime::task::into_stream(task).is_none());
-        assert!(app.session_recovery.open());
-        assert!(app.device_ui.open);
-        app.session_recovery.pending = true;
-        let task = app.update(Message::SessionRecovery(Action::Finished(Ok(()))));
-        assert!(iced::runtime::task::into_stream(task).is_none());
-        assert!(!app.session_recovery.open());
-        assert!(app.device_ui.open);
-        // Explicit cancellation follows the same covered-close focus rule.
-        app.device_ui.open = false;
-        drop(app.update_session_recovery(Action::Open(card)));
-        app.device_ui.open = true;
-        let task = app.update(Message::SessionRecovery(Action::Cancel));
-        assert!(iced::runtime::task::into_stream(task).is_none());
-        assert!(!app.session_recovery.open());
-        assert!(app.device_ui.open);
+    fn modal_gallery_keeps_covered_recovery_keys_actions_and_focus_unchanged() {
+        for captured in [false, true] {
+            let (_directory, mut app, card) = fixture();
+            let prepared = reply(app.update_session_recovery(Action::Open(card)));
+            drop(app.update(prepared));
+            drop(app.session_recovery_key_event(&key(keyboard::key::Named::Tab, false), false));
+            assert_eq!(app.session_recovery.focus, 1);
+            let review = app.session_recovery.review.clone();
+            let before = Arc::clone(&app.durable);
+            app.chat_ui.image_viewer = Some(chat_ui::images::Gallery::file(
+                "/fixture/public-image.png".into(),
+                None,
+                iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
+            ));
+            for named in [
+                keyboard::key::Named::Tab,
+                keyboard::key::Named::Enter,
+                keyboard::key::Named::Escape,
+            ] {
+                assert!(
+                    app.session_recovery_key_event(&key(named, false), captured)
+                        .is_none()
+                );
+            }
+            assert!(
+                iced::runtime::task::into_stream(app.update_session_recovery(Action::Confirm))
+                    .is_none()
+            );
+            assert!(!app.session_recovery.pending);
+            assert_eq!(app.session_recovery.review, review);
+            assert_eq!(app.session_recovery.focus, 1);
+            assert_eq!(app.durable, before);
+            assert!(
+                iced::runtime::task::into_stream(app.focus_session_recovery_if_exposed()).is_none()
+            );
+            drop(app.update(Message::KeyEvent {
+                event: key(keyboard::key::Named::Escape, false),
+                captured,
+            }));
+            assert!(app.chat_ui.image_viewer.is_none());
+            assert!(app.session_recovery.open());
+            assert_eq!(app.session_recovery.review, review);
+            // A fresh explicit choice still works after the viewer retires.
+            let navigation = app
+                .session_recovery_key_event(&key(keyboard::key::Named::Tab, false), false)
+                .unwrap();
+            assert_eq!(app.session_recovery.focus, 0);
+            assert_eq!(
+                super::super::tests::focused_element(
+                    app.session_recovery_dialog().unwrap(),
+                    navigation,
+                ),
+                Some(widget::Id::new("session-recovery.cancel")),
+            );
+            drop(app.session_recovery_key_event(&key(keyboard::key::Named::Enter, false), false));
+            assert!(!app.session_recovery.open());
+            assert_eq!(app.durable, before);
+        }
+    }
+
+    #[test]
+    fn session_recovery_completions_do_not_focus_beneath_device_or_gallery() {
+        for gallery in [false, true] {
+            let cover = |app: &mut Cagents, open: bool| {
+                if gallery {
+                    app.chat_ui.image_viewer = open.then(|| {
+                        chat_ui::images::Gallery::file(
+                            "/fixture/public-image.png".into(),
+                            None,
+                            iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
+                        )
+                    });
+                } else {
+                    app.device_ui.open = open;
+                }
+            };
+            let (_directory, mut app, card) = fixture();
+            drop(app.update_session_recovery(Action::Open(card)));
+            cover(&mut app, true);
+            let task = app.update(Message::SessionRecovery(Action::Prepared {
+                generation: app.session_recovery.generation,
+                result: Err("fixture preparation error".into()),
+            }));
+            assert!(iced::runtime::task::into_stream(task).is_none());
+            assert_eq!(
+                app.session_recovery.error.as_deref(),
+                Some("fixture preparation error")
+            );
+            assert!(app.session_recovery_is_covered());
+            app.session_recovery.pending = true;
+            let task = app.update(Message::SessionRecovery(Action::Finished(Err(
+                "fixture write error".into(),
+            ))));
+            assert!(iced::runtime::task::into_stream(task).is_none());
+            assert!(app.session_recovery.open());
+            assert!(app.session_recovery_is_covered());
+            app.session_recovery.pending = true;
+            let task = app.update(Message::SessionRecovery(Action::Finished(Ok(()))));
+            assert!(iced::runtime::task::into_stream(task).is_none());
+            assert!(!app.session_recovery.open());
+            assert!(app.session_recovery_is_covered());
+            // Explicit cancellation follows the same covered-close focus rule.
+            cover(&mut app, false);
+            drop(app.update_session_recovery(Action::Open(card)));
+            cover(&mut app, true);
+            let task = app.update(Message::SessionRecovery(Action::Cancel));
+            assert!(iced::runtime::task::into_stream(task).is_none());
+            assert!(!app.session_recovery.open());
+            assert!(app.session_recovery_is_covered());
+        }
     }
 
     #[test]
