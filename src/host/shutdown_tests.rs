@@ -8,7 +8,6 @@ use std::{
     fs::File,
     os::fd::{AsRawFd, FromRawFd},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
     sync::mpsc,
     time::{Duration, Instant},
 };
@@ -16,120 +15,765 @@ use std::{
 const ROOT: &str = "CAGENTS_SHUTDOWN_BATCH_ROOT";
 const SCOPE: &str = "CAGENTS_SHUTDOWN_BATCH_AUTHORITY_PRESENCE";
 
-struct TestChild(Child);
+// The guardian is another exact-test process, not a shared-libtest subreaper.
+mod fixture {
+    use super::{ROOT, SCOPE};
+    use std::{
+        fs::{self, File, OpenOptions},
+        io::{self, Read, Write},
+        net::Shutdown,
+        os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::{
+                fs::{OpenOptionsExt, PermissionsExt},
+                net::UnixStream,
+                process::CommandExt,
+            },
+        },
+        path::{Path, PathBuf},
+        process::{Child, Command, ExitStatus, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
 
-impl Drop for TestChild {
-    fn drop(&mut self) {
-        if self.0.try_wait().ok().flatten().is_none() {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+    const SPEC: &str = "CAGENTS_SHUTDOWN_GUARDIAN_SPEC";
+    const CONTROL: &str = "CAGENTS_SHUTDOWN_GUARDIAN_CONTROL";
+    const GUARDIAN: &str = "host::shutdown_tests::fixture::guardian";
+    const BODY_CONTROL: &str = "host::shutdown_tests::fixture::body_control";
+    const LIMIT: Duration = Duration::from_secs(30);
+    const CAPTURE_LIMIT: u64 = 256 * 1024;
+    const RECEIPT_LIMIT: u64 = 16 * 1024;
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Spec {
+        test: String,
+        control: Option<String>,
+        owner_fd: i32,
+        deadline_ns: u64,
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Receipt {
+        version: u8,
+        test: String,
+        guardian: u32,
+        body: u32,
+        body_success: bool,
+        cancelled: bool,
+        descendants_reaped: usize,
+    }
+
+    // Only constructed after the exact original guardian has been reaped and
+    // its receipt matches this run. A failed body can settle without passing.
+    struct Settlement {
+        root: PathBuf,
+        receipt: Receipt,
+    }
+
+    struct EvidenceDirectory(Option<PathBuf>);
+    impl EvidenceDirectory {
+        fn remove_after_assertions(mut self, proof: &Settlement) {
+            assert_eq!(self.0.as_ref(), Some(&proof.root));
+            let root = self.0.take().unwrap();
+            fs::remove_dir_all(&root).unwrap_or_else(|error| {
+                panic!(
+                    "removing settled shutdown fixture {}; remaining evidence retained: {error}",
+                    root.display()
+                )
+            });
+            eprintln!("Removed settled shutdown fixture: {}", root.display());
         }
     }
-}
-
-// Keep private runtime paths and captured child output until the external
-// command owner has checked the whole family, on success as well as failure.
-struct EvidenceDirectory(Option<tempfile::TempDir>);
-
-impl Drop for EvidenceDirectory {
-    fn drop(&mut self) {
-        if let Some(directory) = self.0.take() {
-            let _retained = directory.keep();
+    impl Drop for EvidenceDirectory {
+        fn drop(&mut self) {
+            if let Some(root) = self.0.take() {
+                eprintln!("Retained shutdown fixture: {}", root.display());
+            }
         }
+    }
+
+    fn directory() -> (EvidenceDirectory, PathBuf) {
+        // Honour the command owner's legitimate non-repository TMPDIR and its
+        // short socket paths. Never sweep any directory from an earlier run.
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let _retained = directory.keep();
+        let evidence = EvidenceDirectory(Some(root.clone()));
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        for name in ["home", "run", "data", "config", "cache", "tmp"] {
+            fs::create_dir(root.join(name)).unwrap();
+            fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        (evidence, root)
+    }
+
+    fn capture(path: &Path) -> File {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap()
+    }
+
+    fn monotonic_ns() -> u64 {
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) },
+            0
+        );
+        (now.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(now.tv_nsec as u64)
+    }
+
+    // EOF means the owner timed out, unwound, or exited. The descriptor is
+    // CLOEXEC in the guardian before it starts the body, so no body can keep
+    // this ownership channel alive. No message contains delegation authority.
+    fn owner_cancelled(owner: &mut UnixStream, deadline_ns: u64) -> io::Result<bool> {
+        if monotonic_ns() >= deadline_ns {
+            return Ok(true);
+        }
+        let mut byte = [0];
+        loop {
+            match owner.read(&mut byte) {
+                Ok(_) => return Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    if monotonic_ns() >= deadline_ns {
+                        return Ok(true);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    struct Body(Child);
+    impl Drop for Body {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    struct Guardian {
+        child: Child,
+        owner: UnixStream,
+        reaped: bool,
+    }
+    impl Guardian {
+        fn cancel_and_reap(&mut self) -> io::Result<ExitStatus> {
+            // The guardian kills/reaps its original BODY Child. Killing only
+            // the guardian at this boundary would abandon that live body.
+            let _ = self.owner.shutdown(Shutdown::Write);
+            let status = self.child.wait()?;
+            self.reaped = true;
+            Ok(status)
+        }
+    }
+    impl Drop for Guardian {
+        fn drop(&mut self) {
+            if !self.reaped {
+                let _ = self.cancel_and_reap();
+            }
+        }
+    }
+
+    struct Run {
+        guardian: u32,
+        status: ExitStatus,
+        timed_out: bool,
+        guardian_stdout: String,
+        guardian_stderr: String,
+        stdout: String,
+        stderr: String,
+        capture_errors: Vec<String>,
+    }
+    impl Run {
+        fn settlement(&self, root: &Path, test: &str) -> Result<Settlement, String> {
+            let bytes = read_bounded(root, "family-settled.json", RECEIPT_LIMIT)
+                .map_err(|error| format!("unreadable family settlement receipt: {error}"))?;
+            let receipt: Receipt = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("invalid family settlement receipt: {error}"))?;
+            if receipt.version != 1
+                || receipt.test != test
+                || receipt.guardian != self.guardian
+                || receipt.body <= 1
+                || receipt.body == receipt.guardian
+            {
+                return Err("family settlement receipt does not identify this run".into());
+            }
+            Ok(Settlement {
+                root: root.to_owned(),
+                receipt,
+            })
+        }
+
+        fn success(&self, root: &Path, test: &str) -> Result<Settlement, String> {
+            let proof = self.settlement(root, test)?;
+            if !self.capture_errors.is_empty() {
+                return Err(format!(
+                    "shutdown capture failed: {:?}",
+                    self.capture_errors
+                ));
+            }
+            if self.timed_out
+                || !self.status.success()
+                || !proof.receipt.body_success
+                || proof.receipt.cancelled
+            {
+                return Err(
+                    "shutdown guardian or body failed or exceeded the original 30s budget".into(),
+                );
+            }
+            if !self
+                .guardian_stdout
+                .contains(&format!("test {GUARDIAN} ... ok"))
+                || !self
+                    .guardian_stdout
+                    .contains("test result: ok. 1 passed; 0 failed; 0 ignored;")
+            {
+                return Err("missing exact guardian test".into());
+            }
+            if !self.stdout.contains(&format!("test {test} ... ok"))
+                || !self
+                    .stdout
+                    .contains("test result: ok. 1 passed; 0 failed; 0 ignored;")
+            {
+                return Err("zero, failed or incorrect body test selection".into());
+            }
+            Ok(proof)
+        }
+    }
+
+    fn read_bounded(root: &Path, name: &str, limit: u64) -> Result<Vec<u8>, String> {
+        let path = root.join(name);
+        // Limit the actual read from one descriptor: a failed or uncertain
+        // family may keep appending after any metadata observation. The full
+        // captured file remains untouched, including overflow and invalid UTF-8.
+        // This is a read bound, not a bound on the writer's live disk growth.
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+            .map_err(|error| format!("unreadable {name}: {error}"))?;
+        if !file
+            .metadata()
+            .map_err(|error| format!("cannot inspect {name}: {error}"))?
+            .is_file()
+        {
+            return Err(format!("{name} is not a regular evidence file"));
+        }
+        let mut bytes = Vec::new();
+        file.take(limit + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("unreadable {name}: {error}"))?;
+        if bytes.len() as u64 > limit {
+            return Err(format!("{name} exceeds its {limit}-byte read limit"));
+        }
+        Ok(bytes)
+    }
+
+    fn read_log(root: &Path, name: &str) -> Result<String, String> {
+        let bytes = read_bounded(root, name, CAPTURE_LIMIT)?;
+        String::from_utf8(bytes).map_err(|error| format!("invalid UTF-8 in {name}: {error}"))
+    }
+
+    fn run(
+        root: &Path,
+        test: &str,
+        control: Option<&str>,
+        limit: Duration,
+        cancel_after_ready: bool,
+    ) -> Run {
+        let (owner, remote) = UnixStream::pair().unwrap();
+        let remote_fd = remote.as_raw_fd();
+        let spec = Spec {
+            test: test.into(),
+            control: control.map(str::to_owned),
+            owner_fd: remote_fd,
+            deadline_ns: monotonic_ns().saturating_add(limit.as_nanos() as u64),
+        };
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        // Leave delegation inherited and opaque through BOTH exec boundaries.
+        // Equality crosses the boundary only as a public presence boolean.
+        for (name, _) in std::env::vars_os() {
+            if name != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV) {
+                command.env_remove(name);
+            }
+        }
+        command
+            .args([
+                "--exact",
+                GUARDIAN,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+                "--color=never",
+            ])
+            .current_dir(root)
+            .env(SPEC, serde_json::to_string(&spec).unwrap())
+            .env(ROOT, root)
+            .env(
+                SCOPE,
+                if crate::agent_execution::Authority::from_environment()
+                    != crate::agent_execution::Authority::default()
+                {
+                    "present"
+                } else {
+                    "absent"
+                },
+            )
+            .env("HOME", root.join("home"))
+            .env("XDG_RUNTIME_DIR", root.join("run"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("TMPDIR", root.join("tmp"))
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(capture(&root.join("guardian.stdout"))))
+            .stderr(Stdio::from(capture(&root.join("guardian.stderr"))));
+        // SAFETY: the descriptor stays owned until spawn returns. Only the
+        // async-signal-safe fcntl runs in this between-fork-and-exec hook.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(remote_fd, libc::F_SETFD, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().unwrap();
+        drop(remote);
+        let guardian_id = child.id();
+        let mut guardian = Guardian {
+            child,
+            owner,
+            reaped: false,
+        };
+        let deadline = Instant::now() + limit;
+        let (status, timed_out) = loop {
+            if let Some(status) = guardian.child.try_wait().unwrap() {
+                guardian.reaped = true;
+                break (status, false);
+            }
+            if cancel_after_ready && root.join("control-payload").is_file() {
+                break (guardian.cancel_and_reap().unwrap(), false);
+            }
+            if Instant::now() >= deadline {
+                break (guardian.cancel_and_reap().unwrap(), true);
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        // As in the old exact-child kill+wait, uninterruptible kernel I/O can
+        // extend cancellation/reaping beyond the 30s polling deadline.
+        let mut capture_errors = Vec::new();
+        let mut load = |name| match read_log(root, name) {
+            Ok(text) => text,
+            Err(error) => {
+                capture_errors.push(error.clone());
+                error
+            }
+        };
+        let guardian_stdout = load("guardian.stdout");
+        let guardian_stderr = load("guardian.stderr");
+        let stdout = load("test.stdout");
+        let stderr = load("test.stderr");
+        Run {
+            guardian: guardian_id,
+            status,
+            timed_out,
+            guardian_stdout,
+            guardian_stderr,
+            stdout,
+            stderr,
+            capture_errors,
+        }
+    }
+
+    pub(super) fn private_runtime(test: &str) -> Option<PathBuf> {
+        if let Some(root) = std::env::var_os(ROOT) {
+            let expected = match std::env::var(SCOPE).as_deref() {
+                Ok("present") => true,
+                Ok("absent") => false,
+                _ => panic!("missing or invalid shutdown fixture authority presence marker"),
+            };
+            assert_eq!(
+                crate::agent_execution::Authority::from_environment()
+                    != crate::agent_execution::Authority::default(),
+                expected,
+                "isolated shutdown fixture lost its inherited authority scope"
+            );
+            return Some(PathBuf::from(root).canonicalize().unwrap());
+        }
+        let (evidence, root) = directory();
+        let run = run(&root, test, None, LIMIT, false);
+        let proof = run.success(&root, test).unwrap_or_else(|error| {
+            panic!("{error}; retained {}:\nBODY STDOUT:\n{}\nBODY STDERR:\n{}\nGUARDIAN STDOUT:\n{}\nGUARDIAN STDERR:\n{}", root.display(), run.stdout, run.stderr, run.guardian_stdout, run.guardian_stderr)
+        });
+        evidence.remove_after_assertions(&proof);
+        None
+    }
+
+    fn settle(owner: &mut UnixStream, deadline_ns: u64) -> io::Result<(usize, bool)> {
+        let mut reaped = 0;
+        loop {
+            // Check EVERY iteration, including successful reap and EINTR paths.
+            // Continuous orphan churn cannot evade the original owner's budget.
+            let cancelled = owner_cancelled(owner, deadline_ns)?;
+            let waited = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+            if waited < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+                return Ok((reaped, cancelled));
+            }
+            if cancelled {
+                return Err(io::Error::other(
+                    "shutdown family remains unsettled after cancellation; no receipt",
+                ));
+            }
+            if waited > 0 {
+                reaped += 1;
+                continue;
+            }
+            if waited < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(error);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    #[ignore = "private guardian entrypoint, selected only by shutdown fixture parents"]
+    fn guardian() {
+        let spec: Spec =
+            serde_json::from_str(&std::env::var(SPEC).expect("private guardian specification"))
+                .unwrap();
+        assert!(std::env::var_os(ROOT).is_some(), "private guardian root");
+        // Check the public presence marker in the guardian as well as the body.
+        let root = private_runtime(&spec.test).expect("private guardian runtime");
+        // SAFETY: this is the dedicated exact guardian process. Shared parent
+        // libtests and actual fixture bodies never change their subreaper state.
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+            0
+        );
+        assert!(spec.owner_fd > 2);
+        let mut owner = unsafe { UnixStream::from_raw_fd(spec.owner_fd) };
+        assert_eq!(
+            unsafe { libc::fcntl(owner.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+        owner.set_nonblocking(true).unwrap();
+        assert!(
+            !owner_cancelled(&mut owner, spec.deadline_ns).unwrap(),
+            "owner cancelled before body launch"
+        );
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                &spec.test,
+                "--nocapture",
+                "--test-threads=1",
+                "--color=never",
+            ])
+            .env_remove(SPEC)
+            .env_remove(CONTROL)
+            .current_dir(&root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(capture(&root.join("test.stdout"))))
+            .stderr(Stdio::from(capture(&root.join("test.stderr"))));
+        if let Some(control) = spec.control {
+            command.arg("--ignored").env(CONTROL, control);
+        }
+        let mut body = Body(command.spawn().unwrap());
+        let body_id = body.0.id();
+        fs::write(root.join("body.pid"), body_id.to_string()).unwrap();
+        let mut cancelled = false;
+        let status = loop {
+            if let Some(status) = body.0.try_wait().unwrap() {
+                break status;
+            }
+            if owner_cancelled(&mut owner, spec.deadline_ns).unwrap() {
+                cancelled = true;
+                body.0.kill().unwrap();
+                break body.0.wait().unwrap();
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        // The ORIGINAL BODY process is now reaped. Its background threads,
+        // TLS and atexit callbacks can no longer create new fixture writers.
+        let (descendants_reaped, settlement_cancelled) =
+            settle(&mut owner, spec.deadline_ns).unwrap();
+        cancelled |= settlement_cancelled;
+        let receipt = Receipt {
+            version: 1,
+            test: spec.test,
+            guardian: std::process::id(),
+            body: body_id,
+            body_success: status.success(),
+            cancelled,
+            descendants_reaped,
+        };
+        capture(&root.join("family-settled.json"))
+            .write_all(&serde_json::to_vec(&receipt).unwrap())
+            .unwrap();
+        assert!(
+            receipt.body_success && !receipt.cancelled,
+            "private shutdown body failed or was cancelled; settled failure evidence retained"
+        );
+    }
+
+    // This control registers an atexit writer AFTER libtest reports body success.
+    // The writer closes output pipes and leaves the body session; only the
+    // guardian's post-body-exit ECHILD census can establish its final write.
+    extern "C" fn start_late_writer() {
+        let launch = || -> io::Result<()> {
+            let root = PathBuf::from(
+                std::env::var_os(ROOT)
+                    .ok_or_else(|| io::Error::other("missing late-writer root"))?,
+            );
+            let script = r#"import os,pathlib,sys,time
+root=pathlib.Path(sys.argv[1]); body=int(sys.argv[2]); proc=pathlib.Path('/proc')/str(body)/'stat'
+def identity():
+ try: return proc.read_bytes().rsplit(b')',1)[1].split()[19]
+ except FileNotFoundError: return None
+original=identity(); os.setsid(); (root/'late-ready').write_text(str(os.getpid()))
+deadline=time.monotonic()+5
+while original is not None and identity()==original:
+ if time.monotonic()>=deadline: raise RuntimeError('original body did not exit')
+ time.sleep(0.005)
+(root/'late-payload').write_text('written after original body exit')
+"#;
+            let _child = Command::new("/usr/bin/python3")
+                .args(["-c", script])
+                .arg(&root)
+                .arg(std::process::id().to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !root.join("late-ready").exists() {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::other("late writer did not start"));
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        };
+        if let Err(error) = launch() {
+            let _ = writeln!(io::stderr(), "late-writer atexit control failed: {error}");
+            unsafe {
+                libc::_exit(98);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "private body controls, selected only by fixture regression parents"]
+    fn body_control() {
+        let root = private_runtime(BODY_CONTROL).expect("private control body");
+        let control = std::env::var(CONTROL).unwrap();
+        fs::write(root.join("control-payload"), "private failure evidence").unwrap();
+        match control.as_str() {
+            "late" => assert_eq!(unsafe { libc::atexit(start_late_writer) }, 0),
+            "failure" => panic!("intentional private fixture body failure"),
+            "missing-capture" => fs::remove_file(root.join("test.stderr")).unwrap(),
+            "oversized-capture" => io::stderr()
+                .write_all(&vec![b'x'; CAPTURE_LIMIT as usize + 4096])
+                .unwrap(),
+            "non-utf8-capture" => io::stderr().write_all(&[0xff, b'a']).unwrap(),
+            "limit-capture" => io::stderr()
+                .write_all(&vec![b'v'; CAPTURE_LIMIT as usize])
+                .unwrap(),
+            "blocked" => loop {
+                thread::park();
+            },
+            "success" => {}
+            _ => panic!("unknown private body control"),
+        }
+    }
+
+    #[test]
+    fn cleanup_waits_for_a_writer_created_after_body_success() {
+        let (evidence, root) = directory();
+        let run = run(&root, BODY_CONTROL, Some("late"), LIMIT, false);
+        let proof = run
+            .success(&root, BODY_CONTROL)
+            .unwrap_or_else(|error| panic!("{error}: {}", run.guardian_stderr));
+        assert!(
+            proof.receipt.descendants_reaped >= 1,
+            "the late writer must belong to this guardian"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("late-payload")).unwrap(),
+            "written after original body exit"
+        );
+        evidence.remove_after_assertions(&proof);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn failed_and_empty_body_selections_keep_evidence_until_owned_settlement_is_checked() {
+        for (test, control) in [
+            (BODY_CONTROL, "failure"),
+            (BODY_CONTROL, "missing-capture"),
+            ("host::shutdown_tests::fixture::no_such_test", "success"),
+        ] {
+            let (evidence, root) = directory();
+            let run = run(&root, test, Some(control), LIMIT, false);
+            let proof = run
+                .settlement(&root, test)
+                .expect("even the negative body family must be fully settled");
+            assert!(run.success(&root, test).is_err());
+            if control == "failure" {
+                assert_eq!(
+                    fs::read_to_string(root.join("control-payload")).unwrap(),
+                    "private failure evidence"
+                );
+                assert!(!proof.receipt.body_success);
+            } else if control == "missing-capture" {
+                assert!(
+                    run.capture_errors
+                        .iter()
+                        .any(|error| error.contains("test.stderr"))
+                );
+            }
+            drop(evidence);
+            assert!(
+                root.is_dir(),
+                "failure paths must preserve the original namespace"
+            );
+            // This passing meta-test owns ONLY this freshly created negative
+            // control. Its valid settlement proof permits final no-leak cleanup.
+            EvidenceDirectory(Some(root.clone())).remove_after_assertions(&proof);
+            assert!(!root.exists());
+        }
+    }
+
+    #[test]
+    fn cancellation_reaps_the_original_body_and_keeps_its_evidence() {
+        let (evidence, root) = directory();
+        let run = run(&root, BODY_CONTROL, Some("blocked"), LIMIT, true);
+        let proof = run
+            .settlement(&root, BODY_CONTROL)
+            .expect("cancelled synthetic body must be reaped with ECHILD");
+        assert!(run.success(&root, BODY_CONTROL).is_err());
+        assert!(proof.receipt.cancelled && !proof.receipt.body_success);
+        assert_eq!(
+            proof.receipt.descendants_reaped, 0,
+            "the blocked control starts no descendants"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("control-payload")).unwrap(),
+            "private failure evidence"
+        );
+        drop(evidence);
+        assert!(root.is_dir());
+        EvidenceDirectory(Some(root.clone())).remove_after_assertions(&proof);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn capture_read_limits_preserve_rejected_files_and_accept_the_exact_boundary() {
+        for (control, payload, error) in [
+            (
+                "oversized-capture",
+                vec![b'x'; CAPTURE_LIMIT as usize + 4096],
+                Some("exceeds its 262144-byte"),
+            ),
+            ("non-utf8-capture", vec![0xff, b'a'], Some("invalid UTF-8")),
+            ("limit-capture", vec![b'v'; CAPTURE_LIMIT as usize], None),
+        ] {
+            let (evidence, root) = directory();
+            let run = run(&root, BODY_CONTROL, Some(control), LIMIT, false);
+            let proof = run
+                .settlement(&root, BODY_CONTROL)
+                .expect("capture control must fully settle");
+            assert!(run.status.success() && proof.receipt.body_success && !proof.receipt.cancelled);
+            if let Some(error) = error {
+                assert!(run.success(&root, BODY_CONTROL).is_err());
+                assert!(
+                    run.capture_errors
+                        .iter()
+                        .any(|detail| detail.contains(error))
+                );
+            } else {
+                assert!(run.success(&root, BODY_CONTROL).is_ok());
+                assert_eq!(run.stderr.as_bytes(), payload);
+            }
+            let path = root.join("test.stderr");
+            assert_eq!(fs::metadata(&path).unwrap().len(), payload.len() as u64);
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                payload,
+                "capture reading changed the original bytes"
+            );
+            drop(evidence);
+            assert!(
+                root.is_dir(),
+                "rejected captures must keep the original namespace"
+            );
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                payload,
+                "retention changed the original bytes"
+            );
+            // All synthetic writers have exited under the genuine ECHILD
+            // proof. Remove only this passing meta-test's fresh control root.
+            EvidenceDirectory(Some(root.clone())).remove_after_assertions(&proof);
+            assert!(!root.exists());
+        }
+    }
+
+    #[test]
+    fn missing_malformed_or_mismatched_receipts_and_bad_output_never_authorize_removal() {
+        let (evidence, root) = directory();
+        let mut run = run(&root, BODY_CONTROL, Some("success"), LIMIT, false);
+        let proof = run.success(&root, BODY_CONTROL).unwrap();
+        let path = root.join("family-settled.json");
+        let original = fs::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert!(run.success(&root, BODY_CONTROL).is_err());
+        fs::write(&path, b"not JSON").unwrap();
+        assert!(run.success(&root, BODY_CONTROL).is_err());
+        let oversized_receipt = vec![b'x'; RECEIPT_LIMIT as usize + 4096];
+        fs::write(&path, &oversized_receipt).unwrap();
+        assert!(run.success(&root, BODY_CONTROL).is_err());
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            oversized_receipt,
+            "receipt reading changed oversized evidence"
+        );
+        let mut wrong: Receipt = serde_json::from_slice(&original).unwrap();
+        wrong.guardian += 1;
+        fs::write(&path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+        assert!(run.success(&root, BODY_CONTROL).is_err());
+        fs::write(&path, original).unwrap();
+        run.stdout = "test result: ok. 0 passed; 0 failed;".into();
+        assert!(run.success(&root, BODY_CONTROL).is_err());
+        drop(evidence);
+        assert!(root.is_dir());
+        // The earlier genuine proof still identifies this already settled
+        // synthetic family; corrupting a receipt never starts another writer.
+        EvidenceDirectory(Some(root.clone())).remove_after_assertions(&proof);
+        assert!(!root.exists());
     }
 }
 
 fn private_runtime(test: &str) -> Option<PathBuf> {
-    if let Some(root) = std::env::var_os(ROOT) {
-        let expected = match std::env::var(SCOPE).as_deref() {
-            Ok("present") => true,
-            Ok("absent") => false,
-            _ => panic!("missing or invalid shutdown fixture authority presence marker"),
-        };
-        assert_eq!(
-            crate::agent_execution::Authority::from_environment()
-                != crate::agent_execution::Authority::default(),
-            expected,
-            "isolated shutdown fixture lost its inherited authority scope"
-        );
-        return Some(PathBuf::from(root).canonicalize().unwrap());
-    }
-
-    // Honour the command owner's legitimate non-repository TMPDIR. A public
-    // /tmp or /var/tmp checkout marker is neither removed nor bypassed.
-    let directory = tempfile::tempdir().unwrap();
-    let root = directory.path().canonicalize().unwrap();
-    let _evidence = EvidenceDirectory(Some(directory));
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-    for name in ["home", "run", "data", "config", "cache", "tmp"] {
-        fs::create_dir(root.join(name)).unwrap();
-        fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    let stdout = root.join("test.stdout");
-    let stderr = root.join("test.stderr");
-    let mut command = Command::new(std::env::current_exe().unwrap());
-    // Leave delegation inherited and opaque. Only public Authority equality
-    // crosses the boundary as a boolean assertion; no capability is copied.
-    for (name, _) in std::env::vars_os() {
-        if name != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV) {
-            command.env_remove(name);
-        }
-    }
-    command
-        .args(["--exact", test, "--nocapture", "--test-threads=1"])
-        .current_dir(&root)
-        .env(ROOT, &root)
-        .env(
-            SCOPE,
-            if crate::agent_execution::Authority::from_environment()
-                != crate::agent_execution::Authority::default()
-            {
-                "present"
-            } else {
-                "absent"
-            },
-        )
-        .env("HOME", root.join("home"))
-        .env("XDG_RUNTIME_DIR", root.join("run"))
-        .env("XDG_DATA_HOME", root.join("data"))
-        .env("XDG_CONFIG_HOME", root.join("config"))
-        .env("XDG_CACHE_HOME", root.join("cache"))
-        .env("TMPDIR", root.join("tmp"))
-        .env("PATH", "/usr/bin:/bin")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(File::create(&stdout).unwrap()))
-        .stderr(Stdio::from(File::create(&stderr).unwrap()));
-    let mut child = TestChild(command.spawn().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let status = loop {
-        if let Some(status) = child.0.try_wait().unwrap() {
-            break Some(status);
-        }
-        if Instant::now() >= deadline {
-            child.0.kill().unwrap();
-            child.0.wait().unwrap();
-            break None;
-        }
-        thread::sleep(Duration::from_millis(10));
-    };
-    let stdout = fs::read_to_string(stdout).unwrap();
-    let stderr = fs::read_to_string(stderr).unwrap();
-    assert!(
-        status.is_some_and(|status| status.success()),
-        "isolated shutdown fixture failed or exceeded 30s; retained {}:\n{stdout}\n{stderr}",
-        root.display()
-    );
-    assert!(
-        stdout.contains(&format!("test {test} ... ok")),
-        "missing exact child test; retained {}:\n{stdout}",
-        root.display()
-    );
-    assert!(
-        stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
-        "zero or incorrect child selection; retained {}:\n{stdout}",
-        root.display()
-    );
-    None
+    fixture::private_runtime(test)
 }
 
 fn session(id: u128, root: &Path) -> TerminalSession {
