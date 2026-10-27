@@ -7597,68 +7597,70 @@ mod tests {
         let owner = automation();
         let mut detail = cancel_detail(&owner);
         detail.firing.diagnostic = Some("Retained diagnostic line\n".repeat(40));
-        let mut state = State::default();
-        inspect_cancel_detail(&mut state, &detail);
-        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
-        let size = Size::new(900.0, 400.0);
-        let mut ui = cancel_frame_at_size(&state, Cache::new(), &mut renderer, size);
-        let cursor = mouse::Cursor::Available(Point::new(450.0, 300.0));
-        let mut messages = Vec::new();
-        let _ = ui.update(
-            &[Event::Mouse(mouse::Event::WheelScrolled {
-                delta: mouse::ScrollDelta::Lines { x: 0.0, y: -1000.0 },
-            })],
-            cursor,
-            &mut renderer,
-            &mut cosmic::iced::advanced::clipboard::Null,
-            &mut messages,
-        );
-        assert!(messages.is_empty());
-        ui.draw(
-            &mut renderer,
-            &cosmic::theme::active(),
-            &cosmic::iced::advanced::renderer::Style::default(),
-            cursor,
-        );
-        let nodes = ui.a11y_nodes(cursor);
-        let control = nodes
-            .root()
-            .iter()
-            .chain(nodes.children())
-            .find(|node| node.node().label() == Some("Cancel run"))
-            .expect("the scrolled cancellation control remains accessible");
-        let iced_accessibility::A11yId::Widget(id) = control.id() else {
-            panic!("a cancellation control has a widget identity");
-        };
-        let bounds = control.node().bounds().unwrap();
-        let bounds = Rectangle::new(
-            Point::new(bounds.x0 as f32, bounds.y0 as f32),
-            Size::new(
-                (bounds.x1 - bounds.x0) as f32,
-                (bounds.y1 - bounds.y0) as f32,
-            ),
-        );
-        let mut geometry = Geometry {
-            target: id.clone(),
-            control: None,
-            scrolls: Vec::new(),
-        };
-        ui.operate(&renderer, &mut geometry);
-        let [(viewport, translation)] = geometry.scrolls.as_slice() else {
-            panic!(
-                "Details has one actual scroll owner: {:?}",
-                geometry.scrolls
+        for width in [280.0, 900.0] {
+            let mut state = State::default();
+            inspect_cancel_detail(&mut state, &detail);
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let size = Size::new(width, 400.0);
+            let mut ui = cancel_frame_at_size(&state, Cache::new(), &mut renderer, size);
+            let cursor = mouse::Cursor::Available(Point::new(width / 2.0, 300.0));
+            let mut messages = Vec::new();
+            let _ = ui.update(
+                &[Event::Mouse(mouse::Event::WheelScrolled {
+                    delta: mouse::ScrollDelta::Lines { x: 0.0, y: -1000.0 },
+                })],
+                cursor,
+                &mut renderer,
+                &mut cosmic::iced::advanced::clipboard::Null,
+                &mut messages,
             );
-        };
-        assert!(translation.y > 0.0, "the real wheel event must scroll");
-        assert_eq!(bounds, geometry.control.unwrap() - *translation);
-        assert!(viewport.contains(bounds.center()));
-        assert!(Rectangle::with_size(size).contains(bounds.center()));
-        assert!(cancel_pointer(&mut ui, &mut renderer, bounds.center(), true).is_empty());
-        let mut messages = cancel_pointer(&mut ui, &mut renderer, bounds.center(), false);
-        assert_eq!(messages.len(), 1);
-        let _ = ui.into_cache();
-        assert_cancel_request(&mut state, messages.remove(0), &detail);
+            assert!(messages.is_empty());
+            ui.draw(
+                &mut renderer,
+                &cosmic::theme::active(),
+                &cosmic::iced::advanced::renderer::Style::default(),
+                cursor,
+            );
+            let nodes = ui.a11y_nodes(cursor);
+            let control = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|node| node.node().label() == Some("Cancel run"))
+                .expect("the scrolled cancellation control remains accessible");
+            let iced_accessibility::A11yId::Widget(id) = control.id() else {
+                panic!("a cancellation control has a widget identity");
+            };
+            let bounds = control.node().bounds().unwrap();
+            let bounds = Rectangle::new(
+                Point::new(bounds.x0 as f32, bounds.y0 as f32),
+                Size::new(
+                    (bounds.x1 - bounds.x0) as f32,
+                    (bounds.y1 - bounds.y0) as f32,
+                ),
+            );
+            let mut geometry = Geometry {
+                target: id.clone(),
+                control: None,
+                scrolls: Vec::new(),
+            };
+            ui.operate(&renderer, &mut geometry);
+            let [(viewport, translation)] = geometry.scrolls.as_slice() else {
+                panic!(
+                    "Details has one actual scroll owner: {:?}",
+                    geometry.scrolls
+                );
+            };
+            assert!(translation.y > 0.0, "the real wheel event must scroll");
+            assert_eq!(bounds, geometry.control.unwrap() - *translation);
+            assert!(viewport.contains(bounds.center()));
+            assert!(Rectangle::with_size(size).contains(bounds.center()));
+            assert!(cancel_pointer(&mut ui, &mut renderer, bounds.center(), true).is_empty());
+            let mut messages = cancel_pointer(&mut ui, &mut renderer, bounds.center(), false);
+            assert_eq!(messages.len(), 1);
+            let _ = ui.into_cache();
+            assert_cancel_request(&mut state, messages.remove(0), &detail);
+        }
     }
 
     #[test]
