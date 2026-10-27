@@ -310,6 +310,15 @@ fn cli_inventory_reads_real_pty_titles_without_exporting_launch_environment() {
     assert!(human.starts_with("TERMINAL"), "{human}");
     assert!(human.contains("CLI inventory title"), "{human}");
     assert!(human.contains("running"), "{human}");
+    let listed_json = listed.to_string();
+    for (kind, output) in [("human", &human), ("JSON", &listed_json)] {
+        for canary in ["FIXTURE_DISPLAY_ONLY", "full descriptor only"] {
+            assert!(
+                !output.contains(canary),
+                "{kind} terminal list exposed launch-environment fixture canary {canary:?}"
+            );
+        }
+    }
     let row = &listed["data"]["terminals"][0];
     assert_eq!(row["id"], id.to_string());
     assert_eq!(row["state"], "running");
