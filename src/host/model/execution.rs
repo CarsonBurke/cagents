@@ -2457,7 +2457,7 @@ mod tests {
                     registry.close_agent(&Origin::User, agent.id).map(drop)
                 };
                 assert!(result.unwrap_err().contains(if future {
-                    "requires reopening"
+                    "newer than supported"
                 } else {
                     "layout"
                 }));
