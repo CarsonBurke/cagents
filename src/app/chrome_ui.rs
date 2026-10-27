@@ -1383,7 +1383,9 @@ mod tests {
         for changed in ["generation", "window", "modal", "rename", "popup", "exit"] {
             match changed {
                 "generation" => app.window_close_generation = 9,
-                "window" => app.core.set_main_window_id(Some(window::Id::unique())),
+                "window" => {
+                    app.core.set_main_window_id(Some(window::Id::unique()));
+                }
                 "modal" => app.settings_reset_confirm = true,
                 "rename" => {
                     app.chrome_ui.rename = Some((
@@ -2120,7 +2122,10 @@ impl Cagents {
                     self.focus_popup_control(ring),
                     iced::widget::scrollable::scroll_to(
                         widget::Id::new(NOTICES_SCROLL_ID),
-                        iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
+                        iced::widget::scrollable::AbsoluteOffset {
+                            x: Some(0.0),
+                            y: Some(0.0),
+                        },
                     )
                     .map(cosmic::Action::App),
                 ])
