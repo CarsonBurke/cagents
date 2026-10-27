@@ -898,3 +898,6 @@ fn local_tracked_undo_acquired_previous_never_offers_single_blob_recovery() {
     );
     assert_eq!(discarded.recovery.remaining_paths(), 1);
 }
+
+#[path = "recoverable_discard_contract/access.rs"]
+mod access;
