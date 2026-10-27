@@ -2481,9 +2481,11 @@ mod tests {
                     let row = &app.sidebar_model.projects[0].worktrees[0];
                     assert!(row.status_error.is_none());
                     assert_eq!(row.operation_error.is_some(), newer_error);
-                    if !newer_error {
-                        assert_eq!(row.operation, Some(GitOperationKind::Merge));
-                    }
+                    assert_eq!(
+                        row.operation,
+                        Some(GitOperationKind::Merge),
+                        "a metadata error retains the preceding last-known operation across reload"
+                    );
                     let entry = &app.refresh_ui.git.entries[&key.project_id];
                     assert_eq!(
                         entry.snapshot.operations[&key.worktree_id].is_err(),

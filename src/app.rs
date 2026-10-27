@@ -1778,11 +1778,20 @@ impl LoadedRepository {
         &self,
         record: &WorktreeRecord,
         status: Option<&StatusSnapshot>,
+        previous: Option<&SidebarWorktree>,
     ) -> SidebarWorktree {
         let mut row = SidebarWorktree::from_repository(record, status);
         row.head_repository = self.head_repositories.get(&record.id).cloned();
         row.apply_status_error(self.status_order.errors.get(&record.id).map(String::as_str));
         if let Some(operation) = self.operations.get(&record.id) {
+            if operation.is_err()
+                && let Some(previous) = previous
+                    .filter(|previous| previous.id == record.id && previous.path == record.path)
+            {
+                // A reload rebuilds the row, but an unreadable marker cannot
+                // revoke the operation shown by its preceding successful read.
+                row.apply_operation(&Ok(previous.operation));
+            }
             row.apply_operation(operation);
         }
         row
@@ -13767,9 +13776,11 @@ impl Application for Cagents {
                                         existence: Existence::Open,
                                     }]);
                                 }
-                                existing
-                                    .worktrees
-                                    .push(loaded.sidebar_worktree(record, status.as_ref()));
+                                existing.worktrees.push(loaded.sidebar_worktree(
+                                    record,
+                                    status.as_ref(),
+                                    None,
+                                ));
                             }
                             let existing_id = existing.id;
                             self.refresh_ui.git.forget(project_id);
@@ -13816,11 +13827,24 @@ impl Application for Cagents {
                                 )
                             }));
                         }
+                        let previous_worktrees: HashMap<_, _> = self
+                            .sidebar_model
+                            .projects
+                            .iter()
+                            .find(|project| project.id == project_id)
+                            .into_iter()
+                            .flat_map(|project| &project.worktrees)
+                            .map(|row| (row.id, row))
+                            .collect();
                         let worktrees = loaded
                             .worktrees
                             .iter()
                             .map(|(record, status)| {
-                                loaded.sidebar_worktree(record, status.as_ref())
+                                loaded.sidebar_worktree(
+                                    record,
+                                    status.as_ref(),
+                                    previous_worktrees.get(&record.id).copied(),
+                                )
                             })
                             .collect();
                         let pull_requests = match &loaded.github {
