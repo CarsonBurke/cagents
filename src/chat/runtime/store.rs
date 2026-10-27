@@ -1,5 +1,6 @@
 //! Private, disk-backed transcript. Stable provider IDs and byte-addressed chunks
 //! keep both long conversations and a single enormous tool result pageable.
+mod append;
 mod file_changes;
 pub(crate) mod peer_query;
 mod text_copy;
@@ -73,6 +74,9 @@ pub(crate) struct Store {
     pub dirty: bool,
     /// Dirty identities are bounded even while the conversation is hidden.
     changed: Option<std::collections::HashSet<String>>,
+    appended: append::Changes,
+    #[cfg(test)]
+    field_bytes: std::cell::Cell<usize>,
     pub presented_generation: Option<u64>,
     pub presentation: Option<crate::chat::presentation::Presentation>,
     pub presented_children: std::collections::HashMap<String, Vec<std::sync::Arc<Item>>>,
@@ -265,6 +269,9 @@ impl Store {
                 messages: None,
                 dirty: true,
                 changed: Some(Default::default()),
+                appended: Default::default(),
+                #[cfg(test)]
+                field_bytes: std::cell::Cell::new(0),
                 presented_generation: None,
                 presentation: None,
                 presented_children: Default::default(),
@@ -460,6 +467,10 @@ impl Store {
         } else {
             false
         };
+        // A replacement may commit before its secondary file index fails.
+        // Mark a non-append change before any replacement write can land,
+        // even if a later secondary-index error prevents the final changed().
+        self.changed(&item.id);
         let transaction = self.db.transaction().map_err(|e| e.to_string())?;
         let index_spans = spans.clone();
         let spans = postcard::to_stdvec(&spans).map_err(|e| e.to_string())?;
@@ -760,7 +771,10 @@ impl Store {
     pub fn apply(&mut self, event: Event) -> Result<Vec<Event>, String> {
         // Reset must revoke pending private text before the generic flush below.
         let mut event = match event {
-            Event::Reset { reason } => return self.reset_peer_cache(reason),
+            Event::Reset { reason } => {
+                self.appended.clear();
+                return self.reset_peer_cache(reason);
+            }
             event => event,
         };
         self.peer_query.guard_local()?;
@@ -828,7 +842,7 @@ impl Store {
                     .execute(update, params![id, delta.len(), metadata])
                     .map_err(|error| error.to_string())?;
                 transaction.commit().map_err(|error| error.to_string())?;
-                self.changed(&id);
+                self.append_changed(&id, field as usize, offset);
                 self.dirty = true;
             }
             Event::Item(item) => {
@@ -908,6 +922,11 @@ impl Store {
                 self.dirty = true;
             }
             Event::ItemsRemoved { ids } => {
+                // Secondary removal can fail; old append evidence must not
+                // survive an attempted removal followed by reuse of the ID.
+                for id in &ids {
+                    self.changed(id);
+                }
                 self.files_removed(&ids)?;
                 self.copy_remove(&ids)?;
                 let transaction = self.db.transaction().map_err(|e| e.to_string())?;
@@ -1030,7 +1049,7 @@ impl Store {
                 .map_err(|e| e.to_string())?;
             Self::copy_parent_append(&transaction, id, delta.len())?;
             transaction.commit().map_err(|e| e.to_string())?;
-            self.changed(id);
+            self.append_changed(id, 0, length as usize);
         }
         Ok(warning)
     }
@@ -1087,6 +1106,9 @@ impl Store {
         for row in rows {
             result.extend(row.map_err(|e| e.to_string())?);
         }
+        #[cfg(test)]
+        self.field_bytes
+            .set(self.field_bytes.get().saturating_add(result.len()));
         Ok(result)
     }
     fn body(&self, id: &str, len0: usize, start: usize, end: usize) -> Result<Vec<u8>, String> {
@@ -1124,10 +1146,12 @@ impl Store {
         }
     }
     fn changed(&mut self, id: &str) {
+        self.appended.remove(id);
         if let Some(changed) = &mut self.changed {
             changed.insert(id.into());
             if changed.len() > WINDOW_ITEMS * 2 {
                 self.changed = None;
+                self.appended.clear();
             }
         }
     }
@@ -1141,6 +1165,7 @@ impl Store {
     ) -> Result<Window, String> {
         let _ = self.flush_text()?;
         let mut copy_projection = Vec::new();
+        let mut append_residents = Vec::new();
         let old_copy: std::collections::HashMap<_, _> = previous
             .iter()
             .zip(&self.copy_projection)
@@ -1151,6 +1176,7 @@ impl Store {
             .map(|item| (item.id.as_str(), item))
             .collect();
         let mut reused = std::collections::HashSet::new();
+        let mut proven = std::collections::HashSet::new();
         let records = {
             let query = if self.forward.is_some() {
                 "SELECT id,ordinal,metadata,len0,len1,len2,spans FROM items WHERE ordinal>=?1 ORDER BY ordinal ASC LIMIT 129"
@@ -1264,6 +1290,15 @@ impl Store {
                         Some(first.map_or((ordinal, part), |old: Cursor| old.min((ordinal, part))));
                     bytes += size;
                     copy_projection.push(copy_source);
+                    // Preserve the existing reuse shortcut without promoting an
+                    // arbitrary caller-supplied Arc into future append authority.
+                    let trusted = self
+                        .appended
+                        .owns(self.copy_cache, &id, 0, start0, previous)
+                        && self
+                            .appended
+                            .owns(self.copy_cache, &id, 1, start1, previous);
+                    append_residents.push(trusted.then(|| (id.clone(), [start0, start1])));
                     items.push(std::sync::Arc::clone(previous));
                     continue;
                 }
@@ -1271,10 +1306,16 @@ impl Store {
                 if part > 0 {
                     item.id = item_id.into_owned();
                 }
-                let body0 = String::from_utf8(self.field(&id, 0, start0, end0)?)
-                    .map_err(|e| e.to_string())?;
-                let body1 = String::from_utf8(self.field(&id, 1, start1, end1)?)
-                    .map_err(|e| e.to_string())?;
+                let resident = old.get(item.id.as_str()).copied();
+                let (body0, prefix0) = self.field_reusing(&id, 0, start0, end0, resident)?;
+                let (body1, prefix1) = self.field_reusing(&id, 1, start1, end1, resident)?;
+                if match &item.content {
+                    ItemContent::Text { .. } | ItemContent::Command { .. } => prefix0,
+                    ItemContent::Tool { .. } => prefix1,
+                    _ => false,
+                } {
+                    proven.insert(item.id.clone());
+                }
                 // An inline attachment is never paged: half a base64 payload renders as
                 // nothing, so it is restored whole or replaced by an explanation.
                 let attachment =
@@ -1384,6 +1425,7 @@ impl Store {
                 bytes += size;
                 first = Some(first.map_or((ordinal, part), |old: Cursor| old.min((ordinal, part))));
                 copy_projection.push(copy_source);
+                append_residents.push(Some((id.clone(), [start0, start1])));
                 items.push(std::sync::Arc::new(item));
             }
         }
@@ -1410,6 +1452,7 @@ impl Store {
         if self.forward.is_none() {
             items.reverse();
             copy_projection.reverse();
+            append_residents.reverse();
         }
         self.cached_earlier = match first {
             Some((ordinal, part)) => {
@@ -1447,13 +1490,22 @@ impl Store {
             self.forward = None;
             self.end = None;
         }
+        let mut unique = std::collections::HashSet::new();
+        let mut ambiguous = std::collections::HashSet::new();
+        for item in &items {
+            if !unique.insert(item.id.as_str()) {
+                ambiguous.insert(item.id.as_str());
+            }
+        }
+        proven.retain(|id| !ambiguous.contains(id.as_str()));
         let changes = items
             .iter()
             .filter(|item| !reused.contains(&item.id))
             .map(|item| {
-                crate::chat::presentation::ItemChange::between(
+                crate::chat::presentation::ItemChange::between_known(
                     old.get(item.id.as_str()).map(|item| item.as_ref()),
                     item,
+                    proven.contains(&item.id),
                 )
             })
             .collect();
@@ -1464,6 +1516,8 @@ impl Store {
         self.dirty = false;
         self.paging = false;
         self.changed = Some(Default::default());
+        self.appended
+            .publish(self.copy_cache, &items, append_residents);
         Ok(Window {
             items,
             changes,
