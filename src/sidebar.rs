@@ -15872,7 +15872,7 @@ pub(crate) mod tests {
                 "path" => {
                     sidebar.model.projects[0].worktrees[0] = SidebarWorktree::new(
                         row.id,
-                        "/repo/replaced-source".into(),
+                        "/repo/branch-2-replaced-source".into(),
                         row.branch,
                         false,
                         false,
@@ -16019,7 +16019,14 @@ pub(crate) mod tests {
         }
         let mut unscrolled_row_y: Option<f64> = None;
         for scroll in [0.0, 80.0] {
-            let sidebar = Sidebar::roomy();
+            let mut sidebar = Sidebar::roomy();
+            // Keep the same id6 row visible at both offsets in actual display order.
+            let project = &mut sidebar.model.projects[0];
+            project.navigation_order = project
+                .worktrees
+                .iter()
+                .map(|row| crate::workspace_model::NavigationItem::Worktree(row.path.clone()))
+                .collect();
             let bounds = Size::new(360.0, 640.0);
             let viewport = Rectangle::with_size(bounds);
             let renderer = headless_renderer();

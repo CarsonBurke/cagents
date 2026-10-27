@@ -766,14 +766,66 @@ mod tests {
         let mut menu = NativeMenu::new(40, Size::new(360.0, 220.0), Point::new(20.0, 20.0));
         menu.open();
         let first = menu.named("Action 0");
+        assert!(!first.node().is_disabled());
+        let before = menu.nodes();
+        let before_ids: Vec<_> = before
+            .root()
+            .iter()
+            .chain(before.children())
+            .filter(|node| node.node().role() == iced_accessibility::accesskit::Role::Button)
+            .map(|node| node.id().clone())
+            .collect();
+        let bounds = first.node().bounds().unwrap();
+        let visible = Rectangle::new(
+            Point::new(bounds.x0 as f32, bounds.y0 as f32),
+            Size::new(
+                (bounds.x1 - bounds.x0) as f32,
+                (bounds.y1 - bounds.y0) as f32,
+            ),
+        )
+        .intersection(&menu.viewport)
+        .expect("the first advertised item intersects the real viewport");
+        assert!(visible.width > 0.0 && visible.height > 0.0);
+        let point = Point::new(visible.center_x(), visible.center_y());
+        assert!(menu.viewport.contains(point));
+        // Native wheel scrolling uses the hovered item's menu. Establish it
+        // with actual pointer motion; changing only the wheel cursor would
+        // teleport past the native hover update and leave scrolling inert.
+        assert!(
+            menu.event(
+                Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                mouse::Cursor::Available(point)
+            )
+            .is_empty()
+        );
         assert!(
             menu.event(
                 Event::Mouse(mouse::Event::WheelScrolled {
                     delta: mouse::ScrollDelta::Lines { x: 0.0, y: -30.0 }
                 }),
-                mouse::Cursor::Available(Point::new(230.0, 110.0))
+                mouse::Cursor::Available(point)
             )
             .is_empty()
+        );
+        let scrolled = menu.nodes();
+        let scrolled_ids: Vec<_> = scrolled
+            .root()
+            .iter()
+            .chain(scrolled.children())
+            .filter(|node| node.node().role() == iced_accessibility::accesskit::Role::Button)
+            .map(|node| node.id().clone())
+            .collect();
+        assert!(
+            !scrolled_ids.is_empty(),
+            "scroll keeps a live visible slice"
+        );
+        assert_ne!(
+            scrolled_ids, before_ids,
+            "the real wheel changes the visible slice"
+        );
+        assert!(
+            !scrolled_ids.iter().any(|id| id == first.id()),
+            "the original numeric target is absent before the late click"
         );
         assert!(
             menu.action(&first, Action::Click).is_empty(),
