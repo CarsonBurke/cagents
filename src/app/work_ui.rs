@@ -2,6 +2,8 @@ use super::*;
 use crate::work_ui::{Action, Effect, Watch};
 use cosmic::iced::futures::SinkExt;
 
+mod transport;
+
 /// How often relative times on the board are redrawn.
 const CLOCK: Duration = Duration::from_secs(30);
 
@@ -34,6 +36,7 @@ impl Cagents {
         };
         match effect {
             Effect::Refresh => control(
+                transport::Purpose::Read,
                 |client| client.refresh_work_board(),
                 |result| Action::Refreshed(result),
             ),
@@ -42,6 +45,7 @@ impl Cagents {
                 item,
                 column,
             } => control(
+                transport::Purpose::Mutation,
                 move |client| client.pin_work_card(project, item, column),
                 |result| Action::Pinned(result),
             ),
@@ -110,17 +114,16 @@ impl Cagents {
 
 /// Runs one blocking daemon request off the UI thread.
 fn control(
+    purpose: transport::Purpose,
     request: impl FnOnce(&mut crate::control::ControlClient) -> Result<(), crate::control::ControlError>
     + Send
     + 'static,
     answer: impl FnOnce(Result<(), String>) -> Action + Send + 'static,
 ) -> Task<Message> {
+    let context = transport::Context::capture();
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || {
-            let socket =
-                crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
-            let mut client = crate::control::ControlClient::connect(&socket)
-                .map_err(|error| error.to_string())?;
+            let mut client = context.connect(true, purpose)?;
             request(&mut client).map_err(|error| error.to_string())
         })
         .await
@@ -135,7 +138,8 @@ fn control(
 /// up the connection: the thread's blocking read then fails, it finds no one
 /// listening, and the daemon forgets the watcher.
 fn watch_board() -> impl cosmic::iced::futures::Stream<Item = Action> {
-    cosmic::iced::stream::channel(4, async |mut output| {
+    let context = transport::Context::capture();
+    cosmic::iced::stream::channel(4, async move |mut output| {
         let (sender, receiver) = async_channel::bounded(1);
         let hangup = Arc::new(Mutex::new(None));
         let held = hangup.clone();
@@ -143,7 +147,7 @@ fn watch_board() -> impl cosmic::iced::futures::Stream<Item = Action> {
             .name("cagents-work-board".into())
             .spawn(move || {
                 while !sender.is_closed() {
-                    let watched = watch(&sender, &held);
+                    let watched = watch(&context, &sender, &held);
                     // A connection this side gave up on must not stay open
                     // through the retry delay, where the daemon would keep
                     // queueing boards for it.
@@ -176,14 +180,13 @@ fn watch_board() -> impl cosmic::iced::futures::Stream<Item = Action> {
 }
 
 fn watch(
+    context: &transport::Context,
     sender: &async_channel::Sender<Watch>,
     hangup: &Mutex<Option<crate::control::Hangup>>,
 ) -> Result<(), String> {
     // Never start a daemon merely to watch it; the window starts one as soon
     // as it needs one, and this reconnects then.
-    let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-    let mut client =
-        crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+    let mut client = context.connect(false, transport::Purpose::Read)?;
     *hangup.lock().unwrap_or_else(|p| p.into_inner()) =
         Some(client.hangup().map_err(|error| error.to_string())?);
     // The pane closed while this connected.
