@@ -16382,7 +16382,12 @@ pub(crate) mod tests {
             text: None,
             repeat: false,
         });
-        for reason in ["reload", "busy", "modal"] {
+        // Pointer presses intentionally unfocus COSMIC buttons. Keep the
+        // keyboard and held-pointer oracles in distinct retained widget trees.
+        for (reason, pointer) in ["reload", "busy", "modal"]
+            .into_iter()
+            .flat_map(|reason| [false, true].map(move |pointer| (reason, pointer)))
+        {
             let mut blocked = ready.clone();
             blocked.reloading = reason == "reload";
             blocked.mutation = (reason == "busy").then_some(MutationKind::Stage);
@@ -16398,60 +16403,68 @@ pub(crate) mod tests {
             );
             let row = actual_context_button(&nodes, row_name);
             let numeric: iced_accessibility::accesskit::NodeId = row.id().clone().into();
-            initial.as_widget_mut().operate(
-                &mut tree,
-                Layout::new(&node),
-                &renderer,
-                &mut operation::focusable::focus::<()>(Id::from(numeric.0)),
-            );
+            if !pointer {
+                initial.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut operation::focusable::focus::<()>(Id::from(numeric.0)),
+                );
+            }
             let bounds = row.node().bounds().unwrap();
             let cursor = mouse::Cursor::Available(Point::new(
                 (bounds.x0 + 24.0) as f32,
                 ((bounds.y0 + bounds.y1) / 2.0) as f32,
             ));
-            assert!(
-                send(
-                    &mut initial,
-                    &mut tree,
-                    &node,
-                    &renderer,
-                    viewport,
-                    &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
-                    cursor,
-                )
-                .is_empty()
-            );
+            if pointer {
+                assert!(
+                    send(
+                        &mut initial,
+                        &mut tree,
+                        &node,
+                        &renderer,
+                        viewport,
+                        &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                        cursor,
+                    )
+                    .is_empty()
+                );
+            }
             // A reload/busy row remains browsable. A modal still suppresses
             // the actual panel_row callback; retaining focus cannot bypass it.
             let mut unavailable = make(&state, &blocked, modal);
             tree.diff(unavailable.as_widget_mut());
             let node = measure(&mut unavailable, &mut tree, &renderer, viewport);
-            assert_eq!(
-                send(
-                    &mut unavailable,
-                    &mut tree,
-                    &node,
-                    &renderer,
-                    viewport,
-                    &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-                    cursor,
-                ),
-                if modal { vec![] } else { vec![open.clone()] },
-                "actual Files held pointer follows existing base admission through {reason}"
-            );
-            assert_eq!(
-                send(
-                    &mut unavailable,
-                    &mut tree,
-                    &node,
-                    &renderer,
-                    viewport,
-                    &enter,
-                    mouse::Cursor::Unavailable
-                ),
-                if modal { vec![] } else { vec![open.clone()] },
-                "actual Files focus survives {reason} without weakening modal admission"
-            );
+            if pointer {
+                assert_eq!(
+                    send(
+                        &mut unavailable,
+                        &mut tree,
+                        &node,
+                        &renderer,
+                        viewport,
+                        &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                        cursor,
+                    ),
+                    if modal { vec![] } else { vec![open.clone()] },
+                    "actual Files held pointer follows existing base admission through {reason}"
+                );
+            }
+            if !pointer {
+                assert_eq!(
+                    send(
+                        &mut unavailable,
+                        &mut tree,
+                        &node,
+                        &renderer,
+                        viewport,
+                        &enter,
+                        mouse::Cursor::Unavailable
+                    ),
+                    if modal { vec![] } else { vec![open.clone()] },
+                    "actual Files focus survives {reason} without weakening modal admission"
+                );
+            }
             let right = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right));
             assert!(
                 send(
@@ -16480,19 +16493,21 @@ pub(crate) mod tests {
             let mut recovered = make(&state, &ready, false);
             tree.diff(recovered.as_widget_mut());
             let node = measure(&mut recovered, &mut tree, &renderer, viewport);
-            assert_eq!(
-                send(
-                    &mut recovered,
-                    &mut tree,
-                    &node,
-                    &renderer,
-                    viewport,
-                    &enter,
-                    mouse::Cursor::Unavailable
-                ),
-                [open.clone()],
-                "same focused Files row resumes after {reason} without a new focus operation"
-            );
+            if !pointer {
+                assert_eq!(
+                    send(
+                        &mut recovered,
+                        &mut tree,
+                        &node,
+                        &renderer,
+                        viewport,
+                        &enter,
+                        mouse::Cursor::Unavailable
+                    ),
+                    [open.clone()],
+                    "same focused Files row resumes after {reason} without a new focus operation"
+                );
+            }
             assert!(
                 send(
                     &mut recovered,
