@@ -16,17 +16,98 @@ mod native_tab {
         content: Element<'a, Message>,
         enabled: bool,
         barrier: crate::terminal::ReviewInputBarrier,
+        rows: Vec<iced::advanced::widget::Id>,
     }
     pub(super) fn view<'a>(
         content: Element<'a, Message>,
         enabled: bool,
         barrier: crate::terminal::ReviewInputBarrier,
+        rows: Vec<iced::advanced::widget::Id>,
     ) -> Element<'a, Message> {
         Element::new(TabRing {
             content,
             enabled,
             barrier,
+            rows,
         })
+    }
+
+    // Button operations expose unscrolled content-layout bounds. Probe the
+    // actual focus first, then let only the results scrollable combine those
+    // bounds with its live content origin, viewport and current translation.
+    struct FocusedRow<'a> {
+        rows: &'a [iced::advanced::widget::Id],
+        bounds: Option<Rectangle>,
+    }
+    impl Operation for FocusedRow<'_> {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn focusable(
+            &mut self,
+            id: Option<&iced::advanced::widget::Id>,
+            bounds: Rectangle,
+            state: &mut dyn iced::advanced::widget::operation::Focusable,
+        ) {
+            if state.is_focused() && id.is_some_and(|id| self.rows.contains(id)) {
+                self.bounds = Some(bounds);
+            }
+        }
+    }
+    struct RevealRow(Rectangle);
+    impl Operation for RevealRow {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn scrollable(
+            &mut self,
+            id: Option<&iced::advanced::widget::Id>,
+            bounds: Rectangle,
+            content: Rectangle,
+            translation: Vector,
+            state: &mut dyn iced::advanced::widget::operation::Scrollable,
+        ) {
+            if id != Some(&iced::advanced::widget::Id::new("palette.commands")) {
+                return;
+            }
+            let top = self.0.y - content.y - super::ROW_FOCUS_OUTSET;
+            let bottom = self.0.y - content.y + self.0.height + super::ROW_FOCUS_OUTSET;
+            let offset = if top < translation.y {
+                top
+            } else if bottom > translation.y + bounds.height {
+                bottom - bounds.height
+            } else {
+                translation.y
+            };
+            state.scroll_to(
+                iced::advanced::widget::operation::scrollable::AbsoluteOffset {
+                    x: None,
+                    y: Some(offset.clamp(0.0, (content.height - bounds.height).max(0.0))),
+                },
+            );
+        }
+    }
+    impl TabRing<'_> {
+        fn reveal_focused_row(&mut self, tree: &mut Tree, layout: Layout<'_>, renderer: &Renderer) {
+            let mut focused = FocusedRow {
+                rows: &self.rows,
+                bounds: None,
+            };
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                &mut focused,
+            );
+            if let Some(bounds) = focused.bounds {
+                self.content.as_widget_mut().operate(
+                    &mut tree.children[0],
+                    layout,
+                    renderer,
+                    &mut RevealRow(bounds),
+                );
+            }
+        }
     }
     impl Widget<Message, Theme, Renderer> for TabRing<'_> {
         fn tag(&self) -> tree::Tag {
@@ -127,6 +208,7 @@ mod native_tab {
                         _ => break,
                     }
                 }
+                self.reveal_focused_row(tree, layout, renderer);
                 shell.capture_event();
                 shell.request_redraw();
                 return;
@@ -141,6 +223,14 @@ mod native_tab {
                 shell,
                 viewport,
             );
+            if self.enabled
+                && shell.is_event_captured()
+                && matches!(event, Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowUp | iced::keyboard::key::Named::ArrowDown | iced::keyboard::key::Named::Home | iced::keyboard::key::Named::End), modifiers, ..
+                }) if modifiers.is_empty())
+            {
+                self.reveal_focused_row(tree, layout, renderer);
+            }
         }
 
         fn mouse_interaction(
@@ -375,6 +465,7 @@ impl EntryIdentity {
 }
 
 const ROW_HEIGHT: f32 = 40.0;
+const ROW_FOCUS_OUTSET: f32 = 2.0;
 const ROW_SPACING: f32 = space::XXS;
 
 fn palette_query(query: &str) -> (Option<char>, &str) {
@@ -511,7 +602,7 @@ fn palette_row_style(selected: bool) -> cosmic::theme::Button {
         widget::button::Style {
             background: (selected || hover).then_some(iced::Background::Color(accent)),
             border_radius: design::RADIUS_S.into(),
-            outline_width: if focused { 2.0 } else { 0.0 },
+            outline_width: if focused { ROW_FOCUS_OUTSET } else { 0.0 },
             outline_color: design::accent_color(theme),
             ..design::button_style()
         }
@@ -945,8 +1036,10 @@ impl Cagents {
                 crate::interaction::reveal_list_selection(
                     widget::Id::new("palette.commands"),
                     index,
-                    ROW_HEIGHT,
-                    ROW_SPACING,
+                    // Include the leading outline inset in the selected
+                    // background's reveal bounds, preserving the row stride.
+                    ROW_HEIGHT + ROW_FOCUS_OUTSET,
+                    ROW_SPACING - ROW_FOCUS_OUTSET,
                 )
             })
     }
@@ -1392,6 +1485,11 @@ impl Cagents {
             }
         });
         let selected = self.selected_palette_index(&entries);
+        let row_ids = entries
+            .iter()
+            .filter_map(|(_, _, message)| EntryIdentity::capture(message))
+            .map(|identity| identity.widget_id())
+            .collect();
         let rows: Vec<Element<'_, Message>> = entries
             .into_iter()
             .enumerate()
@@ -1482,8 +1580,15 @@ impl Cagents {
             widget::column::with_children(rows)
         };
         let row_barrier = self.terminal_review_input.clone();
-        let rows = crate::interaction::focused_key(
-            crate::interaction::keyboard_list(rows.spacing(ROW_SPACING), true),
+        let results = crate::interaction::focused_key(
+            crate::interaction::keyboard_list(
+                widget::scrollable(
+                    widget::container(rows.spacing(ROW_SPACING)).padding([ROW_FOCUS_OUTSET, 16.0]),
+                )
+                .id(widget::Id::new("palette.commands"))
+                .height(Length::Shrink),
+                true,
+            ),
             move |event| {
                 if matches!(event, keyboard::Event::KeyPressed { .. })
                     && !matches!(
@@ -1504,13 +1609,7 @@ impl Cagents {
         let surface: Element<'_, Message> = widget::container(
             widget::column::with_children(vec![
                 input.into(),
-                widget::container(
-                    widget::scrollable(widget::container(rows).padding([0, 16]))
-                        .id(widget::Id::new("palette.commands"))
-                        .height(Length::Shrink),
-                )
-                .max_height(360)
-                .into(),
+                widget::container(results).max_height(360).into(),
                 design::caption("↑ ↓ choose · Enter run · Escape close").into(),
             ])
             .spacing(space::S),
@@ -1531,6 +1630,7 @@ impl Cagents {
             surface,
             self.palette_native_owner_is_exposed(),
             self.terminal_review_input.clone(),
+            row_ids,
         ))
     }
 
@@ -5503,5 +5603,970 @@ mod tests {
         let entries = app.palette_entries();
         assert!(EntryIdentity::Workboard.matches(&entries[0].2));
         assert_eq!(app.palette.selected, Some(EntryIdentity::Workboard));
+    }
+    #[derive(Default, Debug)]
+    struct NativePaletteGeometry {
+        focused: Option<(widget::Id, iced::Rectangle)>,
+        scroll: Option<(iced::Rectangle, iced::Rectangle, iced::Vector)>,
+    }
+    impl iced::advanced::widget::Operation for NativePaletteGeometry {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation)) {
+            visit(self);
+        }
+        fn focusable(
+            &mut self,
+            id: Option<&widget::Id>,
+            bounds: iced::Rectangle,
+            state: &mut dyn iced::advanced::widget::operation::Focusable,
+        ) {
+            if state.is_focused()
+                && let Some(id) = id
+            {
+                self.focused = Some((id.clone(), bounds));
+            }
+        }
+        fn scrollable(
+            &mut self,
+            id: Option<&widget::Id>,
+            bounds: iced::Rectangle,
+            content: iced::Rectangle,
+            translation: iced::Vector,
+            _: &mut dyn iced::advanced::widget::operation::Scrollable,
+        ) {
+            if id == Some(&widget::Id::new("palette.commands")) {
+                self.scroll = Some((bounds, content, translation));
+            }
+        }
+    }
+    fn native_palette_geometry(
+        ui: &mut iced::runtime::UserInterface<'_, Message, cosmic::Theme, cosmic::Renderer>,
+        renderer: &cosmic::Renderer,
+    ) -> NativePaletteGeometry {
+        let mut geometry = NativePaletteGeometry::default();
+        ui.operate(renderer, &mut geometry);
+        geometry
+    }
+    fn assert_native_row_ring_visible(geometry: &NativePaletteGeometry, expected: &widget::Id) {
+        let (focused, row) = geometry.focused.as_ref().expect("native focus exists");
+        assert_eq!(focused, expected);
+        let (viewport, _, translation) = geometry.scroll.expect("actual results viewport");
+        let ring = iced::Rectangle {
+            x: row.x - translation.x - ROW_FOCUS_OUTSET,
+            y: row.y - translation.y - ROW_FOCUS_OUTSET,
+            width: row.width + 2.0 * ROW_FOCUS_OUTSET,
+            height: row.height + 2.0 * ROW_FOCUS_OUTSET,
+        };
+        // Tiny floating point tolerance; test the full drawn outline, not only
+        // its button's unscrolled content-layout rectangle.
+        let epsilon = 0.01;
+        assert!(
+            ring.x >= viewport.x - epsilon
+                && ring.y >= viewport.y - epsilon
+                && ring.x + ring.width <= viewport.x + viewport.width + epsilon
+                && ring.y + ring.height <= viewport.y + viewport.height + epsilon,
+            "focused ring must be visible: {geometry:?}; ring={ring:?}"
+        );
+    }
+    fn long_native_palette_fixture() -> Cagents {
+        let mut app = branch_palette_fixture();
+        drop(app.update_palette(Action::Close));
+        let original = app
+            .card_state(app.workspace.focused().unwrap())
+            .unwrap()
+            .clone();
+        for index in 1..34 {
+            let mut card = original.clone();
+            card.id = CardId::new();
+            card.title = format!("Focus fixture {index:02}");
+            app.cards.insert(card.id, CardRuntime::Settings);
+            Arc::make_mut(&mut app.durable).cards.push(card);
+        }
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        drop(app.update_palette(Action::Open));
+        drop(app.update_palette(Action::Query("@".into())));
+        assert_eq!(app.palette_entries().len(), 34);
+        app
+    }
+
+    #[test]
+    fn native_long_palette_rows_reveal_the_entire_focus_ring_before_batched_activation() {
+        use iced::{
+            Size,
+            advanced::{clipboard, widget::operation},
+            mouse,
+        };
+        use keyboard::key::{Code, Named, Physical};
+        for width in [360.0, 880.0] {
+            for direction in ["down", "up", "end", "home", "tab", "shift-tab"] {
+                let mut app = long_native_palette_fixture();
+                let identities: Vec<_> = app
+                    .palette_entries()
+                    .iter()
+                    .map(|(_, _, m)| EntryIdentity::capture(m).unwrap())
+                    .collect();
+                let last = identities.len() - 1;
+                let (named, code, count, start, expected) = match direction {
+                    "down" => (
+                        Named::ArrowDown,
+                        Code::ArrowDown,
+                        20,
+                        identities[0].widget_id(),
+                        20,
+                    ),
+                    "up" => (
+                        Named::ArrowUp,
+                        Code::ArrowUp,
+                        20,
+                        identities[last].widget_id(),
+                        last - 20,
+                    ),
+                    "end" => (Named::End, Code::End, 1, identities[0].widget_id(), last),
+                    "home" => (Named::Home, Code::Home, 1, identities[last].widget_id(), 0),
+                    "tab" => (
+                        Named::Tab,
+                        Code::Tab,
+                        21,
+                        widget::Id::new("palette.query"),
+                        20,
+                    ),
+                    _ => (
+                        Named::Tab,
+                        Code::Tab,
+                        12,
+                        widget::Id::new("palette.query"),
+                        last - 11,
+                    ),
+                };
+                let mut renderer = crate::app::tests::headless_renderer();
+                let mut ui = iced::runtime::UserInterface::build(
+                    app.palette_surface().unwrap(),
+                    Size::new(width, 700.0),
+                    iced::runtime::user_interface::Cache::default(),
+                    &mut renderer,
+                );
+                ui.operate(&renderer, &mut operation::focusable::focus::<()>(start));
+                if direction == "home" || direction == "up" {
+                    ui.operate(
+                        &renderer,
+                        &mut operation::scrollable::scroll_to::<()>(
+                            widget::Id::new("palette.commands"),
+                            operation::scrollable::AbsoluteOffset {
+                                x: None,
+                                y: Some(f32::MAX),
+                            },
+                        ),
+                    );
+                }
+                let before = native_palette_geometry(&mut ui, &renderer);
+                let (viewport, content, _) = before.scroll.unwrap();
+                assert!(
+                    viewport.height <= 360.0
+                        && content.height > viewport.height + 10.0 * ROW_HEIGHT
+                );
+                let cycle = PressCycle::new(Physical::Code(code));
+                let source = Source::tracked(cycle, Transition::Press);
+                let mut events: Vec<_> = (0..count)
+                    .map(|index| {
+                        let mut key = cycle_key(named, code, true, index > 0);
+                        if direction == "shift-tab"
+                            && let keyboard::Event::KeyPressed { modifiers, .. } = &mut key
+                        {
+                            *modifiers = keyboard::Modifiers::SHIFT;
+                        }
+                        iced::Event::Keyboard(key)
+                    })
+                    .collect();
+                let mut sources = vec![source; count];
+                events.push(iced::Event::Keyboard(cycle_key(
+                    Named::Enter,
+                    Code::Enter,
+                    true,
+                    false,
+                )));
+                sources.push(Source::tracked(
+                    PressCycle::new(Physical::Code(Code::Enter)),
+                    Transition::Press,
+                ));
+                let mut messages = Vec::new();
+                let (_, statuses) = ui.update_with_sources(
+                    &events,
+                    &sources,
+                    mouse::Cursor::Unavailable,
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                assert_eq!(
+                    statuses,
+                    vec![iced::event::Status::Captured; events.len()],
+                    "{direction}, width={width}"
+                );
+                let geometry = native_palette_geometry(&mut ui, &renderer);
+                assert_native_row_ring_visible(&geometry, &identities[expected].widget_id());
+                let (viewport, content, offset) = geometry.scroll.unwrap();
+                if direction == "home" {
+                    assert_eq!(offset.y, 0.0);
+                }
+                if direction == "end" {
+                    assert!((offset.y - (content.height - viewport.height)).abs() < 0.01);
+                }
+                if expected > 10 {
+                    assert!(offset.y > 0.0);
+                }
+                assert!(
+                    matches!(messages.as_slice(), [Message::Palette(Action::SubmitFromNative(intent))] if intent.row.as_ref().is_some_and(|m| identities[expected].matches(&m.0)))
+                );
+                drop(ui);
+                assert!(reduce_native_palette(&mut app, messages).is_empty());
+                let EntryIdentity::Pane(target) = &identities[expected] else {
+                    unreachable!()
+                };
+                assert_eq!(app.workspace.focused(), Some(*target));
+                assert!(!app.palette.is_open());
+            }
+        }
+    }
+
+    #[test]
+    fn native_palette_reveal_clamps_short_content_and_preserves_query_caret_and_scroll() {
+        use iced::{
+            Size,
+            advanced::{clipboard, widget::operation},
+            mouse,
+        };
+        use keyboard::key::{Code, Named, Physical};
+        let app = branch_palette_fixture();
+        let row = EntryIdentity::capture(&app.palette_entries()[0].2).unwrap();
+        let mut renderer = crate::app::tests::headless_renderer();
+        let mut ui = iced::runtime::UserInterface::build(
+            app.palette_surface().unwrap(),
+            Size::new(360.0, 700.0),
+            iced::runtime::user_interface::Cache::default(),
+            &mut renderer,
+        );
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(widget::Id::new("palette.query")),
+        );
+        let mut messages = Vec::new();
+        let tab = Source::tracked(
+            PressCycle::new(Physical::Code(Code::Tab)),
+            Transition::Press,
+        );
+        ui.update_with_sources(
+            &[iced::Event::Keyboard(cycle_key(
+                Named::Tab,
+                Code::Tab,
+                true,
+                false,
+            ))],
+            &[tab],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        let geometry = native_palette_geometry(&mut ui, &renderer);
+        assert_native_row_ring_visible(&geometry, &row.widget_id());
+        let (viewport, content, offset) = geometry.scroll.unwrap();
+        assert!(content.height <= viewport.height + 0.01);
+        assert_eq!(offset.y, 0.0);
+        drop(ui);
+        for end in [false, true] {
+            let app = long_native_palette_fixture();
+            let mut ui = iced::runtime::UserInterface::build(
+                app.palette_surface().unwrap(),
+                Size::new(360.0, 700.0),
+                iced::runtime::user_interface::Cache::default(),
+                &mut renderer,
+            );
+            ui.operate(
+                &renderer,
+                &mut operation::focusable::focus::<()>(widget::Id::new("palette.query")),
+            );
+            ui.operate(
+                &renderer,
+                &mut operation::scrollable::scroll_to::<()>(
+                    widget::Id::new("palette.commands"),
+                    operation::scrollable::AbsoluteOffset {
+                        x: None,
+                        y: Some(500.0),
+                    },
+                ),
+            );
+            let before = native_palette_geometry(&mut ui, &renderer)
+                .scroll
+                .unwrap()
+                .2;
+            let (named, code) = if end {
+                (Named::End, Code::End)
+            } else {
+                (Named::Home, Code::Home)
+            };
+            let text = keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character("x".into()),
+                modified_key: keyboard::Key::Character("x".into()),
+                physical_key: Physical::Code(Code::KeyX),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: Some("x".into()),
+                repeat: false,
+            };
+            let mut messages = Vec::new();
+            ui.update_with_sources(
+                &[
+                    iced::Event::Keyboard(cycle_key(named, code, true, false)),
+                    iced::Event::Keyboard(text),
+                ],
+                &[
+                    Source::tracked(PressCycle::new(Physical::Code(code)), Transition::Press),
+                    Source::tracked(
+                        PressCycle::new(Physical::Code(Code::KeyX)),
+                        Transition::Press,
+                    ),
+                ],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            let geometry = native_palette_geometry(&mut ui, &renderer);
+            assert_eq!(
+                geometry.focused.unwrap().0,
+                widget::Id::new("palette.query")
+            );
+            assert_eq!(geometry.scroll.unwrap().2, before);
+            let expected = if end { "@x" } else { "x@" };
+            assert!(
+                matches!(messages.as_slice(), [Message::Palette(Action::QueryFromNative(_, value))] if value == expected)
+            );
+        }
+    }
+
+    #[test]
+    fn native_input_public_scope_contract_restores_nested_and_empty_sources() {
+        use keyboard::key::{Code, Physical};
+        let original = input_source::current_source();
+        let first = Source::tracked(
+            PressCycle::new(Physical::Code(Code::Enter)),
+            Transition::Press,
+        );
+        let second = Source::tracked(
+            PressCycle::new(Physical::Code(Code::Space)),
+            Transition::Release,
+        );
+        {
+            let _outer = input_source::scope(first.clone());
+            assert_eq!(input_source::current_source(), first);
+            {
+                let _inner = input_source::scope(second.clone());
+                assert_eq!(input_source::current_source(), second);
+            }
+            assert_eq!(input_source::current_source(), first);
+            std::thread::spawn(|| {
+                assert_eq!(
+                    input_source::current_source(),
+                    Source::default(),
+                    "new thread cannot inherit its caller's active native input"
+                );
+                let local = Source::tracked(
+                    PressCycle::new(Physical::Code(Code::ArrowDown)),
+                    Transition::Press,
+                );
+                {
+                    let _local = input_source::scope(local.clone());
+                    assert_eq!(input_source::current_source(), local);
+                }
+                assert_eq!(input_source::current_source(), Source::default());
+            })
+            .join()
+            .expect("bounded public input-scope contract worker");
+            assert_eq!(
+                input_source::current_source(),
+                first,
+                "another thread cannot replace the active outer source"
+            );
+            {
+                let _empty = input_source::scope(Source::default());
+                assert_eq!(input_source::current_source(), Source::default());
+            }
+            assert_eq!(input_source::current_source(), first);
+        }
+        assert_eq!(input_source::current_source(), original);
+    }
+
+    #[test]
+    fn native_input_public_scope_contract_unwind_restores_outer_source() {
+        use keyboard::key::{Code, Physical};
+        let original = input_source::current_source();
+        let outer = Source::tracked(
+            PressCycle::new(Physical::Code(Code::Enter)),
+            Transition::Press,
+        );
+        {
+            let _outer = input_source::scope(outer.clone());
+            let result = std::panic::catch_unwind(|| {
+                let _inner = input_source::scope(Source::tracked(
+                    PressCycle::new(Physical::Code(Code::Space)),
+                    Transition::Release,
+                ));
+                panic!("intentional scope-contract unwind");
+            });
+            assert!(result.is_err());
+            assert_eq!(input_source::current_source(), outer);
+        }
+        assert_eq!(input_source::current_source(), original);
+    }
+    // Instrumentation delegates an actual native ContextMenu/Popover overlay;
+    // it observes real UserInterface overlay delivery without inventing a pass.
+    mod native_overlay_audit {
+        use super::{Element, Message, Source};
+        use cosmic::{Renderer, Theme, iced};
+        use iced::advanced::widget::{Operation, Tree, tree};
+        use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer};
+        use iced::{Event, Length, Rectangle, Size, Vector};
+        use std::sync::{Arc, Mutex};
+        #[derive(Default)]
+        pub(super) struct Visits {
+            pub created: usize,
+            pub keys: Vec<(Source, bool)>,
+        }
+        struct NativeOverlayAudit<'a> {
+            content: Element<'a, Message>,
+            visits: Arc<Mutex<Visits>>,
+        }
+        pub(super) fn view<'a>(
+            content: Element<'a, Message>,
+            visits: Arc<Mutex<Visits>>,
+        ) -> Element<'a, Message> {
+            Element::new(NativeOverlayAudit { content, visits })
+        }
+        impl Widget<Message, Theme, Renderer> for NativeOverlayAudit<'_> {
+            fn tag(&self) -> tree::Tag {
+                tree::Tag::of::<NativeOverlayAudit<'static>>()
+            }
+            fn children(&self) -> Vec<Tree> {
+                vec![Tree::new(&self.content)]
+            }
+            fn diff(&mut self, tree: &mut Tree) {
+                tree.diff_children(std::slice::from_mut(&mut self.content));
+            }
+            fn size(&self) -> Size<Length> {
+                self.content.as_widget().size()
+            }
+
+            fn size_hint(&self) -> Size<Length> {
+                self.content.as_widget().size_hint()
+            }
+
+            fn layout(
+                &mut self,
+                tree: &mut Tree,
+                renderer: &Renderer,
+                limits: &layout::Limits,
+            ) -> layout::Node {
+                self.content
+                    .as_widget_mut()
+                    .layout(&mut tree.children[0], renderer, limits)
+            }
+
+            fn operate(
+                &mut self,
+                tree: &mut Tree,
+                layout: Layout<'_>,
+                renderer: &Renderer,
+                operation: &mut dyn Operation,
+            ) {
+                self.content.as_widget_mut().operate(
+                    &mut tree.children[0],
+                    layout,
+                    renderer,
+                    operation,
+                );
+            }
+
+            fn update(
+                &mut self,
+                tree: &mut Tree,
+                event: &Event,
+                layout: Layout<'_>,
+                cursor: mouse::Cursor,
+                renderer: &Renderer,
+                clipboard: &mut dyn Clipboard,
+                shell: &mut Shell<'_, Message>,
+                viewport: &Rectangle,
+            ) {
+                self.content.as_widget_mut().update(
+                    &mut tree.children[0],
+                    event,
+                    layout,
+                    cursor,
+                    renderer,
+                    clipboard,
+                    shell,
+                    viewport,
+                );
+            }
+
+            fn mouse_interaction(
+                &self,
+                tree: &Tree,
+                layout: Layout<'_>,
+                cursor: mouse::Cursor,
+                viewport: &Rectangle,
+                renderer: &Renderer,
+            ) -> mouse::Interaction {
+                self.content.as_widget().mouse_interaction(
+                    &tree.children[0],
+                    layout,
+                    cursor,
+                    viewport,
+                    renderer,
+                )
+            }
+
+            fn draw(
+                &self,
+                tree: &Tree,
+                renderer: &mut Renderer,
+                theme: &Theme,
+                style: &renderer::Style,
+                layout: Layout<'_>,
+                cursor: mouse::Cursor,
+                viewport: &Rectangle,
+            ) {
+                self.content.as_widget().draw(
+                    &tree.children[0],
+                    renderer,
+                    theme,
+                    style,
+                    layout,
+                    cursor,
+                    viewport,
+                );
+            }
+
+            fn a11y_nodes(
+                &self,
+                layout: Layout<'_>,
+                tree: &Tree,
+                cursor: mouse::Cursor,
+            ) -> iced_accessibility::A11yTree {
+                self.content
+                    .as_widget()
+                    .a11y_nodes(layout, &tree.children[0], cursor)
+            }
+
+            fn drag_destinations(
+                &self,
+                tree: &Tree,
+                layout: Layout<'_>,
+                renderer: &Renderer,
+                destinations: &mut iced::advanced::clipboard::DndDestinationRectangles,
+            ) {
+                self.content.as_widget().drag_destinations(
+                    &tree.children[0],
+                    layout,
+                    renderer,
+                    destinations,
+                );
+            }
+
+            fn overlay<'a>(
+                &'a mut self,
+                tree: &'a mut Tree,
+                layout: Layout<'a>,
+                renderer: &Renderer,
+                viewport: &Rectangle,
+                translation: Vector,
+            ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+                self.content
+                    .as_widget_mut()
+                    .overlay(
+                        &mut tree.children[0],
+                        layout,
+                        renderer,
+                        viewport,
+                        translation,
+                    )
+                    .map(|inner| {
+                        self.visits.lock().unwrap().created += 1;
+                        overlay::Element::new(Box::new(AuditedNativeOverlay {
+                            inner,
+                            visits: self.visits.clone(),
+                        }))
+                    })
+            }
+        }
+
+        struct AuditedNativeOverlay<'a> {
+            inner: overlay::Element<'a, Message, Theme, Renderer>,
+            visits: Arc<Mutex<Visits>>,
+        }
+        impl overlay::Overlay<Message, Theme, Renderer> for AuditedNativeOverlay<'_> {
+            fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
+                self.inner.as_overlay_mut().layout(renderer, bounds)
+            }
+            fn update(
+                &mut self,
+                event: &Event,
+                layout: Layout<'_>,
+                cursor: mouse::Cursor,
+                renderer: &Renderer,
+                clipboard: &mut dyn Clipboard,
+                shell: &mut Shell<'_, Message>,
+            ) {
+                self.inner
+                    .as_overlay_mut()
+                    .update(event, layout, cursor, renderer, clipboard, shell);
+                if matches!(
+                    event,
+                    Event::Keyboard(iced::keyboard::Event::KeyPressed { .. })
+                ) {
+                    self.visits.lock().unwrap().keys.push((
+                        iced::runtime::core::keyboard::input::current_source(),
+                        shell.is_event_captured(),
+                    ));
+                }
+            }
+            fn draw(
+                &self,
+                renderer: &mut Renderer,
+                theme: &Theme,
+                style: &renderer::Style,
+                layout: Layout<'_>,
+                cursor: mouse::Cursor,
+            ) {
+                self.inner
+                    .as_overlay()
+                    .draw(renderer, theme, style, layout, cursor);
+            }
+            fn operate(
+                &mut self,
+                layout: Layout<'_>,
+                renderer: &Renderer,
+                operation: &mut dyn Operation,
+            ) {
+                self.inner
+                    .as_overlay_mut()
+                    .operate(layout, renderer, operation);
+            }
+            fn mouse_interaction(
+                &self,
+                layout: Layout<'_>,
+                cursor: mouse::Cursor,
+                renderer: &Renderer,
+            ) -> mouse::Interaction {
+                self.inner
+                    .as_overlay()
+                    .mouse_interaction(layout, cursor, renderer)
+            }
+            fn overlay<'a>(
+                &'a mut self,
+                layout: Layout<'a>,
+                renderer: &Renderer,
+            ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+                self.inner.as_overlay_mut().overlay(layout, renderer)
+            }
+            fn index(&self) -> f32 {
+                self.inner.as_overlay().index()
+            }
+        }
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct RetainedPaletteMenuAction;
+    impl widget::menu::Action for RetainedPaletteMenuAction {
+        type Message = Message;
+        fn message(&self) -> Message {
+            Message::DismissNotice(1725)
+        }
+    }
+    fn palette_retained_menu_fixture<'a>(
+        app: &'a Cagents,
+        palette: bool,
+        visits: Arc<std::sync::Mutex<native_overlay_audit::Visits>>,
+    ) -> Element<'a, Message> {
+        let menu = crate::interaction::context_menu(
+            widget::Space::new()
+                .width(Length::Fill)
+                .height(Length::Fill),
+            widget::menu::items(
+                &HashMap::new(),
+                vec![widget::menu::Item::Button(
+                    "Retained pointer action",
+                    None,
+                    RetainedPaletteMenuAction,
+                )],
+            ),
+        );
+        let menu = native_overlay_audit::view(menu, visits);
+        // Match the actual app mount: existing workspace/context overlay in
+        // the base slot, palette in the front base slot; native overlays remain
+        // the runtime's separate overlay-first pass.
+        crate::interaction::layer(
+            menu,
+            if palette {
+                app.palette_surface().unwrap()
+            } else {
+                widget::Space::new().into()
+            },
+        )
+    }
+    #[test]
+    fn actual_retained_context_menu_ignored_pass_allows_one_palette_tab_per_original_event() {
+        use iced::{
+            Point, Size,
+            advanced::{clipboard, widget::operation},
+            mouse,
+        };
+        use keyboard::key::{Code, Named, Physical};
+        let mut app = long_native_palette_fixture();
+        drop(app.update_palette(Action::Close));
+        let visits: Arc<std::sync::Mutex<native_overlay_audit::Visits>> = Default::default();
+        let mut renderer = crate::app::tests::headless_renderer();
+        let size = Size::new(880.0, 700.0);
+        let mut ui = iced::runtime::UserInterface::build(
+            palette_retained_menu_fixture(&app, false, visits.clone()),
+            size,
+            iced::runtime::user_interface::Cache::default(),
+            &mut renderer,
+        );
+        let mut messages = Vec::new();
+        let anchor = Point::new(30.0, 30.0);
+        ui.update_with_sources(
+            &[
+                iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+                iced::Event::Window(iced::window::Event::RedrawRequested(Instant::now())),
+            ],
+            &[Source::default(), Source::default()],
+            mouse::Cursor::Available(anchor),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        // Opening occurs in the base pass. Drive a separate native frame so
+        // the newly opened real overlay receives its measuring/redraw update
+        // before later keyboard events (as in the running native app).
+        ui.update_with_sources(
+            &[iced::Event::Window(iced::window::Event::RedrawRequested(
+                Instant::now(),
+            ))],
+            &[Source::default()],
+            mouse::Cursor::Available(anchor),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert!(
+            visits.lock().unwrap().created > 0,
+            "the actual pointer context menu opened before the palette"
+        );
+        let cache = ui.into_cache();
+        drop(app.update_palette(Action::Open));
+        drop(app.update_palette(Action::Query("@".into())));
+        let rows: Vec<_> = app
+            .palette_entries()
+            .iter()
+            .map(|(_, _, m)| EntryIdentity::capture(m).unwrap())
+            .collect();
+        let mut ui = iced::runtime::UserInterface::build(
+            palette_retained_menu_fixture(&app, true, visits.clone()),
+            size,
+            cache,
+            &mut renderer,
+        );
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(widget::Id::new("palette.query")),
+        );
+        let tab = Source::tracked(
+            PressCycle::new(Physical::Code(Code::Tab)),
+            Transition::Press,
+        );
+        let enter = Source::tracked(
+            PressCycle::new(Physical::Code(Code::Enter)),
+            Transition::Press,
+        );
+        let events = [
+            iced::Event::Keyboard(cycle_key(Named::Tab, Code::Tab, true, false)),
+            iced::Event::Keyboard(cycle_key(Named::Tab, Code::Tab, true, true)),
+            iced::Event::Keyboard(cycle_key(Named::Enter, Code::Enter, true, false)),
+        ];
+        let sources = [tab.clone(), tab.clone(), enter.clone()];
+        let (_, statuses) = ui.update_with_sources(
+            &events,
+            &sources,
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(statuses, [iced::event::Status::Captured; 3]);
+        let observed = visits.lock().unwrap();
+        assert_eq!(
+            observed.keys.len(),
+            3,
+            "each original key went through an actual retained-menu overlay pass"
+        );
+        assert!(
+            observed.keys.iter().all(|(_, captured)| !captured),
+            "this pointer menu declines keyboard ownership; no blanket overlay-modal rule"
+        );
+        assert_eq!(
+            observed
+                .keys
+                .iter()
+                .map(|(source, _)| source.clone())
+                .collect::<Vec<_>>(),
+            sources
+        );
+        drop(observed);
+        let geometry = native_palette_geometry(&mut ui, &renderer);
+        assert_native_row_ring_visible(&geometry, &rows[1].widget_id());
+        assert!(
+            matches!(messages.as_slice(), [Message::Palette(Action::SubmitFromNative(intent))] if intent.row.as_ref().is_some_and(|m| rows[1].matches(&m.0))),
+            "two genuine same-cycle Tab events traverse exactly two controls; no overlay/base double traversal"
+        );
+        drop(ui);
+        assert!(reduce_native_palette(&mut app, messages).is_empty());
+        let EntryIdentity::Pane(target) = &rows[1] else {
+            unreachable!()
+        };
+        assert_eq!(app.workspace.focused(), Some(*target));
+    }
+    fn palette_captured_popup_fixture<'a>(
+        app: &'a Cagents,
+        popup: bool,
+        visits: Arc<std::sync::Mutex<native_overlay_audit::Visits>>,
+    ) -> Element<'a, Message> {
+        let mut surface = widget::popover(app.palette_surface().unwrap())
+            .id(widget::Id::new("palette.capture.popover"))
+            .modal(true)
+            .position(widget::popover::Position::Point(iced::Point::new(
+                30.0, 30.0,
+            )));
+        if popup {
+            let button = widget::button::custom(design::caption("Foreground keyboard owner"))
+                .id(widget::Id::new("palette.capture.control"))
+                .on_press(Message::Palette(Action::ConsumedActivation));
+            surface = surface.popup(crate::interaction::focused_key(button, |event| {
+                matches!(event, keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::Tab), modifiers, .. } if modifiers.is_empty())
+                    .then_some(Message::Palette(Action::ConsumedActivation))
+            }));
+        }
+        native_overlay_audit::view(surface.into(), visits)
+    }
+    #[test]
+    fn actual_captured_popup_pass_preserves_base_palette_focus_and_allows_later_genuine_repeat() {
+        use iced::{
+            Size,
+            advanced::{clipboard, widget::operation},
+            mouse,
+        };
+        use keyboard::key::{Code, Named, Physical};
+        let app = long_native_palette_fixture();
+        let visits: Arc<std::sync::Mutex<native_overlay_audit::Visits>> = Default::default();
+        let mut renderer = crate::app::tests::headless_renderer();
+        let size = Size::new(360.0, 700.0);
+        let mut ui = iced::runtime::UserInterface::build(
+            palette_captured_popup_fixture(&app, false, visits.clone()),
+            size,
+            iced::runtime::user_interface::Cache::default(),
+            &mut renderer,
+        );
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(widget::Id::new("palette.query")),
+        );
+        let before = native_palette_geometry(&mut ui, &renderer);
+        let cache = ui.into_cache();
+        let mut ui = iced::runtime::UserInterface::build(
+            palette_captured_popup_fixture(&app, true, visits.clone()),
+            size,
+            cache,
+            &mut renderer,
+        );
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(widget::Id::new("palette.capture.control")),
+        );
+        let tab = Source::tracked(
+            PressCycle::new(Physical::Code(Code::Tab)),
+            Transition::Press,
+        );
+        let enter = Source::tracked(
+            PressCycle::new(Physical::Code(Code::Enter)),
+            Transition::Press,
+        );
+        let mut messages = Vec::new();
+        let (_, statuses) = ui.update_with_sources(
+            &[
+                iced::Event::Keyboard(cycle_key(Named::Tab, Code::Tab, true, false)),
+                iced::Event::Keyboard(cycle_key(Named::Enter, Code::Enter, true, false)),
+            ],
+            &[tab.clone(), enter.clone()],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(statuses, [iced::event::Status::Captured; 2]);
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [
+                    Message::Palette(Action::ConsumedActivation),
+                    Message::Palette(Action::ConsumedActivation)
+                ]
+            ),
+            "foreground controls keep their native key actions; palette emits no Submit"
+        );
+        let observed = visits.lock().unwrap();
+        assert!(observed.created > 0);
+        assert_eq!(observed.keys.len(), 2);
+        assert_eq!(
+            observed
+                .keys
+                .iter()
+                .map(|(source, _)| source.clone())
+                .collect::<Vec<_>>(),
+            [tab.clone(), enter]
+        );
+        assert!(observed.keys.iter().all(|(_, captured)| *captured));
+        drop(observed);
+        let cache = ui.into_cache();
+        let mut ui = iced::runtime::UserInterface::build(
+            palette_captured_popup_fixture(&app, false, visits),
+            size,
+            cache,
+            &mut renderer,
+        );
+        let after = native_palette_geometry(&mut ui, &renderer);
+        assert_eq!(
+            after.focused, before.focused,
+            "captured overlay events never traversed the base palette"
+        );
+        assert_eq!(after.scroll, before.scroll);
+        messages.clear();
+        let (_, statuses) = ui.update_with_sources(
+            &[iced::Event::Keyboard(cycle_key(
+                Named::Tab,
+                Code::Tab,
+                true,
+                true,
+            ))],
+            &[tab],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(statuses, [iced::event::Status::Captured]);
+        assert!(messages.is_empty());
+        let first = EntryIdentity::capture(&app.palette_entries()[0].2).unwrap();
+        assert_native_row_ring_visible(
+            &native_palette_geometry(&mut ui, &renderer),
+            &first.widget_id(),
+        );
     }
 }
