@@ -663,6 +663,86 @@ mod tests {
     }
 
     #[test]
+    fn queued_recovery_intent_cannot_follow_restart_reconnect_or_forgotten_evidence() {
+        let replacements: [(&str, fn(&mut TerminalSession)); 4] = [
+            ("restart in the same pane", |terminal| {
+                terminal.id = TerminalId::new();
+            }),
+            ("replacement host incarnation", |terminal| {
+                let TerminalContinuity::Live {
+                    host_incarnation, ..
+                } = &mut terminal.continuity
+                else {
+                    panic!("fixture must carry a live host proof");
+                };
+                *host_incarnation = crate::model::HostIncarnation::new("replacement-host");
+            }),
+            ("changed retry recipe on the same terminal", |terminal| {
+                terminal
+                    .launch
+                    .arguments
+                    .push("replacement-argument".into());
+            }),
+            ("forgotten transcript evidence", |terminal| {
+                terminal.transcript_path = None;
+            }),
+        ];
+        for (scenario, replace) in replacements {
+            let (_directory, mut app, card) = fixture();
+            // Keep the archived and live projections mutually eligible, so a
+            // rejection cannot pass merely because the recovery button vanished.
+            for state in &mut Arc::make_mut(&mut app.durable).cards {
+                if let CardKind::Terminal(terminal) = &mut state.kind {
+                    terminal.continuity = TerminalContinuity::Live {
+                        host_session_id: crate::model::HostSessionId::new("original-session"),
+                        boot_id: crate::model::BootId::new("original-boot"),
+                        host_incarnation: crate::model::HostIncarnation::new("original-host"),
+                    };
+                    terminal.transcript_path = Some("original-transcript".into());
+                }
+            }
+            let queued = open(&app, card);
+            for state in &mut Arc::make_mut(&mut app.durable).cards {
+                if let CardKind::Terminal(terminal) = &mut state.kind {
+                    replace(terminal);
+                }
+            }
+            // Both aliases must describe the same replacement, including when
+            // a restart assigns a new terminal ID.
+            let replacement = app.card_state(card).unwrap().kind.clone();
+            Arc::make_mut(&mut app.durable).cards[0].kind = replacement;
+            assert_eq!(
+                app.refused_terminal_recovery_target(),
+                Some(card),
+                "{scenario}"
+            );
+            assert!(app.session_recovery_action().is_some(), "{scenario}");
+            let before = Arc::clone(&app.durable);
+            let generation = app.session_recovery.generation;
+            drop(app.update_session_recovery(queued));
+            assert!(!app.session_recovery.open(), "{scenario}");
+            assert!(!app.session_recovery.preparing, "{scenario}");
+            assert!(!app.session_recovery.pending, "{scenario}");
+            assert_eq!(app.session_recovery.generation, generation, "{scenario}");
+            assert!(Arc::ptr_eq(&before, &app.durable), "{scenario}");
+
+            // A fresh action may begin review. Deliberately do not poll the
+            // preparation task: this does not establish storage or RPC success.
+            let fresh = open(&app, card);
+            drop(app.update_session_recovery(fresh));
+            assert_eq!(app.session_recovery.target, Some(card), "{scenario}");
+            assert!(app.session_recovery.preparing, "{scenario}");
+            assert_eq!(
+                app.session_recovery.generation,
+                generation + 1,
+                "{scenario}"
+            );
+            drop(app.update_session_recovery(Action::Cancel));
+            app.session.as_mut().unwrap().shutdown();
+        }
+    }
+
+    #[test]
     fn notices_keyboard_traversal_reaches_the_eligible_ownership_recovery_control() {
         let (_directory, mut app, _card) = fixture();
         drop(app.update_chrome(chrome_ui::Action::ToggleNotices));
