@@ -189,7 +189,7 @@ mod tests {
         let opening = app.begin_sidebar_group_delete();
         assert_eq!(
             super::super::tests::focused_element(app.sidebar_selection_dialog().unwrap(), opening),
-            Some(close_focus_id())
+            app.sidebar_selection_dialog_focus_target()
         );
         let dialog = app.sidebar_selection_ui.dialog.as_ref().unwrap();
         assert_eq!(dialog.targets.len(), 2);
@@ -500,12 +500,122 @@ mod tests {
             vec![SelectionRow::Channel(ids[1])]
         );
     }
+    #[test]
+    fn group_primary_and_escape_restore_actual_invoker_not_first_selected_row() {
+        let (mut app, _, ids) = fixture();
+        app.context_inspector_open = false;
+        select(&mut app, &ids[..2]);
+        let invoker = SelectionRow::Channel(ids[1]);
+        let opening = app.update(Message::Sidebar(SidebarAction::DeleteSelectedRowsFrom(
+            invoker,
+        )));
+        let primary = app
+            .sidebar_selection_ui
+            .dialog
+            .as_ref()
+            .unwrap()
+            .control_id(true, true);
+        assert_eq!(
+            super::super::tests::focused_element(app.sidebar_selection_dialog().unwrap(), opening),
+            Some(primary)
+        );
+        let closing = app.update(Message::KeyEvent {
+            event: super::super::dialog_ui::tests::key_press(keyboard::key::Named::Escape),
+            captured: false,
+        });
+        assert!(app.sidebar_selection_ui.dialog.is_none());
+        assert_eq!(
+            super::super::tests::focused(&app, closing),
+            Some(sidebar::selection_row_focus_id(invoker))
+        );
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .any(|channel| channel.id == ids[0])
+        );
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .any(|channel| channel.id == ids[1])
+        );
+    }
+
+    #[test]
+    fn group_live_target_eligibility_matches_cancel_and_reopening_retires_old_answers() {
+        let (mut app, _, ids) = fixture();
+        select(&mut app, &ids[..2]);
+        drop(app.begin_sidebar_group_delete_from(SelectionRow::Channel(ids[1])));
+        let dialog = app.sidebar_selection_ui.dialog.as_ref().unwrap();
+        let old_presentation = dialog.presentation;
+        let primary = dialog.control_id(true, true);
+        let cancel = dialog.control_id(false, true);
+        assert_eq!(
+            app.sidebar_selection_dialog_focus_target(),
+            Some(primary.clone())
+        );
+        let extra = app.durable.cards[0].id;
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|row| row.id == ids[1])
+            .unwrap()
+            .cards
+            .push(extra);
+        assert_eq!(
+            app.sidebar_selection_dialog_focus_target(),
+            Some(cancel.clone())
+        );
+        let (messages, _) = super::super::dialog_ui::tests::key_control(
+            app.sidebar_selection_dialog().unwrap(),
+            primary,
+            super::super::dialog_ui::tests::key_press(keyboard::key::Named::Enter),
+        );
+        assert!(messages.is_empty());
+        let focus = app.update_sidebar_selection(Action::Confirm);
+        assert_eq!(
+            super::super::tests::focused_element(app.sidebar_selection_dialog().unwrap(), focus),
+            Some(cancel)
+        );
+        assert!(!app.channel_ui.deletion_running());
+        drop(app.update_sidebar_selection(Action::Dismiss));
+        drop(app.begin_sidebar_group_delete_from(SelectionRow::Channel(ids[1])));
+        let current = app
+            .sidebar_selection_ui
+            .dialog
+            .as_ref()
+            .unwrap()
+            .presentation;
+        assert_ne!(old_presentation, current);
+        assert_eq!(
+            app.update_sidebar_selection(Action::Answer {
+                presentation: old_presentation,
+                confirm: true
+            })
+            .units(),
+            0
+        );
+        assert_eq!(
+            app.sidebar_selection_ui
+                .dialog
+                .as_ref()
+                .unwrap()
+                .presentation,
+            current
+        );
+        assert!(!app.channel_ui.deletion_running());
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum Action {
     Confirm,
     Dismiss,
+    Answer {
+        presentation: uuid::Uuid,
+        confirm: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -524,6 +634,8 @@ struct Target {
 
 #[derive(Debug)]
 pub(super) struct Dialog {
+    presentation: uuid::Uuid,
+    invoker: SelectionRow,
     targets: Vec<Target>,
     error: Option<String>,
 }
@@ -533,9 +645,13 @@ impl Dialog {
         self.targets[0].row
     }
 
-    /// Every group deletion opens on its non-destructive dismissal.
-    pub(super) fn focus_target(&self) -> widget::Id {
-        close_focus_id()
+    fn control_id(&self, confirm: bool, enabled: bool) -> widget::Id {
+        let role = if confirm { "confirm" } else { "cancel" };
+        let eligibility = if enabled { "enabled" } else { "disabled" };
+        widget::Id::new(format!(
+            "dialog.sidebar-selection.{}.{role}.{eligibility}",
+            self.presentation
+        ))
     }
 
     fn blocked(&self) -> usize {
@@ -546,15 +662,33 @@ impl Dialog {
     }
 }
 
-pub(super) fn focus_id() -> widget::Id {
-    widget::Id::new("dialog.sidebar-selection.confirm")
-}
-
-fn close_focus_id() -> widget::Id {
-    widget::Id::new("dialog.sidebar-selection.close")
-}
-
 impl Cagents {
+    fn sidebar_selection_can_confirm(&self, dialog: &Dialog) -> bool {
+        dialog.error.is_none()
+            && dialog.targets.iter().all(|target| {
+                self.selected_row_target(target.row).is_ok_and(|current| {
+                    current.directory == target.directory
+                        && current.blocker.is_none()
+                        && target
+                            .channel
+                            .as_ref()
+                            .is_none_or(|consent| match target.row {
+                                SelectionRow::Channel(id) => {
+                                    self.channel_deletion_target_current(id, consent)
+                                }
+                                _ => false,
+                            })
+                })
+            })
+    }
+
+    pub(super) fn sidebar_selection_dialog_focus_target(&self) -> Option<widget::Id> {
+        self.sidebar_selection_ui
+            .dialog
+            .as_ref()
+            .map(|dialog| dialog.control_id(self.sidebar_selection_can_confirm(dialog), true))
+    }
+
     pub(super) fn visible_sidebar_rows(&self) -> Vec<SelectionRow> {
         sidebar::visible_selection_rows(
             &self.sidebar_model,
@@ -695,9 +829,23 @@ impl Cagents {
     /// gets that row's own confirmation; several get one group confirmation
     /// that names every member and what goes with them.
     pub(super) fn begin_sidebar_group_delete(&mut self) -> Task<Message> {
+        self.open_sidebar_group_delete(None)
+    }
+
+    pub(super) fn begin_sidebar_group_delete_from(
+        &mut self,
+        invoker: SelectionRow,
+    ) -> Task<Message> {
+        self.open_sidebar_group_delete(Some(invoker))
+    }
+
+    fn open_sidebar_group_delete(&mut self, invoker: Option<SelectionRow>) -> Task<Message> {
         let visible = self.visible_sidebar_rows();
         self.sidebar_state.prune_row_selection(&visible);
         let selected = self.sidebar_state.selected_rows(&visible);
+        if invoker.is_some_and(|row| !selected.contains(&row)) {
+            return Task::none();
+        }
         let first = match selected.as_slice() {
             [] => return Task::none(),
             [only] => return self.delete_sidebar_row(*only),
@@ -719,12 +867,14 @@ impl Cagents {
         {
             Ok(targets) => {
                 let dialog = Dialog {
+                    presentation: uuid::Uuid::new_v4(),
+                    invoker: invoker.unwrap_or(first),
                     targets,
                     error: None,
                 };
-                let focus = dialog.focus_target();
+                let focus = dialog.control_id(self.sidebar_selection_can_confirm(&dialog), true);
                 self.sidebar_selection_ui.dialog = Some(dialog);
-                iced::widget::operation::focus(focus).map(cosmic::Action::App)
+                super::dialog_ui::focus_target_task(focus)
             }
             Err(error) => {
                 self.status = Some(TransientNotice::warning(error));
@@ -734,23 +884,61 @@ impl Cagents {
     }
 
     pub(super) fn update_sidebar_selection(&mut self, action: Action) -> Task<Message> {
+        let action = match action {
+            Action::Answer {
+                presentation,
+                confirm,
+            } => {
+                if self
+                    .sidebar_selection_ui
+                    .dialog
+                    .as_ref()
+                    .map(|dialog| dialog.presentation)
+                    != Some(presentation)
+                {
+                    return Task::none();
+                }
+                if confirm {
+                    Action::Confirm
+                } else {
+                    Action::Dismiss
+                }
+            }
+            other => other,
+        };
+        let Some(current) = self.sidebar_selection_ui.dialog.as_ref() else {
+            return Task::none();
+        };
+        if self.exposed_dialog_focus()
+            != super::dialog_ui::DialogFocus::Focus(
+                current.control_id(self.sidebar_selection_can_confirm(current), true),
+            )
+        {
+            return Task::none();
+        }
         let Some(mut dialog) = self.sidebar_selection_ui.dialog.take() else {
             return Task::none();
         };
         if matches!(action, Action::Dismiss) {
-            return dialog
-                .targets
-                .first()
-                .filter(|target| self.visible_sidebar_rows().contains(&target.row))
-                .map_or_else(Task::none, |target| {
-                    iced::widget::operation::focus(sidebar::selection_row_focus_id(target.row))
-                        .map(cosmic::Action::App)
-                });
+            return self.restore_dialog_focus(|| {
+                self.visible_sidebar_rows()
+                    .contains(&dialog.invoker)
+                    .then(|| {
+                        super::dialog_ui::focus_target_task(sidebar::selection_row_focus_id(
+                            dialog.invoker,
+                        ))
+                    })
+                    .unwrap_or_else(Task::none)
+            });
         }
         // Revalidate every target before starting any operation. A reload may
         // have changed a path, removed a row, or dirtied a worktree while
         // confirmation was open.
-        dialog.error = None;
+        if dialog.error.is_some() {
+            let focus = dialog.control_id(self.sidebar_selection_can_confirm(&dialog), true);
+            self.sidebar_selection_ui.dialog = Some(dialog);
+            return super::dialog_ui::focus_target_task(focus);
+        }
         for target in &mut dialog.targets {
             match self.selected_row_target(target.row) {
                 Ok(current)
@@ -776,9 +964,9 @@ impl Cagents {
             }
         }
         if dialog.error.is_some() || dialog.blocked() > 0 {
-            let focus = dialog.focus_target();
+            let focus = dialog.control_id(self.sidebar_selection_can_confirm(&dialog), true);
             self.sidebar_selection_ui.dialog = Some(dialog);
-            return iced::widget::operation::focus(focus).map(cosmic::Action::App);
+            return super::dialog_ui::focus_target_task(focus);
         }
         let mut tasks = Vec::new();
         for target in dialog.targets {
@@ -946,15 +1134,35 @@ impl Cagents {
         if let Some(error) = &dialog.error {
             rows.push(super::notice_body(error.as_str()));
         }
+        let confirm_enabled = self.sidebar_selection_can_confirm(dialog);
+        if !confirm_enabled && blocked == 0 && dialog.error.is_none() {
+            rows.push(super::notice_body(
+                "A selected row or its panes changed. Cancel and review the selection again.",
+            ));
+        }
+        let cancel_id = dialog.control_id(false, true);
+        let confirm_id = dialog.control_id(true, confirm_enabled);
         rows.push(super::dialog_ui::confirmation_actions(
-            crate::ui_controls::button::secondary("Cancel")
-                .id(close_focus_id())
-                .on_press(Message::SidebarSelection(Action::Dismiss)),
-            crate::ui_controls::button::destructive(kind.deletion_label(count))
-                .id(focus_id())
-                .on_press_maybe(
-                    (blocked == 0).then_some(Message::SidebarSelection(Action::Confirm)),
-                ),
+            crate::ui_controls::owned(
+                cancel_id.clone(),
+                crate::ui_controls::button::secondary("Cancel")
+                    .id(cancel_id)
+                    .on_press(Message::SidebarSelection(Action::Answer {
+                        presentation: dialog.presentation,
+                        confirm: false,
+                    })),
+            ),
+            crate::ui_controls::owned(
+                confirm_id.clone(),
+                crate::ui_controls::button::destructive(kind.deletion_label(count))
+                    .id(confirm_id)
+                    .on_press_maybe(confirm_enabled.then_some(Message::SidebarSelection(
+                        Action::Answer {
+                            presentation: dialog.presentation,
+                            confirm: true,
+                        },
+                    ))),
+            ),
         ));
         Some(dialog_ui::surface(
             widget::column::with_children(rows).spacing(space::M),

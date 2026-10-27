@@ -181,6 +181,10 @@ pub enum Action {
     RequestDelete(ChannelId),
     ConfirmDelete,
     Dismiss,
+    Answer {
+        presentation: uuid::Uuid,
+        confirm: bool,
+    },
     SessionsClosed(ChannelId, uuid::Uuid, Result<(), String>),
     RetryDelete(ChannelId),
     /// Runs a deletion that failed again, from the channel's row.
@@ -196,7 +200,11 @@ impl Action {
     pub fn answers_own_dialog(&self) -> bool {
         matches!(
             self,
-            Self::ConfirmDelete | Self::Dismiss | Self::SessionsClosed(..) | Self::RetryDelete(_)
+            Self::ConfirmDelete
+                | Self::Dismiss
+                | Self::Answer { .. }
+                | Self::SessionsClosed(..)
+                | Self::RetryDelete(_)
         )
     }
 }
@@ -264,6 +272,8 @@ fn closed_channel_source_matches(before: &CardKind, current: &CardKind) -> bool 
 
 #[derive(Debug, Clone)]
 struct Deletion {
+    presentation: uuid::Uuid,
+    origin: Option<sidebar::SelectionRow>,
     channel: ChannelId,
     target: ChannelDeletionTarget,
     title: String,
@@ -273,6 +283,17 @@ struct Deletion {
     /// opened again after it. Confirming retries it.
     failure: Option<String>,
     review_required: bool,
+}
+
+impl Deletion {
+    fn control_id(&self, confirm: bool, enabled: bool) -> widget::Id {
+        let role = if confirm { "confirm" } else { "cancel" };
+        let eligibility = if enabled { "enabled" } else { "disabled" };
+        widget::Id::new(format!(
+            "dialog.channel.{}.{}.{role}.{eligibility}",
+            self.presentation, self.channel
+        ))
+    }
 }
 
 impl State {
@@ -309,13 +330,22 @@ impl State {
     pub(super) fn was_deleted(&self, id: ChannelId) -> bool {
         self.deleted.contains(&id)
     }
-
-    pub(super) fn focus_target() -> widget::Id {
-        widget::Id::new("dialog.channel.close")
-    }
 }
 
 impl Cagents {
+    fn channel_dialog_can_confirm(&self, dialog: &Deletion) -> bool {
+        !dialog.review_required
+            && self.channel_deletion_target_current(dialog.channel, &dialog.target)
+            && self.channel_deletion_blocker(dialog.channel).is_none()
+    }
+
+    pub(super) fn channel_dialog_focus_target(&self) -> Option<widget::Id> {
+        self.channel_ui
+            .dialog
+            .as_ref()
+            .map(|dialog| dialog.control_id(self.channel_dialog_can_confirm(dialog), true))
+    }
+
     /// Utility panes and closed chats do not own the channel conversation name.
     pub(super) fn channel_primary_chat(&self, channel: &ProjectChannel) -> Option<CardId> {
         channel.cards.iter().copied().find(|id| {
@@ -423,6 +453,25 @@ impl Cagents {
         }
         match action {
             Action::SessionsClosed(..) | Action::RetryDelete(_) => unreachable!(),
+            Action::Answer {
+                presentation,
+                confirm,
+            } => {
+                if self
+                    .channel_ui
+                    .dialog
+                    .as_ref()
+                    .map(|dialog| dialog.presentation)
+                    != Some(presentation)
+                {
+                    return Task::none();
+                }
+                self.handle_channel_ui(if confirm {
+                    Action::ConfirmDelete
+                } else {
+                    Action::Dismiss
+                })
+            }
             Action::RetryFailed(id) => {
                 if !self.channel_ui.failed.contains_key(&id) {
                     return Task::none();
@@ -490,16 +539,27 @@ impl Cagents {
             Action::Delete(id) => self.begin_channel_deletion(id, false),
             Action::RequestDelete(id) => self.begin_channel_deletion(id, true),
             Action::ConfirmDelete => {
+                if self.exposed_dialog_focus()
+                    != self.channel_dialog_focus_target().map_or(
+                        super::dialog_ui::DialogFocus::NoOwner,
+                        super::dialog_ui::DialogFocus::Focus,
+                    )
+                {
+                    return Task::none();
+                }
                 let Some(deletion) = self.channel_ui.dialog.take() else {
                     return Task::none();
                 };
+                if deletion.review_required {
+                    self.channel_ui.dialog = Some(deletion);
+                    return self.focus_exposed_dialog();
+                }
                 if let Some(error) = self.channel_deletion_blocker(deletion.channel) {
                     self.channel_ui.dialog = Some(Deletion {
                         failure: Some(error),
                         ..deletion
                     });
-                    return iced::widget::operation::focus(State::focus_target())
-                        .map(cosmic::Action::App);
+                    return self.focus_exposed_dialog();
                 }
                 if !self.channel_deletion_target_current(deletion.channel, &deletion.target) {
                     self.channel_ui.dialog = Some(Deletion {
@@ -507,8 +567,7 @@ impl Cagents {
                         review_required: true,
                         ..deletion
                     });
-                    return iced::widget::operation::focus(State::focus_target())
-                        .map(cosmic::Action::App);
+                    return self.focus_exposed_dialog();
                 }
                 self.channel_ui
                     .approved
@@ -516,21 +575,31 @@ impl Cagents {
                 self.delete_channel(deletion.channel)
             }
             Action::Dismiss => {
+                let Some(target) = self.channel_dialog_focus_target() else {
+                    return Task::none();
+                };
+                if self.exposed_dialog_focus() != super::dialog_ui::DialogFocus::Focus(target) {
+                    return Task::none();
+                }
                 // Declining to delete a channel whose deletion failed is the
                 // answer to that failure, so its row stops asking.
-                if let Some(dismissed) = self.channel_ui.dialog.take()
-                    && self.channel_ui.failed.remove(&dismissed.channel).is_some()
-                {
+                let dismissed = self.channel_ui.dialog.take().unwrap();
+                if self.channel_ui.failed.remove(&dismissed.channel).is_some() {
                     self.channel_ui.approved.remove(&dismissed.channel);
                     self.refresh_sidebar_channels();
                 }
-                let focus = self.nested_modal_focus_target().unwrap_or_else(|| {
-                    self.workspace
-                        .focused()
-                        .map(|card| self.card_keyboard_focus(card))
-                        .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID))
-                });
-                iced::widget::operation::focus(focus).map(cosmic::Action::App)
+                self.restore_dialog_focus(|| match dismissed.origin {
+                    Some(row) if self.visible_sidebar_rows().contains(&row) => {
+                        super::dialog_ui::focus_target_task(sidebar::selection_row_focus_id(row))
+                    }
+                    Some(_) => Task::none(),
+                    None => super::dialog_ui::focus_target_task(
+                        self.workspace
+                            .focused()
+                            .map(|card| self.card_keyboard_focus(card))
+                            .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
+                    ),
+                })
             }
         }
     }
@@ -633,6 +702,11 @@ impl Cagents {
             return self.delete_channel(id);
         }
         self.channel_ui.dialog = Some(Deletion {
+            presentation: uuid::Uuid::new_v4(),
+            origin: self
+                .visible_sidebar_rows()
+                .contains(&sidebar::SelectionRow::Channel(id))
+                .then_some(sidebar::SelectionRow::Channel(id)),
             channel: id,
             target,
             title,
@@ -640,7 +714,7 @@ impl Cagents {
             failure: self.channel_ui.failed.get(&id).cloned(),
             review_required: false,
         });
-        iced::widget::operation::focus(State::focus_target()).map(cosmic::Action::App)
+        self.focus_exposed_dialog()
     }
 
     /// The open conversations - chats and terminals - that deleting
@@ -1140,20 +1214,46 @@ impl Cagents {
                 "The last attempt failed: {failure}"
             )));
         }
+        let changed = !self.channel_deletion_target_current(dialog.channel, &dialog.target);
+        let blocker = self.channel_deletion_blocker(dialog.channel);
+        if changed && !dialog.review_required {
+            rows.push(super::notice_body(
+                "The channel's panes changed. Cancel and review the channel before deleting again.",
+            ));
+        } else if let Some(blocker) = &blocker
+            && dialog.failure.as_ref() != Some(blocker)
+        {
+            rows.push(super::notice_body(blocker.as_str()));
+        }
+        let confirm_enabled = self.channel_dialog_can_confirm(dialog);
+        let cancel_id = dialog.control_id(false, true);
+        let confirm_id = dialog.control_id(true, confirm_enabled);
         rows.push(super::dialog_ui::confirmation_actions(
-            crate::ui_controls::button::secondary("Cancel")
-                .id(widget::Id::new("dialog.channel.close"))
-                .on_press(Message::ChannelUi(Action::Dismiss)),
-            crate::ui_controls::button::destructive(
-                if dialog.failure.is_some() && !dialog.review_required {
-                    "Retry delete"
-                } else {
-                    "Delete channel"
-                },
-            )
-            .id(widget::Id::new("dialog.channel.confirm"))
-            .on_press_maybe(
-                (!dialog.review_required).then_some(Message::ChannelUi(Action::ConfirmDelete)),
+            crate::ui_controls::owned(
+                cancel_id.clone(),
+                crate::ui_controls::button::secondary("Cancel")
+                    .id(cancel_id)
+                    .on_press(Message::ChannelUi(Action::Answer {
+                        presentation: dialog.presentation,
+                        confirm: false,
+                    })),
+            ),
+            crate::ui_controls::owned(
+                confirm_id.clone(),
+                crate::ui_controls::button::destructive(
+                    if dialog.failure.is_some() && !dialog.review_required {
+                        "Retry delete"
+                    } else {
+                        "Delete channel"
+                    },
+                )
+                .id(confirm_id)
+                .on_press_maybe(
+                    confirm_enabled.then_some(Message::ChannelUi(Action::Answer {
+                        presentation: dialog.presentation,
+                        confirm: true,
+                    })),
+                ),
             ),
         ));
         Some(super::dialog_ui::surface(
@@ -1393,47 +1493,172 @@ mod tests {
     use crate::sidebar::RowDeletion;
 
     #[test]
-    fn deletion_opens_on_cancel_and_enter_or_escape_keeps_the_channel_and_cards() {
-        for enter in [false, true] {
-            let (mut app, channel, _survivor, card) = channel_with_a_conversation();
-            let original = app.card_state(card).unwrap().clone();
-            let opening = app.handle_channel_ui(Action::Delete(channel));
-            assert_eq!(
-                super::super::tests::focused_element(app.channel_dialog_view().unwrap(), opening),
-                Some(widget::Id::new("dialog.channel.close"))
-            );
-            let cancel = if enter {
-                let message = super::super::dialog_ui::tests::enter_control(
-                    app.channel_dialog_view().unwrap(),
-                    State::focus_target(),
-                );
-                assert!(matches!(message, Message::ChannelUi(Action::Dismiss)));
-                message
-            } else {
-                Message::KeyEvent {
-                    event: keyboard::Event::KeyPressed {
-                        key: keyboard::Key::Named(keyboard::key::Named::Escape),
-                        modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
-                        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
-                        location: keyboard::Location::Standard,
-                        modifiers: keyboard::Modifiers::empty(),
-                        text: None,
-                        repeat: false,
-                    },
-                    captured: false,
+    fn deletion_opens_on_primary_and_cancel_or_escape_restores_exact_sidebar_invoker() {
+        for retry in [false, true] {
+            for cancel_button in [false, true] {
+                let (mut app, channel, _, card) = channel_with_a_conversation();
+                app.context_inspector_open = false;
+                if retry {
+                    app.channel_ui
+                        .failed
+                        .insert(channel, "Close was refused".into());
                 }
-            };
-            drop(app.update(cancel));
-            assert!(!app.channel_ui.modal_open());
-            assert!(
-                app.durable
-                    .channels
-                    .iter()
-                    .any(|current| current.id == channel)
-            );
-            assert_eq!(app.card_state(card), Some(&original));
-            assert!(!app.channel_ui.deletion_running());
+                let original = app.card_state(card).unwrap().clone();
+                let opening = app.handle_channel_ui(Action::RequestDelete(channel));
+                let dialog = app.channel_ui.dialog.as_ref().unwrap();
+                let confirm = dialog.control_id(true, true);
+                let cancel = dialog.control_id(false, true);
+                assert_eq!(app.channel_dialog_focus_target(), Some(confirm.clone()));
+                assert_eq!(
+                    super::super::tests::focused_element(
+                        app.channel_dialog_view().unwrap(),
+                        opening
+                    ),
+                    Some(confirm.clone())
+                );
+                assert!(matches!(
+                    super::super::dialog_ui::tests::enter_control(
+                        app.channel_dialog_view().unwrap(),
+                        confirm
+                    ),
+                    Message::ChannelUi(Action::Answer { confirm: true, .. })
+                ));
+                let message = if cancel_button {
+                    super::super::dialog_ui::tests::enter_control(
+                        app.channel_dialog_view().unwrap(),
+                        cancel,
+                    )
+                } else {
+                    Message::KeyEvent {
+                        event: super::super::dialog_ui::tests::key_press(
+                            keyboard::key::Named::Escape,
+                        ),
+                        captured: false,
+                    }
+                };
+                let task = app.update(message);
+                assert!(!app.channel_ui.modal_open());
+                assert_eq!(
+                    super::super::tests::focused(&app, task),
+                    Some(sidebar::selection_row_focus_id(
+                        sidebar::SelectionRow::Channel(channel)
+                    ))
+                );
+                assert_eq!(app.card_state(card), Some(&original));
+                assert!(!app.channel_ui.deletion_running());
+                assert_eq!(
+                    app.handle_channel_ui(Action::Dismiss).units(),
+                    0,
+                    "duplicate dismissal cannot refocus background content"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn channel_dialog_live_eligibility_matches_controls_and_new_presentation_refuses_old_answer() {
+        let (mut app, channel, _, _) = channel_with_a_conversation();
+        app.context_inspector_open = false;
+        drop(app.handle_channel_ui(Action::RequestDelete(channel)));
+        let dialog = app.channel_ui.dialog.as_ref().unwrap();
+        let old_presentation = dialog.presentation;
+        let stale_confirm = dialog.control_id(true, true);
+        let cancel = dialog.control_id(false, true);
+        let extra = app.durable.cards[0].id;
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|row| row.id == channel)
+            .unwrap()
+            .cards
+            .push(extra);
+        assert_eq!(app.channel_dialog_focus_target(), Some(cancel.clone()));
+        let (messages, _) = super::super::dialog_ui::tests::key_control(
+            app.channel_dialog_view().unwrap(),
+            stale_confirm,
+            super::super::dialog_ui::tests::key_press(keyboard::key::Named::Enter),
+        );
+        assert!(
+            messages.is_empty(),
+            "a live target change removes enabled confirmation before the next press"
+        );
+        let focus = app.handle_channel_ui(Action::ConfirmDelete);
+        assert_eq!(
+            super::super::tests::focused_element(app.channel_dialog_view().unwrap(), focus),
+            Some(cancel)
+        );
+        assert!(app.channel_ui.dialog.as_ref().unwrap().review_required);
+        drop(app.handle_channel_ui(Action::Dismiss));
+        drop(app.handle_channel_ui(Action::RequestDelete(channel)));
+        let current = app.channel_ui.dialog.as_ref().unwrap().presentation;
+        assert_ne!(old_presentation, current);
+        assert_eq!(
+            app.handle_channel_ui(Action::Answer {
+                presentation: old_presentation,
+                confirm: true
+            })
+            .units(),
+            0
+        );
+        assert_eq!(
+            app.channel_ui.dialog.as_ref().unwrap().presentation,
+            current
+        );
+        assert!(!app.channel_ui.deletion_running());
+        app.chat_ui.image_viewer = Some(chat_ui::images::Gallery::file(
+            "/fixture/public-image.png".into(),
+            None,
+            iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
+        ));
+        assert_eq!(
+            app.handle_channel_ui(Action::Answer {
+                presentation: current,
+                confirm: false
+            })
+            .units(),
+            0
+        );
+        assert!(
+            app.channel_ui.modal_open(),
+            "a covered answer cannot close or refocus another owner"
+        );
+    }
+
+    #[test]
+    fn channel_dialog_live_editor_blocker_clears_to_enabled_primary_without_cached_focus() {
+        let (mut app, channel, _, _) = channel_with_a_conversation();
+        let editor = add_deletion_editor(&mut app, channel, 0);
+        let (clean, _) =
+            repository_widget::RepositoryRuntime::open_fixture(editor, "notes.txt", "saved\n");
+        app.cards
+            .insert(editor, CardRuntime::Repository(Box::new(clean)));
+        drop(app.handle_channel_ui(Action::RequestDelete(channel)));
+        let dialog = app.channel_ui.dialog.as_ref().unwrap();
+        let confirm = dialog.control_id(true, true);
+        let cancel = dialog.control_id(false, true);
+        assert_eq!(app.channel_dialog_focus_target(), Some(confirm.clone()));
+        app.cards.insert(
+            editor,
+            CardRuntime::Repository(Box::new(blocked_deletion_editor(editor, 0))),
+        );
+        assert_eq!(app.channel_dialog_focus_target(), Some(cancel.clone()));
+        let focus = app.handle_channel_ui(Action::ConfirmDelete);
+        assert_eq!(
+            super::super::tests::focused_element(app.channel_dialog_view().unwrap(), focus),
+            Some(cancel)
+        );
+        let (clean, _) =
+            repository_widget::RepositoryRuntime::open_fixture(editor, "notes.txt", "saved\n");
+        app.cards
+            .insert(editor, CardRuntime::Repository(Box::new(clean)));
+        assert_eq!(app.channel_dialog_focus_target(), Some(confirm.clone()));
+        assert!(matches!(
+            super::super::dialog_ui::tests::enter_control(
+                app.channel_dialog_view().unwrap(),
+                confirm
+            ),
+            Message::ChannelUi(Action::Answer { confirm: true, .. })
+        ));
     }
 
     fn blocked_deletion_editor(id: CardId, mode: u8) -> repository_widget::RepositoryRuntime {
