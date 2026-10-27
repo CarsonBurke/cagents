@@ -6,6 +6,8 @@ mod installed;
 mod source;
 pub use confirmation::{Choice as UpdateChoice, Confirmation as UpdateConfirmation, decide};
 pub mod impact;
+#[cfg(feature = "ui")]
+pub mod startup;
 use std::{
     ffi::CString,
     fs::{self, File, OpenOptions},
@@ -415,26 +417,15 @@ pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
     let mut installation = running_installation()?;
     let layout = locate(&std::env::current_exe()?)?;
     let served = served_version_root(&layout)?;
-    if served == layout.version_root && !daemon_protocol_mismatch() {
-        return Err(invalid("the installed application is already running"));
-    }
     if executable.canonicalize()? != served.join("bin/cagents-ui").canonicalize()? {
         return Err(invalid(
             "the installed candidate changed; inspect the installation again",
         ));
     }
     // A newly opened UI may already be current while an older daemon still
-    // owns the sessions. Its own CLI must perform the preview and checkpoint.
-    installation.version =
-        installation_worker_version(&layout, &served, installed_daemon_owner(&layout)?.as_ref());
-    if served
-        == installation
-            .prefix
-            .join("versions")
-            .join(&installation.version)
-    {
-        return Err(invalid("the installed application is already running"));
-    }
+    // owns the sessions. Ordinary skew uses that owner's CLI; the qualified
+    // protocol-77 adapter keeps the new matched coordinator in control.
+    installation.version = installed_entry_worker(&layout, &served)?;
     let version = served
         .file_name()
         .and_then(|name| name.to_str())
@@ -447,11 +438,70 @@ pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
     )
 }
 
+fn installed_entry_worker(window: &InstallLayout, served: &Path) -> Result<String, UpdateError> {
+    let source = source::inspect_installed_identity()?;
+    let owner = installed_daemon_owner(window)?;
+    // A header cannot choose a coordinator. Keep the original socket peer's
+    // pidfd/proof through this exact kernel-owned installation recheck.
+    let executable = owner
+        .as_ref()
+        .map(|owner| owner.version_root.join("bin/cagentsd"));
+    source.verify_owner(executable.as_deref())?;
+    if source.requires_matched_owner_worker()
+        && owner
+            .as_ref()
+            .is_none_or(|owner| owner.version_root == served)
+    {
+        // The UI-only fallback uses the old window's CLI. It cannot speak an
+        // unqualified service already owned by the served candidate, so do
+        // not infer that workflow from an unknown version header.
+        return Err(invalid(
+            "The installed source requires its own matched application to finish this update",
+        ));
+    }
+    installed_update_worker(
+        window,
+        served,
+        owner.as_ref(),
+        source.protocol,
+        source.proof.as_ref(),
+    )
+}
+
+/// This entry decision consumes an authenticated source observation. A failed
+/// ordinary-client decode is neither proof of compatibility nor permission to
+/// route around a source owner. Header discovery alone never reaches here.
+fn installed_update_worker(
+    window: &InstallLayout,
+    served: &Path,
+    daemon: Option<&InstallLayout>,
+    source_protocol: u16,
+    source_proof: Option<&crate::model::HostSessionProof>,
+) -> Result<String, UpdateError> {
+    let replaces_daemon =
+        source_proof.is_some() && source_protocol != crate::terminal_ipc::PROTOCOL_VERSION;
+    if served == window.version_root && !replaces_daemon {
+        return Err(invalid("the installed application is already running"));
+    }
+    let legacy_source = source_proof.is_some()
+        && source_protocol == 77
+        && crate::terminal_ipc::PROTOCOL_VERSION > 77;
+    let worker = installation_worker_version(window, served, daemon, legacy_source);
+    if !legacy_source && served == window.prefix.join("versions").join(&worker) {
+        return Err(invalid("the installed application is already running"));
+    }
+    Ok(worker)
+}
+
 fn installation_worker_version(
     window: &InstallLayout,
     served: &Path,
     daemon: Option<&InstallLayout>,
+    legacy_source: bool,
 ) -> String {
+    if legacy_source {
+        return window.version.clone();
+    }
     // Once the candidate already owns the daemon, the old window's worker
     // must perform the remaining UI-only replacement. A current worker would
     // correctly reject replacing its own installation with itself.
@@ -992,7 +1042,8 @@ fn perform_update(
     )?;
     verify_digest(&mut archive, &archive_hash)?;
     let staged = candidate::Staged::from_archive(&release, &archive, &archive_hash, &cancellation)?;
-    if staged.identity.protocol == crate::terminal_ipc::PROTOCOL_VERSION {
+    let (source_protocol, _) = source::inspect_identity(None)?;
+    if staged.identity.protocol == source_protocol {
         staged.verify_compatible_handshake(&cancellation)?;
     }
     let confirmed = confirmation::wait(state, job, |policy| {
@@ -1033,8 +1084,8 @@ fn perform_update(
         }
         if let Some(daemon) = current.daemon {
             let socket = crate::terminal_ipc::daemon_socket_path()?;
-            let mut client = crate::control::ControlClient::connect(&socket)
-                .map_err(|error| invalid(error.to_string()))?;
+            let mut client =
+                source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
             client
                 .prepare_confirmed_upgrade(daemon, false)
                 .map_err(|error| invalid(error.to_string()))?;
@@ -1207,7 +1258,7 @@ fn observe_impact(
     policy: impact::Policy,
 ) -> Result<impact::Preview, UpdateError> {
     let socket = crate::terminal_ipc::daemon_socket_path()?;
-    let mut client = match crate::control::ControlClient::connect(&socket) {
+    let mut client = match source::Client::connect(&socket) {
         Ok(client) => Some(client),
         Err(crate::control::ControlError::Connect(error))
             if matches!(
@@ -1228,8 +1279,9 @@ fn observe_impact(
         }
         Err(error) => return Err(invalid(error.to_string())),
     };
-    let replaces_daemon =
-        client.is_some() && candidate.protocol != crate::terminal_ipc::PROTOCOL_VERSION;
+    let replaces_daemon = client
+        .as_ref()
+        .is_some_and(|client| candidate.protocol != client.protocol());
     let daemon = if replaces_daemon {
         Some(
             client
@@ -2455,6 +2507,225 @@ sys.exit(7)
     }
 
     #[test]
+    fn installed_entry_routes_ordinary_skew_only_through_its_exact_owned_old_cli() {
+        const CASE: &str = "CAGENTS_TEST_INSTALLED_ENTRY_OWNER";
+        let selector = thread::current().name().unwrap().to_owned();
+        if std::env::var_os(CASE).is_none() {
+            let directory = tempfile::Builder::new().prefix("u").tempdir().unwrap();
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", &selector, "--nocapture", "--test-threads=1"])
+                .env(CASE, "1")
+                .env("TMPDIR", directory.path());
+            for (key, leaf) in [
+                ("XDG_RUNTIME_DIR", "run"),
+                ("XDG_CONFIG_HOME", "config"),
+                ("XDG_DATA_HOME", "data"),
+                ("XDG_CACHE_HOME", "cache"),
+                ("XDG_STATE_HOME", "state"),
+            ] {
+                let path = directory.path().join(leaf);
+                fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+                child.env(key, path);
+            }
+            // HOME and operational authority are inherited unchanged. Only
+            // this fresh private Unix source can be reached by the child.
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let text = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                text.contains("running 1 test") && text.contains("1 passed; 0 failed; 0 ignored"),
+                "{text}"
+            );
+            return;
+        }
+        use crate::terminal_ipc::{
+            ClientEnvelope, ClientRequest, ServerEnvelope, ServerMessage, ServerResponse,
+        };
+        let socket = crate::terminal_ipc::daemon_socket_path().unwrap();
+        let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+        assert!(socket.starts_with(&runtime));
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(socket.parent().unwrap())
+            .unwrap();
+        struct Fixture {
+            child: std::process::Child,
+            release: PathBuf,
+        }
+        impl Fixture {
+            fn finish(&mut self) {
+                fs::write(&self.release, b"finish").unwrap();
+                assert!(self.child.wait().unwrap().success());
+            }
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::write(&self.release, b"finish");
+                let _ = self.child.wait();
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let prefix = root.join("installed");
+        fs::DirBuilder::new().mode(0o700).create(&prefix).unwrap();
+        install_tree(&prefix, &["old", "new"], "new");
+        fs::copy("/usr/bin/python3", prefix.join("versions/old/bin/cagentsd")).unwrap();
+        let window = locate(&prefix.join("versions/new/bin/cagents-ui")).unwrap();
+        let old_window = locate(&prefix.join("versions/old/bin/cagents-ui")).unwrap();
+        let served = window.version_root.clone();
+        let proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("private-installed-entry"),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: crate::model::HostIncarnation::new("private-entry-incarnation"),
+        };
+        let connect = postcard::to_stdvec(&ClientEnvelope {
+            version: crate::terminal_ipc::PROTOCOL_VERSION,
+            request_id: 1,
+            proof: None,
+            request: ClientRequest::Connect {
+                expected_host: None,
+                resume: Vec::new(),
+            },
+        })
+        .unwrap();
+        let current_reply = postcard::to_stdvec(&ServerEnvelope {
+            version: crate::terminal_ipc::PROTOCOL_VERSION,
+            request_id: Some(1),
+            proof: proof.clone(),
+            message: ServerMessage::Response {
+                response: ServerResponse::Connected {
+                    proof: proof.clone(),
+                    resumed: Vec::new(),
+                },
+            },
+        })
+        .unwrap();
+        let mut other_reply =
+            postcard::to_stdvec(&(crate::terminal_ipc::PROTOCOL_VERSION - 1)).unwrap();
+        // Deliberately not a current or protocol77 envelope. Entry routing
+        // must never decode this unknown source's response DTO.
+        other_reply.extend_from_slice(b"opaque-unqualified-source-dto");
+        let script = root.join("source.py");
+        fs::write(&script, r#"
+import fcntl,json,os,socket,struct,sys,time
+from pathlib import Path
+c=json.loads(Path(sys.argv[1]).read_text());s=Path(c['socket']);lock=s.with_name('cagentsd.lock')
+deadline=time.monotonic()+15
+f=lock.open('x+');os.chmod(lock,0o600)
+if c['held']: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+json.dump(dict(pid=os.getpid(),proof=c['proof']),f);f.flush();os.fsync(f.fileno())
+listener=socket.socket(socket.AF_UNIX);listener.bind(str(s));listener.listen(2);listener.settimeout(.05)
+Path(c['ready']).write_text(str(os.getpid()))
+count=0
+try:
+ while not Path(c['release']).exists():
+  assert time.monotonic()<deadline
+  try: stream,_=listener.accept()
+  except TimeoutError: continue
+  with stream:
+   stream.settimeout(5)
+   def read(n):
+    data=b''
+    while len(data)<n:
+     part=stream.recv(n-len(data));assert part;data+=part
+    return data
+   n=struct.unpack('>I',read(4))[0];assert n<=1024*1024
+   assert read(n).hex()==c['connect']
+   count+=1;assert count<=c['connections']
+   reply=bytes.fromhex(c['reply']);stream.sendall(struct.pack('>I',len(reply))+reply)
+   assert stream.recv(1)==b'', 'entry must not preview/prepare/stop'
+ assert count==c['connections']
+finally:
+ listener.close();f.close();s.unlink();lock.unlink()
+"#).unwrap();
+        let mut sequence = 0;
+        let mut start = |executable: &Path, current: bool, held: bool, connections: usize| {
+            sequence += 1;
+            let ready = root.join(format!("ready-{sequence}"));
+            let release = root.join(format!("release-{sequence}"));
+            let config = root.join(format!("source-{sequence}.json"));
+            fs::write(&config, serde_json::to_vec(&serde_json::json!({
+                "socket": socket, "proof": proof, "held": held,
+                "ready": ready, "release": release,
+                "connect": connect.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+                "reply": (if current { &current_reply } else { &other_reply }).iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+                "connections": connections,
+            })).unwrap()).unwrap();
+            let child = Command::new(executable)
+                .args([script.as_os_str(), config.as_os_str()])
+                .stdin(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut fixture = Fixture { child, release };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !ready.exists() {
+                assert!(fixture.child.try_wait().unwrap().is_none());
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(5));
+            }
+            fixture
+        };
+        let executable = prefix.join("versions/old/bin/cagentsd");
+        // The served window is already new. This exact production entry
+        // decision must nevertheless route the unknown old owner to its CLI.
+        let mut fixture = start(&executable, false, true, 1);
+        assert_eq!(installed_entry_worker(&window, &served).unwrap(), "old");
+        fixture.finish();
+        // Fully qualified current peers still follow the original UI-only
+        // replacement route; no inventory or preparation request is sent.
+        let mut fixture = start(&executable, true, true, 2);
+        assert_eq!(installed_entry_worker(&old_window, &served).unwrap(), "old");
+        fixture.finish();
+        let mut fixture = start(&executable, false, false, 1);
+        assert!(installed_entry_worker(&window, &served).is_err());
+        fixture.finish();
+        // Unknown service at the served candidate must not fall back to the
+        // old window's CLI merely to replace that window's UI.
+        fs::copy("/usr/bin/python3", prefix.join("versions/new/bin/cagentsd")).unwrap();
+        let mut fixture = start(&prefix.join("versions/new/bin/cagentsd"), false, true, 1);
+        assert!(installed_entry_worker(&old_window, &served).is_err());
+        fixture.finish();
+        let foreign = root.join("foreign");
+        fs::DirBuilder::new().mode(0o700).create(&foreign).unwrap();
+        install_tree(&foreign, &["old"], "old");
+        fs::copy(
+            "/usr/bin/python3",
+            foreign.join("versions/old/bin/cagentsd"),
+        )
+        .unwrap();
+        let mut fixture = start(&foreign.join("versions/old/bin/cagentsd"), false, true, 1);
+        assert!(installed_entry_worker(&window, &served).is_err());
+        fixture.finish();
+        fs::remove_file(foreign.join(".cagents-install-root")).unwrap();
+        let mut fixture = start(&foreign.join("versions/old/bin/cagentsd"), false, true, 1);
+        assert!(installed_entry_worker(&window, &served).is_err());
+        fixture.finish();
+        // A replacement using the very same executable and proof text is
+        // still another process: the held original pidfd/epoch must refuse it.
+        let mut fixture = start(&executable, false, true, 1);
+        let original = source::inspect_installed_identity().unwrap();
+        fixture.finish();
+        let mut replacement = start(&executable, false, true, 0);
+        // Replacement serves no request; only its real lock/exe are inspected.
+        let owner = installed_daemon_owner(&window).unwrap().unwrap();
+        assert!(
+            original
+                .verify_owner(Some(&owner.version_root.join("bin/cagentsd")))
+                .is_err()
+        );
+        // No connection to replacement was made: the original peer's pidfd
+        // and proof fence reject it before any header/DTO or mutation.
+        replacement.finish();
+    }
+
+    #[test]
     fn staged_update_selects_the_worker_for_both_directions_of_version_skew() {
         let layout = |version: &str| InstallLayout {
             prefix: "/owned/install".into(),
@@ -2465,24 +2736,63 @@ sys.exit(7)
         let new = layout("new");
         // A newer UI cannot speak the old service's protocol.
         assert_eq!(
-            installation_worker_version(&new, &new.version_root, Some(&old)),
+            installation_worker_version(&new, &new.version_root, Some(&old), false),
             "old"
         );
         // Once that service is already new, the old UI still needs replacement:
         // selecting the new worker would reject its candidate as itself.
         assert_eq!(
-            installation_worker_version(&old, &new.version_root, Some(&new)),
+            installation_worker_version(&old, &new.version_root, Some(&new), false),
             "old"
         );
         // Repeated staging must use the actual owner, not the window or current.
         let staged = layout("third");
         assert_eq!(
-            installation_worker_version(&old, &staged.version_root, Some(&new)),
+            installation_worker_version(&old, &staged.version_root, Some(&new), false),
             "new"
+        );
+        // An authenticated legacy source must be migrated by the new matched
+        // coordinator, even when that coordinator is already the served build.
+        assert_eq!(
+            installation_worker_version(&new, &new.version_root, Some(&old), true),
+            "new"
+        );
+        // The real entry decision must not mistake an already-served window
+        // for a completed daemon migration. No-daemon/current observations keep
+        // the old already-running refusal instead of granting a legacy route.
+        for source_proof in [
+            None,
+            Some(crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("current"),
+                boot_id: crate::model::BootId::new("current"),
+                host_incarnation: crate::model::HostIncarnation::new("current"),
+            }),
+        ] {
+            assert!(
+                installed_update_worker(
+                    &new,
+                    &new.version_root,
+                    Some(&new),
+                    crate::terminal_ipc::PROTOCOL_VERSION,
+                    source_proof.as_ref()
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            installed_update_worker(
+                &old,
+                &new.version_root,
+                None,
+                crate::terminal_ipc::PROTOCOL_VERSION,
+                None
+            )
+            .unwrap(),
+            "old"
         );
         // Without a service, the old window's worker can start the candidate.
         assert_eq!(
-            installation_worker_version(&old, &new.version_root, None),
+            installation_worker_version(&old, &new.version_root, None, false),
             "old"
         );
     }
