@@ -198,7 +198,11 @@ if [ "$VARIANT" = full ]; then
 else
     ln -s cagents "$BIN_DIR/cagents-browserless"
 fi
-strip --strip-unneeded "$BIN_DIR/cagents" "$BIN_DIR/cagents-ui" "$BIN_DIR/cagentsd"
+# Opt in when repacking already-qualified executable bytes. Skipping the build
+# alone must retain the normal release stripping behavior.
+if [ "${CAGENTS_SKIP_STRIP:-0}" != 1 ]; then
+    strip --strip-unneeded "$BIN_DIR/cagents" "$BIN_DIR/cagents-ui" "$BIN_DIR/cagentsd"
+fi
 
 # A local/native package can be built on newer glibc than the official release
 # baseline. Declare the requirements of these exact packaged ELFs, not the
