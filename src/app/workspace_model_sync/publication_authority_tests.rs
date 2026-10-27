@@ -1166,3 +1166,388 @@ fn post_edit_title_refusal_reads_the_same_authenticated_or_user_connection() {
         peer.finished();
     }
 }
+
+/// A real public Create action with temporary worktree-protection files and
+/// no store, provider, daemon or executed UI task.
+fn creation_fixture() -> (
+    tempfile::TempDir,
+    crate::app::Cagents,
+    crate::model::ProjectId,
+    ChannelId,
+    PathBuf,
+    async_channel::Receiver<ModelEdit>,
+) {
+    use crate::{
+        app::channel_ui::Action,
+        model::{ProjectId, RepositoryId},
+        sidebar::SidebarProject,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let repository = directory.path().canonicalize().unwrap();
+    let runtime = directory.path().join("runtime");
+    std::fs::create_dir(&runtime).unwrap();
+    let mut app = crate::app::tests::context_inspector_test_app(true);
+    assert!(app.session.is_none());
+    app.worktree_protections.use_fixture_runtime(runtime);
+    let project = ProjectId::new();
+    app.sidebar_model.projects.push(
+        SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "private fixture".into(),
+            repository.clone(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .with_kind(ProjectKind::Folder),
+    );
+    let (tx, requests) = async_channel::unbounded();
+    app.workspace_model_tx = tx;
+    app.status = None;
+    // Call the actual UI action. Returned tasks are not executed: this
+    // checks local creation/publication and starts no provider or daemon.
+    drop(app.handle_channel_ui(Action::Create(project)));
+    let channel = app.durable.active_channel.expect("new channel opens");
+    (directory, app, project, channel, repository, requests)
+}
+
+fn write_creation_draft(app: &mut crate::app::Cagents, card: CardId, text: &str) {
+    let target = match app.cards.get(&card).unwrap() {
+        crate::app::CardRuntime::Chat(runtime) => runtime.target,
+        _ => panic!("the new channel opens its chat composer"),
+    };
+    drop(app.update(crate::app::Message::ChatUi(
+        crate::app::chat_ui::Action::Composer(
+            target,
+            cosmic::iced::widget::text_editor::Action::Edit(
+                cosmic::iced::widget::text_editor::Edit::Paste(std::sync::Arc::new(
+                    text.to_owned(),
+                )),
+            ),
+        ),
+    )));
+}
+
+/// Public creation reports permanent sharing refusal without losing local work.
+/// Private peers do not issue real Host capabilities or run native providers.
+#[test]
+fn public_channel_creation_reports_permanent_publication_refusal_without_losing_local_work() {
+    for authority in [
+        Authority::session("fixture-valid-create-scope".into()),
+        Authority::session("fixture-invalid-create-scope".into()),
+        Authority::session(String::new()),
+    ] {
+        let (_directory, mut app, project, channel, repository, requests) = creation_fixture();
+        let local_before = app
+            .durable
+            .channels
+            .iter()
+            .find(|local| local.id == channel)
+            .unwrap()
+            .clone();
+        let draft_card = local_before.cards[0];
+        write_creation_draft(&mut app, draft_card, "Unsaved private fixture draft");
+        let drafts_before = app.durable.chat_drafts.clone();
+        assert_eq!(
+            drafts_before.get(&draft_card).map(String::as_str),
+            Some("Unsaved private fixture draft")
+        );
+        assert!(!local_before.shared);
+        assert!(
+            app.status.is_none(),
+            "creation and drafting must have succeeded"
+        );
+        assert_eq!(
+            requests.len(),
+            2,
+            "public creation queues project then channel"
+        );
+        let expected = [
+            ModelEdit::OpenProject {
+                kind: ProjectKind::Folder,
+                repository: repository.clone(),
+                name: "private fixture".into(),
+            },
+            ModelEdit::CreateChannel {
+                id: channel,
+                repository,
+                title: String::new(),
+                title_source: Default::default(),
+            },
+        ];
+        let expected_authority = authority.clone();
+        let accept_auth = authority.token() == Some("fixture-valid-create-scope");
+        let peer = Peer::new(vec![connected(), connected()], move |index, peer| {
+            let request = next(peer);
+            assert!(matches!(
+                &request.request,
+                ClientRequest::Authenticate { authority } if authority == &expected_authority
+            ));
+            let refusal = || {
+                ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::PermissionDenied,
+                    format!(
+                        "private fixture echoed {}",
+                        expected_authority.token().unwrap_or_default()
+                    ),
+                    false,
+                ))
+            };
+            if accept_auth {
+                accepted(peer, &request);
+                let request = expect_edit(peer, &expected[index]);
+                response(peer, &request, refusal());
+            } else {
+                response(peer, &request, refusal());
+            }
+            true
+        });
+        let private_token = authority.token().unwrap_or_default().to_owned();
+        let context = PublicationContext {
+            authority,
+            remote: false,
+            no_start: false,
+        };
+        let (updates, received) = async_channel::unbounded();
+        let mut pending = None;
+        let connections = Cell::new(0);
+        for remaining in [1, 0] {
+            let error = publish_with(&updates, &requests, &mut pending, || {
+                connections.set(connections.get() + 1);
+                existing(&context, &peer.socket)
+            })
+            .unwrap_err();
+            assert!(error.contains("PermissionDenied"));
+            assert!(pending.is_none());
+            assert_eq!(requests.len(), remaining);
+        }
+        assert_eq!(connections.get(), 2);
+        peer.finished();
+        // Feed every real update through the owning reducer. Neither a false
+        // success acknowledgement nor destruction of unsaved local work is OK.
+        for key in [
+            crate::app::NoticeKey::SharedProject(project),
+            crate::app::NoticeKey::SharedChannel(channel, project),
+        ] {
+            let update = received
+                .try_recv()
+                .expect("each refused public edit reports its target");
+            assert!(matches!(&update, ModelUpdate::PublicationFailed { .. }));
+            drop(app.apply_workspace_model_update(update));
+            let notice = app.status.as_ref().unwrap();
+            assert_eq!(notice.key, Some(key));
+            assert!(notice.details.as_deref().unwrap().contains("own terminal"));
+            if !private_token.is_empty() {
+                assert!(!notice.message.contains(&private_token));
+                assert!(!notice.details.as_deref().unwrap().contains(&private_token));
+            }
+            app.notices.record(app.status.take().unwrap());
+        }
+        assert!(received.try_recv().is_err());
+        assert_eq!(app.durable.chat_drafts, drafts_before);
+        assert_eq!(
+            app.durable
+                .channels
+                .iter()
+                .find(|local| local.id == channel),
+            Some(&local_before)
+        );
+        assert_eq!(app.durable.active_channel, Some(channel));
+        assert!(
+            app.notice_stands(crate::app::NoticeKey::SharedChannel(channel, project)),
+            "permanent refusal of OpenProject/CreateChannel must reach the person; a debug log cannot explain why their visible channel is not shared"
+        );
+    }
+}
+
+#[test]
+fn confirmed_publication_resolves_its_notice_without_replaying_or_losing_the_local_draft() {
+    use crate::app::{NoticeKey, TransientNotice};
+    use crate::workspace_model::{ModelChannel, ModelProject};
+    let (_directory, mut app, project, channel, repository, requests) = creation_fixture();
+    let queued = [requests.try_recv().unwrap(), requests.try_recv().unwrap()];
+    assert!(requests.try_recv().is_err());
+    let draft_card = app
+        .durable
+        .channels
+        .iter()
+        .find(|local| local.id == channel)
+        .unwrap()
+        .cards[0];
+    write_creation_draft(&mut app, draft_card, "Keep this draft");
+    let drafts_before = app.durable.chat_drafts.clone();
+    for edit in &queued {
+        drop(
+            app.apply_workspace_model_update(ModelUpdate::PublicationFailed { edit: edit.clone() }),
+        );
+        app.notices.record(app.status.take().unwrap());
+    }
+    // Repeated refusal replaces the channel's keyed report; unrelated notices
+    // survive a later successful acknowledgement for this channel.
+    drop(
+        app.apply_workspace_model_update(ModelUpdate::PublicationFailed {
+            edit: queued[1].clone(),
+        }),
+    );
+    app.notices.record(app.status.take().unwrap());
+    app.notices.record(
+        TransientNotice::warning("Unrelated visibility failure")
+            .with_key(NoticeKey::SurfaceVisibility),
+    );
+    assert_eq!(app.notices.entries.len(), 3);
+    let confirmed = WorkspaceModel {
+        identity: uuid::Uuid::new_v4(),
+        sequence: 9,
+        projects: vec![ModelProject {
+            repository: repository.clone(),
+            name: "private fixture".into(),
+            kind: ProjectKind::Folder,
+            ordinal: 1,
+        }],
+        channels: vec![ModelChannel {
+            id: channel,
+            repository,
+            title: String::new(),
+            title_source: Default::default(),
+            ordinal: 9,
+        }],
+        ..WorkspaceModel::default()
+    };
+    let reply_model = confirmed.clone();
+    let expected = queued.clone();
+    let peer = Peer::new(vec![connected()], move |_, peer| {
+        for edit in &expected {
+            let request = expect_edit(peer, edit);
+            response(
+                peer,
+                &request,
+                ServerMessage::Response {
+                    response: ServerResponse::WorkspaceModel {
+                        model: reply_model.clone(),
+                    },
+                },
+            );
+        }
+        true
+    });
+    // A distinct admitted publication is acknowledged through the real User
+    // connector/send path. The failure handler itself enqueued no retry.
+    assert!(requests.is_empty());
+    let (tx, admitted) = async_channel::unbounded();
+    for edit in &queued {
+        tx.send_blocking(edit.clone()).unwrap();
+    }
+    drop(tx);
+    let context = PublicationContext {
+        authority: Authority::default(),
+        remote: false,
+        no_start: true,
+    };
+    let (updates, received) = async_channel::unbounded();
+    let mut pending = None;
+    let connections = Cell::new(0);
+    let error = publish_with(&updates, &admitted, &mut pending, || {
+        connections.set(connections.get() + 1);
+        existing(&context, &peer.socket)
+    })
+    .unwrap_err();
+    assert_eq!(error, "the window stopped publishing");
+    assert_eq!(connections.get(), 1);
+    assert!(pending.is_none() && admitted.is_empty());
+    peer.finished();
+    let update = received.try_recv().unwrap();
+    assert!(matches!(&update, ModelUpdate::Ranked { channel: id, ordinal: 9 } if *id == channel));
+    drop(app.apply_workspace_model_update(update));
+    assert!(received.try_recv().is_err());
+    assert!(!app.notice_stands(NoticeKey::SharedChannel(channel, project)));
+    assert!(
+        app.notice_stands(NoticeKey::SharedProject(project)),
+        "channel ACK does not establish project snapshot visibility"
+    );
+    // An actual authoritative model observation settles the matching project.
+    drop(app.apply_workspace_model_update(ModelUpdate::Connected(confirmed)));
+    // A late refusal for the old request cannot reopen a settled notice.
+    for edit in queued {
+        drop(app.apply_workspace_model_update(ModelUpdate::PublicationFailed { edit }));
+    }
+    assert!(!app.notice_stands(NoticeKey::SharedProject(project)));
+    assert!(app.notice_stands(NoticeKey::SurfaceVisibility));
+    assert_eq!(app.durable.chat_drafts, drafts_before);
+    assert_eq!(app.durable.active_channel, Some(channel));
+}
+
+#[test]
+fn local_retirement_resolves_publication_notice_without_waiting_for_another_model_update() {
+    use crate::app::{Message, NoticeKey};
+    let (_directory, mut app, project, channel, _repository, requests) = creation_fixture();
+    let project_edit = requests.try_recv().unwrap();
+    let channel_edit = requests.try_recv().unwrap();
+    assert!(requests.try_recv().is_err());
+    drop(app.apply_workspace_model_update(ModelUpdate::PublicationFailed { edit: channel_edit }));
+    app.notices.record(app.status.take().unwrap());
+    let key = NoticeKey::SharedChannel(channel, project);
+    assert!(app.notice_stands(key));
+    // An empty channel's public Delete action retires it locally. Its scoped
+    // DeleteChannel can itself be refused with no model callback, so the real
+    // all-update notice sweep must settle this report before any model arrives.
+    drop(
+        app.update(Message::ChannelUi(crate::app::channel_ui::Action::Delete(
+            channel,
+        ))),
+    );
+    assert!(app.durable.channels.iter().all(|local| local.id != channel));
+    assert!(!app.notice_stands(key));
+    // No registry callback or successful sharing receipt was needed for cleanup.
+    assert!(matches!(project_edit, ModelEdit::OpenProject { .. }));
+    let mut deleted = false;
+    while let Ok(edit) = requests.try_recv() {
+        deleted |= matches!(edit, ModelEdit::DeleteChannel { id } if id == channel);
+    }
+    assert!(deleted);
+}
+
+#[test]
+fn publication_notice_does_not_follow_same_id_into_a_successor_project() {
+    use crate::app::{Message, NoticeKey};
+    use crate::model::{ProjectId, RepositoryId};
+    let (_directory, mut app, project, channel, repository, requests) = creation_fixture();
+    let _ = requests.try_recv().unwrap();
+    let old_edit = requests.try_recv().unwrap();
+    assert!(requests.try_recv().is_err());
+    drop(
+        app.apply_workspace_model_update(ModelUpdate::PublicationFailed {
+            edit: old_edit.clone(),
+        }),
+    );
+    app.notices.record(app.status.take().unwrap());
+    let successor = ProjectId::new();
+    app.sidebar_model
+        .projects
+        .push(crate::sidebar::SidebarProject::new(
+            successor,
+            RepositoryId::new(),
+            "successor".into(),
+            repository.join("successor"),
+            Vec::new(),
+            Vec::new(),
+        ));
+    std::sync::Arc::make_mut(&mut app.durable)
+        .channels
+        .iter_mut()
+        .find(|local| local.id == channel)
+        .unwrap()
+        .project_id = successor;
+    // The ordinary all-update completion sweep sees retirement of the original
+    // local association; no synthetic successful registry receipt is involved.
+    drop(app.update(Message::WindowResized(900.0, 700.0)));
+    assert!(!app.notice_stands(NoticeKey::SharedChannel(channel, project)));
+    assert!(!app.notice_stands(NoticeKey::SharedChannel(channel, successor)));
+    drop(app.apply_workspace_model_update(ModelUpdate::PublicationFailed { edit: old_edit }));
+    assert!(!app.notice_stands(NoticeKey::SharedChannel(channel, successor)));
+    assert!(
+        app.durable
+            .channels
+            .iter()
+            .any(|local| local.id == channel && local.project_id == successor && !local.shared)
+    );
+}

@@ -117,6 +117,10 @@ pub enum ModelUpdate {
         model: WorkspaceModel,
     },
     NavigationFailed(String),
+    /// A local project/channel was kept, but its shared publication was refused.
+    PublicationFailed {
+        edit: ModelEdit,
+    },
     /// Optional naming yielded after temporary admission pressure. The next
     /// real wake may retry this exact current candidate; this is not a timer.
     TitleDeferred(ModelEdit),
@@ -302,6 +306,14 @@ fn publish_with(
                     }
                 ) {
                     *pending = None;
+                    if matches!(
+                        &request,
+                        ModelEdit::OpenProject { .. } | ModelEdit::CreateChannel { .. }
+                    ) {
+                        let _ = updates.send_blocking(ModelUpdate::PublicationFailed {
+                            edit: request.clone(),
+                        });
+                    }
                     if matches!(
                         &request,
                         ModelEdit::ReorderNavigation { .. } | ModelEdit::ResetNavigation { .. }
@@ -626,7 +638,9 @@ impl Cagents {
         {
             return (Task::none(), false);
         }
-        (self.apply_workspace_model_update_inner(update), true)
+        let task = self.apply_workspace_model_update_inner(update);
+        self.resolve_workspace_publication_notices();
+        (task, true)
     }
 
     fn apply_workspace_model_update_inner(&mut self, update: ModelUpdate) -> Task<Message> {
@@ -636,6 +650,10 @@ impl Cagents {
                 Task::none()
             }
             ModelUpdate::TitleRefused(edit) => self.restore_refused_channel_title(edit),
+            ModelUpdate::PublicationFailed { edit } => {
+                self.report_workspace_publication_failure(edit);
+                Task::none()
+            }
             ModelUpdate::ViewConflicted {
                 scope,
                 operation,
@@ -1302,6 +1320,114 @@ impl Cagents {
                 Task::none()
             });
         Some(Task::batch([attach, task]))
+    }
+
+    /// Keep local work usable after permanent shared-publication refusal.
+    /// No retry or compensating edit is implied by this notice.
+    fn report_workspace_publication_failure(&mut self, edit: ModelEdit) {
+        let (key, message) = match edit {
+            ModelEdit::OpenProject { repository, .. } => {
+                let Some(project) = self
+                    .sidebar_model
+                    .projects
+                    .iter()
+                    .find(|project| project.repository == repository)
+                else {
+                    return;
+                };
+                if self.workspace_model.project(&repository).is_some()
+                    || self.project_ui.closed.contains(&repository)
+                {
+                    return;
+                }
+                (
+                    NoticeKey::SharedProject(project.id),
+                    format!(
+                        "Could not share project “{}”. Local work was kept.",
+                        project.name
+                    ),
+                )
+            }
+            ModelEdit::CreateChannel { id, repository, .. } => {
+                let Some(channel) = self
+                    .durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.id == id)
+                else {
+                    return;
+                };
+                let Some(project) = self
+                    .sidebar_model
+                    .project(channel.project_id)
+                    .filter(|project| project.repository == repository)
+                else {
+                    return;
+                };
+                if channel.shared
+                    || self.workspace_model.channel(id).is_some()
+                    || self.channel_ui.is_deleting(id)
+                    || self.channel_ui.was_deleted(id)
+                {
+                    return;
+                }
+                let title = if channel.title.is_empty() {
+                    "New channel"
+                } else {
+                    &channel.title
+                };
+                (
+                    NoticeKey::SharedChannel(id, channel.project_id),
+                    format!(
+                        "Could not share channel “{title}” in “{}”. Local work and drafts were kept.",
+                        project.name
+                    ),
+                )
+            }
+            _ => return,
+        };
+        self.status = Some(
+            TransientNotice::warning(message)
+                .with_key(key)
+                .with_details("You can keep working locally. To share this workspace, reopen it from your own terminal."),
+        );
+    }
+
+    /// A real model acknowledgement or target retirement resolves only its
+    /// own report. Repeated refusals replace a keyed notice instead of piling up.
+    pub(super) fn resolve_workspace_publication_notices(&mut self) {
+        let resolved = self
+            .notices
+            .entries
+            .iter()
+            .map(|entry| &entry.notice)
+            .chain(self.status.iter())
+            .filter_map(|notice| match notice.key {
+                Some(key @ NoticeKey::SharedProject(id))
+                    if self.sidebar_model.project(id).is_none_or(|project| {
+                        self.workspace_model.project(&project.repository).is_some()
+                            || self.project_ui.closed.contains(&project.repository)
+                    }) =>
+                {
+                    Some(key)
+                }
+                Some(key @ NoticeKey::SharedChannel(id, project))
+                    if self
+                        .durable
+                        .channels
+                        .iter()
+                        .find(|channel| channel.id == id && channel.project_id == project)
+                        .is_none_or(|channel| channel.shared)
+                        || self.workspace_model.channel(id).is_some() =>
+                {
+                    Some(key)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for key in resolved {
+            self.resolve_notice(key);
+        }
     }
 
     /// Undo only the optimism still owned by this refused title candidate.

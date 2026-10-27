@@ -292,6 +292,9 @@ enum NoticeKey {
     AccountLink,
     /// Telling panes whether they are on screen.
     SurfaceVisibility,
+    /// Publishing a local project or channel to the shared workspace.
+    SharedProject(ProjectId),
+    SharedChannel(ChannelId, ProjectId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11924,6 +11927,7 @@ impl Cagents {
     /// retiring, another client removing a shared pane - so this holds for
     /// all of them in one place, after every update, rather than in each.
     fn resolve_notices_for_closed_cards(&mut self) {
+        self.resolve_workspace_publication_notices();
         let closed = self
             .notices
             .entries
