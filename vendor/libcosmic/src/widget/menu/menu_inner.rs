@@ -651,6 +651,11 @@ impl<'b, Message: Clone + 'static> Menu<'b, Message> {
         let event::Event::A11y(id, request) = event else {
             return false;
         };
+        // Overlay groups may deliver an already-owned event to later menus.
+        // A fresh local Shell must not revive that captured activation.
+        if shell.is_event_captured() {
+            return true;
+        }
         if !self.tree.inner.with_data(|state| state.open) {
             return true;
         }

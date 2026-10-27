@@ -484,8 +484,20 @@ mod tests {
         }
 
         fn event(&mut self, event: Event, cursor: mouse::Cursor) -> Vec<usize> {
+            self.event_with_capture(event, cursor, false)
+        }
+
+        fn event_with_capture(
+            &mut self,
+            event: Event,
+            cursor: mouse::Cursor,
+            captured: bool,
+        ) -> Vec<usize> {
             let mut messages = Vec::new();
             let mut shell = Shell::new(&mut messages);
+            if captured {
+                shell.capture_event();
+            }
             {
                 let widget = self.element.as_widget_mut();
                 if let Some(mut overlay) = widget.overlay(
@@ -768,6 +780,37 @@ mod tests {
         assert_ne!(old.id(), current.id());
         assert!(menu.action(&old, Action::Focus).is_empty());
         assert_eq!(menu.action(&current, Action::Click), [100]);
+    }
+    #[test]
+    fn context_menu_captured_at_click_cannot_be_revived_by_a_retained_menu() {
+        use iced_accessibility::accesskit::{Action, ActionRequest, NodeId, TreeId};
+        let mut menu = NativeMenu::new(3, Size::new(900.0, 650.0), Point::new(20.0, 20.0));
+        menu.open();
+        let current = menu.named("Action 2");
+        let target: NodeId = current.id().clone().into();
+        let event = Event::A11y(
+            Id::from(target.0),
+            ActionRequest {
+                action: Action::Click,
+                target_tree: TreeId::ROOT,
+                target_node: target,
+                data: None,
+            },
+        );
+        assert!(
+            menu.event_with_capture(event, mouse::Cursor::Unavailable, true)
+                .is_empty()
+        );
+        assert_eq!(
+            menu.named("Action 2").id(),
+            current.id(),
+            "captured delivery did not activate/retire the menu"
+        );
+        assert_eq!(
+            menu.action(&current, Action::Click),
+            [2],
+            "same actual numeric target works in a fresh event shell"
+        );
     }
 }
 
