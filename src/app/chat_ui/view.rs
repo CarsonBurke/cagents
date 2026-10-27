@@ -1307,14 +1307,8 @@ impl Runtime {
                 },
             )
         } else if snapshot.finished_at.is_some() {
-            match snapshot.detail.as_str() {
-                "Turn interrupted" => (Some(Icon::Cancel), "Interrupted"),
-                "Turn failed" => (Some(Icon::Warning), "Failed"),
-                _ if self.error.is_some() || snapshot.error.is_some() => {
-                    (Some(Icon::Warning), "Finished with error")
-                }
-                _ => (Some(Icon::Check), "Finished"),
-            }
+            let caption = turn_completion::caption(snapshot, self.error.is_some());
+            (Some(caption.icon()), caption.label())
         } else if self.error.is_some() || snapshot.error.is_some() {
             (Some(Icon::Warning), "Error")
         } else if self.is_draft() {
@@ -1953,12 +1947,14 @@ impl Runtime {
                 && self.queued.is_none()
                 && self.followups.is_empty()
                 && self.pending.is_none()
-                && let Some((_, label, full)) = &self.finished_stamp
+                && let Some((_, clock, full)) = &self.finished_stamp
             {
                 transcript.push(
                     widget::tooltip(
-                        design::caption(label.clone())
-                            .class(cosmic::theme::Text::Custom(design::muted_text)),
+                        design::caption(
+                            turn_completion::caption(snapshot, self.error.is_some()).at(clock),
+                        )
+                        .class(cosmic::theme::Text::Custom(design::muted_text)),
                         design::caption(full.clone()),
                         widget::tooltip::Position::Top,
                     )
@@ -5649,6 +5645,9 @@ mod issue1506_tests;
 
 #[cfg(test)]
 mod user_image_preview_tests;
+
+#[cfg(test)]
+mod turn_completion_tests;
 
 #[cfg(test)]
 pub(super) fn prepared_runtime_for_test(items: &[chat::Item]) -> (Runtime, Arc<ClientHandle>) {
