@@ -6241,13 +6241,30 @@ impl Cagents {
 
     fn duplicate_pane(&mut self, source: CardState) -> Task<Message> {
         let owner = self.card_worktree(&source).map(Path::to_path_buf);
-        self.duplicate_pane_in_scope(source, owner)
+        // A repository browser keeps its current file in window-local
+        // navigation, not in the shared pane recipe. Snapshot the live view
+        // now, before the clone is attached; its cached snapshot can be older.
+        let navigation = match self.cards.get(&source.id) {
+            Some(CardRuntime::Repository(runtime)) => runtime.navigation(),
+            _ => None,
+        };
+        self.duplicate_pane_with_navigation(source, owner, navigation)
     }
 
     fn duplicate_pane_in_scope(
         &mut self,
         source: CardState,
         owner: Option<PathBuf>,
+    ) -> Task<Message> {
+        // Reopening a saved pane has no live clone navigation to inherit.
+        self.duplicate_pane_with_navigation(source, owner, None)
+    }
+
+    fn duplicate_pane_with_navigation(
+        &mut self,
+        source: CardState,
+        owner: Option<PathBuf>,
+        navigation: Option<crate::model::RepositoryNavigation>,
     ) -> Task<Message> {
         #[cfg(not(feature = "integrated-browser"))]
         if let CardKind::Browser(session) = &source.kind {
@@ -6364,7 +6381,14 @@ impl Cagents {
             CardKind::Browser(_) => self.retry_card(id),
             #[cfg(not(feature = "integrated-browser"))]
             CardKind::Browser(_) => unreachable!("browserless clones open externally"),
-            CardKind::Repository(view) => self.attach_repository_pane(id, view),
+            CardKind::Repository(view) => {
+                if let Some(navigation) = navigation {
+                    Arc::make_mut(&mut self.durable)
+                        .repository_navigation
+                        .insert(id, navigation);
+                }
+                self.attach_repository_pane(id, view)
+            }
             CardKind::PullRequests(view) => self.attach_pull_request_pane(id, view),
             CardKind::Settings | CardKind::Accounts | CardKind::Automations | CardKind::Work => {
                 unreachable!("utility panes are refused before cloning")
@@ -25766,6 +25790,301 @@ mod tests {
         assert!(copy.continuity.live_proof().is_none());
         assert!(copy.resume_hint.is_none());
         assert_eq!((copy.recovery_origin, copy.predecessor), (None, None));
+    }
+
+    mod repository_clone_navigation {
+        use super::*;
+
+        struct Fixture {
+            _directory: tempfile::TempDir,
+            root: PathBuf,
+            text: String,
+        }
+
+        impl Fixture {
+            async fn new() -> Self {
+                let directory = tempfile::tempdir().unwrap();
+                let root = directory.path().canonicalize().unwrap();
+                let text = (0..100)
+                    .map(|line| format!("source line {line:03}\n"))
+                    .collect::<String>();
+                std::fs::write(root.join("current.txt"), &text).unwrap();
+                std::fs::write(root.join("other.txt"), "a different file\n").unwrap();
+                for arguments in [
+                    vec!["init", "-q", "--template="],
+                    vec!["add", "current.txt", "other.txt"],
+                    vec![
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=fixture@example.invalid",
+                        "commit",
+                        "-qm",
+                        "fixture",
+                    ],
+                ] {
+                    let mut git = tokio::process::Command::new("/usr/bin/git");
+                    git.env_clear()
+                        .env("GIT_CONFIG_NOSYSTEM", "1")
+                        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                        .current_dir(&root)
+                        .args([
+                            "-c",
+                            "core.hooksPath=/dev/null",
+                            "-c",
+                            "commit.gpgsign=false",
+                        ])
+                        .args(arguments)
+                        .kill_on_drop(true);
+                    let output = tokio::time::timeout(Duration::from_secs(5), git.output())
+                        .await
+                        .expect("private Git fixture command finishes")
+                        .unwrap();
+                    assert!(
+                        output.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                Self {
+                    _directory: directory,
+                    root,
+                    text,
+                }
+            }
+
+            async fn app(&self, selected: bool, fixed_file: bool) -> (Cagents, CardId) {
+                let mut app = context_inspector_test_app(true);
+                app.context_inspector_open = false;
+                app.settings.editor_auto_save = false;
+                let card = app.workspace.focused().unwrap();
+                let view = RepositoryView {
+                    project: ProjectId::new(),
+                    repository: self.root.join(".git"),
+                    worktree: self.root.clone(),
+                    selected_file: fixed_file.then(|| "current.txt".into()),
+                };
+                let state = app.card_state_mut(card).unwrap();
+                state.kind = CardKind::Repository(view.clone());
+                state.residency = Residency::Hot;
+                let mut runtime = RepositoryRuntime::new(view.clone());
+                runtime.set_auto_save(false);
+                if selected {
+                    runtime.restore_navigation(&crate::model::RepositoryNavigation {
+                        project: view.project,
+                        worktree: view.worktree,
+                        selected_file: Some("current.txt".into()),
+                        editor: Some(crate::model::EditorNavigation {
+                            caret: crate::model::EditorPosition {
+                                line: 80,
+                                column: 7,
+                            },
+                            selection: Some(crate::model::EditorPosition {
+                                line: 79,
+                                column: 2,
+                            }),
+                            scroll_line: 70,
+                            scroll_vertical: 2.5,
+                            scroll_horizontal: 7.0,
+                        }),
+                    });
+                }
+                let load = repository_task(runtime.initial_load(card));
+                app.cards
+                    .insert(card, CardRuntime::Repository(Box::new(runtime)));
+                settle(&mut app, load).await;
+                assert_eq!(
+                    self::runtime(&app, card).selected_path().is_some(),
+                    selected
+                );
+                (app, card)
+            }
+        }
+
+        fn runtime(app: &Cagents, card: CardId) -> &RepositoryRuntime {
+            match &app.cards[&card] {
+                CardRuntime::Repository(runtime) => runtime,
+                _ => panic!("actual repository runtime"),
+            }
+        }
+
+        async fn settle(app: &mut Cagents, task: Task<Message>) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut pending = VecDeque::from([task]);
+                let mut tasks = 0;
+                while let Some(task) = pending.pop_front() {
+                    tasks += 1;
+                    assert!(tasks < 64, "repository loads must settle");
+                    let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                        continue;
+                    };
+                    while let Some(action) = stream.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(
+                            message @ Message::Repository(_),
+                        )) = action
+                        {
+                            pending.push_back(app.update(message));
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("actual clone file worker and application callbacks finish");
+        }
+
+        #[tokio::test]
+        async fn browser_clone_loads_live_file_and_independent_navigation() {
+            let fixture = Fixture::new().await;
+            let (mut app, source) = fixture.app(true, false).await;
+            let source_runtime = runtime(&app, source) as *const RepositoryRuntime;
+            let expected = runtime(&app, source).navigation().unwrap();
+            let editor = expected.editor.unwrap();
+            assert_eq!(editor.caret.line, 80);
+            assert_eq!(editor.selection.unwrap().line, 79);
+            assert_eq!(editor.scroll_line, 70);
+            assert_eq!(editor.scroll_vertical, 2.5);
+            assert_eq!(editor.scroll_horizontal, 7.0);
+            let mut stale = expected.clone();
+            stale.selected_file = Some("other.txt".into());
+            stale.editor = None;
+            Arc::make_mut(&mut app.durable)
+                .repository_navigation
+                .insert(source, stale);
+            assert_ne!(app.durable.repository_navigation[&source], expected);
+
+            let task = app.clone_focused_pane();
+            let clone = app.workspace.focused().unwrap();
+            assert_ne!(clone, source);
+            settle(&mut app, task).await;
+            assert_eq!(app.workspace.focused(), Some(clone));
+            assert_eq!(
+                runtime(&app, clone).editor_text(),
+                Some(fixture.text.clone())
+            );
+            assert_eq!(runtime(&app, clone).navigation(), Some(expected.clone()));
+            assert_eq!(runtime(&app, source).navigation(), Some(expected.clone()));
+            assert_eq!(
+                runtime(&app, source).editor_text(),
+                Some(fixture.text.clone())
+            );
+            assert_eq!(
+                runtime(&app, source) as *const RepositoryRuntime,
+                source_runtime
+            );
+            for card in [source, clone] {
+                assert!(runtime(&app, card).descriptor.selected_file.is_none());
+                assert!(matches!(&app.card_state(card).unwrap().kind,
+                    CardKind::Repository(view) if view.selected_file.is_none()));
+                assert!(!runtime(&app, card).is_dirty());
+            }
+
+            let task = app.update(Message::Repository(RepositoryAction::OpenFile {
+                card: clone,
+                path: "other.txt".into(),
+            }));
+            settle(&mut app, task).await;
+            assert_eq!(
+                runtime(&app, clone).selected_path(),
+                Some(Path::new("other.txt"))
+            );
+            assert_eq!(
+                runtime(&app, clone).editor_text().as_deref(),
+                Some("a different file\n")
+            );
+            assert_eq!(runtime(&app, source).navigation(), Some(expected));
+            assert_eq!(
+                runtime(&app, source).editor_text(),
+                Some(fixture.text.clone())
+            );
+
+            // Cloning location must not move or share the source's unsaved
+            // buffer and navigation fence. It does not clone unsaved bytes.
+            drop(app.update(Message::FocusCard(source)));
+            drop(
+                app.update(Message::Repository(RepositoryAction::EditorAction {
+                    card: source,
+                    action: repository_widget::EditorAction::Edit(
+                        repository_widget::EditorEdit::Insert('!'),
+                    ),
+                })),
+            );
+            let dirty_text = runtime(&app, source).editor_text();
+            let dirty_navigation = runtime(&app, source).navigation();
+            assert!(runtime(&app, source).is_dirty());
+            assert!(runtime(&app, source).blocks_navigation());
+            let task = app.clone_focused_pane();
+            let independent = app.workspace.focused().unwrap();
+            settle(&mut app, task).await;
+            assert_ne!(independent, source);
+            assert_eq!(runtime(&app, independent).editor_text(), Some(fixture.text));
+            assert!(!runtime(&app, independent).is_dirty());
+            assert_eq!(runtime(&app, source).editor_text(), dirty_text);
+            assert_eq!(runtime(&app, source).navigation(), dirty_navigation);
+            assert_eq!(
+                runtime(&app, source) as *const RepositoryRuntime,
+                source_runtime
+            );
+            assert!(runtime(&app, source).is_dirty());
+            assert!(runtime(&app, source).blocks_navigation());
+        }
+
+        #[tokio::test]
+        async fn clone_keeps_empty_and_fixed_file_recipes_and_reopen_separate() {
+            let fixture = Fixture::new().await;
+            for (selected, fixed_file) in [(false, false), (true, true)] {
+                let (mut app, source) = fixture.app(selected, fixed_file).await;
+                let expected = runtime(&app, source).navigation();
+                // An empty browser must not acquire an old saved selection.
+                if !selected {
+                    let view = runtime(&app, source).descriptor.clone();
+                    Arc::make_mut(&mut app.durable)
+                        .repository_navigation
+                        .insert(
+                            source,
+                            crate::model::RepositoryNavigation {
+                                project: view.project,
+                                worktree: view.worktree,
+                                selected_file: Some("other.txt".into()),
+                                editor: None,
+                            },
+                        );
+                }
+                let task = app.clone_focused_pane();
+                let clone = app.workspace.focused().unwrap();
+                settle(&mut app, task).await;
+                assert_ne!(clone, source);
+                assert_eq!(runtime(&app, clone).navigation(), expected);
+                assert_eq!(
+                    runtime(&app, clone).descriptor.selected_file.is_some(),
+                    fixed_file
+                );
+                assert_eq!(
+                    runtime(&app, source).descriptor,
+                    runtime(&app, clone).descriptor
+                );
+                assert_eq!(runtime(&app, clone).selected_path().is_some(), selected);
+            }
+
+            let (mut app, source) = fixture.app(true, false).await;
+            let original_navigation = runtime(&app, source).navigation();
+            // Closed entries store the old Open CardState. Deliberately keep
+            // its live runtime here too: neither existence nor an ID match
+            // may turn the separate Reopen route into a live-view clone.
+            app.recently_closed.push((
+                app.card_state(source).unwrap().clone(),
+                app.active_workspace_destination(),
+            ));
+            let task = app.run_workspace_command(
+                workspace_widget::GlobalShortcut::ReopenPane,
+                keyboard::Modifiers::empty(),
+            );
+            let reopened = app.workspace.focused().unwrap();
+            settle(&mut app, task).await;
+            assert_ne!(reopened, source);
+            assert_eq!(runtime(&app, reopened).selected_path(), None);
+            assert_eq!(runtime(&app, reopened).navigation(), None);
+            assert_eq!(runtime(&app, source).navigation(), original_navigation);
+        }
     }
 
     #[test]
