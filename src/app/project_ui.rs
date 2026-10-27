@@ -322,13 +322,23 @@ impl Cagents {
         {
             // Drafts and parked sessions must not be discarded by an optional
             // cleanup, even before they acquire a daemon-hosted actor.
-            if matches!(&card.kind, CardKind::Chat(_) | CardKind::Terminal(_))
-                && let Some(scope) = self
+            let launch_directory = match &card.kind {
+                CardKind::Chat(session) => Some(&session.launch.recipe.working_directory),
+                CardKind::Terminal(session) => Some(&session.launch.working_directory),
+                _ => None,
+            };
+            if let Some(directory) = launch_directory {
+                // Filing may change without rewriting an issued recipe. Keep
+                // its physical launch source protected independently, including
+                // unstarted drafts and parked sessions with no daemon actor.
+                paths.push(directory.clone());
+                if let Some(scope) = self
                     .worktree_owners
                     .get(&card.id)
                     .or_else(|| self.durable.card_scopes.get(&card.id))
-            {
-                paths.push(scope.clone());
+                {
+                    paths.push(scope.clone());
+                }
             }
             if let CardKind::Repository(view) = &card.kind {
                 if view.selected_file.is_some() {

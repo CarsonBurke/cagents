@@ -1745,6 +1745,119 @@ mod tests {
         })
     }
 
+    fn refiled_launch_remains_protected_after_retirement(chat: bool) {
+        let mut f = fixture();
+        let source = f.old.parent().unwrap().join("launch-source");
+        let launch = source.join("nested");
+        std::fs::create_dir_all(&launch).unwrap();
+        // The protection primitive discovers Git ancestors without spawning Git.
+        std::fs::create_dir(source.join(".git")).unwrap();
+        folder(&mut f.app, &source);
+        let mut card = crate::app::tests::terminal_card_state();
+        let CardKind::Terminal(session) = &mut card.kind else {
+            unreachable!()
+        };
+        session.launch.working_directory = launch.clone();
+        session.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: session.launch.clone(),
+            last_exit: None,
+        };
+        if chat {
+            // An unstarted durable descriptor, without a runtime/provider actor
+            // or policy lookup that could independently protect its source.
+            card.kind = CardKind::Chat(chat::Session {
+                id: TerminalId::new(),
+                launch: chat::Launch {
+                    provider: crate::agent::Provider::Codex,
+                    recipe: session.launch.clone(),
+                    session_id: None,
+                },
+                proof: None,
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: Default::default(),
+            });
+        }
+        let id = card.id;
+        let original = card.kind.clone();
+        Arc::make_mut(&mut f.app.durable).cards.push(card);
+        Arc::make_mut(&mut f.app.durable)
+            .card_scopes
+            .insert(id, f.next.clone());
+        f.app.worktree_owners.insert(id, f.next.clone());
+        assert!(!f.app.cards.contains_key(&id));
+        let ui = std::thread::current().id();
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let record = reads.clone();
+        f.app
+            .worktree_protections
+            .observe_navigation_io(Arc::new(move || {
+                record.lock().unwrap().push(std::thread::current().id());
+            }));
+        let reconcile = |app: &mut Cagents| {
+            // Exercise the actual nonnavigation structural update tail, both
+            // acceptance narrowings, and the original worker's joined retirement.
+            let task = app.update(Message::SettingsSearchChanged("refiling".into()));
+            let retirement = app.update(prepared(task));
+            no_effect(app.update(retired(retirement)));
+            assert!(app.worktree_selection.active.is_none());
+        };
+        let ready = || {
+            assert!(matches!(
+                crate::instance::fixture_prepared_lock(&f.runtime.join("navigation-ready"))
+                    .unwrap()
+                    .try_lock(libc::LOCK_SH | libc::LOCK_NB),
+                Err((error, _)) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+        };
+        let denied = |path: &Path| {
+            assert!(matches!(
+                crate::worktree_cleanup::fixture_protection(&f.runtime, path, true),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+        };
+        reconcile(&mut f.app);
+        denied(&source);
+        denied(&f.next);
+        ready();
+
+        // Administrative refiling releases the old filing lease only after
+        // retirement; it cannot release the unchanged executable's source.
+        Arc::make_mut(&mut f.app.durable)
+            .card_scopes
+            .insert(id, f.old.clone());
+        f.app.worktree_owners.insert(id, f.old.clone());
+        reconcile(&mut f.app);
+        drop(crate::worktree_cleanup::fixture_protection(&f.runtime, &f.next, true).unwrap());
+        denied(&source);
+        assert_eq!(f.app.card_state(id).unwrap().kind, original);
+        ready();
+
+        f.app.card_state_mut(id).unwrap().existence = Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: Some("fixture pane closed".into()),
+            },
+        };
+        reconcile(&mut f.app);
+        drop(crate::worktree_cleanup::fixture_protection(&f.runtime, &source, true).unwrap());
+        denied(&f.old);
+        ready();
+        assert!(!reads.lock().unwrap().is_empty());
+        assert!(reads.lock().unwrap().iter().all(|thread| *thread != ui));
+    }
+
+    #[test]
+    fn refiled_unstarted_draft_keeps_launch_and_filing_leases_after_worker_retirement() {
+        refiled_launch_remains_protected_after_retirement(true);
+    }
+
+    #[test]
+    fn refiled_parked_terminal_keeps_launch_and_filing_leases_after_worker_retirement() {
+        refiled_launch_remains_protected_after_retirement(false);
+    }
+
     #[test]
     fn inactive_repository_reload_prepares_owners_and_guards_without_blocking_input() {
         let mut f = fixture();
