@@ -13,6 +13,67 @@ use crate::workspace_model::{
     canonical_repository,
 };
 
+#[cfg(test)]
+mod publication_authority_tests;
+
+/// The original window caller, retained through publisher reconnects.
+struct PublicationContext {
+    authority: crate::agent_execution::Authority,
+    remote: bool,
+    no_start: bool,
+}
+
+impl PublicationContext {
+    fn capture() -> Self {
+        Self {
+            authority: crate::agent_execution::Authority::from_environment(),
+            remote: crate::device::is_remote(),
+            no_start: crate::control::daemon_autostart_disabled()
+                || std::env::var("CAGENTS_NO_START").is_ok_and(|value| {
+                    matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+                }),
+        }
+    }
+
+    fn connect(&self) -> Result<ControlClient, ControlError> {
+        self.connect_with(
+            || crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string()),
+            || crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string()),
+            ControlClient::connect,
+        )
+    }
+
+    fn connect_with(
+        &self,
+        existing: impl FnOnce() -> Result<PathBuf, String>,
+        ready: impl FnOnce() -> Result<PathBuf, String>,
+        connect: impl FnOnce(&Path) -> Result<ControlClient, ControlError>,
+    ) -> Result<ControlClient, ControlError> {
+        let scoped = self.authority.token().is_some();
+        // A local session's capability cannot authorize a remote workspace.
+        // Refuse before its resolver can start an SSH bridge or remote daemon.
+        if scoped && self.remote {
+            return Err(ControlError::Remote {
+                code: crate::terminal::ipc::ProtocolErrorCode::PermissionDenied,
+                message: "Shared workspace changes require your own terminal on the remote device"
+                    .into(),
+                retryable: false,
+            });
+        }
+        let socket = if scoped || self.no_start {
+            existing()
+        } else {
+            ready()
+        }
+        .map_err(|error| ControlError::Connect(std::io::Error::other(error)))?;
+        let mut client = connect(&socket)?;
+        if scoped {
+            client.authenticate(self.authority.clone())?;
+        }
+        Ok(client)
+    }
+}
+
 /// How long a thread waits before reconnecting.
 ///
 /// A window can open before any daemon exists, and the daemon can be replaced
@@ -59,6 +120,9 @@ pub enum ModelUpdate {
     /// Optional naming yielded after temporary admission pressure. The next
     /// real wake may retry this exact current candidate; this is not a timer.
     TitleDeferred(ModelEdit),
+    /// A title was refused before an authenticated edit connection existed.
+    /// Its exact candidate may still own an optimistic local name.
+    TitleRefused(ModelEdit),
     PaneTransferFailed {
         operation: uuid::Uuid,
         error: String,
@@ -168,12 +232,13 @@ pub(super) fn publish_workspace_model(
     updates: async_channel::Sender<ModelUpdate>,
     requests: async_channel::Receiver<ModelEdit>,
 ) {
+    let context = PublicationContext::capture();
     let publisher = std::thread::Builder::new()
         .name("cagents-workspace-model-publisher".into())
         .spawn(move || {
             let mut pending = None;
             while !requests.is_closed() || pending.is_some() {
-                if let Err(error) = publish(&updates, &requests, &mut pending) {
+                if let Err(error) = publish(&context, &updates, &requests, &mut pending) {
                     tracing::debug!(%error, "shared workspace model publishing ended");
                 }
                 std::thread::sleep(RECONNECT_DELAY);
@@ -189,15 +254,21 @@ pub(super) fn publish_workspace_model(
 }
 
 fn publish(
+    context: &PublicationContext,
     updates: &async_channel::Sender<ModelUpdate>,
     requests: &async_channel::Receiver<ModelEdit>,
     pending: &mut Option<ModelEdit>,
 ) -> Result<(), String> {
-    // Unlike the observer, the publisher starts a daemon: a channel the user
-    // just created has to reach the registry, and there is no registry without
-    // a daemon to hold it.
-    let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
-    let mut client = ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+    publish_with(updates, requests, pending, || context.connect())
+}
+
+fn publish_with(
+    updates: &async_channel::Sender<ModelUpdate>,
+    requests: &async_channel::Receiver<ModelEdit>,
+    pending: &mut Option<ModelEdit>,
+    mut connect: impl FnMut() -> Result<ControlClient, ControlError>,
+) -> Result<(), String> {
+    let mut client = None;
     loop {
         let request = match pending.take() {
             Some(request) => request,
@@ -208,7 +279,16 @@ fn publish(
         // Retained until it is sent, so a daemon replaced mid-publish costs a
         // reconnection rather than the edit.
         *pending = Some(request.clone());
-        match send(&mut client, request.clone(), updates) {
+        // Resolve and authenticate only after retaining this edit. A permanent
+        // scope refusal must drain it through the same path as a refused edit,
+        // rather than reconnect forever with the request still in the queue.
+        let result = (|| {
+            if client.is_none() {
+                client = Some(connect()?);
+            }
+            send(client.as_mut().unwrap(), request.clone(), updates)
+        })();
+        match result {
             Ok(()) => *pending = None,
             Err(error) => {
                 // A refusal is final: the registry rejected the edit itself, so
@@ -229,12 +309,20 @@ fn publish(
                         let _ =
                             updates.send_blocking(ModelUpdate::NavigationFailed(error.to_string()));
                     }
-                    if matches!(&request, ModelEdit::SuggestConversationTitle { .. })
-                        && let Ok(model) = client.read_workspace_model()
-                    {
-                        // A refused suggestion is not replayed against a newer
-                        // owner. Restore the authoritative name after optimism.
-                        let _ = updates.send_blocking(ModelUpdate::Read(model));
+                    if matches!(&request, ModelEdit::SuggestConversationTitle { .. }) {
+                        if let Some(client) = client.as_mut() {
+                            if let Ok(model) = client.read_workspace_model() {
+                                // A refused suggestion is not replayed against a newer
+                                // owner. Restore the authoritative name after optimism.
+                                let _ = updates.send_blocking(ModelUpdate::Read(model));
+                            }
+                        } else {
+                            // Authentication or remote scope refused before an edit
+                            // connection existed. Reconcile only this still-owned
+                            // candidate from the UI's last confirmed model.
+                            let _ =
+                                updates.send_blocking(ModelUpdate::TitleRefused(request.clone()));
+                        }
                     }
                     if let ModelEdit::ChangeView {
                         scope, operation, ..
@@ -547,6 +635,7 @@ impl Cagents {
                 self.defer_channel_title_suggestion(&edit);
                 Task::none()
             }
+            ModelUpdate::TitleRefused(edit) => self.restore_refused_channel_title(edit),
             ModelUpdate::ViewConflicted {
                 scope,
                 operation,
@@ -1213,6 +1302,85 @@ impl Cagents {
                 Task::none()
             });
         Some(Task::batch([attach, task]))
+    }
+
+    /// Undo only the optimism still owned by this refused title candidate.
+    /// The wire edit carries no registry identity: use its existing channel,
+    /// primary conversation and view-revision proof, never invent a new one.
+    fn restore_refused_channel_title(&mut self, edit: ModelEdit) -> Task<Message> {
+        let ModelEdit::SuggestConversationTitle {
+            id,
+            card,
+            expected_revision,
+            title,
+            source,
+        } = edit
+        else {
+            return Task::none();
+        };
+        if self.workspace_model.identity == NO_REGISTRY
+            || self.channel_ui.is_deleting(id)
+            || self.channel_ui.was_deleted(id)
+        {
+            return Task::none();
+        }
+        let Some(index) = self
+            .durable
+            .channels
+            .iter()
+            .position(|local| local.id == id)
+        else {
+            return Task::none();
+        };
+        let local = &self.durable.channels[index];
+        if local.title != title
+            || local.title_source != source
+            || self.channel_primary_chat(local) != Some(card)
+        {
+            return Task::none();
+        }
+        let Some(confirmed) = self.workspace_model.channel(id) else {
+            return Task::none();
+        };
+        if !self
+            .sidebar_model
+            .project(local.project_id)
+            .is_some_and(|project| project.repository == confirmed.repository)
+        {
+            return Task::none();
+        }
+        let Some(view) = self.workspace_model.views.iter().find(|view| {
+            view.scope == crate::workspace_model::views::Scope::Channel(id)
+                && view.revision == expected_revision
+                && view.primary_chat() == Some(card)
+        }) else {
+            return Task::none();
+        };
+        let same_source = match (
+            self.card_state(card).map(|local| &local.kind),
+            view.panes
+                .iter()
+                .find(|pane| pane.id == card)
+                .map(|pane| &pane.kind),
+        ) {
+            (Some(CardKind::Chat(local)), Some(CardKind::Chat(confirmed))) => local == confirmed,
+            _ => false,
+        };
+        if !same_source
+            || local.title == confirmed.title && local.title_source == confirmed.title_source
+        {
+            return Task::none();
+        }
+        // The same title/source projection as an equal authoritative snapshot,
+        // restricted to one candidate so other optimistic edits remain intact.
+        let title = confirmed.title.clone();
+        let source = confirmed.title_source;
+        let local = &mut Arc::make_mut(&mut self.durable).channels[index];
+        local.title = title;
+        local.title_source = source;
+        self.refresh_sidebar_channels();
+        self.persist();
+        self.sync_chrome()
     }
 
     /// Takes the shared half of a channel this window already has.
