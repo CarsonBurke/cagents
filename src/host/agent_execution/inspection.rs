@@ -1147,7 +1147,7 @@ mod tests {
         for revoke in [false, true] {
             let f = policy_fixture(None);
             let mut page = staged(&f);
-            let registry = f.registry.lock().unwrap();
+            let mut registry = f.registry.lock().unwrap();
             let (contended_tx, contended_rx) = std::sync::mpsc::sync_channel(0);
             page.final_registry_contended = Some(contended_tx);
             let admitted = Arc::new(AtomicUsize::new(0));
