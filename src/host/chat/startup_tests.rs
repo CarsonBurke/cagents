@@ -83,11 +83,7 @@ fn managed_codex_start_releases_bundle_lease_before_provider_spawn() {
         failure.message, "Native holder did not acknowledge its server",
         "startup must reach the holder's provider-spawn attempt"
     );
-    assert!(
-        directory
-            .join(".agents/skills/cagents/SKILL.md")
-            .is_file()
-    );
+    assert!(directory.join(".agents/skills/cagents/SKILL.md").is_file());
     assert!(host.lock().unwrap().chat_spawning.is_empty());
     // A failed native start must also leave the global lease available for
     // ordinary terminal starts and account operations.
