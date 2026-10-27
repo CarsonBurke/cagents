@@ -7695,7 +7695,8 @@ impl Cagents {
             .find(|channel| channel.cards.contains(&card))
             .map(|channel| Scope::Channel(channel.id))
             .or_else(|| {
-                self.card_worktree(card)
+                self.card_state(card)
+                    .and_then(|state| self.card_worktree(state))
                     .and_then(|path| self.worktree_view_scope(path))
             })
     }
