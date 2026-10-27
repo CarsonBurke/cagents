@@ -2193,7 +2193,11 @@ mod tests {
             sequence,
             result: Arc::new(Ok(crate::automations::Response::Detail(detail.clone()))),
         });
-        let Some(Effect::Request { sequence, .. }) = app.automation_ui.update(Action::OpenSession)
+        let Some(Effect::Request { sequence, .. }) =
+            app.automation_ui.update(Action::OpenSession {
+                automation: detail.firing.automation,
+                firing: detail.firing.id,
+            })
         else {
             panic!("open request expected")
         };

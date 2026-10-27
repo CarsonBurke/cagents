@@ -112,7 +112,10 @@ pub enum Action {
     Shell(text_editor::Action),
     ShellCursor(text_editor::Cursor),
     Enable,
-    Pause,
+    Pause {
+        id: Uuid,
+        revision: u64,
+    },
     RunNow,
     Remove,
     Confirm(u64),
@@ -128,7 +131,10 @@ pub enum Action {
         automation: Uuid,
         firing: Uuid,
     },
-    OpenSession,
+    OpenSession {
+        automation: Uuid,
+        firing: Uuid,
+    },
     Received {
         sequence: u64,
         result: std::sync::Arc<Result<Response, String>>,
@@ -1141,6 +1147,23 @@ impl State {
     }
 
     pub fn update(&mut self, action: Action) -> Option<Effect> {
+        // Captured controls may arrive after another definition or run was read.
+        // Reject them before consuming a current read or confirmation.
+        if let Action::Pause { id, revision } = &action
+            && !self.selected.as_ref().is_some_and(|selected| {
+                selected.id == *id && selected.revision == *revision && selected.enabled
+            })
+        {
+            return None;
+        }
+        if let Action::OpenSession { automation, firing } = &action
+            && !self
+                .run
+                .as_ref()
+                .is_some_and(|run| run.firing.automation == *automation && run.firing.id == *firing)
+        {
+            return None;
+        }
         if let Action::CancelRun { automation, firing } = &action
             && !self.run.as_ref().is_some_and(|run| {
                 run.firing.automation == *automation
@@ -1815,18 +1838,16 @@ impl State {
                     });
                 }
             }
-            Action::Pause => {
-                if let Some(automation) = &self.selected {
-                    return self.request(
-                        Pending::Mutate,
-                        Request::SetEnabled {
-                            id: automation.id,
-                            revision: automation.revision,
-                            enabled: false,
-                            confirmed: false,
-                        },
-                    );
-                }
+            Action::Pause { id, revision } => {
+                return self.request(
+                    Pending::Mutate,
+                    Request::SetEnabled {
+                        id,
+                        revision,
+                        enabled: false,
+                        confirmed: false,
+                    },
+                );
             }
             Action::Lifecycle | Action::MoreLifecycle => {
                 if let Some(selected) = &self.selected {
@@ -1901,11 +1922,8 @@ impl State {
                     },
                 );
             }
-            Action::OpenSession => {
-                if let Some(run) = &self.run {
-                    return self
-                        .request(Pending::OpenRun, Request::ShowFiring { id: run.firing.id });
-                }
+            Action::OpenSession { firing, .. } => {
+                return self.request(Pending::OpenRun, Request::ShowFiring { id: firing });
             }
             _ => {}
         }
@@ -2419,11 +2437,22 @@ impl State {
                         if let Some(blocked) = &selected.blocked {
                             content = content.push(crate::design::body(blocked));
                         }
-                        content = content.push(
+                        let mut subject = [0; 32];
+                        subject[..16].copy_from_slice(selected.id.as_bytes());
+                        subject[16..24].copy_from_slice(&selected.revision.to_be_bytes());
+                        content = content.push(crate::interaction::keyed_list_rows(vec![(
+                            subject,
                             widget::row::with_children(vec![
                                 button("Edit", Action::Edit, !busy),
                                 if selected.enabled {
-                                    button("Pause", Action::Pause, !busy)
+                                    button(
+                                        "Pause",
+                                        Action::Pause {
+                                            id: selected.id,
+                                            revision: selected.revision,
+                                        },
+                                        !busy,
+                                    )
                                 } else {
                                     button(
                                         "Enable…",
@@ -2453,8 +2482,9 @@ impl State {
                                 ),
                             ])
                             .spacing(space::S)
-                            .wrap(),
-                        );
+                            .wrap()
+                            .into(),
+                        )]));
                     }
                 }
                 if self.selected.is_some() {
@@ -2641,7 +2671,10 @@ impl State {
                         ),
                         button(
                             "Open agent",
-                            Action::OpenSession,
+                            Action::OpenSession {
+                                automation: run.firing.automation,
+                                firing: run.firing.id,
+                            },
                             !busy
                                 && run
                                     .agent
@@ -7116,7 +7149,10 @@ mod tests {
             Action::Enable,
             Action::RunNow,
             Action::Remove,
-            Action::OpenSession,
+            Action::OpenSession {
+                automation: id,
+                firing: Uuid::new_v4(),
+            },
             Action::Run(Uuid::new_v4()),
             Action::New,
         ] {
@@ -7594,6 +7630,353 @@ mod tests {
             !focus.focused,
             "another run cannot inherit A's native focus"
         );
+    }
+
+    fn select_control_definition(state: &mut State, owner: &Automation) {
+        let Some(Effect::Request {
+            sequence,
+            request: Request::Show { id },
+        }) = state.update(Action::Select(owner.id))
+        else {
+            panic!("public selection must read the exact definition")
+        };
+        assert_eq!(id, owner.id);
+        finish_control_definition_read(state, sequence, owner);
+    }
+
+    fn finish_control_definition_read(state: &mut State, sequence: u64, owner: &Automation) {
+        let Some(Effect::Request {
+            sequence,
+            request: Request::History { id, before, .. },
+        }) = state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Automation(owner.clone()))),
+        })
+        else {
+            panic!("definition read must request its actual history")
+        };
+        assert_eq!(id, Some(owner.id));
+        assert!(before.is_none());
+        assert!(
+            state
+                .update(Action::Received {
+                    sequence,
+                    result: std::sync::Arc::new(Ok(Response::History(
+                        crate::automations::HistoryPage {
+                            firings: Vec::new(),
+                            next: None,
+                        }
+                    ))),
+                })
+                .is_none()
+        );
+        assert_eq!(state.selected.as_ref().unwrap().id, owner.id);
+        assert!(state.pending.is_none(), "both actual reads have settled");
+    }
+
+    fn assert_pause_request(state: &mut State, action: Action, owner: &Automation) {
+        let Some(Effect::Request {
+            request:
+                Request::SetEnabled {
+                    id,
+                    revision,
+                    enabled,
+                    confirmed,
+                },
+            ..
+        }) = state.update(action)
+        else {
+            panic!("fresh enabled subject must still pause")
+        };
+        assert_eq!((id, revision), (owner.id, owner.revision));
+        assert!(!enabled && !confirmed);
+        assert!(matches!(state.pending, Some((_, Pending::Mutate))));
+    }
+
+    #[test]
+    fn queued_pause_keeps_its_definition_revision_without_consuming_successor_work() {
+        let mut a = automation();
+        a.enabled = true;
+        let mut b = a.clone();
+        b.id = Uuid::new_v4();
+        b.revision += 1;
+        let old = Action::Pause {
+            id: a.id,
+            revision: a.revision,
+        };
+        let fresh = Action::Pause {
+            id: b.id,
+            revision: b.revision,
+        };
+        let mut state = State::default();
+        select_control_definition(&mut state, &a);
+        select_control_definition(&mut state, &b);
+        // Both Show(B) and History(B) completed: a foreground-read guard
+        // cannot mask a stale callback that would otherwise pause B.
+        assert!(state.update(old.clone()).is_none());
+        assert!(state.pending.is_none());
+        for action in [
+            Action::Pause {
+                id: a.id,
+                revision: b.revision,
+            },
+            Action::Pause {
+                id: b.id,
+                revision: a.revision,
+            },
+        ] {
+            assert!(state.update(action).is_none());
+            assert!(state.pending.is_none());
+        }
+        let Some(Effect::Request { sequence, request }) = state.update(Action::Tick) else {
+            panic!("selected definition must refresh")
+        };
+        assert!(matches!(request, Request::Show { id } if id == b.id));
+        assert!(state.update(old.clone()).is_none());
+        assert!(matches!(state.pending,
+            Some((pending, Pending::RefreshAutomation)) if pending == sequence));
+        finish_control_definition_read(&mut state, sequence, &b);
+        assert!(state.update(Action::RunNow).is_none());
+        let confirmation = state.confirmation.as_ref().unwrap().generation;
+        assert!(state.update(old).is_none());
+        assert_eq!(
+            state.confirmation.as_ref().unwrap().generation,
+            confirmation
+        );
+        assert!(state.update(Action::CancelConfirmation).is_none());
+
+        let mut paused = b.clone();
+        paused.enabled = false;
+        select_control_definition(&mut state, &paused);
+        assert!(state.update(fresh.clone()).is_none());
+        assert!(state.pending.is_none());
+        select_control_definition(&mut state, &b);
+        assert_pause_request(&mut state, fresh.clone(), &b);
+        assert!(
+            state.update(fresh).is_none(),
+            "mutation retains its original slot"
+        );
+    }
+
+    fn pause_bounds(ui: &CancelUi<'_>) -> cosmic::iced::Rectangle {
+        use cosmic::iced::{Point, Rectangle, Size, mouse};
+        let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+        let rect = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| node.node().label() == Some("Pause"))
+            .expect("actual selected definition's Pause control is mounted")
+            .node()
+            .bounds()
+            .unwrap();
+        let bounds = Rectangle::new(
+            Point::new(rect.x0 as f32, rect.y0 as f32),
+            Size::new((rect.x1 - rect.x0) as f32, (rect.y1 - rect.y0) as f32),
+        );
+        assert!(Rectangle::with_size(Size::new(900.0, 1100.0)).contains(bounds.center()));
+        bounds
+    }
+
+    #[test]
+    fn retained_pause_press_follows_definition_identity_and_revision_not_refresh_metadata() {
+        use cosmic::iced::runtime::user_interface::Cache;
+        let mut a = automation();
+        a.enabled = true;
+        let mut refreshed = a.clone();
+        refreshed.updated_ms += 1;
+        let mut b = a.clone();
+        b.id = Uuid::new_v4();
+        let mut revised = a.clone();
+        revised.revision += 1;
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        for next in [&refreshed, &b, &revised] {
+            let replaced = (next.id, next.revision) != (a.id, a.revision);
+            let mut state = State::default();
+            // Stable list shape ensures only the actual selected-control key
+            // discriminates the held gesture; no loading frame is rendered.
+            state.rows = vec![a.summary(None), b.summary(None)];
+            select_control_definition(&mut state, &a);
+            let mut ui = cancel_frame(&state, Cache::new(), &mut renderer);
+            let point = pause_bounds(&ui).center();
+            assert!(cancel_pointer(&mut ui, &mut renderer, point, true).is_empty());
+            let cache = ui.into_cache();
+            select_control_definition(&mut state, next);
+            let mut ui = cancel_frame(&state, cache, &mut renderer);
+            assert_eq!(
+                pause_bounds(&ui).center(),
+                point,
+                "same physical control geometry"
+            );
+            let mut messages = cancel_pointer(&mut ui, &mut renderer, point, false);
+            if replaced {
+                assert!(
+                    messages.is_empty(),
+                    "old press cannot activate a new subject: {messages:?}"
+                );
+                assert!(cancel_pointer(&mut ui, &mut renderer, point, true).is_empty());
+                messages = cancel_pointer(&mut ui, &mut renderer, point, false);
+            }
+            let _ = ui.into_cache();
+            assert_eq!(
+                messages.len(),
+                1,
+                "same subject or fresh successor click: {messages:?}"
+            );
+            assert!(matches!(&messages[0], Action::Pause { id, revision }
+                if *id == next.id && *revision == next.revision));
+            assert_pause_request(&mut state, messages.remove(0), next);
+        }
+    }
+
+    fn settled_agent_detail(owner: &Automation) -> RunDetail {
+        use crate::agent_execution::{Agent, HostedSession, Origin, Placement};
+        let mut detail = run_of(owner);
+        let placement = Placement::Channel(crate::model::ChannelId::new());
+        let mut spec = owner.definition.agent.clone();
+        spec.target.placement = Some(placement.clone());
+        let agent = Agent {
+            name: None,
+            id: crate::model::AgentId::new(),
+            origin: Origin::Automation { id: owner.id },
+            spec,
+            placement,
+            session: Some(HostedSession::Chat(crate::chat::Session {
+                native_continuity: Default::default(),
+                id: crate::model::TerminalId::new(),
+                proof: Some(crate::model::HostSessionProof {
+                    host_session_id: crate::model::HostSessionId::new("fixture-host"),
+                    boot_id: crate::model::BootId::new("fixture-boot"),
+                    host_incarnation: crate::model::HostIncarnation::new("fixture-incarnation"),
+                }),
+                terminal: None,
+                owned_codex_listener: None,
+                launch: crate::chat::Launch {
+                    provider: Provider::Claude,
+                    session_id: None,
+                    recipe: crate::model::LaunchRecipe {
+                        program: "claude".into(),
+                        arguments: Vec::new(),
+                        working_directory: "/fixture".into(),
+                        environment: Default::default(),
+                        unset_environment: Default::default(),
+                    },
+                },
+            })),
+            console: None,
+            created_ms: 100,
+            closed: false,
+        };
+        detail.firing.agent = Some(agent.id);
+        detail.agent = Some(agent);
+        assert!(!detail.firing.state.is_active());
+        assert!(detail.run.is_none() && detail.firing.run.is_none());
+        detail
+    }
+
+    fn show_control_detail(state: &mut State, detail: &RunDetail) {
+        let Some(Effect::Request {
+            sequence,
+            request: Request::ShowFiring { id },
+        }) = state.update(Action::Run(detail.firing.id))
+        else {
+            panic!("public history activation must request the original firing")
+        };
+        assert_eq!(id, detail.firing.id);
+        assert!(
+            state
+                .update(Action::Received {
+                    sequence,
+                    result: std::sync::Arc::new(Ok(Response::Detail(detail.clone()))),
+                })
+                .is_none()
+        );
+        assert_eq!(state.run.as_ref().unwrap().firing.id, detail.firing.id);
+        assert!(state.pending.is_none());
+    }
+
+    #[test]
+    fn queued_open_agent_keeps_its_firing_and_settled_agent_uses_the_public_read_route() {
+        let a = settled_agent_detail(&automation());
+        let b = settled_agent_detail(&automation());
+        let old = Action::OpenSession {
+            automation: a.firing.automation,
+            firing: a.firing.id,
+        };
+        let mut state = State::default();
+        show_control_detail(&mut state, &a);
+        show_control_detail(&mut state, &b);
+        assert!(state.update(old.clone()).is_none());
+        assert!(state.pending.is_none());
+        let Some(Effect::Request { sequence, request }) = state.update(Action::Tick) else {
+            panic!("current detail must refresh")
+        };
+        assert!(matches!(request, Request::ShowFiring { id } if id == b.firing.id));
+        assert!(state.update(old.clone()).is_none());
+        assert!(
+            matches!(state.pending, Some((pending, Pending::RefreshRun)) if pending == sequence)
+        );
+        assert!(
+            state
+                .update(Action::Received {
+                    sequence,
+                    result: std::sync::Arc::new(Ok(Response::Detail(b.clone()))),
+                })
+                .is_none()
+        );
+        for stale in [
+            old,
+            Action::OpenSession {
+                automation: a.firing.automation,
+                firing: b.firing.id,
+            },
+            Action::OpenSession {
+                automation: b.firing.automation,
+                firing: a.firing.id,
+            },
+        ] {
+            assert!(state.update(stale).is_none());
+            assert!(state.pending.is_none());
+        }
+        assert!(
+            buttons(&state, 900.0)
+                .iter()
+                .any(|(label, enabled)| label == "Open agent" && *enabled)
+        );
+        let Some(Effect::Request {
+            sequence,
+            request: Request::ShowFiring { id },
+        }) = state.update(Action::OpenSession {
+            automation: b.firing.automation,
+            firing: b.firing.id,
+        })
+        else {
+            panic!("fresh settled agent must be read before opening")
+        };
+        assert_eq!(id, b.firing.id);
+        assert!(matches!(state.pending, Some((_, Pending::OpenRun))));
+        assert!(
+            state
+                .update(Action::OpenSession {
+                    automation: b.firing.automation,
+                    firing: b.firing.id,
+                })
+                .is_none(),
+            "the existing foreground read keeps its request slot"
+        );
+        assert!(matches!(state.pending, Some((pending, Pending::OpenRun)) if pending == sequence));
+        let Some(Effect::OpenRun(opened)) = state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Detail(b.clone()))),
+        }) else {
+            panic!("matching authoritative detail must reach the existing open effect")
+        };
+        assert_eq!(
+            (opened.firing.automation, opened.firing.id),
+            (b.firing.automation, b.firing.id)
+        );
+        assert_eq!(opened.agent.unwrap().id, b.agent.as_ref().unwrap().id);
+        assert!(opened.run.is_none());
     }
 }
 pub fn state_label(state: crate::automations::FiringState) -> &'static str {
