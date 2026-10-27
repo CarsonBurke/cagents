@@ -70,13 +70,17 @@ impl Pane {
     }
 }
 
+/// Recent resurrection hints travel with the view; the daemon keeps the full
+/// narrow guard set in SQLite rather than sending history in every payload.
+pub const RECENT_RETIRED_LIMIT: usize = 256;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct View {
     pub scope: Scope,
     pub revision: u64,
     pub panes: Vec<Pane>,
-    /// Retained across reconnects and restarts. An old cache cannot reintroduce
-    /// a pane removed from this view.
+    /// Recent removal hints, bounded for reconnect payloads. The daemon's
+    /// indexed retirement guards also reject older cached pane identities.
     pub retired: Vec<CardId>,
 }
 
@@ -481,7 +485,7 @@ impl View {
     /// view revision and records operation IDs before acknowledging them.
     pub fn apply(&mut self, change: &Change) -> Result<bool, String> {
         let previous = self.panes.clone();
-        let retired = self.retired.len();
+        let retired = self.retired.clone();
         match change {
             Change::InsertIfEmpty { pane } => {
                 pane.validate()?;
@@ -531,6 +535,10 @@ impl View {
                 self.panes.retain(|pane| pane.id != *id);
                 if !self.retired.contains(id) {
                     self.retired.push(*id);
+                    if self.retired.len() > RECENT_RETIRED_LIMIT {
+                        self.retired
+                            .drain(..self.retired.len() - RECENT_RETIRED_LIMIT);
+                    }
                 }
             }
             Change::Move { id, before } => {
@@ -543,7 +551,7 @@ impl View {
                 }
             }
         }
-        Ok(self.panes != previous || self.retired.len() != retired)
+        Ok(self.panes != previous || self.retired != retired)
     }
 
     fn position(&self, before: Option<CardId>) -> usize {
