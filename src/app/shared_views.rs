@@ -1169,6 +1169,10 @@ impl Cagents {
         self.shared_views.applying = true;
         let mut tasks = Vec::new();
         let mut views = self.workspace_model.views.clone();
+        let mut pending_errors = HashMap::new();
+        // Pending moves are ordered intentions, not idempotent state. Replay
+        // each once, including transfers in their original queue position,
+        // before deriving aliases and ownership from the completed overlay.
         for (_, source, change) in &self.shared_views.pending {
             if let Change::Transfer {
                 id,
@@ -1180,12 +1184,13 @@ impl Cagents {
                     views.push(View::empty(destination.clone()));
                 }
                 let _ = views::transfer(&mut views, source, *id, destination, *before);
-            }
-        }
-        for view in &mut views {
-            for (_, scope, change) in &self.shared_views.pending {
-                if *scope == view.scope && !matches!(change, Change::Transfer { .. }) {
-                    let _ = view.apply(change);
+            } else {
+                for view in &mut views {
+                    if *source == view.scope {
+                        if let Err(error) = view.apply(change) {
+                            pending_errors.insert(view.scope.clone(), error);
+                        }
+                    }
                 }
             }
         }
@@ -1210,7 +1215,7 @@ impl Cagents {
                 .collect::<HashMap<_, _>>()
         };
         let mut projected_scopes = Vec::new();
-        for mut view in views {
+        for view in views {
             if self.shared_views.blocked.contains(&view.scope) {
                 continue;
             }
@@ -1219,12 +1224,10 @@ impl Cagents {
             {
                 continue;
             }
-            for (_, scope, change) in &self.shared_views.pending {
-                if *scope == view.scope && !matches!(change, Change::Transfer { .. }) {
-                    if let Err(error) = view.apply(change) {
-                        self.status = Some(TransientNotice::error(error));
-                    }
-                }
+            // Preserve the last error only for scopes that actually project;
+            // blocked or not-yet-seeded scopes previously kept it silent.
+            if let Some(error) = pending_errors.remove(&view.scope) {
+                self.status = Some(TransientNotice::error(error));
             }
             let current = match &view.scope {
                 Scope::Channel(_) => self.local_view_cards(&view.scope),
