@@ -456,6 +456,7 @@ impl Registry {
         ownership: &super::NativeActorOwnership,
         boot: &crate::model::BootId,
         issued: &[crate::chat::Session],
+        retirement_source: &crate::chat::Session,
     ) -> Result<bool, String> {
         if !ownership.is_pending()
             || &ownership.owner().boot != boot
@@ -594,7 +595,10 @@ impl Registry {
                     params![source.id.to_string(), authority],
                 )
                 .map_err(|error| error.to_string())?;
-            } else if !matches!(&retained, HostedSession::Chat(chat) if issued.contains(chat)) {
+            } else if !matches!(&retained, HostedSession::Chat(chat) if issued.contains(chat)
+                && issued.contains(retirement_source)
+                && crate::agent_execution::same_chat_process(chat, retirement_source))
+            {
                 return Ok(false);
             }
         }
@@ -1867,7 +1871,7 @@ mod tests {
     fn removed_completed_previous_boot_execution_archives_without_borrowing_cleanup_authority() {
         use crate::daemon::holder_registry::{Kind, Process, Record};
         use crate::workspace_model::views::{Pane, Scope};
-        for case in 0..10 {
+        for case in 0..11 {
             let (mut registry, directory, request) = fixture();
             let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
             let HostedSession::Chat(mut current) = source() else {
@@ -2007,8 +2011,18 @@ mod tests {
                     )
                     .unwrap();
             }
-            if case == 7 || case == 9 {
+            if case == 7 {
                 registry.db.execute_batch("CREATE TRIGGER reject_history_archive BEFORE UPDATE OF closed ON agents BEGIN SELECT RAISE(FAIL, 'fixture archive failure'); END;").unwrap();
+            }
+            let mut issued = vec![current.clone()];
+            if case == 10 {
+                let mut earlier = current.clone();
+                earlier.proof.as_mut().unwrap().host_incarnation =
+                    "earlier-current-boot-owner".into();
+                registry
+                    .fresh_agent_authority(&HostedSession::Chat(earlier.clone()))
+                    .unwrap();
+                issued.push(earlier);
             }
             let before = registry.agent(accepted.agent.id).unwrap();
             let run = registry.agent_run(accepted.run.id).unwrap();
@@ -2016,8 +2030,8 @@ mod tests {
                 .retained_agent_authority_source(current.id)
                 .unwrap();
             let result =
-                registry.archive_previous_boot_execution(&ownership, &boot, &[current.clone()]);
-            if case == 7 {
+                registry.archive_previous_boot_execution(&ownership, &boot, &issued, &current);
+            if case == 7 || case == 9 {
                 assert!(result.is_err());
             } else {
                 assert_eq!(result.unwrap(), case == 0 || case == 8, "case {case}");

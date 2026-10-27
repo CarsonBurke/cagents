@@ -1729,7 +1729,12 @@ pub(in crate::host) fn reconcile_previous_boot_history(host: &SharedHost) -> Res
             let archived = registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .archive_previous_boot_execution(&ownership, &proof.boot_id, &issued)?;
+                .archive_previous_boot_execution(
+                    &ownership,
+                    &proof.boot_id,
+                    &issued,
+                    &inspection.source,
+                )?;
             if archived {
                 // Retire performs the existing final semantic ACK/real exit
                 // checks. Archival supplied no alias or execution authority.
