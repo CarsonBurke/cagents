@@ -7514,13 +7514,16 @@ fn context_controls<'a>(
     source: ContextMenuSource<'_>,
 ) -> Element<'a, SidebarAction> {
     use widget::menu::{Item, items};
-    if modal_open || selection_count.is_none() {
-        return content.into();
+    let enabled = !modal_open && selection_count.is_some();
+    // Keep the base row mounted when its menu is temporarily unavailable.
+    // Reuse the menu's editor snapshot for both identity and its lazy builder.
+    let editors: Arc<[SidebarEditor]> = if enabled {
+        editors.to_vec()
+    } else {
+        Vec::new()
     }
-    // Reuse the menu's existing editor snapshot for both identity and its lazy
-    // builder, rather than cloning strings again for the retained key.
-    let editors: Arc<[SidebarEditor]> = editors.to_vec().into();
-    let owner = ContextMenuOwner {
+    .into();
+    let owner = enabled.then(|| ContextMenuOwner {
         project: project_id,
         worktree: worktree_id,
         source: source.resource(),
@@ -7532,8 +7535,11 @@ fn context_controls<'a>(
         group: selection_count
             .is_some_and(|count| count > 1)
             .then(|| source.selection.clone()),
-    };
+    });
     crate::interaction::context_menu_lazy_keyed(owner, content, move || {
+        if !enabled {
+            return Vec::new();
+        }
         let mut commands = vec![
             ("Open folder".to_owned(), None, ProjectCommand::Reveal),
             ("New terminal".to_owned(), None, ProjectCommand::NewTerminal),
@@ -7727,35 +7733,57 @@ fn file_context_controls<'a>(
     file_management: bool,
     blocked: bool,
 ) -> Element<'a, SidebarAction> {
-    if blocked {
-        return content;
+    // The slot stays mounted across routine source reload/busy transitions.
+    // Only its native menu state retires; its base row keeps focus/press state.
+    let key = key.clone();
+    let path = row.path.clone();
+    let directory = row.directory;
+    let editors: Arc<[SidebarEditor]> = if blocked {
+        Vec::new()
+    } else {
+        editors.to_vec()
     }
-    let path = &row.path;
-    let mut entries = Vec::with_capacity(5 + editors.len());
-    for (label, icon, command) in file_commands(row.directory, file_management) {
-        entries.push(widget::menu::Item::Button(
-            label.to_owned(),
-            Some(icon.handle()),
-            FileContextCommand::Manage { key, path, command },
-        ));
-    }
-    if !row.directory {
-        entries.extend(editors.iter().map(|editor| {
-            widget::menu::Item::Button(
-                editor.name.clone(),
-                Some(editor_icon(editor)),
-                FileContextCommand::Editor {
-                    key,
-                    path,
-                    editor_id: &editor.id,
+    .into();
+    let owner = (!blocked).then(|| {
+        (
+            key.clone(),
+            path.clone(),
+            directory,
+            file_management,
+            editors.clone(),
+        )
+    });
+    crate::interaction::context_menu_lazy_keyed(owner, content, move || {
+        if blocked {
+            return Vec::new();
+        }
+        let mut entries = Vec::with_capacity(5 + editors.len());
+        for (label, icon, command) in file_commands(directory, file_management) {
+            entries.push(widget::menu::Item::Button(
+                label.to_owned(),
+                Some(icon.handle()),
+                FileContextCommand::Manage {
+                    key: &key,
+                    path: &path,
+                    command,
                 },
-            )
-        }));
-    }
-    crate::interaction::context_menu(
-        content,
-        widget::menu::items(&std::collections::HashMap::new(), entries),
-    )
+            ));
+        }
+        if !directory {
+            entries.extend(editors.iter().map(|editor| {
+                widget::menu::Item::Button(
+                    editor.name.clone(),
+                    Some(editor_icon(editor)),
+                    FileContextCommand::Editor {
+                        key: &key,
+                        path: &path,
+                        editor_id: &editor.id,
+                    },
+                )
+            }));
+        }
+        widget::menu::items(&std::collections::HashMap::new(), entries)
+    })
 }
 
 fn editor_icon(editor: &SidebarEditor) -> icon::Handle {
@@ -16152,7 +16180,7 @@ pub(crate) mod tests {
         };
         let renderer = headless_renderer();
         let base_id = Id::new("context-menu.unchanged-base-button");
-        for change in ["branch", "editor", "availability"] {
+        for change in ["branch", "editor", "availability", "modal", "selection"] {
             for focus in [true, false] {
                 let make = |changed: bool| {
                     let editor = SidebarEditor {
@@ -16172,12 +16200,12 @@ pub(crate) mod tests {
                             .on_press(SidebarAction::OpenRepositoryPicker),
                         project_id(1),
                         Some(WorktreeId::from_uuid(Uuid::from_u128(2))),
-                        false,
+                        changed && change == "modal",
                         true,
                         true,
                         changed && change == "availability",
                         &[editor],
-                        Some(1),
+                        (!(changed && change == "selection")).then_some(1),
                         ContextMenuSource {
                             path: Path::new("/repo/unchanged-worktree"),
                             branch: Some(if changed && change == "branch" {
@@ -16260,6 +16288,349 @@ pub(crate) mod tests {
                     "same base row retains its native interaction while only the menu is retired: {change}, focus={focus}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn files_context_menu_blocking_keeps_base_focus_and_retires_only_menu_targets() {
+        use cosmic::iced::{
+            Event, Point, Rectangle, Vector,
+            advanced::{Layout, Shell, clipboard, mouse, widget::operation},
+            keyboard,
+            time::Instant,
+            window,
+        };
+        fn make<'a>(
+            state: &'a SidebarState,
+            source: &'a SourceControlModel,
+            modal: bool,
+        ) -> Element<'a, SidebarAction> {
+            files_section(state, source, modal, &[], true)
+        }
+        fn measure(
+            element: &mut Element<'_, SidebarAction>,
+            tree: &mut Tree,
+            renderer: &cosmic::Renderer,
+            viewport: Rectangle,
+        ) -> layout::Node {
+            element.as_widget_mut().layout(
+                tree,
+                renderer,
+                &layout::Limits::new(viewport.size(), viewport.size()),
+            )
+        }
+        fn send(
+            element: &mut Element<'_, SidebarAction>,
+            tree: &mut Tree,
+            node: &layout::Node,
+            renderer: &cosmic::Renderer,
+            viewport: Rectangle,
+            event: &Event,
+            cursor: mouse::Cursor,
+        ) -> Vec<SidebarAction> {
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            if let Some(mut overlay) = element.as_widget_mut().overlay(
+                tree,
+                Layout::new(node),
+                renderer,
+                &viewport,
+                Vector::ZERO,
+            ) {
+                let popup = overlay.as_overlay_mut().layout(renderer, viewport.size());
+                overlay.as_overlay_mut().update(
+                    event,
+                    Layout::new(&popup),
+                    cursor,
+                    renderer,
+                    &mut clipboard::Null,
+                    &mut shell,
+                );
+                // The first redraw initializes the actual native item slice.
+                let _ = overlay.as_overlay_mut().layout(renderer, viewport.size());
+            }
+            if !shell.is_event_captured() {
+                element.as_widget_mut().update(
+                    tree,
+                    event,
+                    Layout::new(node),
+                    cursor,
+                    renderer,
+                    &mut clipboard::Null,
+                    &mut shell,
+                    &viewport,
+                );
+            }
+            messages
+        }
+        let renderer = headless_renderer();
+        let viewport = Rectangle::with_size(Size::new(360.0, 640.0));
+        let mut ready = source_control();
+        ready.files = file_rows(&[repo_path("main.rs")]);
+        let state = SidebarState::default();
+        let row_name = &*ready.files[0].chrome.accessible_name;
+        let open = SidebarAction::OpenFile {
+            key: ready.key.clone(),
+            path: repo_path("main.rs"),
+        };
+        let enter = Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        });
+        for reason in ["reload", "busy", "modal"] {
+            let mut blocked = ready.clone();
+            blocked.reloading = reason == "reload";
+            blocked.mutation = (reason == "busy").then_some(MutationKind::Stage);
+            let modal = reason == "modal";
+            let mut initial = make(&state, &ready, false);
+            let mut tree = Tree::new(&initial);
+            initial.as_widget_mut().diff(&mut tree);
+            let node = measure(&mut initial, &mut tree, &renderer, viewport);
+            let nodes = initial.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                mouse::Cursor::Unavailable,
+            );
+            let row = actual_context_button(&nodes, row_name);
+            let numeric: iced_accessibility::accesskit::NodeId = row.id().clone().into();
+            initial.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut operation::focusable::focus::<()>(Id::from(numeric.0)),
+            );
+            let bounds = row.node().bounds().unwrap();
+            let cursor = mouse::Cursor::Available(Point::new(
+                (bounds.x0 + 24.0) as f32,
+                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+            ));
+            assert!(
+                send(
+                    &mut initial,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    viewport,
+                    &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    cursor,
+                )
+                .is_empty()
+            );
+            // A reload/busy row remains browsable. A modal still suppresses
+            // the actual panel_row callback; retaining focus cannot bypass it.
+            let mut unavailable = make(&state, &blocked, modal);
+            tree.diff(unavailable.as_widget_mut());
+            let node = measure(&mut unavailable, &mut tree, &renderer, viewport);
+            assert_eq!(
+                send(
+                    &mut unavailable,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    viewport,
+                    &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                    cursor,
+                ),
+                if modal { vec![] } else { vec![open.clone()] },
+                "actual Files held pointer follows existing base admission through {reason}"
+            );
+            assert_eq!(
+                send(
+                    &mut unavailable,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    viewport,
+                    &enter,
+                    mouse::Cursor::Unavailable
+                ),
+                if modal { vec![] } else { vec![open.clone()] },
+                "actual Files focus survives {reason} without weakening modal admission"
+            );
+            let right = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right));
+            assert!(
+                send(
+                    &mut unavailable,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    viewport,
+                    &right,
+                    cursor
+                )
+                .is_empty()
+            );
+            assert!(
+                unavailable
+                    .as_widget_mut()
+                    .overlay(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &viewport,
+                        Vector::ZERO
+                    )
+                    .is_none()
+            );
+            let mut recovered = make(&state, &ready, false);
+            tree.diff(recovered.as_widget_mut());
+            let node = measure(&mut recovered, &mut tree, &renderer, viewport);
+            assert_eq!(
+                send(
+                    &mut recovered,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    viewport,
+                    &enter,
+                    mouse::Cursor::Unavailable
+                ),
+                [open.clone()],
+                "same focused Files row resumes after {reason} without a new focus operation"
+            );
+            assert!(
+                send(
+                    &mut recovered,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    viewport,
+                    &right,
+                    cursor
+                )
+                .is_empty()
+            );
+            let redraw = Event::Window(window::Event::RedrawRequested(Instant::now()));
+            assert!(
+                send(
+                    &mut recovered,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    viewport,
+                    &redraw,
+                    cursor
+                )
+                .is_empty()
+            );
+            let old = actual_context_button(
+                &recovered.as_widget().a11y_nodes(
+                    Layout::new(&node),
+                    &tree,
+                    mouse::Cursor::Unavailable,
+                ),
+                "Copy path",
+            );
+            let mut unavailable = make(&state, &blocked, modal);
+            tree.diff(unavailable.as_widget_mut());
+            let node = measure(&mut unavailable, &mut tree, &renderer, viewport);
+            assert!(
+                send(
+                    &mut unavailable,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    viewport,
+                    &actual_context_click(&old),
+                    mouse::Cursor::Unavailable
+                )
+                .is_empty()
+            );
+            let nodes = unavailable.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                mouse::Cursor::Unavailable,
+            );
+            assert!(
+                !nodes
+                    .root()
+                    .iter()
+                    .chain(nodes.children())
+                    .any(|n| n.node().label() == Some("Copy path")),
+                "no phantom AX while {reason} blocks menu"
+            );
+            let mut recovered = make(&state, &ready, false);
+            tree.diff(recovered.as_widget_mut());
+            let node = measure(&mut recovered, &mut tree, &renderer, viewport);
+            assert!(
+                send(
+                    &mut recovered,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    viewport,
+                    &actual_context_click(&old),
+                    mouse::Cursor::Unavailable
+                )
+                .is_empty()
+            );
+            assert!(
+                send(
+                    &mut recovered,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    viewport,
+                    &right,
+                    cursor
+                )
+                .is_empty()
+            );
+            assert!(
+                send(
+                    &mut recovered,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    viewport,
+                    &redraw,
+                    cursor
+                )
+                .is_empty()
+            );
+            let current = actual_context_button(
+                &recovered.as_widget().a11y_nodes(
+                    Layout::new(&node),
+                    &tree,
+                    mouse::Cursor::Unavailable,
+                ),
+                "Copy path",
+            );
+            assert_ne!(old.id(), current.id());
+            assert!(
+                send(
+                    &mut recovered,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    viewport,
+                    &actual_context_click(&old),
+                    mouse::Cursor::Unavailable
+                )
+                .is_empty()
+            );
+            assert_eq!(
+                send(
+                    &mut recovered,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    viewport,
+                    &actual_context_click(&current),
+                    mouse::Cursor::Unavailable
+                ),
+                [SidebarAction::FileCommand {
+                    key: ready.key.clone(),
+                    path: repo_path("main.rs"),
+                    command: FileCommand::CopyPath
+                }],
+                "fresh current Files menu recovers after {reason}"
+            );
         }
     }
 

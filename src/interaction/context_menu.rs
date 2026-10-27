@@ -207,6 +207,12 @@ impl<Key: Clone + Eq + 'static, Message: Clone + 'static> Widget<Message, Theme,
                 tree.state.downcast_mut::<MenuItems<Key>>().count = self.items;
                 tree.children = vec![self.native_tree()];
             }
+            // A temporarily blocked caller retains this mounted menu slot
+            // with no entries. Do not open the native empty root or capture
+            // its base row's input while its actions are unavailable.
+            if self.items == 0 {
+                return;
+            }
             self.native.diff(&mut tree.children[0]);
         }
         // The native widget records the anchor it opens at from this cursor,
