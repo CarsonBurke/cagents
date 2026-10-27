@@ -257,6 +257,7 @@ fn closed_channel_source_matches(before: &CardKind, current: &CardKind) -> bool 
 
 #[derive(Debug, Clone)]
 struct Deletion {
+    presentation: uuid::Uuid,
     channel: ChannelId,
     title: String,
     /// Open conversations the deletion closes, reported before it happens.
@@ -264,6 +265,16 @@ struct Deletion {
     /// Why the last deletion of this channel failed, when the dialog is
     /// opened again after it. Confirming retries it.
     failure: Option<String>,
+}
+
+impl Deletion {
+    fn control_id(&self, confirm: bool) -> widget::Id {
+        let role = if confirm { "confirm" } else { "cancel" };
+        widget::Id::new(format!(
+            "dialog.channel.{}.{}.{role}.enabled",
+            self.presentation, self.channel
+        ))
+    }
 }
 
 impl State {
@@ -301,8 +312,8 @@ impl State {
         self.deleted.contains(&id)
     }
 
-    pub(super) fn focus_target() -> widget::Id {
-        widget::Id::new("dialog.channel.close")
+    pub(super) fn focus_target(&self) -> Option<widget::Id> {
+        self.dialog.as_ref().map(|dialog| dialog.control_id(true))
     }
 }
 
@@ -494,13 +505,14 @@ impl Cagents {
                 {
                     self.refresh_sidebar_channels();
                 }
-                let focus = self.nested_modal_focus_target().unwrap_or_else(|| {
-                    self.workspace
+                self.restore_dialog_focus(|| {
+                    let focus = self
+                        .workspace
                         .focused()
                         .map(|card| self.card_keyboard_focus(card))
-                        .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID))
-                });
-                iced::widget::operation::focus(focus).map(cosmic::Action::App)
+                        .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID));
+                    iced::widget::operation::focus(focus).map(cosmic::Action::App)
+                })
             }
         }
     }
@@ -597,12 +609,13 @@ impl Cagents {
             return self.delete_channel(id);
         }
         self.channel_ui.dialog = Some(Deletion {
+            presentation: uuid::Uuid::new_v4(),
             channel: id,
             title,
             chats,
             failure: self.channel_ui.failed.get(&id).cloned(),
         });
-        iced::widget::operation::focus(State::focus_target()).map(cosmic::Action::App)
+        self.focus_exposed_dialog()
     }
 
     /// The open conversations - chats and terminals - that deleting
@@ -996,16 +1009,22 @@ impl Cagents {
             )));
         }
         rows.push(super::dialog_ui::confirmation_actions(
-            crate::ui_controls::button::secondary("Cancel")
-                .id(widget::Id::new("dialog.channel.close"))
-                .on_press(Message::ChannelUi(Action::Dismiss)),
-            crate::ui_controls::button::destructive(if dialog.failure.is_some() {
-                "Retry delete"
-            } else {
-                "Delete channel"
-            })
-            .id(widget::Id::new("dialog.channel.confirm"))
-            .on_press(Message::ChannelUi(Action::ConfirmDelete)),
+            crate::ui_controls::owned(
+                dialog.control_id(false),
+                crate::ui_controls::button::secondary("Cancel")
+                    .id(dialog.control_id(false))
+                    .on_press(Message::ChannelUi(Action::Dismiss)),
+            ),
+            crate::ui_controls::owned(
+                dialog.control_id(true),
+                crate::ui_controls::button::destructive(if dialog.failure.is_some() {
+                    "Retry delete"
+                } else {
+                    "Delete channel"
+                })
+                .id(dialog.control_id(true))
+                .on_press(Message::ChannelUi(Action::ConfirmDelete)),
+            ),
         ));
         Some(super::dialog_ui::surface(
             widget::column::with_children(rows).spacing(space::M),
@@ -1241,47 +1260,109 @@ mod tests {
     use crate::sidebar::RowDeletion;
 
     #[test]
-    fn deletion_opens_on_cancel_and_enter_or_escape_keeps_the_channel_and_cards() {
-        for enter in [false, true] {
-            let (mut app, channel, _survivor, card) = channel_with_a_conversation();
-            let original = app.card_state(card).unwrap().clone();
-            let opening = app.handle_channel_ui(Action::Delete(channel));
-            assert_eq!(
-                super::super::tests::focused_element(app.channel_dialog_view().unwrap(), opening),
-                Some(widget::Id::new("dialog.channel.close"))
-            );
-            let cancel = if enter {
-                let message = super::super::dialog_ui::tests::enter_control(
-                    app.channel_dialog_view().unwrap(),
-                    State::focus_target(),
-                );
-                assert!(matches!(message, Message::ChannelUi(Action::Dismiss)));
-                message
-            } else {
-                Message::KeyEvent {
-                    event: keyboard::Event::KeyPressed {
-                        key: keyboard::Key::Named(keyboard::key::Named::Escape),
-                        modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
-                        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
-                        location: keyboard::Location::Standard,
-                        modifiers: keyboard::Modifiers::empty(),
-                        text: None,
-                        repeat: false,
-                    },
-                    captured: false,
+    fn deletion_opens_on_primary_and_explicit_cancel_or_escape_keeps_the_channel_and_cards() {
+        for retry in [false, true] {
+            for enter in [false, true] {
+                let (mut app, channel, _survivor, card) = channel_with_a_conversation();
+                let original = app.card_state(card).unwrap().clone();
+                if retry {
+                    app.channel_ui
+                        .failed
+                        .insert(channel, "Close was refused".into());
                 }
-            };
-            drop(app.update(cancel));
-            assert!(!app.channel_ui.modal_open());
-            assert!(
-                app.durable
-                    .channels
-                    .iter()
-                    .any(|current| current.id == channel)
-            );
-            assert_eq!(app.card_state(card), Some(&original));
-            assert!(!app.channel_ui.deletion_running());
+                let opening = app.handle_channel_ui(Action::Delete(channel));
+                let dialog = app.channel_ui.dialog.as_ref().unwrap();
+                let primary = dialog.control_id(true);
+                let cancel_id = dialog.control_id(false);
+                assert_eq!(dialog.failure.is_some(), retry);
+                assert_eq!(app.channel_ui.focus_target(), Some(primary.clone()));
+                assert_eq!(
+                    super::super::tests::focused_element(
+                        app.channel_dialog_view().unwrap(),
+                        opening
+                    ),
+                    Some(primary.clone())
+                );
+                assert!(matches!(
+                    super::super::dialog_ui::tests::enter_control(
+                        app.channel_dialog_view().unwrap(),
+                        primary,
+                    ),
+                    Message::ChannelUi(Action::ConfirmDelete)
+                ));
+                let cancel = if enter {
+                    let message = super::super::dialog_ui::tests::enter_control(
+                        app.channel_dialog_view().unwrap(),
+                        cancel_id,
+                    );
+                    assert!(matches!(message, Message::ChannelUi(Action::Dismiss)));
+                    message
+                } else {
+                    Message::KeyEvent {
+                        event: keyboard::Event::KeyPressed {
+                            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                            modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                            physical_key: keyboard::key::Physical::Code(
+                                keyboard::key::Code::Escape,
+                            ),
+                            location: keyboard::Location::Standard,
+                            modifiers: keyboard::Modifiers::empty(),
+                            text: None,
+                            repeat: false,
+                        },
+                        captured: false,
+                    }
+                };
+                drop(app.update(cancel));
+                assert!(!app.channel_ui.modal_open());
+                assert!(app.channel_ui.focus_target().is_none());
+                assert!(
+                    app.durable
+                        .channels
+                        .iter()
+                        .any(|current| current.id == channel)
+                );
+                assert_eq!(app.card_state(card), Some(&original));
+                assert!(!app.channel_ui.deletion_running());
+            }
         }
+    }
+
+    #[test]
+    fn reopened_channel_presentation_rejects_old_focus_without_clearing_current_cancel() {
+        let (mut app, channel, _survivor, card) = channel_with_a_conversation();
+        let original = app.card_state(card).unwrap().clone();
+        drop(app.handle_channel_ui(Action::Delete(channel)));
+        let old = app.channel_ui.focus_target().unwrap();
+        drop(app.handle_channel_ui(Action::Dismiss));
+        assert!(!app.channel_ui.modal_open());
+        let opening = app.handle_channel_ui(Action::Delete(channel));
+        let current = app.channel_ui.focus_target().unwrap();
+        let cancel = app.channel_ui.dialog.as_ref().unwrap().control_id(false);
+        assert_ne!(
+            old, current,
+            "reopening the same channel has a new presentation"
+        );
+        assert_eq!(
+            super::super::tests::focused_element(app.channel_dialog_view().unwrap(), opening),
+            Some(current.clone())
+        );
+        let stale = super::dialog_ui::focus_target_task(cancel.clone())
+            .chain(super::dialog_ui::focus_target_task(old));
+        assert_eq!(
+            super::super::tests::focused_element(app.channel_dialog_view().unwrap(), stale),
+            Some(cancel),
+            "an old focus task neither focuses the replacement nor clears current focus"
+        );
+        assert!(matches!(
+            super::super::dialog_ui::tests::enter_control(
+                app.channel_dialog_view().unwrap(),
+                current
+            ),
+            Message::ChannelUi(Action::ConfirmDelete)
+        ));
+        assert_eq!(app.card_state(card), Some(&original));
+        assert!(!app.channel_ui.deletion_running());
     }
 
     #[test]
