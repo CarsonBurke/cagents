@@ -12776,7 +12776,12 @@ impl Cagents {
             self.status = Some(TransientNotice::error(
                 "Could not save this window. It remains open; copy unsent drafts before resolving the save error.",
             ).with_details(error).with_key(NoticeKey::WindowClose(window)));
-            return Task::none();
+            // The update postlude records this failure before the deferred
+            // reveal runs. Chrome rechecks its original window and generation
+            // so a late save result cannot reveal another window's notice.
+            return cosmic::task::message(Message::ChromeUi(
+                chrome_ui::Action::RevealWindowCloseFailure { window, generation },
+            ));
         }
         if let Ok(saved) = saved {
             self.acknowledge_settings_save(saved);
@@ -20258,6 +20263,36 @@ mod tests {
             })
     }
 
+    fn window_close_test_reveal_messages(task: Task<Message>) -> Vec<Message> {
+        let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+            return Vec::new();
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    let mut messages = Vec::new();
+                    while let Some(action) = stream.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action
+                        {
+                            assert!(matches!(
+                                &message,
+                                Message::ChromeUi(
+                                    chrome_ui::Action::RevealWindowCloseFailure { .. }
+                                )
+                            ));
+                            messages.push(message);
+                        }
+                    }
+                    messages
+                })
+                .await
+                .expect("deferred close reveal must settle")
+            })
+    }
+
     pub(super) fn acknowledge_test_window_close(app: &mut Cagents, window: window::Id) {
         let task = app.update(Message::WindowCloseRequested(window));
         assert!(app.pending_window_close.is_some());
@@ -20416,6 +20451,102 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn window_close_refusal_publishes_before_reveal_and_rejects_stale_window_messages() {
+        for changed in ["current", "window", "generation"] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, card, window) = window_close_draft_app(directory.path());
+            app.refresh_ui.focused = true;
+            app.persist();
+            app.session
+                .as_ref()
+                .unwrap()
+                .flush(Duration::from_secs(5))
+                .unwrap();
+            let original = app.card_state(card).unwrap().kind.clone();
+            let CardKind::Chat(session) = &mut app.card_state_mut(card).unwrap().kind else {
+                panic!("chat")
+            };
+            session.id = TerminalId::new();
+            // Reproduce a pre-existing error badge: the failure must be
+            // disclosed even when a new unread count cannot explain it.
+            for index in 0..9 {
+                app.notices.record(TransientNotice::error(format!(
+                    "Earlier unrelated failure {index}"
+                )));
+            }
+            let task = app.update(Message::WindowCloseRequested(window));
+            let generation = app.pending_window_close.as_ref().unwrap().generation;
+            let completed = window_close_test_message(&mut app, task);
+            assert!(matches!(
+                &completed,
+                Message::WindowCloseFlushed { result: Err(_), .. }
+            ));
+            let duplicate = completed.clone();
+            let reveal_task = app.update(completed);
+            assert!(
+                app.status.is_none(),
+                "the postlude must publish the failure"
+            );
+            let notice = app.notices.entries.back().unwrap();
+            assert_eq!(notice.notice.key, Some(NoticeKey::WindowClose(window)));
+            assert_eq!(notice.notice.severity, NoticeSeverity::Error);
+            assert!(notice.notice.message.contains("copy unsent drafts"));
+            assert!(notice.notice.details.is_some());
+            assert!(app.exit.is_none());
+            assert!(app.pending_window_close.is_none());
+            assert_eq!(app.core.main_window_id(), Some(window));
+            assert!(!app.chrome_ui.is_open());
+            let mut reveals = window_close_test_reveal_messages(reveal_task);
+            assert_eq!(reveals.len(), 1);
+            assert!(matches!(
+                &reveals[0],
+                Message::ChromeUi(chrome_ui::Action::RevealWindowCloseFailure {
+                    window: original_window,
+                    generation: original_generation,
+                }) if *original_window == window && *original_generation == generation
+            ));
+            let log = app.notices.entries.clone();
+            assert!(window_close_test_reveal_messages(app.update(duplicate)).is_empty());
+            assert_eq!(app.notices.entries, log);
+            match changed {
+                "window" => {
+                    app.core.set_main_window_id(Some(window::Id::unique()));
+                }
+                "generation" => {
+                    app.window_close_generation = generation.wrapping_add(1);
+                }
+                "current" => {}
+                _ => unreachable!(),
+            }
+            drop(app.update(reveals.pop().unwrap()));
+            assert_eq!(app.chrome_ui.is_open(), changed == "current");
+            assert!(app.exit.is_none());
+            assert_eq!(
+                app.persistent_workspace().chat_drafts[&card].trim_end(),
+                "UNSENT before close"
+            );
+            let saved = app
+                .session
+                .as_ref()
+                .unwrap()
+                .operation_store()
+                .load_workspace(app.durable.id, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                saved
+                    .cards
+                    .iter()
+                    .find(|state| state.id == card)
+                    .unwrap()
+                    .kind,
+                original,
+                "disclosure cannot repair or bypass the refused identity"
+            );
+        }
     }
 
     #[test]

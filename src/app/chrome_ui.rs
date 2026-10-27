@@ -47,6 +47,9 @@ pub(super) struct State {
     pub(super) projects_collapsed: bool,
     popup: Option<Popup>,
     attention_page: usize,
+    pinned_notice: Option<u64>,
+    expanded_notice: Option<u64>,
+    revealed_window_close: Option<(window::Id, u64, u64)>,
     focus_index: usize,
     /// The shell's own Tab traversal, set aside while a popup owns Tab: the
     /// two would each move focus on one key press, and whichever landed last
@@ -1325,6 +1328,237 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn close_failure_reveal_pins_the_current_error_once_and_refuses_stale_focus() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
+        app.window_close_generation = 8;
+        app.notices.record(
+            TransientNotice::error("Could not save this window.")
+                .with_details("stored identity refused")
+                .with_key(NoticeKey::WindowClose(window)),
+        );
+        let id = app.notices.recent().next().unwrap().id;
+        app.notices
+            .record(TransientNotice::warning("Later unrelated warning"));
+        let reveal = || Action::RevealWindowCloseFailure {
+            window,
+            generation: 8,
+        };
+        drop(app.update_chrome(reveal()));
+        assert_eq!(app.chrome_ui.popup, Some(Popup::Notices));
+        assert_eq!(app.ordered_chrome_notices()[0].id, id);
+        assert_eq!(
+            app.popup_focus_ring(Popup::Notices)[app.chrome_ui.focus_index],
+            NOTICES_CLOSE_ID
+        );
+        app.chrome_ui.focus_index = 2;
+        drop(app.update_chrome(Action::ToggleNoticeDetails(id)));
+        app.notices
+            .record(TransientNotice::warning("Ongoing warning"));
+        drop(app.update_chrome(reveal()));
+        assert_eq!(
+            app.chrome_ui.focus_index, 2,
+            "duplicate reveal does not steal focus"
+        );
+        assert_eq!(app.chrome_ui.expanded_notice, Some(id));
+        assert_eq!(app.ordered_chrome_notices()[0].id, id);
+        drop(app.update_chrome(Action::Close));
+        assert!(app.chrome_ui.pinned_notice.is_none());
+        assert!(app.chrome_ui.expanded_notice.is_none());
+        drop(app.update_chrome(reveal()));
+        assert_eq!(
+            app.chrome_ui.popup, None,
+            "late duplicate must not reopen after Close"
+        );
+        app.notices.record(
+            TransientNotice::error("Next save refusal")
+                .with_details("next details")
+                .with_key(NoticeKey::WindowClose(window)),
+        );
+        let id = app.notices.recent().next().unwrap().id;
+        for changed in ["generation", "window", "modal", "rename", "popup", "exit"] {
+            match changed {
+                "generation" => app.window_close_generation = 9,
+                "window" => app.core.set_main_window_id(Some(window::Id::unique())),
+                "modal" => app.settings_reset_confirm = true,
+                "rename" => {
+                    app.chrome_ui.rename = Some((
+                        RenameTarget::Pane(app.workspace.focused().unwrap()),
+                        "later".into(),
+                    ))
+                }
+                "popup" => app.chrome_ui.popup = Some(Popup::NewTab),
+                "exit" => app.exit = Some(ApplicationExit::default()),
+                _ => unreachable!(),
+            }
+            drop(app.update_chrome(reveal()));
+            assert!(app.chrome_ui.pinned_notice.is_none(), "{changed}");
+            app.window_close_generation = 8;
+            app.core.set_main_window_id(Some(window));
+            app.settings_reset_confirm = false;
+            app.chrome_ui.rename = None;
+            app.chrome_ui.popup = None;
+            app.exit = None;
+        }
+        drop(app.update_chrome(reveal()));
+        app.notices.record(
+            TransientNotice::error("Replacement failure")
+                .with_details("different details")
+                .with_key(NoticeKey::WindowClose(window)),
+        );
+        drop(app.reconcile_notice_popup());
+        assert!(app.chrome_ui.pinned_notice.is_none());
+        assert!(app.chrome_ui.expanded_notice.is_none());
+        drop(app.update_chrome(Action::ToggleNoticeDetails(id)));
+        assert!(app.chrome_ui.expanded_notice.is_none());
+    }
+
+    fn notice_row_step(
+        app: &Cagents,
+        renderer: &mut cosmic::Renderer,
+        cache: iced::runtime::user_interface::Cache,
+        cursor: iced::mouse::Cursor,
+        events: &[iced::Event],
+    ) -> (
+        iced::runtime::user_interface::Cache,
+        Vec<Message>,
+        iced::Point,
+        iced_accessibility::A11yTree,
+    ) {
+        use iced::{Size, advanced::clipboard, runtime::user_interface::UserInterface};
+        let entry = app.ordered_chrome_notices()[0];
+        let mut ui = UserInterface::build(
+            app.chrome_notice_view(entry),
+            Size::new(300.0, 5000.0),
+            cache,
+            renderer,
+        );
+        let mut messages = Vec::new();
+        ui.update(&[], cursor, renderer, &mut clipboard::Null, &mut messages);
+        ui.draw(
+            renderer,
+            &cosmic::theme::active(),
+            &iced::advanced::renderer::Style::default(),
+            cursor,
+        );
+        let nodes = ui.a11y_nodes(cursor);
+        let button = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| {
+                node.node().role() == iced_accessibility::accesskit::Role::Button
+                    && matches!(
+                        node.node().label(),
+                        Some("Show application notice details" | "Hide application notice details")
+                    )
+            })
+            .expect("actual enabled Details control");
+        let b = button.node().bounds().unwrap();
+        assert!(
+            b.x0 >= 0.0 && b.x1 <= 300.0 && b.x1 > b.x0,
+            "narrow button geometry {b:?}"
+        );
+        assert!(
+            b.y0 >= 0.0 && b.y1 < 150.0,
+            "Details stays before long diagnostic {b:?}"
+        );
+        let point = iced::Point::new(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32);
+        ui.update(
+            events,
+            cursor,
+            renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        (ui.into_cache(), messages, point, nodes)
+    }
+
+    #[test]
+    fn notice_details_real_controls_keep_original_press_owner_and_current_keyboard_ring() {
+        use iced::{Event, mouse, runtime::user_interface::Cache};
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.notices.record(TransientNotice::error("Save refused")
+            .with_details("first diagnostic\nline two\nline three\nline four\nline five\nTAIL_VISIBLE_AFTER_EXPANSION")
+            .with_key(NoticeKey::AccountLink));
+        drop(app.update_chrome(Action::ToggleNotices));
+        let old = app.notices.recent().next().unwrap().id;
+        let mut renderer = super::super::tests::headless_renderer();
+        let (cache, messages, point, _) = notice_row_step(
+            &app,
+            &mut renderer,
+            Cache::default(),
+            mouse::Cursor::Unavailable,
+            &[],
+        );
+        assert!(messages.is_empty());
+        let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+        let cursor = mouse::Cursor::Available(point);
+        let (cache, messages, _, _) =
+            notice_row_step(&app, &mut renderer, cache, cursor, &[press.clone()]);
+        assert!(messages.is_empty());
+        app.notices.record(
+            TransientNotice::error("New save refusal")
+                .with_details("NEW_REASON\nline2\nline3\nline4\nline5\nNEW_TAIL")
+                .with_key(NoticeKey::AccountLink),
+        );
+        let current = app.notices.recent().next().unwrap().id;
+        assert_ne!(old, current);
+        let (cache, messages, point, _) =
+            notice_row_step(&app, &mut renderer, cache, cursor, &[release.clone()]);
+        assert!(
+            messages.is_empty(),
+            "old held press cannot activate replacement details"
+        );
+        let cursor = mouse::Cursor::Available(point);
+        let (cache, messages, _, _) = notice_row_step(&app, &mut renderer, cache, cursor, &[press]);
+        assert!(messages.is_empty());
+        let (cache, mut messages, _, _) =
+            notice_row_step(&app, &mut renderer, cache, cursor, &[release]);
+        assert!(
+            matches!(messages.as_slice(), [Message::ChromeUi(Action::ToggleNoticeDetails(id))] if *id == current)
+        );
+        drop(app.update(messages.remove(0)));
+        assert_eq!(app.chrome_ui.expanded_notice, Some(current));
+        let (_, _, _, nodes) = notice_row_step(&app, &mut renderer, cache, cursor, &[]);
+        assert!(
+            nodes.root().iter().chain(nodes.children()).any(|n| n
+                .node()
+                .label()
+                .is_some_and(|s| s.contains("NEW_TAIL"))
+                || n.node().value().is_some_and(|s| s.contains("NEW_TAIL")))
+        );
+        assert!(
+            app.popup_focus_ring(Popup::Notices)
+                .iter()
+                .any(|id| id.as_ref() == notice_details_id(current))
+        );
+        drop(app.update(Message::DismissNotice(current)));
+        assert!(app.chrome_ui.expanded_notice.is_none());
+    }
+
+    #[test]
+    fn expanded_notice_diagnostics_borrow_a_bounded_utf8_prefix() {
+        let details = format!(
+            "{}{}PRIVATE_AFTER_LIMIT",
+            "x".repeat(NOTICE_EXPANDED_BYTES - 1),
+            "é"
+        );
+        let (visible, truncated) = bounded_notice_details(&details);
+        assert!(truncated);
+        assert_eq!(visible.len(), NOTICE_EXPANDED_BYTES - 1);
+        assert!(
+            std::ptr::eq(visible.as_ptr(), details.as_ptr()),
+            "borrow original payload, no per-frame clone"
+        );
+        assert!(!visible.contains("PRIVATE_AFTER_LIMIT"));
+        assert_eq!(bounded_notice_details("complete"), ("complete", false));
+    }
 }
 
 impl State {
@@ -1342,6 +1576,11 @@ impl State {
 
     pub(super) fn close(&mut self) {
         self.popup = None;
+        self.pinned_notice = None;
+        self.expanded_notice = None;
+        // Keep the consumed reveal receipt: a queued duplicate must not reopen
+        // a popup the reader explicitly closed. A new close generation or
+        // replacement notice has a different receipt.
     }
 }
 
@@ -1407,6 +1646,8 @@ pub enum Action {
     ToggleAttention,
     AttentionPage(usize),
     ShowNoticesFor(CardId),
+    RevealWindowCloseFailure { window: window::Id, generation: u64 },
+    ToggleNoticeDetails(u64),
     Close,
     TabsScrolled(f32),
     Launch(NewTab),
@@ -1622,6 +1863,21 @@ fn notice_expiry_stream(
     })
 }
 
+const NOTICES_SCROLL_ID: &str = "chrome.notices.scroll";
+const NOTICE_EXPANDED_BYTES: usize = 32 * 1024;
+
+fn notice_details_id(id: u64) -> String {
+    format!("notice.details.{id}")
+}
+
+fn bounded_notice_details(details: &str) -> (&str, bool) {
+    let mut end = details.len().min(NOTICE_EXPANDED_BYTES);
+    while !details.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&details[..end], end < details.len())
+}
+
 fn notice_dismiss_id(id: u64) -> String {
     format!("chrome.notices.dismiss.{id}")
 }
@@ -1731,11 +1987,12 @@ impl Cagents {
                     ring.push(Cow::Borrowed(NOTICES_DISMISS_ALL_ID));
                 }
                 ring.push(Cow::Borrowed(NOTICES_CLOSE_ID));
-                ring.extend(
-                    self.notices
-                        .recent()
-                        .map(|entry| Cow::Owned(notice_dismiss_id(entry.id))),
-                );
+                for entry in self.ordered_chrome_notices() {
+                    if entry.notice.details.is_some() {
+                        ring.push(Cow::Owned(notice_details_id(entry.id)));
+                    }
+                    ring.push(Cow::Owned(notice_dismiss_id(entry.id)));
+                }
                 // In the order the notices draw them: the lane's own notice,
                 // then the refused writes. Only one of them offers a retry.
                 let health = self.save_health.as_ref();
@@ -1822,6 +2079,67 @@ impl Cagents {
             return Task::none();
         }
         match action {
+            Action::RevealWindowCloseFailure { window, generation } => {
+                if self.core.main_window_id() != Some(window)
+                    || self.window_close_generation != generation
+                    || self.pending_window_close.is_some()
+                    || self.exit.is_some()
+                    || self.chrome_ui.rename.is_some()
+                    || self
+                        .chrome_ui
+                        .popup
+                        .is_some_and(|popup| popup != Popup::Notices)
+                {
+                    return Task::none();
+                }
+                let Some(id) = self
+                    .notices
+                    .recent()
+                    .find(|entry| {
+                        entry.notice.key == Some(NoticeKey::WindowClose(window))
+                            && entry.notice.severity == NoticeSeverity::Error
+                    })
+                    .map(|entry| entry.id)
+                else {
+                    return Task::none();
+                };
+                let revealed = (window, generation, id);
+                if self.chrome_ui.revealed_window_close == Some(revealed) {
+                    return Task::none();
+                }
+                self.chrome_ui.revealed_window_close = Some(revealed);
+                self.chrome_ui.pinned_notice = Some(id);
+                self.chrome_ui.expanded_notice = None;
+                self.chrome_ui.popup = Some(Popup::Notices);
+                let ring = self.popup_focus_ring(Popup::Notices);
+                self.chrome_ui.focus_index = ring
+                    .iter()
+                    .position(|id| id == NOTICES_CLOSE_ID)
+                    .unwrap_or_default();
+                Task::batch([
+                    self.focus_popup_control(ring),
+                    iced::widget::scrollable::scroll_to(
+                        widget::Id::new(NOTICES_SCROLL_ID),
+                        iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
+                    )
+                    .map(cosmic::Action::App),
+                ])
+            }
+            Action::ToggleNoticeDetails(id) => {
+                if self.chrome_ui.popup != Some(Popup::Notices)
+                    || self.pending_window_close.is_some()
+                    || self.exit.is_some()
+                    || !self
+                        .notices
+                        .recent()
+                        .any(|entry| entry.id == id && entry.notice.details.is_some())
+                {
+                    return Task::none();
+                }
+                self.chrome_ui.expanded_notice =
+                    (self.chrome_ui.expanded_notice != Some(id)).then_some(id);
+                Task::none()
+            }
             Action::HoverTab(card) => {
                 self.chrome_ui.hovered_tab = card;
                 Task::none()
@@ -2024,6 +2342,10 @@ impl Cagents {
                 if popup == Popup::Attention {
                     self.chrome_ui.attention_page = 0;
                 }
+                if popup != Popup::Notices {
+                    self.chrome_ui.pinned_notice = None;
+                    self.chrome_ui.expanded_notice = None;
+                }
                 self.chrome_ui.popup = Some(popup);
                 // The notices popup opens on its close control, which is not
                 // the first stop when "Dismiss all" precedes it.
@@ -2038,9 +2360,13 @@ impl Cagents {
                 self.focus_popup_control(ring)
             }
             Action::Close => {
-                let popup = self.chrome_ui.popup.take();
-                if popup == Some(Popup::Attention)
-                    && (self.modal_is_open() || self.focused_repository_is_saving())
+                let popup = self.chrome_ui.popup;
+                self.chrome_ui.close();
+                if matches!(popup, Some(Popup::Attention | Popup::Notices))
+                    && (self.modal_is_open()
+                        || self.focused_repository_is_saving()
+                        || self.pending_window_close.is_some()
+                        || self.exit.is_some())
                 {
                     // A queued outside-close cannot unfocus a dialog/editor
                     // that acquired the keyboard after this overlay was drawn.
@@ -2220,6 +2546,26 @@ impl Cagents {
     }
 
     pub(super) fn reconcile_notice_popup(&mut self) -> Task<Message> {
+        let notices = &self.notices;
+        let valid = |id| notices.recent().any(|entry| entry.id == id);
+        if self.chrome_ui.expanded_notice.is_some_and(|id| !valid(id)) {
+            self.chrome_ui.expanded_notice = None;
+        }
+        if self.chrome_ui.pinned_notice.is_some_and(|id| !valid(id))
+            || self
+                .chrome_ui
+                .revealed_window_close
+                .is_some_and(|(window, generation, _)| {
+                    self.core.main_window_id() != Some(window)
+                        || self.window_close_generation != generation
+                        || self.pending_window_close.is_some()
+                        || self.exit.is_some()
+                })
+        {
+            self.chrome_ui.pinned_notice = None;
+            self.chrome_ui.expanded_notice = None;
+            self.chrome_ui.revealed_window_close = None;
+        }
         if self.chrome_ui.popup == Some(Popup::Notices) && !self.has_chrome_notices() {
             self.chrome_ui.close();
             iced::widget::operation::focus(context_inspector_toggle_id()).map(cosmic::Action::App)
@@ -2418,6 +2764,81 @@ impl Cagents {
         .into()
     }
 
+    fn ordered_chrome_notices(&self) -> Vec<&LoggedNotice> {
+        let pinned = self.chrome_ui.pinned_notice;
+        self.notices
+            .recent()
+            .filter(|entry| Some(entry.id) == pinned)
+            .chain(
+                self.notices
+                    .recent()
+                    .filter(|entry| Some(entry.id) != pinned),
+            )
+            .collect()
+    }
+
+    fn chrome_notice_view<'a>(&'a self, entry: &'a LoggedNotice) -> Element<'a, Message> {
+        let severity = entry.notice.severity;
+        let mut lines = vec![super::notice_body(&entry.notice.message)];
+        let mut actions = Vec::new();
+        if let Some(details) = &entry.notice.details {
+            let expanded = self.chrome_ui.expanded_notice == Some(entry.id);
+            let (visible, truncated) = bounded_notice_details(details);
+            lines.push(if expanded {
+                super::notice_surface_detail(severity, visible)
+            } else {
+                super::notice_surface_details(severity, visible)
+            });
+            if expanded && truncated {
+                lines.push(super::notice_surface_detail(
+                    severity,
+                    "Diagnostic shortened to the first 32 KiB.",
+                ));
+            }
+            actions.push(super::notice_surface_action(
+                severity,
+                if expanded { "Hide details" } else { "Details" },
+                if expanded {
+                    "Hide application notice details"
+                } else {
+                    "Show application notice details"
+                },
+                widget::Id::new(notice_details_id(entry.id)),
+                Message::ChromeUi(Action::ToggleNoticeDetails(entry.id)),
+            ));
+        }
+        if entry.repeats > 1 {
+            lines.push(super::notice_surface_detail(
+                severity,
+                format!("Repeated {} times", entry.repeats),
+            ));
+        }
+        actions.push(super::notice_surface_action(
+            severity,
+            "Dismiss",
+            "Dismiss application notice",
+            widget::Id::new(notice_dismiss_id(entry.id)),
+            Message::DismissNotice(entry.id),
+        ));
+        // Actions stay near the message, before long expanded diagnostics.
+        lines.insert(
+            1,
+            widget::row::with_children(actions).spacing(space::S).into(),
+        );
+        crate::ui_controls::owned(
+            entry.id,
+            super::notice_surface(
+                severity,
+                widget::column::with_children(lines)
+                    .spacing(space::XS)
+                    .width(Length::Fill)
+                    .into(),
+                None,
+                false,
+            ),
+        )
+    }
+
     fn notice_control(&self) -> Option<Element<'_, Message>> {
         let severity = self
             .notice_control_severity()
@@ -2441,37 +2862,8 @@ impl Cagents {
         let content =
             (self.chrome_ui.popup == Some(Popup::Notices) && !self.modal_is_open()).then(|| {
                 let mut notices = Vec::with_capacity(self.notices.len() + 1);
-                for entry in self.notices.recent() {
-                    let severity = entry.notice.severity;
-                    let mut lines = vec![super::notice_body(&entry.notice.message)];
-                    if let Some(details) = &entry.notice.details {
-                        lines.push(super::notice_surface_details(severity, details));
-                    }
-                    if entry.repeats > 1 {
-                        lines.push(super::notice_surface_detail(
-                            severity,
-                            format!("Repeated {} times", entry.repeats),
-                        ));
-                    }
-                    let body: Element<'_, Message> = if lines.len() > 1 {
-                        widget::column::with_children(lines)
-                            .spacing(space::XS)
-                            .into()
-                    } else {
-                        lines.pop().expect("a notice has its message")
-                    };
-                    notices.push(super::notice_surface(
-                        entry.notice.severity,
-                        body,
-                        Some(super::notice_surface_action(
-                            entry.notice.severity,
-                            "Dismiss",
-                            "Dismiss application notice",
-                            widget::Id::new(notice_dismiss_id(entry.id)),
-                            Message::DismissNotice(entry.id),
-                        )),
-                        false,
-                    ));
+                for entry in self.ordered_chrome_notices() {
+                    notices.push(self.chrome_notice_view(entry));
                 }
                 if let Some(health) = &self.save_health {
                     notices.extend(save_health_views(
@@ -2521,6 +2913,7 @@ impl Cagents {
                                     iced::Padding::new(6.0).top(0.0),
                                 )),
                         )
+                        .id(widget::Id::new(NOTICES_SCROLL_ID))
                         .direction(iced::widget::scrollable::Direction::Vertical(
                             design::scrollbar(),
                         ))
@@ -2529,7 +2922,11 @@ impl Cagents {
                     ])
                     .spacing(space::S),
                 )
-                .width(design::NOTICE_POPOVER_WIDTH)
+                .width(
+                    (self.window_width - 16.0)
+                        .max(1.0)
+                        .min(design::NOTICE_POPOVER_WIDTH),
+                )
                 .max_height(408)
                 .into()
             });
