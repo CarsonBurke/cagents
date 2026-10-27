@@ -512,11 +512,40 @@ mod tests {
 
     #[test]
     fn pane_edge_transcript_keeps_original_text_wrap_and_control_bounds() {
+        use iced::advanced::widget::operation;
+
+        struct Control {
+            id: widget::Id,
+            focus: bool,
+            focused: Option<bool>,
+            bounds: Option<Rectangle>,
+        }
+        impl Operation for Control {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if id == Some(&self.id) {
+                    if self.focus {
+                        state.focus();
+                    }
+                    self.focused = Some(state.is_focused());
+                    self.bounds = Some(bounds);
+                }
+            }
+        }
+
         let renderer = crate::app::tests::headless_renderer();
         let target = Target {
             card: CardId::new(),
             generation: 0,
         };
+        let control = widget::Id::new("pane-edge-control");
         let content = || -> Element<'static, Message> {
             widget::column::with_children(vec![
                 widget::container(
@@ -528,6 +557,7 @@ mod tests {
                 .width(Length::Fill)
                 .into(),
                 widget::button::custom(iced::widget::text("Copy"))
+                    .id(control.clone())
                     .name("Pane edge fixture control")
                     .on_press(action(Action::Latest(target)))
                     .width(Length::Fill)
@@ -536,14 +566,19 @@ mod tests {
             .width(Length::Fill)
             .into()
         };
-        for pane_width in [120.0_f32, 280.0, 600.0, 744.0, 748.0, 956.0, 1440.0] {
+        let mut current = transcript_column(content());
+        let mut current_tree = Tree::new(&current);
+        for (frame, pane_width) in [120.0_f32, 280.0, 600.0, 744.0, 748.0, 956.0, 1440.0]
+            .into_iter()
+            .enumerate()
+        {
             let mut original: Element<'_, Message> = widget::container(content())
                 .padding(step::GAP_M)
                 .width(Length::Fill)
                 .into();
-            let mut current = transcript_column(content());
+            current = transcript_column(content());
+            current_tree.diff(&mut current);
             let mut original_tree = Tree::new(&original);
-            let mut current_tree = Tree::new(&current);
             let original_node = original.as_widget_mut().layout(
                 &mut original_tree,
                 &renderer,
@@ -567,7 +602,6 @@ mod tests {
             // padded container, rather than duplicating the width formula.
             assert_eq!(node.size().height, original_node.size().height);
             assert_eq!(node.children().len(), original_node.children().len());
-            assert_eq!(current_tree.children.len(), original_tree.children.len());
             let previous_column = &original_node.children()[0];
             let column = &node.children()[0];
             assert_eq!(column.size(), previous_column.size());
@@ -587,6 +621,55 @@ mod tests {
                 node.children()[0].children()[0].children().len(),
                 original_node.children()[0].children()[0].children().len()
             );
+            // Containers forward their child's Tree; the geometry widget owns
+            // a child Tree. Exercise the semantic contract across real diffs:
+            // the same named control keeps its native focus and hit bounds.
+            let mut probe = Control {
+                id: control.clone(),
+                focus: frame == 0,
+                focused: None,
+                bounds: None,
+            };
+            current.as_widget_mut().operate(
+                &mut current_tree,
+                Layout::new(&node),
+                &renderer,
+                &mut probe,
+            );
+            assert_eq!(
+                probe.focused,
+                Some(true),
+                "native focus survives resize at {pane_width}"
+            );
+            let bounds = probe.bounds.expect("same named native control");
+            assert!(bounds.x >= 0.0 && bounds.x + bounds.width <= node.size().width);
+            if frame == 6 {
+                let key = iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter);
+                let mut messages = Vec::new();
+                current.as_widget_mut().update(
+                    &mut current_tree,
+                    &Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                        key: key.clone(),
+                        modified_key: key,
+                        physical_key: iced::keyboard::key::Physical::Code(
+                            iced::keyboard::key::Code::Enter,
+                        ),
+                        location: iced::keyboard::Location::Standard,
+                        modifiers: iced::keyboard::Modifiers::empty(),
+                        text: None,
+                        repeat: false,
+                    }),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &node.bounds(),
+                );
+                assert!(
+                    matches!(messages.as_slice(), [Message::ChatUi(Action::Latest(actual))] if *actual == target)
+                );
+            }
         }
     }
 
