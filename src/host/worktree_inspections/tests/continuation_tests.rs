@@ -205,6 +205,97 @@ fn unmerged_refusal_keeps_same_branch_token_for_explicit_force_only() {
     ));
 }
 #[test]
+fn unmerged_force_retry_revalidates_tip_expiry_and_original_connection() {
+    const TEST: &str = "host::worktree_inspections::tests::continuation_tests::unmerged_force_retry_revalidates_tip_expiry_and_original_connection";
+    let Some(root) = super::private_runtime::enter(TEST) else {
+        return;
+    };
+    for change in ["moved-tip", "expired", "reconnected"] {
+        let case = root.join(change);
+        std::fs::create_dir(&case).unwrap();
+        let (repository, target) = setup(&case, true);
+        let host = host_with_registry(&case);
+        let (snapshot, token) = inspected(&host, &repository, &target);
+        let expiry = host.lock().unwrap().stop_inspections[&token].expires;
+        let token = stopped(&host, &repository, &target, &snapshot, token);
+        let token = removed(&host, &repository, &target, &snapshot, token);
+        assert!(matches!(
+            request(&host, 1, branch(&repository, &snapshot, false, token)).unwrap(),
+            Reply::BranchDeleteRefused {
+                failure: crate::worktree_control::BranchDeleteFailure {
+                    kind: BranchDeleteFailureKind::Unmerged,
+                    ..
+                },
+                continuation: Some(same),
+            } if same == token
+        ));
+        assert_eq!(
+            host.lock().unwrap().stop_inspections[&token].expires,
+            expiry,
+            "an unmerged refusal must not renew the original review deadline"
+        );
+        match change {
+            "moved-tip" => git(&repository, &["update-ref", "refs/heads/topic", "HEAD"]),
+            "expired" => {
+                host.lock()
+                    .unwrap()
+                    .stop_inspections
+                    .get_mut(&token)
+                    .and_then(Arc::get_mut)
+                    .unwrap()
+                    .expires = Instant::now();
+            }
+            "reconnected" => {
+                host.lock().unwrap().unregister_client(1);
+                host.lock().unwrap().register_client(1);
+            }
+            _ => unreachable!(),
+        }
+        let reply = request(&host, 1, branch(&repository, &snapshot, true, token)).unwrap();
+        assert!(
+            matches!(
+                reply,
+                Reply::BranchDeleteRefused {
+                    failure: crate::worktree_control::BranchDeleteFailure {
+                        kind: BranchDeleteFailureKind::AuthorityChanged,
+                        ..
+                    },
+                    continuation: None,
+                }
+            ),
+            "{change} must invalidate the retained force retry"
+        );
+        git(&repository, &["show-ref", "--verify", "refs/heads/topic"]);
+        assert!(
+            !target.exists(),
+            "known removal stays complete for {change}"
+        );
+        if change == "moved-tip" {
+            // Restoring the reviewed tip must not revive a spent stale grant.
+            git(
+                &repository,
+                &[
+                    "update-ref",
+                    "refs/heads/topic",
+                    snapshot.head_oid.as_deref().unwrap(),
+                ],
+            );
+            assert!(matches!(
+                request(&host, 1, branch(&repository, &snapshot, true, token)).unwrap(),
+                Reply::BranchDeleteRefused {
+                    failure: crate::worktree_control::BranchDeleteFailure {
+                        kind: BranchDeleteFailureKind::AuthorityChanged,
+                        ..
+                    },
+                    continuation: None,
+                }
+            ));
+            git(&repository, &["show-ref", "--verify", "refs/heads/topic"]);
+        }
+    }
+}
+
+#[test]
 fn changed_files_and_replaced_checkout_after_stop_never_rebind_removal() {
     const TEST: &str = "host::worktree_inspections::tests::continuation_tests::changed_files_and_replaced_checkout_after_stop_never_rebind_removal";
     let Some(root) = super::private_runtime::enter(TEST) else {
