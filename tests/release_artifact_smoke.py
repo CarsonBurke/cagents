@@ -263,7 +263,8 @@ class ShutdownOrdering(unittest.TestCase):
 
             def owned_process(*args, **kwargs):
                 process = subprocess.Popen(*args, **kwargs)
-                processes.append((process, os.pidfd_open(process.pid)))
+                processes.append((process, None))
+                processes[-1] = (process, os.pidfd_open(process.pid))
                 return process
 
             try:
@@ -331,6 +332,7 @@ class ShutdownOrdering(unittest.TestCase):
                 deadline = time.monotonic() + 5
                 while not (acknowledged.exists() and observed.exists()):
                     if smoke.poll() is not None or time.monotonic() >= deadline:
+                        self.assertFalse(premature.exists(), "status queried the original closing listener before the identity wait")
                         self.fail("shutdown must observe the real original identity before polling status")
                     time.sleep(0.01)
                 self.assertIsNone(daemon.poll(), "fixture must remain alive until the identity wait")
@@ -349,10 +351,16 @@ class ShutdownOrdering(unittest.TestCase):
                 for process, pidfd in reversed(processes):
                     try:
                         if process.poll() is None:
-                            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                            if pidfd is None:
+                                # pidfd acquisition failed, but this direct child
+                                # remains ours and unreaped, so its PID cannot recycle.
+                                process.kill()
+                            else:
+                                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
                         process.wait(timeout=5)
                     finally:
-                        os.close(pidfd)
+                        if pidfd is not None:
+                            os.close(pidfd)
                         for stream in (process.stdin, process.stdout, process.stderr):
                             if stream is not None:
                                 stream.close()
