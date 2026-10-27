@@ -752,6 +752,30 @@ mod tests {
                     .unwrap()
                     .is_empty()
             );
+            assert!(
+                after
+                    .remove("automation_proposal_notifications")
+                    .unwrap()
+                    .is_empty(),
+                "schema24 does not replay historical proposals"
+            );
+            let counters = after.get_mut("metadata").unwrap();
+            assert_eq!(counters.len(), 1);
+            let metadata = &mut counters[0];
+            assert_eq!(metadata.len(), before["metadata"][0].len() + 2);
+            let pending: i64 = registry
+                .db
+                .query_row(
+                    "SELECT count(*) FROM automation_proposals WHERE pending=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                metadata.pop().unwrap(),
+                rusqlite::types::Value::Integer(pending)
+            );
+            assert_eq!(metadata.pop().unwrap(), rusqlite::types::Value::Integer(1));
             // History22 appends one nullable column; preserve every original
             // firing payload in this published19 comparison.
             for row in after.get_mut("automation_firings").unwrap() {

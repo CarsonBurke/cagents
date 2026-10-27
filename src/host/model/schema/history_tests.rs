@@ -641,7 +641,7 @@ fn actual_twenty_through_twenty_two_predecessors_keep_payloads_and_fail_atomical
         }
         drop(db);
         let before = bytes(&path);
-        for step in (version + 1)..=23 {
+        for step in (version + 1)..=SCHEMA_VERSION {
             FAIL_STEP.with(|failure| failure.set(Some(step)));
             let error = Registry::at(&path)
                 .err()
@@ -673,7 +673,7 @@ fn actual_twenty_through_twenty_two_predecessors_keep_payloads_and_fail_atomical
             1,
             "the admitted23 upgrade installs the original global active-listing index atomically"
         );
-        assert_eq!(inspect(&registry.db).unwrap().version, 23);
+        assert_eq!(inspect(&registry.db).unwrap().version, SCHEMA_VERSION);
         assert_eq!(registry.model().unwrap().sequence, sequence + 1);
         assert_eq!(
             history_preserved_rows(&registry.db, &names, version),

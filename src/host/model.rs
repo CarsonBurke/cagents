@@ -28,6 +28,7 @@ mod automation_attention;
 mod automation_audit;
 pub(super) use automation_attention::{AutomationAttentionReceipt, PendingAutomationAttention};
 pub(super) mod automation_notifications;
+pub(super) mod automation_proposal_notifications;
 mod automation_proposals;
 mod automations;
 pub(super) mod channel_work;
@@ -48,7 +49,7 @@ mod terminal_owners;
 mod terminal_retention;
 mod views;
 
-const SCHEMA_VERSION: u32 = 23;
+const SCHEMA_VERSION: u32 = 24;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -654,6 +655,11 @@ fn migrate_through(
     if version < 23 && target >= 23 {
         views::migrate_history(tx)?;
         schema::migration_checkpoint(23)?;
+    }
+    if version < 24 && target >= 24 {
+        automation_proposals::migrate_delivery(tx)?;
+        automation_proposal_notifications::migrate(tx)?;
+        schema::migration_checkpoint(24)?;
     }
     Ok(())
 }

@@ -3,6 +3,9 @@
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use uuid::Uuid;
 
+mod delivery;
+pub(super) use delivery::migrate as migrate_delivery;
+
 use super::{Registry, automations::create_automation_in};
 use crate::{
     agent_execution::Origin,
@@ -106,6 +109,7 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        super::schema::require_current(&tx)?;
         if let Some(previous) = read(&tx, id, Some(&owner))? {
             if previous.requested != requested {
                 return Err(
@@ -152,6 +156,9 @@ impl Registry {
             ],
         )
         .map_err(|_| "Could not save this request ID; use a new request ID".to_owned())?;
+        // Source attention and the proposal INSERT commit or roll back together.
+        super::automation_proposal_notifications::queue_in(&tx, &proposal)?;
+        delivery::changed_in(&tx, true)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(proposal)
     }
@@ -164,10 +171,34 @@ impl Registry {
         next: Option<Occurrence>,
         now_ms: u64,
     ) -> Result<Proposal, String> {
+        self.resolve_automation_proposal_scoped(None, expected, next, now_ms)
+    }
+
+    pub(crate) fn resolve_automation_proposal_in_registry(
+        &mut self,
+        identity: Uuid,
+        expected: &Proposal,
+        next: Option<Occurrence>,
+        now_ms: u64,
+    ) -> Result<Proposal, String> {
+        self.resolve_automation_proposal_scoped(Some(identity), expected, next, now_ms)
+    }
+
+    fn resolve_automation_proposal_scoped(
+        &mut self,
+        identity: Option<Uuid>,
+        expected: &Proposal,
+        next: Option<Occurrence>,
+        now_ms: u64,
+    ) -> Result<Proposal, String> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        super::schema::require_current(&tx)?;
+        if let Some(identity) = identity {
+            delivery::require_identity(&tx, identity)?;
+        }
         let mut current = read(&tx, expected.id, None)?
             .ok_or("The automation proposal is no longer available")?;
         if current.revision != expected.revision {
@@ -201,6 +232,10 @@ impl Registry {
             params![current.id.to_string(), encode(&current)?],
         )
         .map_err(|error| error.to_string())?;
+        // A real terminal decision suppresses only an exact not-yet-prepared
+        // source. An already selected immutable notice may still finish.
+        super::automation_proposal_notifications::resolved_in(&tx, &current)?;
+        delivery::changed_in(&tx, false)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(current)
     }
@@ -213,7 +248,7 @@ impl Registry {
 pub(super) fn published_fixture_from_rows(source: &Registry, version: u32) -> std::path::PathBuf {
     use std::os::unix::fs::OpenOptionsExt;
 
-    assert!([2, 3, 9, 10, 11, 12, 15, 16, 20, 21, 22].contains(&version));
+    assert!([2, 3, 9, 10, 11, 12, 15, 16, 20, 21, 22, 23].contains(&version));
     assert_eq!(
         source
             .db
@@ -271,13 +306,18 @@ pub(super) fn published_fixture_from_rows(source: &Registry, version: u32) -> st
             .map(|column| quote(column))
             .collect::<Vec<_>>()
             .join(",");
+        // Keep rowid order for mailbox arrival and history22 backfill, even
+        // when timestamps are nonmonotonic. Only the published23 permanent
+        // UUID archive is WITHOUT ROWID; its declared key is deterministic.
+        let order = if table == quote("compacted_view_operations") {
+            quote("operation")
+        } else {
+            "rowid".into()
+        };
         let rows = {
             let mut statement = source
                 .db
-                // These admitted predecessor layouts all have rowid tables. Keep
-                // relative insertion order: mailbox arrival and schema 22 backfill use
-                // it even when timestamps are intentionally nonmonotonic.
-                .prepare(&format!("SELECT {selected} FROM {table} ORDER BY rowid"))
+                .prepare(&format!("SELECT {selected} FROM {table} ORDER BY {order}"))
                 .unwrap();
             statement
                 .query_map([], |row| {
@@ -339,7 +379,7 @@ mod tests {
         workspace_model::ModelEdit,
     };
 
-    fn fixture() -> (tempfile::TempDir, Registry, Proposal) {
+    pub(super) fn fixture() -> (tempfile::TempDir, Registry, Proposal) {
         let root = tempfile::tempdir().unwrap();
         let mut registry = Registry::at(&root.path().join("registry.sqlite3")).unwrap();
         let repository = root.path().to_path_buf();
@@ -403,7 +443,7 @@ mod tests {
         (root, registry, proposal)
     }
 
-    fn next() -> Occurrence {
+    pub(super) fn next() -> Occurrence {
         Occurrence {
             due_ms: 1000,
             local: "2026-10-12T09:30".into(),

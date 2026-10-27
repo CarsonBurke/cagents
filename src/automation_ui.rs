@@ -1428,7 +1428,13 @@ impl State {
                         "Cancellation requested. Refresh the run for its confirmed outcome.".into(),
                     )
                 }
-                Ok(Response::Proposal(_) | Response::Proposals(_)) => {
+                Ok(
+                    Response::Proposal(_)
+                    | Response::Proposals(_)
+                    | Response::ProposalDelivery(_)
+                    | Response::ProposalPage(_)
+                    | Response::ProposalReview(_),
+                ) => {
                     self.error = Some("Unexpected automation approval response".into());
                 }
             }

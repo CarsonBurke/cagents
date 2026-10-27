@@ -4,10 +4,14 @@ use super::*;
 use crate::automations::{Definition, HistoryCursor, Request, Response};
 use uuid::Uuid;
 
+mod proposal_delivery;
+
 const MAX_DEFINITION_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Subcommand)]
 pub enum AutomationCommand {
+    #[command(flatten)]
+    ProposalDelivery(proposal_delivery::Command),
     /// Save exact launch settings for approval in cagents, without creating a schedule.
     Propose {
         #[arg(long)]
@@ -190,6 +194,12 @@ impl ControlClient {
 
 pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppError> {
     let authority = crate::agent_execution::Authority::from_environment();
+    let command = match command {
+        AutomationCommand::ProposalDelivery(command) => {
+            return proposal_delivery::execute(command, authority);
+        }
+        command => command,
+    };
     let wait = match &command {
         AutomationCommand::Propose {
             wait: true,
@@ -241,6 +251,14 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
         (Response::Proposal(proposal), Some(_)) => Some(proposal_outcome(&proposal.state)),
         _ => None,
     };
+    response_output(name, reply, outcome)
+}
+
+fn response_output(
+    name: &'static str,
+    reply: Response,
+    outcome: Option<WaitOutcome>,
+) -> Result<CommandOutput, AppError> {
     let (mut data, human) = match reply {
         Response::Proposal(proposal) => {
             let human = match &proposal.state {
@@ -261,9 +279,31 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             };
             (json!({"proposal":proposal}), human)
         }
-        Response::Proposals(proposals) => (
-            json!({"proposals":proposals}),
-            "Automation approval requests".into(),
+        Response::Proposals(proposals) => {
+            let human = proposal_delivery::list_human(&proposals);
+            (json!({"proposals":proposals}), human)
+        }
+        Response::ProposalPage(page) => {
+            let human = proposal_delivery::page_human(&page);
+            (json!({"proposal_page":page}), human)
+        }
+        Response::ProposalReview(review) => {
+            let human = format!(
+                "Registry {}\nProposal {} revision {}\n{}",
+                review.identity,
+                review.proposal.id,
+                review.proposal.revision,
+                serde_json::to_string_pretty(&review.proposal)
+                    .map_err(|error| AppError::new("automation_proposal", error))?
+            );
+            (
+                json!({"registry":review.identity,"proposal":review.proposal}),
+                human,
+            )
+        }
+        Response::ProposalDelivery(snapshot) => (
+            json!({"proposal_delivery":snapshot}),
+            "Pending automation request delivery metadata".into(),
         ),
         Response::Listed(entries) => {
             let human = list_human(&entries);
@@ -533,6 +573,12 @@ fn proposal_outcome(state: &crate::automations::ProposalState) -> WaitOutcome {
 
 fn request(command: AutomationCommand) -> Result<(&'static str, Request), AppError> {
     Ok(match command {
+        AutomationCommand::ProposalDelivery(_) => {
+            return Err(AppError::new(
+                "automation_proposal",
+                "User proposal commands require their bound review flow",
+            ));
+        }
         AutomationCommand::Propose {
             request_id,
             definition,

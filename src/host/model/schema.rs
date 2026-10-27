@@ -279,6 +279,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static TWENTY_ONE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_TWO: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_THREE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY_FOUR: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -292,6 +293,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         21 => &TWENTY_ONE,
         22 => &TWENTY_TWO,
         23 => &TWENTY_THREE,
+        24 => &TWENTY_FOUR,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -487,6 +489,7 @@ thread_local! {
 
 #[cfg(test)]
 mod tests {
+    mod global_proposals;
     use super::super::Registry;
     use super::*;
     use crate::{
@@ -1090,6 +1093,10 @@ mod tests {
                 "compacted_view_operation_scopes",
                 "compacted_view_operations",
                 "compacted_view_operations_by_scope",
+                "agents_open_by_recency",
+                "global_pending_automation_proposals",
+                "automation_proposal_notifications",
+                "pending_automation_proposal_notifications",
             ];
             for name in retention_names {
                 let index = inventory
@@ -1107,6 +1114,7 @@ mod tests {
                 "retired_view_panes",
                 "compacted_view_operation_scopes",
                 "compacted_view_operations",
+                "automation_proposal_notifications",
             ] {
                 assert_eq!(
                     registry
@@ -1127,9 +1135,22 @@ mod tests {
             let close = firing.3.len() - 2; // final ')' then STRICT
             assert_eq!(&firing.3[close - suffix.len()..close], &suffix);
             firing.3.drain(close - suffix.len()..close);
+            // Schema24 appends exactly these checked delivery counters. Keep
+            // the original published metadata DDL comparison after proving
+            // and removing only their known token suffix.
+            let metadata = inventory
+                .iter_mut()
+                .find(|object| object.1 == "metadata")
+                .unwrap();
+            let suffix = tokens(", automation_proposal_sequence INTEGER NOT NULL DEFAULT 1 CHECK(automation_proposal_sequence>0), pending_automation_proposal_count INTEGER NOT NULL DEFAULT 0 CHECK(pending_automation_proposal_count>=0)").unwrap();
+            let close = metadata.3.len() - 2;
+            assert_eq!(&metadata.3[close - suffix.len()..close], &suffix);
+            metadata.3.drain(close - suffix.len()..close);
+            let counters: (u64, u64) = registry.db.query_row("SELECT automation_proposal_sequence,pending_automation_proposal_count FROM metadata WHERE key=0", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+            assert_eq!(counters, (1, 0));
             assert_eq!(
                 inventory, old_layout,
-                "only lifecycle/run outboxes, retention objects and the exact history suffix may be added"
+                "only the named published outboxes/indexes, retention objects and exact history/delivery suffixes may be added"
             );
             assert!(
                 registry
@@ -1457,7 +1478,7 @@ mod tests {
     fn each_actual_migration_failure_rolls_back_all_prior_steps_and_header() {
         let _clear = Clear;
         for step in [
-            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("rollback.sqlite3");

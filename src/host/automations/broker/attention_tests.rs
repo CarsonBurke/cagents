@@ -385,6 +385,7 @@ fn withheld_journal_receipt_never_holds_control_host_or_registry_scope() {
         cleanup: Mutex::new(None),
         attention: Mutex::default(),
         notifications: Mutex::default(),
+        proposal_notifications: Mutex::default(),
     }));
     let gate = host.lock().unwrap().control_gate.clone();
     let exclusive = gate.write().unwrap();

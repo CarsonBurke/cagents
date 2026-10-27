@@ -13,6 +13,7 @@ use uuid::Uuid;
 use super::{
     notification_event, notifications,
     precheck::worker::{Request, Status, Worker},
+    proposal_notifications,
     schedule::Compiled,
     service,
 };
@@ -67,6 +68,7 @@ struct Inner {
     attention: Mutex<AttentionTransfer>,
     // The independent no-run lifecycle transfer owns its original receipt.
     notifications: Mutex<notifications::Transfer>,
+    proposal_notifications: Mutex<proposal_notifications::Transfer>,
 }
 
 #[derive(Clone)]
@@ -109,6 +111,7 @@ impl Broker {
             cleanup: Mutex::new(Some(cleanup)),
             attention: Mutex::default(),
             notifications: Mutex::default(),
+            proposal_notifications: Mutex::default(),
         }));
         let owner = handle.clone();
         let thread = std::thread::Builder::new()
@@ -455,7 +458,7 @@ impl Handle {
         let Some(notifications) = notifications else {
             return notifications::RETRY;
         };
-        match self
+        let lifecycle_delay = match self
             .0
             .notifications
             .lock()
@@ -467,7 +470,21 @@ impl Handle {
                 tracing::warn!(%error, "automation attention transfer is temporarily unavailable");
                 notifications::RETRY
             }
-        }
+        };
+        let proposal_delay = match self
+            .0
+            .proposal_notifications
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .advance(&self.0.registry, &notifications)
+        {
+            Ok(delay) => delay,
+            Err(error) => {
+                tracing::warn!(%error, "proposal attention transfer is temporarily unavailable");
+                notifications::RETRY
+            }
+        };
+        lifecycle_delay.min(proposal_delay)
     }
 
     fn tick_under_control(&self, host: &SharedHost) -> Result<Duration, String> {
@@ -1074,6 +1091,7 @@ mod tests {
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
             notifications: Mutex::default(),
+            proposal_notifications: Mutex::default(),
         }));
         host.lock().unwrap().automations = Some(handle.clone());
         let control = host.lock().unwrap().control_gate.clone();
@@ -1283,6 +1301,7 @@ mod tests {
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
             notifications: Mutex::default(),
+            proposal_notifications: Mutex::default(),
         }));
         // Exercise both retire-on-idle and retain-for-reuse policies. Each uses
         // a real offline native actor held busy beyond the cleanup grace.
@@ -1521,6 +1540,7 @@ mod tests {
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
             notifications: Mutex::default(),
+            proposal_notifications: Mutex::default(),
         }));
         let (reported, received) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
@@ -1605,6 +1625,7 @@ mod tests {
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
             notifications: Mutex::default(),
+            proposal_notifications: Mutex::default(),
         }));
         let gate = host.lock().unwrap().control_gate.clone();
         let exclusive = gate.write().unwrap();
@@ -1825,6 +1846,7 @@ mod tests {
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
             notifications: Mutex::default(),
+            proposal_notifications: Mutex::default(),
         }));
         let control = host.lock().unwrap().control_gate.clone();
         let exclusive = control.write().unwrap();

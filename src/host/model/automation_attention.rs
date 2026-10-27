@@ -702,6 +702,8 @@ mod tests {
             let table = table.replace('"', "\"\"");
             let selected = if table == "automation_firings" {
                 "id,automation,revision,occurrence_key,record,created_ms,state,run_id"
+            } else if table == "metadata" {
+                "key,identity,sequence,next_project_ordinal,next_channel_ordinal"
             } else {
                 "*"
             };
@@ -859,6 +861,14 @@ mod tests {
                     .unwrap()
                     .len(),
                 1
+            );
+            let counters: (u64, u64) = registry.db.query_row("SELECT automation_proposal_sequence,pending_automation_proposal_count FROM metadata WHERE key=0", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+            assert_eq!(counters, (1, 0));
+            assert!(
+                registry
+                    .pending_proposal_notifications(1)
+                    .unwrap()
+                    .is_empty()
             );
             for (table, expected) in &before {
                 assert_eq!(

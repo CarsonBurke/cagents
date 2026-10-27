@@ -96,6 +96,7 @@ fn retired_precheck_worker_keeps_retry_custody_until_history_ack_commits() {
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
             notifications: Mutex::default(),
+            proposal_notifications: Mutex::default(),
         }));
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut observer = Worker::recover(&root, claim.firing.id, claim.firing.revision);
@@ -490,6 +491,7 @@ fn history_delete_failure_rolls_back_but_startup_and_tick_keep_both_outboxes_liv
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
             notifications: Mutex::default(),
+            proposal_notifications: Mutex::default(),
         }));
         let mut maintained = Instant::now().checked_sub(Duration::from_secs(61)).unwrap();
         handle

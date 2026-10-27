@@ -10,6 +10,8 @@ use std::{
     thread,
 };
 
+mod proposal;
+
 #[derive(Debug, Clone)]
 pub enum Action {
     Snapshot(Snapshot),
@@ -159,6 +161,7 @@ pub(super) struct State {
     /// Whether a test notification is waiting on the desktop's answer.
     pub testing: bool,
     lifecycle_activation: Option<LifecycleActivation>,
+    proposal_activation: Option<proposal::Activation>,
     lifecycle_read: Option<u64>,
     host: Option<HostSessionProof>,
     // HostBound precedes its Snapshot on the one observer FIFO. Retained old
@@ -191,6 +194,7 @@ impl Default for State {
             acknowledged: BTreeSet::new(),
             testing: false,
             lifecycle_activation: None,
+            proposal_activation: None,
             lifecycle_read: None,
             host: None,
             snapshot_host: None,
@@ -266,8 +270,16 @@ impl State {
 }
 
 fn connect() -> Result<ControlClient, String> {
+    let authority = crate::agent_execution::Authority::from_environment();
+    if authority.token().is_some() && crate::device::is_remote() {
+        return Err("A local session capability cannot use remote notification APIs".into());
+    }
     let socket = crate::terminal_ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-    ControlClient::connect(&socket).map_err(|error| error.to_string())
+    let mut client = ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+    client
+        .authenticate(authority)
+        .map_err(|error| error.to_string())?;
+    Ok(client)
 }
 
 /// Resolve only the current, unambiguous live terminal owner. This is a
@@ -651,6 +663,7 @@ impl Cagents {
             self.notification_ui.inbox_activation = None;
         }
         if matches!(&action, Action::Activated(_)) {
+            self.notification_ui.proposal_activation = None;
             self.notification_ui.lifecycle_activation = None;
             self.notification_ui.session_activation = None;
             self.notification_ui.activation_attempt = None;
@@ -700,11 +713,17 @@ impl Cagents {
             Action::HostBound(proof) => {
                 self.notification_ui.snapshot_host = None;
                 if self.notification_ui.host.as_ref() != Some(&proof) {
+                    self.notification_ui.proposal_activation = None;
                     self.notification_ui.lifecycle_activation = None;
                 }
                 self.notification_ui.host = Some(proof);
                 Task::none()
             }
+            Action::Activated(Target::AutomationProposal {
+                registry,
+                id,
+                revision,
+            }) => self.activate_proposal_notice(registry, id, revision),
             Action::Activated(Target::Automation { id, sequence }) => {
                 // Invalidating the desired target does not cancel blocking I/O.
                 // Keep one real read outstanding, including across host changes.
@@ -997,6 +1016,12 @@ impl Cagents {
     }
 
     pub(super) fn retry_notification_activation(&mut self) -> Task<Message> {
+        let proposal = self.retry_proposal_notice_activation();
+        let session = self.retry_session_notification_activation();
+        Task::batch([proposal, session])
+    }
+
+    fn retry_session_notification_activation(&mut self) -> Task<Message> {
         let Some(session) = self.notification_ui.session_activation else {
             return Task::none();
         };

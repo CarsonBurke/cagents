@@ -24,6 +24,8 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 /// What the daemon threads hand the window.
 #[derive(Debug, Clone)]
 pub enum ModelUpdate {
+    /// A real observer disconnect retires only proposal read/consent epochs.
+    ProposalWatchLost,
     /// The registry as it stood when the watcher connected.
     ///
     /// This is the only update that means "a connection just began", which is
@@ -91,6 +93,7 @@ pub(super) fn observe_workspace_model(sender: async_channel::Sender<ModelUpdate>
             while !sender.is_closed() {
                 if let Err(error) = observe(&sender) {
                     tracing::debug!(%error, "shared workspace model observation ended");
+                    let _ = sender.send_blocking(ModelUpdate::ProposalWatchLost);
                 }
                 std::thread::sleep(RECONNECT_DELAY);
             }
@@ -543,6 +546,10 @@ impl Cagents {
 
     fn apply_workspace_model_update_inner(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
+            ModelUpdate::ProposalWatchLost => {
+                self.retire_global_proposals();
+                Task::none()
+            }
             ModelUpdate::TitleDeferred(edit) => {
                 self.defer_channel_title_suggestion(&edit);
                 Task::none()
@@ -599,22 +606,31 @@ impl Cagents {
                 self.reconcile_workspace_model()
             }
             ModelUpdate::Connected(model) => {
+                self.retire_global_proposals();
                 if model.identity == self.workspace_model.identity
                     && model.sequence < self.shared_views.snapshot_sequence
                 {
-                    return Task::none();
+                    return self.refresh_global_proposals();
                 }
                 self.join_workspace_model(model.identity);
                 self.install_workspace_model_snapshot(model);
                 let closed = self.apply_closed_project_tombstones();
-                Task::batch([closed, self.reconcile_workspace_model()])
+                Task::batch([
+                    closed,
+                    self.reconcile_workspace_model(),
+                    self.refresh_global_proposals(),
+                ])
             }
             ModelUpdate::Read(model) => {
                 if !self.install_workspace_model_snapshot(model) {
                     return Task::none();
                 }
                 let closed = self.apply_closed_project_tombstones();
-                Task::batch([closed, self.reconcile_workspace_model()])
+                Task::batch([
+                    closed,
+                    self.reconcile_workspace_model(),
+                    self.refresh_global_proposals(),
+                ])
             }
             ModelUpdate::Reopened { repository, model } => {
                 if model.identity == self.workspace_model.identity

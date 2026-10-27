@@ -651,6 +651,7 @@ impl HostState {
                         target,
                         crate::notifications::Target::AgentRun(_)
                             | crate::notifications::Target::Automation { .. }
+                            | crate::notifications::Target::AutomationProposal { .. }
                     ) && presence.application == Application::Cagents)
                     || preferred.is_some_and(|destination| *destination == presence.destination())
             })
