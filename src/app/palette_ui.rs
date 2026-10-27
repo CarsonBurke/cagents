@@ -4,8 +4,231 @@ use workspace_widget::GlobalShortcut as Command;
 
 mod row;
 
+// Tab is scoped to the palette and completes synchronously, so a later
+// Enter in one native batch sees the newly focused control.
+mod native_tab {
+    use super::{Element, Message};
+    use cosmic::{Renderer, Theme, iced};
+    use iced::advanced::widget::{Operation, Tree, tree};
+    use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer};
+    use iced::{Event, Length, Rectangle, Size, Vector};
+    struct TabRing<'a> {
+        content: Element<'a, Message>,
+        enabled: bool,
+        barrier: crate::terminal::ReviewInputBarrier,
+    }
+    pub(super) fn view<'a>(
+        content: Element<'a, Message>,
+        enabled: bool,
+        barrier: crate::terminal::ReviewInputBarrier,
+    ) -> Element<'a, Message> {
+        Element::new(TabRing {
+            content,
+            enabled,
+            barrier,
+        })
+    }
+    impl Widget<Message, Theme, Renderer> for TabRing<'_> {
+        fn tag(&self) -> tree::Tag {
+            tree::Tag::of::<TabRing<'static>>()
+        }
+        fn children(&self) -> Vec<Tree> {
+            vec![Tree::new(&self.content)]
+        }
+        fn diff(&mut self, tree: &mut Tree) {
+            tree.diff_children(std::slice::from_mut(&mut self.content));
+        }
+        fn size(&self) -> Size<Length> {
+            self.content.as_widget().size()
+        }
+
+        fn size_hint(&self) -> Size<Length> {
+            self.content.as_widget().size_hint()
+        }
+
+        fn layout(
+            &mut self,
+            tree: &mut Tree,
+            renderer: &Renderer,
+            limits: &layout::Limits,
+        ) -> layout::Node {
+            self.content
+                .as_widget_mut()
+                .layout(&mut tree.children[0], renderer, limits)
+        }
+
+        fn operate(
+            &mut self,
+            tree: &mut Tree,
+            layout: Layout<'_>,
+            renderer: &Renderer,
+            operation: &mut dyn Operation,
+        ) {
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                operation,
+            );
+        }
+
+        fn update(
+            &mut self,
+            tree: &mut Tree,
+            event: &Event,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            renderer: &Renderer,
+            clipboard: &mut dyn Clipboard,
+            shell: &mut Shell<'_, Message>,
+            viewport: &Rectangle,
+        ) {
+            if self.enabled
+                && !shell.is_event_captured()
+                && let Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
+                    modifiers,
+                    ..
+                }) = event
+                && !modifiers.control()
+                && !modifiers.alt()
+                && !modifiers.logo()
+            {
+                if !cfg!(test)
+                    && iced::runtime::core::keyboard::input::current_source()
+                        .cycle()
+                        .is_none()
+                {
+                    shell.capture_event();
+                    return;
+                }
+                if let Event::Keyboard(key) = event
+                    && !self.barrier.capture_consumed_key(key)
+                {
+                    shell.capture_event();
+                    return;
+                }
+                // Complete native traversal before the next event in this batch.
+                // Capture prevents COSMIC's asynchronous global Tab subscription.
+                let mut movement: Box<dyn Operation> = if modifiers.shift() {
+                    Box::new(iced::advanced::widget::operation::focusable::focus_previous::<()>())
+                } else {
+                    Box::new(iced::advanced::widget::operation::focusable::focus_next::<()>())
+                };
+                loop {
+                    self.content.as_widget_mut().operate(
+                        &mut tree.children[0],
+                        layout,
+                        renderer,
+                        movement.as_mut(),
+                    );
+                    match movement.finish() {
+                        iced::advanced::widget::operation::Outcome::Chain(next) => movement = next,
+                        _ => break,
+                    }
+                }
+                shell.capture_event();
+                shell.request_redraw();
+                return;
+            }
+            self.content.as_widget_mut().update(
+                &mut tree.children[0],
+                event,
+                layout,
+                cursor,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+            );
+        }
+
+        fn mouse_interaction(
+            &self,
+            tree: &Tree,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            viewport: &Rectangle,
+            renderer: &Renderer,
+        ) -> mouse::Interaction {
+            self.content.as_widget().mouse_interaction(
+                &tree.children[0],
+                layout,
+                cursor,
+                viewport,
+                renderer,
+            )
+        }
+
+        fn draw(
+            &self,
+            tree: &Tree,
+            renderer: &mut Renderer,
+            theme: &Theme,
+            style: &renderer::Style,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            viewport: &Rectangle,
+        ) {
+            self.content.as_widget().draw(
+                &tree.children[0],
+                renderer,
+                theme,
+                style,
+                layout,
+                cursor,
+                viewport,
+            );
+        }
+
+        fn a11y_nodes(
+            &self,
+            layout: Layout<'_>,
+            tree: &Tree,
+            cursor: mouse::Cursor,
+        ) -> iced_accessibility::A11yTree {
+            self.content
+                .as_widget()
+                .a11y_nodes(layout, &tree.children[0], cursor)
+        }
+
+        fn drag_destinations(
+            &self,
+            tree: &Tree,
+            layout: Layout<'_>,
+            renderer: &Renderer,
+            destinations: &mut iced::advanced::clipboard::DndDestinationRectangles,
+        ) {
+            self.content.as_widget().drag_destinations(
+                &tree.children[0],
+                layout,
+                renderer,
+                destinations,
+            );
+        }
+
+        fn overlay<'a>(
+            &'a mut self,
+            tree: &'a mut Tree,
+            layout: Layout<'a>,
+            renderer: &Renderer,
+            viewport: &Rectangle,
+            translation: Vector,
+        ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+            self.content.as_widget_mut().overlay(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                viewport,
+                translation,
+            )
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct State {
+    native_scope: uuid::Uuid,
     recording: Option<SettingsField>,
     query: Option<String>,
     selected: Option<EntryIdentity>,
@@ -23,6 +246,9 @@ pub enum Action {
     MovePane(CardId),
     Close,
     Query(String),
+    QueryFromNative(uuid::Uuid, String),
+    NavigateFromNative(uuid::Uuid, bool),
+    SubmitFromNative(Box<NativeQuerySubmit>),
     Run(MessageBox),
     Submit,
     FocusPane(CardId),
@@ -31,6 +257,17 @@ pub enum Action {
     /// Input-only acknowledgement; this never becomes a palette command.
     ConsumedActivation,
 }
+#[derive(Debug, Clone)]
+pub struct NativeQuerySubmit {
+    row: Option<MessageBox>,
+    scope: uuid::Uuid,
+    event: keyboard::Event,
+    source: cosmic::iced::runtime::core::keyboard::input::Source,
+    // Native available context, independent of the current filter. Queued
+    // typing/navigation may change selection, never borrow a replacement source.
+    contextual_origins: Vec<EntryIdentity>,
+}
+
 // Box breaks the recursive Message/Action representation.
 #[derive(Debug, Clone)]
 pub struct MessageBox(pub Box<Message>);
@@ -263,20 +500,27 @@ fn highlighted_label(label: &str, query: &str, moving: bool) -> Element<'static,
 }
 
 fn palette_row_style(selected: bool) -> cosmic::theme::Button {
-    fn appearance(selected: bool, hover: bool, theme: &cosmic::Theme) -> widget::button::Style {
+    fn appearance(
+        selected: bool,
+        hover: bool,
+        focused: bool,
+        theme: &cosmic::Theme,
+    ) -> widget::button::Style {
         let mut accent = design::accent_color(theme);
         accent.a = if selected { 0.18 } else { 0.08 };
         widget::button::Style {
             background: (selected || hover).then_some(iced::Background::Color(accent)),
             border_radius: design::RADIUS_S.into(),
+            outline_width: if focused { 2.0 } else { 0.0 },
+            outline_color: design::accent_color(theme),
             ..design::button_style()
         }
     }
     cosmic::theme::Button::Custom {
-        active: Box::new(move |_, theme| appearance(selected, false, theme)),
-        disabled: Box::new(move |theme| appearance(selected, false, theme)),
-        hovered: Box::new(move |_, theme| appearance(selected, true, theme)),
-        pressed: Box::new(move |_, theme| appearance(true, true, theme)),
+        active: Box::new(move |focused, theme| appearance(selected, false, focused, theme)),
+        disabled: Box::new(move |theme| appearance(selected, false, false, theme)),
+        hovered: Box::new(move |focused, theme| appearance(selected, true, focused, theme)),
+        pressed: Box::new(move |focused, theme| appearance(true, true, focused, theme)),
     }
 }
 
@@ -288,6 +532,7 @@ impl Cagents {
         }
         match action {
             Action::Record(field) => {
+                self.palette.native_scope = uuid::Uuid::new_v4();
                 self.palette.recording = Some(field);
                 Task::none()
             }
@@ -296,6 +541,7 @@ impl Cagents {
                     return Task::none();
                 }
                 self.chrome_ui.close();
+                self.palette.native_scope = uuid::Uuid::new_v4();
                 self.palette.query = Some(String::new());
                 self.palette.move_pane = None;
                 self.capture_first_palette_entry();
@@ -313,6 +559,7 @@ impl Cagents {
                 task
             }
             Action::Close => {
+                self.palette.native_scope = uuid::Uuid::new_v4();
                 self.palette.recording = None;
                 self.palette.query = None;
                 self.palette.move_pane = None;
@@ -322,7 +569,43 @@ impl Cagents {
                         .map(cosmic::Action::App)
                 })
             }
+            Action::QueryFromNative(scope, query) => {
+                if !self.palette_native_scope_is_current(scope) {
+                    return Task::none();
+                }
+                self.update_palette(Action::Query(query))
+            }
+            Action::NavigateFromNative(scope, backwards) => {
+                if !self.palette_native_scope_is_current(scope) {
+                    return Task::none();
+                }
+                self.navigate_palette_selection(backwards)
+            }
+            Action::SubmitFromNative(intent) => {
+                if !self.palette_native_scope_is_current(intent.scope)
+                    || !self
+                        .terminal_review_input
+                        .claim_query_submit(&intent.event, &intent.source)
+                {
+                    return Task::none();
+                }
+                if let Some(MessageBox(message)) = intent.row {
+                    return self.run_palette_command(*message);
+                }
+                if let Some(
+                    selected @ (EntryIdentity::CopyBranch(..) | EntryIdentity::TerminalReview(..)),
+                ) = self.palette.selected.as_ref()
+                    && !intent.contextual_origins.contains(selected)
+                {
+                    return Task::none();
+                }
+                self.update_palette(Action::Submit)
+            }
             Action::Query(query) => {
+                // A native query callback queued after Run/Close cannot reopen it.
+                if self.palette.query.is_none() {
+                    return Task::none();
+                }
                 self.palette.query = Some(query);
                 self.capture_first_palette_entry();
                 self.reveal_palette_selection()
@@ -402,7 +685,40 @@ impl Cagents {
         }
     }
 
+    fn palette_native_owner_is_exposed(&self) -> bool {
+        !self.update_prepared
+            && self.exit.is_none()
+            && self.refresh_ui.focused
+            && !self.modal_is_open()
+            && !self.context_inspector_is_overlay()
+            && !self.chrome_ui.is_open()
+    }
+    fn palette_native_scope_is_current(&self, scope: uuid::Uuid) -> bool {
+        self.palette.native_scope == scope
+            && self.palette.query.is_some()
+            && self.palette.recording.is_none()
+            && self.palette_native_owner_is_exposed()
+    }
+    fn navigate_palette_selection(&mut self, backwards: bool) -> Task<Message> {
+        let entries = self.palette_entries();
+        if entries.is_empty() {
+            return Task::none();
+        }
+        let count = entries.len();
+        let selected = self.selected_palette_index(&entries);
+        let next = if backwards {
+            selected.map_or(count - 1, |i| (i + count - 1) % count)
+        } else {
+            selected.map_or(0, |i| (i + 1) % count)
+        };
+        self.palette.selected = EntryIdentity::capture(&entries[next].2);
+        self.reveal_palette_selection()
+    }
+
     fn run_palette_command(&mut self, message: Message) -> Task<Message> {
+        if self.modal_is_open() || self.context_inspector_is_overlay() || self.chrome_ui.is_open() {
+            return Task::none();
+        }
         let dispatch = match &message {
             Message::Palette(Action::CopyBranch(project, worktree, _, _)) => {
                 if !self.contextual_palette_action_is_current(&message) {
@@ -431,6 +747,7 @@ impl Cagents {
             self.settings.palette_recents.insert(0, key);
             self.settings.palette_recents.truncate(24);
         }
+        self.palette.native_scope = uuid::Uuid::new_v4();
         self.palette.query = None;
         self.palette.move_pane = None;
         self.palette.selected = None;
@@ -451,13 +768,25 @@ impl Cagents {
     }
 
     pub(super) fn palette_key_event(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
+        self.palette_key_event_with_source(
+            event,
+            &cosmic::iced::runtime::core::keyboard::input::Source::default(),
+        )
+    }
+    pub(super) fn palette_key_event_with_source(
+        &mut self,
+        event: &keyboard::Event,
+        source: &cosmic::iced::runtime::core::keyboard::input::Source,
+    ) -> Option<Task<Message>> {
         // Contextual commands can restore a nonterminal pane and close the
         // palette before key-up. Its window-owned key still needs retiring
         // when no terminal widget is mounted to observe that release.
         if matches!(
             event,
             keyboard::Event::KeyReleased { .. } | keyboard::Event::KeyPressed { repeat: true, .. }
-        ) && self.terminal_review_input.consume_keyboard(event)
+        ) && self
+            .terminal_review_input
+            .consume_keyboard_with_source(event, source)
         {
             return Some(Task::none());
         }
@@ -542,6 +871,14 @@ impl Cagents {
             return Some(Task::none());
         }
         self.palette.query.as_ref()?;
+        if (source.cycle().is_some() || !cfg!(test))
+            && matches!(event, keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::ArrowDown | keyboard::key::Named::ArrowUp | keyboard::key::Named::Enter),
+                modifiers, ..
+            } if modifiers.is_empty())
+        {
+            return Some(Task::none());
+        }
         if is_escape_press(event) {
             return Some(self.update_palette(Action::Close));
         }
@@ -554,17 +891,12 @@ impl Cagents {
         {
             let entries = self.palette_entries();
             let count = entries.len();
-            let selected = self.selected_palette_index(&entries);
             match key {
                 keyboard::key::Named::ArrowDown if count > 0 => {
-                    let next = selected.map_or(0, |index| (index + 1) % count);
-                    self.palette.selected = EntryIdentity::capture(&entries[next].2);
-                    return Some(self.reveal_palette_selection());
+                    return Some(self.navigate_palette_selection(false));
                 }
                 keyboard::key::Named::ArrowUp if count > 0 => {
-                    let next = selected.map_or(count - 1, |index| (index + count - 1) % count);
-                    self.palette.selected = EntryIdentity::capture(&entries[next].2);
-                    return Some(self.reveal_palette_selection());
+                    return Some(self.navigate_palette_selection(true));
                 }
                 keyboard::key::Named::Enter => {
                     if matches!(
@@ -574,7 +906,16 @@ impl Cagents {
                         if matches!(event, keyboard::Event::KeyPressed { repeat: true, .. }) {
                             return Some(Task::none());
                         }
-                        self.terminal_review_input.capture_activation(event);
+                        if !self
+                            .terminal_review_input
+                            .allow_legacy_app_activation(event, source)
+                        {
+                            return Some(Task::none());
+                        }
+                        // Valid original press may submit after quick release;
+                        // recording must not acquire that released cycle again.
+                        self.terminal_review_input
+                            .capture_app_activation(event, source);
                     }
                     return Some(self.update_palette(Action::Submit));
                 }
@@ -983,6 +1324,14 @@ impl Cagents {
             );
         }
         let query = self.palette.query.as_ref()?;
+        let scope = self.palette.native_scope;
+        let entries = self.palette_entries();
+        let contextual_origins: Vec<_> = self
+            .contextual_palette_entries()
+            .iter()
+            .filter_map(|(_, _, message)| EntryIdentity::capture(message))
+            .collect();
+        let query_origins = contextual_origins.clone();
         let input = crate::ui_controls::field::search(
             if self.palette.move_pane.is_some() {
                 "Move pane to channel…"
@@ -992,28 +1341,56 @@ impl Cagents {
             query,
         )
         .id(widget::Id::new("palette.query"))
-        .on_input(|query| Message::Palette(Action::Query(query)));
-        let contextual = matches!(
-            self.palette.selected,
-            Some(EntryIdentity::CopyBranch(..) | EntryIdentity::TerminalReview(..))
-        );
+        .on_input(move |query| Message::Palette(Action::QueryFromNative(scope, query)));
         let barrier = self.terminal_review_input.clone();
-        // Keep this wrapper's tag stable while query/ranking changes. A
-        // conditional wrapper would replace the focused native search field.
+        // One ordered native query stream; keep the wrapper tag stable.
         let input = crate::interaction::focused_key(input, move |event| {
-            if contextual
-                && matches!(event, keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::Enter), repeat: true, modifiers, .. } if modifiers.is_empty())
+            // Protect keys consumed by the focused editor while preserving its
+            // typing/navigation repeats. Enter's action ticket records itself.
+            if matches!(event, keyboard::Event::KeyPressed { .. })
+                && !matches!(event, keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::Enter), modifiers, .. } if modifiers.is_empty())
             {
-                return Some(Message::Palette(Action::ConsumedActivation));
+                if !matches!(event, keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::Tab), modifiers, .. } if modifiers.control() || modifiers.alt() || modifiers.logo())
+                {
+                    barrier.capture_consumed_key(event);
+                }
             }
-            if contextual
-                && matches!(event, keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::Enter), repeat: false, modifiers, .. } if modifiers.is_empty())
-            {
-                barrier.capture_activation(event);
+            let keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(key),
+                modifiers,
+                repeat,
+                ..
+            } = event
+            else {
+                return None;
+            };
+            if !modifiers.is_empty() {
+                return None;
             }
-            None
+            match key {
+                keyboard::key::Named::ArrowDown => {
+                    Some(Message::Palette(Action::NavigateFromNative(scope, false)))
+                }
+                keyboard::key::Named::ArrowUp => {
+                    Some(Message::Palette(Action::NavigateFromNative(scope, true)))
+                }
+                keyboard::key::Named::Enter => {
+                    if *repeat || !barrier.capture_query_submit(event) {
+                        return Some(Message::Palette(Action::ConsumedActivation));
+                    }
+                    Some(Message::Palette(Action::SubmitFromNative(Box::new(
+                        NativeQuerySubmit {
+                            row: None,
+                            scope,
+                            event: event.clone(),
+                            source: cosmic::iced::runtime::core::keyboard::input::current_source(),
+                            contextual_origins: query_origins.clone(),
+                        },
+                    ))))
+                }
+                _ => None,
+            }
         });
-        let entries = self.palette_entries();
         let selected = self.selected_palette_index(&entries);
         let rows: Vec<Element<'_, Message>> = entries
             .into_iter()
@@ -1043,44 +1420,53 @@ impl Cagents {
                 .height(ROW_HEIGHT)
                 .on_press(on_press.clone())
                 .into();
-                let button = if matches!(
-                    identity,
-                    EntryIdentity::CopyBranch(..) | EntryIdentity::TerminalReview(..)
-                ) {
+                let button = {
                     let barrier = self.terminal_review_input.clone();
+                    let captured = on_press.clone();
                     crate::interaction::focused_key(button, move |event| {
-                        match event {
-                            keyboard::Event::KeyPressed {
-                                key,
-                                modifiers,
-                                repeat,
-                                ..
-                            } if matches!(
+                        let keyboard::Event::KeyPressed {
+                            key,
+                            modifiers,
+                            repeat,
+                            ..
+                        } = event
+                        else {
+                            return None;
+                        };
+                        let activation = matches!(
+                            key.as_ref(),
+                            keyboard::Key::Named(keyboard::key::Named::Enter)
+                        ) || (modifiers.is_empty()
+                            && matches!(
                                 key.as_ref(),
-                                keyboard::Key::Named(keyboard::key::Named::Enter)
-                            ) || (modifiers.is_empty()
-                                && matches!(
-                                    key.as_ref(),
-                                    keyboard::Key::Named(keyboard::key::Named::Space)
-                                        | keyboard::Key::Character(" ")
-                                )) =>
-                            {
-                                if *repeat {
-                                    return Some(Message::Palette(Action::ConsumedActivation));
-                                }
-                                barrier.capture_activation(event);
-                                // Publish only this native focused row's immutable
-                                // payload. Its ordinary reducer revalidates it;
-                                // no half of the activation reaches terminal input.
-                                Some(on_press.clone())
-                            }
-                            _ => None,
+                                keyboard::Key::Named(keyboard::key::Named::Space)
+                                    | keyboard::Key::Character(" ")
+                            ));
+                        if !activation {
+                            return None;
                         }
+                        if *repeat || !barrier.capture_query_submit(event) {
+                            return Some(Message::Palette(Action::ConsumedActivation));
+                        }
+                        let Message::Palette(Action::Run(payload)) = &captured else {
+                            unreachable!()
+                        };
+                        Some(Message::Palette(Action::SubmitFromNative(Box::new(
+                            NativeQuerySubmit {
+                                scope,
+                                row: Some(payload.clone()),
+                                event: event.clone(),
+                                source:
+                                    cosmic::iced::runtime::core::keyboard::input::current_source(),
+                                contextual_origins: Vec::new(),
+                            },
+                        ))))
                     })
-                } else {
-                    button
                 };
-                Some(row::owned(identity, button))
+                Some(row::owned(
+                    identity,
+                    crate::interaction::keyboard_list_row(button),
+                ))
             })
             .collect();
         let rows = if rows.is_empty() {
@@ -1095,15 +1481,33 @@ impl Cagents {
         } else {
             widget::column::with_children(rows)
         };
+        let row_barrier = self.terminal_review_input.clone();
+        let rows = crate::interaction::focused_key(
+            crate::interaction::keyboard_list(rows.spacing(ROW_SPACING), true),
+            move |event| {
+                if matches!(event, keyboard::Event::KeyPressed { .. })
+                    && !matches!(
+                        event,
+                        keyboard::Event::KeyPressed {
+                            key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                            ..
+                        }
+                    )
+                    && !matches!(event, keyboard::Event::KeyPressed { key, modifiers, .. } if modifiers.is_empty() && matches!(key.as_ref(), keyboard::Key::Named(keyboard::key::Named::Space) | keyboard::Key::Character(" ")))
+                    && !matches!(event, keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::Tab), modifiers, .. } if modifiers.control() || modifiers.alt() || modifiers.logo())
+                {
+                    row_barrier.capture_consumed_key(event);
+                }
+                None
+            },
+        );
         let surface: Element<'_, Message> = widget::container(
             widget::column::with_children(vec![
                 input.into(),
                 widget::container(
-                    widget::scrollable(
-                        widget::container(rows.spacing(ROW_SPACING)).padding([0, 16]),
-                    )
-                    .id(widget::Id::new("palette.commands"))
-                    .height(Length::Shrink),
+                    widget::scrollable(widget::container(rows).padding([0, 16]))
+                        .id(widget::Id::new("palette.commands"))
+                        .height(Length::Shrink),
                 )
                 .max_height(360)
                 .into(),
@@ -1116,16 +1520,18 @@ impl Cagents {
         .class(cosmic::theme::Container::Card)
         .into();
         let barrier = self.terminal_review_input.clone();
-        Some(crate::interaction::focused_key(surface, move |event| {
+        let surface = crate::interaction::focused_key(surface, move |event| {
             // Capture and retire after focus moves between palette controls,
             // without forwarding an owned release to another native child.
-            (matches!(
-                event,
-                keyboard::Event::KeyReleased { .. }
-                    | keyboard::Event::KeyPressed { repeat: true, .. }
-            ) && barrier.consume_keyboard(event))
+            (matches!(event, keyboard::Event::KeyReleased { .. })
+                && barrier.consume_keyboard(event))
             .then_some(Message::Palette(Action::ConsumedActivation))
-        }))
+        });
+        Some(native_tab::view(
+            surface,
+            self.palette_native_owner_is_exposed(),
+            self.terminal_review_input.clone(),
+        ))
     }
 
     pub(super) fn run_workspace_command(
@@ -1718,9 +2124,10 @@ mod tests {
                     .any(|message| matches!(message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(_))))
             );
             assert!(
-                while_open
-                    .iter()
-                    .any(|message| matches!(message, Message::Palette(Action::Query(_))))
+                while_open.iter().any(|message| matches!(
+                    message,
+                    Message::Palette(Action::QueryFromNative(..))
+                ))
             );
 
             let dismiss = app.update_palette(dismiss);
@@ -1739,6 +2146,1342 @@ mod tests {
         app.cards.insert(card, CardRuntime::Settings);
         app.card_state_mut(card).unwrap().kind = CardKind::Settings;
         app
+    }
+
+    use cosmic::iced::runtime::core::keyboard::input::{
+        self as input_source, PressCycle, Source, Transition,
+    };
+
+    fn cycle_key(
+        named: keyboard::key::Named,
+        code: keyboard::key::Code,
+        down: bool,
+        repeat: bool,
+    ) -> keyboard::Event {
+        if down {
+            keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(named),
+                modified_key: keyboard::Key::Named(named),
+                physical_key: keyboard::key::Physical::Code(code),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat,
+            }
+        } else {
+            keyboard::Event::KeyReleased {
+                key: keyboard::Key::Named(named),
+                modified_key: keyboard::Key::Named(named),
+                physical_key: keyboard::key::Physical::Code(code),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+            }
+        }
+    }
+    fn palette_native_batch(
+        app: &Cagents,
+        focus: widget::Id,
+        events: &[iced::Event],
+        sources: &[Source],
+    ) -> (Vec<Message>, Vec<iced::event::Status>) {
+        use iced::{
+            Size,
+            advanced::{clipboard, widget::operation},
+            mouse,
+        };
+        let mut renderer = crate::app::tests::headless_renderer();
+        let mut ui = iced::runtime::UserInterface::build(
+            app.palette_surface().unwrap(),
+            Size::new(880.0, 800.0),
+            iced::runtime::user_interface::Cache::default(),
+            &mut renderer,
+        );
+        ui.operate(&renderer, &mut operation::focusable::focus::<()>(focus));
+        let mut messages = Vec::new();
+        let (_, statuses) = ui.update_with_sources(
+            events,
+            sources,
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        (messages, statuses)
+    }
+    fn reduce_native_palette(app: &mut Cagents, messages: Vec<Message>) -> Vec<String> {
+        messages
+            .into_iter()
+            .flat_map(|message| clipboard_writes(app.update(message)))
+            .collect()
+    }
+    fn tagged(app: &mut Cagents, event: keyboard::Event, source: Source) -> Vec<String> {
+        clipboard_writes(app.update(Message::TaggedKeyEvent {
+            event,
+            source,
+            captured: true,
+        }))
+    }
+
+    #[test]
+    fn native_query_quick_press_release_submits_once_and_old_copy_cannot_act_after_reopen() {
+        use keyboard::key::{Code, Named, Physical};
+        let mut app = branch_palette_fixture();
+        let press = cycle_key(Named::Enter, Code::Enter, true, false);
+        let release = cycle_key(Named::Enter, Code::Enter, false, false);
+        let cycle = PressCycle::new(Physical::Code(Code::Enter));
+        let sources = [
+            Source::tracked(cycle.clone(), Transition::Press),
+            Source::tracked(cycle.clone(), Transition::Release),
+        ];
+        cycle.release(); // real ingress has queued key-up before native batch runs
+        let (messages, statuses) = palette_native_batch(
+            &app,
+            widget::Id::new("palette.query"),
+            &[
+                iced::Event::Keyboard(press.clone()),
+                iced::Event::Keyboard(release.clone()),
+            ],
+            &sources,
+        );
+        assert_eq!(statuses, vec![iced::event::Status::Captured; 2]);
+        assert!(matches!(
+            messages.as_slice(),
+            [
+                Message::Palette(Action::SubmitFromNative(_)),
+                Message::Palette(Action::ConsumedActivation)
+            ]
+        ));
+        assert_eq!(
+            reduce_native_palette(&mut app, messages),
+            ["feature/日本語-copy"]
+        );
+        assert!(!app.palette.is_open());
+        drop(app.update_palette(Action::Open));
+        drop(app.update_palette(Action::Query(">copy branch".into())));
+        assert!(tagged(&mut app, press, sources[0].clone()).is_empty());
+        assert!(tagged(&mut app, release, sources[1].clone()).is_empty());
+        assert!(
+            app.palette.is_open(),
+            "delayed subscription copies cannot submit a new palette"
+        );
+    }
+
+    #[test]
+    fn native_query_arrow_repeat_then_enter_resolves_the_ordered_selection_in_both_directions() {
+        use keyboard::key::{Code, Named, Physical};
+        for backwards in [false, true] {
+            let mut app = branch_palette_fixture();
+            drop(app.update_palette(Action::Query(">".into())));
+            let entries = app.palette_entries();
+            let target = entries
+                .iter()
+                .position(|(_, _, message)| {
+                    matches!(message, Message::Palette(Action::CopyBranch(..)))
+                })
+                .unwrap();
+            let start = app.selected_palette_index(&entries).unwrap();
+            let steps = if backwards {
+                (start + entries.len() - target) % entries.len()
+            } else {
+                (target + entries.len() - start) % entries.len()
+            };
+            assert!(
+                steps > 0,
+                "start on an ordinary result, navigate into contextual command"
+            );
+            let (named, code) = if backwards {
+                (Named::ArrowUp, Code::ArrowUp)
+            } else {
+                (Named::ArrowDown, Code::ArrowDown)
+            };
+            let navigation = PressCycle::new(Physical::Code(code));
+            let enter = PressCycle::new(Physical::Code(Code::Enter));
+            let mut events: Vec<_> = (0..steps)
+                .map(|n| iced::Event::Keyboard(cycle_key(named, code, true, n > 0)))
+                .collect();
+            let mut sources = vec![Source::tracked(navigation, Transition::Press); steps];
+            events.push(iced::Event::Keyboard(cycle_key(
+                Named::Enter,
+                Code::Enter,
+                true,
+                false,
+            )));
+            sources.push(Source::tracked(enter.clone(), Transition::Press));
+            enter.release();
+            let (messages, statuses) =
+                palette_native_batch(&app, widget::Id::new("palette.query"), &events, &sources);
+            assert!(
+                statuses
+                    .iter()
+                    .all(|status| *status == iced::event::Status::Captured)
+            );
+            assert_eq!(
+                reduce_native_palette(&mut app, messages),
+                ["feature/日本語-copy"]
+            );
+            assert!(!app.palette.is_open());
+        }
+    }
+
+    #[test]
+    fn native_query_edit_then_enter_does_not_run_the_old_hidden_contextual_result() {
+        use keyboard::key::{Code, Named, Physical};
+        let mut app = branch_palette_fixture();
+        let select = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character("a".into()),
+            modified_key: keyboard::Key::Character("a".into()),
+            physical_key: Physical::Code(Code::KeyA),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::CTRL,
+            text: None,
+            repeat: false,
+        };
+        let edit = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character("z".into()),
+            modified_key: keyboard::Key::Character("z".into()),
+            physical_key: Physical::Code(Code::KeyZ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: Some("zzzx-no-palette-result".into()),
+            repeat: false,
+        };
+        let events = [
+            iced::Event::Keyboard(select),
+            iced::Event::Keyboard(edit),
+            iced::Event::Keyboard(cycle_key(Named::Enter, Code::Enter, true, false)),
+        ];
+        let sources = [Code::KeyA, Code::KeyZ, Code::Enter]
+            .map(|code| Source::tracked(PressCycle::new(Physical::Code(code)), Transition::Press));
+        let (messages, _) =
+            palette_native_batch(&app, widget::Id::new("palette.query"), &events, &sources);
+        assert!(matches!(
+            messages.as_slice(),
+            [
+                Message::Palette(Action::QueryFromNative(..)),
+                Message::Palette(Action::SubmitFromNative(_))
+            ]
+        ));
+        assert!(
+            reduce_native_palette(&mut app, messages).is_empty(),
+            "old Copy branch target became hidden before Enter"
+        );
+        assert!(
+            !app.palette.is_open(),
+            "empty ordered submit keeps existing close behavior"
+        );
+    }
+
+    #[test]
+    fn native_query_post_submit_edit_and_old_scope_cannot_reopen_or_mutate_palette() {
+        use keyboard::key::{Code, Named, Physical};
+        let mut app = branch_palette_fixture();
+        let scope = app.palette.native_scope;
+        let edit = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character("z".into()),
+            modified_key: keyboard::Key::Character("z".into()),
+            physical_key: Physical::Code(Code::KeyZ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: Some("z".into()),
+            repeat: false,
+        };
+        let events = [
+            iced::Event::Keyboard(cycle_key(Named::Enter, Code::Enter, true, false)),
+            iced::Event::Keyboard(edit),
+        ];
+        let sources = [Code::Enter, Code::KeyZ]
+            .map(|code| Source::tracked(PressCycle::new(Physical::Code(code)), Transition::Press));
+        let (messages, _) =
+            palette_native_batch(&app, widget::Id::new("palette.query"), &events, &sources);
+        assert!(matches!(
+            messages.as_slice(),
+            [
+                Message::Palette(Action::SubmitFromNative(_)),
+                Message::Palette(Action::QueryFromNative(..))
+            ]
+        ));
+        assert_eq!(
+            reduce_native_palette(&mut app, messages),
+            ["feature/日本語-copy"]
+        );
+        assert!(!app.palette.is_open());
+        drop(app.update_palette(Action::Open));
+        let query = app.palette.query.clone();
+        drop(app.update_palette(Action::QueryFromNative(scope, "old callback".into())));
+        drop(app.update_palette(Action::NavigateFromNative(scope, false)));
+        assert_eq!(app.palette.query, query);
+    }
+
+    #[test]
+    fn native_row_query_and_ordinary_rows_share_one_action_ticket_until_fresh_press() {
+        use keyboard::key::{Code, Named, Physical};
+        for query_focus in [false, true] {
+            let mut app = branch_palette_fixture();
+            let cycle = PressCycle::new(Physical::Code(Code::Enter));
+            let source = Source::tracked(cycle.clone(), Transition::Press);
+            let press = cycle_key(Named::Enter, Code::Enter, true, false);
+            let identity = EntryIdentity::capture(&app.palette_entries()[0].2).unwrap();
+            let (messages, _) = palette_native_batch(
+                &app,
+                identity.widget_id(),
+                &[iced::Event::Keyboard(press.clone())],
+                &[source.clone()],
+            );
+            assert_eq!(
+                reduce_native_palette(&mut app, messages),
+                ["feature/日本語-copy"]
+            );
+            drop(app.update_palette(Action::Open));
+            drop(app.update_palette(Action::Query(">copy branch".into())));
+            assert!(tagged(&mut app, press.clone(), source.clone()).is_empty());
+            let focus = if query_focus {
+                widget::Id::new("palette.query")
+            } else {
+                identity.widget_id()
+            };
+            let (messages, _) = palette_native_batch(
+                &app,
+                focus.clone(),
+                &[iced::Event::Keyboard(press.clone())],
+                &[source.clone()],
+            );
+            assert!(matches!(
+                messages.as_slice(),
+                [Message::Palette(Action::ConsumedActivation)]
+            ));
+            assert!(reduce_native_palette(&mut app, messages).is_empty());
+            assert!(app.palette.is_open());
+            cycle.release();
+            let release = cycle_key(Named::Enter, Code::Enter, false, false);
+            let (messages, _) = palette_native_batch(
+                &app,
+                focus.clone(),
+                &[iced::Event::Keyboard(release)],
+                &[Source::tracked(cycle, Transition::Release)],
+            );
+            drop(reduce_native_palette(&mut app, messages));
+            let fresh = Source::tracked(
+                PressCycle::new(Physical::Code(Code::Enter)),
+                Transition::Press,
+            );
+            let (messages, _) =
+                palette_native_batch(&app, focus, &[iced::Event::Keyboard(press)], &[fresh]);
+            assert_eq!(
+                reduce_native_palette(&mut app, messages),
+                ["feature/日本語-copy"]
+            );
+        }
+    }
+
+    #[test]
+    fn native_p1_r1_p2_batch_and_delayed_app_r1_preserve_exact_new_press_ownership() {
+        use keyboard::key::{Code, Named, Physical};
+        for query in [false, true] {
+            let mut app = branch_palette_fixture();
+            let press = cycle_key(Named::Enter, Code::Enter, true, false);
+            let release = cycle_key(Named::Enter, Code::Enter, false, false);
+            let first = PressCycle::new(Physical::Code(Code::Enter));
+            first.release();
+            let second = PressCycle::new(Physical::Code(Code::Enter));
+            let sources = [
+                Source::tracked(first.clone(), Transition::Press),
+                Source::tracked(first, Transition::Release),
+                Source::tracked(second, Transition::Press),
+            ];
+            let events = [
+                iced::Event::Keyboard(press.clone()),
+                iced::Event::Keyboard(release.clone()),
+                iced::Event::Keyboard(press.clone()),
+            ];
+            let focus = if query {
+                widget::Id::new("palette.query")
+            } else {
+                EntryIdentity::capture(&app.palette_entries()[0].2)
+                    .unwrap()
+                    .widget_id()
+            };
+            let (messages, statuses) = palette_native_batch(&app, focus, &events, &sources);
+            assert_eq!(statuses, vec![iced::event::Status::Captured; 3]);
+            assert_eq!(
+                reduce_native_palette(&mut app, messages),
+                ["feature/日本語-copy"]
+            );
+            for (event, source) in [press.clone(), release, press.clone()]
+                .into_iter()
+                .zip(sources.iter().cloned())
+            {
+                assert!(tagged(&mut app, event, source).is_empty());
+            }
+            let _native = input_source::scope(sources[2].clone());
+            assert!(
+                app.terminal_review_input
+                    .owns_keyboard(&iced::Event::Keyboard(press))
+            );
+        }
+    }
+
+    #[test]
+    fn native_query_and_row_preserve_ordinary_settings_command_and_tab_forwarding() {
+        use keyboard::key::{Code, Named, Physical};
+        for query_focus in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(true);
+            app.refresh_ui.focused = true;
+            app.context_inspector_open = false;
+            let original = app.workspace.focused().unwrap();
+            drop(app.update_palette(Action::Open));
+            drop(app.update_palette(Action::Query("open settings".into())));
+            assert_eq!(app.palette_entries().len(), 1);
+            let identity = EntryIdentity::capture(&app.palette_entries()[0].2).unwrap();
+            assert!(matches!(
+                identity,
+                EntryIdentity::Command(Command::OpenSettings)
+            ));
+            let focus = if query_focus {
+                widget::Id::new("palette.query")
+            } else {
+                identity.widget_id()
+            };
+            let enter = Source::tracked(
+                PressCycle::new(Physical::Code(Code::Enter)),
+                Transition::Press,
+            );
+            let (messages, statuses) = palette_native_batch(
+                &app,
+                focus,
+                &[iced::Event::Keyboard(cycle_key(
+                    Named::Enter,
+                    Code::Enter,
+                    true,
+                    false,
+                ))],
+                &[enter],
+            );
+            assert_eq!(statuses, [iced::event::Status::Captured]);
+            assert!(reduce_native_palette(&mut app, messages).is_empty());
+            assert!(!app.palette.is_open());
+            let destination = app.workspace.focused().unwrap();
+            assert_ne!(destination, original);
+            assert!(matches!(
+                app.cards.get(&destination),
+                Some(CardRuntime::Settings)
+            ));
+        }
+        let app = branch_palette_fixture();
+        let tab = Source::tracked(
+            PressCycle::new(Physical::Code(Code::Tab)),
+            Transition::Press,
+        );
+        let (messages, _) = palette_native_batch(
+            &app,
+            widget::Id::new("palette.query"),
+            &[iced::Event::Keyboard(cycle_key(
+                Named::Tab,
+                Code::Tab,
+                true,
+                false,
+            ))],
+            &[tab],
+        );
+        assert!(
+            messages.is_empty(),
+            "native Tab traverses without a deferred App message"
+        );
+    }
+
+    #[test]
+    fn native_row_arrows_then_enter_activate_ordered_target_in_both_directions_and_categories() {
+        use keyboard::key::{Code, Named, Physical};
+        for target_contextual in [false, true] {
+            let mut app = branch_palette_fixture();
+            drop(app.update_palette(Action::Query(">".into())));
+            let entries = app.palette_entries();
+            let contextual = entries
+                .iter()
+                .position(|(_, _, message)| {
+                    matches!(message, Message::Palette(Action::CopyBranch(..)))
+                })
+                .unwrap();
+            let generic = entries
+                .iter()
+                .position(|(_, _, message)| {
+                    matches!(message, Message::RunCommand(Command::OpenSettings))
+                })
+                .unwrap();
+            let (start, target) = if target_contextual {
+                (generic, contextual)
+            } else {
+                (contextual, generic)
+            };
+            let origin = EntryIdentity::capture(&entries[start].2).unwrap();
+            let expected = EntryIdentity::capture(&entries[target].2).unwrap();
+            let backwards = target < start;
+            let steps = start.abs_diff(target);
+            assert!(steps > 0);
+            let (named, code) = if backwards {
+                (Named::ArrowUp, Code::ArrowUp)
+            } else {
+                (Named::ArrowDown, Code::ArrowDown)
+            };
+            let navigation = PressCycle::new(Physical::Code(code));
+            let mut events: Vec<_> = (0..steps)
+                .map(|n| iced::Event::Keyboard(cycle_key(named, code, true, n > 0)))
+                .collect();
+            let mut sources = vec![Source::tracked(navigation, Transition::Press); steps];
+            events.push(iced::Event::Keyboard(cycle_key(
+                Named::Enter,
+                Code::Enter,
+                true,
+                false,
+            )));
+            sources.push(Source::tracked(
+                PressCycle::new(Physical::Code(Code::Enter)),
+                Transition::Press,
+            ));
+            let (messages, statuses) =
+                palette_native_batch(&app, origin.widget_id(), &events, &sources);
+            assert_eq!(statuses, vec![iced::event::Status::Captured; events.len()]);
+            assert!(matches!(
+                messages.as_slice(),
+                [Message::Palette(Action::SubmitFromNative(_))]
+            ));
+            let writes = reduce_native_palette(&mut app, messages);
+            if target_contextual {
+                assert_eq!(writes, ["feature/日本語-copy"]);
+            } else {
+                assert!(
+                    writes.is_empty(),
+                    "the originally focused Copy branch row must not run"
+                );
+                assert_eq!(
+                    app.settings.palette_recents.first(),
+                    entry_key(&Message::RunCommand(Command::OpenSettings)).as_ref()
+                );
+            }
+            assert!(
+                !app.palette.is_open(),
+                "ordered Enter executes {:?}",
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn native_query_can_navigate_from_contextual_to_generic_before_enter() {
+        use keyboard::key::{Code, Named, Physical};
+        let mut app = branch_palette_fixture();
+        drop(app.update_palette(Action::Query(">".into())));
+        let entries = app.palette_entries();
+        let start = entries
+            .iter()
+            .position(|(_, _, m)| matches!(m, Message::Palette(Action::CopyBranch(..))))
+            .unwrap();
+        let target = entries
+            .iter()
+            .position(|(_, _, m)| matches!(m, Message::RunCommand(Command::OpenSettings)))
+            .unwrap();
+        app.palette.selected = EntryIdentity::capture(&entries[start].2);
+        let steps = (target + entries.len() - start) % entries.len();
+        assert!(steps > 0);
+        let nav = PressCycle::new(Physical::Code(Code::ArrowDown));
+        let mut events: Vec<_> = (0..steps)
+            .map(|n| {
+                iced::Event::Keyboard(cycle_key(Named::ArrowDown, Code::ArrowDown, true, n > 0))
+            })
+            .collect();
+        let mut sources = vec![Source::tracked(nav, Transition::Press); steps];
+        events.push(iced::Event::Keyboard(cycle_key(
+            Named::Enter,
+            Code::Enter,
+            true,
+            false,
+        )));
+        sources.push(Source::tracked(
+            PressCycle::new(Physical::Code(Code::Enter)),
+            Transition::Press,
+        ));
+        let (messages, _) =
+            palette_native_batch(&app, widget::Id::new("palette.query"), &events, &sources);
+        assert!(reduce_native_palette(&mut app, messages).is_empty());
+        assert!(!app.palette.is_open());
+        assert_eq!(
+            app.settings.palette_recents.first(),
+            entry_key(&Message::RunCommand(Command::OpenSettings)).as_ref()
+        );
+    }
+
+    #[test]
+    fn native_palette_intents_refuse_a_new_cover_without_mutating_or_closing_the_palette() {
+        use keyboard::key::{Code, Named, Physical};
+        for row in [false, true] {
+            for cover in ["approval", "image", "unfocused", "freeze"] {
+                let mut app = branch_palette_fixture();
+                drop(app.update_palette(Action::Query("open settings".into())));
+                let origin = EntryIdentity::capture(&app.palette_entries()[0].2).unwrap();
+                let scope = app.palette.native_scope;
+                let press = cycle_key(Named::Enter, Code::Enter, true, false);
+                let source = Source::tracked(
+                    PressCycle::new(Physical::Code(Code::Enter)),
+                    Transition::Press,
+                );
+                let focus = if row {
+                    origin.widget_id()
+                } else {
+                    widget::Id::new("palette.query")
+                };
+                let (messages, statuses) = palette_native_batch(
+                    &app,
+                    focus,
+                    &[iced::Event::Keyboard(press.clone())],
+                    &[source.clone()],
+                );
+                assert_eq!(statuses, [iced::event::Status::Captured]);
+                match cover {
+                    "approval" => open_copy_release_approval(&mut app),
+                    "image" => {
+                        app.chat_ui.image_viewer = Some(chat_ui::images::Gallery::file(
+                            "/press-cycle-cover-fixture.png".into(),
+                            None,
+                            iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
+                        ))
+                    }
+                    "unfocused" => app.refresh_ui.focused = false,
+                    "freeze" => app.update_prepared = true,
+                    _ => unreachable!(),
+                }
+                let query = app.palette.query.clone();
+                let selected = app.palette.selected.clone();
+                let focused = app.workspace.focused();
+                assert!(reduce_native_palette(&mut app, messages).is_empty());
+                drop(app.update(Message::Palette(Action::QueryFromNative(
+                    scope,
+                    "covered edit".into(),
+                ))));
+                drop(app.update(Message::Palette(Action::NavigateFromNative(scope, false))));
+                assert_eq!(app.palette.query, query, "cover={cover}, row={row}");
+                assert_eq!(app.palette.selected, selected);
+                assert_eq!(app.workspace.focused(), focused);
+                assert!(app.palette.is_open());
+                // Ownership retirement remains independent of palette admission.
+                source.cycle().unwrap().release();
+                let release = cycle_key(Named::Enter, Code::Enter, false, false);
+                assert!(
+                    tagged(
+                        &mut app,
+                        release,
+                        Source::tracked(source.cycle().unwrap().clone(), Transition::Release)
+                    )
+                    .is_empty()
+                );
+                let _native = input_source::scope(source.clone());
+                assert!(
+                    !app.terminal_review_input
+                        .owns_keyboard(&iced::Event::Keyboard(press))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_row_focus_survives_rebuild_and_later_tab_or_accessibility_focus_return() {
+        use iced::{
+            Size,
+            advanced::{clipboard, widget::operation},
+            mouse,
+        };
+        use keyboard::key::{Code, Named, Physical};
+        for return_focus in [false, true] {
+            let mut app = branch_palette_fixture();
+            drop(app.update_palette(Action::Query(">".into())));
+            let entries = app.palette_entries();
+            let target = entries
+                .iter()
+                .position(|(_, _, m)| matches!(m, Message::Palette(Action::CopyBranch(..))))
+                .unwrap();
+            assert!(entries.len() > 2);
+            let backwards = target < 2;
+            let start = if backwards { target + 2 } else { target - 2 };
+            let origin = EntryIdentity::capture(&entries[start].2).unwrap();
+            let mut renderer = crate::app::tests::headless_renderer();
+            let mut ui = iced::runtime::UserInterface::build(
+                app.palette_surface().unwrap(),
+                Size::new(880.0, 800.0),
+                iced::runtime::user_interface::Cache::default(),
+                &mut renderer,
+            );
+            ui.operate(
+                &renderer,
+                &mut operation::focusable::focus::<()>(origin.widget_id()),
+            );
+            let (named, code) = if backwards {
+                (Named::ArrowUp, Code::ArrowUp)
+            } else {
+                (Named::ArrowDown, Code::ArrowDown)
+            };
+            let nav = Source::tracked(PressCycle::new(Physical::Code(code)), Transition::Press);
+            let mut messages = Vec::new();
+            let (_, statuses) = ui.update_with_sources(
+                &[iced::Event::Keyboard(cycle_key(named, code, true, false))],
+                &[nav.clone()],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert_eq!(statuses, [iced::event::Status::Captured]);
+            assert!(
+                messages.is_empty(),
+                "row navigation is entirely synchronous native focus"
+            );
+            let cache = ui.into_cache();
+            let mut ui = iced::runtime::UserInterface::build(
+                app.palette_surface().unwrap(),
+                Size::new(880.0, 800.0),
+                cache,
+                &mut renderer,
+            );
+            if return_focus {
+                // Tab is captured and traversed synchronously in the palette.
+                let tab = Source::tracked(
+                    PressCycle::new(Physical::Code(Code::Tab)),
+                    Transition::Press,
+                );
+                let (_, statuses) = ui.update_with_sources(
+                    &[iced::Event::Keyboard(cycle_key(
+                        Named::Tab,
+                        Code::Tab,
+                        true,
+                        false,
+                    ))],
+                    &[tab],
+                    mouse::Cursor::Unavailable,
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                assert_eq!(statuses, [iced::event::Status::Captured]);
+                // An explicit AT-delivered focus operation may leave and return
+                // to any row; there is no stale logical navigation anchor.
+                ui.operate(
+                    &renderer,
+                    &mut operation::focusable::focus::<()>(widget::Id::new("palette.query")),
+                );
+                ui.operate(
+                    &renderer,
+                    &mut operation::focusable::focus::<()>(origin.widget_id()),
+                );
+            }
+            let arrow_count = if return_focus { 2 } else { 1 };
+            let mut events: Vec<_> = (0..arrow_count)
+                .map(|_| iced::Event::Keyboard(cycle_key(named, code, true, true)))
+                .collect();
+            let mut sources = vec![nav; arrow_count];
+            events.push(iced::Event::Keyboard(cycle_key(
+                Named::Enter,
+                Code::Enter,
+                true,
+                false,
+            )));
+            sources.push(Source::tracked(
+                PressCycle::new(Physical::Code(Code::Enter)),
+                Transition::Press,
+            ));
+            let (_, statuses) = ui.update_with_sources(
+                &events,
+                &sources,
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert_eq!(statuses, vec![iced::event::Status::Captured; events.len()]);
+            assert!(matches!(
+                messages.as_slice(),
+                [Message::Palette(Action::SubmitFromNative(_))]
+            ));
+            drop(ui);
+            assert_eq!(
+                reduce_native_palette(&mut app, messages),
+                ["feature/日本語-copy"]
+            );
+        }
+    }
+
+    #[test]
+    fn palette_custom_style_distinguishes_native_row_focus_from_query_selection() {
+        let cosmic::theme::Button::Custom {
+            active, hovered, ..
+        } = palette_row_style(false)
+        else {
+            unreachable!()
+        };
+        let theme = cosmic::theme::active();
+        assert_eq!(active(false, &theme).outline_width, 0.0);
+        assert!(active(true, &theme).outline_width > 0.0);
+        assert!(hovered(true, &theme).outline_width > 0.0);
+        let cosmic::theme::Button::Custom { active, .. } = palette_row_style(true) else {
+            unreachable!()
+        };
+        assert_eq!(active(false, &theme).outline_width, 0.0);
+        assert!(
+            active(false, &theme).background.is_some(),
+            "query selection remains visible without pretending to hold row focus"
+        );
+    }
+
+    // Runtime-tag contract fixture: actual native query widget and actual App
+    // reducer. The queue producer itself is covered by runtime NativeEvents units.
+    fn native_palette_enter(app: &mut Cagents) -> Task<Message> {
+        use keyboard::key::{Code, Named, Physical};
+        let cycle = PressCycle::new(Physical::Code(Code::Enter));
+        let source = Source::tracked(cycle, Transition::Press);
+        let (mut messages, statuses) = palette_native_batch(
+            app,
+            widget::Id::new("palette.query"),
+            &[iced::Event::Keyboard(cycle_key(
+                Named::Enter,
+                Code::Enter,
+                true,
+                false,
+            ))],
+            &[source],
+        );
+        assert_eq!(statuses, [iced::event::Status::Captured]);
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::Palette(Action::SubmitFromNative(_))]
+        ));
+        app.update(messages.pop().unwrap())
+    }
+
+    #[test]
+    fn native_query_submits_workspace_channel_resume_and_workboard_families() {
+        for family in ["worktree", "repository", "channel", "resume", "workboard"] {
+            let mut app = if family == "repository" {
+                inactive_palette_pane(false).0
+            } else {
+                branch_palette_fixture()
+            };
+            app.refresh_ui.focused = true;
+            let destination = tempfile::tempdir().unwrap();
+            let protection = tempfile::tempdir().unwrap();
+            let directory = destination.path().canonicalize().unwrap();
+            app.worktree_protections
+                .use_fixture_runtime(protection.path().to_owned());
+            if family == "repository" {
+                app.sidebar_model.projects.last_mut().unwrap().repository = directory.clone();
+            } else {
+                let project = &mut app.sidebar_model.projects[0];
+                project.repository = directory.clone();
+                project.worktrees[0].path = directory.clone();
+            }
+            if app.palette.is_open() {
+                drop(app.update_palette(Action::Close));
+            }
+            let expected = match family {
+                "worktree" => {
+                    let p = &app.sidebar_model.projects[0];
+                    let w = &p.worktrees[0];
+                    EntryIdentity::Worktree(p.id, w.id, w.path.clone())
+                }
+                "repository" => {
+                    let p = app.sidebar_model.projects.last().unwrap();
+                    EntryIdentity::Repository(p.id, p.repository.clone())
+                }
+                "channel" => {
+                    let id = crate::model::ChannelId::new();
+                    let p = &mut app.sidebar_model.projects[0];
+                    p.channels.push(crate::sidebar::SidebarChannel::new(
+                        id,
+                        "Native needle".into(),
+                        false,
+                        None,
+                        false,
+                        0,
+                        false,
+                        1,
+                    ));
+                    Arc::make_mut(&mut app.durable)
+                        .channels
+                        .push(crate::model::ProjectChannel {
+                            id,
+                            project_id: p.id,
+                            title: "Native needle".into(),
+                            title_source: Default::default(),
+                            ordinal: 1,
+                            shared: false,
+                            cards: vec![],
+                            focused: None,
+                        });
+                    EntryIdentity::Channel(id)
+                }
+                "resume" => EntryIdentity::ResumeConversation,
+                "workboard" => EntryIdentity::Workboard,
+                _ => unreachable!(),
+            };
+            drop(app.update_palette(Action::Open));
+            let query = match family {
+                "worktree" => "#feature",
+                "repository" => "#heldworkspace",
+                "channel" => "#native needle",
+                "resume" => ">resume conversation",
+                _ => ">work board",
+            };
+            drop(app.update_palette(Action::Query(query.into())));
+            assert_eq!(
+                app.palette.selected.as_ref(),
+                Some(&expected),
+                "family={family}"
+            );
+            let message = app
+                .palette_entries()
+                .into_iter()
+                .find(|(_, _, m)| expected.matches(m))
+                .unwrap()
+                .2;
+            let recent = entry_key(&message).unwrap();
+            drop(native_palette_enter(&mut app));
+            assert!(!app.palette.is_open(), "family={family}");
+            assert_eq!(app.settings.palette_recents.first(), Some(&recent));
+            match expected {
+                EntryIdentity::Worktree(_, _, path) | EntryIdentity::Repository(_, path) => {
+                    assert_eq!(app.active_workspace, Some(path), "family={family}");
+                    assert_eq!(app.durable.active_channel, None);
+                }
+                EntryIdentity::Channel(id) => {
+                    assert_eq!(app.durable.active_channel, Some(id));
+                    assert_eq!(app.active_workspace, Some(directory));
+                }
+                EntryIdentity::ResumeConversation => assert!(app.resume_ui.open),
+                EntryIdentity::Workboard => assert!(matches!(
+                    app.cards.get(&app.workspace.focused().unwrap()),
+                    Some(CardRuntime::Work)
+                )),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn native_palette_consumed_editor_and_row_keys_keep_repeats_local_and_hold_ownership_after_close()
+     {
+        use keyboard::key::{Code, Named, Physical};
+        for row in [false, true] {
+            let mut app = branch_palette_fixture();
+            let origin = EntryIdentity::capture(&app.palette_entries()[0].2).unwrap();
+            let focus = if row {
+                origin.widget_id()
+            } else {
+                widget::Id::new("palette.query")
+            };
+            let nav = Source::tracked(
+                PressCycle::new(Physical::Code(Code::ArrowDown)),
+                Transition::Press,
+            );
+            let events = [
+                iced::Event::Keyboard(cycle_key(Named::ArrowDown, Code::ArrowDown, true, false)),
+                iced::Event::Keyboard(cycle_key(Named::ArrowDown, Code::ArrowDown, true, true)),
+            ];
+            let (messages, statuses) =
+                palette_native_batch(&app, focus.clone(), &events, &[nav.clone(), nav.clone()]);
+            assert_eq!(statuses, [iced::event::Status::Captured; 2]);
+            assert_eq!(
+                messages.len(),
+                if row { 0 } else { 2 },
+                "native query repeats navigate; row repeats move native focus"
+            );
+            for (named, code) in [(Named::Tab, Code::Tab), (Named::Home, Code::Home)] {
+                let source =
+                    Source::tracked(PressCycle::new(Physical::Code(code)), Transition::Press);
+                let key = cycle_key(named, code, true, false);
+                drop(palette_native_batch(
+                    &app,
+                    focus.clone(),
+                    &[iced::Event::Keyboard(key.clone())],
+                    &[source.clone()],
+                ));
+                let _native = input_source::scope(source);
+                assert!(
+                    app.terminal_review_input
+                        .owns_keyboard(&iced::Event::Keyboard(key)),
+                    "row={row}, code={code:?}"
+                );
+            }
+            let letter = keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character("q".into()),
+                modified_key: keyboard::Key::Character("q".into()),
+                physical_key: Physical::Code(Code::KeyQ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: Some("q".into()),
+                repeat: false,
+            };
+            let letter_source = Source::tracked(
+                PressCycle::new(Physical::Code(Code::KeyQ)),
+                Transition::Press,
+            );
+            let (letters, _) = palette_native_batch(
+                &app,
+                focus.clone(),
+                &[iced::Event::Keyboard(letter.clone())],
+                &[letter_source.clone()],
+            );
+            if row {
+                assert!(
+                    letters.is_empty(),
+                    "row letters retain existing native forwarding"
+                );
+            }
+            {
+                let _native = input_source::scope(letter_source.clone());
+                assert!(
+                    app.terminal_review_input
+                        .owns_keyboard(&iced::Event::Keyboard(letter.clone())),
+                    "every palette-focused consumed cycle is protected before App processing, row={row}"
+                );
+            }
+            drop(app.update_palette(Action::Close));
+            let _native = input_source::scope(nav);
+            assert!(
+                app.terminal_review_input.owns_keyboard(&events[1]),
+                "held navigation remains protected after palette closes"
+            );
+        }
+        let app = branch_palette_fixture();
+        let source = Source::tracked(
+            PressCycle::new(Physical::Code(Code::KeyX)),
+            Transition::Press,
+        );
+        let make = |repeat| {
+            iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character("x".into()),
+                modified_key: keyboard::Key::Character("x".into()),
+                physical_key: Physical::Code(Code::KeyX),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: Some("x".into()),
+                repeat,
+            })
+        };
+        let (messages, statuses) = palette_native_batch(
+            &app,
+            widget::Id::new("palette.query"),
+            &[make(false), make(true)],
+            &[source.clone(), source],
+        );
+        assert_eq!(statuses, [iced::event::Status::Captured; 2]);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| matches!(m, Message::Palette(Action::QueryFromNative(..))))
+                .count(),
+            2,
+            "owned text repeat still reaches native editor"
+        );
+    }
+
+    #[test]
+    fn native_query_move_destination_preserves_captured_selection_and_emits_exact_model_transfer() {
+        use crate::workspace_model::{
+            ModelChannel, ModelEdit,
+            views::{Change, Pane, Scope, View},
+        };
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.refresh_ui.focused = true;
+        app.context_inspector_open = false;
+        let source = crate::model::ChannelId::new();
+        let destination = crate::model::ChannelId::new();
+        let project = ProjectId::new();
+        let pane = Pane {
+            id: CardId::new(),
+            title: "Native move fixture".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            scope: None,
+            kind: CardKind::Browser(BrowserSession {
+                id: BrowserId::new(),
+                current_url: "https://example.com".parse().unwrap(),
+                history: vec![],
+                history_index: 0,
+                scroll_x: 0.0,
+                scroll_y: 0.0,
+                fidelity: BrowserRestoreFidelity::UrlOnly,
+            }),
+        };
+        // Descriptor-only projection; every returned task is dropped. No
+        // browser/provider/terminal process is launched by this fixture.
+        for id in [source, destination] {
+            Arc::make_mut(&mut app.durable)
+                .channels
+                .push(crate::model::ProjectChannel {
+                    id,
+                    project_id: project,
+                    title: "Move fixture".into(),
+                    title_source: Default::default(),
+                    ordinal: 1,
+                    shared: true,
+                    cards: vec![],
+                    focused: None,
+                });
+        }
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        app.workspace_model.channels = [source, destination]
+            .into_iter()
+            .map(|id| ModelChannel {
+                id,
+                repository: "/repo/.git".into(),
+                title: "Needle destination".into(),
+                title_source: Default::default(),
+                ordinal: 1,
+            })
+            .collect();
+        let mut from = View::empty(source);
+        from.revision = 17;
+        from.panes.push(pane.clone());
+        app.workspace_model.views = vec![from, View::empty(destination)];
+        Arc::make_mut(&mut app.durable).active_channel = Some(source);
+        app.acknowledge_view_edit(Scope::Channel(source), None);
+        app.acknowledge_view_edit(Scope::Channel(destination), None);
+        drop(app.reconcile_shared_views());
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.update_palette(Action::MovePane(pane.id)));
+        drop(app.update_palette(Action::Query("needle".into())));
+        assert_eq!(
+            app.palette.selected,
+            Some(EntryIdentity::MovePane(pane.id, destination))
+        );
+        let mut newer = app.workspace_model.channel(destination).unwrap().clone();
+        newer.id = crate::model::ChannelId::new();
+        newer.title = "Needle".into();
+        newer.ordinal += 1;
+        app.workspace_model.channels.push(newer);
+        drop(native_palette_enter(&mut app));
+        assert!(!app.palette.is_open());
+        assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
+            scope: Scope::Channel(from), expected_revision: 17,
+            change: Change::Transfer { id, destination: Scope::Channel(to), .. }, ..
+        } if from == source && id == pane.id && to == destination));
+        assert!(app.pane_transfer_pending(pane.id));
+    }
+
+    #[test]
+    fn native_pointer_and_advertised_accessibility_runs_refuse_cover_then_fresh_run_succeeds() {
+        use iced::advanced::widget::Tree;
+        use iced::mouse::{Button, Event};
+        for accessibility in [false, true] {
+            for cover in ["approval", "image"] {
+                let mut app = branch_palette_fixture();
+                drop(app.update_palette(Action::Query("open settings".into())));
+                let identity = EntryIdentity::capture(&app.palette_entries()[0].2).unwrap();
+                let capture = |app: &Cagents| {
+                    if accessibility {
+                        click_current_contextual_palette_row(app, &identity)
+                    } else {
+                        let renderer = crate::app::tests::headless_renderer();
+                        let mut tree = Tree::new(app.palette_surface().unwrap().as_widget());
+                        let (point, messages) = palette_pointer_step(
+                            app,
+                            &mut tree,
+                            &renderer,
+                            &identity,
+                            Event::ButtonPressed(Button::Left),
+                            None,
+                        );
+                        assert!(messages.is_empty());
+                        palette_pointer_step(
+                            app,
+                            &mut tree,
+                            &renderer,
+                            &identity,
+                            Event::ButtonReleased(Button::Left),
+                            Some(point),
+                        )
+                        .1
+                    }
+                };
+                let messages = capture(&app);
+                assert!(matches!(
+                    messages.as_slice(),
+                    [Message::Palette(Action::Run(_))]
+                ));
+                if cover == "approval" {
+                    open_copy_release_approval(&mut app);
+                } else {
+                    app.chat_ui.image_viewer = Some(chat_ui::images::Gallery::file(
+                        "/palette-pointer-cover.png".into(),
+                        None,
+                        iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
+                    ));
+                }
+                let query = app.palette.query.clone();
+                let recents = app.settings.palette_recents.clone();
+                let focused = app.workspace.focused();
+                for message in messages {
+                    let task = app.update(message);
+                    assert!(
+                        iced::runtime::task::into_stream(task).is_none(),
+                        "cover refusal emits no focus/dispatch effect"
+                    );
+                }
+                assert_eq!(app.palette.query, query);
+                assert_eq!(app.settings.palette_recents, recents);
+                assert_eq!(app.workspace.focused(), focused);
+                if cover == "approval" {
+                    drop(app.cancel_automation_approval());
+                } else {
+                    app.chat_ui.image_viewer = None;
+                }
+                assert!(!app.modal_is_open());
+                let fresh = capture(&app);
+                drop(reduce_native_palette(&mut app, fresh));
+                assert!(!app.palette.is_open());
+                assert_eq!(
+                    app.settings.palette_recents.first(),
+                    entry_key(&Message::RunCommand(Command::OpenSettings)).as_ref()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_tab_then_enter_activates_newly_focused_pane_in_one_batch_in_both_directions() {
+        use keyboard::key::{Code, Named, Physical};
+        for backwards in [false, true] {
+            let mut app = branch_palette_fixture();
+            drop(app.update_palette(Action::Close));
+            let original = app.workspace.focused().unwrap();
+            let mut next = app.card_state(original).unwrap().clone();
+            next.id = CardId::new();
+            next.title = "Second settings".into();
+            Arc::make_mut(&mut app.durable).cards.push(next.clone());
+            app.cards.insert(next.id, CardRuntime::Settings);
+            Arc::make_mut(&mut app.durable).focused =
+                Some(if backwards { original } else { next.id });
+            app.workspace = Cagents::rebuild_workspace(&app.durable);
+            drop(app.update_palette(Action::Open));
+            drop(app.update_palette(Action::Query("@".into())));
+            let entries = app.palette_entries();
+            assert_eq!(entries.len(), 2);
+            let expected =
+                EntryIdentity::capture(&entries[if backwards { 1 } else { 0 }].2).unwrap();
+            let other = EntryIdentity::capture(&entries[if backwards { 0 } else { 1 }].2).unwrap();
+            app.palette.selected = Some(other.clone());
+            let mut tab = cycle_key(Named::Tab, Code::Tab, true, false);
+            if backwards && let keyboard::Event::KeyPressed { modifiers, .. } = &mut tab {
+                *modifiers = keyboard::Modifiers::SHIFT;
+            }
+            let sources = [Code::Tab, Code::Enter].map(|code| {
+                Source::tracked(PressCycle::new(Physical::Code(code)), Transition::Press)
+            });
+            let (messages, statuses) = palette_native_batch(
+                &app,
+                widget::Id::new("palette.query"),
+                &[
+                    iced::Event::Keyboard(tab),
+                    iced::Event::Keyboard(cycle_key(Named::Enter, Code::Enter, true, false)),
+                ],
+                &sources,
+            );
+            assert_eq!(
+                statuses,
+                [iced::event::Status::Captured; 2],
+                "COSMIC cannot enqueue a second global traversal"
+            );
+            assert!(
+                matches!(messages.as_slice(), [Message::Palette(Action::SubmitFromNative(intent))] if intent.row.as_ref().is_some_and(|m| expected.matches(&m.0)))
+            );
+            assert!(reduce_native_palette(&mut app, messages).is_empty());
+            let EntryIdentity::Pane(expected) = expected else {
+                unreachable!()
+            };
+            assert_eq!(app.workspace.focused(), Some(expected));
+            assert!(!app.palette.is_open());
+        }
+    }
+
+    #[test]
+    fn native_palette_tab_wraps_to_query_handles_missing_focus_and_declines_disabled_or_modified_chords()
+     {
+        use keyboard::key::{Code, Named, Physical};
+        let app = branch_palette_fixture();
+        let press = |named, code| iced::Event::Keyboard(cycle_key(named, code, true, false));
+        let sources = [Code::Tab, Code::Enter]
+            .map(|code| Source::tracked(PressCycle::new(Physical::Code(code)), Transition::Press));
+        let (messages, statuses) = palette_native_batch(
+            &app,
+            widget::Id::new("no-native-palette-focus"),
+            &[
+                press(Named::Tab, Code::Tab),
+                press(Named::Enter, Code::Enter),
+            ],
+            &sources,
+        );
+        assert_eq!(statuses, [iced::event::Status::Captured; 2]);
+        assert!(
+            matches!(messages.as_slice(), [Message::Palette(Action::SubmitFromNative(intent))] if intent.row.is_none()),
+            "missing focus begins with query"
+        );
+        let app = branch_palette_fixture();
+        let row = EntryIdentity::capture(&app.palette_entries()[0].2).unwrap();
+        let sources = [Code::Tab, Code::Enter]
+            .map(|code| Source::tracked(PressCycle::new(Physical::Code(code)), Transition::Press));
+        let (messages, statuses) = palette_native_batch(
+            &app,
+            row.widget_id(),
+            &[
+                press(Named::Tab, Code::Tab),
+                press(Named::Enter, Code::Enter),
+            ],
+            &sources,
+        );
+        assert_eq!(statuses, [iced::event::Status::Captured; 2]);
+        assert!(
+            matches!(messages.as_slice(), [Message::Palette(Action::SubmitFromNative(intent))] if intent.row.is_none()),
+            "last row wraps to query synchronously"
+        );
+        for modifiers in [
+            keyboard::Modifiers::CTRL,
+            keyboard::Modifiers::ALT,
+            keyboard::Modifiers::LOGO,
+        ] {
+            let app = branch_palette_fixture();
+            let mut tab = cycle_key(Named::Tab, Code::Tab, true, false);
+            if let keyboard::Event::KeyPressed {
+                modifiers: actual, ..
+            } = &mut tab
+            {
+                *actual = modifiers;
+            }
+            let (messages, statuses) = palette_native_batch(
+                &app,
+                widget::Id::new("palette.query"),
+                &[iced::Event::Keyboard(tab)],
+                &[Source::tracked(
+                    PressCycle::new(Physical::Code(Code::Tab)),
+                    Transition::Press,
+                )],
+            );
+            assert!(messages.is_empty());
+            assert_eq!(statuses, [iced::event::Status::Ignored]);
+        }
+        let mut app = branch_palette_fixture();
+        app.settings_reset_confirm = true;
+        let (messages, statuses) = palette_native_batch(
+            &app,
+            widget::Id::new("palette.query"),
+            &[press(Named::Tab, Code::Tab)],
+            &[Source::tracked(
+                PressCycle::new(Physical::Code(Code::Tab)),
+                Transition::Press,
+            )],
+        );
+        assert!(messages.is_empty());
+        assert_eq!(
+            statuses,
+            [iced::event::Status::Ignored],
+            "covered palette leaves Tab to visible owner"
+        );
     }
 
     fn branch_palette_fixture() -> Cagents {
@@ -2398,7 +4141,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "Review visible text");
         assert_contextual_palette_button(&app, &entries[0].2, &entries[0].0);
-        drop(palette_enter(&mut app));
+        drop(native_palette_enter(&mut app));
         assert_eq!(app.terminal_review_card, Some(card));
         assert!(!app.palette.is_open());
         drop(app.update_palette(Action::Open));
@@ -2407,7 +4150,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "Return to terminal input");
         assert_contextual_palette_button(&app, &entries[0].2, &entries[0].0);
-        drop(palette_enter(&mut app));
+        drop(native_palette_enter(&mut app));
         assert_eq!(app.terminal_review_card, None);
         assert_eq!(app.workspace.focused(), Some(card));
     }
@@ -2528,11 +4271,17 @@ mod tests {
                 );
                 drop(element);
                 if row_focus {
-                    assert_eq!(messages.len(), 1);
+                    assert!(matches!(
+                        messages.as_slice(),
+                        [Message::Palette(Action::SubmitFromNative(_))]
+                    ));
                     drop(app.update(messages.pop().unwrap()));
                 } else {
-                    assert!(messages.is_empty());
-                    drop(app.palette_key_event(&press));
+                    assert!(matches!(
+                        messages.as_slice(),
+                        [Message::Palette(Action::SubmitFromNative(_))]
+                    ));
+                    drop(app.update(messages.pop().unwrap()));
                 }
                 assert_eq!(app.terminal_review_card, None);
                 assert!(!app.palette.is_open());
@@ -2879,22 +4628,38 @@ mod tests {
                 matches!(entry.2, Message::Palette(Action::FocusPane(id)) if id == target)
             }).unwrap();
             let held = Message::Palette(Action::Run(MessageBox(Box::new(selected))));
-            let before = (app.active_workspace.clone(), app.durable.active_channel,
-                app.workspace.order().collect::<Vec<_>>(), app.workspace.focused(),
-                app.settings.palette_recents.clone());
+            let before = (
+                app.active_workspace.clone(),
+                app.durable.active_channel,
+                app.workspace.order().collect::<Vec<_>>(),
+                app.workspace.focused(),
+                app.settings.palette_recents.clone(),
+            );
             let (response, _) = std::sync::mpsc::sync_channel(1);
             drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
-                action: instance::UiUpdateAction::Prepare, response,
+                action: instance::UiUpdateAction::Prepare,
+                response,
             })));
-            assert!(app.update_prepared, "real Prepare admitted the palette-open window");
+            assert!(
+                app.update_prepared,
+                "real Prepare admitted the palette-open window"
+            );
             drop(app.update(held.clone()));
-            assert_eq!((app.active_workspace.clone(), app.durable.active_channel,
-                app.workspace.order().collect::<Vec<_>>(), app.workspace.focused(),
-                app.settings.palette_recents.clone()), before);
+            assert_eq!(
+                (
+                    app.active_workspace.clone(),
+                    app.durable.active_channel,
+                    app.workspace.order().collect::<Vec<_>>(),
+                    app.workspace.focused(),
+                    app.settings.palette_recents.clone()
+                ),
+                before
+            );
             assert_eq!(app.palette.query.as_deref(), Some("@held pane"));
             let (response, receiver) = std::sync::mpsc::sync_channel(1);
             drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
-                action: instance::UiUpdateAction::Cancel, response,
+                action: instance::UiUpdateAction::Cancel,
+                response,
             })));
             assert_eq!(receiver.try_recv().unwrap(), "ok");
             drop(app.update(held));
@@ -2980,7 +4745,8 @@ mod tests {
         Arc::make_mut(&mut app.durable).cards.insert(0, other);
         assert_eq!(app.card_state(id).unwrap().id, id);
         assert_eq!(app.card_state_mut(id).unwrap().id, id);
-    }    #[test]
+    }
+    #[test]
     fn move_picker_ranks_destinations_and_keeps_category_prefixes_literal() {
         let mut app = settings_focus_fixture();
         let card = app.workspace.focused().unwrap();
@@ -3385,6 +5151,7 @@ mod tests {
     fn keyboard_selection_keeps_its_pane_when_live_results_rank_ahead() {
         let (mut app, target, path) = inactive_palette_pane(false);
         app.card_state_mut(target).unwrap().title = "Archive held agent".into();
+        app.refresh_ui.focused = true;
         drop(app.update_palette(Action::Open));
         drop(app.update_palette(Action::Query("@held".into())));
         assert_eq!(app.palette.selected, Some(EntryIdentity::Pane(target)));
@@ -3399,7 +5166,7 @@ mod tests {
         let entries = app.palette_entries();
         assert!(matches!(entries[0].2, Message::Palette(Action::FocusPane(id)) if id == fresh_id));
         assert_eq!(app.selected_palette_index(&entries), Some(1));
-        drop(app.update(Message::Palette(Action::Submit)));
+        drop(native_palette_enter(&mut app));
         assert_eq!(app.active_workspace.as_ref(), Some(&path));
         assert_eq!(app.workspace.focused(), Some(target));
         assert_eq!(app.settings.palette_recents[0], format!("pane:{target}"));
@@ -3409,6 +5176,7 @@ mod tests {
     fn keyboard_selection_refuses_a_removed_pane_and_a_replaced_workspace_path() {
         for workspace_path_changed in [false, true] {
             let (mut app, target, _) = inactive_palette_pane(false);
+            app.refresh_ui.focused = true;
             drop(app.update_palette(Action::Open));
             drop(app.update_palette(Action::Query(if workspace_path_changed {
                 "#heldworkspace".into()
@@ -3436,7 +5204,7 @@ mod tests {
                 !app.palette_entries().is_empty(),
                 "another live row must not inherit selection"
             );
-            drop(app.update(Message::Palette(Action::Submit)));
+            drop(native_palette_enter(&mut app));
             assert_eq!(
                 (
                     app.active_workspace.clone(),
@@ -3621,6 +5389,7 @@ mod tests {
             ("Next diagnostic", true, 1),
             ("Previous diagnostic", false, 2),
         ] {
+            app.refresh_ui.focused = true;
             drop(app.update_palette(Action::Open));
             drop(app.update_palette(Action::Query(format!(">{query}"))));
             assert_eq!(
@@ -3637,7 +5406,7 @@ mod tests {
         }
         drop(app.update_palette(Action::Open));
         drop(app.update_palette(Action::Query(">Next diagnostic".into())));
-        drop(app.update(Message::Palette(Action::Submit)));
+        drop(native_palette_enter(&mut app));
         assert!(!app.palette.is_open());
         assert_eq!(
             diagnostic_cursor(&app, card),

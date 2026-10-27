@@ -1384,3 +1384,185 @@ fn temporary_palette_cover_restores_same_revision_review_owner_without_typing() 
         "an explicit pending local exit still wins over a true model view"
     );
 }
+
+#[test]
+fn tracked_palette_consumed_navigation_stays_out_of_terminal_after_review_return() {
+    use cosmic::iced::runtime::core::keyboard::input::{self, PressCycle, Source, Transition};
+    for (key, code) in [
+        (
+            keyboard::Key::Named(keyboard::key::Named::ArrowDown),
+            keyboard::key::Code::ArrowDown,
+        ),
+        (
+            keyboard::Key::Named(keyboard::key::Named::Home),
+            keyboard::key::Code::Home,
+        ),
+        (
+            keyboard::Key::Named(keyboard::key::Named::Tab),
+            keyboard::key::Code::Tab,
+        ),
+        (
+            keyboard::Key::Character("q".into()),
+            keyboard::key::Code::KeyQ,
+        ),
+        (
+            keyboard::Key::Named(keyboard::key::Named::Space),
+            keyboard::key::Code::Space,
+        ),
+    ] {
+        let peer = Peer::new();
+        let renderer = renderer();
+        let barrier = ReviewInputBarrier::default();
+        let mut widget = widget(
+            &peer,
+            "palette-held-navigation",
+            barrier.clone(),
+            true,
+            true,
+        );
+        widget.on_shortcut = None;
+        let mut tree = Tree::new(&widget as &dyn Widget<Message, Theme, Renderer>);
+        let press = keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key.clone(),
+            physical_key: keyboard::key::Physical::Code(code),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        };
+        let mut repeated = press.clone();
+        if let keyboard::Event::KeyPressed { repeat, .. } = &mut repeated {
+            *repeat = true;
+        }
+        let release = keyboard::Event::KeyReleased {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: keyboard::key::Physical::Code(code),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+        };
+        let cycle = PressCycle::new(keyboard::key::Physical::Code(code));
+        let source = Source::tracked(cycle.clone(), Transition::Press);
+        {
+            let _native = input::scope(source.clone());
+            assert!(barrier.capture_consumed_key(&press));
+            assert!(
+                barrier.capture_consumed_key(&repeated),
+                "native editor/list repeats remain accepted"
+            );
+        }
+        // Return to terminal input uses the same real widget/tree and barrier.
+        widget.review_active = false;
+        widget.suppress_focus_reports = false;
+        widget.review_revision += 1;
+        tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
+        assert!(!reviewing(&tree));
+        {
+            let _native = input::scope(source);
+            dispatch(&mut widget, &mut tree, &renderer, Event::Keyboard(repeated));
+        }
+        cycle.release();
+        {
+            let _native = input::scope(Source::tracked(cycle, Transition::Release));
+            dispatch(
+                &mut widget,
+                &mut tree,
+                &renderer,
+                Event::Keyboard(release.clone()),
+            );
+        }
+        assert_no_pty_input(&peer.fence());
+        let node = layout::Node::new(Size::new(640.0, 320.0));
+        widget.operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(widget.id.clone().unwrap()),
+        );
+        let fresh = PressCycle::new(keyboard::key::Physical::Code(code));
+        {
+            let _native = input::scope(Source::tracked(fresh.clone(), Transition::Press));
+            dispatch(&mut widget, &mut tree, &renderer, Event::Keyboard(press));
+        }
+        fresh.release();
+        {
+            let _native = input::scope(Source::tracked(fresh, Transition::Release));
+            dispatch(&mut widget, &mut tree, &renderer, Event::Keyboard(release));
+        }
+        assert_eq!(
+            peer.fence()
+                .iter()
+                .filter(|r| matches!(r, ClientRequest::Key { .. }))
+                .count(),
+            2,
+            "fresh press/release reaches real hosted widget after owned cycle retires"
+        );
+    }
+}
+
+#[test]
+fn tracked_old_app_release_cannot_retire_successor_before_real_widget_wire_admission() {
+    use cosmic::iced::runtime::core::keyboard::input::{self, PressCycle, Source, Transition};
+    let peer = Peer::new();
+    let renderer = renderer();
+    let barrier = ReviewInputBarrier::default();
+    let mut widget = widget(&peer, "palette-p1-r1-p2", barrier.clone(), true, true);
+    widget.on_shortcut = None;
+    let mut tree = Tree::new(&widget as &dyn Widget<Message, Theme, Renderer>);
+    let press = keyboard::Event::KeyPressed {
+        key: keyboard::Key::Named(keyboard::key::Named::Enter),
+        modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+        location: keyboard::Location::Standard,
+        modifiers: keyboard::Modifiers::empty(),
+        text: Some("\r".into()),
+        repeat: false,
+    };
+    let release = keyboard::Event::KeyReleased {
+        key: keyboard::Key::Named(keyboard::key::Named::Enter),
+        modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+        location: keyboard::Location::Standard,
+        modifiers: keyboard::Modifiers::empty(),
+    };
+    let first = PressCycle::new(keyboard::key::Physical::Code(keyboard::key::Code::Enter));
+    first.release();
+    let second = PressCycle::new(keyboard::key::Physical::Code(keyboard::key::Code::Enter));
+    {
+        let _native = input::scope(Source::tracked(first.clone(), Transition::Press));
+        assert!(barrier.claim_native_activation(&press));
+    }
+    assert!(barrier.consume_keyboard_with_source(
+        &release,
+        &Source::tracked(first.clone(), Transition::Release)
+    ));
+    {
+        let _native = input::scope(Source::tracked(second.clone(), Transition::Press));
+        assert!(barrier.claim_native_activation(&press));
+    }
+    // Delayed App R1 after native P2 must not erase physical successor ownership.
+    assert!(
+        !barrier
+            .consume_keyboard_with_source(&release, &Source::tracked(first, Transition::Release))
+    );
+    widget.review_active = false;
+    widget.suppress_focus_reports = false;
+    widget.review_revision += 1;
+    tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
+    {
+        let _native = input::scope(Source::tracked(second.clone(), Transition::Press));
+        dispatch(
+            &mut widget,
+            &mut tree,
+            &renderer,
+            Event::Keyboard(press.clone()),
+        );
+    }
+    second.release();
+    {
+        let _native = input::scope(Source::tracked(second, Transition::Release));
+        dispatch(&mut widget, &mut tree, &renderer, Event::Keyboard(release));
+    }
+    assert_no_pty_input(&peer.fence());
+}

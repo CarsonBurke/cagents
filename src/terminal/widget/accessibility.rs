@@ -11,7 +11,7 @@ use iced_accessibility::{
     accesskit::{NodeId, TextPosition, TextSelection},
 };
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -122,66 +122,235 @@ pub(super) struct View {
     pub alternate: bool,
     pub focused: bool,
 }
+use cosmic::iced::runtime::core::keyboard::input::{
+    PressCycle, Source, Transition, current_source,
+};
+struct OwnedKey {
+    physical: keyboard::key::Physical,
+    cycle: Option<Weak<PressCycle>>, // None is cfg(test)-only compatibility.
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActionPhase {
+    PendingQuery,
+    Claimed,
+}
+struct ClaimedAction {
+    physical: keyboard::key::Physical,
+    cycle: Weak<PressCycle>,
+    phase: ActionPhase,
+}
 #[derive(Default)]
 struct ConsumedInputs {
-    keys: Vec<keyboard::key::Physical>,
+    keys: Vec<OwnedKey>,
+    actions: Vec<ClaimedAction>,
     buttons: Vec<mouse::Button>,
 }
-/// One barrier per application window, shared across mounted cards and retained
-/// while cards unmount. A review key-up must not become input to a new focus.
+impl ConsumedInputs {
+    fn prune(&mut self) {
+        self.keys
+            .retain(|k| k.cycle.as_ref().is_none_or(|w| w.strong_count() > 0));
+        self.actions.retain(|a| a.cycle.strong_count() > 0);
+    }
+    fn physical(event: &keyboard::Event) -> Option<(&keyboard::key::Physical, Transition)> {
+        match event {
+            keyboard::Event::KeyPressed { physical_key, .. } => {
+                Some((physical_key, Transition::Press))
+            }
+            keyboard::Event::KeyReleased { physical_key, .. } => {
+                Some((physical_key, Transition::Release))
+            }
+            _ => None,
+        }
+    }
+    fn cycle<'a>(
+        key: &keyboard::key::Physical,
+        role: Transition,
+        source: &'a Source,
+    ) -> Option<&'a Arc<PressCycle>> {
+        source
+            .cycle()
+            .filter(|c| source.transition() == Some(role) && c.physical_key() == *key)
+    }
+    fn exact(
+        &self,
+        key: &keyboard::key::Physical,
+        role: Transition,
+        source: &Source,
+    ) -> Option<usize> {
+        if let Some(cycle) = Self::cycle(key, role, source) {
+            let weak = Arc::downgrade(cycle);
+            self.keys.iter().position(|k| {
+                k.physical == *key && k.cycle.as_ref().is_some_and(|w| w.ptr_eq(&weak))
+            })
+        } else if source.cycle().is_none() {
+            self.keys
+                .iter()
+                .position(|k| k.physical == *key && k.cycle.is_none())
+        } else {
+            None
+        }
+    }
+    fn owns(&self, key: &keyboard::key::Physical, role: Transition, source: &Source) -> bool {
+        self.exact(key, role, source).is_some()
+            || (source.cycle().is_none() && self.keys.iter().any(|k| k.physical == *key))
+    }
+    fn record(&mut self, event: &keyboard::Event, source: &Source, from_app: bool) -> bool {
+        self.prune();
+        let Some((key, Transition::Press)) = Self::physical(event) else {
+            return false;
+        };
+        if let Some(cycle) = Self::cycle(key, Transition::Press, source) {
+            if from_app && !cycle.is_down() {
+                return false;
+            }
+            if self.exact(key, Transition::Press, source).is_some() {
+                return false;
+            }
+            if self
+                .keys
+                .iter()
+                .any(|k| k.physical == *key && k.cycle.is_none())
+            {
+                return false;
+            }
+            self.keys.push(OwnedKey {
+                physical: key.clone(),
+                cycle: Some(Arc::downgrade(cycle)),
+            });
+            true
+        } else if cfg!(test) && source.cycle().is_none() {
+            if self.keys.iter().any(|k| k.physical == *key)
+                || self.actions.iter().any(|a| a.physical == *key)
+            {
+                return false;
+            }
+            self.keys.push(OwnedKey {
+                physical: key.clone(),
+                cycle: None,
+            });
+            true
+        } else {
+            false
+        }
+    }
+}
 #[derive(Clone, Default)]
 pub(crate) struct ReviewInputBarrier(Arc<Mutex<ConsumedInputs>>);
 impl ReviewInputBarrier {
-    /// Transfer the actual key that activated a contextual review command.
-    /// The terminal may never have received this press while a palette owned
-    /// native focus. Do not infer a physical key from a logical submit action.
+    /// Recording is idempotent; existing widget consumers may redeliver a press.
     pub fn capture_activation(&self, event: &keyboard::Event) -> bool {
-        let keyboard::Event::KeyPressed {
-            physical_key,
-            repeat: false,
-            ..
-        } = event
-        else {
+        matches!(event, keyboard::Event::KeyPressed { repeat: false, .. })
+            && self.capture_consumed_key(event)
+    }
+    /// Action admission is separate from accepted ownership recording.
+    pub fn claim_native_activation(&self, event: &keyboard::Event) -> bool {
+        self.capture_native_action(event, ActionPhase::Claimed)
+    }
+    pub fn capture_query_submit(&self, event: &keyboard::Event) -> bool {
+        self.capture_native_action(event, ActionPhase::PendingQuery)
+    }
+    fn capture_native_action(&self, event: &keyboard::Event, phase: ActionPhase) -> bool {
+        if !matches!(event, keyboard::Event::KeyPressed { repeat: false, .. }) {
             return false;
-        };
+        }
+        let source = current_source();
         let mut inputs = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if !inputs.keys.contains(physical_key) {
-            inputs.keys.push(physical_key.clone());
+        if !inputs.record(event, &source, false) {
+            return false;
+        }
+        if let Some(cycle) = source.cycle() {
+            let weak = Arc::downgrade(cycle);
+            if inputs.actions.iter().any(|a| a.cycle.ptr_eq(&weak)) {
+                return false;
+            }
+            inputs.actions.push(ClaimedAction {
+                physical: cycle.physical_key(),
+                cycle: weak,
+                phase,
+            });
         }
         true
     }
-
-    /// Consume owned repeats/releases even while another control retains
-    /// focus, so a covered terminal cannot keep a key pinned after key-up.
-    pub fn consume_keyboard(&self, event: &keyboard::Event) -> bool {
-        let mut inputs = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        match event {
-            keyboard::Event::KeyPressed { physical_key, .. } => inputs.keys.contains(physical_key),
-            keyboard::Event::KeyReleased { physical_key, .. } => {
-                if let Some(index) = inputs.keys.iter().position(|key| key == physical_key) {
-                    inputs.keys.swap_remove(index);
-                    true
-                } else {
-                    false
-                }
-            }
-            _ => false,
-        }
-    }
-
-    pub fn owns_keyboard(&self, event: &Event) -> bool {
-        let physical = match event {
-            Event::Keyboard(
-                keyboard::Event::KeyPressed { physical_key, .. }
-                | keyboard::Event::KeyReleased { physical_key, .. },
-            ) => physical_key,
-            _ => return false,
+    pub fn claim_query_submit(&self, event: &keyboard::Event, source: &Source) -> bool {
+        let Some((key, Transition::Press)) = ConsumedInputs::physical(event) else {
+            return false;
         };
+        let Some(cycle) = ConsumedInputs::cycle(key, Transition::Press, source) else {
+            return self.allow_legacy_app_activation(event, source);
+        };
+        let mut inputs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        inputs.prune();
+        let weak = Arc::downgrade(cycle);
+        let Some(ticket) = inputs.actions.iter_mut().find(|a| a.cycle.ptr_eq(&weak)) else {
+            return false;
+        };
+        if ticket.phase != ActionPhase::PendingQuery {
+            return false;
+        }
+        ticket.phase = ActionPhase::Claimed;
+        true
+    }
+    /// Recording result is NOT action validity. Quick P1/R1 may reach App up.
+    pub fn capture_app_activation(&self, event: &keyboard::Event, source: &Source) -> bool {
+        if !matches!(event, keyboard::Event::KeyPressed { repeat: false, .. }) {
+            return false;
+        }
         self.0
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .record(event, source, true)
+    }
+    /// Real contextual activation is native-only with an immutable payload.
+    /// Old direct KeyEvent helpers exist only for isolated component tests.
+    pub fn allow_legacy_app_activation(&self, event: &keyboard::Event, source: &Source) -> bool {
+        if !cfg!(test) || source.cycle().is_some() {
+            return false;
+        }
+        let Some((key, Transition::Press)) = ConsumedInputs::physical(event) else {
+            return false;
+        };
+        let mut inputs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        inputs.prune();
+        !inputs
             .keys
-            .contains(physical)
+            .iter()
+            .any(|k| k.physical == *key && k.cycle.is_some())
+            && !inputs.actions.iter().any(|a| a.physical == *key)
+    }
+    pub fn capture_consumed_key(&self, event: &keyboard::Event) -> bool {
+        let source = current_source();
+        let mut inputs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        inputs.prune();
+        let already = ConsumedInputs::physical(event)
+            .is_some_and(|(key, role)| inputs.exact(key, role, &source).is_some());
+        already || inputs.record(event, &source, false)
+    }
+    pub fn consume_keyboard(&self, event: &keyboard::Event) -> bool {
+        self.consume_keyboard_with_source(event, &current_source())
+    }
+    pub fn consume_keyboard_with_source(&self, event: &keyboard::Event, source: &Source) -> bool {
+        let mut inputs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        inputs.prune();
+        let Some((key, role)) = ConsumedInputs::physical(event) else {
+            return false;
+        };
+        if role == Transition::Release {
+            if let Some(index) = inputs.exact(key, role, source) {
+                inputs.keys.swap_remove(index);
+                return true;
+            }
+        }
+        // None can suppress ambiguous input but cannot retire a tracked record.
+        inputs.owns(key, role, source)
+    }
+    pub fn owns_keyboard(&self, event: &Event) -> bool {
+        let Event::Keyboard(event) = event else {
+            return false;
+        };
+        let mut inputs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        inputs.prune();
+        ConsumedInputs::physical(event)
+            .is_some_and(|(key, role)| inputs.owns(key, role, &current_source()))
     }
     pub fn owns_mouse_release(&self, event: &Event) -> bool {
         let Event::Mouse(mouse::Event::ButtonReleased(button)) = event else {
@@ -297,20 +466,20 @@ impl State {
     /// Return true before the widget can call any terminal input API. A key or
     /// button consumed during review keeps its release, even after mode exit.
     pub fn review_input(&mut self, event: &Event) -> bool {
-        let shared = self.barrier.0.clone();
-        let mut barrier = shared.lock().unwrap_or_else(|e| e.into_inner());
         if !self.review
-            && matches!(event, Event::Keyboard(keyboard::Event::KeyPressed { physical_key, .. }) if barrier.keys.contains(physical_key))
+            && matches!(event, Event::Keyboard(keyboard::Event::KeyPressed { .. }))
+            && self.barrier.owns_keyboard(event)
         {
             return true;
         }
-        if let Event::Keyboard(keyboard::Event::KeyReleased { physical_key, .. }) = event {
-            if let Some(i) = barrier.keys.iter().position(|key| key == physical_key) {
-                barrier.keys.swap_remove(i);
-                return true;
-            }
+        if let Event::Keyboard(keyboard::Event::KeyReleased { .. }) = event
+            && let Event::Keyboard(key) = event
+            && self.barrier.consume_keyboard(key)
+        {
+            return true;
         }
         if let Event::Mouse(mouse::Event::ButtonReleased(button)) = event {
+            let mut barrier = self.barrier.0.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(i) = barrier.buttons.iter().position(|held| held == button) {
                 barrier.buttons.swap_remove(i);
                 return true;
@@ -320,14 +489,12 @@ impl State {
             return false;
         }
         match event {
-            Event::Keyboard(keyboard::Event::KeyPressed {
-                key,
-                physical_key,
-                modifiers,
-                ..
-            }) => {
-                if !barrier.keys.contains(physical_key) {
-                    barrier.keys.push(physical_key.clone());
+            Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                let Event::Keyboard(key_event) = event else {
+                    unreachable!()
+                };
+                if !self.barrier.capture_consumed_key(key_event) {
+                    return true;
                 }
                 use keyboard::key::Named;
                 match key.as_ref() {
@@ -352,6 +519,7 @@ impl State {
                 true
             }
             Event::Mouse(mouse::Event::ButtonPressed(button)) => {
+                let mut barrier = self.barrier.0.lock().unwrap_or_else(|e| e.into_inner());
                 if !barrier.buttons.contains(button) {
                     barrier.buttons.push(*button);
                 }
@@ -457,6 +625,117 @@ impl State {
 mod tests {
     use super::super::super::{CellSnapshot, CellText, RowSnapshot};
     use super::*;
+    #[test]
+    fn weak_cycle_records_coexist_and_old_or_untagged_release_cannot_clear_successor() {
+        use cosmic::iced::runtime::core::keyboard::input::{self, PressCycle, Source, Transition};
+        let barrier = ReviewInputBarrier::default();
+        let key = keyboard::Key::Named(keyboard::key::Named::Enter);
+        let event = press(
+            key.clone(),
+            keyboard::key::Code::Enter,
+            keyboard::Modifiers::empty(),
+        );
+        let Event::Keyboard(press) = event.clone() else {
+            unreachable!()
+        };
+        let first = PressCycle::new(keyboard::key::Physical::Code(keyboard::key::Code::Enter));
+        first.release();
+        let second = PressCycle::new(keyboard::key::Physical::Code(keyboard::key::Code::Enter));
+        let one = Source::tracked(first.clone(), Transition::Press);
+        let two = Source::tracked(second, Transition::Press);
+        {
+            let _scope = input::scope(two.clone());
+            assert!(barrier.claim_native_activation(&press));
+        }
+        {
+            let _scope = input::scope(one.clone());
+            assert!(barrier.claim_native_activation(&press));
+        }
+        assert_eq!(
+            barrier.0.lock().unwrap().keys.len(),
+            2,
+            "late native P1 cannot overwrite P2"
+        );
+        let Event::Keyboard(release) = release(key, keyboard::key::Code::Enter) else {
+            unreachable!()
+        };
+        assert!(
+            barrier.consume_keyboard_with_source(
+                &release,
+                &Source::tracked(first, Transition::Release)
+            )
+        );
+        assert!(
+            !barrier.capture_app_activation(&press, &one),
+            "late App capture never reacquires an up cycle"
+        );
+        assert!(
+            barrier.consume_keyboard_with_source(&release, &Source::default()),
+            "unknown release may suppress, never retire tracked ownership"
+        );
+        assert!(!barrier.allow_legacy_app_activation(&press, &Source::default()));
+        let _scope = input::scope(two);
+        assert!(barrier.owns_keyboard(&event));
+    }
+
+    #[test]
+    fn weak_key_and_action_history_do_not_keep_released_cycle_alive() {
+        use cosmic::iced::runtime::core::keyboard::input::{self, PressCycle, Source, Transition};
+        let barrier = ReviewInputBarrier::default();
+        let event = press(
+            keyboard::Key::Named(keyboard::key::Named::Enter),
+            keyboard::key::Code::Enter,
+            keyboard::Modifiers::empty(),
+        );
+        let Event::Keyboard(key) = &event else {
+            unreachable!()
+        };
+        let cycle = PressCycle::new(keyboard::key::Physical::Code(keyboard::key::Code::Enter));
+        let weak = Arc::downgrade(&cycle);
+        {
+            let _scope = input::scope(Source::tracked(cycle.clone(), Transition::Press));
+            assert!(barrier.claim_native_activation(key));
+        }
+        cycle.release();
+        drop(cycle);
+        assert!(
+            weak.upgrade().is_none(),
+            "barrier stores no strong cycle owner"
+        );
+        assert!(!barrier.owns_keyboard(&event));
+        let inputs = barrier.0.lock().unwrap();
+        assert!(inputs.keys.is_empty() && inputs.actions.is_empty());
+    }
+
+    #[test]
+    fn review_consumes_first_seen_repeat_and_protects_its_exact_release_after_exit() {
+        use cosmic::iced::runtime::core::keyboard::input::{self, PressCycle, Source, Transition};
+        let mut state = State {
+            review: true,
+            ..State::default()
+        };
+        let key = keyboard::Key::Character("q".into());
+        let mut event = press(
+            key.clone(),
+            keyboard::key::Code::KeyQ,
+            keyboard::Modifiers::empty(),
+        );
+        if let Event::Keyboard(keyboard::Event::KeyPressed { repeat, .. }) = &mut event {
+            *repeat = true;
+        }
+        let cycle = PressCycle::new(keyboard::key::Physical::Code(keyboard::key::Code::KeyQ));
+        {
+            let _scope = input::scope(Source::tracked(cycle.clone(), Transition::Press));
+            assert!(state.review_input(&event));
+        }
+        state.review = false;
+        cycle.release();
+        let release = release(key, keyboard::key::Code::KeyQ);
+        let _scope = input::scope(Source::tracked(cycle, Transition::Release));
+        assert!(state.review_input(&release));
+        assert!(!state.barrier.owns_keyboard(&release));
+    }
+
     fn frame(text: &str, generation: u64) -> Arc<RenderSnapshot> {
         Arc::new(RenderSnapshot {
             generation,
