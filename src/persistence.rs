@@ -5,7 +5,7 @@ use std::{
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -269,6 +269,7 @@ pub struct WorkspaceManifest {
     pub card_scopes: HashMap<CardId, PathBuf>,
     pub chat_drafts: HashMap<CardId, String>,
     pub chat_draft_attachments: HashMap<CardId, Vec<crate::chat::Attachment>>,
+    pub conversation_channels: Arc<BTreeMap<String, ChannelId>>,
     pub agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
     pub workspace_history: Vec<WorkspaceDestination>,
     pub repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
@@ -612,6 +613,24 @@ struct StoreInner {
     connection: Connection,
     closed: bool,
     refused_closures: RefusedClosures,
+    conversation_channels_commit: Option<CommittedConversationChannels>,
+}
+
+/// A pointer match is useful only against the generation this store committed.
+/// Retaining that Arc also makes a subsequent filing mutation copy on write.
+/// One entry bounds the cache independently of the number of saved workspaces.
+struct CommittedConversationChannels {
+    workspace: WorkspaceId,
+    generation: u64,
+    channels: Arc<BTreeMap<String, ChannelId>>,
+}
+
+impl CommittedConversationChannels {
+    fn matches(&self, state: &WorkspaceState, base: SnapshotBase<'_>) -> bool {
+        self.workspace == state.id
+            && self.generation == base.workspace
+            && Arc::ptr_eq(&self.channels, &state.conversation_channels)
+    }
 }
 
 /// The closed cards whose final content storage has refused, by card.
@@ -777,6 +796,7 @@ impl StateStore {
         Ok(Self {
             inner: Mutex::new(StoreInner {
                 refused_closures: RefusedClosures::new(),
+                conversation_channels_commit: None,
                 connection,
                 closed: false,
             }),
@@ -819,14 +839,29 @@ impl StateStore {
         let StoreInner {
             connection,
             refused_closures,
+            conversation_channels_commit,
             ..
         } = &mut *inner;
+        let write_conversation_channels = !conversation_channels_commit
+            .as_ref()
+            .is_some_and(|committed| committed.matches(state, base));
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let commit = save_workspace_transaction(&transaction, state, base, refused_closures)?;
+        let commit = save_workspace_transaction(
+            &transaction,
+            state,
+            base,
+            refused_closures,
+            write_conversation_channels,
+        )?;
         // A conversion defers its foreign keys, so a violation it caused would
         // surface here, attributed to no card. It cannot arise in practice:
         // the terminal and its transcript metadata move together.
         transaction.commit()?;
+        *conversation_channels_commit = Some(CommittedConversationChannels {
+            workspace: state.id,
+            generation: commit.generation,
+            channels: state.conversation_channels.clone(),
+        });
         Ok(commit)
     }
 
@@ -1136,8 +1171,12 @@ impl StateStore {
         let StoreInner {
             connection,
             refused_closures,
+            conversation_channels_commit,
             ..
         } = &mut *inner;
+        let write_conversation_channels = !conversation_channels_commit
+            .as_ref()
+            .is_some_and(|committed| committed.matches(state, base));
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch("PRAGMA defer_foreign_keys=ON")?;
         let mut prepared = state.clone();
@@ -1259,8 +1298,14 @@ impl StateStore {
                 cards: &generations,
             },
             refused_closures,
+            write_conversation_channels,
         )?;
         transaction.commit()?;
+        *conversation_channels_commit = Some(CommittedConversationChannels {
+            workspace: state.id,
+            generation: commit.generation,
+            channels: state.conversation_channels.clone(),
+        });
         Ok(commit)
     }
 
@@ -2066,6 +2111,7 @@ impl StateStore {
             card_scopes: manifest.card_scopes,
             chat_drafts: manifest.chat_drafts,
             chat_draft_attachments: manifest.chat_draft_attachments,
+            conversation_channels: manifest.conversation_channels,
             agent_updates: manifest.agent_updates,
             workspace_history: manifest.workspace_history,
             repository_navigation: manifest.repository_navigation,
@@ -3867,6 +3913,7 @@ fn save_workspace_transaction(
     state: &WorkspaceState,
     base: SnapshotBase<'_>,
     refused_closures: &mut RefusedClosures,
+    write_conversation_channels: bool,
 ) -> Result<WorkspaceCommit> {
     validate_workspace(state)?;
     let workspace_id = state.id.to_string();
@@ -3950,6 +3997,15 @@ fn save_workspace_transaction(
         &format!("workspace:{workspace_id}:navigation:chat_draft_attachments"),
         &to_json(&state.chat_draft_attachments)?,
     )?;
+    // The caller's last successful commit can prove this exact Arc unchanged.
+    // The generation CAS above still runs first, including for a skipped map.
+    if write_conversation_channels {
+        set_metadata(
+            transaction,
+            &format!("workspace:{workspace_id}:navigation:conversation_channels"),
+            &to_json(&state.conversation_channels)?,
+        )?;
+    }
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:repository_navigation"),
@@ -5327,6 +5383,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace chat image drafts", &value))
         .transpose()?
         .unwrap_or_default(),
+        conversation_channels: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:conversation_channels"),
+        )?
+        .map(|value| from_json("workspace conversation channels", &value))
+        .transpose()?
+        .unwrap_or_default(),
         local_only_cards: metadata(
             connection,
             &format!("workspace:{id}:navigation:local_only_cards"),
@@ -5958,6 +6021,7 @@ mod tests {
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
             chat_draft_attachments: HashMap::new(),
+            conversation_channels: Arc::default(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
@@ -7105,6 +7169,375 @@ mod tests {
             self.cards.clone_from(&commit.card_generations);
             Ok(commit)
         }
+    }
+
+    /// Storage treats filing identities as opaque. The UI regression records
+    /// them through an actual successful close before saving and resuming.
+    #[test]
+    fn conversation_filing_metadata_only_saves_restart_and_reject_stale_writes() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("conversation-filing.sqlite3");
+        let boot_id = boot("conversation-filing");
+        let store = StateStore::open(&database, boot_id.clone()).unwrap();
+        let mut workspace = workspace_with_terminal(&boot_id);
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let stale_base = lane.workspace;
+        let card_generations = lane.cards.clone();
+        let mut stale = workspace.clone();
+        let key = "opaque recorded conversation/account context";
+        let channel = ChannelId::new();
+        Arc::make_mut(&mut workspace.conversation_channels).insert(key.into(), channel);
+        let commit = lane.save(&store, &workspace).unwrap();
+        assert_eq!(commit.generation, stale_base + 1);
+        assert_eq!(commit.card_generations, card_generations);
+        assert_eq!(
+            store
+                .load_workspace_manifest(workspace.id)
+                .unwrap()
+                .unwrap()
+                .conversation_channels,
+            workspace.conversation_channels
+        );
+
+        let current_scope = PathBuf::from("/private/newer-navigation");
+        workspace.active_worktree = Some(current_scope.clone());
+        workspace.project_order.push(ProjectId::new());
+        workspace
+            .card_scopes
+            .insert(workspace.cards[0].id, current_scope);
+        assert_eq!(
+            lane.save(&store, &workspace).unwrap().card_generations,
+            card_generations
+        );
+        Arc::make_mut(&mut stale.conversation_channels).insert(key.into(), ChannelId::new());
+        let before = store.stored_generations(workspace.id).unwrap();
+        assert!(matches!(
+            store.save_workspace(
+                &stale,
+                SnapshotBase {
+                    workspace: stale_base,
+                    cards: &card_generations,
+                },
+            ),
+            Err(StoreError::StaleGeneration { .. })
+        ));
+        assert_eq!(store.stored_generations(workspace.id).unwrap(), before);
+        assert_eq!(
+            store
+                .load_workspace_manifest(workspace.id)
+                .unwrap()
+                .unwrap()
+                .conversation_channels,
+            workspace.conversation_channels
+        );
+        let current = store
+            .load_workspace_manifest(workspace.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.active_worktree, workspace.active_worktree);
+        assert_eq!(current.project_order, workspace.project_order);
+        assert_eq!(current.card_scopes, workspace.card_scopes);
+        drop(store);
+        let store = StateStore::open(&database, boot("conversation-filing-reopen")).unwrap();
+        assert_eq!(
+            store
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .conversation_channels,
+            workspace.conversation_channels
+        );
+        assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+
+        store
+            .lock_inner()
+            .unwrap()
+            .connection
+            .execute(
+                "DELETE FROM metadata WHERE key=?1",
+                [format!(
+                    "workspace:{}:navigation:conversation_channels",
+                    workspace.id
+                )],
+            )
+            .unwrap();
+        assert!(
+            store
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .conversation_channels
+                .is_empty()
+        );
+        assert!(
+            store
+                .load_workspace_manifest(workspace.id)
+                .unwrap()
+                .unwrap()
+                .conversation_channels
+                .is_empty()
+        );
+        let mut legacy = serde_json::to_value(&workspace).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("conversation_channels");
+        assert!(
+            serde_json::from_value::<WorkspaceState>(legacy)
+                .unwrap()
+                .conversation_channels
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unchanged_conversation_history_skips_writes_and_failed_changes_retry() {
+        for restore_canonical in [false, true] {
+            let directory = tempdir().unwrap();
+            let store = StateStore::open(
+                directory.path().join("filing-reuse.sqlite3"),
+                boot("filing-reuse"),
+            )
+            .unwrap();
+            let mut workspace = workspace_with_terminal(&boot("filing-reuse"));
+            let CardKind::Terminal(terminal) = &workspace.cards[0].kind else {
+                unreachable!()
+            };
+            let restoration = TerminalPaneRestoration {
+                canonical: workspace.cards[0].id,
+                terminal: terminal.id,
+            };
+            let save = |lane: &mut SaveLane, state: &WorkspaceState| -> Result<WorkspaceCommit> {
+                let base = SnapshotBase {
+                    workspace: lane.workspace,
+                    cards: &lane.cards,
+                };
+                let commit = if restore_canonical {
+                    store.save_workspace_with_terminal_panes(state, base, &[], &[restoration])?
+                } else {
+                    store.save_workspace(state, base)?
+                };
+                lane.workspace = commit.generation;
+                lane.cards.clone_from(&commit.card_generations);
+                Ok(commit)
+            };
+            workspace.conversation_channels = Arc::new(
+                (0..10_000)
+                    .map(|id| (format!("opaque-history-{id}"), ChannelId::new()))
+                    .collect(),
+            );
+            let mut lane = SaveLane::default();
+            save(&mut lane, &workspace).unwrap();
+            let card_generations = lane.cards.clone();
+            let key = format!(
+                "workspace:{}:navigation:conversation_channels",
+                workspace.id
+            );
+            let original = metadata(&store.lock_inner().unwrap().connection, &key).unwrap();
+            let reject_rewrite = format!(
+                "CREATE TEMP TRIGGER reject_filing_rewrite BEFORE UPDATE OF value ON metadata
+                 WHEN OLD.key='{key}' BEGIN SELECT RAISE(ABORT,'filing rewrite'); END;"
+            );
+            store
+                .lock_inner()
+                .unwrap()
+                .connection
+                .execute_batch(&reject_rewrite)
+                .unwrap();
+            // Successive generations must keep the fast path, including the
+            // canonical-restoration writer's separate transaction wrapper.
+            for step in 0..2 {
+                workspace.active_worktree = Some(PathBuf::from(format!("/private/view-{step}")));
+                workspace
+                    .chat_drafts
+                    .insert(workspace.cards[0].id, format!("draft {step}"));
+                assert_eq!(
+                    save(&mut lane, &workspace).unwrap().card_generations,
+                    card_generations
+                );
+                let saved = store
+                    .load_workspace_manifest(workspace.id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(saved.active_worktree, workspace.active_worktree);
+                assert_eq!(saved.chat_drafts, workspace.chat_drafts);
+            }
+            Arc::make_mut(&mut workspace.conversation_channels)
+                .insert("new closed conversation".into(), ChannelId::new());
+            let before = store.stored_generations(workspace.id).unwrap();
+            assert!(matches!(
+                save(&mut lane, &workspace),
+                Err(StoreError::Sqlite(_))
+            ));
+            assert_eq!(store.stored_generations(workspace.id).unwrap(), before);
+            store
+                .lock_inner()
+                .unwrap()
+                .connection
+                .execute_batch(
+                    "DROP TRIGGER reject_filing_rewrite;
+                 CREATE TEMP TRIGGER reject_filing_card BEFORE UPDATE OF title ON cards
+                 BEGIN SELECT RAISE(ABORT,'card failure after filing write'); END;",
+                )
+                .unwrap();
+            workspace.cards[0].title = "changed after filing".into();
+            assert!(matches!(
+                card_refusal(save(&mut lane, &workspace), workspace.cards[0].id),
+                StoreError::Sqlite(_)
+            ));
+            assert_eq!(store.stored_generations(workspace.id).unwrap(), before);
+            assert_eq!(
+                metadata(&store.lock_inner().unwrap().connection, &key).unwrap(),
+                original
+            );
+            store
+                .lock_inner()
+                .unwrap()
+                .connection
+                .execute_batch("DROP TRIGGER reject_filing_card")
+                .unwrap();
+            save(&mut lane, &workspace).unwrap();
+            let saved = store
+                .load_workspace_manifest(workspace.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.conversation_channels, workspace.conversation_channels);
+            assert_eq!(saved.cards[0].title, workspace.cards[0].title);
+            store
+                .lock_inner()
+                .unwrap()
+                .connection
+                .execute_batch(&reject_rewrite)
+                .unwrap();
+            workspace.active_worktree = Some("/private/after-retry".into());
+            save(&mut lane, &workspace).unwrap();
+        }
+    }
+
+    #[test]
+    fn external_generation_and_cold_store_cannot_reuse_a_filing_commit() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("filing-external.sqlite3");
+        let store = StateStore::open(&database, boot("filing-external")).unwrap();
+        let mut workspace = WorkspaceState::default();
+        Arc::make_mut(&mut workspace.conversation_channels)
+            .insert("recorded identity".into(), ChannelId::new());
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let other = StateStore::open(&database, boot("filing-external")).unwrap();
+        let mut external = workspace.clone();
+        Arc::make_mut(&mut external.conversation_channels)
+            .insert("recorded identity".into(), ChannelId::new());
+        let external_commit = other
+            .save_workspace(
+                &external,
+                SnapshotBase {
+                    workspace: lane.workspace,
+                    cards: &lane.cards,
+                },
+            )
+            .unwrap();
+        let key = format!(
+            "workspace:{}:navigation:conversation_channels",
+            workspace.id
+        );
+        let reject_rewrite = format!(
+            "CREATE TEMP TRIGGER reject_filing_rewrite BEFORE UPDATE OF value ON metadata
+             WHEN OLD.key='{key}' BEGIN SELECT RAISE(ABORT,'filing rewrite'); END;"
+        );
+        store
+            .lock_inner()
+            .unwrap()
+            .connection
+            .execute_batch(&reject_rewrite)
+            .unwrap();
+        assert!(matches!(
+            lane.save(&store, &workspace),
+            Err(StoreError::StaleGeneration { .. })
+        ));
+        assert_eq!(
+            store
+                .load_workspace_manifest(workspace.id)
+                .unwrap()
+                .unwrap()
+                .conversation_channels,
+            external.conversation_channels
+        );
+        // Rebasing onto another connection's committed generation must force
+        // a write even though this instance still remembers the same Arc.
+        lane.workspace = external_commit.generation;
+        assert!(matches!(
+            lane.save(&store, &workspace),
+            Err(StoreError::Sqlite(_))
+        ));
+        store
+            .lock_inner()
+            .unwrap()
+            .connection
+            .execute_batch("DROP TRIGGER reject_filing_rewrite")
+            .unwrap();
+        lane.save(&store, &workspace).unwrap();
+        drop(other);
+        drop(store);
+        let reopened = StateStore::open(&database, boot("filing-external")).unwrap();
+        assert_eq!(
+            reopened
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .conversation_channels,
+            workspace.conversation_channels
+        );
+        reopened
+            .lock_inner()
+            .unwrap()
+            .connection
+            .execute_batch(&reject_rewrite)
+            .unwrap();
+        assert!(matches!(
+            lane.save(&reopened, &workspace),
+            Err(StoreError::Sqlite(_))
+        ));
+        reopened
+            .lock_inner()
+            .unwrap()
+            .connection
+            .execute_batch("DROP TRIGGER reject_filing_rewrite")
+            .unwrap();
+        lane.save(&reopened, &workspace).unwrap();
+    }
+
+    #[test]
+    fn malformed_conversation_filing_metadata_is_not_a_legacy_absence() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::open(
+            directory.path().join("filing-corrupt.sqlite3"),
+            boot("filing-corrupt"),
+        )
+        .unwrap();
+        let workspace = workspace_with_terminal(&boot("filing-corrupt"));
+        SaveLane::default().save(&store, &workspace).unwrap();
+        store
+            .lock_inner()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE metadata SET value='{' WHERE key=?1",
+                [format!(
+                    "workspace:{}:navigation:conversation_channels",
+                    workspace.id
+                )],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.load_workspace_manifest(workspace.id),
+            Err(StoreError::CorruptRow { .. })
+        ));
+        assert!(matches!(
+            store.load_workspace(workspace.id, None),
+            Err(StoreError::CorruptRow { .. })
+        ));
     }
 
     #[test]
@@ -9843,6 +10276,7 @@ mod tests {
                 cards: &BTreeMap::new(),
             },
             &mut RefusedClosures::new(),
+            true,
         )
         .unwrap();
         transaction.pragma_update(None, "user_version", 3).unwrap();
@@ -9928,6 +10362,7 @@ mod tests {
                 cards: &BTreeMap::new(),
             },
             &mut RefusedClosures::new(),
+            true,
         )
         .unwrap();
         // The v5 table must refuse the new kinds, or this test proves nothing.

@@ -387,6 +387,9 @@ impl Cagents {
                 return None;
             }
         };
+        if let Some(card) = closed_descriptor.as_ref() {
+            self.remember_closed_conversation_channel(card);
+        }
         // Read before anything persists the scope, which prunes the
         // closed card from its channel's membership.
         let emptied = if replacing {

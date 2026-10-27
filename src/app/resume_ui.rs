@@ -5,6 +5,7 @@ use crate::persistence::SavedConversation;
 use cosmic::iced::futures::StreamExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 mod catalog;
+mod channel_filing;
 
 /// Conversations read before the first found ones are listed, so the newest
 /// appear at once, and between later listings.
@@ -179,6 +180,13 @@ fn same_conversation(a: &chat::Session, b: &chat::Session) -> bool {
         && crate::account::home_variable(a.launch.provider).is_none_or(|variable| {
             a.launch.recipe.environment.get(variable) == b.launch.recipe.environment.get(variable)
         })
+        // Reject only conflicting known recorded account contexts. If either
+        // is unknown, preserve the existing predicate above so a legacy live
+        // writer cannot be duplicated. Unknown filing still grants no placement.
+        && match (channel_filing::conversation_key(a), channel_filing::conversation_key(b)) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        }
 }
 
 /// What makes two listings the same conversation: its provider, its ID, and
@@ -815,10 +823,22 @@ impl Cagents {
             session.terminal = None;
         }
         let replace = self.resume_ui.replace;
+        let scope = match self.select_recorded_conversation_channel(&session) {
+            Some(scope) => scope,
+            None => {
+                let (selected, scope) = self.select_worktree_checked(
+                    session.launch.recipe.working_directory.clone(),
+                    false,
+                );
+                if !selected && !session.launch.needs_read_only_history() {
+                    return scope;
+                }
+                scope
+            }
+        };
         self.close_resume();
         self.recently_closed
             .retain(|(card, _)| card.id != entry.card);
-        let scope = self.select_worktree(session.launch.recipe.working_directory.clone(), false);
         // The draft `/resume` was asked from gives its place to the
         // conversation, where both belong to the same strip.
         let replace = replace.filter(|card| {
