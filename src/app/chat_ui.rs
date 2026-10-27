@@ -52,6 +52,7 @@ mod text_copy;
 mod thumbnails;
 mod tool_text;
 mod turn;
+mod turn_completion;
 mod view;
 mod virtualized;
 
@@ -2044,6 +2045,7 @@ pub(super) struct Runtime {
     snapshot: Arc<Snapshot>,
     provider_queue: std::cell::RefCell<prompt::ProviderQueue>,
     source_clock: Option<chat::client::SourceClock>,
+    /// Cached local clock/date only; completion wording follows current evidence.
     finished_stamp: Option<(u64, String, String)>,
     cache: HashMap<String, CachedItem>,
     /// Only the selected child has presentation. Parent grouping continues to
@@ -3890,7 +3892,7 @@ impl Runtime {
                     time.day,
                     time.clock()
                 );
-                Some((at, format!("Finished at {}", time.clock()), full))
+                Some((at, time.clock(), full))
             });
         }
         self.subagent_scroll
