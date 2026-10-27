@@ -750,3 +750,819 @@ fn remounted_owner_blocks_input_and_identity_replacement_drops_selection() {
     tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
     assert!(!reviewing(&tree));
 }
+
+#[test]
+fn idle_terminal_has_full_grid_and_no_review_pointer_hotspot() {
+    let peer = Peer::new();
+    let renderer = renderer();
+    let mut widget = widget(
+        &peer,
+        "idle-grid",
+        ReviewInputBarrier::default(),
+        true,
+        false,
+    );
+    widget.scale_factor = 1.25;
+    Arc::make_mut(&mut widget.snapshot).cursor = Some(super::super::CursorSnapshot {
+        row: 0,
+        column: 0,
+        shape: CursorShape::Block,
+        color: Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        },
+        visible: true,
+        blinking: false,
+    });
+    let mut tree = Tree::new(&widget as &dyn Widget<Message, Theme, Renderer>);
+    let bounds = Rectangle::new(Point::new(19.0, 31.0), Size::new(640.0, 320.0));
+    assert_eq!(
+        TerminalWidget::<Message>::grid_bounds(bounds, false),
+        bounds
+    );
+    let node = layout::Node::new(bounds.size()).move_to(bounds.position());
+    let nodes = widget.a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+    let control = nodes
+        .children()
+        .iter()
+        .find(|n| n.node().role() == iced_accessibility::accesskit::Role::Button)
+        .unwrap();
+    assert_eq!(control.node().label(), Some("Review visible terminal"));
+    assert_eq!(
+        control.node().bounds(),
+        None,
+        "virtual entry must not cover text for AT hit testing"
+    );
+    let rows: Vec<_> = nodes
+        .children()
+        .iter()
+        .filter(|n| n.node().role() == iced_accessibility::accesskit::Role::TextRun)
+        .collect();
+    assert!(rows[0].node().bounds().unwrap().y0 < f64::from(bounds.y + REVIEW_BAR_HEIGHT));
+    let geometry = TerminalGeometry::new(
+        bounds,
+        widget.font_size,
+        widget.scale_factor,
+        widget.font_family,
+        widget.line_height,
+        widget.padding,
+    );
+    let first = geometry.cell_bounds(0, 0).unwrap();
+    let enabled = InputMethod::Enabled {
+        cursor: first,
+        purpose: input_method::Purpose::Terminal,
+        preedit: None,
+    };
+    assert_eq!(
+        widget.input_method(tree.state.downcast_ref::<WidgetState>(), geometry),
+        enabled
+    );
+    tree.state
+        .downcast_ref::<WidgetState>()
+        .a11y
+        .borrow_mut()
+        .review = true;
+    assert_eq!(
+        widget.input_method(tree.state.downcast_ref::<WidgetState>(), geometry),
+        InputMethod::Disabled
+    );
+    tree.state
+        .downcast_ref::<WidgetState>()
+        .a11y
+        .borrow_mut()
+        .review = false;
+    assert_eq!(
+        widget.input_method(tree.state.downcast_ref::<WidgetState>(), geometry),
+        enabled
+    );
+
+    let point = Point::new(bounds.x + bounds.width - 20.0, first.center_y());
+    assert_eq!(
+        geometry
+            .cursor_position(mouse::Cursor::Available(point))
+            .map(|p| widget.cell_at(geometry, p).1),
+        Some(0)
+    );
+    assert_eq!(
+        widget.mouse_interaction(
+            &tree,
+            Layout::new(&node),
+            mouse::Cursor::Available(point),
+            &bounds,
+            &renderer
+        ),
+        mouse::Interaction::Text
+    );
+    Arc::make_mut(&mut widget.snapshot).scroll.mouse_tracking = true;
+    let mut messages = Vec::new();
+    widget.update(
+        &mut tree,
+        &Event::Mouse(mouse::Event::ButtonPressed(IcedMouseButton::Left)),
+        Layout::new(&node),
+        mouse::Cursor::Available(point),
+        &renderer,
+        &mut clipboard::Null,
+        &mut Shell::new(&mut messages),
+        &bounds,
+    );
+    assert!(!reviewing(&tree));
+    assert!(!messages.iter().any(|m| matches!(m, Message::Review(_))));
+    assert!(
+        peer.fence()
+            .iter()
+            .any(|r| matches!(r, ClientRequest::Mouse { .. })),
+        "former button area must be real terminal grid"
+    );
+}
+
+#[test]
+fn command_entry_and_fresh_resize_frame_refence_review_text_without_typing() {
+    let peer = Peer::new();
+    let renderer = renderer();
+    let mut widget = widget(
+        &peer,
+        "mode-viewport",
+        ReviewInputBarrier::default(),
+        true,
+        false,
+    );
+    let mut tree = Tree::new(&widget as &dyn Widget<Message, Theme, Renderer>);
+    let bounds = Rectangle::with_size(Size::new(640.0, 320.0));
+    let node = layout::Node::new(bounds.size());
+    let geometry = |active| {
+        TerminalGeometry::new(
+            TerminalWidget::<Message>::grid_bounds(bounds, active),
+            widget.font_size,
+            widget.scale_factor,
+            widget.font_family,
+            widget.line_height,
+            widget.padding,
+        )
+    };
+    let idle = geometry(false);
+    let active = geometry(true);
+    assert!(active.rows < idle.rows);
+    let snapshot = |generation, rows, columns| {
+        Arc::new(RenderSnapshot {
+            generation,
+            rows,
+            columns,
+            lines: (0..rows)
+                .map(|row| {
+                    Arc::new(RowSnapshot {
+                        cells: (if row + 1 == rows { "latest" } else { "row" })
+                            .chars()
+                            .map(|c| CellSnapshot {
+                                text: super::super::CellText::new(&c.to_string()),
+                                ..Default::default()
+                            })
+                            .collect(),
+                        ..Default::default()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            ..RenderSnapshot::empty()
+        })
+    };
+    widget.snapshot = snapshot(10, idle.rows, idle.columns);
+    tree.state.downcast_mut::<WidgetState>().pty_size.pending =
+        Some((idle.terminal_size(), Instant::now() - RESIZE_SETTLE));
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        Event::Window(window::Event::RedrawRequested(Instant::now())),
+    );
+    let requests = peer.fence();
+    assert!(requests.iter().any(|r| matches!(r, ClientRequest::Resize { size, .. } if size.rows == idle.rows && size.columns == idle.columns)));
+    widget.a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+    let old = tree
+        .state
+        .downcast_ref::<WidgetState>()
+        .a11y
+        .borrow()
+        .position(0, 0)
+        .unwrap();
+    let old = iced_accessibility::accesskit::TextSelection {
+        anchor: old,
+        focus: old,
+    };
+    // The palette/menu model request must enter an already-mounted widget.
+    widget.review_active = true;
+    widget.suppress_focus_reports = true;
+    widget.review_revision += 1;
+    tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
+    assert!(reviewing(&tree));
+    widget.a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+    assert!(
+        !tree
+            .state
+            .downcast_ref::<WidgetState>()
+            .a11y
+            .borrow()
+            .valid_selection(&old)
+    );
+    tree.state.downcast_mut::<WidgetState>().pty_size.pending =
+        Some((active.terminal_size(), Instant::now() - RESIZE_SETTLE));
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        Event::Window(window::Event::RedrawRequested(Instant::now())),
+    );
+    let requests = peer.fence();
+    assert!(requests.iter().any(|r| matches!(r, ClientRequest::Resize { size, .. } if size.rows == active.rows && size.columns == active.columns)), "review intentionally resizes the real viewport");
+    assert_no_pty_input(&requests);
+    let interim = tree
+        .state
+        .downcast_ref::<WidgetState>()
+        .a11y
+        .borrow()
+        .position(0, 0)
+        .unwrap();
+    let interim = iced_accessibility::accesskit::TextSelection {
+        anchor: interim,
+        focus: interim,
+    };
+    // Matching new output is a second fence, even inside the normal100ms throttle.
+    widget.snapshot = snapshot(11, active.rows, active.columns);
+    let projected = widget.a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+    assert!(
+        !tree
+            .state
+            .downcast_ref::<WidgetState>()
+            .a11y
+            .borrow()
+            .valid_selection(&interim)
+    );
+    assert!(
+        tree.state
+            .downcast_ref::<WidgetState>()
+            .review_viewport
+            .borrow()
+            .pending_frame
+            .is_none()
+    );
+    let rows: Vec<_> = projected
+        .children()
+        .iter()
+        .filter(|n| n.node().role() == iced_accessibility::accesskit::Role::TextRun)
+        .collect();
+    assert_eq!(rows.len(), usize::from(active.rows));
+    assert!(
+        rows.last()
+            .unwrap()
+            .node()
+            .value()
+            .unwrap()
+            .starts_with("latest"),
+        "fresh bottom output remains reviewable"
+    );
+    let stale = action(
+        widget.id.clone().unwrap(),
+        Action::SetTextSelection,
+        Some(ActionData::SetTextSelection(interim)),
+    );
+    assert!(dispatch(&mut widget, &mut tree, &renderer, stale).is_empty());
+    for down in [true, false] {
+        dispatch(
+            &mut widget,
+            &mut tree,
+            &renderer,
+            key(
+                keyboard::key::Named::ArrowDown,
+                keyboard::key::Code::ArrowDown,
+                down,
+            ),
+        );
+    }
+    assert_no_pty_input(&peer.fence());
+    let exit = TerminalWidget::<Message>::review_control(bounds).center();
+    let mut exit_messages = Vec::new();
+    for event in [
+        Event::Mouse(mouse::Event::ButtonPressed(IcedMouseButton::Left)),
+        Event::Mouse(mouse::Event::ButtonReleased(IcedMouseButton::Left)),
+    ] {
+        widget.update(
+            &mut tree,
+            &event,
+            Layout::new(&node),
+            mouse::Cursor::Available(exit),
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut exit_messages),
+            &bounds,
+        );
+    }
+    assert_eq!(exit_messages, vec![Message::Review(false)]);
+    assert!(!reviewing(&tree));
+    tree.state.downcast_mut::<WidgetState>().pty_size.pending =
+        Some((idle.terminal_size(), Instant::now() - RESIZE_SETTLE));
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        Event::Window(window::Event::RedrawRequested(Instant::now())),
+    );
+    let requests = peer.fence();
+    assert!(
+        requests
+            .iter()
+            .any(|r| matches!(r, ClientRequest::Resize { size, .. } if size.rows == idle.rows))
+    );
+    assert_no_pty_input(&requests);
+}
+
+#[test]
+fn remounted_review_fences_matching_frame_and_identity_or_focus_loss_restores_idle_geometry() {
+    let peer = Peer::new();
+    let renderer = renderer();
+    let mut widget = widget(
+        &peer,
+        "remounted-grid",
+        ReviewInputBarrier::default(),
+        true,
+        true,
+    );
+    let mut tree = Tree::new(&widget as &dyn Widget<Message, Theme, Renderer>);
+    let node = layout::Node::new(Size::new(640.0, 320.0));
+    let nodes = widget.a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+    assert!(
+        tree.state
+            .downcast_ref::<WidgetState>()
+            .review_viewport
+            .borrow()
+            .pending_frame
+            .is_some()
+    );
+    let old = nodes
+        .children()
+        .iter()
+        .find(|n| n.node().role() == iced_accessibility::accesskit::Role::TextRun)
+        .unwrap()
+        .id()
+        .clone();
+    let geometry = TerminalGeometry::new(
+        TerminalWidget::<Message>::grid_bounds(node.bounds(), true),
+        widget.font_size,
+        widget.scale_factor,
+        widget.font_family,
+        widget.line_height,
+        widget.padding,
+    );
+    let frame = Arc::make_mut(&mut widget.snapshot);
+    frame.generation += 1;
+    frame.rows = geometry.rows;
+    frame.columns = geometry.columns;
+    let fresh = widget.a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+    assert!(
+        !fresh
+            .children()
+            .iter()
+            .any(|n| iced_accessibility::IdEq::eq(n.id(), &old))
+    );
+    assert!(
+        tree.state
+            .downcast_ref::<WidgetState>()
+            .review_viewport
+            .borrow()
+            .pending_frame
+            .is_none()
+    );
+    widget.model_focused = false;
+    let unfocused = widget.a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+    assert!(!reviewing(&tree));
+    let row = unfocused
+        .children()
+        .iter()
+        .find(|n| n.node().role() == iced_accessibility::accesskit::Role::TextRun)
+        .unwrap();
+    assert!(row.node().bounds().unwrap().y0 < f64::from(REVIEW_BAR_HEIGHT));
+    assert!(
+        unfocused
+            .children()
+            .iter()
+            .filter(|n| n.node().role() == iced_accessibility::accesskit::Role::Button)
+            .all(|n| n.node().bounds().is_none())
+    );
+    tree.state
+        .downcast_ref::<WidgetState>()
+        .a11y
+        .borrow_mut()
+        .review = true;
+    widget.terminal_identity = crate::model::TerminalId::new();
+    let replacement = widget.a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+    assert!(!reviewing(&tree));
+    assert!(
+        replacement
+            .children()
+            .iter()
+            .filter(|n| n.node().role() == iced_accessibility::accesskit::Role::Button)
+            .all(|n| n.node().bounds().is_none())
+    );
+    assert!(peer.fence().is_empty());
+}
+
+#[test]
+fn completed_terminal_review_does_not_relaunch_or_send_input() {
+    let peer = Peer::new();
+    let renderer = renderer();
+    let mut widget = widget(
+        &peer,
+        "completed-review",
+        ReviewInputBarrier::default(),
+        true,
+        false,
+    )
+    .read_only(true)
+    .on_read_only_submit(Some(Message::Shortcut));
+    let mut tree = Tree::new(&widget as &dyn Widget<Message, Theme, Renderer>);
+    assert_eq!(
+        click_review(&mut widget, &mut tree, &renderer),
+        vec![Message::Review(true)]
+    );
+    for (named, code) in [
+        (keyboard::key::Named::Enter, keyboard::key::Code::Enter),
+        (
+            keyboard::key::Named::ArrowDown,
+            keyboard::key::Code::ArrowDown,
+        ),
+    ] {
+        for down in [true, false] {
+            assert!(dispatch(&mut widget, &mut tree, &renderer, key(named, code, down)).is_empty());
+        }
+    }
+    assert_eq!(
+        dispatch(
+            &mut widget,
+            &mut tree,
+            &renderer,
+            key(
+                keyboard::key::Named::Escape,
+                keyboard::key::Code::Escape,
+                true
+            )
+        ),
+        vec![Message::Review(false)]
+    );
+    assert!(
+        dispatch(
+            &mut widget,
+            &mut tree,
+            &renderer,
+            key(
+                keyboard::key::Named::Escape,
+                keyboard::key::Code::Escape,
+                false
+            )
+        )
+        .is_empty()
+    );
+    assert_no_pty_input(&peer.fence());
+}
+
+#[test]
+fn palette_activation_keeps_original_physical_repeat_and_release_out_of_terminal() {
+    for release_in_palette in [false, true] {
+        let peer = Peer::new();
+        let renderer = renderer();
+        let barrier = ReviewInputBarrier::default();
+        let mut widget = widget(&peer, "palette-return", barrier.clone(), true, true);
+        widget.on_shortcut = None;
+        let mut tree = Tree::new(&widget as &dyn Widget<Message, Theme, Renderer>);
+        let initial = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            // A logical Enter does not establish which physical Enter was used.
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::NumpadEnter),
+            location: keyboard::Location::Numpad,
+            modifiers: keyboard::Modifiers::empty(),
+            text: Some("\r".into()),
+            repeat: false,
+        };
+        let mut repeated = initial.clone();
+        if let keyboard::Event::KeyPressed { repeat, .. } = &mut repeated {
+            *repeat = true;
+        }
+        let release = keyboard::Event::KeyReleased {
+            key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::NumpadEnter),
+            location: keyboard::Location::Numpad,
+            modifiers: keyboard::Modifiers::empty(),
+        };
+        assert!(
+            !barrier.capture_activation(&repeated),
+            "a repeat cannot invent its original activation"
+        );
+        assert!(barrier.capture_activation(&initial));
+        assert!(
+            barrier.capture_activation(&initial),
+            "duplicate delivery must not create a second held-key entry"
+        );
+        let mut other_enter = initial.clone();
+        if let keyboard::Event::KeyPressed { physical_key, .. } = &mut other_enter {
+            *physical_key = keyboard::key::Physical::Code(keyboard::key::Code::Enter);
+        }
+        assert!(
+            !barrier.consume_keyboard(&other_enter),
+            "ownership uses the actual physical event, not its logical name"
+        );
+        // The palette, not this terminal widget, saw and consumed the first press.
+        widget.review_active = false;
+        widget.suppress_focus_reports = false;
+        widget.review_revision += 1;
+        tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
+        assert!(!reviewing(&tree));
+        if release_in_palette {
+            assert!(barrier.consume_keyboard(&repeated));
+            assert!(barrier.consume_keyboard(&release));
+            assert!(
+                !barrier.consume_keyboard(&release),
+                "cleanup is complete after one physical release"
+            );
+        } else {
+            dispatch(&mut widget, &mut tree, &renderer, Event::Keyboard(repeated));
+            dispatch(
+                &mut widget,
+                &mut tree,
+                &renderer,
+                Event::Keyboard(release.clone()),
+            );
+        }
+        assert!(!barrier.owns_keyboard(&Event::Keyboard(initial.clone())));
+        assert_no_pty_input(&peer.fence());
+        // Restoring native terminal focus must admit a genuinely fresh press.
+        let node = layout::Node::new(Size::new(640.0, 320.0));
+        let mut focus = operation::focusable::focus::<()>(widget.id.clone().unwrap());
+        widget.operate(&mut tree, Layout::new(&node), &renderer, &mut focus);
+        dispatch(&mut widget, &mut tree, &renderer, Event::Keyboard(initial));
+        dispatch(&mut widget, &mut tree, &renderer, Event::Keyboard(release));
+        assert_eq!(
+            peer.fence()
+                .iter()
+                .filter(|r| matches!(r, ClientRequest::Key { .. }))
+                .count(),
+            2,
+            "fresh Enter press/release works after barrier cleanup"
+        );
+    }
+}
+
+#[test]
+fn temporary_palette_cover_restores_same_revision_review_owner_without_typing() {
+    let peer = Peer::new();
+    let renderer = renderer();
+    let mut widget = widget(
+        &peer,
+        "covered-review",
+        ReviewInputBarrier::default(),
+        true,
+        true,
+    );
+    widget.on_shortcut = None;
+    let mut tree = Tree::new(&widget as &dyn Widget<Message, Theme, Renderer>);
+    let node = layout::Node::new(Size::new(640.0, 320.0));
+    widget.a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+    assert!(reviewing(&tree));
+    let revision = widget.review_revision;
+    widget.model_focused = false;
+    tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        Event::Window(window::Event::RedrawRequested(Instant::now())),
+    );
+    assert!(
+        !reviewing(&tree),
+        "covered terminal is not the current text focus"
+    );
+    widget.model_focused = true;
+    tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
+    assert_eq!(
+        widget.review_revision, revision,
+        "closing a palette need not change review owner"
+    );
+    assert!(
+        reviewing(&tree),
+        "same authoritative owner resumes review when uncovered"
+    );
+    let nodes = widget.a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+    assert!(
+        nodes.root()[0]
+            .node()
+            .description()
+            .unwrap()
+            .contains("Review mode; typing is blocked")
+    );
+    for down in [true, false] {
+        assert!(
+            dispatch(
+                &mut widget,
+                &mut tree,
+                &renderer,
+                key(
+                    keyboard::key::Named::Enter,
+                    keyboard::key::Code::Enter,
+                    down
+                )
+            )
+            .is_empty()
+        );
+    }
+    assert_no_pty_input(&peer.fence());
+    assert_eq!(
+        click_review(&mut widget, &mut tree, &renderer),
+        vec![Message::Review(false)]
+    );
+    tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
+    assert!(
+        !reviewing(&tree),
+        "an explicit pending local exit still wins over a true model view"
+    );
+}
+
+#[test]
+fn tracked_palette_consumed_navigation_stays_out_of_terminal_after_review_return() {
+    use cosmic::iced::runtime::core::keyboard::input::{self, PressCycle, Source, Transition};
+    for (key, code) in [
+        (
+            keyboard::Key::Named(keyboard::key::Named::ArrowDown),
+            keyboard::key::Code::ArrowDown,
+        ),
+        (
+            keyboard::Key::Named(keyboard::key::Named::Home),
+            keyboard::key::Code::Home,
+        ),
+        (
+            keyboard::Key::Named(keyboard::key::Named::Tab),
+            keyboard::key::Code::Tab,
+        ),
+        (
+            keyboard::Key::Character("q".into()),
+            keyboard::key::Code::KeyQ,
+        ),
+        (
+            keyboard::Key::Named(keyboard::key::Named::Space),
+            keyboard::key::Code::Space,
+        ),
+    ] {
+        let peer = Peer::new();
+        let renderer = renderer();
+        let barrier = ReviewInputBarrier::default();
+        let mut widget = widget(
+            &peer,
+            "palette-held-navigation",
+            barrier.clone(),
+            true,
+            true,
+        );
+        widget.on_shortcut = None;
+        let mut tree = Tree::new(&widget as &dyn Widget<Message, Theme, Renderer>);
+        let press = keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key.clone(),
+            physical_key: keyboard::key::Physical::Code(code),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        };
+        let mut repeated = press.clone();
+        if let keyboard::Event::KeyPressed { repeat, .. } = &mut repeated {
+            *repeat = true;
+        }
+        let release = keyboard::Event::KeyReleased {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: keyboard::key::Physical::Code(code),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+        };
+        let cycle = PressCycle::new(keyboard::key::Physical::Code(code));
+        let source = Source::tracked(cycle.clone(), Transition::Press);
+        {
+            let _native = input::scope(source.clone());
+            assert!(barrier.capture_consumed_key(&press));
+            assert!(
+                barrier.capture_consumed_key(&repeated),
+                "native editor/list repeats remain accepted"
+            );
+        }
+        // Return to terminal input uses the same real widget/tree and barrier.
+        widget.review_active = false;
+        widget.suppress_focus_reports = false;
+        widget.review_revision += 1;
+        tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
+        assert!(!reviewing(&tree));
+        {
+            let _native = input::scope(source);
+            dispatch(&mut widget, &mut tree, &renderer, Event::Keyboard(repeated));
+        }
+        cycle.release();
+        {
+            let _native = input::scope(Source::tracked(cycle, Transition::Release));
+            dispatch(
+                &mut widget,
+                &mut tree,
+                &renderer,
+                Event::Keyboard(release.clone()),
+            );
+        }
+        assert_no_pty_input(&peer.fence());
+        let node = layout::Node::new(Size::new(640.0, 320.0));
+        widget.operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(widget.id.clone().unwrap()),
+        );
+        let fresh = PressCycle::new(keyboard::key::Physical::Code(code));
+        {
+            let _native = input::scope(Source::tracked(fresh.clone(), Transition::Press));
+            dispatch(&mut widget, &mut tree, &renderer, Event::Keyboard(press));
+        }
+        fresh.release();
+        {
+            let _native = input::scope(Source::tracked(fresh, Transition::Release));
+            dispatch(&mut widget, &mut tree, &renderer, Event::Keyboard(release));
+        }
+        assert_eq!(
+            peer.fence()
+                .iter()
+                .filter(|r| matches!(r, ClientRequest::Key { .. }))
+                .count(),
+            2,
+            "fresh press/release reaches real hosted widget after owned cycle retires"
+        );
+    }
+}
+
+#[test]
+fn tracked_old_app_release_cannot_retire_successor_before_real_widget_wire_admission() {
+    use cosmic::iced::runtime::core::keyboard::input::{self, PressCycle, Source, Transition};
+    let peer = Peer::new();
+    let renderer = renderer();
+    let barrier = ReviewInputBarrier::default();
+    let mut widget = widget(&peer, "palette-p1-r1-p2", barrier.clone(), true, true);
+    widget.on_shortcut = None;
+    let mut tree = Tree::new(&widget as &dyn Widget<Message, Theme, Renderer>);
+    let press = keyboard::Event::KeyPressed {
+        key: keyboard::Key::Named(keyboard::key::Named::Enter),
+        modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+        location: keyboard::Location::Standard,
+        modifiers: keyboard::Modifiers::empty(),
+        text: Some("\r".into()),
+        repeat: false,
+    };
+    let release = keyboard::Event::KeyReleased {
+        key: keyboard::Key::Named(keyboard::key::Named::Enter),
+        modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+        location: keyboard::Location::Standard,
+        modifiers: keyboard::Modifiers::empty(),
+    };
+    let first = PressCycle::new(keyboard::key::Physical::Code(keyboard::key::Code::Enter));
+    first.release();
+    let second = PressCycle::new(keyboard::key::Physical::Code(keyboard::key::Code::Enter));
+    {
+        let _native = input::scope(Source::tracked(first.clone(), Transition::Press));
+        assert!(barrier.claim_native_activation(&press));
+    }
+    assert!(barrier.consume_keyboard_with_source(
+        &release,
+        &Source::tracked(first.clone(), Transition::Release)
+    ));
+    {
+        let _native = input::scope(Source::tracked(second.clone(), Transition::Press));
+        assert!(barrier.claim_native_activation(&press));
+    }
+    // Delayed App R1 after native P2 must not erase physical successor ownership.
+    assert!(
+        !barrier
+            .consume_keyboard_with_source(&release, &Source::tracked(first, Transition::Release))
+    );
+    widget.review_active = false;
+    widget.suppress_focus_reports = false;
+    widget.review_revision += 1;
+    tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
+    {
+        let _native = input::scope(Source::tracked(second.clone(), Transition::Press));
+        dispatch(
+            &mut widget,
+            &mut tree,
+            &renderer,
+            Event::Keyboard(press.clone()),
+        );
+    }
+    second.release();
+    {
+        let _native = input::scope(Source::tracked(second, Transition::Release));
+        dispatch(&mut widget, &mut tree, &renderer, Event::Keyboard(release));
+    }
+    assert_no_pty_input(&peer.fence());
+}

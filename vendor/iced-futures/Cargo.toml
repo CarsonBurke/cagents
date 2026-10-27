@@ -1,0 +1,35 @@
+[package]
+name = "iced_futures"
+version = "0.14.0"
+edition = "2024"
+authors = ["Héctor Ramón Jiménez <hector@hecrj.dev>"]
+license = "MIT"
+repository = "https://github.com/iced-rs/iced"
+homepage = "https://iced.rs"
+categories = ["gui"]
+keywords = ["gui", "ui", "graphics", "interface", "widgets"]
+description = "Commands, subscriptions, and future executors for iced"
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
+all-features = true
+
+[workspace]
+
+[features]
+thread-pool = ["futures/thread-pool"]
+a11y = ["iced_core/a11y"]
+
+[dependencies]
+iced_core = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d" }
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+log = "0.4"
+rustc-hash = "2.0"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+smol = { version = "2", optional = true }
+tokio = { version = "1.0", optional = true, features = ["rt", "rt-multi-thread", "time"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"
+wasmtimer = "0.4.2"

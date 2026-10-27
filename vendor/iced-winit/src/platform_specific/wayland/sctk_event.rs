@@ -343,7 +343,7 @@ impl SctkEvent {
         control_sender: &mut mpsc::UnboundedSender<Control>,
         proxy: &EventLoopProxy,
         user_interfaces: &mut UserInterfaces<'a, P>,
-        events: &mut Vec<(Option<window::Id>, iced_runtime::core::Event)>,
+        events: &mut crate::input_source::NativeEvents,
         clipboard: &mut Clipboard,
         subsurface_state: &mut Option<SubsurfaceState>,
         create_compositor_data: CreateCompositor<'b, P>,

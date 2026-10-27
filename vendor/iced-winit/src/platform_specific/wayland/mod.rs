@@ -170,7 +170,7 @@ impl WaylandSpecific {
     pub(crate) async fn handle_event<'a, 'b, P>(
         &mut self,
         e: SctkEvent,
-        events: &mut Vec<(Option<window::Id>, iced_runtime::core::Event)>,
+        events: &mut crate::input_source::NativeEvents,
         program: &'a crate::program::Instance<P>,
         compositor: &mut Option<
             <<P as Program>::Renderer as compositor::Default>::Compositor,

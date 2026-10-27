@@ -4524,6 +4524,11 @@ pub enum Message {
         result: Result<PullRequestCreationOutcome, String>,
     },
     CancelDialog,
+    TaggedKeyEvent {
+        event: keyboard::Event,
+        captured: bool,
+        source: cosmic::iced::runtime::core::keyboard::input::Source,
+    },
     KeyEvent {
         event: keyboard::Event,
         /// Whether a widget already consumed this keystroke. The shell's
@@ -9810,7 +9815,7 @@ impl Cagents {
                         .width_settled(self.workspace.width_is_settled(id))
                         .on_context(move |point, selection, link| {
                             Message::TerminalFind(terminal_ui::Action::Context(
-                                id, point, selection, link,
+                                id, terminal, point, selection, link,
                             ))
                         })
                         .on_paste(move |text| {
@@ -14139,6 +14144,18 @@ impl Application for Cagents {
             Message::UtilityPaneUi(message) => (*message, true),
             message => (message, false),
         };
+        // Explicit App Source; never install delayed App input in Native TLS.
+        let (message, key_source) = match message {
+            Message::TaggedKeyEvent {
+                event,
+                captured,
+                source,
+            } => (Message::KeyEvent { event, captured }, source),
+            message => (
+                message,
+                cosmic::iced::runtime::core::keyboard::input::Source::default(),
+            ),
+        };
         let notice_control = self.notice_control_severity();
         let attention_scope_changed = matches!(
             &message,
@@ -14151,6 +14168,12 @@ impl Application for Cagents {
         // through the lightweight visibility/presence postlude below.
         #[rustfmt::skip]
         let task = (|| {
+        if let Message::KeyEvent { event, .. } = &message
+            && matches!(event, keyboard::Event::KeyReleased { .. } | keyboard::Event::KeyPressed { repeat: true, .. })
+            && self.terminal_review_input.consume_keyboard_with_source(event, &key_source)
+        {
+            return Task::none();
+        }
         if pane_origin && self.channel_work_is_main() {
             return Task::none();
         }
@@ -16820,6 +16843,7 @@ impl Application for Cagents {
                 }
             },
             Message::CancelDialog => self.cancel_form_dialog(),
+            Message::TaggedKeyEvent { .. } => unreachable!("normalized at update entry"),
             Message::KeyEvent { event, captured } => {
                 if let keyboard::Event::KeyPressed { key: keyboard::Key::Character(key), modifiers, .. } = &event
                     && modifiers.command() && (key.eq_ignore_ascii_case("c") || key.eq_ignore_ascii_case("x"))
@@ -16922,7 +16946,7 @@ impl Application for Cagents {
                     }
                     return Task::none();
                 }
-                if let Some(task) = self.palette_key_event(&event) {
+                if let Some(task) = self.palette_key_event_with_source(&event, &key_source) {
                     return task;
                 }
                 if let Some(task) = self.chrome_key_event(&event) {
@@ -17756,29 +17780,32 @@ impl Application for Cagents {
                     },
                 },
             }),
-            event::listen_with(|event, status, event_window| match event {
-                iced::Event::Keyboard(event) => Some(Message::KeyEvent {
-                    event,
-                    captured: matches!(status, event::Status::Captured),
-                }),
-                iced::Event::Window(window::Event::Rescaled(scale_factor)) => {
-                    Some(Message::WindowScaleFactorChanged(scale_factor))
-                }
-                iced::Event::Window(window::Event::CloseRequested) => {
-                    Some(Message::WindowCloseRequested(event_window))
-                }
-                iced::Event::Window(window::Event::Closed) => {
-                    Some(Message::WindowClosed(event_window))
-                }
-                iced::Event::Window(window::Event::Focused) => Some(Message::RefreshUi(
-                    refresh_ui::Action::Focused(event_window, true),
-                )),
-                iced::Event::Window(window::Event::Unfocused) => Some(Message::RefreshUi(
-                    refresh_ui::Action::Focused(event_window, false),
-                )),
-                iced::Event::Window(event) => window_geometry_message(&event),
-                _ => None,
-            }),
+            cosmic::iced::runtime::futures::event::listen_with_source(
+                |event, status, event_window, source| match event {
+                    iced::Event::Keyboard(event) => Some(Message::TaggedKeyEvent {
+                        source,
+                        event,
+                        captured: matches!(status, event::Status::Captured),
+                    }),
+                    iced::Event::Window(window::Event::Rescaled(scale_factor)) => {
+                        Some(Message::WindowScaleFactorChanged(scale_factor))
+                    }
+                    iced::Event::Window(window::Event::CloseRequested) => {
+                        Some(Message::WindowCloseRequested(event_window))
+                    }
+                    iced::Event::Window(window::Event::Closed) => {
+                        Some(Message::WindowClosed(event_window))
+                    }
+                    iced::Event::Window(window::Event::Focused) => Some(Message::RefreshUi(
+                        refresh_ui::Action::Focused(event_window, true),
+                    )),
+                    iced::Event::Window(window::Event::Unfocused) => Some(Message::RefreshUi(
+                        refresh_ui::Action::Focused(event_window, false),
+                    )),
+                    iced::Event::Window(event) => window_geometry_message(&event),
+                    _ => None,
+                },
+            ),
         ];
         if let Some(session) = &self.session {
             subscriptions.push(

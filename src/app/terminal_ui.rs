@@ -10,11 +10,15 @@ pub enum Action {
     Focus(CardId, bool),
     Context(
         CardId,
+        crate::model::TerminalId,
         iced::Point,
         Option<crate::terminal::SearchMatch>,
         Option<Url>,
     ),
     DismissContext(CardId),
+    Review(CardId, crate::model::TerminalId, bool),
+    ReviewFromMenu(CardId, crate::model::TerminalId, u64, bool),
+    ReviewKeyConsumed(CardId),
     Copy(CardId, String),
     CopySelection(CardId, crate::terminal::SearchMatch),
     PasteClipboard(CardId),
@@ -28,6 +32,451 @@ pub enum Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn review_context_captures_origin_and_rejects_queued_successor_actions() {
+        let (mut app, card, directory) = super::super::tests::live_agent_app("review-menu-fixture");
+        let terminal = match app.cards.get(&card).unwrap() {
+            CardRuntime::Terminal(handle) => handle.terminal_id(),
+            _ => unreachable!(),
+        };
+        drop(app.handle_terminal_find(Action::Context(
+            card,
+            terminal,
+            iced::Point::ORIGIN,
+            None,
+            None,
+        )));
+        assert_eq!(app.terminal_context.as_ref().unwrap().terminal, terminal);
+        let message = super::super::dialog_ui::tests::enter_control(
+            app.terminal_menu(card).unwrap(),
+            review_id(card, terminal, app.terminal_review_revision, true),
+        );
+        let Message::TerminalFind(Action::ReviewFromMenu(target, origin, revision, true)) = message
+        else {
+            panic!("the actual menu control must retain its exact review target");
+        };
+        assert_eq!((target, origin), (card, terminal));
+        drop(app.handle_terminal_find(Action::ReviewFromMenu(target, origin, revision, true)));
+        assert_eq!(app.terminal_review_card, Some(card));
+        assert!(app.terminal_context.is_none());
+        drop(app.handle_terminal_find(Action::Review(card, terminal, false)));
+        assert_eq!(app.terminal_review_card, None);
+        drop(app.handle_terminal_find(Action::Context(
+            card,
+            terminal,
+            iced::Point::ORIGIN,
+            None,
+            None,
+        )));
+        let replacement = crate::model::TerminalId::new();
+        app.cards.insert(
+            card,
+            CardRuntime::Terminal(super::super::tests::unconnected_surface(
+                directory.path(),
+                replacement,
+            )),
+        );
+        drop(app.handle_terminal_find(Action::Review(card, terminal, true)));
+        assert_eq!(app.terminal_review_card, None);
+        assert!(
+            app.terminal_context.is_none(),
+            "a stale menu closes without affecting the successor"
+        );
+        drop(app.handle_terminal_find(Action::Context(
+            card,
+            terminal,
+            iced::Point::ORIGIN,
+            None,
+            None,
+        )));
+        assert!(
+            app.terminal_context.is_none(),
+            "a queued old-widget gesture cannot create a successor menu"
+        );
+        drop(app.handle_terminal_find(Action::Context(
+            card,
+            replacement,
+            iced::Point::ORIGIN,
+            None,
+            None,
+        )));
+        assert_eq!(app.terminal_context.as_ref().unwrap().terminal, replacement);
+        drop(app.handle_terminal_find(Action::Review(card, replacement, true)));
+        assert_eq!(app.terminal_review_card, Some(card));
+    }
+
+    #[test]
+    fn stale_open_review_menu_keyboard_return_owns_activation_until_release() {
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout,
+            widget::{Tree, operation},
+        };
+        for key in [
+            keyboard::Key::Named(keyboard::key::Named::Enter),
+            keyboard::Key::Character(" ".into()),
+        ] {
+            for release_before_dispatch in [false, true] {
+                let (mut app, card, _directory) =
+                    super::super::tests::live_agent_app("review-menu-key-fixture");
+                let terminal = match app.cards.get(&card).unwrap() {
+                    CardRuntime::Terminal(handle) => handle.terminal_id(),
+                    _ => unreachable!(),
+                };
+                drop(app.handle_terminal_find(Action::Context(
+                    card,
+                    terminal,
+                    iced::Point::ORIGIN,
+                    None,
+                    None,
+                )));
+                // The menu was already open when AT/model entry activated review.
+                drop(app.update(Message::TerminalReviewMode {
+                    card,
+                    terminal,
+                    active: true,
+                }));
+                assert!(app.terminal_context.is_some());
+                let barrier = app.terminal_review_input.clone();
+                let renderer = super::super::tests::headless_renderer();
+                let mut menu = app.terminal_menu(card).unwrap();
+                let mut tree = Tree::new(&menu);
+                let bounds = iced::Rectangle::with_size(iced::Size::new(400.0, 500.0));
+                let node = menu.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, bounds.size()),
+                );
+                menu.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut operation::focusable::focus::<()>(review_id(
+                        card,
+                        terminal,
+                        app.terminal_review_revision,
+                        false,
+                    )),
+                );
+                let physical_key = keyboard::key::Physical::Code(
+                    if matches!(&key, keyboard::Key::Named(keyboard::key::Named::Enter)) {
+                        keyboard::key::Code::NumpadEnter
+                    } else {
+                        keyboard::key::Code::Space
+                    },
+                );
+                let modifiers = if matches!(&key, keyboard::Key::Named(keyboard::key::Named::Enter))
+                {
+                    keyboard::Modifiers::CTRL
+                } else {
+                    keyboard::Modifiers::empty()
+                };
+                let initial = keyboard::Event::KeyPressed {
+                    key: key.clone(),
+                    modified_key: key.clone(),
+                    physical_key,
+                    location: keyboard::Location::Standard,
+                    modifiers,
+                    text: None,
+                    repeat: false,
+                };
+                let release = keyboard::Event::KeyReleased {
+                    key: key.clone(),
+                    modified_key: key.clone(),
+                    physical_key,
+                    location: keyboard::Location::Standard,
+                    modifiers,
+                };
+                let mut repeat = initial.clone();
+                if let keyboard::Event::KeyPressed { repeat, .. } = &mut repeat {
+                    *repeat = true;
+                }
+                if matches!(&key, keyboard::Key::Character(value) if value == " ") {
+                    let mut modified = initial.clone();
+                    if let keyboard::Event::KeyPressed { modifiers, .. } = &mut modified {
+                        *modifiers = keyboard::Modifiers::CTRL;
+                    }
+                    let mut blocked_messages = Vec::new();
+                    // This modified Space must not be promoted to a review command.
+                    menu.as_widget_mut().update(
+                        &mut tree,
+                        &iced::Event::Keyboard(modified),
+                        Layout::new(&node),
+                        iced::mouse::Cursor::Unavailable,
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut Shell::new(&mut blocked_messages),
+                        &bounds,
+                    );
+                    assert!(
+                        !blocked_messages.iter().any(|m| matches!(
+                            m,
+                            Message::TerminalFind(Action::ReviewFromMenu(..))
+                        ))
+                    );
+                    assert!(!barrier.owns_keyboard(&iced::Event::Keyboard(initial.clone())));
+                }
+                let mut dispatch = |event| {
+                    let mut messages = Vec::new();
+                    let mut shell = Shell::new(&mut messages);
+                    menu.as_widget_mut().update(
+                        &mut tree,
+                        &iced::Event::Keyboard(event),
+                        Layout::new(&node),
+                        iced::mouse::Cursor::Unavailable,
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut shell,
+                        &bounds,
+                    );
+                    assert!(
+                        shell.is_event_captured(),
+                        "owned menu activation/repeat/release must stop before terminal input"
+                    );
+                    messages
+                };
+                let mut messages = dispatch(initial.clone());
+                assert_eq!(messages.len(), 1);
+                assert!(
+                    matches!(messages.pop().unwrap(), Message::TerminalFind(Action::ReviewFromMenu(target, origin, _, false)) if target == card && origin == terminal)
+                );
+                assert!(barrier.owns_keyboard(&iced::Event::Keyboard(initial.clone())));
+                if release_before_dispatch {
+                    for event in [repeat.clone(), release.clone()] {
+                        assert!(
+                            matches!(dispatch(event).as_slice(), [Message::TerminalFind(Action::ReviewKeyConsumed(target))] if *target == card)
+                        );
+                    }
+                    // A fresh activation of the retained row works after release.
+                    assert!(matches!(
+                        dispatch(initial.clone()).as_slice(),
+                        [Message::TerminalFind(Action::ReviewFromMenu(
+                            _,
+                            _,
+                            _,
+                            false
+                        ))]
+                    ));
+                    dispatch(release.clone());
+                }
+                drop(dispatch);
+                drop(menu);
+                drop(app.handle_terminal_find(Action::Review(card, terminal, false)));
+                assert_eq!(app.terminal_review_card, None);
+                assert!(app.terminal_context.is_none());
+                if !release_before_dispatch {
+                    // With the menu retired, the same shared barrier is still
+                    // owned by the retained terminal (real wire case in its tests).
+                    assert!(barrier.consume_keyboard(&repeat));
+                    assert!(barrier.consume_keyboard(&release));
+                }
+                assert!(!barrier.owns_keyboard(&iced::Event::Keyboard(initial.clone())));
+                assert!(
+                    !barrier.consume_keyboard(&initial),
+                    "fresh physical press is no longer suppressed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn review_menu_retires_held_pointer_when_context_mode_or_revision_changes() {
+        use iced::advanced::clipboard;
+        use iced::runtime::{UserInterface, user_interface::Cache};
+        fn frame(
+            app: &Cagents,
+            card: CardId,
+            renderer: &mut cosmic::Renderer,
+            cache: &mut Cache,
+            event: impl FnOnce(iced_accessibility::accesskit::NodeId) -> iced::Event,
+        ) -> (Vec<Message>, iced_accessibility::accesskit::NodeId) {
+            let mut ui = UserInterface::build(
+                app.terminal_menu(card).unwrap(),
+                iced::Size::new(400.0, 500.0),
+                std::mem::replace(cache, Cache::new()),
+                renderer,
+            );
+            let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+            let target = iced_accessibility::A11yId::from(review_id(
+                card,
+                app.terminal_context.as_ref().unwrap().terminal,
+                app.terminal_review_revision,
+                app.terminal_review_card != Some(card),
+            ));
+            let node = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|node| iced_accessibility::IdEq::eq(node.id(), &target))
+                .unwrap();
+            let advertised = node.id().clone().into();
+            let bounds = node.node().bounds().unwrap();
+            let pointer = iced::Point::new(
+                ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+            );
+            let mut messages = Vec::new();
+            let _ = ui.update(
+                &[event(advertised)],
+                iced::mouse::Cursor::Available(pointer),
+                renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            *cache = ui.into_cache();
+            (messages, advertised)
+        }
+        let mut renderer = super::super::tests::headless_renderer();
+        for changed in ["unchanged", "mode", "revision", "terminal"] {
+            let (mut app, card, directory) =
+                super::super::tests::live_agent_app("review-held-menu-fixture");
+            let terminal = match app.cards.get(&card).unwrap() {
+                CardRuntime::Terminal(handle) => handle.terminal_id(),
+                _ => unreachable!(),
+            };
+            drop(app.handle_terminal_find(Action::Context(
+                card,
+                terminal,
+                iced::Point::ORIGIN,
+                None,
+                None,
+            )));
+            let mut cache = Cache::new();
+            let (messages, old_target) = frame(&app, card, &mut renderer, &mut cache, |_| {
+                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left))
+            });
+            assert!(messages.is_empty());
+            match changed {
+                "mode" => {
+                    drop(app.update(Message::TerminalReviewMode {
+                        card,
+                        terminal,
+                        active: true,
+                    }));
+                }
+                "revision" => {
+                    // Same final label/mode, but a different authoritative request.
+                    drop(app.update(Message::TerminalReviewMode {
+                        card,
+                        terminal,
+                        active: true,
+                    }));
+                    drop(app.update(Message::TerminalReviewMode {
+                        card,
+                        terminal,
+                        active: false,
+                    }));
+                }
+                "terminal" => {
+                    let successor = crate::model::TerminalId::new();
+                    app.cards.insert(
+                        card,
+                        CardRuntime::Terminal(super::super::tests::unconnected_surface(
+                            directory.path(),
+                            successor,
+                        )),
+                    );
+                    drop(app.handle_terminal_find(Action::Context(
+                        card,
+                        successor,
+                        iced::Point::ORIGIN,
+                        None,
+                        None,
+                    )));
+                }
+                _ => {}
+            }
+            let (messages, _) = frame(&app, card, &mut renderer, &mut cache, |_| {
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                ))
+            });
+            if changed == "unchanged" {
+                assert!(
+                    matches!(messages.as_slice(), [Message::TerminalFind(Action::ReviewFromMenu(target, origin, _, true))] if *target == card && *origin == terminal),
+                    "unchanged native press/release must still work"
+                );
+            } else {
+                assert!(
+                    messages.is_empty(),
+                    "held pointer must not migrate to a changed menu action: {changed}"
+                );
+            }
+            if changed != "unchanged" {
+                let stale = iced::Event::A11y(
+                    widget::Id::from(old_target.0),
+                    iced_accessibility::accesskit::ActionRequest {
+                        action: iced_accessibility::accesskit::Action::Click,
+                        target_tree: iced_accessibility::accesskit::TreeId::ROOT,
+                        target_node: old_target,
+                        data: None,
+                    },
+                );
+                assert!(
+                    frame(&app, card, &mut renderer, &mut cache, |_| stale)
+                        .0
+                        .is_empty(),
+                    "the old advertised native action ID cannot invoke the new mode"
+                );
+            }
+            let (activated, _) = frame(&app, card, &mut renderer, &mut cache, |current_target| {
+                iced::Event::A11y(
+                    widget::Id::from(current_target.0),
+                    iced_accessibility::accesskit::ActionRequest {
+                        action: iced_accessibility::accesskit::Action::Click,
+                        target_tree: iced_accessibility::accesskit::TreeId::ROOT,
+                        target_node: current_target,
+                        data: None,
+                    },
+                )
+            });
+            let current_terminal = app.terminal_context.as_ref().unwrap().terminal;
+            let current_revision = app.terminal_review_revision;
+            let current_active = app.terminal_review_card != Some(card);
+            assert!(
+                matches!(activated.as_slice(), [Message::TerminalFind(Action::ReviewFromMenu(target, origin, revision, active))]
+                    if *target == card && *origin == current_terminal && *revision == current_revision && *active == current_active),
+                "the exact currently advertised native action must remain usable: {changed}"
+            );
+            assert!(
+                frame(&app, card, &mut renderer, &mut cache, |_| {
+                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left))
+                })
+                .0
+                .is_empty()
+            );
+            let (mut fresh, _) = frame(&app, card, &mut renderer, &mut cache, |_| {
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                ))
+            });
+            assert_eq!(
+                fresh.len(),
+                1,
+                "a fresh click must work after retiring the old native state"
+            );
+            let Message::TerminalFind(action @ Action::ReviewFromMenu(..)) = fresh.pop().unwrap()
+            else {
+                panic!("expected current review command")
+            };
+            // Even a fully released callback can be queued across a new model
+            // revision. The reducer must not undo that new external mode.
+            let next_owner = if app.terminal_review_card == Some(card) {
+                None
+            } else {
+                Some(card)
+            };
+            app.set_terminal_review_owner(next_owner);
+            let revision = app.terminal_review_revision;
+            drop(app.handle_terminal_find(action));
+            assert_eq!(app.terminal_review_card, next_owner);
+            assert_eq!(app.terminal_review_revision, revision);
+            assert!(
+                app.terminal_context.is_some(),
+                "stale callback must not dismiss the current context"
+            );
+        }
+    }
+
     #[test]
     fn closed_find_rejects_delayed_results_for_its_current_request() {
         let mut app = super::super::tests::context_inspector_test_app(false);
@@ -530,6 +979,7 @@ impl Find {
 
 pub(super) struct Context {
     pub card: CardId,
+    terminal: crate::model::TerminalId,
     pub selection: Option<crate::terminal::SearchMatch>,
     pub link: Option<Url>,
     pub point: iced::Point,
@@ -537,6 +987,17 @@ pub(super) struct Context {
 
 fn input_id(card: CardId) -> iced::widget::Id {
     iced::widget::Id::from(format!("terminal-find-{card}"))
+}
+
+fn review_id(
+    card: CardId,
+    terminal: crate::model::TerminalId,
+    revision: u64,
+    active: bool,
+) -> iced::widget::Id {
+    iced::widget::Id::new(format!(
+        "terminal-review-{card}-{terminal}-{revision}-{active}"
+    ))
 }
 
 impl Cagents {
@@ -573,6 +1034,9 @@ impl Cagents {
             | Action::Focus(card, _)
             | Action::Context(card, ..)
             | Action::DismissContext(card)
+            | Action::Review(card, ..)
+            | Action::ReviewFromMenu(card, ..)
+            | Action::ReviewKeyConsumed(card)
             | Action::Copy(card, _)
             | Action::CopySelection(card, _)
             | Action::PasteClipboard(card)
@@ -607,9 +1071,13 @@ impl Cagents {
                 }
                 return Task::none();
             }
-            Action::Context(_, point, selection, link) => {
+            Action::Context(_, terminal, point, selection, link) => {
+                if handle.terminal_id() != terminal {
+                    return Task::none();
+                }
                 self.terminal_context = Some(Context {
                     card,
+                    terminal,
                     selection,
                     link,
                     point,
@@ -620,6 +1088,37 @@ impl Cagents {
                 self.terminal_context = None;
                 return Task::none();
             }
+            Action::ReviewFromMenu(_, terminal, revision, active) => {
+                if self.terminal_review_revision != revision
+                    || (self.terminal_review_card != Some(card)) != active
+                    || !self
+                        .terminal_context
+                        .as_ref()
+                        .is_some_and(|context| context.card == card && context.terminal == terminal)
+                {
+                    return Task::none();
+                }
+                return self.handle_terminal_find(Action::Review(card, terminal, active));
+            }
+            Action::Review(_, terminal, active) => {
+                if handle.terminal_id() != terminal {
+                    if self
+                        .terminal_context
+                        .as_ref()
+                        .is_some_and(|context| context.card == card && context.terminal == terminal)
+                    {
+                        self.terminal_context = None;
+                    }
+                    return Task::none();
+                }
+                self.terminal_context = None;
+                return self.update(Message::TerminalReviewMode {
+                    card,
+                    terminal,
+                    active,
+                });
+            }
+            Action::ReviewKeyConsumed(_) => return Task::none(),
             Action::Copy(_, text) => {
                 self.terminal_context = None;
                 chat_ui::invalidate_copy_intent();
@@ -905,6 +1404,58 @@ impl Cagents {
         items.push(command("Select all", Action::SelectAll(card)));
         items.push(command("Clear scrollback", Action::Clear(card)));
         items.push(command("Find…", Action::Open(card)));
+        let active = self.terminal_review_card != Some(card);
+        let revision = self.terminal_review_revision;
+        let review = Message::TerminalFind(Action::ReviewFromMenu(
+            card,
+            context.terminal,
+            revision,
+            active,
+        ));
+        let barrier = self.terminal_review_input.clone();
+        items.push(crate::ui_controls::owned(
+            (card, context.terminal, revision, active),
+            crate::interaction::focused_key(
+                widget::button::text(if self.terminal_review_card == Some(card) {
+                    "Return to terminal input"
+                } else {
+                    "Review visible text"
+                })
+                .id(review_id(card, context.terminal, revision, active))
+                .width(Length::Fill)
+                .on_press(review.clone()),
+                move |event| {
+                    if let keyboard::Event::KeyPressed {
+                        key,
+                        modifiers,
+                        repeat: false,
+                        ..
+                    } = event
+                    {
+                        let space = modifiers.is_empty()
+                            && matches!(
+                                key.as_ref(),
+                                keyboard::Key::Named(keyboard::key::Named::Space)
+                                    | keyboard::Key::Character(" ")
+                            );
+                        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Enter)) || space
+                        {
+                            if !barrier.claim_native_activation(event) {
+                                return Some(Message::TerminalFind(Action::ReviewKeyConsumed(
+                                    card,
+                                )));
+                            }
+                            // COSMIC buttons activate Enter natively. Space is an
+                            // equivalent command, including Linux character Space.
+                            if space {
+                                return Some(review.clone());
+                            }
+                        }
+                    }
+                    None
+                },
+            ),
+        ));
         if let Some(link) = &context.link {
             items.push(
                 widget::button::text(if link.scheme() == "file" {
@@ -925,11 +1476,15 @@ impl Cagents {
                 Action::Copy(card, link.as_str().to_owned()),
             ));
         }
-        Some(
-            widget::column::with_children(items)
-                .width(Length::Fixed(200.0))
-                .into(),
-        )
+        let barrier = self.terminal_review_input.clone();
+        Some(crate::interaction::focused_key(
+            widget::column::with_children(items).width(Length::Fixed(200.0)),
+            move |event| {
+                barrier
+                    .consume_keyboard(event)
+                    .then_some(Message::TerminalFind(Action::ReviewKeyConsumed(card)))
+            },
+        ))
     }
 
     pub(super) fn terminal_paste_dialog(&self) -> Option<Element<'_, Message>> {
