@@ -7760,6 +7760,13 @@ impl Cagents {
             self.release_draft_start_capture(target.card);
             return Task::none();
         }
+        if self.shared_chat_creation_revoked(target.card) {
+            self.release_draft_start_capture(target.card);
+            if let Some(runtime) = self.chat_card_runtime_mut(target) {
+                runtime.error = Some("This pane was closed or its creation was refused. Your draft is retained; nothing was started.".into());
+            }
+            return Task::none();
+        }
         if !message_matches || self.modal_is_open() {
             self.release_draft_start_capture(target.card);
             if let Some(runtime) = self.chat_card_runtime_mut(target) {

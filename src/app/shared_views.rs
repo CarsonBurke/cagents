@@ -835,6 +835,17 @@ impl Cagents {
         });
     }
 
+    /// Passive retention preserves work, but cannot authorize a provider start
+    /// after another client retired the pane or the registry refused creation.
+    pub(super) fn shared_chat_creation_revoked(&self, card: CardId) -> bool {
+        self.shared_views.retained.contains(&card)
+            || self
+                .workspace_model
+                .views
+                .iter()
+                .any(|view| view.retired.contains(&card))
+    }
+
     /// An automatic empty composer has no shared descriptor yet. Once it has
     /// work, establish its one creation intent before an empty snapshot can
     /// mistake that unpublished source for a pane removed by another window.
@@ -4941,7 +4952,7 @@ mod tests {
             assert!(!app.shared_views.retained.contains(&card));
         }
         let edits = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
-        let [(operation, pane)] = edits
+        let [(operation, pane)]: [(uuid::Uuid, Pane); 1] = edits
             .iter()
             .filter_map(|edit| match edit {
                 ModelEdit::ChangeView {
@@ -4971,33 +4982,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn first_start_empty_view_does_not_convert_creation_to_local_only() {
-        let (mut app, channel, card, target, receiver) = unpublished_default_chat();
-        let directory = tempfile::tempdir().unwrap();
-        let (writer, _) = crate::session::SessionRuntime::open(
-            directory.path().join("state.sqlite3"),
-            crate::model::BootId::new("first-send-view"),
-        )
-        .unwrap();
-        app.session = Some(writer);
-        compose_default_chat(&mut app, target);
-        // First publish A, then Send, then an empty snapshot while the save
-        // receipt is waiting. This used to project A over the new runtime B.
-        drop(app.reconcile_shared_views());
-        let source = match &app.card_state(card).unwrap().kind {
-            CardKind::Chat(session) => session.clone(),
-            _ => unreachable!(),
-        };
-        let save = app.handle_chat_ui(super::super::chat_ui::Action::Submit(
-            target,
-            crate::chat::PromptMode::Send,
-        ));
-        assert!(app.chat_start_pending(card));
-        drop(app.reconcile_shared_views());
-        assert!(!app.durable.local_only_cards.contains(&card));
-        assert!(app.card_state(card).unwrap().existence.is_open());
-        let completion = std::thread::spawn(move || {
+    fn first_start_save_completion(save: Task<Message>) -> super::super::chat_ui::Action {
+        std::thread::spawn(move || {
             use cosmic::iced::futures::StreamExt;
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -5027,7 +5013,36 @@ mod tests {
                 })
         })
         .join()
+        .unwrap()
+    }
+
+    #[test]
+    fn first_start_empty_view_does_not_convert_creation_to_local_only() {
+        let (mut app, channel, card, target, receiver) = unpublished_default_chat();
+        let directory = tempfile::tempdir().unwrap();
+        let (writer, _) = crate::session::SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("first-send-view"),
+        )
         .unwrap();
+        app.session = Some(writer);
+        compose_default_chat(&mut app, target);
+        // First publish A, then Send, then an empty snapshot while the save
+        // receipt is waiting. This used to project A over the new runtime B.
+        drop(app.reconcile_shared_views());
+        let source = match &app.card_state(card).unwrap().kind {
+            CardKind::Chat(session) => session.clone(),
+            _ => unreachable!(),
+        };
+        let save = app.handle_chat_ui(super::super::chat_ui::Action::Submit(
+            target,
+            crate::chat::PromptMode::Send,
+        ));
+        assert!(app.chat_start_pending(card));
+        drop(app.reconcile_shared_views());
+        assert!(!app.durable.local_only_cards.contains(&card));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        let completion = first_start_save_completion(save);
         assert!(matches!(
             &completion,
             super::super::chat_ui::Action::DraftStartCheckpointed(_, _, Ok(()))
@@ -5061,6 +5076,67 @@ mod tests {
             ModelEdit::ChangeView { change: Change::Update { before, pane }, .. }
                 if pane.id == card && before.kind == CardKind::Chat(source.clone()) && pane.kind == CardKind::Chat(candidate.clone()))));
         drop(provider);
+    }
+
+    #[test]
+    fn first_start_receipt_cannot_start_after_creation_refusal_or_retirement() {
+        for refused in [false, true] {
+            let (mut app, _, card, target, receiver) = unpublished_default_chat();
+            let directory = tempfile::tempdir().unwrap();
+            let (writer, _) = crate::session::SessionRuntime::open(
+                directory.path().join("state.sqlite3"),
+                crate::model::BootId::new("first-send-revoked"),
+            )
+            .unwrap();
+            app.session = Some(writer);
+            compose_default_chat(&mut app, target);
+            drop(app.reconcile_shared_views());
+            let operation = std::iter::from_fn(|| receiver.try_recv().ok())
+                .find_map(|edit| match edit {
+                    ModelEdit::ChangeView {
+                        operation,
+                        change: Change::Insert { pane, .. },
+                        ..
+                    } if pane.id == card => Some(operation),
+                    _ => None,
+                })
+                .unwrap();
+            let save = app.handle_chat_ui(super::super::chat_ui::Action::Submit(
+                target,
+                crate::chat::PromptMode::Send,
+            ));
+            assert!(app.chat_start_pending(card));
+            if refused {
+                app.shared_views.refused(operation);
+            } else {
+                app.workspace_model.views[0].retired.push(card);
+            }
+            drop(app.reconcile_shared_views());
+            let completion = first_start_save_completion(save);
+            assert!(matches!(
+                &completion,
+                super::super::chat_ui::Action::DraftStartCheckpointed(_, _, Ok(()))
+            ));
+            let start = app.handle_chat_ui(completion);
+            assert!(
+                cosmic::iced::runtime::task::into_stream(start).is_none(),
+                "revoked creation must emit no provider Task"
+            );
+            assert!(!app.chat_start_pending(card));
+            assert!(
+                matches!(&app.card_state(card).unwrap().kind, CardKind::Chat(session) if session.is_unstarted())
+            );
+            let saved = app.persistent_workspace();
+            assert_eq!(
+                saved.chat_drafts.get(&card).map(String::as_str),
+                Some("first message")
+            );
+            assert!(saved.local_only_cards.contains(&card));
+            assert!(
+                receiver.try_recv().is_err(),
+                "revoked creation must not be recreated"
+            );
+        }
     }
 
     #[test]
