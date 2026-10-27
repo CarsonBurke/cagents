@@ -426,26 +426,33 @@ fn retained_startup_blocks_absence_but_keeps_exact_live_attachments_inspectable(
 }
 
 #[test]
-fn an_issued_unknown_exit_is_not_promoted_to_a_live_surface() {
+fn an_issued_unknown_exit_is_saved_ready_only_after_fresh_post_gate_confirmation() {
     let (_, _, source) = fixture();
+    let before = source.clone();
     let result = inspect_inventory(&source, &[descriptor(source.clone())], &proof(), || {
-        panic!("the exact completed descriptor still permits an inspection attachment")
+        Ok(vec![descriptor(source.clone())])
     })
-    .unwrap()
     .unwrap();
-    assert_eq!(result, source);
-    assert!(matches!(
-        result.continuity,
-        TerminalContinuity::RelaunchAvailable {
-            last_exit: None,
-            ..
-        }
-    ));
     assert!(
-        !terminal_ended(&result),
-        "issued completion evidence does not manufacture an exit record"
+        result.is_none(),
+        "saved readiness never mounts the completed surface"
     );
-    assert!(surface_attachment_allowed(&result).is_err());
+    assert_eq!(source, before);
+    assert!(!terminal_ended(&source), "no exit record was manufactured");
+    assert!(surface_attachment_allowed(&source).is_err());
+    assert!(
+        inspect_inventory(&source, &[descriptor(source.clone())], &proof(), || {
+            Err("retained startup ownership".into())
+        })
+        .is_err()
+    );
+    assert!(
+        inspect_inventory(&source, &[descriptor(source.clone())], &proof(), || {
+            Ok(vec![])
+        })
+        .is_err(),
+        "the exact completed record must still exist after readiness"
+    );
 }
 
 #[test]
@@ -598,4 +605,54 @@ fn transcript_context_is_bound_to_the_saved_nonce_source_and_selected_endpoint()
         current.resume_hint = Some("new-source".into());
     }
     assert!(app.saved_terminal_transcript_context(card).is_none());
+}
+
+#[test]
+fn post_gate_inventory_cannot_hide_an_owner_published_during_startup() {
+    let (_, _, source) = fixture();
+    let live = exact_live(&source);
+    assert!(
+        inspect_inventory(&source, &[], &proof(), || {
+            Ok(vec![descriptor(live.clone())])
+        })
+        .is_err(),
+        "pre-gate absence cannot override newly published live ownership"
+    );
+    assert_eq!(
+        inspect_inventory(&source, &[], &proof(), || Ok(vec![])).unwrap(),
+        None
+    );
+    let saved = exact_live(&source);
+    let mut descendant = live;
+    descendant.id = TerminalId::new();
+    descendant.recovery_origin = Some(source.id);
+    assert!(
+        confirm_disconnected(&saved, None, &[descriptor(descendant)], &proof()).is_err(),
+        "an unused replay plan cannot hide a newly published descendant"
+    );
+}
+
+#[test]
+fn confirmed_completed_saved_state_refuses_changed_source_lineage_or_incomplete_proof() {
+    let (_, _, source) = fixture();
+    let mut changed = source.clone();
+    changed.resume_hint = Some("changed-after-readiness".into());
+    assert!(
+        confirm_disconnected(&source, Some(&source), &[descriptor(changed)], &proof()).is_err()
+    );
+    let mut descendant = exact_live(&source);
+    descendant.id = TerminalId::new();
+    descendant.recovery_origin = Some(source.id);
+    assert!(
+        confirm_disconnected(
+            &source,
+            Some(&source),
+            &[descriptor(source.clone()), descriptor(descendant)],
+            &proof()
+        )
+        .is_err()
+    );
+    let mut incomplete = proof();
+    incomplete.boot_id = crate::model::BootId::new("");
+    assert!(confirm_disconnected(&source, None, &[], &incomplete).is_err());
 }

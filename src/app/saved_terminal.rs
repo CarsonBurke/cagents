@@ -150,8 +150,8 @@ fn current_host_attachment(
 
 /// The current surface reducer has no read-only completion witness apart from
 /// an actual exit record. Attaching unknown-exit completion would promote it to
-/// Live on the first host-proof wake. Preserve it as actionable uncertainty
-/// until that separate readable-completion contract exists; never invent exit 0.
+/// Live on the first host-proof wake. Keep it in the saved presentation after
+/// confirmed read-only inventory instead; never mount it or invent exit 0.
 fn surface_attachment_allowed(session: &TerminalSession) -> Result<(), String> {
     if matches!(
         session.continuity,
@@ -167,20 +167,60 @@ fn surface_attachment_allowed(session: &TerminalSession) -> Result<(), String> {
     Ok(())
 }
 
-/// An exact issued attachment is inspectable while other startup recovery is
-/// blocked. Only absence needs positive admission readiness; a failed check
-/// must never turn a partial inventory into disconnected-pane success.
+/// A readiness-sensitive decision must use inventory obtained after BuildInfo.
+/// A changed or newly published related owner is uncertainty, never absence.
+fn confirm_disconnected(
+    source: &TerminalSession,
+    selected_completed: Option<&TerminalSession>,
+    terminals: &[crate::terminal::ipc::TerminalDescriptor],
+    proof: &HostSessionProof,
+) -> Result<(), String> {
+    if !proof.is_complete() {
+        return Err("The terminal service did not confirm its identity".into());
+    }
+    let origin = source.recovery_origin.unwrap_or(source.id);
+    if let Some(expected) = selected_completed {
+        let selected = attachment(expected, terminals, proof)?;
+        if selected.as_ref() != Some(expected) {
+            return Err(
+                "The completed terminal changed while checking recovery; reconnect again".into(),
+            );
+        }
+    }
+    if terminals.iter().any(|terminal| {
+        Some(terminal.session.id) != selected_completed.map(|session| session.id)
+            && (terminal.session.id == source.id
+                || terminal.session.recovery_origin == Some(origin)
+                || terminal
+                    .upgrade_sources
+                    .iter()
+                    .any(|previous| previous.id == source.id))
+    }) {
+        return Err("Terminal ownership changed while checking recovery; reconnect again".into());
+    }
+    Ok(())
+}
+
+/// Exact live/known-exit attachments do not require general startup readiness.
+/// Unknown-exit completion stays a saved pane, without mounting a surface or
+/// inventing an exit. Both that decision and absence require fresh post-gate
+/// inventory on the same authenticated client, never a partial pre-gate list.
 fn inspect_inventory(
     source: &TerminalSession,
     terminals: &[crate::terminal::ipc::TerminalDescriptor],
     proof: &HostSessionProof,
-    ready: impl FnOnce() -> Result<(), String>,
+    ready_inventory: impl FnOnce() -> Result<Vec<crate::terminal::ipc::TerminalDescriptor>, String>,
 ) -> Result<Option<TerminalSession>, String> {
     let selected = attachment(source, terminals, proof)?;
-    if selected.is_none() {
-        ready()?;
+    if selected
+        .as_ref()
+        .is_some_and(|session| surface_attachment_allowed(session).is_ok())
+    {
+        return Ok(selected);
     }
-    Ok(selected)
+    let refreshed = ready_inventory()?;
+    confirm_disconnected(source, selected.as_ref(), &refreshed, proof)?;
+    Ok(None)
 }
 
 /// Keep the captured endpoint through the actual attachment, not just its
@@ -426,6 +466,12 @@ impl Cagents {
                     let proof = client.proof().clone();
                     let terminals = client.list().map_err(|error| error.to_string())?;
                     if let Some(session) = current_host_attachment(&source, &terminals, &proof)? {
+                        if surface_attachment_allowed(&session).is_err() {
+                            client.daemon_version().map_err(|error| error.to_string())?;
+                            let refreshed = client.list().map_err(|error| error.to_string())?;
+                            confirm_disconnected(&source, Some(&session), &refreshed, &proof)?;
+                            return Ok(None);
+                        }
                         return attach_existing(
                             card,
                             daemon_recovery::RecoveredTerminal {
@@ -451,6 +497,18 @@ impl Cagents {
                                 | TerminalContinuity::DetachedSameBoot { .. }
                         ) || recovered.attach_completed
                         {
+                            if surface_attachment_allowed(&recovered.session).is_err() {
+                                client.daemon_version().map_err(|error| error.to_string())?;
+                                let refreshed = client.list().map_err(|error| error.to_string())?;
+                                confirm_disconnected(
+                                    &source,
+                                    Some(&recovered.session),
+                                    &refreshed,
+                                    &proof,
+                                )?;
+                                drop(recovered);
+                                return Ok(None);
+                            }
                             return attach_existing(card, recovered, socket, proof, sender)
                                 .map(Some);
                         }
@@ -459,6 +517,8 @@ impl Cagents {
                         // Confirm admission readiness on the same proof-pinned
                         // client while the existing recovery lease is held.
                         client.daemon_version().map_err(|error| error.to_string())?;
+                        let refreshed = client.list().map_err(|error| error.to_string())?;
+                        confirm_disconnected(&source, None, &refreshed, &proof)?;
                         // This is an unused, normally authorized replay plan.
                         // Retain the ORIGINAL descriptor, never its derived ID,
                         // recipe, hints or transcript path. Dropping it releases
@@ -467,10 +527,8 @@ impl Cagents {
                         return Ok(None);
                     }
                     let selected = inspect_inventory(&source, &terminals, &proof, || {
-                        client
-                            .daemon_version()
-                            .map(|_| ())
-                            .map_err(|error| error.to_string())
+                        client.daemon_version().map_err(|error| error.to_string())?;
+                        client.list().map_err(|error| error.to_string())
                     })?;
                     let Some(session) = selected else {
                         return Ok(None);
