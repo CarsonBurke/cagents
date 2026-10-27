@@ -169,7 +169,10 @@ impl cosmic::Application for Window {
             Message::Observed(snapshot) => {
                 self.polling = false;
                 self.snapshot = snapshot;
-                if !self.working && self.follow.observe(&self.snapshot) {
+                if self
+                    .follow
+                    .observe_when_ready(&self.snapshot, !self.working)
+                {
                     self.open()
                 } else {
                     cosmic::app::Task::none()

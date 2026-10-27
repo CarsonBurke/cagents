@@ -179,6 +179,11 @@ impl Follow {
         self.auto_opened = true;
     }
     pub fn observe(&mut self, snapshot: &Snapshot) -> bool {
+        self.observe_when_ready(snapshot, true)
+    }
+    fn observe_when_ready(&mut self, snapshot: &Snapshot, ready: bool) -> bool {
+        // Focus and diagnostics may defer reopening, but cannot hide an
+        // observed operation change or the first leased operation.
         if self.operation_changed {
             return false;
         }
@@ -196,7 +201,11 @@ impl Follow {
             {
                 self.active = Some(job.id.clone());
             }
-            if snapshot.finished() && self.active.as_deref() == Some(&job.id) && !self.auto_opened {
+            if ready
+                && snapshot.finished()
+                && self.active.as_deref() == Some(&job.id)
+                && !self.auto_opened
+            {
                 self.auto_opened = true;
                 return true;
             }

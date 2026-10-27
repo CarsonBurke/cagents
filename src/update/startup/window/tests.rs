@@ -269,3 +269,90 @@ fn diagnostic_details_are_historical_fixed_categories_without_private_records() 
             && !summary.contains("123")
     );
 }
+
+fn observed_operation(id: &str, complete: bool) -> Snapshot {
+    use super::super::{Job, LockState};
+    Snapshot {
+        installation_lock: if complete {
+            LockState::Free
+        } else {
+            LockState::Held
+        },
+        helper_lock: if complete {
+            LockState::Free
+        } else {
+            LockState::Held
+        },
+        job: Some(Job {
+            id: id.into(),
+            version: Some("1.2.4".into()),
+            phase: if complete {
+                crate::update::UpdatePhase::Complete
+            } else {
+                crate::update::UpdatePhase::Installing
+            },
+            waiting: 0,
+            blocked: 0,
+            daemon_timeout: false,
+        }),
+    }
+}
+
+#[test]
+fn operation_change_observed_during_focus_or_diagnostics_still_requires_explicit_open() {
+    for diagnostics in [false, true] {
+        let mut state = window(false);
+        drop(state.update(Message::Observed(observed_operation("original", false))));
+        drop(state.update(if diagnostics {
+            Message::Diagnostics
+        } else {
+            Message::Focus
+        }));
+        assert!(state.working);
+        drop(state.update(Message::Observed(observed_operation("replacement", false))));
+        drop(state.update(if diagnostics {
+            Message::Diagnosed("Historical startup evidence".into())
+        } else {
+            Message::Focused(Ok(false))
+        }));
+        drop(state.update(Message::Observed(observed_operation("original", true))));
+        assert!(
+            !state.working && !state.follow.auto_opened,
+            "busy actions must not hide an observed replacement operation"
+        );
+        // The permanent automatic-return fence retains deliberate recovery.
+        drop(state.update(Message::Open));
+        assert!(state.working && state.follow.auto_opened);
+        // Tasks are deliberately unpolled: callback/state proof, no launcher.
+    }
+}
+
+#[test]
+fn first_leased_operation_observed_while_busy_returns_once_after_the_action_finishes() {
+    for diagnostics in [false, true] {
+        let mut state = window(false);
+        drop(state.update(if diagnostics {
+            Message::Diagnostics
+        } else {
+            Message::Focus
+        }));
+        drop(state.update(Message::Observed(observed_operation("original", false))));
+        drop(state.update(Message::Observed(observed_operation("original", true))));
+        assert!(state.working && !state.follow.auto_opened);
+        drop(state.update(if diagnostics {
+            Message::Diagnosed("Historical startup evidence".into())
+        } else {
+            Message::Focused(Ok(false))
+        }));
+        assert!(!state.working && !state.follow.auto_opened);
+        drop(state.update(Message::Observed(observed_operation("original", true))));
+        assert!(state.working && state.follow.auto_opened);
+        drop(state.update(Message::Opened(Err("Fixture launch failure"))));
+        drop(state.update(Message::Observed(observed_operation("original", true))));
+        assert!(
+            !state.working && state.follow.auto_opened,
+            "a failed automatic launch must leave explicit retry, not a retry loop"
+        );
+        // Tasks are deliberately unpolled: callback/state proof, no launcher.
+    }
+}
