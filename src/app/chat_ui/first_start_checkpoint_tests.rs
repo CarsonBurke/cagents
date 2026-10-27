@@ -699,3 +699,199 @@ fn saved_first_prompt_keeps_exact_whitespace_and_original_images_before_later_ed
         );
     }
 }
+/// Reducer/real-writer regression only. The fixture supplies Ready and the
+/// provider receipt; provider futures are never polled. Native Claude is a
+/// separate acceptance requirement.
+#[test]
+fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
+    use crate::app::workspace_model_sync::ModelUpdate;
+    use crate::workspace_model::{
+        ModelChannel, ModelEdit,
+        views::{Change, Pane, Scope, View},
+    };
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let directory = tempfile::tempdir().unwrap();
+    let repository = directory.path().to_path_buf();
+    let project = crate::model::ProjectId::new();
+    app.sidebar_model
+        .projects
+        .push(crate::sidebar::SidebarProject::new(
+            project,
+            crate::model::RepositoryId::new(),
+            "First send".into(),
+            repository.clone(),
+            vec![],
+            vec![],
+        ));
+    let channel = crate::model::ChannelId::new();
+    Arc::make_mut(&mut app.durable)
+        .channels
+        .push(crate::model::ProjectChannel {
+            id: channel,
+            project_id: project,
+            title: String::new(),
+            title_source: Default::default(),
+            ordinal: 1,
+            shared: true,
+            cards: vec![],
+            focused: None,
+        });
+    Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+    app.active_workspace = Some(repository.clone());
+    app.workspace_model.identity = uuid::Uuid::new_v4();
+    app.workspace_model.sequence = 1;
+    app.workspace_model.channels.push(ModelChannel {
+        id: channel,
+        repository: repository.clone(),
+        title: String::new(),
+        title_source: Default::default(),
+        ordinal: 1,
+    });
+    app.workspace_model.views.push(View {
+        revision: 1,
+        ..View::empty(channel)
+    });
+    let scope = Scope::Channel(channel);
+    app.acknowledge_view_edit(scope.clone(), None);
+    let (sender, published) = async_channel::unbounded();
+    app.workspace_model_tx = sender;
+    let (writer, _) = crate::session::SessionRuntime::open(
+        directory.path().join("state.sqlite3"),
+        crate::model::BootId::new("first-acceptance-view"),
+    )
+    .unwrap();
+    app.session = Some(writer);
+    drop(app.new_native_chat_with_lifetime(Provider::Claude, Some(repository), true));
+    let card = app.workspace.focused().unwrap();
+    let target = runtime(&app, card).target;
+    assert!(app.chat_is_unused_default(card));
+    let empty = app.workspace_model.clone();
+    drop(app.handle_chat_ui(Action::Composer(
+        target,
+        text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(
+            "one original prompt".into(),
+        ))),
+    )));
+    drop(app.apply_workspace_model_update(ModelUpdate::Read(empty.clone())));
+    let save = app.handle_chat_ui(Action::Submit(target, PromptMode::Send));
+    drop(app.apply_workspace_model_update(ModelUpdate::Read(empty.clone())));
+    let (target, attempt, result) = checkpoint(save);
+    assert!(result.is_ok());
+    drop(app.handle_chat_ui(Action::DraftStartCheckpointed(target, attempt, result)));
+    let attempt = app.chat_ui.attempt(card).unwrap();
+    let target = attempt.target;
+    let mut session = attempt.session.clone();
+    session.proof = Some(crate::model::HostSessionProof {
+        host_session_id: "first-send-host".into(),
+        boot_id: "first-send-boot".into(),
+        host_incarnation: "first-send-incarnation".into(),
+    });
+    let actor = session.id;
+    let handle = Arc::new(ClientHandle::fixture(
+        session,
+        Snapshot {
+            ready: true,
+            session_id: Some("first-send-native-thread".into()),
+            ..Snapshot::default()
+        },
+    ));
+    drop(app.handle_chat_ui(Action::Ready(
+        target,
+        Ready(Arc::new(Mutex::new(Some(Ok(handle.clone()))))),
+    )));
+    let pending = runtime(&app, card).pending.as_ref().unwrap();
+    assert_eq!(pending.queued, Some(QueuedStep::Prompt));
+    assert_eq!(pending.sent.as_deref(), Some("one original prompt"));
+    let command = pending.id;
+    drop(app.apply_workspace_model_update(ModelUpdate::Read(empty.clone())));
+    assert_eq!(runtime(&app, card).pending.as_ref().unwrap().id, command);
+    handle.replace_snapshot_for_test(Snapshot {
+        ready: true,
+        busy: true,
+        session_id: Some("first-send-native-thread".into()),
+        items: vec![Arc::new(chat::Item {
+            id: "original-user-item".into(),
+            role: chat::Role::User,
+            content: chat::ItemContent::Text {
+                text: "one original prompt".into(),
+                thinking: false,
+                phase: Default::default(),
+            },
+            started_at: None,
+            at: None,
+        })],
+        ..Snapshot::default()
+    });
+    drop(app.handle_chat_ui(Action::CommandFinished(target, command, Ok(()))));
+    assert!(runtime(&app, card).pending.is_none());
+    assert!(runtime(&app, card).queued.is_none());
+    assert!(!app.shared_chat_has_local_work(card));
+    // This is the second failure predicate: the first command no longer
+    // protects the pane, and the provider is still busy with the original turn.
+    drop(app.apply_workspace_model_update(ModelUpdate::Read(empty.clone())));
+    drop(app.handle_chat_ui(Action::CommandFinished(target, command, Ok(()))));
+    drop(app.apply_workspace_model_update(ModelUpdate::Read(empty)));
+    let current = runtime(&app, card);
+    assert!(Arc::ptr_eq(current.handle().unwrap(), &handle));
+    assert_eq!(current.session.id, actor);
+    assert_eq!(
+        current.session.launch.session_id.as_deref(),
+        Some("first-send-native-thread")
+    );
+    assert!(current.snapshot.busy);
+    assert_eq!(
+        current
+            .snapshot
+            .items
+            .iter()
+            .filter(|item| item.role == chat::Role::User)
+            .count(),
+        1
+    );
+    assert!(current.pending.is_none() && current.queued.is_none());
+    assert!(app.card_state(card).unwrap().existence.is_open());
+    assert_eq!(app.workspace.focused(), Some(card));
+    let saved = app.persistent_workspace();
+    assert!(!saved.local_only_cards.contains(&card));
+    assert_eq!(
+        saved
+            .channels
+            .iter()
+            .find(|entry| entry.id == channel)
+            .unwrap()
+            .cards,
+        vec![card]
+    );
+    let edits = std::iter::from_fn(|| published.try_recv().ok()).collect::<Vec<_>>();
+    assert_eq!(edits.iter().filter(|edit| matches!(edit, ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. } if pane.id == card)).count(), 1);
+    assert!(!edits.iter().any(|edit| matches!(edit, ModelEdit::ChangeView { change: Change::Remove { id }, .. } if *id == card)));
+    let pane = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+    let mut accepted = app.workspace_model.clone();
+    accepted.sequence += 1;
+    accepted.views[0].panes = vec![pane];
+    accepted.views[0].revision += 1;
+    for edit in edits {
+        if let ModelEdit::ChangeView { operation, .. } = edit {
+            drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+                scope: scope.clone(),
+                operation: Some(operation),
+                model: accepted.clone(),
+            }));
+        }
+    }
+    app.session
+        .as_ref()
+        .unwrap()
+        .flush(Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(stored(&app, card).id, actor);
+    assert_eq!(
+        stored(&app, card).launch.session_id.as_deref(),
+        Some("first-send-native-thread")
+    );
+    assert!(
+        !std::iter::from_fn(|| published.try_recv().ok()).any(|edit| matches!(edit,
+        ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. } if pane.id == card))
+    );
+    assert!(!app.chat_start_pending(card));
+}
