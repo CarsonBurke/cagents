@@ -3324,6 +3324,7 @@ mod tests {
 
     #[test]
     fn native_query_move_destination_preserves_captured_selection_and_emits_exact_model_transfer() {
+        use crate::model::{BrowserId, BrowserRestoreFidelity, BrowserSession};
         use crate::workspace_model::{
             ModelChannel, ModelEdit,
             views::{Change, Pane, Scope, View},

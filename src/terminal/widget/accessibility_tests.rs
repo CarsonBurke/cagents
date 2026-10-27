@@ -768,9 +768,9 @@ fn idle_terminal_has_full_grid_and_no_review_pointer_hotspot() {
         column: 0,
         shape: CursorShape::Block,
         color: Rgb {
-            r: 255,
-            g: 255,
-            b: 255,
+            red: 255,
+            green: 255,
+            blue: 255,
         },
         visible: true,
         blinking: false,
