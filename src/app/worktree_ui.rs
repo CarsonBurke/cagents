@@ -370,13 +370,19 @@ impl Cagents {
         let Some(path) = self.channel_directory(id) else {
             return Task::none();
         };
-        let channel = self
+        self.worktree_selection.cancel();
+        self.commit_channel_selection(id, path)
+    }
+
+    fn commit_channel_selection(&mut self, id: ChannelId, path: PathBuf) -> Task<Message> {
+        let Some(channel) = self
             .durable
             .channels
             .iter()
             .find(|channel| channel.id == id)
-            .expect("the channel directory resolved this same channel");
-        self.worktree_selection.cancel();
+        else {
+            return Task::none();
+        };
         if self.durable.active_channel == Some(id)
             && self.active_workspace.as_ref() == Some(&path)
             && self.workspace.order().eq(self
@@ -527,8 +533,8 @@ impl Cagents {
         }) {
             #[cfg(test)]
             terminal_output_tests::record_folder_root_refresh();
-            if self.worktree_selection.needs_reconciliation() {
-                // The active preparation's model fence will see this new
+            if self.uses_navigation_scheduler() {
+                // The bounded preparation's model fence will see this new
                 // boundary. Do not canonicalize a newly loaded Folder in the
                 // UI tail while that same filesystem worker may be stalled.
                 self.collect_worktree_roots();

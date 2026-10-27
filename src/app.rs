@@ -14842,13 +14842,8 @@ impl Application for Cagents {
                             // into distinct worktrees after session restoration.
                             // Only the project holding the scope can move it,
                             // and re-selecting resolves every card's owner.
-                            task = if self.worktree_selection.needs_reconciliation() {
-                                // An automatic reload must neither block input
-                                // nor supersede an accepted explicit selection.
-                                // Its new roots/rows invalidate that same worker's
-                                // snapshot before any scope/default-pane commit.
-                                self.collect_worktree_roots();
-                                Task::none()
+                            task = if self.uses_navigation_scheduler() {
+                                self.refresh_automatic_worktree_owners()
                             } else if let Some(channel) = self.durable.active_channel {
                                 self.select_channel(channel)
                             } else {
@@ -17674,8 +17669,13 @@ impl Application for Cagents {
         // recorded with this update rather than the next.
         self.reconcile_terminal_review_owner();
         let task = Task::batch([task, self.flush_settings_on_blur()]);
-        let task = if self.worktree_selection.needs_reconciliation() || navigation_completion {
-            Task::batch([task, self.reconcile_navigation_protections()])
+        let task = if self.uses_navigation_scheduler() {
+            if !terminal_metadata_unchanged || self.worktree_selection.needs_reconciliation() || navigation_completion {
+                // Collect newly arrived Folder/repository boundaries before
+                // deciding whether the one filesystem worker is needed.
+                self.collect_worktree_roots();
+                Task::batch([task, self.reconcile_navigation_protections()])
+            } else { task }
         } else {
             if !terminal_metadata_unchanged { self.sync_worktree_protections(); }
             task

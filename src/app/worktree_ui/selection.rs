@@ -16,6 +16,7 @@ pub(in crate::app) struct State {
     pending: Option<Request>,
     failed_sync: Option<(Vec<PathBuf>, Instant)>,
     owners_dirty: bool,
+    refresh_scope: bool,
     retired_readiness: Vec<Arc<crate::instance::OwnedLock>>,
     #[cfg(test)]
     local_window: bool,
@@ -53,6 +54,7 @@ impl State {
 
     pub(super) fn owners_refreshed(&mut self) {
         self.owners_dirty = false;
+        self.refresh_scope = false;
     }
 
     pub(in crate::app) fn cancel(&mut self) {
@@ -69,6 +71,8 @@ struct Request {
     path: Option<PathBuf>,
     create: bool,
     origin: Option<Origin>,
+    background: bool,
+    refresh_channel: Option<ChannelId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,6 +114,8 @@ struct Inputs {
     device: Option<(String, String, String)>,
     work: (bool, uuid::Uuid),
     default_pane: settings::DefaultPane,
+    scope: (Option<PathBuf>, Option<ChannelId>),
+    refresh_scope: bool,
 }
 
 impl Inputs {
@@ -155,6 +161,7 @@ impl Inputs {
         let mut protected = app.desired_worktree_protections();
         protected.sort();
         protected.dedup();
+        let refresh_scope = request.background && app.worktree_selection.refresh_scope;
         Self {
             request,
             roots,
@@ -164,6 +171,8 @@ impl Inputs {
             window: app.core.main_window_id(),
             work: (app.channel_work_is_main(), app.channel_home_generation()),
             default_pane: app.settings.default_worktree_pane,
+            scope: (app.active_workspace.clone(), app.durable.active_channel),
+            refresh_scope,
             device: crate::device::selected().map(|device| {
                 (
                     device.name.clone(),
@@ -656,16 +665,29 @@ fn prepare(
 }
 
 impl Cagents {
+    pub(in crate::app) fn uses_navigation_scheduler(&self) -> bool {
+        let local = crate::instance::window_is_initialized() && !crate::device::is_remote();
+        #[cfg(test)]
+        let local = local || self.worktree_selection.local_window;
+        local
+    }
+
+    pub(super) fn refresh_automatic_worktree_owners(&mut self) -> Task<Message> {
+        self.collect_worktree_roots();
+        self.worktree_selection.refresh_scope = true;
+        self.navigation_owners_changed();
+        // This is background reconciliation, never a newer user navigation.
+        // An explicit active/pending selection keeps its intent and priority.
+        self.reconcile_navigation_protections()
+    }
+
     pub(in crate::app) fn navigate_worktree(
         &mut self,
         path: PathBuf,
         create: bool,
         origin: Option<Origin>,
     ) -> Task<Message> {
-        let local = crate::instance::window_is_initialized() && !crate::device::is_remote();
-        #[cfg(test)]
-        let local = local || self.worktree_selection.local_window;
-        if !local {
+        if !self.uses_navigation_scheduler() {
             return self.select_worktree(path, create);
         }
         self.worktree_selection.cancel();
@@ -674,6 +696,8 @@ impl Cagents {
             path: Some(path),
             create,
             origin,
+            background: false,
+            refresh_channel: None,
         });
         self.dispatch_worktree_navigation()
     }
@@ -741,6 +765,8 @@ impl Cagents {
             path: None,
             create: false,
             origin: None,
+            background: true,
+            refresh_channel: None,
         });
         self.dispatch_worktree_navigation()
     }
@@ -753,9 +779,16 @@ impl Cagents {
             self.worktree_selection.cancel();
             return Task::none();
         }
-        let Some(request) = self.worktree_selection.pending.take() else {
+        let Some(mut request) = self.worktree_selection.pending.take() else {
             return Task::none();
         };
+        if request.background && self.worktree_selection.refresh_scope {
+            request.refresh_channel = self.durable.active_channel;
+            request.path = request
+                .refresh_channel
+                .and_then(|channel| self.channel_directory(channel))
+                .or_else(|| self.active_workspace.clone());
+        }
         if request.origin.as_ref().is_some_and(|origin| {
             !origin.current(self, request.path.as_deref().expect("navigation origin"))
         }) {
@@ -1041,8 +1074,13 @@ impl Cagents {
                                 self.worktree_owners = std::mem::take(&mut prepared.owners);
                                 self.worktree_selection.owners_refreshed();
                                 let task = if let Some(path) = &prepared.path {
-                                    let scope =
-                                        self.commit_worktree_selection(path.clone(), false).1;
+                                    let scope = if let Some(channel) =
+                                        prepared.inputs.request.refresh_channel
+                                    {
+                                        self.commit_channel_selection(channel, path.clone())
+                                    } else {
+                                        self.commit_worktree_selection(path.clone(), false).1
+                                    };
                                     let pane = if needs_default {
                                         match self.settings.default_worktree_pane {
                                             settings::DefaultPane::NativeChat => self
@@ -1683,6 +1721,227 @@ mod tests {
         );
     }
 
+    fn automatic_folder_load(app: &mut Cagents, project: ProjectId, path: &Path) -> Task<Message> {
+        app.repository_generations.insert(project, 1);
+        app.update(Message::RepositoryLoaded {
+            open_cards: false,
+            project_id: project,
+            generation: 1,
+            result: Ok(Box::new(LoadedRepository {
+                project: ProjectState {
+                    id: project,
+                    generation: 0,
+                    name: "background folder".into(),
+                    repository: path.to_owned(),
+                    kind: ProjectKind::Folder,
+                    existence: Existence::Open,
+                },
+                repository: None,
+                worktrees: Vec::new(),
+                github: GitHubAvailability::NotAssociated,
+                review_repository: None,
+                head_repositories: HashMap::new(),
+            })),
+        })
+    }
+
+    #[test]
+    fn inactive_repository_reload_prepares_owners_and_guards_without_blocking_input() {
+        let mut f = fixture();
+        let project = f
+            .app
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|project| project.repository == f.old)
+            .unwrap()
+            .id;
+        let reads = Arc::new(AtomicUsize::new(0));
+        let record = reads.clone();
+        f.app.worktree_selection.owner_read = Some(Arc::new(move || {
+            record.fetch_add(1, AtomicOrdering::SeqCst);
+        }));
+        let (entered, release, starts) = blocked(&mut f.app);
+        let task = automatic_folder_load(&mut f.app, project, &f.old);
+        let worker = std::thread::spawn(move || prepared(task));
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        no_effect(f.app.update(Message::SettingsSearchChanged(
+            "input while reload waits".into(),
+        )));
+        assert_eq!(f.app.settings_search, "input while reload waits");
+        assert_eq!(f.app.active_workspace.as_ref(), Some(&f.old));
+        assert_eq!(reads.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(starts.load(AtomicOrdering::SeqCst), 1);
+        release.send(()).unwrap();
+        let retirement = f.app.update(worker.join().unwrap());
+        no_effect(f.app.update(retired(retirement)));
+        assert_eq!(reads.load(AtomicOrdering::SeqCst), 0);
+        assert!(f.app.worktree_selection.active.is_none());
+        assert!(!f.app.worktree_selection.owners_dirty);
+        assert!(!f.app.worktree_selection.refresh_scope);
+    }
+
+    #[test]
+    fn due_protection_retry_uses_the_one_worker_without_ui_path_io() {
+        let mut f = fixture();
+        let ui = std::thread::current().id();
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let record = reads.clone();
+        f.app
+            .worktree_protections
+            .observe_navigation_io(Arc::new(move || {
+                record.lock().unwrap().push(std::thread::current().id());
+            }));
+        f.app.worktree_protections.expire_navigation_retry();
+        let (entered, release, starts) = blocked(&mut f.app);
+        let task = f
+            .app
+            .update(Message::SettingsSearchChanged("retry admitted".into()));
+        let worker = std::thread::spawn(move || prepared(task));
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        no_effect(
+            f.app
+                .update(Message::SettingsSearchChanged("still editable".into())),
+        );
+        assert_eq!(f.app.settings_search, "still editable");
+        assert_eq!(starts.load(AtomicOrdering::SeqCst), 1);
+        assert!(reads.lock().unwrap().is_empty());
+        release.send(()).unwrap();
+        let retirement = f.app.update(worker.join().unwrap());
+        no_effect(f.app.update(retired(retirement)));
+        assert!(!reads.lock().unwrap().is_empty());
+        assert!(reads.lock().unwrap().iter().all(|thread| *thread != ui));
+    }
+
+    #[test]
+    fn explicit_selection_supersedes_blocked_background_reload_without_a_second_worker() {
+        let mut f = fixture();
+        let project = f
+            .app
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|project| project.repository == f.old)
+            .unwrap()
+            .id;
+        let (entered, release, starts) = blocked(&mut f.app);
+        let task = automatic_folder_load(&mut f.app, project, &f.old);
+        let worker = std::thread::spawn(move || prepared(task));
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        no_effect(open(&mut f.app, &f.next));
+        assert_eq!(starts.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(f.app.active_workspace.as_ref(), Some(&f.old));
+        release.send(()).unwrap();
+        let retirement = f.app.update(worker.join().unwrap());
+        assert_eq!(f.app.active_workspace.as_ref(), Some(&f.old));
+        let next = f.app.update(retired(retirement));
+        let retirement = commit(&mut f.app, prepared(next), &f.next);
+        no_effect(f.app.update(retired(retirement)));
+        assert_eq!(f.app.active_workspace.as_ref(), Some(&f.next));
+        assert_eq!(starts.load(AtomicOrdering::SeqCst), 2);
+        assert!(!f.app.worktree_selection.refresh_scope);
+    }
+
+    #[test]
+    fn background_reload_preserves_current_channel_and_its_focused_pane() {
+        let mut f = fixture();
+        let project = f
+            .app
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|project| project.repository == f.old)
+            .unwrap()
+            .id;
+        let mut card = crate::app::tests::terminal_card_state();
+        let CardKind::Terminal(session) = &mut card.kind else {
+            unreachable!()
+        };
+        session.launch.working_directory = f.old.clone();
+        session.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: session.launch.clone(),
+            last_exit: None,
+        };
+        let focused = card.id;
+        let channel = ChannelId::new();
+        Arc::make_mut(&mut f.app.durable).cards.push(card);
+        Arc::make_mut(&mut f.app.durable)
+            .channels
+            .push(crate::model::ProjectChannel {
+                id: channel,
+                project_id: project,
+                title: "kept channel".into(),
+                title_source: Default::default(),
+                ordinal: 0,
+                shared: false,
+                cards: vec![focused],
+                focused: Some(focused),
+            });
+        f.app.cards.insert(focused, CardRuntime::Loading);
+        drop(f.app.select_channel(channel));
+        let generation = f.app.worktree_selection.generation;
+        let count = f.app.durable.cards.len();
+        let task = automatic_folder_load(&mut f.app, project, &f.old);
+        let retirement = f.app.update(prepared(task));
+        assert_eq!(f.app.durable.active_channel, Some(channel));
+        assert_eq!(f.app.active_workspace.as_ref(), Some(&f.old));
+        assert_eq!(f.app.workspace.focused(), Some(focused));
+        assert_eq!(f.app.worktree_selection.generation, generation);
+        assert_eq!(f.app.durable.cards.len(), count);
+        no_effect(f.app.update(retired(retirement)));
+    }
+
+    #[test]
+    fn background_discovery_promotes_loose_scope_without_rewriting_launch_or_focus() {
+        let mut f = fixture();
+        let parent = f.old.parent().unwrap().to_owned();
+        let project = f
+            .app
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|project| project.repository == f.old)
+            .unwrap()
+            .id;
+        // Before discovery the project is known, but has no owning root row.
+        let row = f
+            .app
+            .sidebar_model
+            .projects
+            .iter_mut()
+            .find(|p| p.id == project)
+            .unwrap();
+        row.kind = ProjectKind::Git;
+        row.repository = parent.clone();
+        f.app.known_worktree_roots.remove(&f.old);
+        let mut card = crate::app::tests::terminal_card_state();
+        let CardKind::Terminal(session) = &mut card.kind else {
+            unreachable!()
+        };
+        session.launch.working_directory = f.old.clone();
+        session.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: session.launch.clone(),
+            last_exit: None,
+        };
+        let launch = session.launch.clone();
+        let focused = card.id;
+        Arc::make_mut(&mut f.app.durable).cards.push(card);
+        f.app.cards.insert(focused, CardRuntime::Loading);
+        drop(f.app.select_worktree(f.old.clone(), false));
+        assert_eq!(f.app.worktree_owners[&focused], f.old);
+        assert_eq!(f.app.workspace.focused(), Some(focused));
+        let task = automatic_folder_load(&mut f.app, project, &parent);
+        let retirement = f.app.update(prepared(task));
+        assert_eq!(f.app.active_workspace.as_ref(), Some(&parent));
+        assert_eq!(f.app.worktree_owners[&focused], parent);
+        assert_eq!(f.app.workspace.focused(), Some(focused));
+        let CardKind::Terminal(session) = &f.app.card_state(focused).unwrap().kind else {
+            unreachable!()
+        };
+        assert_eq!(session.launch, launch);
+        no_effect(f.app.update(retired(retirement)));
+    }
+
     #[test]
     fn same_named_directory_replacement_after_acquisition_refuses_the_receipt() {
         let mut f = fixture();
@@ -1802,7 +2061,21 @@ mod tests {
 
     #[test]
     fn modal_deferred_close_cancels_metadata_without_ui_retirement_or_false_settlement() {
+        deferred_close(false);
+    }
+
+    #[test]
+    fn deferred_background_reload_close_retires_original_worker_without_a_scope_commit() {
+        deferred_close(true);
+    }
+
+    fn deferred_close(background: bool) {
         let mut f = fixture();
+        let protected = if background {
+            f.old.clone()
+        } else {
+            f.next.clone()
+        };
         let ui = std::thread::current().id();
         let (entered, receive) = crossbeam_channel::bounded(1);
         let (release, wait) = crossbeam_channel::bounded(1);
@@ -1815,7 +2088,20 @@ mod tests {
         f.app.worktree_selection.after_retire = Some(Arc::new(move || {
             observed.lock().unwrap().push(std::thread::current().id());
         }));
-        let message = prepared(f.app.navigate_worktree(f.next.clone(), false, None));
+        let task = if background {
+            let project = f
+                .app
+                .sidebar_model
+                .projects
+                .iter()
+                .find(|project| project.repository == f.old)
+                .unwrap()
+                .id;
+            automatic_folder_load(&mut f.app, project, &f.old)
+        } else {
+            f.app.navigate_worktree(f.next.clone(), false, None)
+        };
+        let message = prepared(task);
         let Message::WorktreeNavigationPrepared { receipt, .. } = &message else {
             unreachable!()
         };
@@ -1826,7 +2112,7 @@ mod tests {
         f.app.settings_reset_confirm = true;
         no_effect(f.app.update(message));
         assert_eq!(f.app.deferred_navigation.len(), 1);
-        assert!(crate::worktree_cleanup::fixture_protection(&f.runtime, &f.next, true).is_err());
+        assert!(crate::worktree_cleanup::fixture_protection(&f.runtime, &protected, true).is_err());
         drop(f.app); // No close-policy hook: the ordinary field teardown cancels metadata.
         let retirement_thread = receive.recv_timeout(Duration::from_secs(3)).unwrap();
         assert_ne!(retirement_thread, ui);
@@ -1838,12 +2124,12 @@ mod tests {
         );
         assert!(shared.slot.lock().unwrap().result.is_some());
         assert!(retired_on.lock().unwrap().is_empty());
-        assert!(crate::worktree_cleanup::fixture_protection(&f.runtime, &f.next, true).is_err());
+        assert!(crate::worktree_cleanup::fixture_protection(&f.runtime, &protected, true).is_err());
         release.send(()).unwrap();
         executor().block_on(worker).unwrap();
         assert!(shared.slot.lock().unwrap().result.is_none());
         assert_eq!(*retired_on.lock().unwrap(), vec![retirement_thread]);
-        assert!(crate::worktree_cleanup::fixture_protection(&f.runtime, &f.next, true).is_ok());
+        assert!(crate::worktree_cleanup::fixture_protection(&f.runtime, &protected, true).is_ok());
     }
 
     #[test]
