@@ -4273,7 +4273,7 @@ pub enum SidebarAction {
     ChangePage {
         key: ActiveWorktreeKey,
         scope: ChangeTreeScope,
-        first_row: usize,
+        forward: bool,
         epoch: u64,
     },
     ChangeViewport {
@@ -9210,7 +9210,7 @@ pub(crate) fn change_page_target(
     let SidebarAction::ChangePage {
         key,
         scope,
-        first_row,
+        forward,
         epoch,
     } = action
     else {
@@ -9243,11 +9243,34 @@ pub(crate) fn change_page_target(
         state.change_list_mode == FileListMode::Flat,
         0,
     );
-    let first = (*first_row).min(total.saturating_sub(crate::change_list::VIEW_ROWS));
+    let current = state
+        .change_first_rows
+        .get(scope)
+        .copied()
+        .unwrap_or(0)
+        .min(total.saturating_sub(crate::change_list::VIEW_ROWS));
+    let first = if *forward {
+        current.saturating_add(crate::change_list::VIEW_ROWS)
+    } else {
+        current.saturating_sub(crate::change_list::VIEW_ROWS)
+    }
+    .min(total.saturating_sub(crate::change_list::VIEW_ROWS));
     state.change_first_rows.insert(*scope, first);
     Some((
         change_scroll_id(key, *scope, *epoch),
         first as f32 * PANEL_ROW_HEIGHT,
+    ))
+}
+
+fn change_page_button_id(
+    key: &ActiveWorktreeKey,
+    scope: ChangeTreeScope,
+    epoch: u64,
+    forward: bool,
+) -> Id {
+    stable_id(format!(
+        "changes.page.{}.{scope:?}.{epoch}.{forward}",
+        key.worktree_id
     ))
 }
 
@@ -9304,38 +9327,28 @@ fn virtual_changes<'a>(
     if total <= crate::change_list::VIEW_ROWS {
         return scroll;
     }
-    let action = |first_row| {
-        gated(
-            SidebarAction::ChangePage {
-                key: key.clone(),
-                scope,
-                first_row,
-                epoch,
-            },
-            modal_open,
-        )
+    let button = |label: &'static str, forward: bool, enabled: bool| {
+        let action = SidebarAction::ChangePage {
+            key: key.clone(),
+            scope,
+            forward,
+            epoch,
+        };
+        let content = crate::ui_controls::button::secondary(label)
+            .id(change_page_button_id(&key, scope, epoch, forward))
+            .on_press_maybe(gated(action.clone(), modal_open || !enabled))
+            .into();
+        RowInteraction::change_target(content, action, None)
     };
     let navigation = widget::row::with_children(vec![
-        crate::ui_controls::button::secondary("Previous")
-            .on_press_maybe(
-                (first > 0)
-                    .then(|| action(first.saturating_sub(crate::change_list::VIEW_ROWS)))
-                    .flatten(),
-            )
-            .into(),
+        button("Previous", false, first > 0),
         design::caption(format!(
             "{}–{} of {total}",
             first + 1,
             (first + crate::change_list::VIEW_ROWS).min(total)
         ))
         .into(),
-        crate::ui_controls::button::secondary("Next")
-            .on_press_maybe(
-                (first + crate::change_list::VIEW_ROWS < total)
-                    .then(|| action(first + crate::change_list::VIEW_ROWS))
-                    .flatten(),
-            )
-            .into(),
+        button("Next", true, first + crate::change_list::VIEW_ROWS < total),
     ])
     .spacing(space::XS)
     .align_y(Alignment::Center);
@@ -20142,9 +20155,13 @@ pub(crate) mod tests {
         drop(element);
         let mut last_action = None;
         for expected in [16, 32] {
-            let action = frame_enter_presses(&renderer, change_group_view(&state, &source, &source.groups[0], false))
-                .into_iter().find(|action| matches!(action, SidebarAction::ChangePage { first_row, .. } if *first_row == expected))
-                .expect("Next is focusable and activates with Enter, without a wheel event");
+            let action = frame_enter_presses(
+                &renderer,
+                change_group_view(&state, &source, &source.groups[0], false),
+            )
+            .into_iter()
+            .find(|action| matches!(action, SidebarAction::ChangePage { forward: true, .. }))
+            .expect("Next is focusable and activates with Enter, without a wheel event");
             let (id, offset) = change_page_target(&mut state, &source, &action).unwrap();
             let mut element = change_group_view(&state, &source, &source.groups[0], false);
             tree.diff(&mut element);
@@ -20189,6 +20206,169 @@ pub(crate) mod tests {
             "old layout navigation is retired"
         );
         assert!(!state.change_first_rows.contains_key(&scope));
+    }
+
+    #[test]
+    fn held_change_navigation_does_not_transfer_across_reset_or_rebind() {
+        use cosmic::iced::{
+            Event, Point, Rectangle,
+            advanced::{
+                Shell, clipboard,
+                widget::{Operation, operation},
+            },
+            mouse,
+        };
+        struct Bounds {
+            target: Id,
+            found: Option<Rectangle>,
+        }
+        impl Operation for Bounds {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&Id>,
+                bounds: Rectangle,
+                _state: &mut dyn operation::Focusable,
+            ) {
+                if id == Some(&self.target) {
+                    self.found = Some(bounds);
+                }
+            }
+        }
+        fn source(key: ActiveWorktreeKey) -> SourceControlModel {
+            let mut source = SourceControlModel::ready(key, &snapshot());
+            source.groups = vec![ChangeGroup::new(
+                source.key.worktree_id,
+                ChangeArea::Unstaged,
+                (0..80)
+                    .map(|index| {
+                        ChangeRow::new(
+                            source.key.worktree_id,
+                            &changed(
+                                repo_path(&format!("file-{index:04}.rs")),
+                                ChangeArea::Unstaged,
+                                ChangeKind::Modified,
+                                None,
+                            ),
+                        )
+                    })
+                    .collect(),
+            )];
+            source
+        }
+        struct Frame {
+            source: SourceControlModel,
+            state: SidebarState,
+            renderer: cosmic::Renderer,
+            tree: Tree,
+        }
+        impl Frame {
+            fn visit(
+                &mut self,
+                events: &[Event],
+                pointer: Point,
+            ) -> (Vec<SidebarAction>, Rectangle) {
+                let mut element =
+                    change_group_view(&self.state, &self.source, &self.source.groups[0], false);
+                self.tree.diff(&mut element);
+                let size = Size::new(380.0, 600.0);
+                let node = element.as_widget_mut().layout(
+                    &mut self.tree,
+                    &self.renderer,
+                    &layout::Limits::new(Size::ZERO, size),
+                );
+                let mut bounds = Bounds {
+                    target: change_page_button_id(
+                        &self.source.key,
+                        ChangeTreeScope::Area(ChangeArea::Unstaged),
+                        self.state.change_scroll_epoch,
+                        true,
+                    ),
+                    found: None,
+                };
+                element.as_widget_mut().operate(
+                    &mut self.tree,
+                    Layout::new(&node),
+                    &self.renderer,
+                    &mut bounds,
+                );
+                let mut published = Vec::new();
+                for event in events {
+                    element.as_widget_mut().update(
+                        &mut self.tree,
+                        event,
+                        Layout::new(&node),
+                        mouse::Cursor::Available(pointer),
+                        &self.renderer,
+                        &mut clipboard::Null,
+                        &mut Shell::new(&mut published),
+                        &Rectangle::with_size(size),
+                    );
+                }
+                (published, bounds.found.expect("Next is mounted"))
+            }
+        }
+        for rebind in [false, true] {
+            let model = panel_model();
+            let mut frame = Frame {
+                source: source(main_key()),
+                state: panel_state(&model),
+                renderer: headless_renderer(),
+                tree: Tree::empty(),
+            };
+            let (_, bounds) = frame.visit(&[], Point::ORIGIN);
+            let pointer = bounds.center();
+            let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+            let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+            let (original, _) = frame.visit(&[press.clone(), release.clone()], pointer);
+            assert!(
+                original.iter().any(|action| matches!(
+                    action,
+                    SidebarAction::ChangePage { forward: true, .. }
+                )),
+                "the original control activates"
+            );
+            let (held, _) = frame.visit(&[press.clone()], pointer);
+            assert!(held.is_empty());
+            if rebind {
+                assert!(
+                    frame
+                        .state
+                        .sync_active_worktree(&model, &focus_on(&fix_key()))
+                );
+                frame.source = source(fix_key());
+            } else {
+                frame.state.apply(&SidebarAction::SetChangeListMode {
+                    key: frame.source.key.clone(),
+                    mode: FileListMode::Flat,
+                });
+            }
+            let (_, after) = frame.visit(&[], pointer);
+            assert_eq!(
+                after.center(),
+                pointer,
+                "the replacement control occupies the held coordinates"
+            );
+            let (stale, _) = frame.visit(&[release.clone()], pointer);
+            assert!(
+                !stale
+                    .iter()
+                    .any(|action| matches!(action, SidebarAction::ChangePage { .. })),
+                "held navigation is retired, rebind={rebind}"
+            );
+            let (fresh, _) = frame.visit(&[press, release], pointer);
+            assert_eq!(
+                fresh,
+                vec![SidebarAction::ChangePage {
+                    key: frame.source.key.clone(),
+                    scope: ChangeTreeScope::Area(ChangeArea::Unstaged),
+                    forward: true,
+                    epoch: frame.state.change_scroll_epoch
+                }]
+            );
+        }
     }
 
     #[test]
