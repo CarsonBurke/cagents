@@ -873,6 +873,46 @@ After a confirmed close, or a kernel boot change, the picker resumes the exact
 conversation from disk. Missing ownership evidence within the same boot keeps
 the conversation available and explains the refusal without starting a writer.
 
+### Read a peer conversation from an agent
+
+From an authenticated agent session, `cagents chat read` reads one bounded page
+of another native chat's cache in the same current channel. Use the full session
+UUID shown by `cagents ls --json`, rather than an agent handle, agent ID, or
+short session prefix:
+
+```sh
+cagents ls --json
+cagents chat read FULL_SESSION_UUID
+cagents --json chat read FULL_SESSION_UUID
+cagents --json chat read FULL_SESSION_UUID --cursor 'RETURNED_CURSOR'
+```
+
+Each command reads one page; it does not follow output or load uncached provider
+history. Human output shows the continuation when more cached content remains.
+JSON puts the page in `data`, including `parts`, `coverage`, `at_end`, and
+`next_cursor`. Continue with the returned `next_cursor` for that same session.
+An empty page can still have a continuation because omitted items also advance
+the scan. At `at_end: true`, `next_cursor` is null and that logical read ends.
+Omitting `--cursor` later starts a fresh authorized read. A refused or stale
+cursor requires a fresh read; it does not grant access to an old source.
+
+Pages contain only user text, assistant text, visible tool output, and command
+output, with their bounded metadata. Raw tool input, command recipes and working
+directories, image paths and attachments, and reasoning/system content are
+excluded. Pages are limited to 16 parts and 128 KiB including the response
+budget; a scan examines at most 128 cached items. Coverage always describes the
+cache, with earlier provider history possibly absent.
+
+The daemon checks the caller's issued session and both chats' canonical channel
+placement on every request. Shared ancestry or working directory alone does not
+permit a read, and the CLI cannot select a channel to bypass that check. This is
+a point-in-time read: the cache observation and later permission check are
+separate, and neither reserves content or placement afterward. It leaves hidden
+chats hidden and sends no prompt, provider-history request, or output
+acknowledgement. Agent status, requests,
+answers, interrupt, and close remain owner-only; reading a peer conversation
+does not grant those controls.
+
 ### Image references and local image storage
 
 Pasted and selected images receive stable **Image N** labels. Their inline
