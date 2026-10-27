@@ -1339,6 +1339,140 @@ mod tests {
     }
 
     #[test]
+    fn ordered_wrapped_tasks_align_markers_with_first_line_and_keep_authored_state() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        use iced_accessibility::accesskit::Role;
+
+        let label = "Pending wrapped follow-up: review the wide conversation transcript, then resize to the narrow window and confirm that this deliberately long checklist label wraps onto multiple lines while its number and unchecked box stay aligned with the first line; nested completed tasks and ordinary numbered items must remain readable and unchanged.";
+        let source = format!(
+            "8. [x] Finished\n9. [ ] {label}\n   1. [x] Nested finished\n   2. Ordinary nested item\n\n- [ ] Unordered pending\n- Ordinary bullet\n"
+        );
+        let cached = CachedItem::new(
+            &ItemContent::Text {
+                text: source,
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        for theme in [cosmic::Theme::dark(), cosmic::Theme::light()] {
+            let settings = design::markdown_settings(&theme, design::TEXT_PROSE);
+            let line = iced::widget::text::LineHeight::default()
+                .to_absolute(settings.text_size)
+                .0 as f64;
+            let mut heights = Vec::new();
+            for width in [360.0, 900.0] {
+                let mut element = view(&cached, settings, target, None);
+                let mut tree = Tree::new(element.as_widget());
+                let renderer = crate::app::tests::headless_renderer();
+                let viewport = Rectangle::with_size(Size::new(width, 1200.0));
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+                );
+                let accessible = element.as_widget().a11y_nodes(
+                    Layout::new(&node),
+                    &tree,
+                    mouse::Cursor::Unavailable,
+                );
+                let nodes: Vec<_> = accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .collect();
+                let checks: Vec<_> = nodes
+                    .iter()
+                    .filter(|node| node.node().role() == Role::CheckBox)
+                    .map(|node| node.node().bounds().expect("actual checkbox geometry"))
+                    .collect();
+                assert_eq!(checks.len(), 4);
+                for (index, number, body) in [
+                    (0, "8.", "Finished"),
+                    (1, "9.", label),
+                    (2, "1.", "Nested finished"),
+                ] {
+                    let number = nodes
+                        .iter()
+                        .find(|node| node.node().label() == Some(number))
+                        .unwrap()
+                        .node()
+                        .bounds()
+                        .expect("actual ordered number geometry");
+                    let text = nodes
+                        .iter()
+                        .find(|node| node.node().value() == Some(body))
+                        .unwrap()
+                        .node()
+                        .bounds()
+                        .expect("actual selectable body geometry");
+                    let check = checks[index];
+                    assert!(number.x1 <= check.x0 && check.x1 < text.x0);
+                    assert!(text.x1 <= f64::from(width) + 0.01);
+                    assert!(check.y0 >= text.y0 - 0.01);
+                    assert!(check.y1 <= text.y0 + line + 0.01);
+                    assert!((number.y0 - text.y0).abs() <= 0.01);
+                    if index == 1 {
+                        assert!(text.y1 - text.y0 > line, "the label must actually wrap");
+                        heights.push(text.y1 - text.y0);
+                    }
+                }
+                assert!(
+                    checks[2].x0 > checks[0].x0,
+                    "nested task retains its indent"
+                );
+                // Transcript checkboxes have no edit callback. Exercise the
+                // real widget's pointer path and re-read authored state.
+                let mut messages = Vec::new();
+                for check in checks {
+                    let cursor = mouse::Cursor::Available(Point::new(
+                        ((check.x0 + check.x1) / 2.0) as f32,
+                        ((check.y0 + check.y1) / 2.0) as f32,
+                    ));
+                    for event in [
+                        mouse::Event::ButtonPressed(mouse::Button::Left),
+                        mouse::Event::ButtonReleased(mouse::Button::Left),
+                    ] {
+                        element.as_widget_mut().update(
+                            &mut tree,
+                            &Event::Mouse(event),
+                            Layout::new(&node),
+                            cursor,
+                            &renderer,
+                            &mut clipboard::Null,
+                            &mut Shell::new(&mut messages),
+                            &viewport,
+                        );
+                    }
+                }
+                let after = element.as_widget().a11y_nodes(
+                    Layout::new(&node),
+                    &tree,
+                    mouse::Cursor::Unavailable,
+                );
+                assert_eq!(
+                    after
+                        .root()
+                        .iter()
+                        .chain(after.children())
+                        .filter(|node| node.node().role() == Role::CheckBox)
+                        .map(|node| node.node().is_selected())
+                        .collect::<Vec<_>>(),
+                    [Some(true), Some(false), Some(true), Some(false)],
+                );
+            }
+            assert!(
+                heights[0] > heights[1],
+                "narrower layout adds wrapped lines"
+            );
+        }
+    }
+
+    #[test]
     fn prepared_palette_maps_are_shared_across_views_in_both_appearances() {
         let theme = crate::settings::EditorSyntaxTheme::Auto;
         let blocks = (0..200)
