@@ -2398,6 +2398,7 @@ impl State {
         }
         let query = self.browser_query.trim().to_lowercase();
         let mut browser_count = 0;
+        let mut has_matching_rows = false;
         let mut rows: Vec<Element<'a, Action>> = match &self.list {
             ListState::Idle | ListState::Loading => {
                 vec![design::caption("Loading pull requests…").into()]
@@ -2416,11 +2417,6 @@ impl State {
                 )
                 .padding(Padding::from([space::S, space::M]))
                 .into(),
-            ],
-            ListState::Ready(pull_requests) if pull_requests.is_empty() => vec![
-                widget::container(design::caption("No open pull requests."))
-                    .padding(Padding::from([space::S, space::M]))
-                    .into(),
             ],
             ListState::Ready(pull_requests) => {
                 let matches: Vec<_> = pull_requests
@@ -2450,6 +2446,7 @@ impl State {
                     })
                     .collect();
                 browser_count = matches.len();
+                has_matching_rows = !matches.is_empty();
                 let window = browser_row_window(
                     matches.len(),
                     self.browser_viewport.0,
@@ -2506,6 +2503,7 @@ impl State {
                 {
                     continue;
                 }
+                has_matching_rows = true;
                 rows.push(
                     button::custom(widget::column::with_children(vec![
                         design::body(entry.title.as_str()).into(),
@@ -2528,6 +2526,27 @@ impl State {
                     .into(),
                 );
             }
+        }
+        if matches!(self.list, ListState::Ready(_)) && !has_matching_rows {
+            let message = if self.list_loaded_query.as_deref() != Some(self.browser_query.trim()) {
+                if query.is_empty() {
+                    "Pull request refresh pending."
+                } else {
+                    "Search results pending."
+                }
+            } else if query.is_empty()
+                && matches!(&self.list, ListState::Ready(prs) if prs.is_empty())
+            {
+                "No open pull requests."
+            } else {
+                "No matching open pull requests."
+            };
+            rows.clear();
+            rows.push(
+                widget::container(design::caption(message))
+                    .padding(Padding::from([space::S, space::M]))
+                    .into(),
+            );
         }
         let count = match &self.list {
             ListState::Ready(pull_requests) if !pull_requests.is_empty() => browser_count,
