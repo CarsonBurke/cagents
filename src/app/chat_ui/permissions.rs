@@ -88,11 +88,12 @@ fn page_control_id(card: CardId, page: Page) -> widget::Id {
     card_control_id(card, &format!("chat-permission-page-{page:?}"))
 }
 
-fn denial_control_id(card: CardId, tool: &str, retry: bool) -> widget::Id {
+fn denial_control_id(target: Target, tool: &str, retry: bool) -> widget::Id {
     card_control_id(
-        card,
+        target.card,
         &format!(
-            "chat-permission-{}-{tool}",
+            "chat-permission-{}-{}-{tool}",
+            target.generation,
             if retry { "retry" } else { "dismiss" }
         ),
     )
@@ -125,9 +126,9 @@ impl Runtime {
             }
             for denial in self.snapshot.permission_denials.iter().rev() {
                 if denial.tool_input.is_some() {
-                    controls.push(denial_control_id(card, &denial.tool_use_id, true));
+                    controls.push(denial_control_id(self.target, &denial.tool_use_id, true));
                 }
-                controls.push(denial_control_id(card, &denial.tool_use_id, false));
+                controls.push(denial_control_id(self.target, &denial.tool_use_id, false));
             }
             if !(self.session.launch.provider == Provider::Codex && self.snapshot.busy) {
                 controls.extend(
@@ -237,14 +238,14 @@ impl Runtime {
             details.push(
                 widget::row::with_children(vec![
                     widget::button::custom(design::caption("Review retry"))
-                        .id(denial_control_id(target.card, &denial.tool_use_id, true))
+                        .id(denial_control_id(target, &denial.tool_use_id, true))
                         .class(crate::ui_controls::control_style(false, None))
                         .on_press_maybe((enabled && denial.tool_input.is_some()).then(|| {
                             action(Action::PermissionRetry(target, denial.tool_use_id.clone()))
                         }))
                         .into(),
                     widget::button::custom(design::caption("Dismiss"))
-                        .id(denial_control_id(target.card, &denial.tool_use_id, false))
+                        .id(denial_control_id(target, &denial.tool_use_id, false))
                         .class(crate::ui_controls::control_style(false, None))
                         .on_press_maybe(enabled.then(|| {
                             action(Action::PermissionDismiss(
