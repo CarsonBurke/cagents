@@ -2,8 +2,7 @@
 //! Wire reference: anthropics/claude-agent-sdk-python, _internal/query.py,
 //! _internal/transport/subprocess_cli.py and types.py; matched SDK 0.3.236.
 //! https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.236/sdk.d.ts
-use super::{Adapter, ProcessSpec, Step,CanonicalItemKey};
-use super::tool_cache::{ToolCache,Reader};
+use super::{Adapter, ProcessSpec, Step};
 use crate::account::{self, LiveReport};
 use crate::agent::Provider;
 use crate::chat;
@@ -38,12 +37,69 @@ const MODES: &[&str] = &[
     "bypassPermissions",
 ];
 
-#[cfg(test)]
-pub(crate) fn fixture_adapter() -> Box<dyn Adapter> {
-    Box::new(Claude::default())
+pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    create_inner(launch, None, false)
 }
 
-pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+pub(super) fn create_history(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    create_inner(launch, None, true)
+}
+
+/// Transient identity selected by the original adapter during preparation.
+/// A fresh UUID is not provider confirmation or a disk-resume descriptor.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct PreparedIdentity {
+    session_id: String,
+    resumed: bool,
+}
+impl PreparedIdentity {
+    fn validate(&self, launch: &Launch) -> Result<(), String> {
+        validate_id(&self.session_id)?;
+        if self.resumed != launch.session_id.is_some()
+            || launch
+                .session_id
+                .as_deref()
+                .is_some_and(|id| id != self.session_id)
+        {
+            return Err(
+                "Retained Claude identity differs from its issued launch mode or session".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn create_prepared(
+    launch: &Launch,
+    identity: PreparedIdentity,
+) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    identity.validate(launch)?;
+    create_inner(launch, Some(identity), false)
+}
+
+fn create_inner(
+    launch: &Launch,
+    prepared: Option<PreparedIdentity>,
+    forced_history: bool,
+) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    if forced_history
+        && (launch
+            .session_id
+            .as_deref()
+            .is_none_or(|id| id.len() != 36 || uuid::Uuid::parse_str(id).is_err())
+            || !launch.recipe.working_directory.is_absolute()
+            || launch.recipe.working_directory.components().any(|part| {
+                matches!(
+                    part,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            }))
+    {
+        return Err(
+            "Read-only history requires an exact saved conversation and absolute working directory"
+                .into(),
+        );
+    }
     let mut spec = ProcessSpec::from(&launch.recipe);
     spec.arguments = arguments(launch)?;
     let history = launch
@@ -51,13 +107,13 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
         .as_deref()
         .map(|id| History::open(launch, id))
         .transpose()?;
-    let history_only = launch.needs_read_only_history();
+    let history_only = forced_history || launch.needs_read_only_history();
     if history_only {
         spec.transport = super::TransportSpec::History;
     }
-    let session_id = launch
-        .session_id
-        .clone()
+    let session_id = prepared
+        .map(|identity| identity.session_id)
+        .or_else(|| launch.session_id.clone())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     if launch.session_id.is_none() {
         spec.arguments.push(format!("--session-id={session_id}"));
@@ -65,11 +121,17 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
     Ok((
         spec,
         Box::new(Claude {
+            prepared_identity: Some(PreparedIdentity {
+                session_id: session_id.clone(),
+                resumed: launch.session_id.is_some(),
+            }),
             session_id: Some(session_id),
             resumed: launch.session_id.is_some(),
             history_only,
+            forced_history,
             cwd: launch.recipe.working_directory.clone(),
             history,
+            titles: super::claude_titles::ClaudeTitles::new(launch),
             ..Claude::default()
         }),
     ))
@@ -279,6 +341,23 @@ fn validate_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Provider IDs are opaque and local to their parent transcript. Keep the
+/// namespace structural: concatenating a parent and ID can itself collide.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ScopedId {
+    parent: Option<String>,
+    id: String,
+}
+
+impl ScopedId {
+    fn new(parent: Option<&str>, id: &str) -> Self {
+        Self {
+            parent: parent.filter(|id| !id.is_empty()).map(str::to_owned),
+            id: id.into(),
+        }
+    }
+}
+
 /// The API message one stream is delivering, keyed by parent tool use.
 struct Stream {
     message: String,
@@ -305,6 +384,8 @@ enum ReportTask {
 #[derive(Default)]
 struct Claude {
     session_id: Option<String>,
+    prepared_identity: Option<PreparedIdentity>,
+    titles: Option<super::claude_titles::ClaudeTitles>,
     /// Whether this process was launched to resume `session_id`, as opposed
     /// to being handed a new one that names nothing until its first prompt.
     resumed: bool,
@@ -331,29 +412,28 @@ struct Claude {
     >,
     execution: Option<crate::model::RunId>,
     pending: HashMap<String, Value>,
-    decision_generations: HashMap<String, u64>,
     retired: VecDeque<String>,
     controls: HashMap<String, Value>,
-    control_deadlines: HashMap<String, std::time::Instant>,
-    unknown_frames: HashSet<String>,
-    command_ack: Option<String>,
-    control_replies: Vec<(String, Result<(), String>)>,
     streams: HashMap<String, Stream>,
     /// Blocks of the messages still streaming. Claude emits each block's
     /// assistant frame before that block stops, so a message's blocks are
     /// dropped at its `message_stop`, or when its stream starts another message.
-    blocks: HashMap<(String, u64), Item>,
+    blocks: HashMap<(ScopedId, u64), Item>,
     stream_events: VecDeque<String>,
     carrier_offsets: HashMap<String, usize>,
-    message_offsets: HashMap<String, usize>,
-    message_order: VecDeque<String>,
+    message_offsets: HashMap<ScopedId, usize>,
+    message_order: VecDeque<ScopedId>,
     carrier_items: HashMap<String, Vec<String>>,
     carrier_parent: HashMap<String, String>,
     carrier_order: VecDeque<String>,
     retracted: std::collections::HashSet<String>,
     retracted_order: VecDeque<String>,
-    tools: ToolCache,
-    item_reader:Option<Reader>,
+    tools: super::tool_cache::ToolCache,
+    item_reader: Option<std::sync::Arc<dyn super::CanonicalItemReader>>,
+    /// Count-bounded lifecycle facts outlive optional body copies.
+    tool_status: HashMap<ScopedId, (ToolStatus, bool)>,
+    /// Represented task rows have canonical source but no visible parent item.
+    hidden_task_rows: HashSet<String>,
     /// Synthetic task rows shown before their Agent tool is known. Bounded by
     /// the same cache as task tools, so late correlation can retract one row.
     visible_task_rows: HashSet<String>,
@@ -361,17 +441,20 @@ struct Claude {
     /// no place for the name, and an edit that fails is shown as its call
     /// again; the input says which tool that was only while it is still
     /// held, which a large write's never is.
-    edit_tools: HashMap<CanonicalItemKey, String>,
-    tool_inputs: HashMap<CanonicalItemKey, String>,
-    tool_input_order: VecDeque<CanonicalItemKey>,
+    edit_tools: HashMap<ScopedId, String>,
+    tool_inputs: HashMap<ScopedId, String>,
+    tool_input_order: VecDeque<ScopedId>,
     dismissed_denials: VecDeque<String>,
     permissions: Option<super::claude_permissions::Snapshot>,
-    tool_order: VecDeque<CanonicalItemKey>,
+    tool_order: VecDeque<ScopedId>,
     /// Running background tasks, oldest first.
     tasks: VecDeque<String>,
-    /// Report-producing tasks, oldest first. Preserve their explicit native
-    /// kind through progress frames, which omit it, until final notification.
+    /// Bounded origin metadata, not running state. Preserve the explicit
+    /// native kind through progress and terminal-notification replay.
     report_tasks: VecDeque<(String, ReportTask)>,
+    /// Exact successful child failure/result and task-notification receipts,
+    /// not bodies or running work. Changed payloads remain observable.
+    failure_receipts: VecDeque<[u8; 32]>,
     /// Agents whose report was handed back as a peer message, newest last,
     /// so the notification that follows it does not show it again.
     handed_back: VecDeque<String>,
@@ -411,125 +494,49 @@ struct Claude {
     history: Option<History>,
     /// A saved directory is gone; only its exact persisted history is readable.
     history_only: bool,
+    forced_history: bool,
 }
 impl Claude {
-    fn warn_unknown(&mut self, kind: &str, name: &str) {
-        // Provider-controlled names must not grow the rate-limit map forever.
-        let key = format!("{kind}:{}", super::preview(name.as_bytes(), 128));
-        if self.unknown_frames.len() < 64 && self.unknown_frames.insert(key.clone()) {
-            tracing::warn!(frame_type = %key, "Skipping unknown Claude protocol frame");
-        }
-    }
-    fn expire_controls(&mut self, now: std::time::Instant) -> Step {
-        let expired: Vec<_> = self
-            .control_deadlines
-            .iter()
-            .filter(|(_, deadline)| **deadline <= now)
-            .map(|(id, _)| id.clone())
-            .collect();
-        let mut step = Step::default();
-        for id in expired {
-            self.control_deadlines.remove(&id);
-            if let Some(request) = self.controls.remove(&id) {
-                if string(&request, "subtype") == "interrupt" {
-                    if request["_cagents_turn"].as_u64() == Some(self.attention_generation) {
-                        self.interruption = None;
-                    }
-                    if let Some(generation) = request["_cagents_turn"].as_u64()
-                        && let Some((key, outcome, run)) =
-                            self.deferred_attention.remove(&generation)
-                    {
-                        self.publish_deferred_finish(generation, key, outcome, &mut step);
-                        if let Some(run) = run {
-                            step.events.push(Event::Execution {
-                                run,
-                                event: crate::agent_execution::ProviderEvent::Finished { outcome },
-                            });
-                        }
-                    }
-                }
-                let operation = super::preview(string(&request, "subtype").as_bytes(), 100);
-                let seconds = if string(&request, "subtype") == "initialize" {
-                    30
-                } else {
-                    5
-                };
-                if string(&request, "subtype") == "initialize" {
-                    step.events.push(Event::Error {message:"Claude did not confirm initialization within 30 seconds; restart the session".into(),fatal:true});
-                }
-                self.control_replies.push((
-                    request["_cagents_ack"].as_str().unwrap_or(&id).to_owned(),
-                    Err(format!(
-                        "Claude did not answer the {operation} request within {seconds} seconds; try again"
-                    )),
-                ));
+    fn remember_failure_receipt(&mut self, receipt: Option<[u8; 32]>) {
+        if let Some(receipt) = receipt {
+            self.failure_receipts.push_back(receipt);
+            if self.failure_receipts.len() > MAX_TOOLS {
+                self.failure_receipts.pop_front();
             }
         }
-        step
+    }
+
+    fn observe_title(&mut self, step: &mut Step) {
+        if let Some(id) = self.session_id.clone()
+            && let Some(titles) = &mut self.titles
+            && let Some(title) = titles.update(&id)
+        {
+            step.events.push(Event::Session {
+                id,
+                title: Some(title),
+            });
+        }
     }
 
     fn control(&mut self, mut request: Value) -> Result<Step, String> {
-        let expired = self.expire_controls(std::time::Instant::now());
-        let interrupt = string(&request, "subtype") == "interrupt";
-        if !interrupt && self.controls.len() >= MAX_PENDING {
+        if self.controls.len() >= MAX_PENDING {
             return Err("Too many pending Claude control operations".into());
         }
         let id = uuid::Uuid::new_v4().to_string();
-        // Repeated interrupts supersede an unanswered interrupt, keeping the
-        // emergency lane bounded without letting ordinary requests block it.
-        if interrupt {
-            let old: Vec<_> = self
-                .controls
-                .iter()
-                .filter(|(_, value)| string(value, "subtype") == "interrupt")
-                .map(|(id, _)| id.clone())
-                .collect();
-            for id in old {
-                self.controls.remove(&id);
-                self.control_deadlines.remove(&id);
-                self.control_replies.push((
-                    id,
-                    Err("A newer interrupt request superseded this one".into()),
-                ));
-            }
-        }
-        self.command_ack = Some(id.clone());
-        self.control_deadlines.insert(
-            id.clone(),
-            std::time::Instant::now()
-                + std::time::Duration::from_secs(if string(&request, "subtype") == "initialize" {
-                    30
-                } else {
-                    5
-                }),
-        );
         self.controls.insert(id.clone(), request.clone());
         let wire = request
             .as_object_mut()
             .ok_or("Malformed native Claude control operation")?;
-        wire.remove("_cagents_ack");
         wire.remove("_cagents_reasoning");
         wire.remove("_cagents_turn");
         wire.remove("_cagents_permissions");
         wire.remove("_cagents_permission_update");
         Ok(Step {
+            suppress_current_notification: false,
+            notification_preview: None,
             writes: vec![json!({"type":"control_request","request_id":id,"request":request})],
-            events: expired.events,
+            events: vec![],
         })
-    }
-    fn followup_control(
-        &mut self,
-        mut request: Value,
-        acknowledgement: &str,
-        deadline: Option<std::time::Instant>,
-    ) -> Result<Step, String> {
-        request["_cagents_ack"] = Value::String(acknowledgement.into());
-        let next = self.control(request)?;
-        if let Some(deadline) = deadline {
-            let id = next.writes[0]["request_id"].as_str().unwrap();
-            self.control_deadlines.insert(id.into(), deadline);
-        }
-        Ok(next)
     }
     fn fast_mode_metadata(&mut self, data: &Value, step: &mut Step) {
         if let Some(state) = data["fast_mode_state"]
@@ -596,75 +603,126 @@ impl Claude {
     }
     fn retire(&mut self, id: String, step: &mut Step) {
         self.pending.remove(&id);
-        self.decision_generations.remove(&id);
         step.events.push(Event::RequestResolved { id: id.clone() });
+        // A background decision can arrive before or after the main result,
+        // so the adapter may already be idle when it is answered. Once no
+        // request or active turn remains, forget between-turn interruption:
+        // this idle generation also identifies the next prompt.
+        if self.pending.is_empty() && self.started_generation != Some(self.attention_generation) {
+            self.interruption = None;
+            // This idle generation will also identify the next prompt. Forget
+            // its between-turn interrupts before a late reply can be mistaken
+            // for that prompt's own interrupt or deferred result.
+            self.controls.retain(|_, request| {
+                string(request, "subtype") != "interrupt"
+                    || request["_cagents_turn"].as_u64() != Some(self.attention_generation)
+            });
+            self.status(false, "Claude turn complete", step);
+        }
         self.retired.push_back(id);
         if self.retired.len() > 512 {
             self.retired.pop_front();
         }
     }
-    fn remember_decision(&mut self, id: String, raw: Value) {
-        self.decision_generations
-            .insert(id.clone(), self.attention_generation);
-        self.pending.insert(id, raw);
-    }
-    fn retire_turn_decisions(&mut self, generation: u64, step: &mut Step) {
-        let ids = self
-            .decision_generations
-            .iter()
-            .filter(|(_, owner)| **owner == generation)
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        for id in ids {
-            self.retire(id, step);
+    fn tool(&mut self, parent: Option<&str>, item: Item) {
+        let key = ScopedId::new(parent, &item.id);
+        if !self.tool_order.contains(&key) {
+            self.tool_order.push_back(key.clone());
         }
-    }
-    fn publish_deferred_finish(
-        &mut self,
-        generation: u64,
-        key: Option<String>,
-        outcome: crate::notifications::Kind,
-        step: &mut Step,
-    ) {
-        use crate::notifications::Kind;
-        if matches!(outcome, Kind::Cancelled | Kind::Failed) {
-            self.retire_turn_decisions(generation, step);
+        if let Some(status) = item.content.status() {
+            self.tool_status.insert(
+                key.clone(),
+                (status, matches!(item.content, ItemContent::Tool { .. })),
+            );
         }
-        let current = generation.wrapping_add(1) == self.attention_generation
-            && self.started_generation != Some(self.attention_generation);
-        if current {
-            self.status(!self.pending.is_empty(), "Claude turn complete", step);
-            step.events.push(Event::TurnFinished { key, outcome });
-        } else {
-            step.events.push(Event::PastTurnFinished { key, outcome });
+        if parent.is_none() {
+            self.hidden_task_rows.remove(&item.id);
         }
-    }
-    fn tool(&mut self,parent:Option<&str>,item:Item) {
-        let key=CanonicalItemKey::new(parent,&item.id);
-        if key.item_id.len()>4096 || key.agent_id.as_ref().is_some_and(|id|id.len()>4096) {return;}
-        if !self.tool_order.contains(&key) {self.tool_order.push_back(key);}
-        self.tools.insert(parent,item);
-        while self.tool_order.len()>MAX_TOOLS {
-            if let Some(key)=self.tool_order.pop_front() {
-                self.tools.remove(key.agent_id.as_deref(),&key.item_id);
-                self.visible_task_rows.remove(&key.item_id);
-                self.edit_tools.remove(&key);
-                self.tool_inputs.remove(&key);
+        self.tools.insert(parent, item);
+        while self.tool_order.len() > MAX_TOOLS {
+            if let Some(key) = self.tool_order.pop_front() {
+                self.forget_tool(&key);
             }
         }
     }
-    fn cached_tool(&self,parent:Option<&str>,id:&str)->Result<Option<Item>,String> {
-        if let Some(item)=self.tools.get(parent,id) {return Ok(Some(item.clone()));}
-        let key=CanonicalItemKey::new(parent,id);
-        let Some(reader)=&self.item_reader else {
-            return if self.tool_order.contains(&key) {Err("Original tool source is unavailable; its stored call was preserved".into())} else {Ok(None)};
+    fn forget_tool(&mut self, key: &ScopedId) {
+        self.tools.remove(key.parent.as_deref(), &key.id);
+        self.tool_status.remove(key);
+        self.edit_tools.remove(key);
+        self.tool_inputs.remove(key);
+        self.tool_input_order.retain(|known| known != key);
+        if key.parent.is_none() {
+            self.hidden_task_rows.remove(&key.id);
+            self.visible_task_rows.remove(&key.id);
+        }
+    }
+    fn completed_tool(&self, parent: Option<&str>, id: &str) -> bool {
+        self.tool_status
+            .get(&ScopedId::new(parent, id))
+            .is_some_and(|(status, _)| *status != ToolStatus::Running)
+    }
+    fn cached_tool(&self, parent: Option<&str>, id: &str) -> Result<Option<Item>, String> {
+        let key = super::CanonicalItemKey::new(parent, id);
+        let hidden = parent.is_none() && self.hidden_task_rows.contains(id);
+        let mut item = if let Some(item) = self.tools.get(parent, id) {
+            if let Some(reader) = &self.item_reader {
+                if self.tools.pending(parent, id) {
+                    reader.validate_key(&key)?;
+                } else if hidden {
+                    let canonical = reader
+                        .read_hidden_task(id)?
+                        .ok_or("Original task description is unavailable")?;
+                    if canonical.id != item.id
+                        || canonical.role != item.role
+                        || canonical.content != item.content
+                    {
+                        return Err("Hidden task source no longer matches its cached record".into());
+                    }
+                } else {
+                    reader.validate_cached_item(&key, item)?;
+                }
+            }
+            Some(item.clone())
+        } else if let Some(reader) = &self.item_reader {
+            if hidden {
+                reader.read_hidden_task(id)?
+            } else {
+                reader.read(&key)?
+            }
+        } else {
+            None
         };
-        let item=reader.read(&key)?;
-        if item.is_none() && self.tool_order.contains(&key) {return Err("Original tool source is unavailable; its stored call was preserved".into());}
-        if item.as_ref().is_some_and(|item|item.id!=id) {return Err("Original tool source identity changed; refusing mismatched classification".into());}
+        if item.is_none() && self.tool_order.contains(&ScopedId::new(parent, id)) {
+            return Err(
+                "Original tool source is unavailable; its stored call was preserved".into(),
+            );
+        }
+        if let Some(item) = &mut item {
+            if item.id != id {
+                return Err("Original tool source identity changed".into());
+            }
+            if let Some((known, _)) = self.tool_status.get(&ScopedId::new(parent, id)) {
+                match &mut item.content {
+                    ItemContent::Tool { status, .. }
+                    | ItemContent::Command { status, .. }
+                    | ItemContent::Changes { status, .. } => *status = *known,
+                    _ => {}
+                }
+            }
+        }
         Ok(item)
     }
-    fn task_rows_for_agent(&mut self, tool: &str) -> Vec<String> {
+    fn task_rows_for_agent(&mut self, parent: Option<&str>, tool: &str) -> Vec<String> {
+        let incoming = ScopedId::new(parent, tool);
+        if self
+            .tool_order
+            .iter()
+            .any(|known| known.id == tool && known.parent != incoming.parent)
+        {
+            // Task notifications carry no transcript. Keep their fallback row
+            // while more than one scope could own the reported tool ID.
+            return Vec::new();
+        }
         self.agent_task_calls
             .iter()
             .filter(|(known, _)| known == tool)
@@ -672,14 +730,20 @@ impl Claude {
             .filter(|id| self.visible_task_rows.remove(id))
             .collect()
     }
-    fn remember_tool_input(&mut self,parent:Option<&str>, id: &str, input: &Value) -> Result<(), String> {
+    fn remember_tool_input(
+        &mut self,
+        parent: Option<&str>,
+        id: &str,
+        input: &Value,
+    ) -> Result<(), String> {
         if !input.is_object() || encoded_len(input)? > chat::PermissionDenial::INPUT_LIMIT {
             return Ok(());
         }
-        let key=CanonicalItemKey::new(parent,id);
-        if key.item_id.len()>4096 || key.agent_id.as_ref().is_some_and(|id|id.len()>4096) {return Ok(());}
-        if !self.tool_inputs.contains_key(&key) {self.tool_input_order.push_back(key.clone());}
-        self.tool_inputs.insert(key,input.to_string());
+        let key = ScopedId::new(parent, id);
+        if !self.tool_inputs.contains_key(&key) {
+            self.tool_input_order.push_back(key.clone());
+        }
+        self.tool_inputs.insert(key, input.to_string());
         while self.tool_input_order.len() > chat::PermissionDenial::LIMIT {
             if let Some(expired) = self.tool_input_order.pop_front() {
                 self.tool_inputs.remove(&expired);
@@ -723,13 +787,28 @@ impl Claude {
         }
         let mut content = vec![json!({"type":"text", "text":text})];
         let mut payload_size = encoded_len(&content)?;
-        for attachment in &attachments {
+        for attachment in super::image_references::ordered(&text, &attachments)? {
+            let attachment = crate::chat::attachment_assets::resolve(attachment)?;
             let block = attachment_block(&self.cwd, &attachment.path)?;
             payload_size = payload_size.saturating_add(encoded_len(&block)? + 1);
             if payload_size >= MAX_PAYLOAD {
                 return Err(
                     "Combined Claude prompt and attachments must be smaller than 30 MiB".into(),
                 );
+            }
+            if let Some(reference) = &attachment.reference {
+                if block["type"] != "image" {
+                    return Err("An image reference must accompany an actual image".into());
+                }
+                let marker =
+                    json!({"type":"text", "text":super::image_references::marker(reference)?});
+                payload_size = payload_size.saturating_add(encoded_len(&marker)? + 1);
+                if payload_size >= MAX_PAYLOAD {
+                    return Err(
+                        "Combined Claude prompt and attachments must be smaller than 30 MiB".into(),
+                    );
+                }
+                content.push(marker);
             }
             content.push(block);
         }
@@ -763,6 +842,9 @@ impl Claude {
         } else {
             0
         };
+        for attachment in &attachments {
+            crate::chat::attachment_assets::retain(attachment)?;
+        }
         self.suggestion_turn = None;
         step.events.push(Event::PromptSuggestionCleared);
         self.message(&frame, &mut step)?;
@@ -895,6 +977,8 @@ impl Claude {
             return Err("Claude permission response must be smaller than 30 MiB".into());
         }
         let mut step = Step {
+            suppress_current_notification: false,
+            notification_preview: None,
             writes: vec![
                 json!({"type":"control_response", "response":{"subtype":"success", "request_id":id, "response":response}}),
             ],
@@ -905,6 +989,7 @@ impl Claude {
             && let Some(tool_use_id) = request["tool_use_id"].as_str()
         {
             self.permission_denied(
+                None,
                 &json!({
                     "tool_use_id": tool_use_id,
                     "tool_name": request["tool_name"],
@@ -944,7 +1029,7 @@ impl Claude {
                 fields: vec![],
                 actions: vec![],
             };
-            self.remember_decision(id, raw);
+            self.pending.insert(id, raw);
             return Ok(Step {
                 events: vec![
                     Event::Request(prompt),
@@ -962,6 +1047,8 @@ impl Claude {
                 string(request, "subtype")
             );
             return Ok(Step {
+                suppress_current_notification: false,
+                notification_preview: None,
                 writes: vec![
                     json!({"type":"control_response", "response":{"subtype":"error", "request_id":id, "error":error}}),
                 ],
@@ -1028,7 +1115,7 @@ impl Claude {
             fields,
             actions,
         };
-        self.remember_decision(id, raw);
+        self.pending.insert(id, raw);
         Ok(Step {
             events: vec![Event::Request(event)],
             ..Step::default()
@@ -1189,6 +1276,9 @@ impl Claude {
         if self.retracted.contains(carrier) {
             return Ok(());
         }
+        // Capture provenance before this carrier updates correlation state.
+        // Replaying an old answer is not evidence that a blocked child resumed.
+        let fresh_live_carrier = !history && !self.carrier_items.contains_key(carrier);
         self.retract(&frame["supersedes"], step)?;
         let child = frame["parent_tool_use_id"]
             .as_str()
@@ -1200,6 +1290,54 @@ impl Claude {
         } else {
             Role::Assistant
         };
+        if let Some(parent) = child
+            && fresh_live_carrier
+            && role == Role::Assistant
+            && frame["error"].is_null()
+            && frame["isMeta"].as_bool() != Some(true)
+            && (frame["message"]["content"]
+                .as_str()
+                .is_some_and(|text| !text.trim().is_empty())
+                || frame["message"]["content"]
+                    .as_array()
+                    .is_some_and(|blocks| {
+                        blocks.iter().any(|block| match string(block, "type") {
+                            "text" => !string(block, "text").trim().is_empty(),
+                            "thinking" => !string(block, "thinking").trim().is_empty(),
+                            "redacted_thinking" => !string(block, "data").trim().is_empty(),
+                            "tool_use" | "server_tool_use" => {
+                                !string(block, "id").trim().is_empty()
+                                    && !string(block, "name").trim().is_empty()
+                            }
+                            "tool_result" => !string(block, "tool_use_id").trim().is_empty(),
+                            "image" => match string(&block["source"], "type") {
+                                "url" => !string(&block["source"], "url").trim().is_empty(),
+                                "base64" => {
+                                    matches!(
+                                        string(&block["source"], "media_type"),
+                                        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                                    ) && !string(&block["source"], "data").trim().is_empty()
+                                }
+                                _ => false,
+                            },
+                            "document" => ["data", "url", "text"]
+                                .iter()
+                                .any(|field| !string(&block["source"], field).trim().is_empty()),
+                            _ => false,
+                        })
+                    }))
+        {
+            step.events.push(Event::Subagent {
+                id: parent.into(),
+                kind: String::new(),
+                description: String::new(),
+                status: None,
+                background: None,
+                model: None,
+                waiting: Some(false),
+                detail: Some(String::new()),
+            });
+        }
         // Another agent's delivery is shown as one, including the hand-backs
         // Claude marks as meta.
         let delivered = if role == Role::User && !model_only(frame) {
@@ -1243,11 +1381,12 @@ impl Claude {
                 false,
             )));
         } else if let Some(content) = message["content"].as_array() {
+            let message_key = ScopedId::new(child, id);
             let base = frame["_cagents_block_base"]
                 .as_u64()
                 .map(|v| v as usize)
                 .or_else(|| self.carrier_offsets.get(carrier).copied())
-                .unwrap_or_else(|| self.message_offsets.get(id).copied().unwrap_or(0));
+                .unwrap_or_else(|| self.message_offsets.get(&message_key).copied().unwrap_or(0));
             // Carrier offsets age out with `carrier_order`. A message's carriers
             // arrive together, so evicting the message first seen longest ago
             // leaves any message still arriving with its offset.
@@ -1255,10 +1394,10 @@ impl Claude {
                 self.carrier_offsets.insert(carrier.into(), base);
                 if self
                     .message_offsets
-                    .insert(id.into(), base + content.len())
+                    .insert(message_key.clone(), base + content.len())
                     .is_none()
                 {
-                    self.message_order.push_back(id.into());
+                    self.message_order.push_back(message_key.clone());
                 }
                 while self.message_order.len() > 2048 {
                     if let Some(old) = self.message_order.pop_front() {
@@ -1266,13 +1405,41 @@ impl Claude {
                     }
                 }
             }
+            let mut synthetic = std::collections::HashSet::new();
+            let mut references = std::collections::HashMap::new();
+            let mut unverified = std::collections::HashMap::new();
+            if role == Role::User {
+                for (index, pair) in content.windows(2).enumerate() {
+                    let marker = string(&pair[0], "text");
+                    if string(&pair[0], "type") == "text"
+                        && string(&pair[1], "type") == "image"
+                        && let ItemContent::Image { path, .. } = image_content(&pair[1])
+                        && super::image_references::claims_reference(marker)
+                    {
+                        if let Some(reference) = super::image_references::restore(marker, &path) {
+                            synthetic.insert(index);
+                            references.insert(index + 1, reference);
+                        } else if !path.starts_with("data:image/") {
+                            // A structured owned-image claim cannot authorize
+                            // a coincident local path after receipt failure.
+                            // Self-contained actual inline pixels remain safe.
+                            unverified.insert(index + 1, format!("{} is unavailable on this device: its owned image receipt could not be verified. Use the originating device or attach the image again.", super::image_references::candidate(marker).map(|r| r.label()).unwrap_or_else(|| "Image reference".into())));
+                        }
+                    }
+                }
+            }
             for (index, block) in content.iter().enumerate() {
+                if synthetic.contains(&index) {
+                    continue;
+                }
+                let reference = references.get(&index).cloned();
+                let unavailable = unverified.get(&index);
                 let correlated_call = history_calls.get(&index);
                 let index = self
                     .blocks
                     .iter()
                     .filter(|((message, block_index), item)| {
-                        message == id
+                        message == &message_key
                             && *block_index >= base as u64
                             && match (&item.content, string(block, "type")) {
                                 (
@@ -1321,7 +1488,6 @@ impl Claude {
                     }
                     "tool_use" | "server_tool_use" => {
                         let tool_id = required(block, "id")?.to_owned();
-                        self.remember_tool_input(child,&tool_id, &block["input"])?;
                         let item = Item {
                             id: tool_id.clone(),
                             role: Role::Assistant,
@@ -1334,17 +1500,25 @@ impl Claude {
                             at: None,
                         };
                         // Replayed assistant envelopes must not reset a completed tool result.
-                        let cached=match self.cached_tool(child,&item.id) {
-                            Ok(cached)=>cached,
-                            Err(message)=> {step.events.push(Event::Error {message,fatal:false});continue;}
+                        let cached = match self.cached_tool(child, &item.id) {
+                            Ok(cached) => cached,
+                            Err(message) => {
+                                step.events.push(Event::Error {
+                                    message,
+                                    fatal: false,
+                                });
+                                continue;
+                            }
                         };
                         if !cached.as_ref().is_some_and(|old| {
                             old.content
                                 .status()
                                 .is_some_and(|status| status != ToolStatus::Running)
                         }) {
+                            self.remember_tool_input(child, &tool_id, &block["input"])?;
                             if string(block, "name") == "Agent" {
-                                global_task_removals.extend(self.task_rows_for_agent(&tool_id));
+                                global_task_removals
+                                    .extend(self.task_rows_for_agent(child, &tool_id));
                                 let background = child.is_none().then(|| {
                                     block["input"]["run_in_background"].as_bool() == Some(true)
                                 });
@@ -1363,37 +1537,43 @@ impl Claude {
                                 });
                             }
                             if matches!(item.content, ItemContent::Changes { .. }) {
-                                self.edit_tools
-                                    .insert(CanonicalItemKey::new(child,&tool_id), string(block, "name").into());
+                                self.edit_tools.insert(
+                                    ScopedId::new(child, &tool_id),
+                                    string(block, "name").into(),
+                                );
                             }
-                            self.tool(child,item.clone());
+                            self.tool(child, item.clone());
                             step.events.push(Event::Item(item));
                         } else if history {
                             // Keep the original call position as an overlap
                             // anchor without changing its confirmed outcome.
                             if let Some(completed) = cached {
-                                step.events.push(Event::Item(completed.clone()));
+                                step.events.push(Event::Item(completed));
                             }
                         }
                     }
                     "tool_result" => {
                         let tool_id = required(block, "tool_use_id")?.to_owned();
-                        let cached=match self.cached_tool(child,&tool_id) {
-                            Ok(cached)=>cached,
-                            // History supplied this result's exact original
-                            // call from the selected visible chain. It can
-                            // recover presentation without a cache source.
-                            Err(_) if correlated_call.is_some()=>None,
-                            Err(message)=> {step.events.push(Event::Error {message,fatal:false});continue;}
+                        let cached = match self.cached_tool(child, &tool_id) {
+                            Ok(cached) => cached,
+                            Err(_) if correlated_call.is_some() => None,
+                            Err(message) => {
+                                step.events.push(Event::Error {
+                                    message,
+                                    fatal: false,
+                                });
+                                continue;
+                            }
                         };
                         let needs_call=cached.as_ref().is_none_or(|old|matches!(&old.content,ItemContent::Tool{name,input,..} if name=="Tool"&&input.is_empty()));
                         let recovered = if needs_call {
                             if let Some(call) = correlated_call {
-                                self.remember_tool_input(child,&tool_id, &call["input"])?;
+                                self.remember_tool_input(child, &tool_id, &call["input"])?;
                                 let name = required(call, "name")?;
                                 let content = tool_content(name, &call["input"], &self.cwd);
                                 if matches!(&content, ItemContent::Changes { .. }) {
-                                    self.edit_tools.insert(CanonicalItemKey::new(child,&tool_id), name.into());
+                                    self.edit_tools
+                                        .insert(ScopedId::new(child, &tool_id), name.into());
                                 }
                                 Some(content)
                             } else {
@@ -1423,13 +1603,27 @@ impl Claude {
                                 started_at: None,
                                 at: None,
                             });
-                        let failed=block["is_error"].as_bool()==Some(true);
-                        let original_input=if failed {correlated_call.map(|call|call["input"].to_string())} else {None};
-                        let edit=self.edit_tools.get(&CanonicalItemKey::new(child,&tool_id)).map(String::as_str).or_else(||correlated_call.and_then(|call|call["name"].as_str()));
-                        let input=self.tool_inputs.get(&CanonicalItemKey::new(child,&tool_id)).map(String::as_str).or(original_input.as_deref());
-                        if failed && (edit.is_none()||input.is_none()) && matches!(&item.content,ItemContent::Changes {..}) {
-                            let missing=if edit.is_none(){"identity"}else{"input"};
-                            step.events.push(Event::Error {message:format!("Tool failed: {}. Its original tool {missing} is unavailable; the failed attempted changes were preserved.",super::preview(content_text(&block["content"]).as_bytes(),512)),fatal:false});
+                        let failed = block["is_error"].as_bool() == Some(true);
+                        let original_input = if failed {
+                            correlated_call.map(|call| call["input"].to_string())
+                        } else {
+                            None
+                        };
+                        let edit = self
+                            .edit_tools
+                            .get(&ScopedId::new(child, &tool_id))
+                            .map(String::as_str)
+                            .or_else(|| correlated_call.and_then(|call| call["name"].as_str()));
+                        let input = self
+                            .tool_inputs
+                            .get(&ScopedId::new(child, &tool_id))
+                            .map(String::as_str)
+                            .or(original_input.as_deref());
+                        if failed
+                            && (edit.is_none() || input.is_none())
+                            && matches!(item.content, ItemContent::Changes { .. })
+                        {
+                            step.events.push(Event::Error{message:format!("Tool failed: {}. Its exact original invocation is unavailable; the full failed attempted changes were preserved.",super::preview(content_text(&block["content"]).as_bytes(),512)),fatal:false});
                         }
                         apply_result(
                             &mut item.content,
@@ -1493,13 +1687,31 @@ impl Claude {
                                 }));
                             }
                         }
-                        self.tool(child,item.clone());
+                        self.tool(child, item.clone());
                         step.events.push(Event::Item(item));
                     }
                     "image" => step.events.push(Event::Item(Item {
                         id: format!("{id}:{index}"),
                         role,
-                        content: image_content(block),
+                        content: match image_content(block) {
+                            ItemContent::Image {
+                                path, description, ..
+                            } => ItemContent::Image {
+                                path: if unavailable.is_some() {
+                                    String::new()
+                                } else {
+                                    path
+                                },
+                                description: unavailable.cloned().unwrap_or_else(|| {
+                                    reference
+                                        .as_ref()
+                                        .map(|reference| reference.label())
+                                        .unwrap_or(description)
+                                }),
+                                reference,
+                            },
+                            content => content,
+                        },
                         started_at: None,
                         at: None,
                     })),
@@ -1507,17 +1719,30 @@ impl Claude {
                         id: format!("{id}:{index}"),
                         role,
                         content: ItemContent::Image {
+                            reference: None,
                             path: String::new(),
                             description: format!("Claude document: {}", string(block, "title")),
                         },
                         started_at: None,
                         at: None,
                     })),
-                    other => self.warn_unknown("content", other),
+                    other => step.events.push(Event::Item(text_item(
+                        format!("{id}:{index}"),
+                        role,
+                        format!("Unsupported Claude content block {other}: {block}"),
+                        false,
+                    ))),
                 }
             }
         }
         if role == Role::Assistant {
+            if frame["error"].as_str().is_some() {
+                for event in &mut step.events[event_start..] {
+                    if let Event::Item(item) = event {
+                        chat::failure::mark_provider_error(Provider::Claude, item);
+                    }
+                }
+            }
             if child.is_none()
                 && let Some(usage) = frame["context_usage"].as_object()
             {
@@ -1533,7 +1758,14 @@ impl Claude {
             }
             if let Some(error) = frame["error"].as_str() {
                 step.events.push(Event::Error {
-                    message: format!("Claude: {error}"),
+                    message: {
+                        let body = content_text(&message["content"]);
+                        if body.is_empty() {
+                            format!("Claude: {error}")
+                        } else {
+                            format!("Claude: {error}\n{body}")
+                        }
+                    },
                     fatal: false,
                 });
             }
@@ -1647,10 +1879,19 @@ impl Claude {
             }
             self.remember_retracted(carrier);
         }
-        for id in ids.iter().chain(child_ids.values().flatten()) {
-            if ids.contains(id) {self.tools.remove(None,id);}
-            for (parent,children) in &child_ids {if children.contains(id) {self.tools.remove(Some(parent),id);}}
-            self.blocks.retain(|_, item| &item.id != id);
+        for (parent, removed) in std::iter::once((None, &ids)).chain(
+            child_ids
+                .iter()
+                .map(|(parent, ids)| (Some(parent.as_str()), ids)),
+        ) {
+            for id in removed {
+                let key = ScopedId::new(parent, id);
+                self.forget_tool(&key);
+                self.tool_order.retain(|known| known != &key);
+                self.blocks.retain(|(message, _), item| {
+                    message.parent.as_deref() != parent || &item.id != id
+                });
+            }
         }
         if !ids.is_empty() {
             step.events.push(Event::ItemsRemoved { ids });
@@ -1709,9 +1950,21 @@ impl Claude {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn fixture_adapter() -> Box<dyn Adapter> {
+    Box::new(Claude::default())
+}
 impl Adapter for Claude {
-    fn bind_item_reader(&mut self,reader:std::sync::Arc<dyn super::CanonicalItemReader>) {self.item_reader=Some(reader);}
-    fn committed(&mut self) {self.tools.trim();}
+    fn bind_item_reader(&mut self, reader: std::sync::Arc<dyn super::CanonicalItemReader>) {
+        self.item_reader = Some(reader);
+    }
+    fn committed(&mut self) {
+        self.tools.committed();
+    }
+    fn prepared_launch_identity(&self) -> Option<PreparedIdentity> {
+        self.prepared_identity.clone()
+    }
+
     fn command_for_run(
         &mut self,
         run: crate::model::RunId,
@@ -1816,7 +2069,10 @@ impl Adapter for Claude {
                 for mut frame in frames {
                     frame["parent_tool_use_id"] = json!(parent);
                     let mut child_step = Step::default();
-                    if self.message(&frame, &mut child_step).is_ok() {
+                    if self
+                        .message_with_tools(&frame, &mut child_step, &HashMap::new(), true)
+                        .is_ok()
+                    {
                         history_step.events.extend(child_step.events);
                     }
                 }
@@ -1841,10 +2097,15 @@ impl Adapter for Claude {
             self.history = Some(history);
         }
         if self.history_only {
-            let reason = format!(
-                "The saved working directory {} is unavailable. Conversation history is read-only.",
-                self.cwd.display()
-            );
+            self.observe_title(&mut step);
+            let reason = if self.forced_history {
+                "Saved conversation history is read-only; no provider was started.".to_owned()
+            } else {
+                format!(
+                    "The saved working directory {} is unavailable. Conversation history is read-only.",
+                    self.cwd.display()
+                )
+            };
             step.events.push(Event::ReadOnlyHistory {
                 reason: reason.clone(),
             });
@@ -1863,10 +2124,11 @@ impl Adapter for Claude {
             match command {
                 Command::LoadEarlier => {}
                 Command::Refresh => return Ok(Step::default()),
-                _ => return Err(
-                    "The saved working directory is unavailable; this conversation is read-only"
-                        .into(),
-                ),
+                _ => {
+                    return Err(
+                        "This saved conversation is read-only; no provider was started".into(),
+                    );
+                }
             }
         }
         match command {
@@ -2026,6 +2288,9 @@ impl Adapter for Claude {
                     PromptMode::Send,
                 )
             }
+            Command::ReadTextCopy { .. } => {
+                return Err("Text copies are served by the transcript cache".into());
+            }
             Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } => {
                 return Err("File changes are served by the transcript cache".into());
             }
@@ -2070,20 +2335,31 @@ impl Adapter for Claude {
             }
         }
     }
-    fn tick(&mut self) -> Step {
-        self.expire_controls(std::time::Instant::now())
-    }
-    fn deadline(&self) -> Option<std::time::Instant> {
-        self.control_deadlines.values().copied().min()
-    }
-    fn command_ack(&mut self) -> Option<String> {
-        self.command_ack.take()
-    }
-    fn control_replies(&mut self) -> Vec<(String, Result<(), String>)> {
-        std::mem::take(&mut self.control_replies)
-    }
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = Step::default();
+        // Reject only exact previously accepted receipts, before metadata or
+        // lifecycle bookkeeping. An old child failure cannot re-block fresh
+        // activity; parent result and unrelated SDK frames are untouched.
+        let child = frame["parent_tool_use_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty());
+        let guarded = match string(&frame, "type") {
+            "result" => child,
+            "stream_event" => child && string(&frame["event"], "type") == "error",
+            "system" => string(&frame, "subtype") == "task_notification",
+            _ => false,
+        };
+        let receipt = if guarded {
+            scoped_failure_receipt(&frame)?
+        } else {
+            None
+        };
+        if receipt
+            .as_ref()
+            .is_some_and(|key| self.failure_receipts.contains(key))
+        {
+            return Ok(step);
+        }
         if frame["parent_tool_use_id"].is_null() {
             self.fast_mode_metadata(&frame, &mut step);
         }
@@ -2130,7 +2406,6 @@ impl Adapter for Claude {
                 self.session_id = None;
                 self.history = None;
                 self.pending.clear();
-                self.decision_generations.clear();
                 self.retired.clear();
                 self.streams.clear();
                 self.blocks.clear();
@@ -2138,6 +2413,8 @@ impl Adapter for Claude {
                 self.message_offsets.clear();
                 self.message_order.clear();
                 self.tools.clear();
+                self.tool_status.clear();
+                self.hidden_task_rows.clear();
                 self.visible_task_rows.clear();
                 self.edit_tools.clear();
                 self.tool_inputs.clear();
@@ -2147,6 +2424,7 @@ impl Adapter for Claude {
                 self.tool_order.clear();
                 self.tasks.clear();
                 self.report_tasks.clear();
+                self.failure_receipts.clear();
                 self.agent_task_calls.clear();
                 self.stopped_agents.clear();
                 self.handed_back.clear();
@@ -2167,20 +2445,8 @@ impl Adapter for Claude {
             "control_response" => {
                 let response = &frame["response"];
                 let id = required(response, "request_id")?;
-                let deadline = self.control_deadlines.remove(id);
                 let Some(request) = self.controls.remove(id) else {
                     return Ok(step);
-                };
-                let acknowledgement = request["_cagents_ack"].as_str().unwrap_or(id).to_owned();
-                let mut chained = false;
-                let mut acknowledged = if string(response, "subtype") == "success" {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "Claude {}: {}",
-                        super::preview(string(&request, "subtype").as_bytes(), 100),
-                        super::preview(string(response, "error").as_bytes(), 700)
-                    ))
                 };
                 if string(&request, "subtype") == "interrupt"
                     && let Some(generation) = request["_cagents_turn"].as_u64()
@@ -2189,12 +2455,19 @@ impl Adapter for Claude {
                     if let Some((key, outcome, execution)) =
                         self.deferred_attention.remove(&generation)
                     {
+                        // This acknowledgement may settle the old run after
+                        // another accepted prompt has begun. Keep its exact
+                        // execution result without replacing that prompt's
+                        // current notification context.
+                        step.suppress_current_notification = generation
+                            != self.attention_generation
+                            && self.started_generation == Some(self.attention_generation);
                         let outcome = if accepted {
                             crate::notifications::Kind::Cancelled
                         } else {
                             outcome
                         };
-                        self.publish_deferred_finish(generation, key, outcome, &mut step);
+                        step.events.push(Event::TurnFinished { key, outcome });
                         if let Some(run) = execution {
                             step.events.push(Event::Execution {
                                 run,
@@ -2222,25 +2495,20 @@ impl Adapter for Claude {
                         // the identical handshake once without suggestions.
                         let mut request = request.clone();
                         request.as_object_mut().unwrap().remove("promptSuggestions");
-                        let retry = self.followup_control(request, &acknowledgement, deadline)?;
+                        let retry = self.control(request)?;
                         step.writes.extend(retry.writes);
                         return Ok(step);
                     }
-                    if string(&request, "subtype") == "initialize" {
-                        step.events.push(Event::Error {
-                            message: format!(
-                                "Claude initialization failed: {}",
-                                super::preview(string(response, "error").as_bytes(), 700)
-                            ),
-                            fatal: true,
-                        });
-                    }
+                    step.events.push(Event::Error {
+                        message: format!(
+                            "Claude {}: {}",
+                            string(&request, "subtype"),
+                            string(response, "error")
+                        ),
+                        fatal: string(&request, "subtype") == "initialize",
+                    });
                 } else if string(response, "subtype") != "success" {
-                    self.warn_unknown("control response", string(response, "subtype"));
-                    acknowledged=Err("Claude returned an unrecognized control response; the requested change is unconfirmed".into());
-                    if string(&request, "subtype") == "initialize" {
-                        step.events.push(Event::Error {message:"Claude could not confirm initialization; restart the session after updating the provider".into(),fatal:true});
-                    }
+                    return Err("Unsupported Claude control response subtype".into());
                 } else {
                     match string(&request, "subtype") {
                         "initialize" => {
@@ -2260,6 +2528,9 @@ impl Adapter for Claude {
                                     id: id.clone(),
                                     title: None,
                                 });
+                            }
+                            if self.resumed {
+                                self.observe_title(&mut step);
                             }
                             self.metadata(&response["response"], &mut step);
                             self.fast_mode_metadata(&response["response"], &mut step);
@@ -2287,8 +2558,7 @@ impl Adapter for Claude {
                         "set_model" => {
                             self.selected = request["model"].as_str().map(str::to_owned);
                             self.metadata(&Value::Null, &mut step);
-                            let next = self.followup_control(json!({"subtype":"apply_flag_settings", "settings":{"effortLevel":request["_cagents_reasoning"]}}), &acknowledgement, deadline)?;
-                            chained = true;
+                            let next = self.control(json!({"subtype":"apply_flag_settings", "settings":{"effortLevel":request["_cagents_reasoning"]}}))?;
                             step.writes.extend(next.writes);
                         }
                         "get_settings" => {
@@ -2305,7 +2575,10 @@ impl Adapter for Claude {
                                         |_| "Malformed pending Claude permission settings update",
                                     )?;
                                 if let Err(message) = snapshot.confirm(&update) {
-                                    acknowledged = Err(message);
+                                    step.events.push(Event::Error {
+                                        message,
+                                        fatal: false,
+                                    });
                                 }
                             }
                             self.permissions = Some(snapshot);
@@ -2314,8 +2587,7 @@ impl Adapter for Claude {
                             if request["_cagents_permissions"].as_bool() == Some(true) =>
                         {
                             self.permissions = None;
-                            let next = self.followup_control(json!({"subtype":"get_settings", "_cagents_permission_update":request["_cagents_permission_update"]}), &acknowledgement, deadline)?;
-                            chained = true;
+                            let next = self.control(json!({"subtype":"get_settings", "_cagents_permission_update":request["_cagents_permission_update"]}))?;
                             step.writes.extend(next.writes);
                         }
                         "apply_flag_settings" if request["settings"].get("fastMode").is_some() => {
@@ -2370,9 +2642,6 @@ impl Adapter for Claude {
                         _ => {}
                     }
                 }
-                if !chained {
-                    self.control_replies.push((acknowledgement, acknowledged));
-                }
             }
             "assistant" | "user" => {
                 // The replay acknowledgement can precede consumption. Its
@@ -2388,7 +2657,7 @@ impl Adapter for Claude {
                 }
             }
             "stream_event" => {
-                if let Some(id) = frame["uuid"].as_str() {
+                if !guarded && let Some(id) = frame["uuid"].as_str() {
                     if self.stream_events.iter().any(|seen| seen == id) {
                         return Ok(step);
                     }
@@ -2407,19 +2676,90 @@ impl Adapter for Claude {
                 }
             }
             "result" => {
-                let can_suggest = frame["parent_tool_use_id"].is_null()
-                    && frame["is_error"] != true
-                    && frame["subtype"] == "success"
-                    && self.interruption.is_none()
-                    && self.started_generation == Some(self.attention_generation);
+                // A delegated result still carries scoped permission evidence,
+                // even though it must never settle the parent turn.
                 for denial in frame["permission_denials"]
                     .as_array()
                     .into_iter()
                     .flatten()
                     .take(chat::PermissionDenial::LIMIT)
                 {
-                    self.permission_denied(denial, &mut step)?;
+                    self.permission_denied(
+                        frame["parent_tool_use_id"].as_str(),
+                        denial,
+                        &mut step,
+                    )?;
                 }
+                if let Some(parent) = frame["parent_tool_use_id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                {
+                    // A child result settles this exact delegated turn, not the
+                    // parent's prompt, usage, interrupt or accepted execution.
+                    let errors = content_text(&frame["errors"]);
+                    let detail = if !errors.is_empty() {
+                        errors
+                    } else {
+                        string(&frame, "result").to_owned()
+                    };
+                    let status = if self.stopped_agents.iter().any(|id| id == parent) {
+                        ToolStatus::Stopped
+                    } else if frame["is_error"].as_bool() == Some(true) {
+                        ToolStatus::Failed
+                    } else {
+                        ToolStatus::Succeeded
+                    };
+                    self.background_agents.remove(parent);
+                    let key = ScopedId::new(None, parent);
+                    if let Some((known, true)) = self.tool_status.get_mut(&key) {
+                        *known = status;
+                    }
+                    if let Some(mut item) = self.tools.get(None, parent).cloned() {
+                        if let ItemContent::Tool { status: known, .. } = &mut item.content {
+                            *known = status;
+                            self.tools.insert(None, item);
+                        }
+                    }
+                    self.tasks.retain(|task| {
+                        !self
+                            .agent_task_calls
+                            .iter()
+                            .any(|(tool, known)| tool == parent && known == task)
+                            && !self
+                                .agent_calls
+                                .iter()
+                                .any(|(known, tool)| tool == parent && known == task)
+                    });
+                    if let Some(stream) = self.streams.remove(parent) {
+                        self.settle(Some(parent), &stream.message);
+                    }
+                    if frame["is_error"].as_bool() == Some(true) && !detail.is_empty() {
+                        step.events.push(Event::SubagentItem {
+                            id: parent.into(),
+                            item: child_failure_item(&frame, "result-error", detail.clone()),
+                        });
+                    }
+                    step.events.push(Event::Subagent {
+                        id: parent.into(),
+                        kind: String::new(),
+                        description: String::new(),
+                        status: Some(status),
+                        background: None,
+                        model: None,
+                        waiting: Some(false),
+                        detail: Some(detail),
+                    });
+                    self.remember_failure_receipt(receipt);
+                    return Ok(step);
+                }
+                if frame["parent_tool_use_id"].is_null() {
+                    self.observe_title(&mut step);
+                }
+                let can_suggest = frame["parent_tool_use_id"].is_null()
+                    && frame["is_error"] != true
+                    && frame["subtype"] == "success"
+                    && self.interruption.is_none()
+                    && self.started_generation == Some(self.attention_generation);
                 let had_turn = self.busy;
                 let interruption = self.interruption.take();
                 if had_turn || frame["uuid"].as_str().is_some() {
@@ -2437,16 +2777,11 @@ impl Adapter for Claude {
                     ));
                     let outcome = if interruption == Some(true) {
                         Kind::Cancelled
-                    } else if frame["is_error"].as_bool() == Some(true)
-                        || frame["subtype"] != "success"
-                    {
+                    } else if frame["is_error"].as_bool() == Some(true) {
                         Kind::Failed
                     } else {
                         Kind::Succeeded
                     };
-                    if matches!(outcome, Kind::Cancelled | Kind::Failed) {
-                        self.retire_turn_decisions(self.attention_generation, &mut step);
-                    }
                     let execution = self.execution.take();
                     if let Some(run) = execution {
                         step.events.push(Event::Execution {
@@ -2487,7 +2822,7 @@ impl Adapter for Claude {
                     &mut step,
                 );
                 if let Some(stream) = self.streams.remove("") {
-                    self.settle(&stream.message);
+                    self.settle(None, &stream.message);
                 }
                 // Result input totals span multiple API calls; they are not the
                 // context occupancy of the last individual model call.
@@ -2522,8 +2857,8 @@ impl Adapter for Claude {
                     }
                 }
                 step.events.push(Event::Usage(self.usage.clone()));
-                if frame["is_error"].as_bool() == Some(true) || frame["subtype"] != "success" {
-                    let errors = provider_error_text(&frame["errors"]);
+                if frame["is_error"].as_bool() == Some(true) {
+                    let errors = content_text(&frame["errors"]);
                     let message = if !errors.is_empty() {
                         errors
                     } else if !string(&frame, "result").is_empty() {
@@ -2648,47 +2983,11 @@ impl Adapter for Claude {
                 }
             }
             "keep_alive" => {}
-            other => self.warn_unknown("frame", other),
+            other => return Err(format!("Unsupported Claude stream-json frame type {other}")),
         }
-        for event in &mut step.events {
-            if let Event::Error { message, .. } | Event::HistoryError(message) = event {
-                *message = super::preview(message.as_bytes(), 1024);
-            }
-        }
+        self.remember_failure_receipt(receipt);
         Ok(step)
     }
-}
-
-fn provider_error_text(value: &Value) -> String {
-    fn readable(value: &Value) -> Option<&str> {
-        value
-            .as_str()
-            .or_else(|| value["message"].as_str())
-            .or_else(|| value["text"].as_str())
-    }
-    if let Some(text) = readable(value) {
-        return super::preview(text.as_bytes(), 1024);
-    }
-    if let Some(errors) = value.as_array() {
-        let mut message = String::new();
-        for error in errors {
-            if let Some(text) = readable(error) {
-                if !message.is_empty() {
-                    message.push_str("; ");
-                }
-                message.push_str(&super::preview(
-                    text.as_bytes(),
-                    1024usize.saturating_sub(message.len()),
-                ));
-                if message.len() >= 1024 {
-                    break;
-                }
-            }
-        }
-        message.truncate(message.floor_char_boundary(1024));
-        return message;
-    }
-    String::new()
 }
 
 /// A usage-limit notice as a sentence, or nothing while the limit is not
@@ -2848,6 +3147,50 @@ fn required<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("Claude protocol frame is missing {key}"))
 }
+/// Explicit child API/result failures retain their original diagnostic in
+/// history as well as transient status. A carrier identifies exact replay;
+/// without one, distinct actual receipts must never share a fabricated ID.
+fn child_failure_item(frame: &Value, source: &str, message: String) -> Item {
+    let carrier = frame["uuid"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let mut item = text_item(
+        format!("claude-{source}:{carrier}:0"),
+        Role::System,
+        message,
+        false,
+    );
+    chat::failure::mark_provider_error(Provider::Claude, &mut item);
+    item
+}
+
+/// Hash the already parsed frame without allocating another full diagnostic.
+/// UUID-less receipts have no replay authority and are always processed.
+fn scoped_failure_receipt(frame: &Value) -> Result<Option<[u8; 32]>, String> {
+    if frame["uuid"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+        .is_none()
+    {
+        return Ok(None);
+    }
+    struct HashWriter(sha2::Sha256);
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            sha2::Digest::update(&mut self.0, bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = HashWriter(<sha2::Sha256 as sha2::Digest>::new());
+    serde_json::to_writer(&mut writer, frame).map_err(|error| error.to_string())?;
+    Ok(Some(sha2::Digest::finalize(writer.0).into()))
+}
+
 /// A child frame belongs to its agent's transcript, even when Claude gives it
 /// the wire role `user` for an internal prompt or tool result.
 fn route_subagent_events(events: &mut Vec<Event>, start: usize, parent: &str) {
@@ -2888,6 +3231,18 @@ fn route_subagent_events(events: &mut Vec<Event>, start: usize, parent: &str) {
             Event::ItemsRemoved { ids } => Event::SubagentItemsRemoved {
                 id: parent.into(),
                 ids,
+            },
+            Event::Error { message, .. } => Event::Subagent {
+                id: parent.into(),
+                kind: String::new(),
+                description: String::new(),
+                // A retryable API error is not proof that the task stopped.
+                // Keep its exact status, but expose that it needs attention.
+                status: None,
+                background: None,
+                model: None,
+                waiting: Some(true),
+                detail: Some(message),
             },
             event => event,
         })
@@ -3582,15 +3937,17 @@ fn apply_result(
         // An edit that failed changed nothing, and why it failed is the one
         // thing a reader needs: a patch has nowhere to say it, so the step
         // goes back to being the tool call it was, carrying the message.
-        ItemContent::Changes {status,..} => {
-            if let (Some(name),Some(input))=(edit,input) {
-                *content=ItemContent::Tool{name:name.into(),input:input.into(),output:text,status:result};
-            } else {
-                // A known native name alone cannot reconstruct its arguments.
-                // Keep the complete attempted patch instead of replacing it
-                // with a filepath-shaped placeholder.
-                *status=result;
-            }
+        ItemContent::Changes { status, .. } if edit.is_none() || input.is_none() => {
+            *status = result;
+        }
+        ItemContent::Changes { .. } => {
+            let input = input.unwrap().to_owned();
+            *content = ItemContent::Tool {
+                name: edit.unwrap_or("Edit").into(),
+                input,
+                output: text,
+                status: result,
+            };
         }
         // Only a shell command's result is what a terminal was written to: a
         // file that was read is shown as the bytes it holds.
@@ -3635,6 +3992,7 @@ fn image_content(block: &Value) -> ItemContent {
         _ => String::new(),
     };
     ItemContent::Image {
+        reference: None,
         path,
         description: "Claude image attachment".into(),
     }
@@ -3663,6 +4021,9 @@ fn content_text(value: &Value) -> String {
         value.to_string()
     }
 }
+// Question and option strings are provider-authored text, not attachment
+// descriptors. Preserve them verbatim: they also serve as answer-map keys.
+// A filename or shell pattern in a question does not authorize a file read.
 fn question_fields(input: &Value) -> Result<Vec<Field>, String> {
     let questions = input["questions"]
         .as_array()
@@ -3805,13 +4166,26 @@ impl Claude {
                     // A message interrupted before its `message_stop` is
                     // abandoned once its stream moves on.
                     if let Some(abandoned) = self.streams.insert(parent.clone(), stream) {
-                        self.settle(&abandoned.message);
+                        self.settle(Some(&parent), &abandoned.message);
                     }
                 }
                 if parent.is_empty() {
                     self.start_turn(step);
                     self.update_usage(&event["message"]["usage"], step);
                     self.status(true, "Claude is working", step);
+                } else {
+                    // Only actual new child API activity clears a retryable
+                    // child failure; an unrelated background notice cannot.
+                    step.events.push(Event::Subagent {
+                        id: parent.clone(),
+                        kind: String::new(),
+                        description: String::new(),
+                        status: None,
+                        background: None,
+                        model: None,
+                        waiting: Some(false),
+                        detail: Some(String::new()),
+                    });
                 }
             }
             "content_block_start" => {
@@ -3864,12 +4238,20 @@ impl Claude {
                         at: None,
                     },
                     other => {
-                        self.warn_unknown("stream content", other);
+                        step.events.push(Event::Error {
+                            message: format!("Unsupported Claude streaming content block {other}"),
+                            fatal: false,
+                        });
                         return Ok(());
                     }
                 };
-                step.events.push(Event::Item(item.clone()));
-                self.blocks.insert((message, index), item);
+                if !matches!(&item.content, ItemContent::Tool { .. })
+                    || !self.completed_tool(Some(&parent), &item.id)
+                {
+                    step.events.push(Event::Item(item.clone()));
+                }
+                self.blocks
+                    .insert((ScopedId::new(Some(&parent), &message), index), item);
             }
             "content_block_delta" => {
                 let stream = self
@@ -3881,13 +4263,23 @@ impl Claude {
                 if matches!(string(delta, "type"), "signature_delta" | "citations_delta") {
                     return Ok(());
                 }
-                let Some(item) = self.blocks.get_mut(&(stream.message.clone(), index)) else {
+                let Some(item) = self
+                    .blocks
+                    .get_mut(&(ScopedId::new(Some(&parent), &stream.message), index))
+                else {
                     if stream.truncated {
                         return Ok(());
                     }
-                    self.warn_unknown("untracked block delta", string(delta, "type"));
-                    return Ok(());
+                    return Err("Claude delta arrived without its content block".into());
                 };
+                if matches!(&item.content, ItemContent::Tool { .. })
+                    && self
+                        .tool_status
+                        .get(&ScopedId::new(Some(&parent), &item.id))
+                        .is_some_and(|(status, _)| *status != ToolStatus::Running)
+                {
+                    return Ok(());
+                }
                 match (&mut item.content, string(delta, "type")) {
                     (ItemContent::Text { text, thinking, .. }, "text_delta" | "thinking_delta") => {
                         let value = delta[if *thinking { "thinking" } else { "text" }]
@@ -3911,15 +4303,13 @@ impl Claude {
                                 "Claude streamed tool input exceeds the 30 MiB item limit".into()
                             );
                         }
-                        let offset = input.len();
                         input.push_str(value);
-                        step.events.push(Event::InputDelta {
-                            id: item.id.clone(),
-                            offset,
-                            delta: value.into(),
-                        });
+                        step.events.push(Event::Item(item.clone()));
                     }
-                    (_, other) => self.warn_unknown("stream delta", other),
+                    (_, other) => step.events.push(Event::Error {
+                        message: format!("Unsupported Claude stream delta {other}"),
+                        fatal: false,
+                    }),
                 }
             }
             "content_block_stop" => {
@@ -3932,7 +4322,14 @@ impl Claude {
                 let index = event["index"]
                     .as_u64()
                     .ok_or("Claude block stop has no index")?;
-                if let Some(mut item) = self.blocks.get(&(message, index)).cloned() {
+                if let Some(mut item) = self
+                    .blocks
+                    .get(&(ScopedId::new(Some(&parent), &message), index))
+                    .cloned()
+                {
+                    if self.completed_tool(Some(&parent), &item.id) {
+                        return Ok(());
+                    }
                     if let ItemContent::Tool { name, input, .. } = &item.content {
                         let parsed = if input.is_empty() {
                             Value::Null
@@ -3942,6 +4339,9 @@ impl Claude {
                             // Claude Code closes a block cut off by a retried
                             // request with a synthetic stop. Its call was
                             // discarded, never run, so it leaves the transcript.
+                            let key = ScopedId::new(Some(&parent), &item.id);
+                            self.forget_tool(&key);
+                            self.tool_order.retain(|known| known != &key);
                             step.events.push(Event::ItemsRemoved {
                                 ids: vec![item.id.clone()],
                             });
@@ -3952,13 +4352,16 @@ impl Claude {
                         // accumulate as a plain tool call and the richer
                         // mapping happens here rather than against a prefix.
                         let content = tool_content(name, &parsed, &self.cwd);
-                        self.remember_tool_input(Some(&parent),&item.id, &parsed)?;
+                        self.remember_tool_input(Some(&parent), &item.id, &parsed)?;
                         if matches!(content, ItemContent::Changes { .. }) {
-                            self.edit_tools.insert(CanonicalItemKey::new(Some(&parent),&item.id), name.clone());
+                            self.edit_tools
+                                .insert(ScopedId::new(Some(&parent), &item.id), name.clone());
                         }
-                        item.content = content;
-                        step.events.push(Event::Item(item.clone()));
-                        self.tool(Some(&parent),item);
+                        if !matches!(content, ItemContent::Tool { .. }) {
+                            item.content = content;
+                            step.events.push(Event::Item(item.clone()));
+                        }
+                        self.tool(Some(&parent), item);
                     }
                 }
             }
@@ -3969,30 +4372,47 @@ impl Claude {
             }
             "message_stop" => {
                 if let Some(stream) = self.streams.remove(&parent) {
-                    self.settle(&stream.message);
+                    self.settle(Some(&parent), &stream.message);
                 }
             }
             "ping" => {}
-            "error" => step.events.push(Event::Error {
-                message: event["error"]["message"]
-                    .as_str()
-                    .or_else(|| event["error"].as_str())
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| {
-                        "Claude reported a stream error without a readable message".into()
-                    }),
+            "error" => {
+                let message = content_text(&event["error"]);
+                if !parent.is_empty() {
+                    // Transient child detail is cleared by terminal task
+                    // notifications. Keep explicit API failures in that child's
+                    // transcript as well, with the same exact original cause.
+                    step.events.push(Event::Item(child_failure_item(
+                        frame,
+                        "stream-error",
+                        message.clone(),
+                    )));
+                }
+                step.events.push(Event::Error {
+                    message,
+                    fatal: false,
+                });
+            }
+            other => step.events.push(Event::Error {
+                message: format!("Unsupported Claude API stream event {other}"),
                 fatal: false,
             }),
-            other => self.warn_unknown("stream event", other),
         }
         Ok(())
     }
     /// Forget a message that will stream no further blocks.
-    fn settle(&mut self, message: &str) {
-        self.blocks.retain(|(id, _), _| id != message);
+    fn settle(&mut self, parent: Option<&str>, message: &str) {
+        let key = ScopedId::new(parent, message);
+        self.blocks.retain(|(id, _), _| id != &key);
     }
 
-    fn permission_denied(&self, frame: &Value, step: &mut Step) -> Result<(), String> {
+    fn permission_denied(
+        &self,
+        parent: Option<&str>,
+        frame: &Value,
+        step: &mut Step,
+    ) -> Result<(), String> {
+        let parent = parent.filter(|id| !id.is_empty());
         let id = required(frame, "tool_use_id")?;
         if self
             .dismissed_denials
@@ -4004,8 +4424,12 @@ impl Claude {
         let name = required(frame, "tool_name")?;
         let input = if frame["tool_input"].is_object() {
             Some(frame["tool_input"].to_string())
+        } else if parent.is_some() || string(frame, "agent_id").is_empty() {
+            self.tool_inputs.get(&ScopedId::new(parent, id)).cloned()
         } else {
-            self.tool_inputs.get(&CanonicalItemKey::new(frame["parent_tool_use_id"].as_str(),id)).cloned()
+            // An agent UUID is not a parent tool-use ID. Without the latter,
+            // no cached input can safely be attributed to this advisory.
+            None
         }
         .filter(|input| input.len() <= chat::PermissionDenial::INPUT_LIMIT);
         let bounded = |value: &str| {
@@ -4038,14 +4462,16 @@ impl Claude {
             )));
         }
         match string(frame, "subtype") {
-            "permission_denied" => self.permission_denied(frame, step)?,
+            "permission_denied" => {
+                self.permission_denied(frame["parent_tool_use_id"].as_str(), frame, step)?
+            }
             "init" | "commands_changed" => self.metadata(frame, step),
             "model_refusal_fallback" => {
                 self.retract(&frame["retracted_message_uuids"], step)?;
                 step.events.push(Event::Item(text_item(
                     required(frame, "uuid")?.into(),
                     Role::System,
-                    "Claude switched models after a refusal; continuing the turn".into(),
+                    frame.to_string(),
                     false,
                 )));
             }
@@ -4077,10 +4503,17 @@ impl Claude {
             "task_started" | "task_progress" | "task_notification" | "task_updated" => {
                 let task = required(frame, "task_id")?;
                 let id = format!("claude-task:{task}");
-                let mut presentation_known=true;
-                let previous=match self.cached_tool(None,&id) {
-                    Ok(previous)=>previous,
-                    Err(message)=> {step.events.push(Event::Error {message,fatal:false});presentation_known=false;None}
+                let mut presentation_known = true;
+                let previous = match self.cached_tool(None, &id) {
+                    Ok(previous) => previous,
+                    Err(message) => {
+                        step.events.push(Event::Error {
+                            message,
+                            fatal: false,
+                        });
+                        presentation_known = false;
+                        None
+                    }
                 };
                 let mut item = previous.unwrap_or(Item {
                     id,
@@ -4165,21 +4598,35 @@ impl Claude {
                 });
                 // Lifecycle bookkeeping and notification summaries still need
                 // the synthetic tool. Only its duplicate presentation is hidden.
-                let represented=if let Some(tool)=known_tool.as_deref().or_else(||frame["tool_use_id"].as_str()) {
-                    let mut owners=self.tool_order.iter().filter(|key|key.item_id==tool);
-                    let owner=owners.next().cloned();
+                let represented = if let Some(tool) = known_tool
+                    .as_deref()
+                    .or_else(|| frame["tool_use_id"].as_str())
+                {
+                    let mut owners = self.tool_order.iter().filter(|key| key.id == tool);
+                    let owner = owners.next().cloned();
                     if owners.next().is_some() {
-                        step.events.push(Event::Error {message:"Original task tool scope is ambiguous; preserving its existing source".into(),fatal:false});
-                        presentation_known=false;false
+                        presentation_known = false;
+                        false
                     } else {
-                        let scope=owner.as_ref().and_then(|key|key.agent_id.as_deref());
-                        match self.cached_tool(scope,tool) {
-                            Ok(Some(item))=>matches!(&item.content,ItemContent::Tool {name,..} if name=="Agent"),
-                            Ok(None)=>false,
-                            Err(message)=> {step.events.push(Event::Error {message,fatal:false});presentation_known=false;false}
+                        let scope = owner.as_ref().and_then(|key| key.parent.as_deref());
+                        match self.cached_tool(scope, tool) {
+                            Ok(Some(item)) => {
+                                matches!(item.content,ItemContent::Tool{name,..} if name=="Agent")
+                            }
+                            Ok(None) => false,
+                            Err(message) => {
+                                step.events.push(Event::Error {
+                                    message,
+                                    fatal: false,
+                                });
+                                presentation_known = false;
+                                false
+                            }
                         }
                     }
-                } else {false};
+                } else {
+                    false
+                };
                 if let Some(tool) = &known_tool {
                     if string(frame, "subtype") == "task_started" {
                         self.stopped_agents.retain(|known| known != tool);
@@ -4224,34 +4671,50 @@ impl Claude {
                         background: None,
                     });
                 }
-                // Presentation loss cannot suppress independent provider task
-                // lifecycle proof. Preserve the old source rather than emit a
-                // newly fabricated task row, and keep processing completion.
                 if presentation_known {
-                self.tool(None,item.clone());
+                    self.tool(None, item.clone());
+                    if represented {
+                        self.hidden_task_rows.insert(item.id.clone());
+                        if let Some(reader) = &self.item_reader {
+                            let live: Vec<_> = self
+                                .hidden_task_rows
+                                .iter()
+                                .filter(|id| id.len() <= 4096)
+                                .cloned()
+                                .collect();
+                            if let Err(message) = reader.retain_hidden_task(&item, &live) {
+                                step.events.push(Event::Error {
+                                    message,
+                                    fatal: false,
+                                });
+                            }
+                        }
+                    }
+                }
                 if represented {
                     if self.visible_task_rows.remove(&item.id) {
                         step.events.push(Event::ItemsRemoved {
                             ids: vec![item.id.clone()],
                         });
                     }
-                } else {
+                } else if presentation_known {
                     self.visible_task_rows.insert(item.id.clone());
                     step.events.push(Event::Item(item.clone()));
                 }
-                }
-                if string(frame, "subtype") == "task_started"
-                    && matches!(string(frame, "task_type"), "local_agent" | "local_workflow")
-                {
-                    let kind = if string(frame, "task_type") == "local_workflow" {
-                        ReportTask::Workflow
-                    } else {
-                        ReportTask::Agent
-                    };
+                if string(frame, "subtype") == "task_started" {
+                    // A new task identity binding retires any prior native
+                    // origin, including reuse for a Bash or unknown task.
                     self.report_tasks.retain(|(known, _)| known != task);
-                    self.report_tasks.push_back((task.into(), kind));
-                    if self.report_tasks.len() > MAX_TOOLS {
-                        self.report_tasks.pop_front();
+                    if matches!(string(frame, "task_type"), "local_agent" | "local_workflow") {
+                        let kind = if string(frame, "task_type") == "local_workflow" {
+                            ReportTask::Workflow
+                        } else {
+                            ReportTask::Agent
+                        };
+                        self.report_tasks.push_back((task.into(), kind));
+                        if self.report_tasks.len() > MAX_TOOLS {
+                            self.report_tasks.pop_front();
+                        }
                     }
                 }
                 // Headless Claude Code tells the model a task finished in a turn
@@ -4269,7 +4732,6 @@ impl Claude {
                         .report_tasks
                         .iter()
                         .find_map(|(known, kind)| (known == task).then_some(*kind));
-                    self.report_tasks.retain(|(known, _)| known != task);
                     let recorded = ["skip_transcript", "ambient"]
                         .iter()
                         .all(|key| frame.get(key).and_then(Value::as_bool) != Some(true));
@@ -4313,7 +4775,10 @@ impl Claude {
             | "background_tasks_changed"
             | "vcs_state_changed"
             | "elicitation_complete" => {}
-            other => self.warn_unknown("system", other),
+            other => step.events.push(Event::Error {
+                message: format!("Unsupported Claude system event {other}: {frame}"),
+                fatal: false,
+            }),
         }
         Ok(())
     }
@@ -4890,6 +5355,14 @@ impl History {
             .map_err(|e| e.to_string())?;
         let mut frame: Value = serde_json::from_slice(&bytes)
             .map_err(|e| format!("Claude history changed while reading: {e}"))?;
+        // The provider can rewrite this inode after indexing. Revalidate the
+        // record being published, including off-page tool-call dependencies.
+        if frame["sessionId"]
+            .as_str()
+            .is_some_and(|id| id != self.session_id)
+        {
+            return Err("Claude history changed session identity while reading".into());
+        }
         frame["_cagents_block_base"] = json!(base);
         frame
             .as_object_mut()
@@ -5063,7 +5536,7 @@ impl Claude {
             fields,
             actions,
         }));
-        self.remember_decision(id, raw);
+        self.pending.insert(id, raw);
         Ok(step)
     }
     fn answer_elicitation(
@@ -5119,6 +5592,8 @@ impl Claude {
             return Err("Claude elicitation response must be smaller than 30 MiB".into());
         }
         let mut step = Step {
+            suppress_current_notification: false,
+            notification_preview: None,
             writes: vec![
                 json!({"type":"control_response", "response":{"subtype":"success", "request_id":id, "response":response}}),
             ],
@@ -5282,431 +5757,1232 @@ fn elicitation_value(schema: &Value, values: &[String]) -> Result<Value, String>
 }
 
 #[cfg(test)]
+mod history_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    #[test]
+    fn unverified_owned_claude_image_history_never_downgrades_to_a_coincident_path() {
+        crate::chat::attachment_assets::with_test_image(|image| {
+            let reference = image.reference.as_ref().unwrap();
+            let bytes = std::fs::read(&image.path).unwrap();
+            let image_items = |frame: &Value| {
+                let mut step = Step::default();
+                Claude::default().message(frame, &mut step).unwrap();
+                step.events
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        Event::Item(item) => Some(item),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for failure in 0..3 {
+                let mut candidate = reference.clone();
+                if failure == 0 {
+                    candidate.device = uuid::Uuid::new_v4();
+                } else if failure == 1 {
+                    candidate.id = uuid::Uuid::new_v4();
+                }
+                let mut marker = super::super::image_references::marker(&candidate).unwrap();
+                if failure == 2 {
+                    marker = marker.replace("{\"id\"", "{\"future\":true,\"id\"");
+                }
+                let mut frame = json!({"type":"user", "uuid":"unverified-image-history", "message":{"role":"user", "content":[
+                    {"type":"text", "text":marker},
+                    {"type":"image", "source":{"type":"url", "url":image.path.to_str().unwrap()}}
+                ]}});
+                let items = image_items(&frame);
+                assert_eq!(items.len(), 2, "unverified marker must remain literal");
+                assert!(
+                    matches!(&items[0].content, ItemContent::Text { text, .. } if text == &marker)
+                );
+                assert!(
+                    matches!(&items[1].content, ItemContent::Image { path, reference:None, description } if path.is_empty() && description.contains("originating device")),
+                    "a real coincident local PNG is not preview authority"
+                );
+                // The foreign claim still cannot create trusted metadata, but
+                // actual self-contained history pixels need no local path.
+                frame["message"]["content"][1]["source"] = json!({"type":"base64", "media_type":"image/png", "data":STANDARD.encode(&bytes)});
+                let inline = image_items(&frame);
+                assert!(
+                    matches!(&inline[1].content, ItemContent::Image { path, reference:None, .. } if path.starts_with("data:image/png;base64,"))
+                );
+            }
+            let legacy = json!({"type":"user", "uuid":"legacy-url", "message":{"role":"user", "content":[
+                {"type":"text", "text":"ordinary earlier [Image 77777] prose"},
+                {"type":"image", "source":{"type":"url", "url":image.path.to_str().unwrap()}}
+            ]}});
+            let items = image_items(&legacy);
+            assert!(
+                matches!(&items[1].content, ItemContent::Image { path, reference:None, .. } if path == image.path.to_str().unwrap()),
+                "unclaimed legacy URL behavior stays unchanged"
+            );
+            assert_eq!(std::fs::read(&image.path).unwrap(), bytes);
+        });
+    }
+
+    #[test]
+    fn referenced_image_payload_history_and_queue_keep_real_bytes_and_identity() {
+        crate::chat::attachment_assets::with_test_image(|attachment| {
+            let display = tempfile::tempdir().unwrap();
+            let other_pixels =
+                crate::chat::attachment_assets::test_image("display-side pixels.png");
+            let mut hinted = attachment.clone();
+            hinted.path = display.path().join(attachment.path.file_name().unwrap());
+            std::fs::copy(&other_pixels.path, &hinted.path).unwrap();
+            assert_ne!(
+                std::fs::read(&hinted.path).unwrap(),
+                std::fs::read(&attachment.path).unwrap()
+            );
+            let reference = attachment.reference.clone().unwrap();
+            let text = format!(
+                "Earlier [Image 77777] was dark; compare new {} after",
+                reference.token()
+            );
+            let mut adapter = Claude {
+                ready: true,
+                async_input: true,
+                ..Default::default()
+            };
+            let submitted = adapter
+                .send_prompt(text.clone(), vec![hinted.clone()], PromptMode::Queue)
+                .unwrap();
+            let frame = &submitted.writes[0];
+            let content = frame["message"]["content"].as_array().unwrap();
+            assert_eq!(content.len(), 3);
+            assert_eq!(content[0], json!({"type":"text","text":text}));
+            assert_eq!(
+                content[1]["text"],
+                super::super::image_references::marker(&reference).unwrap()
+            );
+            assert_eq!(content[2]["type"], "image");
+            assert_eq!(content[2]["source"]["type"], "base64");
+            assert_eq!(
+                STANDARD
+                    .decode(content[2]["source"]["data"].as_str().unwrap())
+                    .unwrap(),
+                std::fs::read(&attachment.path).unwrap()
+            );
+            let queued = &adapter.queued[0];
+            assert_eq!(queued.text, text);
+            assert_eq!(queued.attachments, [hinted]);
+            assert!(queued.editable);
+            let mut retry = Claude {
+                ready: true,
+                ..Default::default()
+            };
+            let resent = retry
+                .send_prompt(
+                    queued.text.clone(),
+                    queued.attachments.clone(),
+                    PromptMode::Send,
+                )
+                .unwrap();
+            assert_eq!(
+                resent.writes[0]["message"]["content"],
+                frame["message"]["content"]
+            );
+            // A newly attached adapter parses the actual persisted provider
+            // frame, not a fabricated local image item.
+            let mut restored = Claude::default();
+            let mut history = Step::default();
+            restored.message(frame, &mut history).unwrap();
+            let items = history
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Item(item) => Some(item),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(items.len(), 2);
+            assert!(
+                matches!(&items[0].content, ItemContent::Text { text: restored, .. } if restored == &text)
+            );
+            assert!(
+                matches!(&items[1].content, ItemContent::Image { reference: Some(restored), path, description } if restored == &reference && path.starts_with("data:image/png;base64,") && description == &reference.label())
+            );
+            assert!(
+                items[1].id.ends_with(":2"),
+                "stripping a marker never shifts provider block indices"
+            );
+
+            let mut foreign = frame.clone();
+            let mut forged = reference.clone();
+            forged.id = uuid::Uuid::new_v4();
+            foreign["uuid"] = json!("forged-image-history");
+            foreign["message"]["content"][1]["text"] =
+                json!(super::super::image_references::marker(&forged).unwrap());
+            let mut visible = Step::default();
+            Claude::default().message(&foreign, &mut visible).unwrap();
+            assert_eq!(
+                visible
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event, Event::Item(_)))
+                    .count(),
+                3
+            );
+            assert!(visible.events.iter().any(|event| matches!(
+                event,
+                Event::Item(Item {
+                    content: ItemContent::Image {
+                        reference: None,
+                        ..
+                    },
+                    ..
+                })
+            )));
+        });
+    }
+
+    #[test]
+    fn multiple_referenced_images_keep_caret_mapping_and_base64_order() {
+        crate::chat::attachment_assets::with_test_image(|first| {
+            let second = crate::chat::attachment_assets::test_image("second.png");
+            let first_ref = first.reference.as_ref().unwrap();
+            let second_ref = second.reference.as_ref().unwrap();
+            let text = format!("Use {} before {}", second_ref.token(), first_ref.token());
+            let mut adapter = Claude {
+                ready: true,
+                ..Default::default()
+            };
+            let submitted = adapter
+                .send_prompt(
+                    text.clone(),
+                    vec![first.clone(), second.clone()],
+                    PromptMode::Send,
+                )
+                .unwrap();
+            let content = &submitted.writes[0]["message"]["content"];
+            assert_eq!(content[0]["text"], text);
+            assert_eq!(
+                content[1]["text"],
+                super::super::image_references::marker(second_ref).unwrap()
+            );
+            assert_eq!(content[2]["type"], "image");
+            assert_eq!(
+                content[3]["text"],
+                super::super::image_references::marker(first_ref).unwrap()
+            );
+            assert_eq!(content[4]["type"], "image");
+            let first_bytes = std::fs::read(&first.path).unwrap();
+            let second_bytes = std::fs::read(&second.path).unwrap();
+            assert_ne!(
+                first_bytes, second_bytes,
+                "image order fixture must contain different pixels"
+            );
+            assert_eq!(
+                STANDARD
+                    .decode(content[2]["source"]["data"].as_str().unwrap())
+                    .unwrap(),
+                second_bytes
+            );
+            assert_eq!(
+                STANDARD
+                    .decode(content[4]["source"]["data"].as_str().unwrap())
+                    .unwrap(),
+                first_bytes
+            );
+            let mut restored = Step::default();
+            Claude::default()
+                .message(&submitted.writes[0], &mut restored)
+                .unwrap();
+            let identities = restored
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Item(Item {
+                        content:
+                            ItemContent::Image {
+                                reference: Some(reference),
+                                ..
+                            },
+                        ..
+                    }) => Some(reference.id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(identities, [second_ref.id, first_ref.id]);
+        });
+    }
+
+    #[test]
+    fn referenced_image_only_and_foreign_attachment_failures_preserve_transport_rules() {
+        crate::chat::attachment_assets::with_test_image(|attachment| {
+            let mut adapter = Claude {
+                ready: true,
+                ..Default::default()
+            };
+            let submitted = adapter
+                .send_prompt(String::new(), vec![attachment.clone()], PromptMode::Send)
+                .unwrap();
+            assert_eq!(
+                submitted.writes[0]["message"]["content"][2]["type"],
+                "image"
+            );
+            let mut foreign = attachment;
+            foreign.reference.as_mut().unwrap().device = uuid::Uuid::new_v4();
+            foreign.path = "/missing/foreign-image.png".into();
+            let mut adapter = Claude {
+                ready: true,
+                ..Default::default()
+            };
+            assert!(
+                adapter
+                    .send_prompt("compare".into(), vec![foreign], PromptMode::Send)
+                    .is_err()
+            );
+            assert!(adapter.submissions.is_empty());
+            assert!(!adapter.busy);
+        });
+    }
     use crate::agent::Provider;
     use crate::chat::{ChangeKind, FileChange};
     use std::io::Write as _;
 
+    fn commit_tool_fixture(
+        adapter: &mut Claude,
+        store: &std::sync::Arc<std::sync::Mutex<crate::chat::runtime::Store>>,
+        step: Step,
+    ) {
+        for event in step.events {
+            store.lock().unwrap().apply(event).unwrap();
+        }
+        adapter.committed();
+    }
     #[test]
-    fn three_hundred_completed_tools_never_imply_a_successful_turn() {
+    fn byte_eviction_keeps_one_logical_identity_and_its_permission_input() {
+        let store = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::chat::runtime::Store::new().unwrap(),
+        ));
+        let mut adapter = Claude::default();
+        adapter.bind_item_reader(crate::chat::runtime::Store::adapter_reader_for_test(&store));
+        let input = json!({"file_path":"owned.rs","content":"original"});
+        for parent in [Some("one"), Some("two")] {
+            let step = adapter
+                .receive(scoped_call(
+                    parent,
+                    &format!("call-{}", parent.unwrap()),
+                    "same",
+                    "Write",
+                    input.clone(),
+                ))
+                .unwrap();
+            commit_tool_fixture(&mut adapter, &store, step);
+        }
+        for index in 0..3 {
+            let step = adapter
+                .receive(scoped_call(
+                    None,
+                    &format!("filler-{index}"),
+                    &format!("filler-{index}"),
+                    "Write",
+                    json!({"file_path":"large.rs","content":"x".repeat(1024*1024)}),
+                ))
+                .unwrap();
+            commit_tool_fixture(&mut adapter, &store, step);
+        }
+        assert!(adapter.tools.get(Some("one"), "same").is_none());
+        let original = adapter.cached_tool(Some("one"), "same").unwrap().unwrap();
+        adapter.tool(Some("one"), original);
+        assert_eq!(
+            adapter
+                .tool_order
+                .iter()
+                .filter(|key| **key == ScopedId::new(Some("one"), "same"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            adapter
+                .tool_order
+                .iter()
+                .filter(|key| **key == ScopedId::new(Some("two"), "same"))
+                .count(),
+            1
+        );
+        assert!(
+            adapter
+                .edit_tools
+                .contains_key(&ScopedId::new(Some("two"), "same"))
+        );
+        assert_eq!(
+            adapter
+                .tool_inputs
+                .get(&ScopedId::new(Some("one"), "same"))
+                .and_then(|v| serde_json::from_str::<Value>(v).ok()),
+            Some(input)
+        );
+    }
+    #[test]
+    fn byte_evicted_parent_agent_keeps_actual_child_settlement_on_call_replay() {
+        for failed in [false, true] {
+            let store = std::sync::Arc::new(std::sync::Mutex::new(
+                crate::chat::runtime::Store::new().unwrap(),
+            ));
+            let mut adapter = Claude::default();
+            adapter.bind_item_reader(crate::chat::runtime::Store::adapter_reader_for_test(&store));
+            let launch = scoped_call(
+                None,
+                "launch",
+                "agent",
+                "Agent",
+                json!({"run_in_background":true}),
+            );
+            let step = adapter.receive(launch.clone()).unwrap();
+            commit_tool_fixture(&mut adapter, &store, step);
+            let step=adapter.receive(json!({"type":"result","uuid":"child-result","parent_tool_use_id":"agent","is_error":failed,"result":"done"})).unwrap();
+            commit_tool_fixture(&mut adapter, &store, step);
+            let expected = if failed {
+                ToolStatus::Failed
+            } else {
+                ToolStatus::Succeeded
+            };
+            assert!(adapter.completed_tool(None, "agent"));
+            for index in 0..3 {
+                let step = adapter
+                    .receive(scoped_call(
+                        None,
+                        &format!("fill-{index}"),
+                        &format!("fill-{index}"),
+                        "Write",
+                        json!({"file_path":"large.rs","content":"x".repeat(1024*1024)}),
+                    ))
+                    .unwrap();
+                commit_tool_fixture(&mut adapter, &store, step);
+            }
+            assert!(adapter.tools.get(None, "agent").is_none());
+            assert_eq!(
+                adapter
+                    .cached_tool(None, "agent")
+                    .unwrap()
+                    .unwrap()
+                    .content
+                    .status(),
+                Some(expected)
+            );
+            let replay = adapter.receive(launch).unwrap();
+            assert!(!replay.events.iter().any(|event| matches!(
+                event,
+                Event::Subagent {
+                    status: Some(ToolStatus::Running),
+                    ..
+                }
+            )));
+            assert!(!adapter.background_agents.contains("agent"));
+            assert_eq!(
+                adapter
+                    .tool_status
+                    .get(&ScopedId::new(None, "agent"))
+                    .map(|row| row.0),
+                Some(expected)
+            );
+        }
+    }
+    #[test]
+    fn represented_task_source_keeps_description_through_progress_and_byte_eviction() {
+        let store = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::chat::runtime::Store::new().unwrap(),
+        ));
+        let mut adapter = Claude::default();
+        adapter.bind_item_reader(crate::chat::runtime::Store::adapter_reader_for_test(&store));
+        let step = adapter
+            .receive(scoped_call(
+                None,
+                "launch",
+                "agent",
+                "Agent",
+                json!({"run_in_background":true}),
+            ))
+            .unwrap();
+        commit_tool_fixture(&mut adapter, &store, step);
+        let started=adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task","tool_use_id":"agent","task_type":"local_agent","description":"Review hidden source"})).unwrap();
+        assert!(
+            !started
+                .events
+                .iter()
+                .any(|event| matches!(event,Event::Item(item) if item.id=="claude-task:task"))
+        );
+        assert!(
+            !started
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { .. }))
+        );
+        commit_tool_fixture(&mut adapter, &store, started);
+        let progress=adapter.receive(json!({"type":"system","subtype":"task_progress","task_id":"task","patch":{"summary":"Checking files"}})).unwrap();
+        assert!(
+            !progress
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { .. }))
+        );
+        commit_tool_fixture(&mut adapter, &store, progress);
+        for index in 0..3 {
+            let step = adapter
+                .receive(scoped_call(
+                    None,
+                    &format!("fill-{index}"),
+                    &format!("fill-{index}"),
+                    "Write",
+                    json!({"file_path":"large.rs","content":"x".repeat(1024*1024)}),
+                ))
+                .unwrap();
+            commit_tool_fixture(&mut adapter, &store, step);
+        }
+        assert!(adapter.tools.get(None, "claude-task:task").is_none());
+        assert!(adapter.hidden_task_rows.contains("claude-task:task"));
+        let source = adapter
+            .cached_tool(None, "claude-task:task")
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(source.content,ItemContent::Tool{input,output,..} if input=="Review hidden source" && output=="Checking files")
+        );
+        let done=adapter.receive(json!({"type":"system","subtype":"task_notification","uuid":"done","task_id":"task","tool_use_id":"agent","status":"completed","summary":"Finished review","patch":{"status":"completed"}})).unwrap();
+        assert!(
+            !done
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { .. }))
+        );
+        assert!(done.events.iter().any(|event|matches!(event,Event::Subagent{id,status:Some(ToolStatus::Succeeded),..} if id=="agent")));
+        assert!(done.events.iter().any(|event|matches!(event,Event::Item(Item{content:ItemContent::Delivery{summary,..},..}) if summary.contains("Review hidden source"))));
+        assert!(
+            !done
+                .events
+                .iter()
+                .any(|event| matches!(event,Event::Item(item) if item.id=="claude-task:task"))
+        );
+        commit_tool_fixture(&mut adapter, &store, done);
+    }
+    #[test]
+    fn overlong_optional_body_keys_still_retire_all_logical_metadata() {
+        let mut adapter = Claude::default();
+        for index in 0..MAX_TOOLS + 3 {
+            let id = format!("{}-{index}", "k".repeat(4097));
+            adapter
+                .receive(scoped_call(
+                    None,
+                    &format!("carrier-{index}"),
+                    &id,
+                    "Write",
+                    json!({"file_path":"owned.rs","content":"keep"}),
+                ))
+                .unwrap();
+        }
+        assert_eq!(adapter.tool_order.len(), MAX_TOOLS);
+        assert_eq!(adapter.edit_tools.len(), MAX_TOOLS);
+        assert_eq!(adapter.tool_status.len(), MAX_TOOLS);
+        assert!(adapter.tool_inputs.len() <= chat::PermissionDenial::LIMIT);
+        let before = adapter.tool_status.len();
+        adapter.receive(json!({"type":"result","uuid":"unknown","parent_tool_use_id":"never-launched","result":"done","is_error":false})).unwrap();
+        assert_eq!(adapter.tool_status.len(), before);
+        assert!(
+            !adapter
+                .tool_status
+                .contains_key(&ScopedId::new(None, "never-launched"))
+        );
+    }
+    #[test]
+    fn child_result_settles_only_its_exact_task_without_settling_parent_or_siblings() {
         let run = crate::model::RunId::new();
         let mut adapter = Claude {
             busy: true,
             execution: Some(run),
+            interruption: Some(false),
             ..Default::default()
         };
-        for index in 0..300 {
-            let id = format!("tool-{index}");
-            for frame in [
-                json!({"type":"assistant","message":{"id":format!("message-{index}"),"role":"assistant","content":[{"type":"tool_use","id":id,"name":"Bash","input":{"command":"true"}}]}}),
-                json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":"done","is_error":false}]}}),
-            ] {
-                let step = adapter.receive(frame).unwrap();
-                assert!(
-                    !step.events.iter().any(|event| matches!(
-                        event,
-                        Event::TurnFinished { .. }
-                            | Event::Execution {
-                                event: crate::agent_execution::ProviderEvent::Finished { .. },
-                                ..
-                            }
-                    )),
-                    "individual tool completion cannot settle a run"
-                );
-            }
+        for (tool, task) in [("failed-child", "task-failed"), ("live-child", "task-live")] {
+            adapter.receive(json!({"type":"assistant","uuid":format!("launch-{tool}"),"message":{"id":format!("message-{tool}"),"content":[{"type":"tool_use","id":tool,"name":"Agent","input":{"run_in_background":true}}]}})).unwrap();
+            adapter.receive(json!({"type":"system","subtype":"task_started","task_id":task,"tool_use_id":tool,"task_type":"local_agent"})).unwrap();
         }
+        let child_input =
+            json!({"file_path":"child.rs","old_string":"before","new_string":"after"});
+        adapter
+            .receive(scoped_call(
+                Some("failed-child"),
+                "child-edit",
+                "colliding-edit",
+                "Edit",
+                child_input.clone(),
+            ))
+            .unwrap();
+        let root_input = json!({"file_path":"root.rs","content":"root stays separate"});
+        adapter
+            .receive(scoped_call(
+                None,
+                "root-edit",
+                "colliding-edit",
+                "Write",
+                root_input.clone(),
+            ))
+            .unwrap();
+        let generation = adapter.attention_generation;
+        let failure = "You've hit your limit · resets 1:30pm (America/Los_Angeles)";
+        let step = adapter.receive(json!({"type":"result","uuid":"child-result","parent_tool_use_id":"failed-child","is_error":true,"errors":[failure],"usage":{"input_tokens":999},"permission_denials":[{"tool_use_id":"colliding-edit","tool_name":"Edit","decision_reason":"Child edit was refused"}]})).unwrap();
         assert!(adapter.busy);
         assert_eq!(adapter.execution, Some(run));
-        let failed = adapter
-            .receive(json!({"type":"result","subtype":"error_during_execution","is_error":false}))
-            .unwrap();
-        assert!(failed.events.iter().any(|event| matches!(event,Event::Execution {run:actual,event:crate::agent_execution::ProviderEvent::Finished {outcome:crate::notifications::Kind::Failed}} if *actual==run)));
-        assert!(!failed.events.iter().any(|event| matches!(
+        assert_eq!(adapter.interruption, Some(false));
+        assert_eq!(adapter.attention_generation, generation);
+        assert_eq!(adapter.usage.input_tokens, 0);
+        assert!(!adapter.background_agents.contains("failed-child"));
+        assert!(adapter.background_agents.contains("live-child"));
+        assert!(!adapter.tasks.iter().any(|task| task == "task-failed"));
+        assert!(adapter.tasks.iter().any(|task| task == "task-live"));
+        assert!(
+            matches!(step.events.as_slice(), [Event::PermissionDenied(denial), Event::SubagentItem { id:owner,item }, Event::Subagent { id, status:Some(ToolStatus::Failed), waiting:Some(false), detail:Some(detail), .. }]
+                if owner=="failed-child" && id=="failed-child" && detail==failure
+                && item.id=="claude-result-error:child-result:0"
+                && chat::failure::provider_error_text(Provider::Claude,item)==Some(failure)
+                && denial.tool_use_id=="colliding-edit" && denial.tool_name=="Edit"
+                && denial.reason=="Child edit was refused"
+                && denial.tool_input.as_deref().and_then(|input|serde_json::from_str::<Value>(input).ok())==Some(child_input))
+        );
+        assert_eq!(
+            adapter
+                .tool_inputs
+                .get(&ScopedId::new(None, "colliding-edit"))
+                .and_then(|input| serde_json::from_str::<Value>(input).ok()),
+            Some(root_input),
+            "A child result cannot overwrite the colliding root permission input"
+        );
+        assert!(adapter.completed_tool(None, "failed-child"));
+        let replay = adapter.receive(json!({"type":"assistant","uuid":"launch-failed-child","message":{"id":"message-failed-child","content":[{"type":"tool_use","id":"failed-child","name":"Agent","input":{"run_in_background":true}}]}})).unwrap();
+        assert!(!replay.events.iter().any(|event| matches!(
             event,
-            Event::TurnFinished {
-                outcome: crate::notifications::Kind::Succeeded,
+            Event::Subagent {
+                status: Some(ToolStatus::Running),
                 ..
             }
         )));
     }
 
     #[test]
-    fn multi_step_control_refusal_resolves_original_caller_with_original_deadline() {
+    fn retryable_child_error_is_scoped_and_only_actual_child_activity_clears_it() {
         let mut adapter = Claude {
-            ready: true,
-            models: vec![Model {
-                id: "sonnet".into(),
-                label: "Sonnet".into(),
-                reasoning: vec!["high".into()],
-            }],
+            busy: true,
             ..Default::default()
         };
-        let first = adapter
-            .command(Command::SetModel {
-                model: "sonnet".into(),
-                reasoning: Some("high".into()),
-            })
-            .unwrap();
-        let first_id = first.writes[0]["request_id"].as_str().unwrap().to_owned();
-        let deadline = adapter.control_deadlines[&first_id];
-        let next = adapter.receive(json!({"type":"control_response","response":{"subtype":"success","request_id":first_id,"response":{}}})).unwrap();
+        let failure = "You've hit your limit · resets 1:30pm (America/Los_Angeles)";
+        let error = adapter.receive(json!({"type":"stream_event","parent_tool_use_id":"waiting-child","event":{"type":"error","error":{"type":"rate_limit_error","message":failure}}})).unwrap();
         assert!(
-            adapter.control_replies().is_empty(),
-            "first acknowledgement does not confirm effort settings"
+            matches!(error.events.as_slice(), [Event::SubagentItem { id:owner, item }, Event::Subagent { id, status:None, waiting:Some(true), detail:Some(detail), .. }]
+                if owner=="waiting-child" && id=="waiting-child" && detail.contains(failure)
+                && chat::failure::provider_error_text(Provider::Claude,item)==Some(detail.as_str()))
         );
-        let next_id = next.writes[0]["request_id"].as_str().unwrap();
-        assert_eq!(adapter.control_deadlines[next_id], deadline);
-        assert!(next.writes[0]["request"].get("_cagents_ack").is_none());
-        let failed = adapter.receive(json!({"type":"control_response","response":{"subtype":"error","request_id":next_id,"error":"Rejected effort"}})).unwrap();
+        assert!(adapter.busy);
+        let notice = adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"bash-done","status":"completed","summary":"Background command completed (exit code 0)","uuid":"bash-notice"})).unwrap();
+        assert!(!notice.events.iter().any(|event| matches!(
+            event,
+            Event::Status { .. } | Event::TurnStarted | Event::Subagent { .. }
+        )));
+        assert!(adapter.busy);
+        let resumed = adapter.receive(json!({"type":"stream_event","parent_tool_use_id":"waiting-child","event":{"type":"message_start","message":{"id":"recovered-child"}}})).unwrap();
+        assert!(resumed.events.iter().any(|event| matches!(event, Event::Subagent { id, status:None, waiting:Some(false), detail:Some(detail), .. } if id=="waiting-child" && detail.is_empty())));
         assert!(
-            !failed
+            !resumed
                 .events
                 .iter()
-                .any(|event| matches!(event, Event::Error { .. }))
+                .any(|event| matches!(event, Event::TurnStarted | Event::Status { .. }))
         );
-        let replies = adapter.control_replies();
-        assert_eq!(replies.len(), 1);
-        assert_eq!(replies[0].0, first_id);
-        assert!(
-            replies[0]
-                .1
-                .as_ref()
-                .unwrap_err()
-                .contains("Rejected effort")
-        );
-
-        let initial = adapter
-            .control(json!({"subtype":"set_model","model":"sonnet"}))
-            .unwrap();
-        let id = initial.writes[0]["request_id"].as_str().unwrap();
-        let next = adapter.receive(json!({"type":"control_response","response":{"subtype":"success","request_id":id,"response":{}}})).unwrap();
-        assert_eq!(next.writes.len(), 1);
-        assert!(adapter.control_replies().is_empty());
-        adapter.expire_controls(std::time::Instant::now() + std::time::Duration::from_secs(6));
-        let replies = adapter.control_replies();
-        assert_eq!(replies.len(), 1);
-        assert_eq!(replies[0].0, id);
-        assert!(replies[0].1.is_err());
     }
 
     #[test]
-    fn only_explicit_success_results_can_complete_a_run_successfully() {
-        for result in [
-            json!({"type":"result","subtype":"error_during_execution"}),
-            json!({"type":"result","subtype":"error_max_turns","is_error":false}),
-            json!({"type":"result","is_error":false}),
-        ] {
+    fn child_api_failures_survive_terminal_task_notifications_and_replay_through_runtime_store() {
+        let first = json!({"type":"connection_error","message":"Connection reset by peer\nrequest-id: original-network"});
+        let second = json!({"type":"rate_limit_error","message":"You've hit your limit · resets 1:30pm\nrequest-id: distinct-quota"});
+        let error = |carrier: &str, cause: &Value| json!({"type":"stream_event","uuid":carrier,"parent_tool_use_id":"failed-child","event":{"type":"error","error":cause}});
+        let mut frames = vec![
+            json!({"type":"stream_event","uuid":"actual-parent-start","event":{"type":"message_start","message":{"id":"live-parent-message"}}}),
+        ];
+        for (tool, task) in [("failed-child", "failed-task"), ("live-child", "live-task")] {
+            frames.push(scoped_call(
+                None,
+                &format!("launch-{tool}"),
+                tool,
+                "Agent",
+                json!({"run_in_background":true}),
+            ));
+            frames.push(json!({"type":"system","subtype":"task_started","task_id":task,"tool_use_id":tool,"task_type":"local_agent"}));
+        }
+        frames.push(json!({"type":"assistant","uuid":"retained-child-answer","parent_tool_use_id":"failed-child","message":{"id":"retained-child-answer","content":[{"type":"text","text":"Original child work remains visible"}]}}));
+        frames.push(error("first-failure", &first));
+        frames.push(error("second-failure", &second));
+        frames.push(json!({"type":"system","subtype":"task_notification","uuid":"terminal-notification","task_id":"failed-task","tool_use_id":"failed-child","status":"failed","summary":"The child task failed"}));
+        // Exact old API frames after the terminal notification cannot erase or
+        // multiply history, or put this failed child back into waiting.
+        frames.push(error("first-failure", &first));
+        frames.push(error("second-failure", &second));
+        // The helper requires a real outcome callback, then returns the actual
+        // resident Actor/Store snapshot and proves its cat process teardown.
+        frames.push(json!({"type":"result","uuid":"parent-settlement","subtype":"success","is_error":false}));
+        let (_, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(Claude {
+                busy: true,
+                ..Default::default()
+            }),
+            frames,
+            false,
+        );
+        let child = state
+            .subagents
+            .iter()
+            .find(|child| child.id == "failed-child")
+            .unwrap();
+        assert_eq!(child.status, ToolStatus::Failed);
+        assert!(!child.waiting);
+        assert!(
+            child.detail.is_empty(),
+            "terminal transient-detail cleanup remains unchanged"
+        );
+        assert!(child.items.iter().any(|item| matches!(&item.content, ItemContent::Text { text, .. } if text=="Original child work remains visible")));
+        let failures: Vec<_> = child
+            .items
+            .iter()
+            .filter_map(|item| {
+                chat::failure::provider_error_text(Provider::Claude, item)
+                    .map(|body| (item.id.as_str(), body))
+            })
+            .collect();
+        let first_raw = content_text(&first);
+        let second_raw = content_text(&second);
+        assert_eq!(
+            failures,
+            [
+                ("claude-stream-error:first-failure:0", first_raw.as_str()),
+                ("claude-stream-error:second-failure:0", second_raw.as_str()),
+            ]
+        );
+        assert_eq!(
+            child.items.len(),
+            3,
+            "one original answer plus two errors; replay adds no entries"
+        );
+        assert!(
+            !state
+                .items
+                .iter()
+                .any(|item| chat::failure::provider_error_text(Provider::Claude, item).is_some()),
+            "child diagnostic originals must not enter the parent transcript"
+        );
+        assert!(
+            state
+                .subagents
+                .iter()
+                .any(|child| child.id == "live-child" && child.status == ToolStatus::Running)
+        );
+        assert!(
+            state.error.is_none(),
+            "child API errors must never become parent failures"
+        );
+        assert!(
+            !state.busy,
+            "only the explicit parent result settles parent busy"
+        );
+        assert!(state.is_working(), "the live sibling remains genuine work");
+
+        // Without a provider carrier ID, preserve distinct actual receipts
+        // rather than guessing that identical unkeyed errors are replay.
+        let mut adapter = Claude::default();
+        let mut unkeyed = error("discarded", &first);
+        unkeyed.as_object_mut().unwrap().remove("uuid");
+        let a = adapter.receive(unkeyed.clone()).unwrap();
+        let b = adapter.receive(unkeyed).unwrap();
+        let item = |step: &Step| {
+            step.events
+                .iter()
+                .find_map(|event| match event {
+                    Event::SubagentItem { item, .. } => Some(item.id.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_ne!(item(&a), item(&b));
+        for carrier in ["", " \t\n"] {
+            let blank = error(carrier, &first);
+            let a = adapter.receive(blank.clone()).unwrap();
+            let b = adapter.receive(blank).unwrap();
+            assert_ne!(
+                item(&a),
+                item(&b),
+                "a blank carrier is not replay authority"
+            );
+        }
+        let parent = adapter.receive(json!({"type":"stream_event","uuid":"root-error","event":{"type":"error","error":first}})).unwrap();
+        assert!(
+            matches!(parent.events.as_slice(), [Event::Error { .. }]),
+            "ordinary parent API errors keep their existing event representation"
+        );
+    }
+
+    #[test]
+    fn child_result_failures_keep_exact_history_across_terminal_notifications_without_parent_failure()
+     {
+        let raw = "Authentication failed: invalid_api_key\nrequest-id: exact-child-result";
+        let result = json!({"type":"result","uuid":"failed-result","parent_tool_use_id":"failed-child","is_error":true,"errors":[raw],"usage":{"input_tokens":9000}});
+        let terminal = json!({"type":"system","subtype":"task_notification","uuid":"failed-notification","task_id":"failed-task","tool_use_id":"failed-child","status":"failed","summary":raw});
+        let mut frames = vec![
+            json!({"type":"stream_event","uuid":"actual-parent-start","event":{"type":"message_start","message":{"id":"live-parent-message"}}}),
+        ];
+        for (tool, task) in [("failed-child", "failed-task"), ("live-child", "live-task")] {
+            frames.push(scoped_call(
+                None,
+                &format!("launch-{tool}"),
+                tool,
+                "Agent",
+                json!({"run_in_background":true}),
+            ));
+            frames.push(json!({"type":"system","subtype":"task_started","task_id":task,"tool_use_id":tool,"task_type":"local_agent"}));
+            // Keep accepted async-result metadata alongside task_started.
+            // The child result itself owns its terminal diagnostic; a later
+            // notification need not emit another child status patch.
+            frames.push(json!({"type":"user","uuid":format!("async-{tool}"),"toolUseResult":{"isAsync":true,"status":"async_launched","agentId":task},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":tool,"content":"Async agent launched successfully.","is_error":false}]}}));
+        }
+        frames.extend([result.clone(), terminal.clone(), result.clone(), terminal,
+            json!({"type":"result","uuid":"only-parent-settlement","subtype":"success","is_error":false})]);
+        let (_, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(Claude {
+                busy: true,
+                ..Default::default()
+            }),
+            frames,
+            false,
+        );
+        let child = state
+            .subagents
+            .iter()
+            .find(|child| child.id == "failed-child")
+            .unwrap();
+        assert_eq!(child.status, ToolStatus::Failed);
+        assert!(!child.waiting);
+        assert_eq!(
+            child.detail, raw,
+            "without a later child status patch, the result's exact diagnostic remains"
+        );
+        assert_eq!(
+            child.items.len(),
+            1,
+            "stable result replay upserts only its original failure"
+        );
+        assert_eq!(child.items[0].id, "claude-result-error:failed-result:0");
+        assert_eq!(
+            chat::failure::provider_error_text(Provider::Claude, &child.items[0]),
+            Some(raw)
+        );
+        assert!(state.error.is_none());
+        assert!(!state.busy);
+        assert!(state.is_working());
+        assert!(
+            state
+                .subagents
+                .iter()
+                .any(|child| child.id == "live-child" && child.status == ToolStatus::Running)
+        );
+        assert!(
+            state
+                .items
+                .iter()
+                .all(|item| chat::failure::provider_error_text(Provider::Claude, item).is_none())
+        );
+
+        let mut adapter = Claude {
+            busy: true,
+            interruption: Some(false),
+            ..Default::default()
+        };
+        let generation = adapter.attention_generation;
+        let mut unkeyed = result.clone();
+        unkeyed.as_object_mut().unwrap().remove("uuid");
+        let a = adapter.receive(unkeyed.clone()).unwrap();
+        let b = adapter.receive(unkeyed).unwrap();
+        let id = |step: &Step| {
+            step.events
+                .iter()
+                .find_map(|event| match event {
+                    Event::SubagentItem { item, .. } => Some(item.id.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_ne!(id(&a), id(&b));
+        for carrier in ["", " \t\n"] {
+            let mut blank = result.clone();
+            blank["uuid"] = json!(carrier);
+            let a = adapter.receive(blank.clone()).unwrap();
+            let b = adapter.receive(blank).unwrap();
+            assert_ne!(id(&a), id(&b));
+        }
+        assert!(adapter.busy);
+        assert_eq!(adapter.interruption, Some(false));
+        assert_eq!(adapter.attention_generation, generation);
+        assert_eq!(adapter.usage.input_tokens, 0);
+        assert!(a.events.iter().chain(&b.events).all(|event| !matches!(
+            event,
+            Event::Error { .. }
+                | Event::TurnStarted
+                | Event::TurnSettled
+                | Event::TurnFinished { .. }
+                | Event::Status { .. }
+        )));
+    }
+
+    #[test]
+    fn exact_child_failure_receipts_cannot_rollback_fresh_activity_but_changed_payloads_remain_visible()
+     {
+        for source in ["stream", "result"] {
             let mut adapter = Claude {
                 busy: true,
                 ..Default::default()
             };
-            let step = adapter.receive(result).unwrap();
-            assert!(step.events.iter().any(|event| matches!(
-                event,
-                Event::TurnFinished {
-                    outcome: crate::notifications::Kind::Failed,
-                    ..
-                }
-            )));
-            assert!(!step.events.iter().any(|event| matches!(
-                event,
-                Event::TurnFinished {
-                    outcome: crate::notifications::Kind::Succeeded,
-                    ..
-                }
-            )));
-        }
-    }
-
-    #[test]
-    fn provider_startup_keeps_its_handshake_budget_before_expiring() {
-        let mut adapter = Claude::default();
-        adapter.initialize().unwrap();
-        let after_user_deadline =
-            adapter.expire_controls(std::time::Instant::now() + std::time::Duration::from_secs(6));
-        assert!(after_user_deadline.events.is_empty());
-        assert_eq!(adapter.controls.len(), 1);
-        let expired =
-            adapter.expire_controls(std::time::Instant::now() + std::time::Duration::from_secs(31));
-        assert!(expired.events.iter().any(|event|matches!(event,Event::Error {fatal:true,message} if message.contains("initialization") && message.contains("30 seconds"))));
-        assert!(adapter.controls.is_empty());
-    }
-
-    #[test]
-    fn unfamiliar_control_acknowledgements_refuse_only_the_command() {
-        let mut adapter = Claude::default();
-        let request = adapter
-            .control(json!({"subtype":"set_permission_mode","mode":"manual"}))
-            .unwrap();
-        let id = request.writes[0]["request_id"].as_str().unwrap();
-        let step=adapter.receive(json!({"type":"control_response","response":{"subtype":"future_ack","request_id":id}})).unwrap();
-        assert!(step.events.is_empty());
-        let replies = adapter.control_replies();
-        assert_eq!(replies.len(), 1);
-        assert_eq!(replies[0].0, id);
-        assert!(replies[0].1.is_err());
-    }
-
-    #[test]
-    fn failed_turn_retires_pending_decisions_before_reporting_idle() {
-        let mut adapter = Claude {
-            ready: true,
-            busy: true,
-            ..Default::default()
-        };
-        adapter.receive(json!({"type":"control_request","request_id":"old","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-old","input":{"command":"true"}}})).unwrap();
-        let failed = adapter
-            .receive(json!({"type":"result","subtype":"error_during_execution","is_error":true}))
-            .unwrap();
-        assert!(adapter.pending.is_empty());
-        assert!(adapter.decision_generations.is_empty());
-        assert!(!adapter.busy);
-        assert!(
-            failed
-                .events
-                .contains(&Event::RequestResolved { id: "old".into() })
-        );
-        assert!(
-            !failed
-                .events
-                .iter()
-                .any(|event| matches!(event, Event::Status { busy: true, .. }))
-        );
-        assert!(
             adapter
-                .command(Command::Prompt {
-                    text: "new prompt".into(),
-                    attachments: Vec::new(),
-                    mode: PromptMode::Send
-                })
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn late_interrupt_result_retires_only_its_original_decisions_and_not_the_new_turn() {
-        let mut adapter = Claude {
-            ready: true,
-            busy: true,
-            ..Default::default()
-        };
-        let request = |id: &str| json!({"type":"control_request","request_id":id,"request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":format!("tool-{id}"),"input":{"command":"true"}}});
-        adapter.receive(request("old")).unwrap();
-        let interrupt = adapter.command(Command::Interrupt).unwrap();
-        let id = interrupt.writes[0]["request_id"].clone();
-        adapter
-            .receive(
-                json!({"type":"result","uuid":"old-result","subtype":"success","is_error":false}),
-            )
-            .unwrap();
-        let mut start = Step::default();
-        adapter.start_turn(&mut start);
-        adapter.receive(request("new")).unwrap();
-        let reply=adapter.receive(json!({"type":"control_response","response":{"subtype":"success","request_id":id,"response":{}}})).unwrap();
-        assert!(!adapter.pending.contains_key("old"));
-        assert!(adapter.pending.contains_key("new"));
-        assert!(adapter.busy);
-        assert!(
-            reply
-                .events
-                .contains(&Event::RequestResolved { id: "old".into() })
-        );
-        assert!(
-            !reply
-                .events
-                .contains(&Event::RequestResolved { id: "new".into() })
-        );
-        assert!(reply.events.iter().any(|event| matches!(
-            event,
-            Event::PastTurnFinished {
-                outcome: crate::notifications::Kind::Cancelled,
-                ..
+                .receive(scoped_call(
+                    None,
+                    "launch-receipt-child",
+                    "child",
+                    "Agent",
+                    json!({"run_in_background":true}),
+                ))
+                .unwrap();
+            let started = json!({"type":"system","subtype":"task_started","task_id":"task","tool_use_id":"child","task_type":"local_agent"});
+            adapter.receive(started.clone()).unwrap();
+            adapter.receive(json!({"type":"user","uuid":"async-receipt-child","toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"task"},"message":{"content":[{"type":"tool_result","tool_use_id":"child","content":"Async agent launched successfully."}]}})).unwrap();
+            let mut failure = if source == "stream" {
+                json!({"type":"stream_event","uuid":"actual-failure","parent_tool_use_id":"child","event":{"type":"error","error":{"type":"rate_limit_error","message":"quota exceeded"}}})
+            } else {
+                json!({"type":"result","uuid":"actual-failure","parent_tool_use_id":"child","is_error":true,"errors":["quota exceeded"]})
+            };
+            failure["session_id"] = json!("00000000-0000-4000-8000-000000000001");
+            adapter.receive(failure.clone()).unwrap();
+            let terminal = json!({"type":"system","subtype":"task_notification","task_id":"task","tool_use_id":"child","uuid":"actual-terminal","status":"failed","summary":"quota exceeded"});
+            adapter.receive(terminal.clone()).unwrap();
+            adapter.receive(started).unwrap();
+            let fresh = adapter.receive(json!({"type":"stream_event","uuid":"actual-new-work","parent_tool_use_id":"child","event":{"type":"message_start","message":{"id":"new-child-message"}}})).unwrap();
+            assert!(fresh.events.iter().any(|event|matches!(event,Event::Subagent { id, waiting:Some(false),.. } if id=="child")));
+            let generation = adapter.attention_generation;
+            for replay in [failure.clone(), terminal] {
+                assert!(
+                    adapter.receive(replay).unwrap().events.is_empty(),
+                    "an exact old failure/result/notification cannot re-block or settle fresh child work"
+                );
             }
-        )));
-        assert!(!reply.events.iter().any(|event| matches!(
-            event,
-            Event::TurnFinished { .. } | Event::Status { busy: false, .. }
-        )));
-    }
-
-    #[test]
-    fn expiring_an_old_interrupt_cannot_clear_a_newer_turns_pending_interrupt() {
-        let mut adapter = Claude {
-            busy: true,
-            ..Default::default()
-        };
-        let old = adapter.command(Command::Interrupt).unwrap().writes[0]["request_id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        adapter
-            .receive(json!({"type":"result","uuid":"old","subtype":"success","is_error":false}))
-            .unwrap();
-        let mut started = Step::default();
-        adapter.start_turn(&mut started);
-        adapter.busy = true;
-        let current = adapter.command(Command::Interrupt).unwrap().writes[0]["request_id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let now = std::time::Instant::now();
-        adapter
-            .control_deadlines
-            .insert(old, now - std::time::Duration::from_millis(1));
-        adapter
-            .control_deadlines
-            .insert(current.clone(), now + std::time::Duration::from_secs(10));
-        let expired = adapter.expire_controls(now);
-        assert_eq!(adapter.interruption, Some(false));
-        assert!(expired.events.iter().any(|event| matches!(
-            event,
-            Event::PastTurnFinished {
-                outcome: crate::notifications::Kind::Succeeded,
-                ..
+            assert!(adapter.tasks.iter().any(|task| task == "task"));
+            assert_eq!(adapter.streams["child"].message, "new-child-message");
+            assert!(adapter.busy);
+            assert_eq!(adapter.attention_generation, generation);
+            if source == "stream" {
+                failure["event"]["error"]["message"] = json!("quota exceeded; revised diagnostics");
+            } else {
+                failure["errors"] = json!(["quota exceeded; revised diagnostics"]);
             }
-        )));
-        assert!(adapter.controls.contains_key(&current));
-        adapter
-            .receive(json!({"type":"result","uuid":"new","subtype":"success","is_error":false}))
-            .unwrap();
-        let acknowledged=adapter.receive(json!({"type":"control_response","response":{"subtype":"success","request_id":current,"response":{}}})).unwrap();
-        assert!(acknowledged.events.iter().any(|event| matches!(
-            event,
-            Event::TurnFinished {
-                outcome: crate::notifications::Kind::Cancelled,
-                ..
-            }
-        )));
-    }
-
-    #[test]
-    fn expired_interrupt_releases_its_deferred_provider_result() {
-        let mut adapter = Claude {
-            busy: true,
-            ..Default::default()
-        };
-        adapter.command(Command::Interrupt).unwrap();
-        let waiting = adapter
-            .receive(json!({"type":"result","subtype":"success","is_error":false}))
-            .unwrap();
-        assert!(
-            !waiting
-                .events
-                .iter()
-                .any(|event| matches!(event, Event::TurnFinished { .. }))
-        );
-        let expired =
-            adapter.expire_controls(std::time::Instant::now() + std::time::Duration::from_secs(6));
-        assert!(expired.events.iter().any(|event| matches!(
-            event,
-            Event::TurnFinished {
-                outcome: crate::notifications::Kind::Succeeded,
-                ..
-            }
-        )));
-        assert!(adapter.deferred_attention.is_empty());
-        assert!(
-            adapter
-                .control_replies()
-                .iter()
-                .any(|(_, reply)| reply.is_err())
-        );
-    }
-
-    #[test]
-    fn provider_errors_are_bounded_readable_and_never_serialize_objects() {
-        let mut adapter = Claude::default();
-        let step = adapter.receive(json!({"type":"result","subtype":"error_during_execution","is_error":true,"errors":[{"opaque_protocol_payload":"secret raw JSON"}]})).unwrap();
-        assert!(step.events.iter().any(|event| matches!(event,Event::Error{message,..} if message.contains("error_during_execution") && !message.contains("opaque_protocol_payload"))));
-        for frame in [
-            json!({"type":"auth_status","error":"x".repeat(5000)}),
-            json!({"type":"result","subtype":"error","is_error":true,"errors":[{"message":"x".repeat(5000)}]}),
-        ] {
-            let step = adapter.receive(frame).unwrap();
-            assert!(
-                step.events
-                    .iter()
-                    .any(|event| matches!(event,Event::Error{message,..} if message.len()<=1024))
-            );
-            assert!(
-                step.events
-                    .iter()
-                    .all(|event| !matches!(event,Event::Error{message,..} if message.len()>1024))
-            );
+            let changed = adapter.receive(failure).unwrap();
+            assert!(changed.events.iter().any(|event| matches!(event,Event::SubagentItem { id,item }
+                if id=="child" && chat::failure::provider_error_text(Provider::Claude,item).is_some_and(|body|body.contains("revised diagnostics")))),
+                "a reused UUID with new payload remains observable");
         }
     }
 
     #[test]
-    fn unknown_frames_do_not_interrupt_a_streamed_turn() {
-        let mut adapter = Claude::default();
-        adapter.busy = true;
-        let future = adapter
-            .receive(json!({"type":"future_frame", "payload":"secret raw protocol"}))
-            .unwrap();
-        assert!(future.events.is_empty());
-        let system = adapter.receive(json!({"type":"system", "subtype":"future_system", "payload":"secret raw protocol"})).unwrap();
-        assert!(system.events.is_empty());
-        adapter.receive(json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"m"}}})).unwrap();
-        for event in [
-            json!({"type":"future_stream_event"}),
-            json!({"type":"content_block_start","index":1,"content_block":{"type":"future_content","opaque":"raw protocol"}}),
-            json!({"type":"content_block_delta","index":1,"delta":{"type":"future_delta"}}),
-        ] {
-            assert!(
-                adapter
-                    .receive(json!({"type":"stream_event","event":event}))
-                    .unwrap()
-                    .events
-                    .is_empty()
-            );
-        }
-        adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}})).unwrap();
-        let delta = adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}})).unwrap();
+    fn replayed_and_historical_child_answers_do_not_clear_a_later_retry_failure() {
+        let mut adapter = Claude {
+            busy: true,
+            ..Default::default()
+        };
+        let answer = |uuid: &str| json!({"type":"assistant","uuid":uuid,"parent_tool_use_id":"blocked-child","message":{"id":uuid,"content":[{"type":"text","text":"Earlier child answer"}]}});
+        adapter.receive(answer("old-live-carrier")).unwrap();
+        let failure = adapter.receive(json!({"type":"stream_event","parent_tool_use_id":"blocked-child","event":{"type":"error","error":{"type":"rate_limit_error","message":"quota exceeded"}}})).unwrap();
+        assert!(failure.events.iter().any(|event| matches!(
+            event,
+            Event::Subagent {
+                waiting: Some(true),
+                ..
+            }
+        )));
+        let clears = |events: &[Event]| {
+            events.iter().any(|event| matches!(event, Event::Subagent { id, waiting:Some(false), detail:Some(detail), .. } if id=="blocked-child" && detail.is_empty()))
+        };
+        let replay = adapter.receive(answer("old-live-carrier")).unwrap();
         assert!(
-            delta
-                .events
-                .iter()
-                .any(|event| matches!(event, Event::TextDelta { delta, .. } if delta == "answer"))
+            !clears(&replay.events),
+            "An identical already-seen live carrier is not recovery"
         );
-        let result = adapter
-            .receive(
-                json!({"type":"result","subtype":"success","result":"answer","is_error":false}),
+        let mut history = Step::default();
+        adapter
+            .message_with_tools(
+                &answer("previously-unseen-history-carrier"),
+                &mut history,
+                &HashMap::new(),
+                true,
             )
             .unwrap();
         assert!(
-            !result
+            !clears(&history.events),
+            "An unseen saved sidecar carrier is still history"
+        );
+        let replay_history = adapter
+            .receive(answer("previously-unseen-history-carrier"))
+            .unwrap();
+        assert!(
+            !clears(&replay_history.events),
+            "Previously imported history cannot become fresh through replay"
+        );
+        let mut meta = answer("new-model-only-carrier");
+        meta["isMeta"] = json!(true);
+        assert!(!clears(&adapter.receive(meta).unwrap().events));
+        for (index, content) in [
+            json!([]),
+            json!("   \n\t"),
+            json!([{"type":"text","text":"   \n\t"}]),
+            json!([{"type":"thinking","thinking":" "}]),
+            json!([{"type":"image","source":{}}]),
+            json!([{"type":"unknown-content","text":"not proven activity"}]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut empty = answer(&format!("fresh-empty-envelope-{index}"));
+            empty["message"]["content"] = content;
+            assert!(
+                !clears(&adapter.receive(empty).unwrap().events),
+                "A new envelope without meaningful assistant activity cannot clear the blocked child"
+            );
+        }
+        let fresh = adapter
+            .receive(answer("genuinely-new-live-carrier"))
+            .unwrap();
+        assert!(clears(&fresh.events));
+        for (index, content) in [
+            json!("Actual live child response"),
+            json!([{"type":"thinking","thinking":"Considering the current change"}]),
+            json!([{"type":"tool_use","id":"new-child-tool","name":"Read","input":{"file_path":"current.rs"}}]),
+            json!([{"type":"image","source":{"type":"url","url":"https://example.test/current.png"}}]),
+        ].into_iter().enumerate() {
+            let mut active = answer(&format!("fresh-meaningful-envelope-{index}"));
+            active["message"]["content"] = content;
+            assert!(clears(&adapter.receive(active).unwrap().events),
+                "Fresh parsed assistant activity still clears its exact child failure");
+        }
+        assert!(
+            adapter.busy,
+            "Child recovery does not settle or restart the parent"
+        );
+        assert!(!fresh.events.iter().any(|event| matches!(
+            event,
+            Event::Status { .. } | Event::TurnStarted | Event::TurnSettled
+        )));
+    }
+
+    #[test]
+    fn explicit_assistant_failure_keeps_raw_text_system_identity_and_reset_cause() {
+        let mut adapter = Claude::default();
+        let failure = "You've hit your limit · resets 1:30pm (America/Los_Angeles)\nrequest diagnostics retained";
+        let step = adapter.receive(json!({"type":"assistant","uuid":"quota-carrier","error":"rate_limit","message":{"id":"quota-message","content":[{"type":"text","text":failure}]}})).unwrap();
+        assert!(step.events.iter().any(|event| matches!(event, Event::Item(item) if item.id=="quota-message:0" && chat::failure::provider_error_text(Provider::Claude, item)==Some(failure))));
+        let current = step
+            .events
+            .iter()
+            .find_map(|event| {
+                if let Event::Error { message, .. } = event {
+                    Some(message)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert!(current.contains("Claude: rate_limit") && current.contains(failure));
+        assert_eq!(
+            chat::failure::Failure::parse(Provider::Claude, current)
+                .unwrap()
+                .key,
+            chat::failure::Failure::parse(Provider::Claude, failure)
+                .unwrap()
+                .key
+        );
+        let quote = adapter.receive(json!({"type":"assistant","uuid":"quote-carrier","message":{"id":"quote-message","content":[{"type":"text","text":failure}]}})).unwrap();
+        assert!(quote.events.iter().any(|event| matches!(
+            event,
+            Event::Item(Item {
+                role: Role::Assistant,
+                ..
+            })
+        )));
+        assert!(
+            !quote
                 .events
                 .iter()
                 .any(|event| matches!(event, Event::Error { .. }))
         );
-        assert!(!adapter.busy);
     }
 
     #[test]
-    fn control_deadlines_free_capacity_and_interrupt_has_an_emergency_slot() {
+    fn explicit_child_failure_blocks_share_only_their_proven_carrier() {
         let mut adapter = Claude::default();
-        for _ in 0..MAX_PENDING {
-            adapter
-                .control(json!({"subtype":"set_model","model":"test"}))
-                .unwrap();
+        let bodies = [
+            "You've hit your limit · resets 1:30pm (America/Los_Angeles)",
+            "request-id: same-provider-envelope\nOriginal details stay separate and exact.",
+        ];
+        for carrier in ["first-error-message", "next-error-message"] {
+            let step = adapter.receive(json!({"type":"assistant","uuid":carrier,"parent_tool_use_id":"same-child","error":"rate_limit","message":{"id":carrier,"content":[{"type":"text","text":bodies[0]},{"type":"text","text":bodies[1]}]}})).unwrap();
+            let items: Vec<_> = step
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::SubagentItem { id, item } if id == "same-child" => Some(item),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(items.len(), 2);
+            for (index, item) in items.iter().enumerate() {
+                assert_eq!(item.id, format!("{carrier}:{index}"));
+                assert_eq!(
+                    chat::failure::provider_error_text(Provider::Claude, item),
+                    Some(bodies[index])
+                );
+                assert_eq!(
+                    chat::failure::provider_error_carrier(Provider::Claude, item),
+                    Some(carrier)
+                );
+            }
+            assert!(!step.events.iter().any(|event| matches!(
+                event,
+                Event::Error { .. } | Event::TurnStarted | Event::TurnSettled
+            )));
         }
-        assert!(adapter.control(json!({"subtype":"set_model"})).is_err());
-        let interrupt = adapter.command(Command::Interrupt).unwrap();
-        assert_eq!(interrupt.writes[0]["request"]["subtype"], "interrupt");
-        assert_eq!(adapter.controls.len(), MAX_PENDING + 1);
-        let expired =
-            adapter.expire_controls(std::time::Instant::now() + std::time::Duration::from_secs(31));
-        assert!(expired.events.is_empty());
-        let replies = adapter.control_replies();
-        assert_eq!(replies.len(), MAX_PENDING + 1);
-        assert!(replies.iter().all(|(_, result)| {
-            result
-                .as_ref()
-                .is_err_and(|message| message.contains("5 seconds"))
-        }));
-        assert!(adapter.controls.is_empty());
-        assert!(adapter.deadline().is_none());
+    }
+
+    #[test]
+    fn child_user_quotations_are_not_provider_errors_and_followup_failures_keep_their_ids() {
+        let mut adapter = Claude::default();
+        let quota = "You've hit your limit · resets 1:30pm (America/Los_Angeles)";
+        let frame = |kind: &str, id: &str, error: bool| {
+            let mut value = json!({"type":kind,"uuid":id,"parent_tool_use_id":"same-child","message":{"id":id,"content":[{"type":"text","text":quota}]}});
+            if error {
+                value["error"] = json!("rate_limit");
+            }
+            value
+        };
+        for id in ["original-child-prompt", "followup-child-prompt"] {
+            let quote = adapter.receive(frame("user", id, false)).unwrap();
+            assert!(quote.events.iter().any(|event| matches!(event, Event::SubagentItem { id, item } if id=="same-child" && item.role==Role::System && matches!(&item.content,ItemContent::Text{text,..} if text==quota) && chat::failure::provider_error_text(Provider::Claude,item).is_none())));
+            let error_id = format!("{id}-error");
+            let error = adapter
+                .receive(frame("assistant", &error_id, true))
+                .unwrap();
+            assert!(error.events.iter().any(|event| matches!(event, Event::SubagentItem { id,item } if id=="same-child" && item.id==format!("{error_id}:0") && chat::failure::provider_error_text(Provider::Claude,item)==Some(quota))));
+            assert!(!error.events.iter().any(|event| matches!(
+                event,
+                Event::Error { .. } | Event::TurnStarted | Event::TurnSettled
+            )));
+        }
+        let replay = adapter
+            .receive(frame("assistant", "original-child-prompt-error", true))
+            .unwrap();
+        assert!(replay.events.iter().any(|event| matches!(event, Event::SubagentItem { item,.. } if item.id=="original-child-prompt-error:0" && chat::failure::provider_error_text(Provider::Claude,item)==Some(quota))));
+    }
+
+    #[test]
+    fn confirmed_claude_session_observes_only_its_saved_names_at_result_boundaries() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().canonicalize().unwrap();
+        let config = cwd.join("claude-config");
+        let project: String = cwd
+            .to_str()
+            .unwrap()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let project = config.join("projects").join(project);
+        std::fs::create_dir_all(&project).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let path = project.join(format!("{id}.jsonl"));
+        std::fs::write(&path, format!("{}\n{}\n",
+            json!({"type":"user","sessionId":id,"cwd":cwd,"message":{"content":"Review encrypted bundles"}}),
+            json!({"type":"summary","summary":"Bundle encryption and throughput"}))).unwrap();
+        let launch = Launch {
+            provider: Provider::Claude,
+            session_id: Some(id.clone()),
+            recipe: crate::model::LaunchRecipe {
+                program: "claude".into(),
+                arguments: Vec::new(),
+                working_directory: cwd.clone(),
+                environment: [
+                    ("HOME".into(), cwd.to_string_lossy().into_owned()),
+                    (
+                        "CLAUDE_CONFIG_DIR".into(),
+                        config.to_string_lossy().into_owned(),
+                    ),
+                ]
+                .into(),
+                unset_environment: Default::default(),
+            },
+        };
+        let mut adapter = Claude {
+            session_id: Some(id.clone()),
+            titles: super::super::claude_titles::ClaudeTitles::new(&launch),
+            ..Default::default()
+        };
+        let foreign = uuid::Uuid::new_v4().to_string();
+        assert!(
+            adapter
+                .receive(json!({"type":"result","session_id":foreign}))
+                .is_err()
+        );
+        let result = adapter
+            .receive(json!({"type":"result","session_id":id}))
+            .unwrap();
+        assert!(result.events.iter().any(|event| matches!(event,
+            Event::Session { id: actual, title: Some(title) }
+            if actual == &id && title == "Bundle encryption and throughput")));
+        let unchanged = adapter
+            .receive(json!({"type":"result","session_id":id}))
+            .unwrap();
+        assert!(
+            !unchanged
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Session { title: Some(_), .. }))
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"ai-title","sessionId":id,"aiTitle":"Generated encryption review"})
+        )
+        .unwrap();
+        let generated = adapter
+            .receive(json!({"type":"result","session_id":id}))
+            .unwrap();
+        assert!(generated.events.iter().any(|event| matches!(event,
+            Event::Session { title: Some(title), .. } if title == "Generated encryption review")));
+
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"custom-title","sessionId":id,"customTitle":"Encrypted bundle audit"})
+        )
+        .unwrap();
+        let streaming = adapter
+            .receive(json!({"type":"stream_event","session_id":id,"event":{}}))
+            .unwrap();
+        assert!(
+            !streaming
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Session { title: Some(_), .. }))
+        );
+        let result = adapter
+            .receive(json!({"type":"result","session_id":id}))
+            .unwrap();
+        assert!(result.events.iter().any(|event| matches!(event,
+            Event::Session { title: Some(title), .. } if title == "Encrypted bundle audit")));
     }
 
     #[test]
@@ -5732,12 +7008,12 @@ mod tests {
                 .is_err()
         );
         let refused = adapter.receive(json!({"type":"control_response","response":{"subtype":"error","request_id":request.writes[0]["request_id"],"error":"Fast mode unavailable"}})).unwrap();
-        assert!(refused.events.is_empty());
-        assert!(adapter.control_replies().iter().any(|(_, result)| {
-            result
-                .as_ref()
-                .is_err_and(|message| message.contains("Fast mode unavailable"))
-        }));
+        assert!(
+            refused
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { fatal: false, .. }))
+        );
         assert!(!adapter.fast_mode.as_ref().unwrap().enabled());
         let request = adapter
             .command(Command::SetFastMode { enabled: true })
@@ -6010,12 +7286,10 @@ mod tests {
         let failed = adapter.receive(json!({"type":"control_response","response":{
             "subtype":"error","request_id":apply.writes[0]["request_id"],"error":"Policy rejected the change"
         }})).unwrap();
-        assert!(failed.events.is_empty());
-        assert!(adapter.control_replies().iter().any(|(_, result)| {
-            result
-                .as_ref()
-                .is_err_and(|message| message.contains("Policy rejected"))
-        }));
+        assert!(matches!(
+            failed.events.as_slice(),
+            [Event::Error { fatal: false, .. }]
+        ));
         assert!(failed.writes.is_empty());
         assert!(adapter.permissions.unwrap().settings.rules.is_empty());
     }
@@ -6076,13 +7350,14 @@ mod tests {
                 .unwrap();
             assert!(matches!(
                 confirmed.events.as_slice(),
-                [Event::PermissionSettings(_)]
+                [
+                    Event::PermissionSettings(_),
+                    Event::Error { fatal: false, .. }
+                ]
             ));
-            let replies = adapter.control_replies();
-            let message = replies
-                .iter()
-                .find_map(|(_, reply)| reply.as_ref().err())
-                .unwrap();
+            let Event::Error { message, .. } = &confirmed.events[1] else {
+                unreachable!()
+            };
             assert!(message.contains(if removal {
                 "did not remove"
             } else {
@@ -6255,12 +7530,15 @@ mod tests {
         };
         assert_eq!(denial.reason, "Push needs approval");
         assert_eq!(denial.agent_id.as_deref(), Some("child"));
-        assert_eq!(
-            serde_json::from_str::<Value>(denial.tool_input.as_ref().unwrap()).unwrap(),
-            input
-        );
+        // The provider agent UUID does not identify the parent tool-use
+        // namespace. Never attribute a root cache entry to that child.
+        assert!(denial.tool_input.is_none());
+        let root = adapter.receive(json!({"type":"system","subtype":"permission_denied","parent_tool_use_id":null,"tool_use_id":"blocked","tool_name":"Bash","decision_reason":"Root advisory"})).unwrap();
+        assert!(root.events.iter().any(|event| matches!(event, Event::PermissionDenied(d)
+            if d.tool_input.as_deref().and_then(|v| serde_json::from_str::<Value>(v).ok()) == Some(input.clone()))));
         let result = adapter.receive(json!({"type":"result","permission_denials":[{"tool_use_id":"blocked","tool_name":"Bash","tool_input":input}]})).unwrap();
-        assert!(result.events.iter().any(|event| matches!(event, Event::PermissionDenied(d) if d.tool_use_id == "blocked" && d.tool_input.is_some())));
+        assert!(result.events.iter().any(|event| matches!(event, Event::PermissionDenied(d)
+            if d.tool_use_id == "blocked" && d.tool_input.as_deref().and_then(|v| serde_json::from_str::<Value>(v).ok()) == Some(input.clone()))));
         adapter
             .command(Command::DismissPermissionDenial {
                 tool_use_id: "blocked".into(),
@@ -6325,7 +7603,7 @@ mod tests {
                     .insert("background-permission".into(), Value::Null);
             }
             adapter
-                .receive(json!({"type":"result","subtype":"success","is_error":false}))
+                .receive(json!({"type":"result","is_error":false}))
                 .unwrap();
             assert_eq!(adapter.busy, pending);
             let started = adapter
@@ -6355,7 +7633,7 @@ mod tests {
                 );
             }
             adapter
-                .receive(json!({"type":"result","subtype":"success","is_error":false}))
+                .receive(json!({"type":"result","is_error":false}))
                 .unwrap();
             let started = adapter
                 .receive(
@@ -6370,6 +7648,182 @@ mod tests {
                     .count(),
                 1
             );
+        }
+    }
+
+    /// A decision a background agent leaves past the end of its parent's turn
+    /// keeps Claude busy only until it is answered, and an interrupt sent in
+    /// between does not cancel the next turn.
+    #[test]
+    fn a_decision_left_past_its_turn_frees_claude_once_answered() {
+        for interrupted in [false, true] {
+            let mut adapter = Claude {
+                ready: true,
+                ..Claude::default()
+            };
+            adapter
+                .send_prompt("hello".into(), vec![], PromptMode::Send)
+                .unwrap();
+            adapter
+                .receive(approval("background-1", "Bash", json!({"command":"true"})))
+                .unwrap();
+            adapter
+                .receive(json!({"type":"result","is_error":false}))
+                .unwrap();
+            assert!(adapter.busy, "the decision outlives the turn");
+            assert!(
+                adapter
+                    .send_prompt("too soon".into(), vec![], PromptMode::Send)
+                    .is_err()
+            );
+            let interrupt = interrupted.then(|| adapter.command(Command::Interrupt).unwrap());
+            let answered = adapter
+                .command(Command::Answer {
+                    request_id: "background-1".into(),
+                    action: "deny".into(),
+                    answers: vec![],
+                })
+                .unwrap();
+            assert!(!adapter.busy);
+            assert!(
+                answered
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::Status { busy: false, .. }))
+            );
+            if let Some(interrupt) = interrupt {
+                adapter
+                    .receive(reply(
+                        interrupt.writes[0]["request_id"].as_str().unwrap(),
+                        json!({}),
+                    ))
+                    .unwrap();
+            }
+            adapter
+                .send_prompt("next".into(), vec![], PromptMode::Send)
+                .unwrap();
+            let finished = adapter
+                .receive(json!({"type":"result","subtype":"success","is_error":false}))
+                .unwrap();
+            assert!(
+                finished.events.iter().any(|event| matches!(
+                    event,
+                    Event::TurnFinished { outcome, .. }
+                        if *outcome != crate::notifications::Kind::Cancelled
+                )),
+                "{:?}",
+                finished.events
+            );
+            assert!(!adapter.busy);
+        }
+    }
+
+    #[test]
+    fn a_between_turn_interrupt_ack_cannot_settle_the_next_runs_interrupt() {
+        between_turn_interrupt_ack_with_request_order(false);
+    }
+
+    #[test]
+    fn an_interrupt_for_a_request_arriving_after_result_cannot_settle_the_next_run() {
+        between_turn_interrupt_ack_with_request_order(true);
+    }
+
+    fn between_turn_interrupt_ack_with_request_order(request_after_result: bool) {
+        use crate::agent_execution::ProviderEvent;
+        use crate::notifications::Kind;
+
+        for after_result in [false, true] {
+            for old_accepted in [false, true] {
+                let mut adapter = Claude {
+                    ready: true,
+                    ..Claude::default()
+                };
+                adapter
+                    .send_prompt("first".into(), vec![], PromptMode::Send)
+                    .unwrap();
+                if !request_after_result {
+                    adapter
+                        .receive(approval("background", "Bash", json!({"command":"true"})))
+                        .unwrap();
+                }
+                adapter
+                    .receive(json!({"type":"result","is_error":false}))
+                    .unwrap();
+                if request_after_result {
+                    assert!(!adapter.busy, "main result precedes the late decision");
+                    adapter
+                        .receive(approval("background", "Bash", json!({"command":"true"})))
+                        .unwrap();
+                    assert!(
+                        !adapter.busy,
+                        "late permission does not create a new main turn"
+                    );
+                }
+                let old = adapter.command(Command::Interrupt).unwrap();
+                let old_id = old.writes[0]["request_id"].as_str().unwrap();
+                adapter
+                    .command(Command::Answer {
+                        request_id: "background".into(),
+                        action: "deny".into(),
+                        answers: vec![],
+                    })
+                    .unwrap();
+
+                let next = crate::model::RunId::new();
+                adapter
+                    .command_for_run(
+                        next,
+                        Command::Prompt {
+                            text: "next".into(),
+                            attachments: vec![],
+                            mode: PromptMode::Send,
+                        },
+                    )
+                    .unwrap();
+                let current = adapter.command(Command::Interrupt).unwrap();
+                let current_id = current.writes[0]["request_id"].as_str().unwrap();
+                let result = json!({"type":"result","uuid":"next-result","is_error":false});
+                let mut events = Vec::new();
+                if after_result {
+                    events.extend(adapter.receive(result.clone()).unwrap().events);
+                }
+                let old_ack = if old_accepted {
+                    reply(old_id, json!({}))
+                } else {
+                    json!({"type":"control_response","response":{"request_id":old_id,"subtype":"error","error":"already settled"}})
+                };
+                let stale = adapter.receive(old_ack).unwrap();
+                assert!(stale.events.is_empty(), "{:?}", stale.events);
+                if !after_result {
+                    events.extend(adapter.receive(result).unwrap().events);
+                }
+                assert!(
+                    !events.iter().any(|event| matches!(event,
+                        Event::Execution { run, event: ProviderEvent::Finished { .. } } if *run == next)),
+                    "the next run must await its own interrupt acknowledgement: {events:?}"
+                );
+                events.extend(
+                    adapter
+                        .receive(json!({
+                            "type":"control_response",
+                            "response":{"request_id":current_id,"subtype":"error","error":"already settled"}
+                        }))
+                        .unwrap()
+                        .events,
+                );
+                let outcomes: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        Event::Execution {
+                            run,
+                            event: ProviderEvent::Finished { outcome },
+                        } if *run == next => Some(*outcome),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(outcomes, [Kind::Succeeded], "{events:?}");
+                assert!(!adapter.busy);
+            }
         }
     }
 
@@ -6448,7 +7902,7 @@ mod tests {
         assert!(steered.events.iter().any(|event| matches!(event, Event::Item(item) if matches!(&item.content, ItemContent::Text { text, .. } if text == "correct the approach"))));
         assert_eq!(adapter.queued.len(), 1);
         adapter
-            .receive(json!({"type":"result","subtype":"success","is_error":false}))
+            .receive(json!({"type":"result","is_error":false}))
             .unwrap();
         let started = adapter
             .receive(json!({"type":"command_lifecycle","command_uuid":id,"state":"started"}))
@@ -6559,6 +8013,7 @@ mod tests {
             .send_prompt(
                 text.clone(),
                 vec![Attachment {
+                    reference: None,
                     path: attachment.clone(),
                 }],
                 PromptMode::Queue,
@@ -6577,7 +8032,7 @@ mod tests {
             Event::QueueChanged(messages)
                 if messages.len() == 1
                     && !messages[0].editable
-                    && messages[0].attachments == [Attachment { path: attachment.clone() }]
+                    && messages[0].attachments == [Attachment { path: attachment.clone(), reference: None }]
         )));
         let frame = submitted.writes[0].clone();
         let id = frame["uuid"].clone();
@@ -6761,7 +8216,7 @@ mod tests {
                 .send_prompt("legacy".into(), vec![], PromptMode::Send)
                 .unwrap();
             adapter
-                .receive(json!({"type":"result","subtype":"success","is_error":false}))
+                .receive(json!({"type":"result","is_error":false}))
                 .unwrap();
         }
         assert!(adapter.submissions.is_empty());
@@ -6903,6 +8358,55 @@ mod tests {
     }
 
     #[test]
+    fn question_artifact_shorthand_remains_text_and_round_trips_exactly() {
+        let question = "Compare .worktrees/v2review-related-sites-redesign/docs/local/v2review/tree-fixture-dark-{collapsed,expanded,expanded-11,search}.png and tree-real-*.png";
+        let description = "Inspect [expanded](docs/local/v2review/tree-fixture-dark-expanded.png)";
+        let input = json!({"questions":[{
+            "question":question,
+            "header":"Artifacts",
+            "options":[
+                {"label":"Use fixtures", "description":description},
+                {"label":"Use tree-real-*.png", "description":"Keep the literal filename"}
+            ]
+        }]});
+        let mut adapter = Claude::default();
+        let requested = adapter
+            .receive(approval("artifacts", "AskUserQuestion", input.clone()))
+            .unwrap();
+        // The request supplies no image blocks. In particular, neither the
+        // question nor an option description becomes a filesystem attachment.
+        assert!(requested.writes.is_empty());
+        assert_eq!(requested.events.len(), 1);
+        let Event::Request(request) = &requested.events[0] else {
+            panic!("question request");
+        };
+        assert_eq!(request.fields[0].id, question);
+        assert_eq!(request.fields[0].label, question);
+        assert_eq!(request.fields[0].choices[0].description, description);
+        assert_eq!(request.fields[0].choices[1].id, "Use tree-real-*.png");
+
+        let answered = adapter
+            .answer(
+                "artifacts".into(),
+                "allow".into(),
+                vec![Answer {
+                    field: question.into(),
+                    values: vec!["Use tree-real-*.png".into()],
+                }],
+            )
+            .unwrap();
+        let mut expected = input;
+        expected["answers"] = json!({question:"Use tree-real-*.png"});
+        assert_eq!(
+            answered.writes,
+            vec![reply(
+                "artifacts",
+                json!({"behavior":"allow","updatedInput":expected})
+            )]
+        );
+    }
+
+    #[test]
     fn skipping_questions_is_not_a_tool_permission_denial() {
         let mut adapter = Claude::default();
         let input = json!({"questions":[{"question":"Which file?","options":[{"label":"First"},{"label":"Second"}]}]});
@@ -6936,6 +8440,483 @@ mod tests {
         assert!(
             matches!(&approval.events[0], Event::Request(request) if request.kind == chat::RequestKind::Approval && request.actions[0].label == "Allow once")
         );
+    }
+
+    fn scoped_call(
+        parent: Option<&str>,
+        carrier: &str,
+        id: &str,
+        name: &str,
+        input: Value,
+    ) -> Value {
+        json!({"type":"assistant","uuid":carrier,"parent_tool_use_id":parent,"message":{"id":carrier,"content":[{"type":"tool_use","id":id,"name":name,"input":input}]}})
+    }
+
+    fn scoped_result(parent: Option<&str>, carrier: &str, id: &str, failed: bool) -> Value {
+        json!({"type":"user","uuid":carrier,"parent_tool_use_id":parent,"message":{"content":[{"type":"tool_result","tool_use_id":id,"is_error":failed,"content":"finished"}]}})
+    }
+
+    fn scoped_item<'a>(step: &'a Step, parent: Option<&str>, id: &str) -> &'a Item {
+        step.events
+            .iter()
+            .find_map(|event| match (event, parent) {
+                (Event::Item(item), None) if item.id == id => Some(item),
+                (Event::SubagentItem { id: scope, item }, Some(parent))
+                    if scope == parent && item.id == id =>
+                {
+                    Some(item)
+                }
+                _ => None,
+            })
+            .expect("tool item must be published in its original parent scope")
+    }
+
+    fn assert_scoped_body(
+        step: &Step,
+        parent: Option<&str>,
+        id: &str,
+        body: &str,
+        status: ToolStatus,
+    ) {
+        let ItemContent::Tool {
+            name,
+            input,
+            status: actual,
+            ..
+        } = &scoped_item(step, parent, id).content
+        else {
+            panic!("coordination item must retain its exact tool payload");
+        };
+        assert_eq!(name, "SendMessage");
+        let input: Value = serde_json::from_str(input).unwrap();
+        assert_eq!(
+            input["message"], body,
+            "tool body must belong to its parent scope"
+        );
+        assert_eq!(*actual, status);
+    }
+
+    #[test]
+    fn opaque_tool_calls_and_results_keep_exact_parent_scoped_bodies() {
+        for parents in [
+            [Some("one"), Some("two")],
+            [Some("two"), Some("one")],
+            [None, Some("one")],
+            [Some("one"), None],
+        ] {
+            let mut adapter = Claude::default();
+            for (index, parent) in parents.into_iter().enumerate() {
+                let body = format!(
+                    "Current {} coordination body\n\n",
+                    parent.unwrap_or("parent")
+                )
+                .repeat(32);
+                let call = scoped_call(
+                    parent,
+                    &format!("call-{index}"),
+                    "same#opaque-id",
+                    "SendMessage",
+                    json!({"to":"reviewer","message":body}),
+                );
+                let call_step = adapter.receive(call).unwrap();
+                let step = adapter
+                    .receive(scoped_result(
+                        parent,
+                        &format!("result-{index}"),
+                        "same#opaque-id",
+                        false,
+                    ))
+                    .unwrap();
+                assert_scoped_body(
+                    &step,
+                    parent,
+                    "same#opaque-id",
+                    &body,
+                    ToolStatus::Succeeded,
+                );
+                assert_scoped_body(
+                    &call_step,
+                    parent,
+                    "same#opaque-id",
+                    &body,
+                    ToolStatus::Running,
+                );
+            }
+        }
+        // These two (parent, ID) pairs collide under delimiter concatenation.
+        let mut adapter = Claude::default();
+        for (index, parent, id) in [(0, "a", "b:c"), (1, "a:b", "c")] {
+            let body = format!("body-{index}");
+            adapter
+                .receive(scoped_call(
+                    Some(parent),
+                    &format!("call-{index}"),
+                    id,
+                    "SendMessage",
+                    json!({"message":body}),
+                ))
+                .unwrap();
+            let result = adapter
+                .receive(scoped_result(
+                    Some(parent),
+                    &format!("result-{index}"),
+                    id,
+                    false,
+                ))
+                .unwrap();
+            assert_scoped_body(&result, Some(parent), id, &body, ToolStatus::Succeeded);
+        }
+    }
+
+    #[test]
+    fn colliding_edit_inputs_and_permission_fallback_keep_their_scope() {
+        let mut adapter = Claude::default();
+        let calls = [
+            (
+                "one",
+                "Edit",
+                json!({"file_path":"one.rs","old_string":"before","new_string":"after"}),
+            ),
+            (
+                "two",
+                "Write",
+                json!({"file_path":"two.rs","content":"second"}),
+            ),
+        ];
+        for (parent, name, input) in &calls {
+            adapter
+                .receive(scoped_call(
+                    Some(parent),
+                    &format!("call-{parent}"),
+                    "same",
+                    name,
+                    input.clone(),
+                ))
+                .unwrap();
+        }
+        adapter
+            .receive(scoped_call(
+                None,
+                "root-call",
+                "same",
+                "SendMessage",
+                json!({"message":"root body"}),
+            ))
+            .unwrap();
+        for parent in [None, Some("")] {
+            let ambiguous = adapter.receive(json!({"type":"system","subtype":"permission_denied","agent_id":"provider-agent-uuid","parent_tool_use_id":parent,"tool_use_id":"same","tool_name":"Edit"})).unwrap();
+            assert!(
+                ambiguous.events.iter().any(
+                    |event| matches!(event, Event::PermissionDenied(d) if d.tool_input.is_none())
+                ),
+                "unidentified child advisories must not borrow root input"
+            );
+        }
+        let absent = adapter.receive(json!({"type":"system","subtype":"permission_denied","agent_id":"provider-agent-uuid","tool_use_id":"same","tool_name":"Edit"})).unwrap();
+        assert!(
+            absent
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::PermissionDenied(d) if d.tool_input.is_none()))
+        );
+        for (parent, name, input) in &calls {
+            let denial = adapter.receive(json!({"type":"system","subtype":"permission_denied","parent_tool_use_id":parent,"tool_use_id":"same","tool_name":name,"decision_reason":"denied"})).unwrap();
+            assert!(denial.events.iter().any(|event| matches!(event, Event::PermissionDenied(d) if d.tool_input.as_deref().and_then(|v|serde_json::from_str::<Value>(v).ok())==Some(input.clone()))));
+            let result = adapter.receive(json!({"type":"result","parent_tool_use_id":parent,"permission_denials":[{"tool_use_id":"same","tool_name":name}]})).unwrap();
+            assert!(result.events.iter().any(|event| matches!(event, Event::PermissionDenied(d) if d.tool_input.as_deref().and_then(|v|serde_json::from_str::<Value>(v).ok())==Some(input.clone()))));
+        }
+        for (parent, name, file) in [("one", "Edit", "one.rs"), ("two", "Write", "two.rs")] {
+            let step = adapter
+                .receive(scoped_result(
+                    Some(parent),
+                    &format!("failed-{parent}"),
+                    "same",
+                    true,
+                ))
+                .unwrap();
+            let ItemContent::Tool {
+                name: actual,
+                input,
+                status,
+                ..
+            } = &scoped_item(&step, Some(parent), "same").content
+            else {
+                panic!("failed edit must restore its own call");
+            };
+            assert_eq!(actual, name);
+            assert_eq!(
+                serde_json::from_str::<Value>(input).unwrap()["file_path"],
+                file
+            );
+            assert_eq!(*status, ToolStatus::Failed);
+        }
+    }
+
+    #[test]
+    fn fragmented_colliding_child_streams_settle_and_replay_independently() {
+        let mut adapter = Claude::default();
+        let frame = |parent: &str, event: Value| json!({"type":"stream_event","parent_tool_use_id":parent,"event":event});
+        for parent in ["one", "two"] {
+            adapter
+                .receive(frame(
+                    parent,
+                    json!({"type":"message_start","message":{"id":"same-message"}}),
+                ))
+                .unwrap();
+            adapter.receive(frame(parent, json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"same","name":"SendMessage"}}))).unwrap();
+            adapter.receive(frame(parent, json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"message\":\""}}))).unwrap();
+        }
+        for parent in ["one", "two"] {
+            adapter.receive(frame(parent, json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":format!("{parent}\"}}")}}))).unwrap();
+            adapter
+                .receive(frame(
+                    parent,
+                    json!({"type":"content_block_stop","index":0}),
+                ))
+                .unwrap();
+            adapter
+                .receive(frame(parent, json!({"type":"message_stop"})))
+                .unwrap();
+            let result = adapter
+                .receive(scoped_result(
+                    Some(parent),
+                    &format!("result-{parent}"),
+                    "same",
+                    false,
+                ))
+                .unwrap();
+            assert_scoped_body(&result, Some(parent), "same", parent, ToolStatus::Succeeded);
+            // Both full-envelope and streamed replays must preserve the completed item.
+            let replay = adapter
+                .receive(scoped_call(
+                    Some(parent),
+                    &format!("replay-{parent}"),
+                    "same",
+                    "SendMessage",
+                    json!({"message":"must not replace completion"}),
+                ))
+                .unwrap();
+            assert!(
+                !replay
+                    .events
+                    .iter()
+                    .any(|e| matches!(e,Event::SubagentItem{item,..} if item.id=="same"))
+            );
+            let replay = stream_message(
+                &mut adapter,
+                Some(parent),
+                &format!("replay-stream-{parent}"),
+                &[
+                    json!({"type":"tool_use","id":"same","name":"SendMessage","input":{"message":"must not replace completion"}}),
+                ],
+            );
+            assert!(
+                !replay
+                    .iter()
+                    .any(|e| matches!(e,Event::SubagentItem{item,..} if item.id=="same"))
+            );
+            let result = adapter
+                .receive(scoped_result(
+                    Some(parent),
+                    &format!("result-replay-{parent}"),
+                    "same",
+                    false,
+                ))
+                .unwrap();
+            assert_scoped_body(&result, Some(parent), "same", parent, ToolStatus::Succeeded);
+        }
+    }
+
+    #[test]
+    fn retracting_one_tool_scope_preserves_equal_sibling_ids() {
+        let mut adapter = Claude::default();
+        for parent in ["one", "two"] {
+            adapter
+                .receive(scoped_call(
+                    Some(parent),
+                    &format!("call-{parent}"),
+                    "same",
+                    "SendMessage",
+                    json!({"message":parent}),
+                ))
+                .unwrap();
+            adapter
+                .receive(scoped_result(
+                    Some(parent),
+                    &format!("result-{parent}"),
+                    "same",
+                    false,
+                ))
+                .unwrap();
+        }
+        let stream =
+            |event: Value| json!({"type":"stream_event","parent_tool_use_id":"two","event":event});
+        adapter
+            .receive(stream(
+                json!({"type":"message_start","message":{"id":"live"}}),
+            ))
+            .unwrap();
+        adapter.receive(stream(json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"same","name":"SendMessage"}}))).unwrap();
+        let removed = adapter.receive(json!({"type":"assistant","uuid":"replacement","supersedes":["call-one"],"message":{"content":"replacement"}})).unwrap();
+        assert!(removed.events.iter().any(|e|matches!(e,Event::SubagentItemsRemoved{id,ids} if id=="one" && ids==&vec!["same".to_owned()])));
+        adapter.receive(stream(json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}))).unwrap();
+        adapter
+            .receive(stream(json!({"type":"message_stop"})))
+            .unwrap();
+        let replay = adapter
+            .receive(scoped_call(
+                Some("two"),
+                "replay-two",
+                "same",
+                "SendMessage",
+                json!({"message":"wrong"}),
+            ))
+            .unwrap();
+        assert!(
+            !replay
+                .events
+                .iter()
+                .any(|e| matches!(e,Event::SubagentItem{item,..} if item.id=="same"))
+        );
+        let new = adapter
+            .receive(scoped_call(
+                Some("one"),
+                "new-one",
+                "same",
+                "SendMessage",
+                json!({"message":"new one"}),
+            ))
+            .unwrap();
+        assert_scoped_body(&new, Some("one"), "same", "new one", ToolStatus::Running);
+        let result = adapter
+            .receive(scoped_result(Some("two"), "late-two", "same", false))
+            .unwrap();
+        assert_scoped_body(&result, Some("two"), "same", "two", ToolStatus::Succeeded);
+    }
+
+    #[test]
+    fn tool_eviction_retires_only_the_exact_parent_identity() {
+        let mut adapter = Claude::default();
+        for parent in ["one", "two"] {
+            adapter
+                .receive(scoped_call(
+                    Some(parent),
+                    &format!("call-{parent}"),
+                    "same",
+                    "SendMessage",
+                    json!({"message":parent}),
+                ))
+                .unwrap();
+            adapter
+                .receive(scoped_result(
+                    Some(parent),
+                    &format!("result-{parent}"),
+                    "same",
+                    false,
+                ))
+                .unwrap();
+        }
+        for index in 0..MAX_TOOLS - 1 {
+            adapter
+                .receive(scoped_call(
+                    None,
+                    &format!("fill-{index}"),
+                    &format!("tool-{index}"),
+                    "Read",
+                    json!({"file_path":"filler"}),
+                ))
+                .unwrap();
+        }
+        // Only the oldest entry (child one) passed the existing bound.
+        let replay = adapter
+            .receive(scoped_call(
+                Some("two"),
+                "two-replay",
+                "same",
+                "SendMessage",
+                json!({"message":"wrong"}),
+            ))
+            .unwrap();
+        assert!(
+            !replay
+                .events
+                .iter()
+                .any(|e| matches!(e,Event::SubagentItem{item,..} if item.id=="same"))
+        );
+        let new = adapter
+            .receive(scoped_call(
+                Some("one"),
+                "one-reloaded",
+                "same",
+                "SendMessage",
+                json!({"message":"fresh one"}),
+            ))
+            .unwrap();
+        assert_scoped_body(&new, Some("one"), "same", "fresh one", ToolStatus::Running);
+    }
+
+    #[test]
+    fn child_tool_eviction_preserves_root_task_visibility() {
+        let mut adapter = Claude::default();
+        adapter
+            .receive(scoped_call(
+                Some("child"),
+                "child-call",
+                "claude-task:root",
+                "SendMessage",
+                json!({"message":"child body"}),
+            ))
+            .unwrap();
+        adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"root","task_type":"local_workflow","description":"root task"})).unwrap();
+        for index in 0..MAX_TOOLS - 1 {
+            adapter
+                .receive(scoped_call(
+                    None,
+                    &format!("fill-{index}"),
+                    &format!("tool-{index}"),
+                    "Read",
+                    json!({"file_path":"filler"}),
+                ))
+                .unwrap();
+        }
+        assert!(
+            adapter.visible_task_rows.contains("claude-task:root"),
+            "evicting a child must preserve the colliding root task row"
+        );
+    }
+
+    #[test]
+    fn ambiguous_nested_agents_preserve_the_root_task_fallback_on_replay() {
+        let mut adapter = Claude::default();
+        for parent in ["one", "two"] {
+            adapter
+                .receive(scoped_call(
+                    Some(parent),
+                    &format!("agent-{parent}"),
+                    "same",
+                    "Agent",
+                    json!({"description":parent}),
+                ))
+                .unwrap();
+        }
+        let task = adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"taskB","tool_use_id":"same","task_type":"local_agent"})).unwrap();
+        assert!(
+            task.events
+                .iter()
+                .any(|event| matches!(event,Event::Item(item) if item.id=="claude-task:taskB")),
+            "ambiguous task must keep its root fallback"
+        );
+        let replay = adapter
+            .receive(scoped_call(
+                Some("one"),
+                "agent-one-replay",
+                "same",
+                "Agent",
+                json!({"description":"one"}),
+            ))
+            .unwrap();
+        assert!(!replay.events.iter().any(|event|matches!(event,Event::ItemsRemoved{ids} if ids.iter().any(|id|id=="claude-task:taskB"))), "ambiguous replay must not retract the root task fallback");
+        assert!(adapter.visible_task_rows.contains("claude-task:taskB"));
     }
 
     #[test]
@@ -7091,7 +9072,7 @@ mod tests {
         let (first, second) = encoded.split_at(encoded.len() / 2);
         let partial = streamed.receive(stream(json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":first}}))).unwrap();
         assert!(
-            matches!(&partial.events[..], [Event::InputDelta { id, offset:0, delta }] if id == "edit" && delta == first)
+            matches!(&items(&partial)[..], [ItemContent::Tool { name, input, .. }] if name == "Edit" && input == first)
         );
         streamed.receive(stream(json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":second}}))).unwrap();
         let stopped = streamed
@@ -7173,27 +9154,42 @@ mod tests {
     /// has since been pushed out by later calls, still fail as the tool they
     /// were: the name is kept for as long as the call is.
     #[test]
-    fn a_failed_edit_without_original_input_keeps_its_attempted_changes() {
+    fn a_failed_edit_keeps_its_name_without_its_input() {
         let mut adapter = Claude::default();
         let content = "x".repeat(chat::PermissionDenial::INPUT_LIMIT);
         adapter.receive(json!({"type":"assistant","uuid":"a1","message":{"id":"msg-1","content":[
             {"type":"tool_use","id":"write","name":"Write","input":{"file_path":"big.txt","content":content}},
             {"type":"tool_use","id":"edit","name":"MultiEdit","input":{"file_path":"src/app.rs","edits":[{"old_string":"missing","new_string":"found"}]}},
         ]}})).unwrap();
-        assert!(!adapter.tool_inputs.contains_key(&CanonicalItemKey::new(None,"write")));
+        assert!(
+            !adapter
+                .tool_inputs
+                .contains_key(&ScopedId::new(None, "write"))
+        );
         for call in 0..chat::PermissionDenial::LIMIT {
             adapter.receive(json!({"type":"assistant","uuid":format!("b{call}"),"message":{"id":format!("msg-b{call}"),"content":[
                 {"type":"tool_use","id":format!("read-{call}"),"name":"Read","input":{"file_path":"src/app.rs"}},
             ]}})).unwrap();
         }
-        assert!(!adapter.tool_inputs.contains_key(&CanonicalItemKey::new(None,"edit")));
-        for (id,name) in [("write","Write"),("edit","MultiEdit")] {
-            let mut expected=adapter.tools[id].content.clone();
-            let ItemContent::Changes{status,..}=&mut expected else{panic!("native edit must retain attempted patch");};*status=ToolStatus::Failed;
-            assert_eq!(adapter.edit_tools.get(&CanonicalItemKey::new(None,id)).map(String::as_str),Some(name));
+        assert!(
+            !adapter
+                .tool_inputs
+                .contains_key(&ScopedId::new(None, "edit"))
+        );
+        for (id, name, path) in [
+            ("write", "Write", "big.txt"),
+            ("edit", "MultiEdit", "src/app.rs"),
+        ] {
             let failed = adapter.receive(json!({"type":"user","uuid":format!("u-{id}"),"message":{"content":[{"type":"tool_result","tool_use_id":id,"is_error":true,"content":"denied"}]}})).unwrap();
-            assert_eq!(items(&failed),vec![expected]);
-            assert!(failed.events.iter().any(|event|matches!(event,Event::Error{message,fatal:false} if message.contains("original tool input is unavailable"))));
+            assert_eq!(
+                items(&failed),
+                vec![ItemContent::Tool {
+                    name: name.into(),
+                    input: json!({"file_path": path}).to_string(),
+                    output: "denied".into(),
+                    status: ToolStatus::Failed,
+                }]
+            );
         }
         // The name is let go of with the call.
         adapter
@@ -7718,8 +9714,107 @@ mod tests {
             let mut adapter = Claude::default();
             adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task","task_type":kind,"description":"Review"})).unwrap();
             adapter.receive(json!({"type":"system","subtype":"task_progress","task_id":"task","patch":{"summary":"Making progress"}})).unwrap();
-            let done = adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"task","status":"completed","summary":"Findings","uuid":"report"})).unwrap();
+            let notification = json!({"type":"system","subtype":"task_notification","task_id":"task","status":"completed","summary":"Findings","uuid":"report"});
+            let done = adapter.receive(notification.clone()).unwrap();
             assert!(done.events.iter().any(|event| matches!(event, Event::Item(Item {content:ItemContent::Delivery {kind, summary, body, .. }, .. }) if summary == heading && if report { *kind == DeliveryKind::Report && body == "Findings" } else { *kind == DeliveryKind::Notice && body.is_empty() })));
+            assert!(
+                adapter.tasks.is_empty(),
+                "origin retention is never running work"
+            );
+            assert_eq!(adapter.report_tasks.len(), usize::from(report));
+            let replay = adapter.receive(notification.clone()).unwrap();
+            assert!(
+                replay.events.is_empty(),
+                "exact replay cannot replace the original role/ID/kind/heading/raw body"
+            );
+            let mut changed = notification;
+            changed["summary"] = json!("Revised findings");
+            let changed = adapter.receive(changed).unwrap();
+            assert!(changed.events.iter().any(|event|matches!(event, Event::Item(Item { content:ItemContent::Delivery {kind,summary,body,..},.. })
+                if if report { *kind==DeliveryKind::Report && summary==heading && body=="Revised findings" } else { *kind==DeliveryKind::Notice && summary=="Revised findings" && body.is_empty() })),
+                "same UUID with changed payload must still be processed");
+            // Same task ID reused for a nonreport producer must not inherit an
+            // old native-agent/workflow origin.
+            adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task","task_type":"local_bash","description":"New command"})).unwrap();
+            let command = adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"task","status":"completed","summary":"Command finished","uuid":"new-command-report"})).unwrap();
+            assert!(command.events.iter().any(|event|matches!(event, Event::Item(Item { content:ItemContent::Delivery {kind:DeliveryKind::Notice, summary,body,..},.. }) if summary=="Command finished" && body.is_empty())));
+            assert!(adapter.report_tasks.is_empty());
+        }
+    }
+
+    #[test]
+    fn exact_task_receipts_do_not_reexpose_a_handed_back_report_and_cache_stays_bounded() {
+        for kind in ["local_agent", "local_workflow"] {
+            let mut adapter = Claude::default();
+            adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task","task_type":kind,"description":"Review"})).unwrap();
+            adapter.receive(json!({"type":"user","uuid":"actual-handback","isMeta":true,
+                "origin":{"kind":"peer","from":"task","senderTaskId":"task","body":format!("{HANDBACK_PREAMBLE}\n  Original findings"),"handback":true},
+                "message":{"role":"user","content":"unused"}})).unwrap();
+            let mut notification = json!({"type":"system","subtype":"task_notification","task_id":"task","uuid":"terminal-after-handback","status":"completed","summary":"Original findings"});
+            let done = adapter.receive(notification.clone()).unwrap();
+            assert!(done.events.iter().any(|event|matches!(event,Event::Item(Item {content:ItemContent::Delivery {kind:DeliveryKind::Notice,body,..},..}) if body.is_empty())));
+            assert!(
+                adapter
+                    .receive(notification.clone())
+                    .unwrap()
+                    .events
+                    .is_empty(),
+                "exact replay must not consume handoff state again or re-expose its body"
+            );
+            notification["summary"] = json!("Revised findings");
+            let changed = adapter.receive(notification.clone()).unwrap();
+            assert!(changed.events.iter().any(|event|matches!(event,Event::Item(Item {content:ItemContent::Delivery {kind:DeliveryKind::Report,body,..},..}) if body=="Revised findings")));
+            notification["uuid"] = json!("fresh-report");
+            let fresh = adapter.receive(notification.clone()).unwrap();
+            assert!(fresh.events.iter().any(|event|matches!(event,Event::Item(Item {content:ItemContent::Delivery {kind:DeliveryKind::Report,body,..},..}) if body=="Revised findings")));
+            notification.as_object_mut().unwrap().remove("uuid");
+            for _ in 0..2 {
+                assert!(
+                    adapter
+                        .receive(notification.clone())
+                        .unwrap()
+                        .events
+                        .iter()
+                        .any(|event| matches!(
+                            event,
+                            Event::Item(Item {
+                                content: ItemContent::Delivery { .. },
+                                ..
+                            })
+                        )),
+                    "missing UUID never authorizes global replay suppression"
+                );
+            }
+            for carrier in ["", " \t\n"] {
+                notification["uuid"] = json!(carrier);
+                for _ in 0..2 {
+                    assert!(
+                        adapter
+                            .receive(notification.clone())
+                            .unwrap()
+                            .events
+                            .iter()
+                            .any(|event| matches!(
+                                event,
+                                Event::Item(Item {
+                                    content: ItemContent::Delivery { .. },
+                                    ..
+                                })
+                            )),
+                        "blank UUID does not suppress an actual notification"
+                    );
+                }
+            }
+            for index in 0..=MAX_TOOLS {
+                notification["uuid"] = json!(format!("bounded-{index}"));
+                adapter.receive(notification.clone()).unwrap();
+            }
+            assert_eq!(adapter.failure_receipts.len(), MAX_TOOLS);
+            assert!(adapter.tasks.is_empty());
+            adapter
+                .receive(json!({"type":"conversation_reset"}))
+                .unwrap();
+            assert!(adapter.failure_receipts.is_empty());
             assert!(adapter.report_tasks.is_empty());
         }
     }
@@ -7850,8 +9945,14 @@ mod tests {
             .unwrap();
         adapter.receive(stream(json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-1","name":"Bash"}}))).unwrap();
         let partial = adapter.receive(stream(json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"ls"}}))).unwrap();
-        assert!(
-            matches!(&partial.events[..], [Event::InputDelta { id, offset:0, delta }] if id == "tool-1" && delta == "{\"command\":\"ls")
+        assert_eq!(
+            items(&partial),
+            vec![ItemContent::Tool {
+                name: "Bash".into(),
+                input: "{\"command\":\"ls".into(),
+                output: String::new(),
+                status: ToolStatus::Running,
+            }]
         );
         adapter.receive(stream(json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"}"}}))).unwrap();
         let stopped = adapter
@@ -8615,7 +10716,7 @@ mod tests {
             .unwrap();
         adapter.receive(child(json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}))).unwrap();
         adapter
-            .receive(json!({"type":"result","subtype":"success","uuid":"parent-result","is_error":false}))
+            .receive(json!({"type":"result","uuid":"parent-result","is_error":false}))
             .unwrap();
         let delta = adapter.receive(child(json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"still working"}}))).unwrap();
         assert!(delta.events.iter().any(|event| matches!(event, Event::SubagentTextDelta { id, delta, .. } if id == "child" && delta == "still working")));
@@ -8822,9 +10923,7 @@ mod tests {
         let interrupt = adapter.command(Command::Interrupt).unwrap();
         let request_id = interrupt.writes[0]["request_id"].as_str().unwrap();
         let settled = adapter
-            .receive(
-                json!({"type":"result","subtype":"success","uuid":"first-result","is_error":false}),
-            )
+            .receive(json!({"type":"result","uuid":"first-result","is_error":false}))
             .unwrap();
         assert!(settled.events.iter().any(|event| matches!(event,
             Event::Execution { run, event: ProviderEvent::Settled } if *run == first)));
@@ -8843,10 +10942,207 @@ mod tests {
         assert!(ack.events.iter().any(|event| matches!(event,
             Event::Execution { run, event: ProviderEvent::Finished { outcome: crate::notifications::Kind::Cancelled } } if *run == first)));
         let second_result = adapter
-            .receive(json!({"type":"result","subtype":"success","uuid":"second-result","is_error":false}))
+            .receive(json!({"type":"result","uuid":"second-result","is_error":false}))
             .unwrap();
         assert!(second_result.events.iter().any(|event| matches!(event,
             Event::Execution { run, event: ProviderEvent::Finished { outcome: crate::notifications::Kind::Succeeded } } if *run == second)));
+    }
+
+    #[test]
+    fn notification_questions_use_real_claude_prompts_across_pending_requests() {
+        let question = |id: &str, text: &str| {
+            json!({
+                "type":"control_request", "request_id":id,
+                "request":{"subtype":"can_use_tool", "tool_name":"AskUserQuestion",
+                    "input":{"questions":[{"question":text,"header":"Migration",
+                        "options":[{"label":"Keep","description":"Keep existing"},
+                            {"label":"Replace","description":"Use replacement"}],
+                        "multiSelect":false}]}}
+            })
+        };
+        let frames = vec![
+            question("question-a", "Which config_file.rs strategy should A use?"),
+            question("question-b", "Which migration should B use?"),
+            json!({"type":"control_cancel_request","request_id":"question-a"}),
+            // Claude rejects duplicate pending IDs, so this must not invent a
+            // provider-supported same-ID question edit or a third notice.
+            question("question-b", "Unsupported duplicate wording"),
+        ];
+        let receipts = crate::chat::runtime::notification_frames_for_test(
+            Box::new(Claude {
+                busy: true,
+                ready: true,
+                ..Default::default()
+            }),
+            frames,
+            false,
+        );
+        assert_eq!(receipts.len(), 2);
+        assert!(
+            receipts[0]
+                .1
+                .preview
+                .contains("Which config_file.rs strategy should A use?")
+        );
+        assert!(
+            receipts[1]
+                .1
+                .preview
+                .contains("Which migration should B use?")
+        );
+        assert!(!receipts[1].1.preview.contains("Unsupported duplicate"));
+        assert_ne!(receipts[0].0.key, receipts[1].0.key);
+        for (evidence, content) in receipts {
+            assert_eq!(evidence.kind, crate::notifications::Kind::Waiting);
+            assert_eq!(
+                content.request,
+                Some(crate::notifications::RequestType::Question)
+            );
+            assert!(!content.preview.contains("waiting for your answers"));
+        }
+    }
+
+    #[test]
+    fn notification_old_interrupt_ack_preserves_the_new_question_and_topic() {
+        for accepted in [false, true] {
+            let mut adapter = Claude {
+                ready: true,
+                ..Default::default()
+            };
+            adapter
+                .send_prompt("Old A".into(), Vec::new(), PromptMode::Send)
+                .unwrap();
+            let interrupt = adapter.command(Command::Interrupt).unwrap();
+            let id = interrupt.writes[0]["request_id"].as_str().unwrap();
+            adapter
+                .receive(json!({"type":"result","uuid":"old-a","is_error":false}))
+                .unwrap();
+            adapter
+                .send_prompt("Review B migration".into(), Vec::new(), PromptMode::Send)
+                .unwrap();
+            let ack = if accepted {
+                reply(id, json!({}))
+            } else {
+                json!({"type":"control_response","response":{"request_id":id,"subtype":"error","error":"already settled"}})
+            };
+            let (callbacks, state) =
+                crate::chat::runtime::notification_frames_with_snapshot_for_test(
+                    Box::new(adapter),
+                    vec![
+                        json!({"type":"user","uuid":"new-b-user","session_id":"44444444-4444-4444-8444-444444444444",
+                        "message":{"role":"user","content":[{"type":"text","text":"Review B migration"}]}}),
+                        json!({"type":"control_request","request_id":"question-b","request":{
+                        "subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{
+                            "question":"Which B migration should I prepare?","header":"Migration",
+                            "options":[{"label":"Keep","description":"Preserve existing"},{"label":"Replace","description":"Use the new migration"}],"multiSelect":false}]}}}),
+                        ack,
+                    ],
+                    false,
+                );
+            assert_eq!(
+                callbacks.len(),
+                1,
+                "old acknowledgement cannot publish a current outcome"
+            );
+            assert_eq!(callbacks[0].0.kind, crate::notifications::Kind::Waiting);
+            assert_eq!(callbacks[0].1.conversation, "Review B migration");
+            assert!(callbacks[0].1.preview.contains("Which B migration"));
+            assert_eq!(state.requests.len(), 1);
+            assert_eq!(state.requests[0].id, "question-b");
+            assert!(state.error.is_none());
+            assert_eq!(state.activity(), crate::agent::ActivityState::Waiting);
+        }
+    }
+
+    #[test]
+    fn notification_label_survives_the_actual_send_step_event_order() {
+        let mut adapter = Claude {
+            ready: true,
+            ..Default::default()
+        };
+        let mut step = adapter
+            .send_prompt(
+                "Repair `config_file.rs`".into(),
+                Vec::new(),
+                PromptMode::Send,
+            )
+            .unwrap();
+        let user = step
+            .events
+            .iter()
+            .position(|event| matches!(event, Event::Item(item) if item.role == Role::User))
+            .unwrap();
+        let started = step
+            .events
+            .iter()
+            .position(|event| matches!(event, Event::TurnStarted))
+            .unwrap();
+        assert!(user < started, "exercise the real command-step ordering");
+        step.events.push(Event::TurnFinished {
+            key: Some("fixture-turn".into()),
+            outcome: crate::notifications::Kind::Succeeded,
+        });
+        let contexts =
+            crate::chat::notification::FrameContext::capture(&crate::chat::Snapshot::default())
+                .project(&step.events);
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].conversation, "Repair config_file.rs");
+    }
+
+    #[test]
+    fn notification_without_provider_title_uses_its_current_message_label() {
+        let receipts = crate::chat::runtime::notification_frames_for_test(
+            Box::new(Claude {
+                busy: true,
+                ready: true,
+                ..Default::default()
+            }),
+            vec![
+                json!({"type":"user","uuid":"notification-topic-user","session_id":"44444444-4444-4444-8444-444444444444",
+                    "message":{"role":"user","content":[{"type":"text","text":"Repair `config_file.rs`"}]}}),
+                json!({"type":"assistant","uuid":"notification-topic-answer","session_id":"44444444-4444-4444-8444-444444444444",
+                    "message":{"role":"assistant","content":[{"type":"text","text":"The configuration is ready to review."}]}}),
+                json!({"type":"result","uuid":"notification-topic-result","session_id":"44444444-4444-4444-8444-444444444444","is_error":false}),
+            ],
+            false,
+        );
+        let (evidence, content) = receipts.last().expect("real actor publishes completion");
+        assert_eq!(evidence.kind, crate::notifications::Kind::Succeeded);
+        assert_eq!(content.conversation, "Repair config_file.rs");
+        assert_eq!(content.preview, "The configuration is ready to review.");
+        let mut event = crate::notifications::Event::session(
+            crate::model::TerminalId::new(),
+            crate::agent::Provider::Claude,
+            "/project".into(),
+            evidence.clone(),
+        );
+        event.content = Some(content.clone());
+        event.validate().unwrap();
+        assert_eq!(
+            crate::notifications::presentation::message(&event, true).title,
+            "Repair config_file.rs"
+        );
+        assert!(
+            !crate::notifications::presentation::message(&event, false)
+                .title
+                .contains("config_file")
+        );
+    }
+
+    #[test]
+    fn notification_callback_sees_the_failed_result_diagnosis() {
+        let adapter = Claude {
+            busy: true,
+            ready: true,
+            ..Default::default()
+        };
+        let (evidence, content) = crate::chat::runtime::notification_frame_for_test(
+            Box::new(adapter),
+            json!({"type":"result","uuid":"failed-notification-result","is_error":true,"subtype":"error_during_execution","errors":["The provider rejected this request"]}),
+            false,
+        );
+        assert_eq!(evidence.kind, crate::notifications::Kind::Failed);
+        assert_eq!(content.preview, "The provider rejected this request");
     }
 
     #[test]
@@ -8865,9 +11161,7 @@ mod tests {
                     .is_none()
             );
             let first = adapter
-                .receive(
-                    json!({"type":"result","subtype":"success","uuid":"first","is_error":false}),
-                )
+                .receive(json!({"type":"result","uuid":"first","is_error":false}))
                 .unwrap();
             assert!(
                 !first
@@ -8890,6 +11184,7 @@ mod tests {
                 json!({"type":"control_response","response":{"request_id":request_id,"subtype":"error","error":"already settled"}})
             };
             let acknowledged = adapter.receive(acknowledgment).unwrap();
+            assert!(acknowledged.suppress_current_notification);
             let expected = if accepted {
                 crate::notifications::Kind::Cancelled
             } else {
@@ -8897,9 +11192,7 @@ mod tests {
             };
             assert!(acknowledged.events.iter().any(|event| matches!(event, Event::TurnFinished { key, outcome } if key.as_deref() == Some("claude:first") && *outcome == expected)));
             let second = adapter
-                .receive(
-                    json!({"type":"result","subtype":"success","uuid":"second","is_error":false}),
-                )
+                .receive(json!({"type":"result","uuid":"second","is_error":false}))
                 .unwrap();
             assert!(second.events.iter().any(|event| matches!(event, Event::TurnFinished { key, outcome: crate::notifications::Kind::Succeeded } if key.as_deref() == Some("claude:second"))));
         }
@@ -8981,11 +11274,12 @@ mod tests {
         );
         assert!(settings.events.iter().any(|event| matches!(event, Event::Models { selected, reasoning, .. } if selected.as_deref() == Some("sonnet") && reasoning.as_deref() == Some("high"))));
         let failed = adapter.receive(json!({"type":"control_response","response":{"subtype":"error","request_id":settings.writes[0]["request_id"],"error":"Settings rejected"}})).unwrap();
-        assert!(adapter.control_replies().iter().any(|(_, result)| {
-            result
-                .as_ref()
-                .is_err_and(|message| message.contains("Settings rejected"))
-        }));
+        assert!(
+            failed
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { fatal: false, .. }))
+        );
         assert!(
             !failed
                 .events
@@ -9037,11 +11331,12 @@ mod tests {
             .unwrap();
         let failed = adapter.receive(json!({"type":"control_response","response":{"subtype":"error","request_id":change.writes[0]["request_id"],"error":"Model rejected"}})).unwrap();
         assert!(failed.writes.is_empty());
-        assert!(adapter.control_replies().iter().any(|(_, result)| {
-            result
-                .as_ref()
-                .is_err_and(|message| message.contains("Model rejected"))
-        }));
+        assert!(
+            failed
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { fatal: false, .. }))
+        );
         assert!(
             !failed
                 .events
@@ -9628,6 +11923,46 @@ mod tests {
     }
 
     #[test]
+    fn attachment_paths_are_exact_and_relative_to_the_provider_cwd() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider_cwd = directory.path().join("child-worktree");
+        std::fs::create_dir(&provider_cwd).unwrap();
+        std::fs::write(
+            directory.path().join("tree-real-expanded.png"),
+            "wrong root",
+        )
+        .unwrap();
+        std::fs::write(
+            provider_cwd.join("tree-real-expanded.png"),
+            b"\x89PNG\r\n\x1a\nchild image",
+        )
+        .unwrap();
+        let concrete =
+            attachment_block(&provider_cwd, Path::new("tree-real-expanded.png")).unwrap();
+        assert_eq!(concrete["type"], "image");
+        assert_eq!(
+            concrete["source"]["data"],
+            base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nchild image")
+        );
+        for shorthand in ["tree-real-*.png", "tree-real-{expanded,collapsed}.png"] {
+            let error = attachment_block(&provider_cwd, Path::new(shorthand)).unwrap_err();
+            assert!(error.contains(&provider_cwd.join(shorthand).display().to_string()));
+        }
+        // Pattern characters can be valid literal filenames. Do not reject or
+        // expand them when an explicitly selected attachment exists verbatim.
+        std::fs::write(
+            provider_cwd.join("tree-real-*.png"),
+            b"\x89PNG\r\n\x1a\nliteral image",
+        )
+        .unwrap();
+        let literal = attachment_block(&provider_cwd, Path::new("tree-real-*.png")).unwrap();
+        assert_eq!(
+            literal["source"]["data"],
+            base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nliteral image")
+        );
+    }
+
+    #[test]
     fn documents_exceeding_the_old_frame_limit_are_supported() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("notes.txt");
@@ -10107,31 +12442,6 @@ mod tests {
         );
     }
     #[test]
-    fn claude_history_exact_call_recovers_when_cached_source_is_unavailable() {
-        struct MissingSource;
-        impl super::super::CanonicalItemReader for MissingSource {
-            fn read(&self, _: &super::super::CanonicalItemKey) -> Result<Option<Item>, String> {
-                Err("recorded source unavailable".into())
-            }
-        }
-        let mut adapter = Claude::default();
-        adapter.bind_item_reader(std::sync::Arc::new(MissingSource));
-        let record = HistoryRecord {
-            frame: json!({"type":"user","uuid":"result","message":{"content":[correlation_result("wanted",false)]},"toolUseResult":actual_patch()}),
-            tool_calls: [(0, std::sync::Arc::new(correlation_call("wanted", "/project/wanted.rs")))].into(),
-        };
-        let mut step = Step::default();
-        adapter.history_message(&record, &mut step).unwrap();
-        assert!(!step.events.iter().any(|event| matches!(event, Event::Error { .. })));
-        let item = step.events.iter().find_map(|event| match event {
-            Event::Item(item) if item.id == "wanted" => Some(item),
-            _ => None,
-        }).unwrap();
-        assert!(matches!(&item.content, ItemContent::Changes { status: ToolStatus::Succeeded, changes, .. }
-            if changes.len() == 1 && changes[0].path == "/project/wanted.rs"));
-    }
-
-    #[test]
     fn claude_history_context_excludes_abandoned_retracted_and_future_calls() {
         let frames = vec![
             json!({"type":"user","uuid":"root","parentUuid":null,"message":{"content":"root"}}),
@@ -10207,16 +12517,19 @@ mod tests {
             history: Some(history),
             ..Claude::default()
         };
-        adapter.tool(None,Item {
-            id: "confirmed".into(),
-            role: Role::Assistant,
-            started_at: None,
-            at: None,
-            content: ItemContent::Changes {
-                changes: vec![],
-                status: ToolStatus::Succeeded,
+        adapter.tool(
+            None,
+            Item {
+                id: "confirmed".into(),
+                role: Role::Assistant,
+                started_at: None,
+                at: None,
+                content: ItemContent::Changes {
+                    changes: vec![],
+                    status: ToolStatus::Succeeded,
+                },
             },
-        });
+        );
         assert!(adapter.command(Command::LoadEarlier).is_err());
         assert_eq!(adapter.history.as_ref().unwrap().offset, prior);
         assert_eq!(

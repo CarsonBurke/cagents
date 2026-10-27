@@ -99,6 +99,8 @@ pub(crate) fn main_with_before_start(
         previous_hook(panic);
     }));
 
+    #[cfg(feature = "integrated-browser")]
+    let _browser_cleanup = cagents::browser::ProcessShutdown;
     let result = run(options);
     match &result {
         Err(error) => report_startup_failure(&error.to_string()),
@@ -165,6 +167,7 @@ fn spawn_startup_error_dialog(message: &str) -> std::io::Result<()> {
         .arg(STARTUP_ERROR)
         .arg(message)
         .env_remove(cagents::instance::UI_LAUNCH_HANDSHAKE_ENV)
+        .env_remove(cagents::instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -483,6 +486,7 @@ fn relaunch() -> Result<(), String> {
     std::process::Command::new(launcher)
         .arg("ui")
         .env_remove(cagents::instance::UI_LAUNCH_HANDSHAKE_ENV)
+        .env_remove(cagents::instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

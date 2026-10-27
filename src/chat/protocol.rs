@@ -1,16 +1,18 @@
 //! Provider JSON protocols used by daemon-owned pipe and Unix WebSocket transports.
+mod tool_cache;
 use super::{Command, Event, Launch};
 use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf};
+pub(crate) use tool_cache::{ItemKey as CanonicalItemKey, ItemReader as CanonicalItemReader};
 
 pub mod claude;
 mod claude_edits;
 mod claude_permissions;
+mod claude_titles;
 pub mod codex;
+mod image_references;
 pub mod omp;
-mod tool_cache;
-pub use tool_cache::{ItemKey as CanonicalItemKey,ItemReader as CanonicalItemReader};
-pub(crate) use super::terminal_output;
+mod terminal_output;
 
 #[derive(Debug, Clone)]
 pub enum TransportSpec {
@@ -37,7 +39,7 @@ pub struct ProcessSpec {
     /// Recognizes the messages the daemon delivered among the prompts the
     /// transcript records, so they are shown as messages rather than as the
     /// user's own words.
-    pub(crate) messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
+    pub(crate) messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Recognizer>>,
     pub transport: TransportSpec,
     pub program: String,
     pub arguments: Vec<String>,
@@ -98,9 +100,46 @@ pub(crate) struct ExecutionContext {
     pub directory: Option<std::sync::Arc<std::fs::File>>,
     expected_directory: Option<crate::agent_execution::DirectoryIdentity>,
     ownership: std::sync::Mutex<LaunchOwnership>,
+    provider_directory: std::sync::Mutex<Option<PathBuf>>,
 }
 
 impl ExecutionContext {
+    /// Pin the selected directory before an ordinary native provider starts.
+    /// The descriptor remains authoritative after a same-filesystem move;
+    /// opening a replacement at the old spelling never changes its identity.
+    pub(crate) fn capture(path: &std::path::Path) -> Result<Self, String> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let relative = path
+            .strip_prefix("/")
+            .map_err(|_| "The selected provider directory must be absolute".to_owned())?;
+        let root = crate::fs_safety::Root::open("/".as_ref()).map_err(|error| error.to_string())?;
+        let directory = if relative.as_os_str().is_empty() {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open("/")
+                .map_err(|error| error.to_string())
+        } else {
+            crate::fs_safety::open_beneath(&root, relative).map_err(|error| error.to_string())
+        }
+        .map_err(|error| {
+            format!(
+                "Cannot pin the selected provider directory {}: {error}",
+                path.display()
+            )
+        })?;
+        if !directory
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .is_dir()
+        {
+            return Err("The selected provider directory is not a folder".into());
+        }
+        let context = Self::new(Some(std::sync::Arc::new(directory)));
+        context.verify_directory(path)?;
+        Ok(context)
+    }
+
     pub(crate) fn new(directory: Option<std::sync::Arc<std::fs::File>>) -> Self {
         Self {
             directory,
@@ -127,6 +166,33 @@ impl ExecutionContext {
                 .map_err(|error| error.to_string()),
             None => Ok(self.expected_directory),
         }
+    }
+    pub(crate) fn directory_descriptor(&self) -> Option<std::sync::Arc<std::fs::File>> {
+        self.directory.clone()
+    }
+    /// Return the descriptor used by spawn, never a new lookup of its pathname.
+    pub(crate) fn pinned_launch_directory(
+        &self,
+    ) -> Result<
+        (
+            crate::agent_execution::DirectoryIdentity,
+            std::sync::Arc<std::fs::File>,
+        ),
+        String,
+    > {
+        let directory = self
+            .directory_descriptor()
+            .ok_or("This provider has no original launch-directory descriptor")?;
+        let identity = directory.metadata().map_err(|error| error.to_string())?;
+        let identity = crate::agent_execution::DirectoryIdentity::from_metadata(&identity);
+        validate_launch_directory(&directory, identity)?;
+        if self
+            .expected_directory
+            .is_some_and(|expected| expected != identity)
+        {
+            return Err("Original launch-directory identity changed".into());
+        }
+        Ok((identity, directory))
     }
     /// Claim before asynchronous work may spawn, or synchronously at child
     /// creation when the caller itself performs the entire spawn attempt.
@@ -173,6 +239,36 @@ impl ExecutionContext {
         }
         Ok(state.outcome)
     }
+    /// Minted only after typed preparation has pinned the private launch and
+    /// updated the adapter before initialize. A process cwd alone is no proof
+    /// of a resumed provider thread's operational directory.
+    pub(crate) fn observe_provider_directory(&self, path: &std::path::Path) -> Result<(), String> {
+        if self.directory_descriptor().is_none() {
+            return Err("Provider scope requires its admitted directory descriptor".into());
+        }
+        self.verify_directory(path)?;
+        *self
+            .provider_directory
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(path.to_owned());
+        Ok(())
+    }
+    pub(crate) fn provider_directory_observed(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<bool, String> {
+        if self
+            .provider_directory
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_deref()
+            != Some(path)
+        {
+            return Ok(false);
+        }
+        self.verify_directory(path)?;
+        Ok(true)
+    }
     pub(crate) fn verify_directory(&self, path: &std::path::Path) -> Result<(), String> {
         let Some(expected) = self.directory_identity()? else {
             return Ok(());
@@ -186,6 +282,26 @@ impl ExecutionContext {
         Ok(())
     }
 }
+/// Validate both local and received pins without reopening a filesystem path.
+pub(crate) fn validate_launch_directory(
+    directory: &std::fs::File,
+    expected: crate::agent_execution::DirectoryIdentity,
+) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    let metadata = directory.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_dir()
+        || crate::agent_execution::DirectoryIdentity::from_metadata(&metadata) != expected
+    {
+        return Err("Launch-directory descriptor does not match its original identity".into());
+    }
+    // Received descriptors must not escape through a subsequent provider exec.
+    let flags = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_GETFD) };
+    if flags < 0 || flags & libc::FD_CLOEXEC == 0 {
+        return Err("Launch-directory descriptor is not close-on-exec".into());
+    }
+    Ok(())
+}
+
 impl ProcessSpec {
     pub(crate) fn remove_unset_environment(&mut self) {
         self.environment
@@ -194,6 +310,15 @@ impl ProcessSpec {
 }
 #[derive(Debug, Default)]
 pub struct Step {
+    /// The decoder has not qualified this frame as the current turn. Its
+    /// transcript and exact managed execution evidence remain valid, but it
+    /// cannot replace the current conversation's notification context/error.
+    /// This transport-local flag never enters the shared wire codec.
+    pub suppress_current_notification: bool,
+    /// Bounded pre-acknowledgement context selected by the exact accepted
+    /// provider turn. Restores only notification metadata, never transcript
+    /// deltas that would otherwise be appended a second time.
+    pub notification_preview: Option<super::notification::Preview>,
     /// Written in order before the next incoming frame is processed.
     pub writes: Vec<Value>,
     pub events: Vec<Event>,
@@ -209,13 +334,22 @@ pub struct ServerIdentity {
 /// An adapter is confined to one daemon worker. No UI state, subprocesses,
 /// unbounded transcript storage, credentials, or global mutable state live here.
 pub trait Adapter: Send {
-    /// Optional exact canonical source for byte-budgeted adapter caches.
-    fn bind_item_reader(&mut self,_reader:std::sync::Arc<dyn CanonicalItemReader>) {}
-    /// The runtime has committed this Step into its canonical Store. Resident
-    /// caches may now retire bodies without losing same-frame correlation.
+    /// Optional bodies are backed only by this exact Store, never a presentation page.
+    fn bind_item_reader(&mut self, _reader: std::sync::Arc<dyn CanonicalItemReader>) {}
+    /// The decoder has finished this Step; same-frame copies can now be released.
     fn committed(&mut self) {}
+    /// Private launch selection, distinct from a provider-confirmed session.
+    /// Only a provider with a retained bootstrap contract supplies this value.
+    fn prepared_launch_identity(&self) -> Option<claude::PreparedIdentity> {
+        None
+    }
     fn initialize(&mut self) -> Result<Step, String>;
     fn command(&mut self, command: Command) -> Result<Step, String>;
+    /// Whether this exact pending answer refuses work. Providers with opaque
+    /// action IDs must inspect their retained decision, never its UI label.
+    fn answer_declines(&self, _request_id: &str, action: &str) -> bool {
+        super::declines(action)
+    }
     fn command_for_run(
         &mut self,
         _run: crate::model::RunId,
@@ -224,26 +358,6 @@ pub trait Adapter: Send {
         Err("This provider transport does not support correlated agent runs".into())
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String>;
-    /// Providers with redundant partial snapshots can avoid allocating them.
-    fn decode(&self, bytes: &[u8]) -> Result<Value, serde_json::Error> {
-        serde_json::from_slice(bytes)
-    }
-
-    /// Housekeeping must run even when a provider stops sending frames.
-    fn tick(&mut self) -> Step {
-        Step::default()
-    }
-    fn deadline(&self) -> Option<std::time::Instant> {
-        None
-    }
-    /// A command may await provider confirmation without blocking its actor.
-    fn command_ack(&mut self) -> Option<String> {
-        None
-    }
-    fn control_replies(&mut self) -> Vec<(String, Result<(), String>)> {
-        Vec::new()
-    }
-
     /// Identity reported by the initialized server on this exact connection.
     /// Only a holder with a verified provider contract can use it for durable
     /// ownership; an executable's separate `--version` output is insufficient.
@@ -253,6 +367,17 @@ pub trait Adapter: Send {
 }
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
     launch.provider.create_chat(launch)
+}
+
+/// Reconstruct a saved reader without granting permission to launch a provider.
+/// Support is deliberately limited to adapters with a local history transport.
+pub(crate) fn create_history(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    match launch.provider {
+        crate::agent::Provider::Claude => claude::create_history(launch),
+        _ => {
+            Err("This provider does not support restoring a local read-only history reader".into())
+        }
+    }
 }
 
 /// Record a provider-confirmed conversation rotation in the launch recipe.
@@ -290,6 +415,56 @@ mod launch_tests {
         fn cleanup(&self) -> Result<LaunchOutcome, String> {
             Ok(*self.0.lock().unwrap())
         }
+    }
+
+    #[test]
+    fn provider_directory_observation_requires_a_pinned_exact_launch_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original");
+        let other = root.path().join("other");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let context = ExecutionContext::capture(&original).unwrap();
+        let identity = context.directory_identity().unwrap().unwrap();
+        assert!(!context.provider_directory_observed(&original).unwrap());
+        assert!(context.observe_provider_directory(&other).is_err());
+        assert!(!context.provider_directory_observed(&other).unwrap());
+        context.observe_provider_directory(&original).unwrap();
+        assert!(context.provider_directory_observed(&original).unwrap());
+        assert!(!context.provider_directory_observed(&other).unwrap());
+        assert!(
+            ExecutionContext::default()
+                .observe_provider_directory(&original)
+                .is_err()
+        );
+        assert!(
+            ExecutionContext::restored(identity)
+                .observe_provider_directory(&original)
+                .is_err()
+        );
+
+        // Renaming preserves the retained descriptor but never grants authority
+        // to the replacement at the original spelling or observes a new path.
+        let moved = root.path().join("moved");
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        assert_eq!(context.directory_identity().unwrap(), Some(identity));
+        assert!(context.provider_directory_observed(&original).is_err());
+        assert!(!context.provider_directory_observed(&moved).unwrap());
+    }
+
+    #[test]
+    fn execution_directory_capture_refuses_relative_paths_files_and_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("file");
+        std::fs::write(&file, b"fixture").unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(root.path(), &alias).unwrap();
+        assert!(ExecutionContext::capture(std::path::Path::new("relative")).is_err());
+        assert!(ExecutionContext::capture(&file).is_err());
+        assert!(ExecutionContext::capture(&alias).is_err());
+        assert!(ExecutionContext::capture(&alias.join("file")).is_err());
+        assert!(ExecutionContext::capture(std::path::Path::new("/")).is_ok());
     }
 
     #[test]
@@ -336,22 +511,4 @@ mod launch_tests {
             LaunchOutcome::TeardownProved
         );
     }
-}
-
-/// A byte-bounded, terminal-safe preview of untrusted protocol text.
-pub(crate) fn preview(bytes: &[u8], limit: usize) -> String {
-    let text = String::from_utf8_lossy(bytes);
-    let mut result = String::new();
-    for ch in text.chars() {
-        let escaped: String = if ch.is_control() {
-            ch.escape_default().collect()
-        } else {
-            ch.to_string()
-        };
-        if result.len() + escaped.len() > limit {
-            break;
-        }
-        result.push_str(&escaped);
-    }
-    result
 }

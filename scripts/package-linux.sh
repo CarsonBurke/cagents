@@ -61,7 +61,7 @@ case $VARIANT in
         DESKTOP_ID=dev.cagents.Cagents
         CHECKSUM_NAME=SHA256SUMS
         SIZE_NAME=cagents-$VERSION-sizes.txt
-        EXTRA_DEPENDS=
+        EXTRA_DEPENDS=', libegl1'
         OTHER_PACKAGE=cagents-browserless
         ;;
     browserless)
@@ -83,7 +83,7 @@ case $VARIANT in
     *) fail "unknown package variant: $VARIANT" ;;
 esac
 
-for command in cargo date dpkg-deb gzip install mktemp sed sha256sum sort strip tar touch wc; do
+for command in awk cargo date dpkg-deb gzip install mktemp readelf sed sha256sum sort strip tar touch wc; do
     command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
 done
 
@@ -198,7 +198,52 @@ if [ "$VARIANT" = full ]; then
 else
     ln -s cagents "$BIN_DIR/cagents-browserless"
 fi
-strip --strip-unneeded "$BIN_DIR/cagents" "$BIN_DIR/cagents-ui" "$BIN_DIR/cagentsd"
+# Opt in when repacking already-qualified executable bytes. Skipping the build
+# alone must retain the normal release stripping behavior.
+if [ "${CAGENTS_SKIP_STRIP:-0}" != 1 ]; then
+    strip --strip-unneeded "$BIN_DIR/cagents" "$BIN_DIR/cagents-ui" "$BIN_DIR/cagentsd"
+fi
+
+# A local/native package can be built on newer glibc than the official release
+# baseline. Declare the requirements of these exact packaged ELFs, not the
+# packager host version or unrelated exported version definitions.
+GLIBC_REQUIREMENTS=$WORK_DIR/glibc-requirements
+printf '%s\n' 2.35 > "$GLIBC_REQUIREMENTS"
+for binary in cagents cagents-ui cagentsd; do
+    VERSION_INFO=$WORK_DIR/$binary-version-info
+    VERSION_ERRORS=$WORK_DIR/$binary-version-errors
+    LC_ALL=C readelf --wide --version-info "$BIN_DIR/$binary" \
+        > "$VERSION_INFO" 2> "$VERSION_ERRORS" \
+        || fail "cannot inspect glibc requirements for $binary"
+    [ ! -s "$VERSION_ERRORS" ] || fail "readelf reported invalid version information for $binary"
+    # Keep inspection and parsing separate: POSIX sh has no pipefail, so a
+    # successful parser must never hide a failed readelf invocation.
+    LC_ALL=C awk '
+        /^Version needs section / { needs++; in_needs = 1; next }
+        /^Version .* section / { in_needs = 0; next }
+        in_needs && /Name:/ {
+            if (NF != 7 || $1 !~ /^0x[0-9a-fA-F]+:$/ || $2 != "Name:" ||
+                $4 != "Flags:" || $6 != "Version:" || $7 !~ /^[0-9]+$/) {
+                bad = 1; exit
+            }
+            if ($3 ~ /^GLIBC_/) {
+                if ($3 !~ /^GLIBC_(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))+$/) {
+                    bad = 1; exit
+                }
+                print substr($3, 7)
+                glibc++
+            }
+        }
+        END { if (bad || needs != 1 || !glibc) exit 1 }
+    ' "$VERSION_INFO" >> "$GLIBC_REQUIREMENTS" \
+        || fail "missing or malformed required glibc versions for $binary"
+done
+LC_ALL=C sort -Vu "$GLIBC_REQUIREMENTS" > "$WORK_DIR/glibc-sorted" \
+    || fail 'cannot sort required glibc versions'
+GLIBC_MINIMUM=$(sed -n '$p' "$WORK_DIR/glibc-sorted") \
+    || fail 'cannot select required glibc version'
+[ -n "$GLIBC_MINIMUM" ] || fail 'no minimum glibc version was determined'
+
 sed \
     -e "s/^Name=cagents\$/Name=$PACKAGE_NAME/" \
     -e "s/^Exec=cagents ui\$/Exec=$COMMAND_NAME ui/" \
@@ -281,7 +326,7 @@ Package: $PACKAGE_NAME
 Version: $VERSION
 Architecture: $DEB_ARCH
 Maintainer: cagents contributors <maintainers@cagents.dev>
-Depends: ca-certificates, tzdata, curl, git (>= 2.36), libc6 (>= 2.35), libfontconfig1, libfreetype6, libgcc-s1, libstdc++6, libwayland-client0, libxkbcommon0, zlib1g$EXTRA_DEPENDS
+Depends: ca-certificates, tzdata, curl, git (>= 2.36), libsecret-tools, libc6 (>= $GLIBC_MINIMUM), libfontconfig1, libfreetype6, libgcc-s1, libstdc++6, libwayland-client0, libxkbcommon0, zlib1g$EXTRA_DEPENDS
 Recommends: gh
 Section: devel
 Priority: optional

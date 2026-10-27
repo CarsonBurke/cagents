@@ -44,7 +44,13 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::AcknowledgeRedraw { .. }
         | R::TerminalAcknowledge { .. }
         | R::SearchTerminal { .. }
-        | R::CopyTerminalSelection { .. } => Access::Open,
+        | R::CopyTerminalSelection { .. }
+        | R::Work(
+            crate::work::Request::Board { .. }
+            | crate::work::Request::RemovalPlan { .. }
+            | crate::work::Request::Snapshots { .. },
+        )
+        | R::WatchWork => Access::Open,
         R::Input { terminal_id, .. }
         | R::Paste { terminal_id, .. }
         | R::Key { terminal_id, .. }
@@ -62,6 +68,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::DeviceOperation { .. }
         | R::Agent { .. }
         | R::Automation { .. }
+        | R::ChannelWork { .. }
         | R::Shutdown
         | R::ShutdownV1 { .. }
         | R::PrepareUpgrade { .. }
@@ -82,11 +89,14 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ChatAttach { .. }
         | R::ChatDetach { .. }
         | R::ChatCommand { .. }
-        | R::ChatProviderExitOutput { .. }
         | R::ChatVisibility { .. }
         | R::ChatRead { .. }
         | R::ChatClose { .. }
         | R::ChatCloseRetained { .. }
+        | R::ChatCapacityInspect
+        | R::ChatCapacitySet { .. }
+        | R::ChatReleaseInspect { .. }
+        | R::ChatRelease { .. }
         | R::ChatList
         | R::ChatAcknowledge { .. }
         | R::ChatPreview { .. }
@@ -94,7 +104,10 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ChatStartSelected { .. }
         | R::ChatReturnTerminal { .. }
         | R::ChatCommitTerminal { .. }
-        | R::ChatPrepareResume { .. } => Access::Refused,
+        | R::ChatPrepareResume { .. }
+        | R::Work(crate::work::Request::Pin { .. } | crate::work::Request::Remove(_)) => {
+            Access::Refused
+        }
     }
 }
 

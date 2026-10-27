@@ -1,20 +1,16 @@
 //! Private, disk-backed transcript. Stable provider IDs and byte-addressed chunks
 //! keep both long conversations and a single enormous tool result pageable.
-mod file_changes;
 mod adapter_items;
 mod child_tools;
-pub(super) use adapter_items::reader as adapter_item_reader;
+mod file_changes;
+mod text_copy;
 use super::observed_at;
 use crate::chat::{Event, Item, ItemContent, Phase, Role};
+pub(super) use adapter_items::reader as adapter_item_reader;
 use base64::Engine as _;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
-use std::{
-    fs,
-    io::Write,
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
-    path::PathBuf,
-};
+use std::{fs, io::Write, os::unix::fs::OpenOptionsExt, path::PathBuf};
 
 const PART_BYTES: usize = 128 * 1024;
 const WINDOW_BYTES: usize = 3 * 1024 * 1024;
@@ -53,8 +49,13 @@ pub(super) struct Window {
 }
 pub(crate) struct Store {
     db: Connection,
-    /// A reset revokes every previously issued canonical source reader.
     canonical_generation: uuid::Uuid,
+    pending_child_tool: Option<child_tools::Pending>,
+    child_tools_unavailable: Option<&'static str>,
+    child_tools_have_revocations: bool,
+    copy_cache: uuid::Uuid,
+    copy_revision: u64,
+    copy_projection: Vec<Option<crate::chat::TextCopySource>>,
     file_revision: u64,
     child_file_ordinal: i64,
     child_files_seen: bool,
@@ -64,6 +65,7 @@ pub(crate) struct Store {
     pub(super) file_cwd: Option<PathBuf>,
     pub(super) presented_file_changes: Option<(u64, crate::chat::FileChangesCoverage)>,
     directory: PathBuf,
+    _lease: fs::File,
     end: Option<Cursor>,
     first: Option<Cursor>,
     newest: Option<Cursor>,
@@ -80,14 +82,19 @@ pub(crate) struct Store {
     pub presentation: Option<crate::chat::presentation::Presentation>,
     pub presented_children: std::collections::HashMap<String, Vec<std::sync::Arc<Item>>>,
     pending_text: Option<(String, Role, bool, String)>,
-    pending_input: Option<(String, usize, String)>,
-    pending_child_tool: Option<child_tools::Pending>,
-    child_tools_unavailable: Option<&'static str>,
-    child_tools_have_revocations: bool,
     /// Recognizes delivered messages as they enter the transcript.
-    messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
+    messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Recognizer>>,
 }
 impl Store {
+    pub(super) fn directory(&self) -> &std::path::Path {
+        &self.directory
+    }
+    #[cfg(test)]
+    pub(super) fn read_only_for_test(&mut self) -> Result<(), String> {
+        self.db
+            .pragma_update(None, "query_only", true)
+            .map_err(|error| error.to_string())
+    }
     /// Decode once at ingestion. Snapshots carry a small path, never megabytes
     /// of base64, and identical payloads share the same private file.
     fn image_file(&self, url: &str) -> Result<String, String> {
@@ -124,6 +131,91 @@ impl Store {
         }
         Ok(path.to_string_lossy().into_owned())
     }
+    /// Check every resident parent item and body chunk against a fresh provider
+    /// reload. Keep memory bounded to one metadata record or 128 KiB chunk;
+    /// paging windows alone cannot establish transcript preservation.
+    pub(super) fn is_covered_by(&mut self, reloaded: &Self) -> Result<bool, String> {
+        self.flush_text()?;
+        // Child sidecars are independent sources. Parent rows alone cannot
+        // establish that their transcript and edit index can be recovered.
+        if self.child_files_seen
+            || self.file_index_incomplete
+            || !self.presented_children.is_empty()
+            || self.pending_child_tool.is_some()
+            || self.child_tools_unavailable.is_some()
+            || self.db.query_row("SELECT EXISTS(SELECT 1 FROM child_tools) OR EXISTS(SELECT 1 FROM child_tool_revoked) OR EXISTS(SELECT 1 FROM adapter_task_items)",[],|row|row.get::<_,bool>(0)).map_err(|e|e.to_string())?
+        {
+            return Ok(false);
+        }
+        let mut items = self
+            .db
+            .prepare("SELECT id,metadata,len0,len1,len2,spans FROM items ORDER BY ordinal")
+            .map_err(|error| error.to_string())?;
+        let mut rows = items.query([]).map_err(|error| error.to_string())?;
+        let mut last_ordinal = None;
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            let id: String = row.get(0).map_err(|error| error.to_string())?;
+            let resident: (Vec<u8>, i64, i64, i64, Vec<u8>) = (
+                row.get(1).map_err(|error| error.to_string())?,
+                row.get(2).map_err(|error| error.to_string())?,
+                row.get(3).map_err(|error| error.to_string())?,
+                row.get(4).map_err(|error| error.to_string())?,
+                row.get(5).map_err(|error| error.to_string())?,
+            );
+            let loaded: Option<(i64, (Vec<u8>, i64, i64, i64, Vec<u8>))> = reloaded
+                .db
+                .query_row(
+                    "SELECT ordinal,metadata,len0,len1,len2,spans FROM items WHERE id=?1",
+                    [&id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            (
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                            ),
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let Some((ordinal, contents)) = loaded else {
+                return Ok(false);
+            };
+            if contents != resident || last_ordinal.is_some_and(|previous| ordinal <= previous) {
+                return Ok(false);
+            }
+            last_ordinal = Some(ordinal);
+        }
+        let mut chunks = self
+            .db
+            .prepare("SELECT id,field,position,data FROM chunks")
+            .map_err(|error| error.to_string())?;
+        let mut rows = chunks.query([]).map_err(|error| error.to_string())?;
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            let id: String = row.get(0).map_err(|error| error.to_string())?;
+            let field: i64 = row.get(1).map_err(|error| error.to_string())?;
+            let position: i64 = row.get(2).map_err(|error| error.to_string())?;
+            let resident: Vec<u8> = row.get(3).map_err(|error| error.to_string())?;
+            let loaded: Option<Vec<u8>> = reloaded
+                .db
+                .query_row(
+                    "SELECT data FROM chunks WHERE id=?1 AND field=?2 AND position=?3",
+                    params![id, field, position],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if loaded.as_ref() != Some(&resident) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub fn new() -> Result<Self, String> {
         #[cfg(test)]
         let root = std::env::temp_dir();
@@ -134,11 +226,8 @@ impl Store {
         Self::at(root)
     }
     fn at(root: PathBuf) -> Result<Self, String> {
-        let directory = root.join(format!("chat-{}", uuid::Uuid::new_v4()));
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&directory)
-            .map_err(|e| format!("Cannot create private transcript cache: {e}"))?;
+        let (directory, lease) = crate::transcript_cache::create(&root)
+            .map_err(|error| format!("Cannot create private transcript cache: {error}"))?;
         let path = directory.join("transcript.sqlite");
         let result = (|| {
             fs::OpenOptions::new()
@@ -149,14 +238,24 @@ impl Store {
                 .map_err(|e| e.to_string())?;
             let db = Connection::open(&path).map_err(|e| e.to_string())?;
             db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA foreign_keys=ON;
-                CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL,running INTEGER NOT NULL DEFAULT 0,source_shortened INTEGER NOT NULL DEFAULT 0);
-                CREATE INDEX running_tools ON items(id) WHERE running=1;
+                CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL, source_shortened INTEGER NOT NULL DEFAULT 0);
                 CREATE TABLE chunks(id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, field INTEGER NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id,field,position));").map_err(|e| e.to_string())?;
             db.execute_batch(file_changes::SCHEMA)
                 .map_err(|e| e.to_string())?;
-            db.execute_batch(child_tools::SCHEMA).map_err(|e| e.to_string())?;
+            db.execute_batch(adapter_items::SCHEMA)
+                .map_err(|e| e.to_string())?;
+            db.execute_batch(child_tools::SCHEMA)
+                .map_err(|e| e.to_string())?;
+            db.execute_batch(text_copy::SCHEMA)
+                .map_err(|e| e.to_string())?;
             Ok(Self {
                 canonical_generation: uuid::Uuid::new_v4(),
+                pending_child_tool: None,
+                child_tools_unavailable: None,
+                child_tools_have_revocations: false,
+                copy_cache: uuid::Uuid::new_v4(),
+                copy_revision: 0,
+                copy_projection: Default::default(),
                 file_revision: 0,
                 child_file_ordinal: 0,
                 child_files_seen: false,
@@ -167,6 +266,7 @@ impl Store {
                 presented_file_changes: None,
                 db,
                 directory: directory.clone(),
+                _lease: lease,
                 end: None,
                 first: None,
                 newest: None,
@@ -183,10 +283,6 @@ impl Store {
                 presentation: None,
                 presented_children: Default::default(),
                 pending_text: None,
-                pending_input: None,
-                pending_child_tool: None,
-                child_tools_unavailable: None,
-                child_tools_have_revocations: false,
             })
         })();
         if result.is_err() {
@@ -260,6 +356,7 @@ impl Store {
             item.started_at = item.at;
         }
         let mut preserve_input = false;
+        let mut inherited_identity = false;
         if let Some((_, metadata, _)) = &previous {
             let old: Item = postcard::from_bytes(metadata).map_err(|e| e.to_string())?;
             item.started_at = old.started_at.or(old.at).or(item.started_at);
@@ -272,13 +369,16 @@ impl Store {
             ) = (&mut item.content, old.content)
             {
                 if name.is_empty() {
+                    inherited_identity = true;
                     *name = old_name;
                 }
                 preserve_input = input.is_empty();
             }
         }
         let mut warning = None;
-        if let ItemContent::Image { path, description } = &mut item.content
+        if let ItemContent::Image {
+            path, description, ..
+        } = &mut item.content
             && path.starts_with("data:")
         {
             match self.image_file(path) {
@@ -324,7 +424,9 @@ impl Store {
             }
             // Descriptions and provider paths can grow; inline bytes have
             // already become a short private path above.
-            ItemContent::Image { description, path } => (
+            ItemContent::Image {
+                description, path, ..
+            } => (
                 std::mem::take(description),
                 String::new(),
                 std::mem::take(path),
@@ -369,10 +471,27 @@ impl Store {
         } else {
             body0.len() as i64
         };
+        let copy_prefix = if matches!(item.content, ItemContent::Text { .. }) {
+            self.copy_parent_prefix(&item.id, &body0)?
+        } else {
+            false
+        };
+        let source_shortened = shortened
+            || ((preserve_input || inherited_identity)
+                && self
+                    .db
+                    .query_row(
+                        "SELECT source_shortened FROM items WHERE id=?1",
+                        [&item.id],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(false));
         let transaction = self.db.transaction().map_err(|e| e.to_string())?;
         let index_spans = spans.clone();
         let spans = postcard::to_stdvec(&spans).map_err(|e| e.to_string())?;
-        transaction.execute("INSERT INTO items(id,ordinal,metadata,len0,len1,len2,spans,running,source_shortened) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans,running=excluded.running,source_shortened=MAX(items.source_shortened,excluded.source_shortened)", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans,item.content.status()==Some(crate::chat::ToolStatus::Running),shortened]).map_err(|e| e.to_string())?;
+        transaction.execute("INSERT INTO items(id,ordinal,metadata,len0,len1,len2,spans,source_shortened) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans,source_shortened=excluded.source_shortened", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans,source_shortened]).map_err(|e| e.to_string())?;
         if preserve_input {
             transaction
                 .execute("DELETE FROM chunks WHERE id=?1 AND field=1", [&item.id])
@@ -385,7 +504,16 @@ impl Store {
         }
         insert_body(&transaction, &item.id, 1, 0, &body1)?;
         insert_body(&transaction, &item.id, 2, 0, &body2)?;
+        let copy_invalidated = Self::copy_parent_put(
+            &transaction,
+            &item.id,
+            matches!(item.content, ItemContent::Text { .. }).then_some(len0 as usize),
+            copy_prefix,
+        )?;
         transaction.commit().map_err(|e| e.to_string())?;
+        if copy_invalidated {
+            self.copy_revision = self.copy_revision.wrapping_add(1);
+        }
         if shortened && matches!(&item.content, ItemContent::Changes { .. }) {
             self.file_index_incomplete = true;
             self.files_removed(std::slice::from_ref(&item.id))?;
@@ -649,17 +777,21 @@ impl Store {
     /// next event on.
     pub(crate) fn recognize_messages(
         &mut self,
-        seal: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
+        seal: Option<std::sync::Arc<crate::agent_execution::mailbox::Recognizer>>,
     ) {
         self.messages = seal;
     }
     /// Returns the events the store does not own, plus any non-fatal warning raised
     /// while caching. Warnings are events, never errors: the caller must stay alive.
+    #[cfg(test)]
+    pub(crate) fn adapter_reader_for_test(
+        store: &std::sync::Arc<std::sync::Mutex<Self>>,
+    ) -> std::sync::Arc<dyn crate::chat::protocol::CanonicalItemReader> {
+        adapter_items::reader(store)
+    }
     pub fn apply(&mut self, mut event: Event) -> Result<Vec<Event>, String> {
-        if matches!(&event,Event::Reset {..}) {
-            // Revoke before the first destructive operation, including a
-            // failing child/index cleanup. Old readers must never revive.
-            self.canonical_generation=uuid::Uuid::new_v4();
+        if matches!(&event, Event::Reset { .. }) {
+            self.canonical_generation = uuid::Uuid::new_v4();
         }
         if let Some(seal) = &self.messages {
             match &mut event {
@@ -671,9 +803,19 @@ impl Store {
             }
         }
         if self.revoked_child_tool_event(&event)? {
-            return Ok(vec![nonfatal("Delegated tool source was removed; a late update was discarded without recreating its private body".into())]);
+            return Ok(vec![nonfatal(
+                "Delegated tool source was removed or changed kind; its late update was discarded"
+                    .into(),
+            )]);
         }
-        let mut out = self.cache_child_tool(&event)?.into_iter().map(nonfatal).collect::<Vec<_>>();
+        let mut out = if matches!(&event, Event::Reset { .. }) {
+            Vec::new()
+        } else {
+            self.cache_child_tool(&event)?
+                .into_iter()
+                .map(nonfatal)
+                .collect::<Vec<_>>()
+        };
         self.index_child_event(&event)?;
         let earlier = matches!(&event, Event::History { .. });
         if !matches!(&event, Event::TextDelta { .. })
@@ -681,70 +823,54 @@ impl Store {
         {
             out.push(nonfatal(warning));
         }
-        if let Event::InputDelta { id, offset, delta } = event {
-            if let Some((pending_id, pending_offset, pending)) = &self.pending_input {
-                if pending_id == &id && pending_offset.saturating_add(pending.len()) != offset {
-                    return Err("Input delta does not follow the cached input".into());
-                }
-            }
-            if self.pending_input.as_ref().is_some_and(|pending| {
-                pending.0 != id || pending.2.len().saturating_add(delta.len()) > 64 * 1024
-            }) {
-                if let Some(warning) = self.flush_input()? {
-                    out.push(nonfatal(warning));
-                }
-            }
-            if delta.len() > 64 * 1024 {
-                if let Some(warning) = self.append_body(&id, offset, &delta, true)? {
-                    out.push(nonfatal(warning));
-                }
-            } else if let Some(pending) = &mut self.pending_input {
-                pending.2.push_str(&delta);
-            } else {
-                let length: Option<usize> = self
-                    .db
-                    .query_row("SELECT len0 FROM items WHERE id=?1", [&id], |row| {
-                        row.get(0)
-                    })
-                    .optional()
-                    .map_err(|e| e.to_string())?;
-                match length {
-                    Some(length) if length != offset => {
-                        return Err("Input delta does not follow the cached input".into());
-                    }
-                    None => {
-                        out.push(nonfatal(format!(
-                            "Input for uncached provider item {} was not cached",
-                            brief(&id)
-                        )));
-                        return Ok(out);
-                    }
-                    _ => {}
-                }
-                self.pending_input = Some((id, offset, delta));
-            }
-            self.dirty = true;
-            return Ok(out);
-        }
-        if let Some(warning) = self.flush_input()? {
-            out.push(nonfatal(warning));
-        }
-        if let Event::TurnFinished { outcome, .. } = &event {
-            let status = match outcome {
-                crate::notifications::Kind::Cancelled => Some(crate::chat::ToolStatus::Stopped),
-                crate::notifications::Kind::Failed => Some(crate::chat::ToolStatus::Failed),
-                _ => None,
-            };
-            if let Some(status) = status {
-                self.finish_running(status)?;
-            }
-        }
-        let input_delta = matches!(&event, Event::InputDelta { .. });
         match event {
-            Event::InputDelta { id, offset, delta } | Event::OutputDelta { id, offset, delta } => {
-                if let Some(warning) = self.append_body(&id, offset, &delta, input_delta)? {
-                    out.push(nonfatal(warning));
+            Event::OutputDelta { id, offset, delta } => {
+                let cached: Option<(Vec<u8>, usize, usize)> = self
+                    .db
+                    .query_row(
+                        "SELECT metadata,len0,len1 FROM items WHERE id=?1",
+                        [&id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()
+                    .map_err(|error| error.to_string())?;
+                let Some((metadata, len0, len1)) = cached else {
+                    // Oversized identities are deliberately refused by put_at
+                    // without terminating the provider. Their later appends
+                    // must preserve that same nonfatal cache boundary.
+                    out.push(nonfatal(format!(
+                        "Output for uncached provider item {} was not cached",
+                        brief(&id)
+                    )));
+                    return Ok(out);
+                };
+                let mut item: Item =
+                    postcard::from_bytes(&metadata).map_err(|error| error.to_string())?;
+                let (field, length) = match item.content {
+                    ItemContent::Command { .. } => (0, len0),
+                    ItemContent::Tool { .. } => (1, len1),
+                    _ => return Err("Output delta names a non-tool item".into()),
+                };
+                if length != offset {
+                    return Err("Output delta does not follow the cached output".into());
                 }
+                let at = observed_at();
+                item.started_at = item.started_at.or(item.at).or(at);
+                item.at = at;
+                let metadata = postcard::to_stdvec(&item).map_err(|error| error.to_string())?;
+                let transaction = self.db.transaction().map_err(|error| error.to_string())?;
+                insert_body(&transaction, &id, field, offset as i64, &delta)?;
+                let update = if field == 0 {
+                    "UPDATE items SET len0=len0+?2,metadata=?3 WHERE id=?1"
+                } else {
+                    "UPDATE items SET len1=len1+?2,metadata=?3 WHERE id=?1"
+                };
+                transaction
+                    .execute(update, params![id, delta.len(), metadata])
+                    .map_err(|error| error.to_string())?;
+                transaction.commit().map_err(|error| error.to_string())?;
+                self.changed(&id);
+                self.dirty = true;
             }
             Event::Item(item) => {
                 if let Some(warning) = self.put(item, false)? {
@@ -824,6 +950,7 @@ impl Store {
             }
             Event::ItemsRemoved { ids } => {
                 self.files_removed(&ids)?;
+                self.copy_remove(&ids)?;
                 let transaction = self.db.transaction().map_err(|e| e.to_string())?;
                 for id in ids {
                     transaction
@@ -834,10 +961,10 @@ impl Store {
                 self.dirty = true;
             }
             Event::Reset { reason } => {
-                self.files_reset()?;
-                self.db
-                    .execute("DELETE FROM items", [])
-                    .map_err(|e| e.to_string())?;
+                self.reset_adapter_sources()?;
+                self.copy_cache = uuid::Uuid::new_v4();
+                self.copy_revision = self.copy_revision.wrapping_add(1);
+                self.copy_projection.clear();
                 self.end = None;
                 self.first = None;
                 self.newest = None;
@@ -883,125 +1010,45 @@ impl Store {
         }
         Ok(out)
     }
-    /// Finalize only the indexed live tools, leaving transcript bodies and
-    /// completed history untouched. Batch metadata bounds transient memory.
-    pub(super) fn finish_running(&mut self, status: crate::chat::ToolStatus) -> Result<(), String> {
-        let _ = self.flush_text()?;
-        let _ = self.flush_input()?;
-        loop {
-            let rows = {
-                let mut query = self
-                    .db
-                    .prepare("SELECT id,metadata FROM items WHERE running=1 LIMIT 64")
-                    .map_err(|error| error.to_string())?;
-                let rows = query
-                    .query_map([], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-                    })
-                    .map_err(|error| error.to_string())?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| error.to_string())?;
-                rows
-            };
-            if rows.is_empty() {
-                break;
+    fn reset_adapter_sources(&mut self) -> Result<(), String> {
+        let previous = (
+            self.file_revision,
+            self.child_files_seen,
+            self.file_index_incomplete,
+            self.file_keys,
+            self.applied_files,
+        );
+        self.db
+            .execute_batch("SAVEPOINT reset_adapter_sources")
+            .map_err(|e| e.to_string())?;
+        let result = (|| {
+            self.files_reset()?;
+            self.db.execute_batch("DELETE FROM copy_sources; DELETE FROM items; DELETE FROM adapter_task_items; DELETE FROM child_tools; DELETE FROM child_tool_revoked; UPDATE child_tool_budget SET bytes=0,items=0,chunks=0 WHERE singleton=1;").map_err(|e|e.to_string())?;
+            self.db
+                .execute_batch("RELEASE reset_adapter_sources")
+                .map_err(|e| e.to_string())
+        })();
+        if let Err(error) = result {
+            let rollback = self
+                .db
+                .execute_batch("ROLLBACK TO reset_adapter_sources; RELEASE reset_adapter_sources");
+            (
+                self.file_revision,
+                self.child_files_seen,
+                self.file_index_incomplete,
+                self.file_keys,
+                self.applied_files,
+            ) = previous;
+            if let Err(rollback) = rollback {
+                self.child_tools_unavailable = Some("Canonical source reset rollback failed");
+                return Err(format!("{error}; reset rollback failed: {rollback}"));
             }
-            for (id, metadata) in rows {
-                let mut item: Item =
-                    postcard::from_bytes(&metadata).map_err(|error| error.to_string())?;
-                match &mut item.content {
-                    ItemContent::Tool {
-                        status: current, ..
-                    }
-                    | ItemContent::Command {
-                        status: current, ..
-                    }
-                    | ItemContent::Changes {
-                        status: current, ..
-                    } if *current == crate::chat::ToolStatus::Running => *current = status,
-                    _ => {}
-                }
-                if matches!(item.content, ItemContent::Changes { .. }) {
-                    self.finish_file_status("", &id, status)?;
-                }
-                let metadata = postcard::to_stdvec(&item).map_err(|error| error.to_string())?;
-                self.db
-                    .execute(
-                        "UPDATE items SET metadata=?2,running=0 WHERE id=?1",
-                        params![id, metadata],
-                    )
-                    .map_err(|error| error.to_string())?;
-                self.changed(&id);
-                self.dirty = true;
-            }
+            return Err(error);
         }
+        self.pending_child_tool = None;
+        self.child_tools_unavailable = None;
+        self.child_tools_have_revocations = false;
         Ok(())
-    }
-    fn flush_input(&mut self) -> Result<Option<String>, String> {
-        match self.pending_input.take() {
-            Some((id, offset, delta)) => match self.append_body(&id, offset, &delta, true) {
-                Ok(warning) => Ok(warning),
-                Err(error) => {
-                    self.pending_input = Some((id, offset, delta));
-                    Err(error)
-                }
-            },
-            None => Ok(None),
-        }
-    }
-    fn append_body(
-        &mut self,
-        id: &str,
-        offset: usize,
-        delta: &str,
-        input_delta: bool,
-    ) -> Result<Option<String>, String> {
-        let cached: Option<(Vec<u8>, usize, usize)> = self
-            .db
-            .query_row(
-                "SELECT metadata,len0,len1 FROM items WHERE id=?1",
-                [&id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        let Some((metadata, len0, len1)) = cached else {
-            // Oversized identities are deliberately refused by put_at
-            // without terminating the provider. Their later appends
-            // must preserve that same nonfatal cache boundary.
-            return Ok(Some(format!(
-                "Output for uncached provider item {} was not cached",
-                brief(&id)
-            )));
-        };
-        let mut item: Item = postcard::from_bytes(&metadata).map_err(|error| error.to_string())?;
-        let (field, length) = match item.content {
-            ItemContent::Tool { .. } if input_delta => (0, len0),
-            ItemContent::Command { .. } if !input_delta => (0, len0),
-            ItemContent::Tool { .. } if !input_delta => (1, len1),
-            _ => return Err("Output delta names a non-tool item".into()),
-        };
-        if length != offset {
-            return Err("Output delta does not follow the cached output".into());
-        }
-        let at = observed_at();
-        item.started_at = item.started_at.or(item.at).or(at);
-        item.at = at;
-        let metadata = postcard::to_stdvec(&item).map_err(|error| error.to_string())?;
-        let transaction = self.db.transaction().map_err(|error| error.to_string())?;
-        insert_body(&transaction, &id, field, offset as i64, &delta)?;
-        let update = if field == 0 {
-            "UPDATE items SET len0=len0+?2,metadata=?3 WHERE id=?1"
-        } else {
-            "UPDATE items SET len1=len1+?2,metadata=?3 WHERE id=?1"
-        };
-        transaction
-            .execute(update, params![id, delta.len(), metadata])
-            .map_err(|error| error.to_string())?;
-        transaction.commit().map_err(|error| error.to_string())?;
-        self.changed(&id);
-        self.dirty = true;
-        Ok(None)
     }
     fn flush_text(&mut self) -> Result<Option<String>, String> {
         match self.pending_text.take() {
@@ -1041,6 +1088,7 @@ impl Store {
                 },
                 false,
             )?;
+            self.copy_remove(&[id.to_owned()])?;
             if !self.exists(id)? {
                 // The identity itself could not be cached; the delta has nowhere to go.
                 return Ok(warning);
@@ -1073,6 +1121,7 @@ impl Store {
                     params![id, delta.len() as i64, stamped],
                 )
                 .map_err(|e| e.to_string())?;
+            Self::copy_parent_append(&transaction, id, delta.len())?;
             transaction.commit().map_err(|e| e.to_string())?;
             self.changed(id);
         }
@@ -1184,7 +1233,12 @@ impl Store {
         previous: &mut Vec<std::sync::Arc<Item>>,
     ) -> Result<Window, String> {
         let _ = self.flush_text()?;
-        let _ = self.flush_input()?;
+        let mut copy_projection = Vec::new();
+        let old_copy: std::collections::HashMap<_, _> = previous
+            .iter()
+            .zip(&self.copy_projection)
+            .map(|(item, source)| (item.id.as_str(), source.clone()))
+            .collect();
         let old: std::collections::HashMap<_, _> = previous
             .iter()
             .map(|item| (item.id.as_str(), item))
@@ -1281,10 +1335,18 @@ impl Store {
                 {
                     break 'records;
                 }
+                let copy_source = if matches!(base.content, ItemContent::Text { .. }) {
+                    self.copy_parent_source(&id)?
+                } else {
+                    None
+                };
                 if self
                     .changed
                     .as_ref()
                     .is_some_and(|changed| !changed.contains(&id))
+                    && old_copy
+                        .get(item_id.as_ref())
+                        .is_some_and(|source| *source == copy_source)
                     && let Some(previous) = old.get(item_id.as_ref())
                 {
                     reused.insert(item_id.into_owned());
@@ -1294,6 +1356,7 @@ impl Store {
                     first =
                         Some(first.map_or((ordinal, part), |old: Cursor| old.min((ordinal, part))));
                     bytes += size;
+                    copy_projection.push(copy_source);
                     items.push(std::sync::Arc::clone(previous));
                     continue;
                 }
@@ -1383,7 +1446,9 @@ impl Store {
                             *name = format!("{name} (part {}/{parts})", part + 1);
                         }
                     }
-                    ItemContent::Image { path, description } => {
+                    ItemContent::Image {
+                        path, description, ..
+                    } => {
                         *description = body0;
                         match attachment {
                             Some(data) => *path = data,
@@ -1411,6 +1476,7 @@ impl Store {
                     Some(newest.map_or((ordinal, part), |old: Cursor| old.max((ordinal, part))));
                 bytes += size;
                 first = Some(first.map_or((ordinal, part), |old: Cursor| old.min((ordinal, part))));
+                copy_projection.push(copy_source);
                 items.push(std::sync::Arc::new(item));
             }
         }
@@ -1436,6 +1502,7 @@ impl Store {
         }
         if self.forward.is_none() {
             items.reverse();
+            copy_projection.reverse();
         }
         self.cached_earlier = match first {
             Some((ordinal, part)) => {
@@ -1484,6 +1551,8 @@ impl Store {
             })
             .collect();
         drop(old);
+        drop(old_copy);
+        self.copy_projection = copy_projection;
         previous.clear();
         self.dirty = false;
         self.paging = false;
@@ -1498,9 +1567,10 @@ impl Store {
 }
 impl Drop for Store {
     fn drop(&mut self) {
-        // This UUID directory was created exclusively by this store, never discovered by a scan.
+        // This store owns the cache lease. Retained semantic evidence must outlive
+        // the reducer until its journal owner publishes a checked disposal permit.
         let _ = self.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
-        let _ = fs::remove_dir_all(&self.directory);
+        let _ = crate::transcript_cache::remove_if_reclaimable(&self.directory);
     }
 }
 /// Bounds the identity fields a provider can make arbitrarily large so an
@@ -1650,191 +1720,161 @@ mod tests {
     use super::*;
     use crate::chat::Role;
     use std::os::unix::fs::PermissionsExt;
+
     #[test]
-    fn one_megabyte_input_deltas_write_linear_bytes_and_hydrate_exactly() {
-        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
-        let mut store = Store::at(directory.path().into()).unwrap();
-        let input = "x".repeat(1024 * 1024);
-        store
-            .apply(Event::Item(Item {
-                id: "large-input".into(),
-                role: Role::Assistant,
-                started_at: None,
-                at: None,
-                content: ItemContent::Tool {
-                    name: "Write".into(),
-                    input: String::new(),
-                    output: String::new(),
-                    status: crate::chat::ToolStatus::Running,
-                },
-            }))
+    fn dropping_a_store_removes_ordinary_cache_but_preserves_unretired_actor_evidence() {
+        use std::fs::OpenOptions;
+
+        let root = tempfile::tempdir().unwrap();
+        let ordinary = Store::at(root.path().to_owned()).unwrap();
+        let ordinary_directory = ordinary.directory().to_owned();
+        drop(ordinary);
+        assert!(!ordinary_directory.exists());
+
+        let retained = Store::at(root.path().to_owned()).unwrap();
+        let retained_directory = retained.directory().to_owned();
+        let mut journal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(retained_directory.join("actor-journal.sqlite"))
             .unwrap();
-        store.db.execute_batch("CREATE TEMP TRIGGER reject_stream_body_delete BEFORE DELETE ON chunks BEGIN SELECT RAISE(ABORT,'streaming input must append body chunks'); END;").unwrap();
-        for (index, chunk) in input.as_bytes().chunks(50).enumerate() {
-            store
-                .apply(Event::InputDelta {
-                    id: "large-input".into(),
-                    offset: index * 50,
-                    delta: String::from_utf8(chunk.to_vec()).unwrap(),
-                })
+        let retention =
+            crate::transcript_cache::ActorJournalRetention::create(&retained_directory, &journal)
                 .unwrap();
-        }
-        store.flush_input().unwrap();
-        let (bytes, chunks): (usize, usize) = store
-            .db
-            .query_row(
-                "SELECT SUM(length(data)),COUNT(*) FROM chunks WHERE id='large-input' AND field=0",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+        journal
+            .write_all(b"accepted input and unacknowledged outcome")
             .unwrap();
-        assert_eq!(bytes, input.len());
-        assert!(
-            chunks < 100,
-            "deltas are batched, not separate SQLite transactions"
-        );
-        let read =
-            String::from_utf8(store.field("large-input", 0, 0, input.len()).unwrap()).unwrap();
-        assert_eq!(read, input);
-        let hydrated = store.window().unwrap();
-        assert!(hydrated.items.iter().all(
-            |item| matches!(&item.content, ItemContent::Tool { input, .. } if !input.is_empty())
-        ));
-        let reference_directory = tempfile::tempdir_in("/var/tmp").unwrap();
-        let mut reference = Store::at(reference_directory.path().into()).unwrap();
-        // Compare the same observed times: a separate live put would stamp a
-        // later wall clock, which is unrelated to append/reload equivalence.
-        reference
-            .put(
-                Item {
-                    id: "large-input".into(),
-                    role: Role::Assistant,
-                    started_at: hydrated.items[0].started_at,
-                    at: hydrated.items[0].at,
-                    content: ItemContent::Tool {
-                        name: "Write".into(),
-                        input,
-                        output: String::new(),
-                        status: crate::chat::ToolStatus::Running,
-                    },
-                },
-                true,
-            )
-            .unwrap();
+        journal.sync_all().unwrap();
+        drop(journal);
+        drop(retained);
+        assert!(retained_directory.join("transcript.sqlite").exists());
         assert_eq!(
-            hydrated.items,
-            reference.window().unwrap().items,
-            "append hydration must equal a single authoritative full item"
+            fs::read(retained_directory.join("actor-journal.sqlite")).unwrap(),
+            b"accepted input and unacknowledged outcome"
         );
+        assert_eq!(
+            crate::transcript_cache::sweep(root.path()).unwrap().count,
+            0
+        );
+
+        // Only the journal owner can assert retirement/drain. Dropping Store
+        // releases the lease, so its exact permit allows a later sweep.
+        retention.allow_removal().unwrap();
+        assert_eq!(
+            crate::transcript_cache::sweep(root.path()).unwrap().count,
+            1
+        );
+        assert!(!retained_directory.exists());
     }
 
     #[test]
-    #[ignore = "explicit disk-backed before/after performance measurement"]
-    fn benchmark_one_megabyte_tool_input_stream() {
-        fn written_bytes() -> u64 {
-            std::fs::read_to_string("/proc/self/io")
-                .unwrap()
-                .lines()
-                .find_map(|line| {
-                    line.strip_prefix("wchar:")
-                        .map(|value| value.trim().parse().unwrap())
+    fn dropping_a_store_reclaims_an_exactly_retired_actor_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::at(root.path().to_owned()).unwrap();
+        let directory = store.directory().to_owned();
+        let journal = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join("actor-journal.sqlite"))
+            .unwrap();
+        let retention =
+            crate::transcript_cache::ActorJournalRetention::create(&directory, &journal).unwrap();
+        retention.allow_removal().unwrap();
+        drop(journal);
+        drop(store);
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn history_coverage_checks_hidden_rows_and_every_chunk_not_only_the_window() {
+        let old = history_item("old-page", "older cached page");
+        let large = history_item("large-tail", &"x".repeat(4 * 1024 * 1024));
+        let mut resident = Store::new().unwrap();
+        resident
+            .apply(Event::History {
+                items: vec![old.clone(), large.clone()],
+                has_earlier: false,
+            })
+            .unwrap();
+        let window = resident.window().unwrap();
+        assert!(
+            window
+                .items
+                .iter()
+                .all(|item| !item.id.starts_with("old-page"))
+        );
+        let empty = Store::new().unwrap();
+        assert!(!resident.is_covered_by(&empty).unwrap());
+        let mut missing_old = Store::new().unwrap();
+        missing_old
+            .apply(Event::History {
+                items: vec![large.clone()],
+                has_earlier: false,
+            })
+            .unwrap();
+        assert!(!resident.is_covered_by(&missing_old).unwrap());
+        let mut changed = large.clone();
+        if let ItemContent::Text { text, .. } = &mut changed.content {
+            text.replace_range(..1, "y");
+        }
+        let mut changed_hidden_chunk = Store::new().unwrap();
+        changed_hidden_chunk
+            .apply(Event::History {
+                items: vec![old.clone(), changed],
+                has_earlier: false,
+            })
+            .unwrap();
+        assert!(!resident.is_covered_by(&changed_hidden_chunk).unwrap());
+        let mut reordered = Store::new().unwrap();
+        reordered
+            .apply(Event::History {
+                items: vec![large.clone(), old.clone()],
+                has_earlier: false,
+            })
+            .unwrap();
+        assert!(!resident.is_covered_by(&reordered).unwrap());
+        let mut unchanged = Store::new().unwrap();
+        unchanged
+            .apply(Event::History {
+                items: vec![
+                    old,
+                    large,
+                    history_item("additional", "new provider history"),
+                ],
+                has_earlier: false,
+            })
+            .unwrap();
+        assert!(resident.is_covered_by(&unchanged).unwrap());
+    }
+
+    #[test]
+    fn history_coverage_preserves_child_payload_outside_parent_sql_rows() {
+        let parent = history_item("parent", "saved parent body");
+        let mut resident = Store::new().unwrap();
+        let mut reloaded = Store::new().unwrap();
+        for store in [&mut resident, &mut reloaded] {
+            store
+                .apply(Event::History {
+                    items: vec![parent.clone()],
+                    has_earlier: false,
                 })
-                .unwrap()
-        }
-        for append in [false, true] {
-            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
-            let mut store = Store::at(directory.path().into()).unwrap();
-            let mut adapter = crate::chat::protocol::claude::fixture_adapter();
-            let stream = |event| serde_json::json!({"type":"stream_event","event":event});
-            for event in [
-                serde_json::json!({"type":"message_start","message":{"id":"bench-message"}}),
-                serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"bench","name":"Write","input":{}}}),
-            ] {
-                for event in adapter.receive(stream(event)).unwrap().events {
-                    store.apply(event).unwrap();
-                }
-            }
-            let mut item = Item {
-                id: "bench".into(),
-                role: Role::Assistant,
-                started_at: None,
-                at: None,
-                content: ItemContent::Tool {
-                    name: "Write".into(),
-                    input: String::new(),
-                    output: String::new(),
-                    status: crate::chat::ToolStatus::Running,
-                },
-            };
-            let mut payload = serde_json::json!({"file_path":"fixture.txt","content":""});
-            let overhead = payload.to_string().len();
-            payload["content"] = serde_json::Value::String("x".repeat(1024 * 1024 - overhead));
-            let source = payload.to_string();
-            assert_eq!(source.len(), 1024 * 1024);
-            let io_before = written_bytes();
-            let started = std::time::Instant::now();
-            let mut submitted_bytes = 0usize;
-            for chunk in source.as_bytes().chunks(50) {
-                let delta = String::from_utf8(chunk.to_vec()).unwrap();
-                let step = adapter.receive(stream(serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":delta}}))).unwrap();
-                for event in step.events {
-                    if append {
-                        if let Event::InputDelta { delta, .. } = &event {
-                            submitted_bytes += delta.len();
-                        }
-                        store.apply(event).unwrap();
-                    } else if let Event::InputDelta { delta, .. } = event {
-                        let ItemContent::Tool { input, .. } = &mut item.content else {
-                            unreachable!()
-                        };
-                        input.push_str(&delta);
-                        submitted_bytes += input.len();
-                        // Reproduce the previous adapter's full-item publication.
-                        store.apply(Event::Item(item.clone())).unwrap();
-                    }
-                }
-            }
-            store.flush_input().unwrap();
-            let stream_io_written = written_bytes() - io_before;
-            let stream_duration = started.elapsed();
-            let (bytes, chunks): (usize, usize) = store
-                .db
-                .query_row(
-                    "SELECT SUM(length(data)),COUNT(*) FROM chunks WHERE id='bench' AND field=0",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
                 .unwrap();
-            assert_eq!(bytes, source.len());
-            // Include the authoritative block-stop classification in the
-            // complete measurement; it is one full final item, not a delta.
-            for event in adapter
-                .receive(stream(
-                    serde_json::json!({"type":"content_block_stop","index":0}),
-                ))
-                .unwrap()
-                .events
-            {
-                store.apply(event).unwrap();
-            }
-            store.flush_input().unwrap();
-            let total_io_written = written_bytes() - io_before;
-            println!(
-                "append={append} stream_duration_ms={} total_duration_ms={} delta_body_bytes_submitted={submitted_bytes} stream_syscall_write_bytes={stream_io_written} total_syscall_write_bytes={total_io_written} streamed_body_bytes={bytes} streamed_chunks={chunks}",
-                stream_duration.as_millis(),
-                started.elapsed().as_millis()
-            );
-            if append {
-                assert!(
-                    stream_io_written <= 5 * 1024 * 1024,
-                    "append writes should stay within a small constant factor of input size"
-                );
-                assert!(
-                    total_io_written <= 16 * 1024 * 1024,
-                    "the final authoritative classification must remain linear too"
-                );
-            }
         }
+        assert!(resident.is_covered_by(&reloaded).unwrap());
+        assert!(!resident.child_files_seen);
+        assert!(!resident.file_index_incomplete);
+        resident.presented_children.insert(
+            "retained-child".into(),
+            vec![std::sync::Arc::new(history_item(
+                "child-item",
+                "child payload is outside the parent SQL coverage",
+            ))],
+        );
+        assert!(!resident.is_covered_by(&reloaded).unwrap());
     }
 
     #[test]
@@ -1868,127 +1908,6 @@ mod tests {
             .apply(Event::Item(history_item("later", "provider still alive")))
             .unwrap();
         assert_eq!(store.window().unwrap().items[0].id, "later");
-    }
-
-    #[test]
-    fn terminal_outcomes_update_only_running_metadata_and_never_rewrite_bodies() {
-        for (outcome, expected) in [
-            (
-                crate::notifications::Kind::Cancelled,
-                crate::chat::ToolStatus::Stopped,
-            ),
-            (
-                crate::notifications::Kind::Failed,
-                crate::chat::ToolStatus::Failed,
-            ),
-            (
-                crate::notifications::Kind::Succeeded,
-                crate::chat::ToolStatus::Running,
-            ),
-        ] {
-            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
-            let mut store = Store::at(directory.path().into()).unwrap();
-            let input = "retained input".repeat(1000);
-            let output = "retained output".repeat(1000);
-            store
-                .apply(Event::Item(Item {
-                    id: "pending".into(),
-                    role: Role::Assistant,
-                    started_at: None,
-                    at: None,
-                    content: ItemContent::Tool {
-                        name: "Write".into(),
-                        input: input.clone(),
-                        output: output.clone(),
-                        status: crate::chat::ToolStatus::Running,
-                    },
-                }))
-                .unwrap();
-            let before: i64 = store
-                .db
-                .query_row("SELECT total_changes()", [], |row| row.get(0))
-                .unwrap();
-            store
-                .apply(Event::TurnFinished { key: None, outcome })
-                .unwrap();
-            let after: i64 = store
-                .db
-                .query_row("SELECT total_changes()", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(
-                after - before,
-                if outcome == crate::notifications::Kind::Succeeded {
-                    0
-                } else {
-                    1
-                },
-                "only the metadata row changes; chunks are never deleted or rewritten"
-            );
-            store.apply(Event::TurnStarted).unwrap();
-            let page = store.window().unwrap();
-            assert!(
-                matches!(&page.items[0].content,ItemContent::Tool{input:actual_input,output:actual_output,status,..} if actual_input==&input && actual_output==&output && *status==expected)
-            );
-        }
-    }
-
-    #[test]
-    fn input_appends_preserve_existing_chunks_and_final_rewrites() {
-        let mut store = Store::at(std::env::temp_dir()).unwrap();
-        let item = Item {
-            id: "tool".into(),
-            role: Role::Assistant,
-            started_at: None,
-            at: None,
-            content: ItemContent::Tool {
-                name: "shell".into(),
-                input: "α".into(),
-                output: "args".into(),
-                status: crate::chat::ToolStatus::Running,
-            },
-        };
-        store.apply(Event::Item(item.clone())).unwrap();
-        for offset in [2, 4, 6] {
-            store
-                .apply(Event::InputDelta {
-                    id: "tool".into(),
-                    offset,
-                    delta: "β".into(),
-                })
-                .unwrap();
-        }
-        assert!(
-            store
-                .apply(Event::InputDelta {
-                    id: "tool".into(),
-                    offset: 1,
-                    delta: "bad".into()
-                })
-                .is_err()
-        );
-        store.flush_input().unwrap();
-        let chunks: usize = store
-            .db
-            .query_row(
-                "SELECT COUNT(*) FROM chunks WHERE id='tool' AND field=0",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(chunks, 2, "the original chunk survives each append");
-        let window = store.window().unwrap();
-        assert!(
-            matches!(&window.items[0].content, ItemContent::Tool { input, output, .. } if input == "αβββ" && output == "args")
-        );
-        let mut rewritten = item;
-        if let ItemContent::Tool { output, status, .. } = &mut rewritten.content {
-            *output = "final replacement".into();
-            *status = crate::chat::ToolStatus::Succeeded;
-        }
-        store.apply(Event::Item(rewritten)).unwrap();
-        assert!(
-            matches!(&store.window().unwrap().items[0].content, ItemContent::Tool { output, .. } if output == "final replacement")
-        );
     }
 
     #[test]
@@ -2251,6 +2170,7 @@ mod tests {
                 content: ItemContent::Image {
                     path: "x".repeat(WINDOW_BYTES - 32 * 1024),
                     description: "image".into(),
+                    reference: None,
                 },
             }))
             .unwrap();
@@ -2771,6 +2691,7 @@ mod tests {
                 content: ItemContent::Image {
                     path: payload.clone(),
                     description: "screenshot".into(),
+                    reference: None,
                 },
                 started_at: None,
                 at: None,
@@ -2780,7 +2701,9 @@ mod tests {
         let window = store.window().unwrap();
         assert_eq!(window.items.len(), 1);
         match &window.items[0].content {
-            ItemContent::Image { path, description } => {
+            ItemContent::Image {
+                path, description, ..
+            } => {
                 assert!(path.starts_with(store.directory.to_str().unwrap()));
                 assert_eq!(fs::read(path).unwrap(), b"ABC".repeat(512 * 1024));
                 assert_eq!(description, "screenshot");
@@ -2820,6 +2743,7 @@ mod tests {
                             "data:image/png;base64,QUJD".into()
                         },
                         description: id.into(),
+                        reference: None,
                     },
                 }))
                 .unwrap();

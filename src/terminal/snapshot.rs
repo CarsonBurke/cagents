@@ -348,6 +348,7 @@ impl VisualResources {
 
         let mut row_iteration = self.rows.update(&snapshot)?;
         let mut row_index = 0usize;
+        let local_host = std::cell::OnceCell::new();
         while let Some(row) = row_iteration.next() {
             let row_dirty = row.dirty()?;
             should_publish |= row_dirty;
@@ -418,6 +419,7 @@ impl VisualResources {
                     });
                 }
 
+                localize_file_links(&mut hyperlinks, &local_host);
                 let line = Arc::new(RowSnapshot {
                     cells: owned_cells,
                     wrapped: row.raw_row()?.is_wrapped()?,
@@ -488,6 +490,43 @@ impl VisualResources {
     }
 }
 
+/// Respells links to this machine's files by its host name in the host-less
+/// form, which a snapshot's reader opens as a local path. The terminal host
+/// does this because it is the machine the terminal's programs ran on and
+/// named; a window attached to a remote device runs on another. Links naming
+/// any other host stay as they are, for readers to refuse.
+///
+/// `local_host` is looked up at most once per capture, and only once a link
+/// names a file by host.
+#[cfg(feature = "host")]
+fn localize_file_links(
+    hyperlinks: &mut [HyperlinkSpan],
+    local_host: &std::cell::OnceCell<Option<String>>,
+) {
+    for span in hyperlinks {
+        // Leave every other link unparsed: the common ones are web links and
+        // host-less file links.
+        let names_host = span
+            .uri
+            .get(..7)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file://"))
+            && !span.uri[7..].starts_with('/');
+        if !names_host {
+            continue;
+        }
+        let Ok(mut url) = url::Url::parse(&span.uri) else {
+            continue;
+        };
+        if crate::file_url::localize(&mut url, || {
+            local_host
+                .get_or_init(crate::file_url::host_name)
+                .as_deref()
+        }) {
+            span.uri = url.into();
+        }
+    }
+}
+
 #[cfg(feature = "host")]
 fn map_underline(value: GhosttyUnderline) -> Underline {
     match value {
@@ -539,6 +578,97 @@ mod tests {
             }]
         );
         assert_eq!(snapshot.lines[1].hyperlinks[0].end, 2);
+    }
+
+    #[test]
+    fn file_links_naming_this_machine_lose_the_host_and_others_keep_it() {
+        let span = |uri: &str| HyperlinkSpan {
+            start: 0,
+            end: 1,
+            uri: uri.into(),
+        };
+        let mut spans = [
+            "file://Workstation/tmp/a%20b#L2",
+            "FILE://WORKSTATION/tmp/b",
+            "file://elsewhere/tmp/c",
+            "file://localhost/tmp/d",
+            "file:///tmp/e",
+            "https://workstation/f",
+        ]
+        .map(span);
+        localize_file_links(
+            &mut spans,
+            &std::cell::OnceCell::from(Some("workstation".to_owned())),
+        );
+        assert_eq!(
+            spans.map(|span| span.uri),
+            [
+                "file:///tmp/a%20b#L2",
+                "file:///tmp/b",
+                "file://elsewhere/tmp/c",
+                "file://localhost/tmp/d",
+                "file:///tmp/e",
+                "https://workstation/f",
+            ]
+        );
+        // Rows without a file link named by host never look the name up.
+        let unasked = std::cell::OnceCell::new();
+        let mut spans = [
+            "file:///tmp/e",
+            "https://workstation/f",
+            "file://localhost/d",
+        ]
+        .map(span);
+        localize_file_links(&mut spans, &unasked);
+        assert_eq!(unasked.get(), None);
+    }
+
+    #[test]
+    fn live_and_scrolled_back_captures_localize_file_links() {
+        // `ls --hyperlink` spells its links with this machine's own name.
+        let Some(host) = crate::file_url::test_host_name() else {
+            eprintln!("skipped: this machine has no name a file URL can carry");
+            return;
+        };
+        let links = [
+            format!("file://{}/tmp/a%20b", host.to_ascii_uppercase()),
+            "file://elsewhere/tmp/c".into(),
+        ];
+        let expected = ["file:///tmp/a%20b", "file://elsewhere/tmp/c"];
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 8,
+            rows: 3,
+            max_scrollback: 64,
+        })
+        .unwrap();
+        for link in &links {
+            terminal.vt_write(format!("\x1b]8;;{link}\x1b\\name\x1b]8;;\x1b\\\r\n").as_bytes());
+        }
+        let uris = |snapshot: &RenderSnapshot| {
+            snapshot.lines[..links.len()]
+                .iter()
+                .map(|line| {
+                    let [span] = line.hyperlinks.as_slice() else {
+                        panic!("one link per row: {:?}", line.hyperlinks);
+                    };
+                    assert_eq!((span.start, span.end), (0, 4));
+                    span.uri.clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut visual = VisualResources::new().unwrap();
+        let live = visual.capture(&terminal, 1, true, None).unwrap().unwrap();
+        assert_eq!(uris(&live), expected);
+        // Push the links off the screen; only history holds them now.
+        for _ in 0..8 {
+            terminal.vt_write(b"line\r\n");
+        }
+        let live = visual.capture(&terminal, 2, false, None).unwrap().unwrap();
+        assert!(live.lines.iter().all(|line| line.hyperlinks.is_empty()));
+        assert!(live.scroll.offset > 0);
+        let history = capture_viewport(&terminal, &live, Some(0), 3).unwrap();
+        assert_eq!(history.scroll.offset, 0);
+        assert_eq!(uris(&history), expected);
     }
 
     #[test]
@@ -789,6 +919,7 @@ pub(crate) fn capture_viewport(
     let mut lines = Vec::new();
     let mut graphemes = vec!['\0'; 32];
     let mut uri = vec![0; 1024];
+    let local_host = std::cell::OnceCell::new();
     for row in snapshot.scroll.offset..snapshot.scroll.offset + snapshot.scroll.len {
         let mut cells = Vec::with_capacity(snapshot.columns as usize);
         let mut hyperlinks: Vec<HyperlinkSpan> = Vec::new();
@@ -855,6 +986,7 @@ pub(crate) fn capture_viewport(
                 }
             }
         }
+        localize_file_links(&mut hyperlinks, &local_host);
         lines.push(Arc::new(RowSnapshot {
             cells,
             wrapped,

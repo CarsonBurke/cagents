@@ -21,6 +21,73 @@ mod tests {
     use super::*;
 
     #[test]
+    fn escape_cancels_the_import_surface_or_its_stop_confirmation() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        drop(app.update(Message::BrowserImport(Action::Open)));
+        let focus = app.update(Message::BrowserImport(Action::Open));
+        assert_eq!(
+            super::super::tests::focused_element(app.browser_import_dialog().unwrap(), focus),
+            Some(widget::Id::new("dialog.browser-import.cancel"))
+        );
+        let escape = || Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            },
+            captured: false,
+        };
+        drop(app.update(escape()));
+        assert!(!app.browser_import.open());
+        drop(app.update(Message::BrowserImport(Action::Open)));
+        app.browser_import.phase = Phase::Scanning;
+        drop(app.update(escape()));
+        assert!(app.browser_import.confirm_cancel);
+        assert!(!app.browser_import.cancel.load(Ordering::Relaxed));
+        drop(app.update(escape()));
+        assert!(!app.browser_import.confirm_cancel);
+        assert!(app.browser_import.busy());
+        assert!(
+            !app.browser_import.cancel.load(Ordering::Relaxed),
+            "Escape from Stop import keeps the current scan"
+        );
+    }
+
+    #[test]
+    fn focused_import_filter_captured_escape_cancels_the_visible_import() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        drop(app.update(Message::BrowserImport(Action::Open)));
+        app.browser_import.phase = Phase::Selection;
+        let event = dialog_ui::tests::key_press(keyboard::key::Named::Escape);
+        let (messages, captured) = dialog_ui::tests::key_control(
+            app.dialog().unwrap(),
+            widget::Id::new("dialog.browser-import.filter"),
+            event.clone(),
+        );
+        assert!(captured, "the actual focused COSMIC input captures Escape");
+        assert!(messages.is_empty());
+        drop(app.update(Message::KeyEvent { event, captured }));
+        assert!(!app.browser_import.open());
+
+        drop(app.update(Message::BrowserImport(Action::Open)));
+        app.browser_import.phase = Phase::Selection;
+        app.transient_work_close = Some(window::Id::unique());
+        drop(app.update(Message::KeyEvent {
+            event: dialog_ui::tests::key_press(keyboard::key::Named::Escape),
+            captured: true,
+        }));
+        assert!(
+            app.browser_import.open(),
+            "an obscured import must not consume the upper owner's Escape"
+        );
+        assert!(app.transient_work_close.is_some());
+    }
+
+    #[test]
     fn settings_import_creates_browser_before_its_modal_can_block_creation() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         assert!(app.durable.cards.is_empty());
@@ -149,6 +216,13 @@ impl State {
     pub(super) fn open(&self) -> bool {
         !matches!(self.phase, Phase::Closed)
     }
+    pub(super) fn escape_action(&self) -> Action {
+        if self.confirm_cancel {
+            Action::KeepWorking
+        } else {
+            Action::Cancel
+        }
+    }
     fn busy(&self) -> bool {
         matches!(
             self.phase,
@@ -169,6 +243,7 @@ fn message(action: Action) -> Message {
 
 impl Cagents {
     pub(super) fn update_browser_import(&mut self, action: Action) -> Task<Message> {
+        let focus_cancel = matches!(&action, Action::Open | Action::Cancel | Action::KeepWorking);
         match action {
             Action::Open => {
                 if self.browser_import.busy() {
@@ -184,7 +259,12 @@ impl Cagents {
                     // Create the card in this authorized update. Queuing a
                     // public OpenBrowser message after mounting the intro
                     // would be rejected by the modal input fence.
-                    return self.add_browser(Url::parse("about:blank").unwrap());
+                    return self.add_browser(Url::parse("about:blank").unwrap()).chain(
+                        iced::widget::operation::focus(widget::Id::new(
+                            "dialog.browser-import.cancel",
+                        ))
+                        .map(cosmic::Action::App),
+                    );
                 }
             }
             Action::Consent => {
@@ -460,7 +540,24 @@ impl Cagents {
             }
             _ => {}
         }
-        Task::none()
+        if focus_cancel && self.browser_import.open() {
+            iced::widget::operation::focus(widget::Id::new("dialog.browser-import.cancel"))
+                .map(cosmic::Action::App)
+        } else {
+            Task::none()
+        }
+    }
+
+    // Match the owners drawn above this surface in App::dialog. Captured
+    // Escape from its focused filter still belongs to this visible dialog.
+    pub(super) fn browser_import_on_top(&self) -> bool {
+        self.browser_import.open()
+            && !self.automation_approval_open()
+            && self.transient_work_close.is_none()
+            && !self.automation_ui.draft_dialog_open()
+            && !self.device_ui.open
+            && self.chat_ui.image_viewer.is_none()
+            && self.terminal_paste.is_none()
     }
 
     pub(super) fn browser_import_dialog(&self) -> Option<Element<'_, Message>> {
@@ -471,20 +568,27 @@ impl Cagents {
         let mut content: Vec<Element<'_, Message>> =
             vec![crate::design::title("Import browser logins").into()];
         let button = |label: &'static str, action| {
-            crate::ui_controls::button::secondary(label)
-                .on_press(message(action))
-                .into()
+            let cancel = matches!(action, Action::Cancel | Action::KeepWorking);
+            let button = if matches!(action, Action::ConfirmCancel) {
+                crate::ui_controls::button::destructive(label)
+            } else {
+                crate::ui_controls::button::secondary(label)
+            };
+            let button = button.on_press(message(action));
+            if cancel {
+                button
+                    .id(widget::Id::new("dialog.browser-import.cancel"))
+                    .into()
+            } else {
+                button.into()
+            }
         };
         if state.confirm_cancel {
             content.push(notice_body("Stop this import? A scan may be waiting for the desktop keyring. Cookies already written into the in-app browser remain there."));
-            content.push(
-                widget::row::with_children(vec![
-                    button("Keep going", Action::KeepWorking),
-                    button("Stop import", Action::ConfirmCancel),
-                ])
-                .spacing(space::S)
-                .into(),
-            );
+            content.push(super::dialog_ui::confirmation_actions(
+                button("Keep going", Action::KeepWorking),
+                button("Stop import", Action::ConfirmCancel),
+            ));
         } else {
             match &state.phase {
                 Phase::Intro => {
@@ -522,6 +626,7 @@ impl Cagents {
                     content.push(notice_body("Choose sites to import. If profiles overlap, the first selected profile wins. Only SameSite=None cookies are supported; restricted, container, and partitioned cookies are skipped. Some logins may still need signing in."));
                     content.push(
                         crate::ui_controls::field::search("Filter sites or profiles", &state.query)
+                            .id(widget::Id::new("dialog.browser-import.filter"))
                             .on_input(|query| message(Action::Filter(query)))
                             .into(),
                     );
