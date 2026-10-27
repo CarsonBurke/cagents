@@ -3,6 +3,10 @@ use crate::agent::Provider;
 use crate::chat;
 use crate::persistence::SavedConversation;
 use cosmic::iced::futures::StreamExt;
+use cosmic::{Renderer, Theme};
+use iced::advanced::widget::{Operation, Tree};
+use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, overlay, renderer};
+use iced::{Event, Rectangle, Size, Vector, mouse};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 mod catalog;
@@ -76,6 +80,7 @@ struct Reader {
     active: bool,
     viewport: Option<ReaderViewport>,
     pending: Option<PendingReveal>,
+    input_update: bool,
 }
 
 impl Default for Reader {
@@ -84,6 +89,7 @@ impl Default for Reader {
             active: true,
             viewport: None,
             pending: None,
+            input_update: false,
         }
     }
 }
@@ -96,12 +102,14 @@ impl Reader {
         // A redraw can clamp the old offset when indexing shortens the list.
         // Preserve that visibility evidence, but let later manual scrolling
         // retire a reveal queued before the reader moved the viewport.
-        if self.viewport.is_some_and(|previous| {
-            let clamped = previous
-                .top
-                .clamp(0.0, (content_height - viewport.height).max(0.0));
-            (viewport.top - clamped).abs() > f32::EPSILON
-        }) {
+        if self.input_update
+            || self.viewport.is_some_and(|previous| {
+                let clamped = previous
+                    .top
+                    .clamp(0.0, (content_height - viewport.height).max(0.0));
+                (viewport.top - clamped).abs() > f32::EPSILON
+            })
+        {
             self.pending = None;
         }
         self.viewport = Some(viewport);
@@ -126,6 +134,165 @@ impl ReaderViewport {
     fn contains(self, index: usize) -> bool {
         let top = index as f32 * (ROW_HEIGHT + ROW_SPACING);
         top + ROW_HEIGHT > self.top && top < self.top + self.height
+    }
+}
+
+// A passive, local input-cause witness; shared controls/vendor stay unchanged.
+struct ObservedScroll<'a> {
+    content: Element<'a, Message>,
+    reader: Arc<Mutex<Reader>>,
+}
+
+impl Widget<Message, Theme, Renderer> for ObservedScroll<'_> {
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_mut(&mut self.content));
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn size_hint(&self) -> Size<Length> {
+        self.content.as_widget().size_hint()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        // on_scroll also runs for Redraw/layout clamping. Remember its actual
+        // cause during child dispatch, even before this Reader's first frame.
+        if let Ok(mut reader) = self.reader.lock() {
+            reader.input_update = !matches!(event, Event::Window(_));
+        }
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+        if let Ok(mut reader) = self.reader.lock() {
+            reader.input_update = false;
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+
+    fn overlay<'a>(
+        &'a mut self,
+        tree: &'a mut Tree,
+        layout: Layout<'a>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        self.content
+            .as_widget()
+            .a11y_nodes(layout, &tree.children[0], cursor)
+    }
+
+    fn drag_destinations(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        destinations: &mut cosmic::iced::advanced::clipboard::DndDestinationRectangles,
+    ) {
+        self.content.as_widget().drag_destinations(
+            &tree.children[0],
+            layout,
+            renderer,
+            destinations,
+        );
     }
 }
 
@@ -1168,7 +1335,11 @@ impl Cagents {
                 // does not move the list.
                 .height(Length::Fixed(32.0))
                 .into(),
-            widget::scrollable(widget::column::with_children(rows).spacing(ROW_SPACING))
+            Element::new(ObservedScroll {
+                reader: state.reader.clone(),
+                content: widget::scrollable(
+                    widget::column::with_children(rows).spacing(ROW_SPACING),
+                )
                 .id(widget::Id::new("conversation-resume.results"))
                 .on_scroll({
                     let observed = state.reader.clone();
@@ -1187,6 +1358,7 @@ impl Cagents {
                 })
                 .height(Length::Fill)
                 .into(),
+            }),
         ])
         .spacing(space::M)
         .height(Length::Fill);
@@ -1675,7 +1847,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_native_scroll_retires_an_already_queued_indexed_reveal() {
+    fn manual_native_scroll_retires_queued_index_and_query_reveals() {
         use iced::advanced::{
             Layout, layout,
             widget::{Operation, Tree, operation},
@@ -1704,128 +1876,144 @@ mod tests {
             }
         }
         let directory = tempfile::tempdir().unwrap();
-        let renderer = crate::app::tests::headless_renderer();
-        let size = iced::Size::new(880.0, 480.0);
-        let limits = layout::Limits::new(iced::Size::ZERO, size);
-        let mut app = crate::app::tests::context_inspector_test_app(false);
-        app.resume_ui.open = true;
-        app.resume_ui.limit = PAGE;
-        let generation = app.resume_ui.generation;
-        list(
-            &mut app,
-            generation,
-            (0..24).map(|_| saved(directory.path())).collect(),
-        );
-        drop(arrow(&mut app, keyboard::key::Named::ArrowUp));
-        let selected = app.resume_ui.reader_selection().unwrap();
-        let mut before = app.resume_dialog().unwrap();
-        let mut tree = Tree::new(before.as_widget());
-        let node = before.as_widget_mut().layout(&mut tree, &renderer, &limits);
-        let mut messages = Vec::new();
-        before.as_widget_mut().update(
-            &mut tree,
-            &iced::Event::Window(iced::window::Event::RedrawRequested(
-                iced::time::Instant::now(),
-            )),
-            Layout::new(&node),
-            iced::mouse::Cursor::Unavailable,
-            &renderer,
-            &mut iced::advanced::clipboard::Null,
-            &mut iced::advanced::Shell::new(&mut messages),
-            &iced::Rectangle::with_size(size),
-        );
-        drop(before);
-        // The selection is visible when the arrival queues its reveal.
-        let queued = app.update_resume(Action::Indexed(
-            generation,
-            Progress::Saved {
-                entries: (0..PAGE)
-                    .map(|_| {
-                        let mut entry = saved(directory.path());
-                        entry.updated_at_unix_ms = 2;
-                        entry
-                    })
-                    .collect(),
-                seeds: Arc::from([]),
-                error: None,
-            },
-        ));
-        assert_eq!(app.resume_ui.reader_selection(), Some(selected));
-        assert!(app.resume_ui.reader.lock().unwrap().pending.is_some());
-        let mut after = app.resume_dialog().unwrap();
-        tree.diff(after.as_widget_mut());
-        let node = after.as_widget_mut().layout(&mut tree, &renderer, &limits);
-        let mut initial = Viewport::default();
-        after
-            .as_widget_mut()
-            .operate(&mut tree, Layout::new(&node), &renderer, &mut initial);
-        messages.clear();
-        after.as_widget_mut().update(
-            &mut tree,
-            &iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
-                delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -12.0 },
-            }),
-            Layout::new(&node),
-            iced::mouse::Cursor::Available(initial.bounds.center()),
-            &renderer,
-            &mut iced::advanced::clipboard::Null,
-            &mut iced::advanced::Shell::new(&mut messages),
-            &iced::Rectangle::with_size(size),
-        );
-        let mut manual = Viewport::default();
-        after
-            .as_widget_mut()
-            .operate(&mut tree, Layout::new(&node), &renderer, &mut manual);
-        assert!(
-            manual.top > initial.top,
-            "real wheel input must move the list"
-        );
-        assert!(app.resume_ui.reader.lock().unwrap().pending.is_none());
-        iced::futures::executor::block_on(async {
-            let mut effects = iced::runtime::task::into_stream(queued).unwrap();
-            let Some(iced::runtime::Action::Widget(mut operation)) = effects.next().await else {
-                panic!("the queued indexing task must contain its real native operation");
-            };
-            after.as_widget_mut().operate(
-                &mut tree,
-                Layout::new(&node),
-                &renderer,
-                operation.as_mut(),
+        for query_reset in [false, true] {
+            let renderer = crate::app::tests::headless_renderer();
+            let size = iced::Size::new(880.0, 480.0);
+            let limits = layout::Limits::new(iced::Size::ZERO, size);
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.resume_ui.open = true;
+            app.resume_ui.limit = PAGE;
+            let generation = app.resume_ui.generation;
+            list(
+                &mut app,
+                generation,
+                (0..24).map(|_| saved(directory.path())).collect(),
             );
-        });
-        let mut current = Viewport::default();
-        after
-            .as_widget_mut()
-            .operate(&mut tree, Layout::new(&node), &renderer, &mut current);
-        assert_eq!(
-            current.top, manual.top,
-            "older indexing cannot override later input"
-        );
-        drop(after);
-        assert_eq!(app.resume_ui.reader_selection(), Some(selected));
-        // Explicit navigation after that manual scroll still reveals its row.
-        let key = arrow(&mut app, keyboard::key::Named::ArrowUp);
-        let mut after = app.resume_dialog().unwrap();
-        tree.diff(after.as_widget_mut());
-        let node = after.as_widget_mut().layout(&mut tree, &renderer, &limits);
-        iced::futures::executor::block_on(async {
-            let mut effects = iced::runtime::task::into_stream(key).unwrap();
-            let Some(iced::runtime::Action::Widget(mut operation)) = effects.next().await else {
-                panic!("fresh keyboard navigation must retain its reveal operation");
-            };
-            after.as_widget_mut().operate(
+            drop(arrow(&mut app, keyboard::key::Named::ArrowUp));
+            let selected = app.resume_ui.reader_selection().unwrap();
+            let mut before = app.resume_dialog().unwrap();
+            let mut tree = Tree::new(before.as_widget());
+            let node = before.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let mut messages = Vec::new();
+            before.as_widget_mut().update(
                 &mut tree,
+                &iced::Event::Window(iced::window::Event::RedrawRequested(
+                    iced::time::Instant::now(),
+                )),
                 Layout::new(&node),
+                iced::mouse::Cursor::Unavailable,
                 &renderer,
-                operation.as_mut(),
+                &mut iced::advanced::clipboard::Null,
+                &mut iced::advanced::Shell::new(&mut messages),
+                &iced::Rectangle::with_size(size),
             );
-        });
-        after
-            .as_widget_mut()
-            .operate(&mut tree, Layout::new(&node), &renderer, &mut current);
-        let row_top = app.resume_ui.selected as f32 * (ROW_HEIGHT + ROW_SPACING);
-        assert!(row_top >= current.top);
-        assert!(row_top + ROW_HEIGHT <= current.top + current.bounds.height + 0.1);
+            drop(before);
+            // The selection is visible when the arrival queues its reveal.
+            let queued = if query_reset {
+                let task = app.update_resume(Action::Query(String::new()));
+                assert!(app.resume_ui.reader.lock().unwrap().viewport.is_none());
+                task
+            } else {
+                app.update_resume(Action::Indexed(
+                    generation,
+                    Progress::Saved {
+                        entries: (0..PAGE)
+                            .map(|_| {
+                                let mut entry = saved(directory.path());
+                                entry.updated_at_unix_ms = 2;
+                                entry
+                            })
+                            .collect(),
+                        seeds: Arc::from([]),
+                        error: None,
+                    },
+                ))
+            };
+            assert_eq!(
+                app.resume_ui.rows[app.resume_ui.visible[app.resume_ui.selected]].card,
+                selected
+            );
+            assert!(app.resume_ui.reader.lock().unwrap().pending.is_some());
+            let mut after = app.resume_dialog().unwrap();
+            tree.diff(after.as_widget_mut());
+            let node = after.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let mut initial = Viewport::default();
+            after
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut initial);
+            messages.clear();
+            after.as_widget_mut().update(
+                &mut tree,
+                &iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                    delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -12.0 },
+                }),
+                Layout::new(&node),
+                iced::mouse::Cursor::Available(initial.bounds.center()),
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut iced::advanced::Shell::new(&mut messages),
+                &iced::Rectangle::with_size(size),
+            );
+            let mut manual = Viewport::default();
+            after
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut manual);
+            assert!(
+                manual.top > initial.top,
+                "real wheel input must move the list"
+            );
+            assert!(app.resume_ui.reader.lock().unwrap().pending.is_none());
+            iced::futures::executor::block_on(async {
+                let mut effects = iced::runtime::task::into_stream(queued).unwrap();
+                let Some(iced::runtime::Action::Widget(mut operation)) = effects.next().await
+                else {
+                    panic!("the queued indexing task must contain its real native operation");
+                };
+                after.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    operation.as_mut(),
+                );
+            });
+            let mut current = Viewport::default();
+            after
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut current);
+            assert_eq!(
+                current.top, manual.top,
+                "older indexing cannot override later input"
+            );
+            drop(after);
+            assert_eq!(
+                app.resume_ui.rows[app.resume_ui.visible[app.resume_ui.selected]].card,
+                selected
+            );
+            // Explicit navigation after that manual scroll still reveals its row.
+            let key = arrow(&mut app, keyboard::key::Named::ArrowUp);
+            let mut after = app.resume_dialog().unwrap();
+            tree.diff(after.as_widget_mut());
+            let node = after.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            iced::futures::executor::block_on(async {
+                let mut effects = iced::runtime::task::into_stream(key).unwrap();
+                let Some(iced::runtime::Action::Widget(mut operation)) = effects.next().await
+                else {
+                    panic!("fresh keyboard navigation must retain its reveal operation");
+                };
+                after.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    operation.as_mut(),
+                );
+            });
+            after
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut current);
+            let row_top = app.resume_ui.selected as f32 * (ROW_HEIGHT + ROW_SPACING);
+            assert!(row_top >= current.top);
+            assert!(row_top + ROW_HEIGHT <= current.top + current.bounds.height + 0.1);
+        }
     }
 
     #[test]
