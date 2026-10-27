@@ -11,6 +11,18 @@ use crate::automations::{Proposal, ProposalState, ProposalSummary};
 const MAX_RECORD_BYTES: usize = 512;
 const MAX_SUMMARY_BYTES: usize = 8192;
 const MAX_PAGE: usize = 32;
+const MAX_ATTRIBUTION_BYTES: usize = 64;
+
+fn attribution_label(value: &str) -> Option<String> {
+    let mut label = crate::notifications::presentation::title(value);
+    let mut end = label.len().min(MAX_ATTRIBUTION_BYTES);
+    while !label.is_char_boundary(end) {
+        end -= 1;
+    }
+    label.truncate(end);
+    let label = label.trim();
+    (!label.is_empty()).then(|| label.to_owned())
+}
 
 pub(super) fn migrate(tx: &Transaction<'_>) -> Result<(), String> {
     tx.execute_batch(
@@ -32,6 +44,10 @@ struct Created {
     proposal: Uuid,
     revision: u64,
     created_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requester: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +62,17 @@ impl Entry {
             registry: self.created.registry,
             id: self.created.proposal,
             revision: self.created.revision,
+        }
+    }
+
+    pub(in crate::host) fn attribution(&self) -> Option<String> {
+        match (&self.created.requester, &self.created.project) {
+            (Some(requester), Some(project)) => {
+                Some(format!("Requested by {requester} · Project {project}."))
+            }
+            (Some(requester), None) => Some(format!("Requested by {requester}.")),
+            (None, Some(project)) => Some(format!("Project {project}.")),
+            (None, None) => None,
         }
     }
 
@@ -88,6 +115,13 @@ fn decode(
         || created.proposal.to_string() != proposal
         || created.revision != revision
         || created.created_ms != created_ms
+        || created
+            .requester
+            .as_deref()
+            .is_some_and(|label| attribution_label(label).as_deref() != Some(label))
+        || created.project.as_deref().is_some_and(|label| {
+            attribution_label(label).as_deref() != Some(label) || label.contains('/')
+        })
     {
         return Err("Proposal notice metadata does not match its source identity".into());
     }
@@ -96,7 +130,11 @@ fn decode(
 
 /// Called immediately after the real INSERT, before its clock update/commit.
 /// Any failure rolls back the original proposal as well as this source record.
-pub(super) fn queue_in(tx: &Transaction<'_>, proposal: &Proposal) -> Result<(), String> {
+pub(super) fn queue_in(
+    tx: &Transaction<'_>,
+    proposal: &Proposal,
+    requester: Option<&str>,
+) -> Result<(), String> {
     if proposal.id.is_nil() || proposal.revision == 0 || proposal.state != ProposalState::Pending {
         return Err("Only the newly inserted pending proposal can create attention".into());
     }
@@ -105,6 +143,15 @@ pub(super) fn queue_in(tx: &Transaction<'_>, proposal: &Proposal) -> Result<(), 
         proposal: proposal.id,
         revision: proposal.revision,
         created_ms: proposal.created_ms,
+        requester: requester.and_then(attribution_label),
+        project: proposal
+            .definition
+            .agent
+            .target
+            .repository
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(attribution_label),
     };
     i64::try_from(created.revision).map_err(|_| "Invalid proposal revision")?;
     i64::try_from(created.created_ms).map_err(|_| "Invalid proposal creation time")?;
@@ -122,7 +169,8 @@ pub(super) fn queue_in(tx: &Transaction<'_>, proposal: &Proposal) -> Result<(), 
     if record.len() > MAX_RECORD_BYTES {
         return Err("Proposal notice metadata exceeds its boundary".into());
     }
-    // Never replace an older/unknown source, and never store proposal content.
+    // Never replace an older/unknown source. Store only bounded optional
+    // human attribution, never the prompt, full definition, or parent path.
     tx.execute(
         "INSERT INTO automation_proposal_notifications(proposal,registry,revision,created_ms,record)
          VALUES(?1,?2,?3,?4,?5)",
@@ -138,15 +186,32 @@ pub(super) fn resolved_in(tx: &Transaction<'_>, proposal: &Proposal) -> Result<(
     if proposal.state == ProposalState::Pending {
         return Err("A pending proposal cannot suppress its creation notice".into());
     }
-    let created = Created {
-        registry: identity(tx)?,
-        proposal: proposal.id,
-        revision: proposal.revision,
-        created_ms: proposal.created_ms,
+    // Naming is immutable source metadata, not reconstructible from the
+    // mutable runtime or destination channel. Read one bounded known-canonical
+    // source in this existing resolution transaction, then delete its EXACT
+    // captured bytes only when the full creation tuple still matches.
+    let row: Option<(String, String, u64, u64, Option<String>)> = tx.query_row(
+        "SELECT registry,proposal,revision,created_ms,CASE WHEN length(CAST(record AS BLOB))<=?2 THEN record END FROM automation_proposal_notifications WHERE proposal=?1",
+        params![proposal.id.to_string(), MAX_RECORD_BYTES],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+    ).optional().map_err(|error|error.to_string())?;
+    let Some((registry, id, revision, created_ms, record)) = row else {
+        return Ok(());
     };
-    let record = serde_json::to_string(&created).map_err(|error| error.to_string())?;
+    let Ok(entry) = decode(registry, id, revision, created_ms, record) else {
+        return Ok(());
+    };
+    let created = &entry.created;
+    if created.registry != identity(tx)?
+        || created.proposal != proposal.id
+        || created.revision != proposal.revision
+        || created.created_ms != proposal.created_ms
+        || serde_json::to_string(created).map_err(|error| error.to_string())? != entry.record
+    {
+        return Ok(());
+    }
     tx.execute("DELETE FROM automation_proposal_notifications WHERE proposal=?1 AND registry=?2 AND revision=?3 AND created_ms=?4 AND record=?5",
-        params![created.proposal.to_string(),created.registry.to_string(),created.revision,created.created_ms,record])
+        params![created.proposal.to_string(),created.registry.to_string(),created.revision,created.created_ms,entry.record])
         .map_err(|error|error.to_string())?;
     Ok(())
 }
@@ -473,5 +538,159 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn creation_attribution_is_bounded_immutable_optional_and_resolution_preserves_unknown_sources()
+    {
+        let (_root, mut registry, definition) = registry();
+        let id = Uuid::new_v4();
+        let requester = format!("  Human conversation\n{}", "\"".repeat(100));
+        let proposal = registry
+            .propose_automation_with_requester(
+                id,
+                Origin::User,
+                definition.clone(),
+                definition.clone(),
+                DirectoryIdentity {
+                    device: 1,
+                    inode: 2,
+                },
+                Some("Destination channel is not the requester".into()),
+                Some(&requester),
+                1,
+            )
+            .unwrap();
+        let entry = registry
+            .pending_proposal_notifications(1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(entry.record.len() <= MAX_RECORD_BYTES);
+        let captured = entry.created.requester.as_ref().unwrap();
+        assert!(captured.starts_with("Human conversation"));
+        assert!(captured.len() <= MAX_ATTRIBUTION_BYTES && !captured.contains('\n'));
+        assert_eq!(
+            entry.created.project.as_deref(),
+            definition
+                .agent
+                .target
+                .repository
+                .file_name()
+                .and_then(|name| name.to_str())
+        );
+        assert!(!entry.record.contains("Destination channel"));
+        assert!(!entry.record.contains(&definition.prompt));
+        assert!(
+            !entry.record.contains(
+                definition
+                    .agent
+                    .target
+                    .repository
+                    .parent()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            registry
+                .propose_automation_with_requester(
+                    id,
+                    Origin::User,
+                    definition.clone(),
+                    definition.clone(),
+                    proposal.target_identity.clone(),
+                    None,
+                    Some("A later mutable title"),
+                    2,
+                )
+                .unwrap(),
+            proposal
+        );
+        assert_eq!(
+            registry.pending_proposal_notifications(1).unwrap(),
+            vec![entry]
+        );
+        registry
+            .resolve_automation_proposal(&proposal, None, 3)
+            .unwrap();
+        assert!(
+            registry
+                .pending_proposal_notifications(1)
+                .unwrap()
+                .is_empty()
+        );
+
+        // The exact pre-attribution canonical format remains suppressible.
+        let old = propose(&mut registry, Uuid::new_v4(), &definition).unwrap();
+        let mut entry = registry
+            .pending_proposal_notifications(1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        entry.created.requester = None;
+        entry.created.project = None;
+        let old_record = serde_json::to_string(&entry.created).unwrap();
+        registry
+            .db
+            .execute(
+                "UPDATE automation_proposal_notifications SET record=?2 WHERE proposal=?1",
+                params![old.id.to_string(), old_record],
+            )
+            .unwrap();
+        registry.resolve_automation_proposal(&old, None, 4).unwrap();
+        assert!(
+            registry
+                .pending_proposal_notifications(1)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Unknown extensions, noncanonical replacement bytes and a changed
+        // creation time are not silently consumed as this proposal's source.
+        for replacement in 0..3 {
+            let proposal = propose(&mut registry, Uuid::new_v4(), &definition).unwrap();
+            let entry = registry
+                .pending_proposal_notifications(1)
+                .unwrap()
+                .pop()
+                .unwrap();
+            let mut created = entry.created.clone();
+            let raw = match replacement {
+                0 => format!(
+                    "{},\"unknown\":true}}",
+                    entry.record.strip_suffix('}').unwrap()
+                ),
+                1 => format!("{} ", entry.record),
+                _ => {
+                    created.created_ms += 1;
+                    serde_json::to_string(&created).unwrap()
+                }
+            };
+            registry.db.execute("UPDATE automation_proposal_notifications SET created_ms=?2,record=?3 WHERE proposal=?1", params![proposal.id.to_string(),created.created_ms,raw]).unwrap();
+            registry.acknowledge_proposal_notification(&entry).unwrap();
+            registry
+                .resolve_automation_proposal(&proposal, None, 5)
+                .unwrap();
+            let retained: String = registry
+                .db
+                .query_row(
+                    "SELECT record FROM automation_proposal_notifications WHERE proposal=?1",
+                    [proposal.id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(retained, raw);
+            // Fixture teardown of this intentionally unsupported source keeps
+            // the next independent case's bounded read unobstructed.
+            registry
+                .db
+                .execute(
+                    "DELETE FROM automation_proposal_notifications WHERE proposal=?1",
+                    [proposal.id.to_string()],
+                )
+                .unwrap();
+        }
     }
 }

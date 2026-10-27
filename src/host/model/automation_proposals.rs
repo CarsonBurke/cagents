@@ -105,6 +105,31 @@ impl Registry {
         channel_title: Option<String>,
         now_ms: u64,
     ) -> Result<Proposal, String> {
+        self.propose_automation_with_requester(
+            id,
+            owner,
+            requested,
+            definition,
+            identity,
+            channel_title,
+            None,
+            now_ms,
+        )
+    }
+
+    /// Requester naming is optional creation-time notification metadata. It is
+    /// neither destination placement nor proposal/consent identity.
+    pub(crate) fn propose_automation_with_requester(
+        &mut self,
+        id: Uuid,
+        owner: Origin,
+        requested: Definition,
+        definition: Definition,
+        identity: DirectoryIdentity,
+        channel_title: Option<String>,
+        requester: Option<&str>,
+        now_ms: u64,
+    ) -> Result<Proposal, String> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -157,7 +182,7 @@ impl Registry {
         )
         .map_err(|_| "Could not save this request ID; use a new request ID".to_owned())?;
         // Source attention and the proposal INSERT commit or roll back together.
-        super::automation_proposal_notifications::queue_in(&tx, &proposal)?;
+        super::automation_proposal_notifications::queue_in(&tx, &proposal, requester)?;
         delivery::changed_in(&tx, true)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(proposal)

@@ -92,14 +92,32 @@ impl Transfer {
             let Some((entry, name)) = registry.prepare_proposal_notification()? else {
                 return Ok(IDLE);
             };
-            let event=Event {
-                target:entry.target(),source_session:None,provider:None,directory:None,destination:None,
-                evidence:Evidence{key:entry.evidence_key(),kind:Kind::ProposalCreated},
-                content:name.map(|conversation|Content{
-                    conversation,
-                    preview:"An automation request was created. Review its current saved settings before deciding.".into(),
-                    request:None,
-                }),
+            let attribution = entry.attribution();
+            let content = if name.is_some() || attribution.is_some() {
+                let mut preview = attribution.unwrap_or_default();
+                if !preview.is_empty() {
+                    preview.push(' ');
+                }
+                preview.push_str("Review its current saved settings before deciding.");
+                Some(Content {
+                    conversation: name.unwrap_or_else(|| "Automation request".into()),
+                    preview,
+                    request: None,
+                })
+            } else {
+                None
+            };
+            let event = Event {
+                target: entry.target(),
+                source_session: None,
+                provider: None,
+                directory: None,
+                destination: None,
+                evidence: Evidence {
+                    key: entry.evidence_key(),
+                    kind: Kind::ProposalCreated,
+                },
+                content,
             };
             event.validate()?;
             (entry, event)
@@ -429,5 +447,110 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn actual_journal_attribution_uses_creation_requester_and_basename_only_when_previews_are_enabled()
+     {
+        use crate::{
+            host::notifications::JournalTestBridge,
+            notifications::{Preferences, presentation},
+        };
+        for previews in [false, true] {
+            let (root, registry, first, _) = fixture();
+            registry
+                .lock()
+                .unwrap()
+                .resolve_automation_proposal(&first, None, 2)
+                .unwrap();
+            let proposal = registry
+                .lock()
+                .unwrap()
+                .propose_automation_with_requester(
+                    uuid::Uuid::new_v4(),
+                    Origin::User,
+                    first.requested.clone(),
+                    first.definition.clone(),
+                    first.target_identity.clone(),
+                    Some("Unrelated destination title".into()),
+                    Some("Planning conversation"),
+                    3,
+                )
+                .unwrap();
+            let entry = registry
+                .lock()
+                .unwrap()
+                .pending_proposal_notifications(1)
+                .unwrap()
+                .pop()
+                .unwrap();
+            let (handle, mut journal) =
+                JournalTestBridge::new(&root.path().join("attribution.sqlite3")).unwrap();
+            let mut transfer = Transfer::default();
+            transfer.advance(&registry, &handle).unwrap();
+            let events = journal.pending_events();
+            assert_eq!(events.len(), 1);
+            let event = &events[0];
+            assert_eq!(event.target, entry.target());
+            assert_eq!(event.evidence.key, entry.evidence_key());
+            let content = event.content.as_ref().unwrap();
+            assert!(
+                content
+                    .preview
+                    .contains("Requested by Planning conversation")
+            );
+            let basename = proposal
+                .definition
+                .agent
+                .target
+                .repository
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert!(content.preview.contains(&format!("Project {basename}")));
+            assert!(!content.preview.contains("Unrelated destination"));
+            assert!(!content.preview.contains(&proposal.definition.prompt));
+            assert!(
+                !content
+                    .preview
+                    .contains(root.path().parent().unwrap().to_str().unwrap())
+            );
+            assert!(
+                event.source_session.is_none()
+                    && event.provider.is_none()
+                    && event.directory.is_none()
+                    && event.destination.is_none()
+            );
+            let notice = journal
+                .commit_next(
+                    &Preferences {
+                        message_previews: previews,
+                        ..Preferences::default()
+                    },
+                    false,
+                )
+                .unwrap()
+                .unwrap();
+            let visible = presentation::message(&notice.event, previews);
+            if previews {
+                assert_eq!(notice.event.content, event.content);
+                assert!(visible.body.contains("Planning conversation"));
+                assert!(visible.body.contains(basename));
+            } else {
+                assert!(notice.event.content.is_none());
+                assert_eq!(visible.title, "Automation request created");
+                assert_eq!(visible.body, "Automation request created");
+            }
+            transfer.advance(&registry, &handle).unwrap();
+            assert!(
+                registry
+                    .lock()
+                    .unwrap()
+                    .pending_proposal_notifications(1)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 }

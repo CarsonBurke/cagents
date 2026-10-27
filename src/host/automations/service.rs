@@ -300,18 +300,36 @@ fn process_hosted(
         }
         _ => {}
     }
-    let directory = {
+    let (directory, requester) = {
         let host = host.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(chat) = host.chats.get(&source) {
-            chat.session.launch.recipe.working_directory.clone()
+            // Optional resident metadata only: never wait for naming, open the
+            // transcript, or make naming availability an admission condition.
+            let requester = if matches!(&request, Request::Propose { .. }) {
+                chat.handle
+                    .conversation_title()
+                    .ok()
+                    .and_then(|(_, title)| title)
+            } else {
+                None
+            };
+            (
+                chat.session.launch.recipe.working_directory.clone(),
+                requester,
+            )
         } else {
-            host.terminals
+            let terminal = host
+                .terminals
                 .get(&source)
-                .ok_or("The requesting session is no longer live")?
-                .session
-                .launch
-                .working_directory
-                .clone()
+                .ok_or("The requesting session is no longer live")?;
+            (
+                terminal.session.launch.working_directory.clone(),
+                if matches!(&request, Request::Propose { .. }) {
+                    terminal.conversation_title().map(str::to_owned)
+                } else {
+                    None
+                },
+            )
         }
     };
     let model = registry.lock().unwrap_or_else(|p| p.into_inner()).model()?;
@@ -340,7 +358,7 @@ fn process_hosted(
                 Ok::<_, String>(channel.title.clone())
             }).transpose()?;
             let proposal = registry.lock().unwrap_or_else(|p| p.into_inner())
-                .propose_automation(request, owner, requested, definition, identity, channel_title, now()?)?;
+                .propose_automation_with_requester(request, owner, requested, definition, identity, channel_title, requester.as_deref(), now()?)?;
             super::proposal_delivery::publish(host, &registry);
             super::wake(host);
             Ok(Response::Proposal(Box::new(proposal)))
