@@ -1910,6 +1910,8 @@ pub struct RepositoryRuntime {
     external_editors: Vec<crate::sidebar::SidebarEditor>,
     disk_stamp: Option<Option<crate::editor_reload::Stamp>>,
     disk_poll: Option<(u64, Instant)>,
+    disk_retry_after: Option<Instant>,
+    disk_retry_delay: Duration,
     next_disk_poll: u64,
     next_branch_refresh: u64,
     branch_refresh: Option<u64>,
@@ -2140,6 +2142,8 @@ impl RepositoryRuntime {
             external_editors: Vec::new(),
             disk_stamp: None,
             disk_poll: None,
+            disk_retry_after: None,
+            disk_retry_delay: Duration::from_secs(1),
             next_disk_poll: 0,
             next_branch_refresh: 0,
             branch_refresh: None,
@@ -4983,11 +4987,30 @@ impl RepositoryRuntime {
                 if document.active_save.is_some() { self.disk_poll = None; return Task::none(); }
                 let stamp = match result {
                     Ok(stamp) => stamp,
-                    Err(error) => { self.disk_poll = None; document.conflict = true; document.error = Some(format!("Could not check the file on disk: {error}")); return Task::none(); }
+                    Err(error) => {
+                        self.disk_poll = None;
+                        self.disk_retry_after = Some(Instant::now() + self.disk_retry_delay);
+                        self.disk_retry_delay = self.disk_retry_delay.saturating_mul(2).min(Duration::from_secs(30));
+                        document.conflict = true;
+                        document.error = Some(format!("Could not check the file on disk: {error}"));
+                        return Task::none();
+                    }
                 };
-                if self.disk_stamp == Some(stamp) { self.disk_poll = None; document.external_check_pending = false; return Task::none(); }
+                if self.disk_stamp == Some(stamp) {
+                    // A failed content read did not validate this stamp. Retry
+                    // it after backoff even when no further filesystem event arrives.
+                    if self.disk_retry_after.is_none_or(|deadline| Instant::now() < deadline) {
+                        self.disk_poll = None;
+                        document.external_check_pending = false;
+                        return Task::none();
+                    }
+                } else {
+                    self.disk_retry_delay = Duration::from_secs(1);
+                }
                 let Some(stamp) = stamp else {
                     self.disk_poll = None; self.disk_stamp = Some(None);
+                    self.disk_retry_after = None;
+                    self.disk_retry_delay = Duration::from_secs(1);
                     document.external_deleted = true; document.external_version = None; document.conflict = true;
                     document.error = Some("File deleted or renamed on disk. Your buffer has been kept.".into());
                     return Task::none();
@@ -5008,12 +5031,21 @@ impl RepositoryRuntime {
                 if document.disk_hash != baseline || document.active_save.is_some() { self.disk_stamp = None; return Task::none(); }
                 let version = match result {
                     Ok(version) => version,
-                    Err(error) => { document.conflict = true; document.error = Some(error); self.disk_stamp = Some(Some(stamp)); return Task::none(); }
+                    Err(error) => {
+                        document.conflict = true;
+                        document.error = Some(error);
+                        self.disk_stamp = Some(Some(stamp));
+                        self.disk_retry_after = Some(Instant::now() + self.disk_retry_delay);
+                        self.disk_retry_delay = self.disk_retry_delay.saturating_mul(2).min(Duration::from_secs(30));
+                        return Task::none();
+                    }
                 };
                 self.disk_stamp = Some(Some(stamp));
+                let recovered_read = self.disk_retry_after.take().is_some();
+                self.disk_retry_delay = Duration::from_secs(1);
                 match crate::editor_reload::decide(document.disk_hash, Some(version.content_hash), document.dirty) {
                     crate::editor_reload::Decision::Unchanged => {
-                        if document.external_version.is_some() || document.external_deleted {
+                        if recovered_read || document.external_version.is_some() || document.external_deleted {
                             document.external_version = None; document.external_deleted = false; document.conflict = false; document.error = None; self.disk_comparison = None;
                         }
                         Task::none()
@@ -6606,6 +6638,8 @@ impl RepositoryRuntime {
         self.selected = Some(file.clone());
         self.document = DocumentState::Loading;
         self.disk_stamp = None; self.disk_poll = None; self.disk_comparison = None;
+        self.disk_retry_after = None;
+        self.disk_retry_delay = Duration::from_secs(1);
         self.diffs.clear();
         self.basis_resolution = None;
         self.apply_diff_viewport(
@@ -12557,6 +12591,104 @@ mod tests {
         }
         assert!(!runtime.comparison_refresh_failed());
         assert_eq!(runtime.comparison_metadata.stamp.as_ref().unwrap().2, stamp);
+    }
+
+    #[test]
+    fn document_read_failures_retry_equal_stamps_and_clear_only_after_success() {
+        let before = "before\n";
+        for metadata_failure in [false, true] {
+            for after in [before, "changed outside\n"] {
+                for dirty in [false, true] {
+                    let root = tempfile::tempdir().unwrap();
+                    let path = Path::new("file.rs");
+                    std::fs::write(root.path().join(path), after).unwrap();
+                    let card = CardId::new();
+                    let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "file.rs", before);
+                    runtime.descriptor.worktree = root.path().to_path_buf();
+                    runtime.set_auto_save(false);
+                    if dirty {
+                        drop(runtime.update(RepositoryAction::EditorAction {
+                            card,
+                            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+                        }));
+                    }
+                    let edited = runtime.editor_text().unwrap();
+                    let identity = runtime.current_identity(card, path.to_path_buf());
+                    let stamp = crate::editor_reload::stamp(root.path(), path, path)
+                        .unwrap()
+                        .unwrap();
+                    runtime.disk_stamp = Some(Some(stamp));
+                    runtime.disk_poll = Some((1, Instant::now()));
+                    let failure = if metadata_failure {
+                        RepositoryAction::DiskMetadata {
+                            identity: identity.clone(),
+                            ticket: 1,
+                            result: Err("temporary stat failure".into()),
+                        }
+                    } else {
+                        RepositoryAction::DiskLoaded {
+                            identity: identity.clone(),
+                            ticket: 1,
+                            stamp,
+                            baseline: blake3::hash(before.as_bytes()),
+                            result: Err("temporary content failure".into()),
+                        }
+                    };
+                    drop(runtime.update(failure));
+                    assert!(
+                        matches!(&runtime.document, DocumentState::Editable(document) if document.conflict && document.error.is_some() && document.content.text() == edited)
+                    );
+                    assert_eq!(runtime.disk_retry_delay, Duration::from_secs(2));
+                    runtime.disk_poll = Some((2, Instant::now()));
+                    let backoff = runtime.update(RepositoryAction::DiskMetadata {
+                        identity: identity.clone(),
+                        ticket: 2,
+                        result: Ok(Some(stamp)),
+                    });
+                    assert!(iced::runtime::task::into_stream(backoff).is_none());
+                    assert!(runtime.disk_poll.is_none());
+                    // Advance only the test deadline; the actual file and stamp
+                    // stay fixed, and the normal content reader must recover them.
+                    runtime.disk_retry_after =
+                        Some(Instant::now().checked_sub(Duration::from_secs(1)).unwrap());
+                    runtime.disk_poll = Some((3, Instant::now()));
+                    let retry = runtime.update(RepositoryAction::DiskMetadata {
+                        identity,
+                        ticket: 3,
+                        result: Ok(Some(stamp)),
+                    });
+                    assert!(
+                        matches!(&runtime.document, DocumentState::Editable(document) if document.external_check_pending && document.conflict)
+                    );
+                    let loaded = find_output(retry);
+                    assert!(matches!(
+                        &loaded,
+                        RepositoryAction::DiskLoaded { result: Ok(_), .. }
+                    ));
+                    drop(runtime.update(loaded));
+                    let DocumentState::Editable(document) = &runtime.document else {
+                        panic!("buffer stays open");
+                    };
+                    assert!(!document.external_check_pending);
+                    assert_eq!(document.dirty, dirty);
+                    if dirty {
+                        assert_eq!(document.content.text(), edited);
+                        assert_eq!(document.conflict, after != before);
+                        assert_eq!(document.external_version.is_some(), after != before);
+                        assert_eq!(
+                            document.error.as_deref(),
+                            (after != before).then_some("File changed on disk")
+                        );
+                    } else {
+                        assert_eq!(document.content.text(), after);
+                        assert!(!document.conflict);
+                        assert!(document.error.is_none());
+                    }
+                    assert!(runtime.disk_retry_after.is_none());
+                    assert_eq!(runtime.disk_retry_delay, Duration::from_secs(1));
+                }
+            }
+        }
     }
 
     #[test]
