@@ -559,8 +559,9 @@ impl Project {
     /// display. Ordinary staging in a watched directory needs no inventory.
     /// A force-added ignored path or newly introduced submodule needs the
     /// existing row planner to repair coverage instead of growing a path cache.
-    /// The caller also replans an index-like metadata+untracked edge when its
-    /// status is truncated; a plain content edit must not force that census.
+    /// Invoke only for an index-like metadata+untracked edge. A plain content
+    /// edit must not force this census. Truncated status is uncertain, but an
+    /// already-polling row retains its explicit incomplete-coverage fallback.
     pub(crate) fn status_needs_replan(
         &self,
         record: &WorktreeRecord,
@@ -589,7 +590,8 @@ impl Project {
         // A capped predicate never establishes full coverage. An existing
         // polling reason already makes that limitation explicit; avoid
         // repeatedly rebuilding an equally capped plan on ordinary edits.
-        status.entries.len() > MAX_DIRECTORIES && worktree.polling.is_none()
+        (status.listing_truncated || status.entries.len() > MAX_DIRECTORIES)
+            && worktree.polling.is_none()
     }
 
     /// Reconcile an older worker plan with newer accepted row facts. This is
@@ -1962,6 +1964,73 @@ mod tests {
         foreign = record.clone();
         foreign.id = WorktreeId::new();
         assert!(ui.status_needs_replan(&foreign, &status));
+    }
+
+    #[test]
+    fn capped_index_status_repairs_covered_rows_but_keeps_explicit_polling_cheap() {
+        let mut plan = project(Path::new("/fixture"));
+        plan.directory_inventory = true;
+        let row = &plan.worktrees[0];
+        let record = WorktreeRecord {
+            id: row.id,
+            path: row.root.clone(),
+            created_at_unix_ms: None,
+            head_oid: None,
+            branch: row.branch.clone(),
+            detached: false,
+            bare: false,
+            lock: Default::default(),
+            prunable_reason: None,
+        };
+        // Forty thousand dirty rows can be ordinary staging in an already
+        // observed directory. The bounded sidebar projection is not complete.
+        let mut status = crate::repository::StatusSnapshot {
+            listing_truncated: true,
+            entries: (0..40_000)
+                .map(|i| crate::repository::ChangedPath {
+                    path: crate::repository::RepoPath::parse(format!("src/file{i}.rs")).unwrap(),
+                    old_path: None,
+                    area: crate::repository::ChangeArea::Staged,
+                    kind: crate::repository::ChangeKind::Modified,
+                    conflict: None,
+                    submodule: false,
+                    added_lines: None,
+                    removed_lines: None,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert!(
+            plan.status_needs_replan(&record, &status),
+            "previously covered rows conservatively repair uncertain status"
+        );
+        plan.worktrees[0].polling = Some("directory watch limit reached".into());
+        let before = plan.clone();
+        assert!(
+            !plan.status_needs_replan(&record, &status),
+            "ordinary staging must not rebuild an already capped inventory"
+        );
+        assert_eq!(
+            plan, before,
+            "predicate neither clears fallback nor grants full coverage"
+        );
+        // Any actually observed missing route or newly introduced submodule
+        // still repairs, even if the rest of that status was capped.
+        status.entries[0].path =
+            crate::repository::RepoPath::parse("ignored/deep/force-added.rs").unwrap();
+        assert!(plan.status_needs_replan(&record, &status));
+        status.entries[0].path = crate::repository::RepoPath::parse("src/new-module").unwrap();
+        status.entries[0].submodule = true;
+        assert!(plan.status_needs_replan(&record, &status));
+        status.entries.clear();
+        assert!(!plan.status_needs_replan(&record, &status));
+        plan.worktrees[0].polling = None;
+        assert!(
+            plan.status_needs_replan(&record, &status),
+            "even an empty truncated prefix cannot establish coverage"
+        );
+        status.listing_truncated = false;
+        assert!(!plan.status_needs_replan(&record, &status));
     }
 
     #[test]
