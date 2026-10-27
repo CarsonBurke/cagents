@@ -556,7 +556,7 @@ fn failed_pending_commit_retries_the_same_original_without_relaunching_or_retarg
     assert!(!failure.retryable);
     assert_eq!(
         failure.message,
-        "The original terminal worker is retained, but its exact pane completion was not confirmed: workspace registry layout does not match published schema 19"
+        "The original terminal worker is retained, but its exact pane completion was not confirmed: workspace registry layout does not match published schema 23"
     );
     let original = host.lock().unwrap().terminals[&session.id].handle.clone();
     assert!(!original.is_completed());
