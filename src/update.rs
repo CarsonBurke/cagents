@@ -2762,19 +2762,26 @@ finally:
         fixture.finish();
         // A replacement using the very same executable and proof text is
         // still another process: the held original pidfd/epoch must refuse it.
-        let mut fixture = start(&executable, false, true, 1);
+        let mut fixture = start(&executable, false, true, 2);
         let original = source::inspect_installed_identity().unwrap();
+        let same_owner = source::inspect_installed_identity().unwrap();
+        original.verify_same_owner(&same_owner).unwrap();
         fixture.finish();
-        let mut replacement = start(&executable, false, true, 0);
-        // Replacement serves no request; only its real lock/exe are inspected.
+        let mut replacement = start(&executable, false, true, 1);
+        let replacement_identity = source::inspect_installed_identity().unwrap();
         let owner = installed_daemon_owner(&window).unwrap().unwrap();
+        replacement_identity
+            .verify_owner(Some(&owner.version_root.join("bin/cagentsd")))
+            .unwrap();
+        // Fresh authentication succeeds, but it cannot renew the original
+        // process's authority even with the very same executable and proof.
+        assert!(original.verify_same_owner(&replacement_identity).is_err());
         assert!(
             original
                 .verify_owner(Some(&owner.version_root.join("bin/cagentsd")))
                 .is_err()
         );
-        // No connection to replacement was made: the original peer's pidfd
-        // and proof fence reject it before any header/DTO or mutation.
+        // Neither observation requests inventory, preparation or mutation.
         replacement.finish();
     }
 

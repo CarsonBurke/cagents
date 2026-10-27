@@ -276,6 +276,28 @@ pub(super) struct InstalledIdentity {
 }
 
 impl InstalledIdentity {
+    /// Check continuity of an already authenticated owner across an inspection.
+    /// This grants no new routing authority and does not renew either TTL: the
+    /// caller must separately authenticate the fresh observation's executable.
+    pub(super) fn verify_same_owner(&self, after: &Self) -> Result<(), UpdateError> {
+        match (&self.peer, &after.peer, &self.proof, &after.proof) {
+            (Some(before), Some(current), Some(proof), Some(after_proof))
+                if self.protocol == after.protocol
+                    && proof == after_proof
+                    && before.pid == current.pid
+                    && before.start == current.start
+                    && before.socket == current.socket =>
+            {
+                before.verify(proof)?;
+                current.verify(after_proof)?;
+                before.verify(proof)
+            }
+            _ => Err(invalid(
+                "The original installed source changed during update inspection",
+            )),
+        }
+    }
+
     pub(super) fn requires_matched_owner_worker(&self) -> bool {
         self.unqualified_executable.is_some()
     }

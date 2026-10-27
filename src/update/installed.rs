@@ -265,6 +265,7 @@ fn observe_installed_source(
         .as_ref()
         .map(|owner| owner.version_root.join("bin/cagentsd"));
     after.verify_owner(after_executable.as_deref())?;
+    source.verify_same_owner(&after)?;
     if after.protocol != source.protocol
         || after.proof != source.proof
         || after_executable != executable
