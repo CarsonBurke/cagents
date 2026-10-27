@@ -549,6 +549,7 @@ mod tests {
         drop(app.begin_sidebar_group_delete_from(SelectionRow::Channel(ids[1])));
         let dialog = app.sidebar_selection_ui.dialog.as_ref().unwrap();
         let old_presentation = dialog.presentation;
+        let old_backdrop = app.sidebar_selection_dialog_dismiss_message().unwrap();
         let primary = dialog.control_id(true, true);
         let cancel = dialog.control_id(false, true);
         assert_eq!(
@@ -603,6 +604,16 @@ mod tests {
                 .unwrap()
                 .presentation,
             current
+        );
+        assert_eq!(app.update(old_backdrop).units(), 0);
+        assert_eq!(
+            app.sidebar_selection_ui
+                .dialog
+                .as_ref()
+                .unwrap()
+                .presentation,
+            current,
+            "a queued backdrop dismissal cannot close a replacement group"
         );
         assert!(!app.channel_ui.deletion_running());
     }
@@ -687,6 +698,15 @@ impl Cagents {
             .dialog
             .as_ref()
             .map(|dialog| dialog.control_id(self.sidebar_selection_can_confirm(dialog), true))
+    }
+
+    pub(super) fn sidebar_selection_dialog_dismiss_message(&self) -> Option<Message> {
+        self.sidebar_selection_ui.dialog.as_ref().map(|dialog| {
+            Message::SidebarSelection(Action::Answer {
+                presentation: dialog.presentation,
+                confirm: false,
+            })
+        })
     }
 
     pub(super) fn visible_sidebar_rows(&self) -> Vec<SelectionRow> {

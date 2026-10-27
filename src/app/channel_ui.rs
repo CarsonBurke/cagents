@@ -346,6 +346,15 @@ impl Cagents {
             .map(|dialog| dialog.control_id(self.channel_dialog_can_confirm(dialog), true))
     }
 
+    pub(super) fn channel_dialog_dismiss_message(&self) -> Option<Message> {
+        self.channel_ui.dialog.as_ref().map(|dialog| {
+            Message::ChannelUi(Action::Answer {
+                presentation: dialog.presentation,
+                confirm: false,
+            })
+        })
+    }
+
     /// Utility panes and closed chats do not own the channel conversation name.
     pub(super) fn channel_primary_chat(&self, channel: &ProjectChannel) -> Option<CardId> {
         channel.cards.iter().copied().find(|id| {
@@ -1562,6 +1571,7 @@ mod tests {
         drop(app.handle_channel_ui(Action::RequestDelete(channel)));
         let dialog = app.channel_ui.dialog.as_ref().unwrap();
         let old_presentation = dialog.presentation;
+        let old_backdrop = app.channel_dialog_dismiss_message().unwrap();
         let stale_confirm = dialog.control_id(true, true);
         let cancel = dialog.control_id(false, true);
         let extra = app.durable.cards[0].id;
@@ -1603,6 +1613,12 @@ mod tests {
         assert_eq!(
             app.channel_ui.dialog.as_ref().unwrap().presentation,
             current
+        );
+        assert_eq!(app.update(old_backdrop).units(), 0);
+        assert_eq!(
+            app.channel_ui.dialog.as_ref().unwrap().presentation,
+            current,
+            "a queued backdrop dismissal cannot close a replacement presentation"
         );
         assert!(!app.channel_ui.deletion_running());
         app.chat_ui.image_viewer = Some(chat_ui::images::Gallery::file(
