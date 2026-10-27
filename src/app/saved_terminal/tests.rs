@@ -400,3 +400,121 @@ fn remote_user_keeps_its_existing_route_but_scoped_callers_cannot_fall_back_to_u
         "inherited remote scope must be captured and refused before bridge resolution"
     );
 }
+
+#[test]
+fn retained_startup_blocks_absence_but_keeps_exact_live_attachments_inspectable() {
+    let (_, _, source) = fixture();
+    let live = exact_live(&source);
+    let result = inspect_inventory(&source, &[descriptor(live.clone())], &proof(), || {
+        panic!("an exact available attachment must not request general startup readiness")
+    });
+    assert_eq!(result.unwrap(), Some(live));
+    assert!(
+        inspect_inventory(&source, &[], &proof(), || Err(
+            "retained startup ownership".into()
+        ))
+        .is_err()
+    );
+    let mut conflicting = exact_live(&source);
+    conflicting.launch.working_directory = PathBuf::from("/different-source");
+    assert!(
+        inspect_inventory(&source, &[descriptor(conflicting)], &proof(), || {
+            panic!("a source conflict cannot be converted into admitted absence")
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn an_issued_completed_descriptor_is_readable_without_inventing_an_exit() {
+    let (_, _, source) = fixture();
+    let result = inspect_inventory(&source, &[descriptor(source.clone())], &proof(), || {
+        panic!("the exact completed descriptor still permits an inspection attachment")
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(result, source);
+    assert!(matches!(
+        result.continuity,
+        TerminalContinuity::RelaunchAvailable {
+            last_exit: None,
+            ..
+        }
+    ));
+    assert!(
+        !terminal_ended(&result),
+        "readable completion evidence does not manufacture an exit record"
+    );
+}
+
+#[test]
+fn scoped_saved_controls_cannot_dispatch_user_commands_but_user_recovery_remains_available() {
+    let (mut app, card, source) = fixture();
+    let request = pending(&mut app, card, &source);
+    drop(app.update_saved_terminal(complete(card, source.clone(), request, Ok(None))));
+    app.saved_terminals
+        .entries
+        .get_mut(&card)
+        .unwrap()
+        .authority =
+        crate::agent_execution::Authority::session("synthetic-scoped-capability".into());
+    let original = app.durable.cards.clone();
+    for command in [
+        Command::Reconnect,
+        Command::Relaunch,
+        Command::Transcript,
+        Command::Folder,
+        Command::NewTerminal,
+        Command::Close,
+    ] {
+        assert!(!allows_command(
+            &app.saved_terminals.entries[&card].authority,
+            command
+        ));
+        let task = app.update_saved_terminal(Action::User {
+            card,
+            request,
+            command,
+        });
+        assert!(
+            iced::runtime::task::into_stream(task).is_none(),
+            "refused controls cannot enqueue a picker, bridge, launch, close or inspection"
+        );
+        assert_eq!(app.durable.cards, original);
+        assert!(!app.terminal_start_in_flight(card));
+    }
+    assert!(allows_command(
+        &app.saved_terminals.entries[&card].authority,
+        Command::CopyDetails
+    ));
+    app.saved_terminals
+        .entries
+        .get_mut(&card)
+        .unwrap()
+        .authority = crate::agent_execution::Authority::default();
+    for command in [
+        Command::Reconnect,
+        Command::Relaunch,
+        Command::Transcript,
+        Command::Folder,
+        Command::NewTerminal,
+        Command::Close,
+    ] {
+        assert!(allows_command(
+            &app.saved_terminals.entries[&card].authority,
+            command
+        ));
+    }
+    // Construct, but never poll, the ordinary User reinspection task.
+    let task = app.update_saved_terminal(Action::User {
+        card,
+        request,
+        command: Command::Relaunch,
+    });
+    assert!(iced::runtime::task::into_stream(task).is_some());
+    assert!(app.terminal_start_in_flight(card));
+    assert_eq!(
+        app.card_state(card).unwrap().kind,
+        CardKind::Terminal(source)
+    );
+}
