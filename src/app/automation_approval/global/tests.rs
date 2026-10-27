@@ -832,3 +832,156 @@ fn an_initial_delivery_error_keeps_a_rendered_retry_without_fabricating_a_count_
     assert!(!app.automation_approval_open());
     assert!(app.automation_approval.global.reviewed_identity.is_none());
 }
+
+#[test]
+fn proposal_discovery_has_no_time_based_subscription_even_when_focused_with_a_project() {
+    use crate::{model::ProjectKind, workspace_model::ModelProject};
+    use cosmic::iced::advanced::subscription::into_recipes;
+    let mut app = app();
+    for projects in [
+        vec![],
+        vec![ModelProject {
+            repository: "/fixture".into(),
+            name: "Visible project".into(),
+            kind: ProjectKind::Folder,
+            ordinal: 1,
+        }],
+    ] {
+        let snapshot = WorkspaceModel {
+            identity: app.workspace_model.identity,
+            sequence: app.workspace_model.sequence + 1,
+            projects,
+            ..WorkspaceModel::default()
+        };
+        drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(snapshot))));
+        for focused in [false, true] {
+            app.refresh_ui.focused = focused;
+            assert!(into_recipes(app.automation_approval_subscription()).is_empty());
+        }
+    }
+    assert!(
+        !app.sidebar_model.projects.is_empty(),
+        "the original focused/project timer condition is actually present"
+    );
+}
+
+#[test]
+fn foreign_project_watch_reads_reconnect_and_decision_receipts_refresh_the_global_badge_without_ticks()
+ {
+    use crate::{model::ProjectKind, workspace_model::ModelEdit, workspace_model::ModelProject};
+    let mut app = app();
+    let identity = app.workspace_model.identity;
+    let initial = flight(&app);
+    drop(complete(
+        &mut app,
+        initial,
+        Ok(delivery(identity, 1, 0, &[])),
+    ));
+    let snapshot = |sequence| WorkspaceModel {
+        identity,
+        sequence,
+        projects: vec![ModelProject {
+            repository: "/fixture".into(),
+            name: "Visible project".into(),
+            kind: ProjectKind::Folder,
+            ordinal: 1,
+        }],
+        ..WorkspaceModel::default()
+    };
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+            snapshot(2),
+        ))),
+    );
+    let current = flight(&app);
+    drop(complete(
+        &mut app,
+        current,
+        Ok(delivery(identity, 1, 0, &[])),
+    ));
+    app.refresh_ui.focused = false;
+    // This is the observer's actual pair for a ranked AgentsChanged edge:
+    // fold its metadata, then install the complete authoritative read. No Tick.
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Edited {
+            sequence: 3,
+            edit: ModelEdit::AgentsChanged,
+        })),
+    );
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+            snapshot(3),
+        ))),
+    );
+    let pushed = flight(&app);
+    assert!(matches!(pushed.2, Read::Delivery));
+    let mut foreign = proposal(901);
+    foreign.definition.agent.target.repository = "/other-project".into();
+    foreign.definition.agent.target.directory = "/other-project".into();
+    foreign.requested = foreign.definition.clone();
+    assert!(
+        app.sidebar_model
+            .projects
+            .iter()
+            .all(|project| project.repository != foreign.definition.agent.target.repository)
+    );
+    drop(complete(
+        &mut app,
+        pushed,
+        Ok(delivery(identity, 2, 1, &[foreign.clone()])),
+    ));
+    assert_eq!(app.automation_approval.global.total, Some(1));
+    assert_eq!(
+        app.automation_approval.global.pending,
+        vec![ProposalSummary::from(&foreign)]
+    );
+    assert!(app.global_proposal_banner().is_some());
+    assert!(!app.automation_approval_open(), "a push never steals focus");
+
+    drop(app.update(Message::WorkspaceModelObserved(
+        ModelUpdate::ProposalWatchLost,
+    )));
+    assert!(!app.automation_approval.global.connected);
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+            snapshot(3),
+        ))),
+    );
+    let reconnect = flight(&app);
+    assert!(matches!(reconnect.2, Read::Delivery));
+    drop(complete(
+        &mut app,
+        reconnect,
+        Ok(delivery(identity, 2, 1, &[foreign.clone()])),
+    ));
+    app.refresh_ui.focused = true;
+    open(&mut app, &foreign); // Actual exact scoped full-review handler.
+    let generation = app.automation_approval.generation;
+    let decision = app.update(Message::AutomationApproval(ApprovalAction::Decide {
+        id: foreign.id,
+        revision: foreign.revision,
+        generation,
+        approved: false,
+    }));
+    assert!(decision.units() > 0);
+    drop(decision); // The test supplies the correlated typed receipt, not IO.
+    let mut declined = foreign;
+    declined.state = ProposalState::Declined;
+    drop(
+        app.update(Message::AutomationApproval(ApprovalAction::Finished {
+            generation,
+            result: Arc::new(Ok(declined)),
+        })),
+    );
+    assert!(!app.automation_approval_open());
+    let after_decision = flight(&app);
+    assert!(matches!(after_decision.2, Read::Delivery));
+    drop(complete(
+        &mut app,
+        after_decision,
+        Ok(delivery(identity, 3, 0, &[])),
+    ));
+    assert_eq!(app.automation_approval.global.total, Some(0));
+    assert!(app.automation_approval.global.pending.is_empty());
+    assert!(app.automation_approval.global.flight.is_none());
+}

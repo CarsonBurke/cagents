@@ -129,12 +129,10 @@ impl Cagents {
     }
 
     pub(super) fn automation_approval_subscription(&self) -> Subscription<Message> {
-        if self.refresh_ui.focused && !self.sidebar_model.projects.is_empty() {
-            cosmic::iced::time::every(Duration::from_secs(2))
-                .map(|_| Message::AutomationApproval(Action::Tick))
-        } else {
-            Subscription::none()
-        }
+        // Initial snapshots, committed proposal watch edges, reconnect and
+        // decision receipts drive discovery. Explicit Refresh retries errors;
+        // an idle window never starts a periodic proposal reader.
+        Subscription::none()
     }
 
     pub(super) fn adopt_automation_approval_keyboard_nav(&mut self, restore: bool) -> bool {
