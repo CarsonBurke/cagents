@@ -10865,6 +10865,29 @@ impl Cagents {
             .map(|card| card.id)
     }
 
+    /// Sidebar file navigation follows an eligible focused browser. Other
+    /// callers of `repository_card_for`, including save completion, retain
+    /// their existing first-browser selection.
+    fn repository_panel_destination(&self, worktree: &Path) -> Option<CardId> {
+        self.workspace
+            .focused()
+            .filter(|focused| {
+                self.durable.cards.iter().any(|card| {
+                    card.id == *focused
+                        && card.existence.is_open()
+                        && self
+                            .durable
+                            .channels
+                            .iter()
+                            .find(|channel| channel.cards.contains(&card.id))
+                            .map(|channel| channel.id)
+                            == self.durable.active_channel
+                        && matches!(&card.kind, CardKind::Repository(view) if view.selected_file.is_none() && view.worktree == worktree)
+                })
+            })
+            .or_else(|| self.repository_card_for(worktree))
+    }
+
     /// Routes one panel row to the worktree's repository card.
     ///
     /// The card is opened if the worktree has none. Either way the navigation
@@ -10894,7 +10917,7 @@ impl Cagents {
                     .any(|row| row.path == *path && row.ignored)
             });
         let path = path.as_path().to_path_buf();
-        let task = match self.repository_card_for(&key.canonical_path) {
+        let task = match self.repository_panel_destination(&key.canonical_path) {
             Some(card) => {
                 self.pending_panel_open = Some(PendingPanelOpen {
                     card,
@@ -25978,9 +26001,37 @@ mod tests {
                 assert!(!runtime(&app, card).is_dirty());
             }
 
-            let task = app.update(Message::Repository(RepositoryAction::OpenFile {
-                card: clone,
-                path: "other.txt".into(),
+            // Drive the sidebar row, not a card-addressed repository action:
+            // the sidebar must choose the focused clone rather than the first
+            // browser, which is still the source.
+            let project = runtime(&app, clone).descriptor.project;
+            app.sidebar_model = SidebarModel::ready(
+                sidebar::SidebarMode::Expanded,
+                vec![SidebarProject::new(
+                    project,
+                    RepositoryId::new(),
+                    "clone navigation fixture".into(),
+                    fixture.root.join(".git"),
+                    vec![SidebarWorktree::from_durable(
+                        WorktreeId::new(),
+                        fixture.root.clone(),
+                        None,
+                    )],
+                    Vec::new(),
+                )],
+            );
+            assert!(app.sidebar_state.sync_active_worktree(
+                &app.sidebar_model,
+                &sidebar::SidebarFocus::Repository {
+                    worktree: fixture.root.clone(),
+                },
+            ));
+            let key = app.sidebar_state.active_worktree().unwrap().clone();
+            assert_eq!(app.repository_card_for(&fixture.root), Some(source));
+            assert_eq!(app.repository_panel_destination(&fixture.root), Some(clone));
+            let task = app.update(Message::Sidebar(SidebarAction::OpenFile {
+                key,
+                path: RepoPath::parse("other.txt").unwrap(),
             }));
             settle(&mut app, task).await;
             assert_eq!(
@@ -25996,6 +26047,73 @@ mod tests {
                 runtime(&app, source).editor_text(),
                 Some(fixture.text.clone())
             );
+
+            // Ineligible focus must preserve the existing first-browser
+            // fallback. None of these cases may retarget a fixed file or a
+            // pane belonging to another worktree/channel.
+            let eligible = app.card_state(clone).unwrap().clone();
+            for fixed_file in [true, false] {
+                let CardKind::Repository(view) = &mut app.card_state_mut(clone).unwrap().kind
+                else {
+                    panic!("repository clone");
+                };
+                if fixed_file {
+                    view.selected_file = Some("other.txt".into());
+                } else {
+                    view.worktree = fixture.root.join("different-worktree");
+                }
+                assert_eq!(
+                    app.repository_panel_destination(&fixture.root),
+                    Some(source)
+                );
+                *app.card_state_mut(clone).unwrap() = eligible.clone();
+            }
+            app.card_state_mut(clone).unwrap().kind = CardKind::Settings;
+            assert_eq!(
+                app.repository_panel_destination(&fixture.root),
+                Some(source)
+            );
+            *app.card_state_mut(clone).unwrap() = eligible.clone();
+            app.card_state_mut(clone).unwrap().existence = crate::model::Existence::Closing {
+                operation_id: crate::model::OperationId::new(),
+            };
+            assert_eq!(
+                app.repository_panel_destination(&fixture.root),
+                Some(source)
+            );
+            *app.card_state_mut(clone).unwrap() = eligible.clone();
+            Arc::make_mut(&mut app.durable)
+                .channels
+                .push(ProjectChannel {
+                    id: ChannelId::new(),
+                    project_id: project,
+                    title: "other channel".into(),
+                    title_source: Default::default(),
+                    ordinal: 0,
+                    shared: false,
+                    cards: vec![clone],
+                    focused: Some(clone),
+                });
+            assert_eq!(
+                app.repository_panel_destination(&fixture.root),
+                Some(source)
+            );
+            Arc::make_mut(&mut app.durable).channels.pop();
+            let position = app
+                .durable
+                .cards
+                .iter()
+                .position(|card| card.id == clone)
+                .unwrap();
+            Arc::make_mut(&mut app.durable).cards.remove(position);
+            assert_eq!(app.workspace.focused(), Some(clone));
+            assert_eq!(
+                app.repository_panel_destination(&fixture.root),
+                Some(source)
+            );
+            Arc::make_mut(&mut app.durable)
+                .cards
+                .insert(position, eligible);
 
             // Cloning location must not move or share the source's unsaved
             // buffer and navigation fence. It does not clone unsaved bytes.
