@@ -17989,7 +17989,10 @@ mod tests {
             generation: app.workspace_view_generation,
             event: WorkspaceViewportEvent::Resized(1_600.0),
         }));
-        assert_eq!(app.workspace.visibility(card), Some(VisibilityClass::Visible));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
         let target = chat_runtime(&app, card).target;
         let handle = chat_runtime(&app, card).handle().unwrap().clone();
         write(&mut app, card, "accepted ");
@@ -18035,7 +18038,10 @@ mod tests {
         // Hidden transcript-derived history is disposable. The daemon hydrates
         // it again only after the reader returns to the actual visible pane.
         return_to_chat(&mut app);
-        assert_eq!(app.workspace.visibility(card), Some(VisibilityClass::Visible));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
         let runtime = chat_runtime(&app, card);
         assert!(runtime.visible.load(Ordering::Relaxed));
         assert_eq!(runtime.target, target);
@@ -20900,11 +20906,11 @@ mod tests {
     /// either order, including when its chat never got as far as starting.
     #[test]
     fn a_channel_closes_when_its_last_pane_does() {
+        use super::super::workspace_model_sync::ModelUpdate;
         use crate::workspace_model::{
             ModelChannel, ModelEdit, ModelProject,
             views::{Pane, Scope, View},
         };
-        use super::super::workspace_model_sync::ModelUpdate;
 
         for (chat_first, chat_state) in [(true, 0), (true, 1), (true, 2), (false, 0), (false, 2)] {
             let mut app = crate::app::tests::context_inspector_test_app(true);
@@ -21014,13 +21020,19 @@ mod tests {
                 before_ack.push(edit);
             }
             assert!(
-                !before_ack.iter().any(|edit| matches!(edit, ModelEdit::RetireEmptyChannel { .. })),
+                !before_ack
+                    .iter()
+                    .any(|edit| matches!(edit, ModelEdit::RetireEmptyChannel { .. })),
                 "the occupied canonical view cannot authorize retirement: {before_ack:?}"
             );
 
             let mut settled = app.workspace_model.clone();
             settled.sequence = 11;
-            let view = settled.views.iter_mut().find(|view| view.scope == scope).unwrap();
+            let view = settled
+                .views
+                .iter_mut()
+                .find(|view| view.scope == scope)
+                .unwrap();
             view.panes.clear();
             view.retired = vec![terminal, chat];
             view.revision = 8;
@@ -21033,12 +21045,16 @@ mod tests {
             while let Ok(edit) = published.try_recv() {
                 after_ack.push(edit);
             }
-            let retire_requests = after_ack.iter().filter_map(|edit| match edit {
-                ModelEdit::RetireEmptyChannel { home, expected_view_revision } => {
-                    Some((*home, *expected_view_revision))
-                }
-                _ => None,
-            }).collect::<Vec<_>>();
+            let retire_requests = after_ack
+                .iter()
+                .filter_map(|edit| match edit {
+                    ModelEdit::RetireEmptyChannel {
+                        home,
+                        expected_view_revision,
+                    } => Some((*home, *expected_view_revision)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
             assert_eq!(retire_requests, vec![(home, 8)], "{after_ack:?}");
 
             // These are explicit App model-reply fixtures, not an executed
@@ -21052,7 +21068,9 @@ mod tests {
             // An authoritative no-work retirement reply removes that same Home.
             settled.sequence = 13;
             settled.channels.retain(|entry| entry.id != channel);
-            settled.views.retain(|view| view.scope != Scope::Channel(channel));
+            settled
+                .views
+                .retain(|view| view.scope != Scope::Channel(channel));
             drop(app.apply_workspace_model_update(ModelUpdate::Read(settled)));
             assert!(!channel_exists(&app));
             assert!(app.channel_ui.was_deleted(channel));
@@ -22257,6 +22275,212 @@ mod tests {
             );
             assert!(!app.chat_ui.removed_accounts.contains(&card));
         }
+    }
+
+    #[test]
+    fn confirmed_account_replacement_retires_only_predecessor_attention_without_acknowledging_it() {
+        use crate::agent::ActivityState;
+
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        app.refresh_ui.focused = false;
+        let old_target = chat_runtime(&app, card).target;
+        let old_handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let mut source = chat_runtime(&app, card).session.clone();
+        source
+            .launch
+            .recipe
+            .environment
+            .insert("CODEX_HOME".into(), "/removed-account".into());
+        app.install_chat_session(card, source.clone());
+        let other = crate::app::tests::terminal_card_state();
+        let unrelated = other.id;
+        Arc::make_mut(&mut app.durable).cards.push(other);
+        app.sidebar_state.observe_card_update(unrelated);
+        let old_notice = uuid::Uuid::new_v4();
+        let journal = |id, session| crate::notifications::Snapshot {
+            diagnostic: None,
+            notices: vec![crate::notifications::Notice {
+                id,
+                delivered: true,
+                acknowledged: false,
+                window: None,
+                event: crate::notifications::Event {
+                    content: None,
+                    target: crate::notifications::Target::Session(session),
+                    source_session: Some(session),
+                    provider: Some(Provider::Codex),
+                    directory: Some(source.launch.recipe.working_directory.clone()),
+                    destination: None,
+                    evidence: crate::notifications::Evidence {
+                        key: "account-replacement-unread".into(),
+                        kind: crate::notifications::Kind::Succeeded,
+                    },
+                },
+            }],
+        };
+        let old_journal = journal(old_notice, source.id);
+        drop(
+            app.update(Message::NotificationUi(notification_ui::Action::Snapshot(
+                old_journal.clone(),
+            ))),
+        );
+        assert!(old_handle.observe_activity_for_test(ActivityState::Waiting));
+        drop(app.update(Message::ChatUi(Action::Wake(old_target, Wake::Activity))));
+        let waiting = Activity {
+            provider: Provider::Codex,
+            state: ActivityState::Waiting,
+        };
+        assert_eq!(app.sidebar_state.card_activity(card), Some(waiting));
+        assert!(app.sidebar_state.has_card_update(card));
+        // Metadata on the same UUID must not spend that actor's attention.
+        let mut metadata = source.clone();
+        metadata.proof = None;
+        app.install_chat_session(card, metadata);
+        assert_eq!(app.sidebar_state.card_activity(card), Some(waiting));
+        assert!(app.sidebar_state.has_card_update(card));
+        app.install_chat_session(card, source.clone());
+
+        let directory = tempfile::tempdir().unwrap();
+        let (writer, _) = crate::session::SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("account-attention"),
+        )
+        .unwrap();
+        app.session = Some(writer);
+        app.persist();
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(10))
+            .unwrap();
+        app.chat_forget(card);
+        app.cards.insert(card, CardRuntime::Loading);
+        drop(app.open_chat(card, source.clone(), chat::Intent::Restore));
+        let target = chat_runtime_attempt(&app, card);
+        answer_start(
+            &mut app,
+            target,
+            Err(chat::StartFailure {
+                message: "The saved account was removed".into(),
+                recovery: chat::Recovery::Account,
+            }),
+        );
+        assert!(app.chat_ui.removed_accounts.contains(&card));
+        assert!(app.sidebar_state.has_card_update(card));
+        let activity_before = app.sidebar_state.card_activity(card);
+        let system = Account::system(Provider::Codex).id();
+        // Failed and wrong-conversation candidates never install a new source.
+        for wrong_thread in [false, true] {
+            drop(app.update(Message::ChatUi(Action::RecoverAccount(
+                card,
+                system.clone(),
+            ))));
+            let target = chat_runtime_attempt(&app, card);
+            assert_ne!(app.chat_ui.attempt(card).unwrap().session.id, source.id);
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(source.clone())
+            );
+            assert_eq!(app.sidebar_state.card_activity(card), activity_before);
+            assert!(app.sidebar_state.has_card_update(card));
+            if wrong_thread {
+                let handle = fixture_handle(&app, card, Some("different-conversation"));
+                answer_start(&mut app, target, Ok(handle));
+            } else {
+                answer_start(
+                    &mut app,
+                    target,
+                    Err(chat::StartFailure::retry("fixture refusal")),
+                );
+            }
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(source.clone())
+            );
+            assert_eq!(app.sidebar_state.card_activity(card), activity_before);
+            assert!(app.sidebar_state.has_card_update(card));
+            assert!(!app.notification_ui.acknowledged_for_test(old_notice));
+            let retirement = retired(&mut app, card);
+            drop(app.update(Message::ChatUi(Action::Retired(retirement, Ok(())))));
+        }
+        let focused = app.workspace.focused();
+        let durable_focused = app.durable.focused;
+        drop(app.update(Message::ChatUi(Action::RecoverAccount(card, system))));
+        let target = chat_runtime_attempt(&app, card);
+        // The existing handle fixture supplies the confirmed session; the
+        // ordered writer and AccountCommitted path are real, not a forged ACK.
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        let replacement = handle.session();
+        assert_ne!(replacement.id, source.id);
+        let task = app.update(Message::ChatUi(Action::Ready(
+            target,
+            Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+        )));
+        assert!(app.chat_start_pending(card));
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(source.clone())
+        );
+        assert_eq!(app.sidebar_state.card_activity(card), activity_before);
+        assert!(app.sidebar_state.has_card_update(card));
+        let reply = account_commit_reply(task);
+        assert!(matches!(
+            &reply,
+            Message::ChatUi(Action::AccountCommitted(_, _, Ok(())))
+        ));
+        let store = app.session.as_ref().unwrap().operation_store();
+        assert_eq!(
+            store.load_card(card, None).unwrap().unwrap().kind,
+            CardKind::Chat(replacement.clone())
+        );
+        // Even a genuinely committed receipt has not installed the UI identity
+        // until the normal reducer accepts that exact completion.
+        assert!(app.sidebar_state.has_card_update(card));
+        drop(app.update(reply));
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(replacement.clone())
+        );
+        assert_eq!(replacement.launch.session_id, source.launch.session_id);
+        assert!(!app.chat_start_pending(card));
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert_eq!(
+            app.sidebar_state.card_activity(card),
+            Some(Activity {
+                provider: Provider::Codex,
+                state: ActivityState::Idle,
+            })
+        );
+        assert!(app.sidebar_state.has_card_update(unrelated));
+        assert_eq!(app.workspace.focused(), focused);
+        assert_eq!(app.durable.focused, durable_focused);
+        assert!(!app.notification_ui.acknowledged_for_test(old_notice));
+        let current_target = chat_runtime(&app, card).target;
+        drop(app.update(Message::ChatUi(Action::Wake(old_target, Wake::Activity))));
+        assert_eq!(chat_runtime(&app, card).target, current_target);
+        drop(
+            app.update(Message::NotificationUi(notification_ui::Action::Snapshot(
+                old_journal,
+            ))),
+        );
+        assert!(
+            !app.sidebar_state.has_card_update(card),
+            "late predecessor news cannot rebind"
+        );
+        assert!(!app.notification_ui.acknowledged_for_test(old_notice));
+        let fresh_notice = uuid::Uuid::new_v4();
+        drop(
+            app.update(Message::NotificationUi(notification_ui::Action::Snapshot(
+                journal(fresh_notice, replacement.id),
+            ))),
+        );
+        assert!(
+            app.sidebar_state.has_card_update(card),
+            "current actor news remains usable"
+        );
+        assert!(app.sidebar_state.has_card_update(unrelated));
+        assert!(!app.notification_ui.acknowledged_for_test(fresh_notice));
     }
 
     /// A conversation an earlier version started for a chat nobody wrote in

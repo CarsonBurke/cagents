@@ -1381,6 +1381,128 @@ mod tests {
     }
 
     #[test]
+    fn exact_receipts_reopen_only_consumed_full_queue_slots_and_retire_courier_candidates() {
+        let (mut registry, _directory) = registry();
+        let recipient = Lineage(TerminalId::new());
+        let other = Lineage(TerminalId::new());
+        let senders = [Lineage(TerminalId::new()), Lineage(TerminalId::new())];
+        let query = Inbox {
+            all: false,
+            replies_to: None,
+        };
+        let mut original = Vec::new();
+        let mut unrelated = Vec::new();
+        for index in 0..MAX_PENDING {
+            let entry = message(party(senders[index % 2]), party(recipient), index as u64);
+            registry.post_message(&entry).unwrap();
+            original.push(entry.id);
+            let entry = message(party(senders[0]), party(other), index as u64);
+            registry.post_message(&entry).unwrap();
+            unrelated.push(entry.id);
+        }
+        let assert_full = |registry: &mut Registry, to| {
+            let refusal = registry
+                .post_message(&message(party(senders[0]), party(to), 10_000))
+                .unwrap_err();
+            assert!(refusal.contains("messages waiting"), "{refusal}");
+        };
+        assert_full(&mut registry, recipient);
+        assert_full(&mut registry, other);
+
+        let peeked = registry.peek_messages(Some(recipient), &query).unwrap();
+        assert_eq!(
+            peeked.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            original
+        );
+        assert!(peeked.iter().all(|entry| entry.state == State::Pending));
+        assert_full(&mut registry, recipient);
+
+        // A received batch can be partial. Noncontiguous exact IDs also make an
+        // accidental count-only or range-based settlement observable below.
+        let receipt = Receipt {
+            ids: vec![
+                original[0],
+                original[MAX_PENDING / 2],
+                original[MAX_PENDING - 1],
+            ],
+        };
+        let session = TerminalId::new();
+        registry
+            .acknowledge_messages(Some(recipient), Some(session), &receipt, 100)
+            .unwrap();
+        for id in &receipt.ids {
+            let settled = registry.message(*id).unwrap().unwrap();
+            assert_eq!(settled.state, State::Read);
+            assert_eq!(settled.to.session, Some(session));
+        }
+        let mut expected: Vec<_> = original
+            .into_iter()
+            .filter(|id| !receipt.ids.contains(id))
+            .collect();
+        assert_eq!(
+            registry
+                .peek_messages(Some(recipient), &query)
+                .unwrap()
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for index in 0..receipt.ids.len() {
+            let entry = message(party(senders[1]), party(recipient), 200 + index as u64);
+            registry.post_message(&entry).unwrap();
+            expected.push(entry.id);
+        }
+        assert_full(&mut registry, recipient);
+        assert_full(&mut registry, other);
+
+        // A repeated read receipt cannot buy more capacity or settle newer mail.
+        registry
+            .acknowledge_messages(Some(recipient), Some(session), &receipt, 300)
+            .unwrap();
+        assert_full(&mut registry, recipient);
+
+        // Walk every courier candidate, since selection returns only the oldest
+        // pending message per lineage. No provider or live mailbox is involved.
+        let mut courier_ids = Vec::new();
+        for _ in 0..MAX_PENDING {
+            let next = registry
+                .deliverable_messages(400)
+                .unwrap()
+                .0
+                .into_iter()
+                .find(|entry| entry.to.lineage == Some(recipient))
+                .expect("every unconsumed message remains courier-eligible");
+            assert!(!receipt.ids.contains(&next.id));
+            assert!(registry.deliver_message(next.id, session, 400).unwrap());
+            courier_ids.push(next.id);
+        }
+        assert_eq!(courier_ids, expected);
+        assert!(
+            registry
+                .deliverable_messages(400)
+                .unwrap()
+                .0
+                .iter()
+                .all(|entry| entry.to.lineage != Some(recipient))
+        );
+        let other_pending = registry.peek_messages(Some(other), &query).unwrap();
+        assert_eq!(
+            other_pending
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            unrelated
+        );
+        assert!(
+            other_pending
+                .iter()
+                .all(|entry| entry.state == State::Pending)
+        );
+        assert_full(&mut registry, other);
+    }
+
+    #[test]
     fn a_recipient_holds_a_bounded_queue_and_old_messages_are_pruned() {
         let (mut registry, _directory) = registry();
         let b = Lineage(TerminalId::new());

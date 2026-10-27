@@ -101,10 +101,10 @@ use crate::{
     location::SanitizedLocation,
     lsp::{LspCoordinates, LspDocumentId, LspError, LspEvent, LspManager, LspPosition, LspStatus},
     model::{
-        CardId, CardKind, CardState, ChannelId, Existence, Exposure, HostSessionProof, LaunchRecipe,
-        ProjectId, ProjectKind, ProjectState, RepositoryView, Residency, RuntimeError,
-        TerminalContinuity, TerminalExit, TerminalId, TerminalSession, WorkspaceDestination,
-        WorkspaceState, WorktreeState,
+        CardId, CardKind, CardState, ChannelId, Existence, Exposure, HostSessionProof,
+        LaunchRecipe, ProjectId, ProjectKind, ProjectState, RepositoryView, Residency,
+        RuntimeError, TerminalContinuity, TerminalExit, TerminalId, TerminalSession,
+        WorkspaceDestination, WorkspaceState, WorktreeState,
     },
     pull_request_review,
     repository::{
@@ -2562,6 +2562,8 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
         RepositoryAction::FilesLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
             | RepositoryAction::FileLoadedAt { .. }
+            | RepositoryAction::DocumentChanged { .. }
+            | RepositoryAction::DocumentReloaded { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::SaveFinished { .. }
@@ -2949,7 +2951,7 @@ pub enum SettingsField {
     BrowserSearchUrl,
     EditorFontFamily,
     EditorFontSize,
-    TerminalScrollbackLines,
+    TerminalScrollbackMib,
     ManagedWorktreeDirectory,
     AutoDeleteMergedWorktrees,
     WorktreeSort,
@@ -3081,7 +3083,7 @@ impl SettingsField {
             Self::WorkStaleAfterDays => "Stale after (days)",
             Self::TerminalFontSize => "Font size",
             Self::TerminalFontFamily => "Font family",
-            Self::TerminalScrollbackLines => "Scrollback lines",
+            Self::TerminalScrollbackMib => "Scrollback (MiB)",
             Self::ManagedWorktreeDirectory => "Managed worktree directory",
             Self::WorktreeSort => "Worktree order",
             Self::DefaultWorktreePane => "Default worktree pane",
@@ -3168,7 +3170,7 @@ impl SettingsField {
             | Self::TerminalTheme
             | Self::TerminalFontSize
             | Self::TerminalFontFamily
-            | Self::TerminalScrollbackLines
+            | Self::TerminalScrollbackMib
             | Self::ConfirmTerminalClose
             | Self::ConfirmMultilinePaste
             | Self::RelaunchAgentsOnUpgrade => SettingsCategory::Terminal,
@@ -3360,7 +3362,7 @@ struct SettingsDraft {
     editor_font_size: String,
     confirm_multiline_paste: bool,
     browser_search_url: String,
-    terminal_scrollback_lines: String,
+    terminal_scrollback_mib: String,
     managed_worktree_directory: String,
     auto_delete_merged_worktrees: bool,
     worktree_sort: String,
@@ -3416,7 +3418,7 @@ impl SettingsDraft {
                 .editor_font_size
                 .map(|size| size.to_string())
                 .unwrap_or_default(),
-            terminal_scrollback_lines: settings.terminal_scrollback_lines.to_string(),
+            terminal_scrollback_mib: settings.terminal_scrollback_mib.to_string(),
             managed_worktree_directory: settings.managed_worktree_directory.clone(),
             auto_delete_merged_worktrees: settings.auto_delete_merged_worktrees,
             worktree_sort: match settings.worktree_sort {
@@ -3471,7 +3473,7 @@ impl SettingsDraft {
             SettingsField::BrowserSearchUrl => self.browser_search_url = value,
             SettingsField::EditorFontFamily => self.editor_font_family = value,
             SettingsField::EditorFontSize => self.editor_font_size = value,
-            SettingsField::TerminalScrollbackLines => self.terminal_scrollback_lines = value,
+            SettingsField::TerminalScrollbackMib => self.terminal_scrollback_mib = value,
             SettingsField::ManagedWorktreeDirectory => self.managed_worktree_directory = value,
             SettingsField::AutoDeleteMergedWorktrees => {
                 self.auto_delete_merged_worktrees = value == "true"
@@ -3893,9 +3895,9 @@ fn settings_update(
             next.terminal_font_family = value.to_owned();
             Ok(())
         }
-        SettingsField::TerminalScrollbackLines => value
+        SettingsField::TerminalScrollbackMib => value
             .parse::<usize>()
-            .map(|value| next.terminal_scrollback_lines = value)
+            .map(|value| next.terminal_scrollback_mib = value)
             .map_err(|_| "Terminal scrollback must be a whole number.".to_owned()),
         SettingsField::ManagedWorktreeDirectory => {
             next.managed_worktree_directory = value.to_owned();
@@ -4046,9 +4048,9 @@ fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
             "{label} must be 1–{} lines.",
             settings::MAX_TERMINAL_SCROLL_SIZE
         ),
-        SettingsField::TerminalScrollbackLines => format!(
-            "Scrollback must be 0–{} lines.",
-            grouped_digits(settings::MAX_TERMINAL_SCROLLBACK_LINES)
+        SettingsField::TerminalScrollbackMib => format!(
+            "Scrollback must be 0–{} MiB.",
+            grouped_digits(settings::MAX_TERMINAL_SCROLLBACK_MIB)
         ),
         SettingsField::MaxHotCards => format!("{label} must be a whole number, at least 1."),
         SettingsField::HibernationDelayMs => {
@@ -6050,7 +6052,7 @@ impl Cagents {
     fn terminal_config(&self, visible: bool) -> TerminalConfig {
         TerminalConfig {
             initially_visible: visible,
-            max_scrollback: self.settings.terminal_scrollback_lines,
+            max_scrollback_bytes: self.settings.terminal_scrollback_mib * 1024 * 1024,
             theme: self.effective_terminal_theme(),
             ..TerminalConfig::default()
         }
@@ -6060,10 +6062,8 @@ impl Cagents {
         let width = if self.workspace.cards().is_empty() {
             // The welcome view has no WorkspaceSurface to replace the startup
             // width estimate. Use the window's current bounds until one mounts.
-            let sidebar = sidebar::effective_width(
-                self.projects_sidebar_mode(),
-                self.settings.sidebar_width,
-            );
+            let sidebar =
+                sidebar::effective_width(self.projects_sidebar_mode(), self.settings.sidebar_width);
             let inspector = if matches!(
                 self.context_inspector_mount(),
                 Some(InspectorLayout::Docked)
@@ -7446,6 +7446,12 @@ impl Cagents {
         if unchanged {
             return None;
         }
+        if self.card_state(card).is_some_and(
+            |state| matches!(&state.kind, CardKind::Chat(current) if current.id != session.id),
+        ) {
+            // An accepted identity replacement retires attribution, not journal news.
+            self.sidebar_state.forget_card_attention(card);
+        }
         let conversion = self
             .card_state(card)
             .is_some_and(|state| !matches!(state.kind, CardKind::Chat(_)));
@@ -7573,6 +7579,8 @@ impl Cagents {
     }
 
     fn agent_worktree(&self, card: CardId) -> Option<ActiveWorktreeKey> {
+        #[cfg(test)]
+        terminal_output_tests::record_owner_resolution();
         let state = self
             .card_state(card)
             .filter(|state| state.existence.is_open())?;
@@ -8377,6 +8385,9 @@ impl Cagents {
         }
         self.status = None;
         if let Some((expected_terminal_id, _)) = &terminal_replacement {
+            // A fresh actor must not inherit its predecessor's sidebar news.
+            // Retiring that attribution does not acknowledge the old journal.
+            self.sidebar_state.forget_card_attention(card);
             // The ended identity's final-screen outcome is spent.
             self.retained_outputs.remove(expected_terminal_id);
         }
@@ -9142,8 +9153,10 @@ impl Cagents {
                 // the end replays the activity it once reported, which must
                 // not bring a finished agent's row back to life.
                 TerminalEvent::AgentActivityChanged(activity) => {
-                    if ended_terminal(self.card_state(card)).is_none() {
-                        metadata_changed |= self.sidebar_state.card_activity(card) != activity;
+                    if ended_terminal(self.card_state(card)).is_none()
+                        && self.sidebar_state.card_activity(card) != activity
+                    {
+                        metadata_changed = true;
                         self.observe_agent_activity_for_card(card, activity);
                     }
                 }
@@ -9309,8 +9322,10 @@ impl Cagents {
                 CardRuntime::Terminal(handle) => handle.agent_activity(),
                 _ => None,
             });
-            metadata_changed |= self.sidebar_state.card_activity(card) != activity;
-            self.observe_agent_activity_for_card(card, activity);
+            if self.sidebar_state.card_activity(card) != activity {
+                metadata_changed = true;
+                self.observe_agent_activity_for_card(card, activity);
+            }
         }
         // Attention follows semantic agent transitions, not ordinary terminal output.
         if durable_changed {
@@ -14307,7 +14322,11 @@ impl Application for Cagents {
             Message::HostedTerminalsObserved(terminals) => {
                 self.observe_hosted_descriptors(terminals)
             }
-            Message::WorkspaceModelObserved(update) => self.apply_workspace_model_update(update),
+            Message::WorkspaceModelObserved(update) => {
+                let (task, changed) = self.apply_workspace_model_update_effect(update);
+                terminal_metadata_unchanged = !changed;
+                task
+            }
             Message::TerminalStarted {
                 card,
                 terminal,
@@ -17779,6 +17798,16 @@ impl Application for Cagents {
             )
             .map(Message::Lsp),
         );
+        subscriptions.extend(
+            self.cards
+                .iter()
+                .filter_map(|(&card, runtime)| match runtime {
+                    CardRuntime::Repository(runtime) => {
+                        Some(runtime.document_subscription(card).map(Message::Repository))
+                    }
+                    _ => None,
+                }),
+        );
         subscriptions.extend(operation_subscriptions);
         if let Some(window) = self.core.main_window_id()
             && (self.workspace.is_animating() || self.context_inspector_transition.is_some())
@@ -18996,6 +19025,37 @@ fn unix_millis() -> i64 {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_scrollback_settings_draft_reaches_runtime_as_bytes() {
+        let mut app = context_inspector_test_app(false);
+        assert_eq!(app.settings.terminal_scrollback_mib, 16);
+        for mib in [0, 16, 32, settings::MAX_TERMINAL_SCROLLBACK_MIB] {
+            let SettingsDecision::Persist(next) = settings_update(
+                &app.settings,
+                SettingsField::TerminalScrollbackMib,
+                &mib.to_string(),
+            ) else {
+                panic!("valid MiB setting must persist")
+            };
+            let draft = SettingsDraft::from_settings(&next);
+            assert_eq!(draft.terminal_scrollback_mib, mib.to_string());
+            app.settings = next;
+            let config = app.terminal_config(false);
+            assert!(!config.initially_visible);
+            assert_eq!(config.max_scrollback_bytes, mib * 1024 * 1024);
+            assert_eq!(
+                crate::terminal::TerminalSpawnOptions::from(config).max_scrollback_bytes,
+                mib * 1024 * 1024
+            );
+        }
+        for invalid in ["-1", "1025", "18446744073709551615"] {
+            assert!(matches!(
+                settings_update(&app.settings, SettingsField::TerminalScrollbackMib, invalid),
+                SettingsDecision::Invalid(_)
+            ));
+        }
+    }
+
     #[test]
     fn completed_push_observation_warning_preserves_known_completion() {
         let notice = super::push_report(Ok(crate::repository::PushOutcome::OutcomeUnknown {
@@ -24516,10 +24576,24 @@ mod tests {
         drop(app.initialize_runtimes());
         assert_eq!(
             app.terminal_starts_in_flight(),
-            0,
-            "ordinary offscreen lifecycle stays deferred"
+            1,
+            "the identified Omp agent already observes background metadata"
         );
+        assert!(app.terminal_start_in_flight(terminals[1].id));
+        assert!(!app.terminal_start_in_flight(terminals[0].id));
+        assert!(!app.terminal_start_in_flight(terminals[2].id));
         assert!(app.restored_agent_attaches.is_empty());
+        let CardKind::Terminal(omp) = &terminals[1].kind else {
+            unreachable!()
+        };
+        drop(app.update(Message::RestoredAgentAttached {
+            card: terminals[1].id,
+            terminal: omp.id,
+            result: Ok(None),
+        }));
+        assert_eq!(app.terminal_starts_in_flight(), 0);
+        // An unavailable original remains unqualified; the explicit startup
+        // check then uses the same serial attach-only path for every owner.
         drop(app.qualify_startup_terminals());
         assert_eq!(app.terminal_starts_in_flight(), 1);
         assert_eq!(app.restored_agent_attaches.len(), 2);
@@ -27760,6 +27834,7 @@ mod tests {
         // says so far better than an unwrap would.
         if let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) {
             let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
                 .build()
                 .expect("executor");
             while let Some(action) = executor.block_on(stream.next()) {
@@ -27900,6 +27975,62 @@ mod tests {
         assert_eq!(
             focused(&app, ready),
             Some(repository_widget::editor_focus_id(pane))
+        );
+    }
+
+    #[test]
+    fn fresh_editor_load_returns_keyboard_without_saved_navigation() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("notes.txt"), "fresh source\n").unwrap();
+        let (mut app, pane) = editing_repository_app();
+        let view = RepositoryView {
+            project: ProjectId::new(),
+            repository: directory.path().into(),
+            worktree: directory.path().into(),
+            selected_file: None,
+        };
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .iter_mut()
+            .find(|card| card.id == pane)
+            .unwrap()
+            .kind = CardKind::Repository(view.clone());
+        let mut runtime = RepositoryRuntime::new_directory(view);
+        // This is the public action emitted after sidebar navigation resolves
+        // its file list, without saved caret or viewport metadata.
+        let load = runtime.update(RepositoryAction::OpenFile {
+            card: pane,
+            path: "notes.txt".into(),
+        });
+        app.cards
+            .insert(pane, CardRuntime::Repository(Box::new(runtime)));
+        app.window_width = 1900.0;
+        let update = app.workspace.resize_viewport(1200.0);
+        drop(app.apply_viewport(update, false, false));
+        assert!(app.card_holds_keyboard(pane));
+        let placeholder = app.card_header_widget_id(pane);
+        let mut messages = cosmic::iced::runtime::task::into_stream(load).unwrap();
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut tasks = Vec::new();
+        let mut completed_read = false;
+        while let Some(action) = executor.block_on(messages.next()) {
+            if let cosmic::iced::runtime::Action::Output(action) = action {
+                completed_read |= matches!(&action, RepositoryAction::FileLoadedAt { .. });
+                tasks.push(app.update(Message::Repository(action)));
+            }
+        }
+        assert!(
+            completed_read,
+            "the actual file worker must answer the open"
+        );
+        let initial = iced::widget::operation::focus(placeholder).map(cosmic::Action::App);
+        assert_eq!(
+            focused(&app, initial.chain(Task::batch(tasks))),
+            Some(repository_widget::editor_focus_id(pane)),
+            "a freshly opened editor must receive typing without a body click"
         );
     }
 
@@ -30289,8 +30420,8 @@ mod tests {
             "Scroll size must be 1–10 lines."
         );
         assert_eq!(
-            refusal(SettingsField::TerminalScrollbackLines, "1000001"),
-            "Scrollback must be 0–1,000,000 lines."
+            refusal(SettingsField::TerminalScrollbackMib, "1025"),
+            "Scrollback must be 0–1,024 MiB."
         );
         assert_eq!(
             refusal(SettingsField::TerminalFontFamily, "F".repeat(129).as_str()),
