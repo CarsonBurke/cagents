@@ -20998,7 +20998,7 @@ mod tests {
             task: Task<RepositoryAction>,
         ) {
             let mut element = controls(card, runtime);
-            tree.diff(element.as_widget());
+            tree.diff(element.as_widget_mut());
             let node = element.as_widget_mut().layout(
                 tree,
                 renderer,
@@ -21036,7 +21036,7 @@ mod tests {
             hit: Option<usize>,
         ) -> Vec<RepositoryAction> {
             let mut element = controls(card, runtime);
-            tree.diff(element.as_widget());
+            tree.diff(element.as_widget_mut());
             let bounds = iced::Rectangle::with_size(iced::Size::new(640.0, 480.0));
             let node = element.as_widget_mut().layout(
                 tree,
