@@ -4988,6 +4988,18 @@ impl RepositoryRuntime {
         });
     }
 
+    /// Closes the language server's copy without changing the reader's Find
+    /// state. A same-document replacement reopens that protocol document while
+    /// keeping the query, options and keyboard focus in the mounted strip.
+    fn push_lsp_close_notification(&mut self) {
+        self.flush_lsp_change();
+        self.lsp_edits.clear();
+        self.lsp_edits_exact = true;
+        if matches!(&self.document, DocumentState::Editable(_)) {
+            self.lsp_intents.push(LspIntent::Close);
+        }
+    }
+
     /// Records that the open buffer is about to stop existing.
     ///
     /// Conditioned on there being an editable buffer rather than on
@@ -4996,12 +5008,7 @@ impl RepositoryRuntime {
     /// would drop the close of a document opened and abandoned between two
     /// drains, and leak that session.
     fn push_lsp_close(&mut self) {
-        self.flush_lsp_change();
-        self.lsp_edits.clear();
-        self.lsp_edits_exact = true;
-        if matches!(&self.document, DocumentState::Editable(_)) {
-            self.lsp_intents.push(LspIntent::Close);
-        }
+        self.push_lsp_close_notification();
         // The buffer the strip was searching is going away, and a strip left
         // mounted over the next one would hold it in search mode while
         // counting occurrences of a query nobody typed for it.
@@ -6091,7 +6098,7 @@ impl RepositoryRuntime {
                     {
                         self.pending_editor_navigation = Some((identity.path.clone(), editor));
                     }
-                    self.push_lsp_close();
+                    self.push_lsp_close_notification();
                     self.dismiss_editor_results();
                     self.diffs.retain(|(basis, _)| basis.is_immutable());
                 }

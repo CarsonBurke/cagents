@@ -295,6 +295,8 @@ async fn clean_reload_invalidates_revision_zero_find_cache() {
     std::fs::write(&path, "needle erased").unwrap();
     text(card, &mut runtime, "needle erased").await;
     assert!(old_key != runtime.find_cache);
+    assert!(runtime.find_is_open());
+    assert_eq!(runtime.find_query, "needle");
     assert_eq!(runtime.find_total, 1);
     assert!(runtime.take_restored_editor_focus(card).is_none());
 
