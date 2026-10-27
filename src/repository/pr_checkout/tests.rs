@@ -671,6 +671,90 @@ fn dirty_or_locally_ahead_checkout_refuses_and_preserves_every_edit() {
 }
 
 #[test]
+fn hidden_submodule_edits_refuse_checkout_advance_without_changing_display_preferences() {
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(
+            hidden_submodule_edits_refuse_checkout_advance_without_changing_display_preferences
+        )
+    )) {
+        return;
+    }
+    for untracked in [false, true] {
+        let fixture = Fixture::new(true);
+        let source = fixture.temporary.path().join("submodule-source");
+        fs::create_dir(&source).unwrap();
+        run_git(&source, &["init", "--initial-branch=main"]);
+        fs::write(source.join("tracked"), "original child\n").unwrap();
+        run_git(&source, &["add", "tracked"]);
+        run_git(&source, &["commit", "-qm", "child"]);
+        run_git(
+            &fixture.root,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                source.to_str().unwrap(),
+                "module",
+            ],
+        );
+        run_git(&fixture.root, &["commit", "-qam", "add child"]);
+        run_git(&fixture.root, &["push", "origin", "feature"]);
+        run_git(&fixture.root, &["config", "submodule.module.ignore", "all"]);
+        let cancellation = CancellationToken::default();
+        assert!(
+            !fixture
+                .service
+                .status_for_removal(&fixture.root, &cancellation)
+                .unwrap()
+                .dirty
+                .is_dirty(),
+            "a genuinely clean submodule must not block safety admission"
+        );
+        let original = git_text(&fixture.root, &["rev-parse", "HEAD"]);
+        let new = fixture.advance(|root| fs::write(root.join("file"), "PR\n").unwrap());
+        let child = fixture.root.join("module");
+        let local = child.join(if untracked { "private-note" } else { "tracked" });
+        fs::write(&local, "preserve local child data\n").unwrap();
+        assert!(
+            !fixture
+                .service
+                .status(&fixture.root, &cancellation)
+                .unwrap()
+                .dirty
+                .is_dirty(),
+            "ordinary status must retain the user's ignore preference"
+        );
+        let complete = fixture
+            .service
+            .status_for_removal(&fixture.root, &cancellation)
+            .unwrap();
+        assert_eq!(complete.dirty.submodule, 1);
+        assert!(complete.dirty.is_dirty());
+        assert!(
+            fixture
+                .service
+                .prepare_existing_pr_checkout(&fixture.request(new), &cancellation)
+                .unwrap_err()
+                .detail
+                .contains("local changes")
+        );
+        assert_eq!(fs::read(&local).unwrap(), b"preserve local child data\n");
+        assert_eq!(fs::read(fixture.root.join("file")).unwrap(), b"old\n");
+        assert_eq!(git_text(&fixture.root, &["rev-parse", "HEAD"]), original);
+        assert_eq!(
+            git_text(
+                &fixture.root,
+                &["config", "--get", "submodule.module.ignore"]
+            ),
+            "all"
+        );
+    }
+}
+
+#[test]
 fn same_oid_branch_switch_at_effect_is_refused_under_native_ref_locks() {
     if isolated_fixture_case(concat!(
         module_path!(),
