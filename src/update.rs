@@ -2667,7 +2667,7 @@ sys.exit(7)
         other_reply.extend_from_slice(b"opaque-unqualified-source-dto");
         let script = root.join("source.py");
         fs::write(&script, r#"
-import fcntl,json,os,socket,struct,sys,time
+import concurrent.futures,fcntl,json,os,socket,struct,sys,threading,time
 from pathlib import Path
 c=json.loads(Path(sys.argv[1]).read_text());s=Path(c['socket']);lock=s.with_name('cagentsd.lock')
 deadline=time.monotonic()+15
@@ -2676,13 +2676,10 @@ if c['held']: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
 json.dump(dict(pid=os.getpid(),proof=c['proof']),f);f.flush();os.fsync(f.fileno())
 listener=socket.socket(socket.AF_UNIX);listener.bind(str(s));listener.listen(2);listener.settimeout(.05)
 Path(c['ready']).write_text(str(os.getpid()))
-count=0;impacts=0
-try:
- while not Path(c['release']).exists():
-  assert time.monotonic()<deadline
-  try: stream,_=listener.accept()
-  except TimeoutError: continue
-  with stream:
+count=0;impacts=0;counts=threading.Lock()
+def serve(stream):
+ global count,impacts
+ with stream:
    stream.settimeout(5)
    def read(n):
     data=b''
@@ -2691,18 +2688,33 @@ try:
     return data
    n=struct.unpack('>I',read(4))[0];assert n<=1024*1024
    assert read(n).hex()==c['connect']
-   count+=1;assert count<=c['connections']
+   with counts:
+    count+=1;assert count<=c['connections']
    reply=bytes.fromhex(c['reply']);stream.sendall(struct.pack('>I',len(reply))+reply)
    first=stream.recv(1)
    if first:
     n=struct.unpack('>I',first+read(3))[0];assert n<=1024*1024
     assert c['impact_request'] is not None, 'entry must not preview/prepare/stop'
-    assert read(n).hex()==c['impact_request'];impacts+=1;assert impacts==1
+    assert read(n).hex()==c['impact_request']
+    with counts:
+     impacts+=1;assert impacts==1
     if c['impact_reply'] is not None:
      reply=bytes.fromhex(c['impact_reply']);stream.sendall(struct.pack('>I',len(reply))+reply)
      assert stream.recv(1)==b'', 'preview must never prepare/stop'
- assert count==c['connections']
- assert impacts==int(c['impact_request'] is not None)
+try:
+ # Like the real daemon, keep the impact connection alive while accepting
+ # the observer's independent fresh owner-authentication connections.
+ with concurrent.futures.ThreadPoolExecutor(max_workers=8) as workers:
+  pending=[]
+  while not Path(c['release']).exists():
+   assert time.monotonic()<deadline
+   try: stream,_=listener.accept()
+   except TimeoutError: continue
+   assert len(pending)<c['connections'], 'unexpected source connection'
+   pending.append(workers.submit(serve,stream))
+  for worker in pending: worker.result()
+  assert count==c['connections']
+  assert impacts==int(c['impact_request'] is not None)
 finally:
  listener.close();f.close();s.unlink();lock.unlink()
 "#).unwrap();
