@@ -704,7 +704,12 @@ fn saved_first_prompt_keeps_exact_whitespace_and_original_images_before_later_ed
 /// separate acceptance requirement.
 #[test]
 fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
-    for wake_before_ack in [true, false] {
+    // Fresh Claude emits Ready before a native Session frame. Keep the original
+    // already-confirmed case, and also clear the first command while identity
+    // is still absent: neither an ID nor a pending command protects that pane.
+    for (late_native_identity, wake_before_ack) in
+        [(false, true), (false, false), (true, true), (true, false)]
+    {
         use crate::app::workspace_model_sync::ModelUpdate;
         use crate::workspace_model::{
             ModelChannel, ModelEdit,
@@ -788,7 +793,7 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
             card,
             Snapshot {
                 ready: true,
-                session_id: Some("first-send-native-thread".into()),
+                session_id: (!late_native_identity).then(|| "first-send-native-thread".into()),
                 ..Snapshot::default()
             },
         );
@@ -801,25 +806,34 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
         let command = pending.id;
         drop(app.apply_workspace_model_update(ModelUpdate::Read(empty.clone())));
         assert_eq!(runtime(&app, card).pending.as_ref().unwrap().id, command);
+        let accepted_snapshot = Snapshot {
+            ready: true,
+            busy: true,
+            session_id: Some("first-send-native-thread".into()),
+            items: vec![Arc::new(chat::Item {
+                id: "original-user-item".into(),
+                role: chat::Role::User,
+                content: chat::ItemContent::Text {
+                    text: "one original prompt".into(),
+                    thinking: false,
+                    phase: Default::default(),
+                },
+                started_at: None,
+                at: None,
+            })],
+            ..Snapshot::default()
+        };
         super::show_chat_snapshot_for_test(
             &mut app,
             card,
-            Snapshot {
-                ready: true,
-                busy: true,
-                session_id: Some("first-send-native-thread".into()),
-                items: vec![Arc::new(chat::Item {
-                    id: "original-user-item".into(),
-                    role: chat::Role::User,
-                    content: chat::ItemContent::Text {
-                        text: "one original prompt".into(),
-                        thinking: false,
-                        phase: Default::default(),
-                    },
-                    started_at: None,
-                    at: None,
-                })],
-                ..Snapshot::default()
+            if late_native_identity {
+                Snapshot {
+                    ready: true,
+                    busy: true,
+                    ..Snapshot::default()
+                }
+            } else {
+                accepted_snapshot.clone()
             },
         );
         if wake_before_ack {
@@ -832,6 +846,32 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
         assert!(runtime(&app, card).pending.is_none());
         assert!(runtime(&app, card).queued.is_none());
         assert!(!app.shared_chat_has_local_work(card));
+        if late_native_identity {
+            assert!(runtime(&app, card).session.launch.session_id.is_none());
+            drop(app.apply_workspace_model_update(ModelUpdate::Read(empty.clone())));
+            let unconfirmed = runtime(&app, card);
+            assert!(Arc::ptr_eq(unconfirmed.handle().unwrap(), &handle));
+            assert_eq!(unconfirmed.session.id, actor);
+            assert!(unconfirmed.session.launch.session_id.is_none());
+            assert!(unconfirmed.pending.is_none() && unconfirmed.queued.is_none());
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert_eq!(app.workspace.focused(), Some(card));
+            let saved = app.persistent_workspace();
+            assert!(!saved.local_only_cards.contains(&card));
+            assert_eq!(
+                saved
+                    .channels
+                    .iter()
+                    .find(|entry| entry.id == channel)
+                    .unwrap()
+                    .cards,
+                vec![card]
+            );
+            // Only the later first-turn fixture snapshot confirms native ID;
+            // no second submission or replacement actor may be needed.
+            super::show_chat_snapshot_for_test(&mut app, card, accepted_snapshot);
+            drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Changed))));
+        }
         // This is the second failure predicate: the first command no longer
         // protects the pane, and the provider is still busy with the original turn.
         drop(app.apply_workspace_model_update(ModelUpdate::Read(empty.clone())));
