@@ -3,6 +3,8 @@
 import os
 from pathlib import Path
 import platform
+import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -12,6 +14,38 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = "9.9.9"
+
+
+def provisioned_runtime_packages():
+    source = (ROOT / "scripts/prepare-release-smoke-rootfs").read_text()
+    parts = source.split("<<'PROVISION'\n")
+    if len(parts) != 2 or "\nPROVISION\n" not in parts[1]:
+        raise ValueError("expected one literal provisioning heredoc")
+    lines = parts[1].split("\nPROVISION\n", 1)[0].splitlines()
+    installs = []
+    for index, line in enumerate(lines):
+        if not line.startswith("apt-get "):
+            continue
+        command = line
+        while command.endswith("\\"):
+            index += 1
+            if index >= len(lines):
+                raise ValueError("unterminated provisioning apt command")
+            command = command[:-1] + lines[index]
+        arguments = shlex.split(command)
+        if "install" in arguments:
+            installs.append(arguments)
+    if len(installs) != 1:
+        raise ValueError("expected one provisioning apt install command")
+    arguments = installs[0]
+    if arguments[:4] != ["apt-get", "-o", "Dir::Bin::dpkg=/usr/local/sbin/cagents-dpkg", "install"]:
+        raise ValueError("unsupported provisioning apt install prefix")
+    if arguments[4:6] != ["--yes", "--no-install-recommends"]:
+        raise ValueError("unsupported provisioning apt install options")
+    packages = arguments[6:]
+    if not packages or any(not re.fullmatch(r"[a-z0-9][a-z0-9+.-]*", name) for name in packages):
+        raise ValueError("expected literal provisioning package names")
+    return set(packages)
 
 
 def native_package_host_supported():
@@ -84,6 +118,7 @@ class PackageDependencies(unittest.TestCase):
             raise unittest.SkipTest("Linux x86_64 glibc and dpkg-deb are required")
 
     def test_only_integrated_package_requires_egl(self):
+        runtime_packages = provisioned_runtime_packages()
         with tempfile.TemporaryDirectory(dir="/var/tmp", prefix="cagents-package-deps-") as temporary:
             work = Path(temporary)
             tools = work / "tools"
@@ -131,6 +166,20 @@ class PackageDependencies(unittest.TestCase):
                     dependencies = {dependency.strip() for dependency in metadata.split(",")}
                     self.assertEqual("libegl1" in dependencies, variant == "full")
                     self.assertEqual("xdg-utils" in dependencies, variant == "browserless")
+                    # Keep preparation self-contained for every declared runtime
+                    # package instead of relying on incidental apt transitivity.
+                    required_packages = set()
+                    for dependency in dependencies:
+                        match = re.fullmatch(
+                            r"([a-z0-9][a-z0-9+.-]*)(?: \((?:<<|<=|=|>=|>>) [^()\s]+\))?",
+                            dependency,
+                        )
+                        self.assertIsNotNone(match, f"unsupported Debian dependency: {dependency}")
+                        required_packages.add(match.group(1))
+                    self.assertEqual(
+                        required_packages - runtime_packages, set(),
+                        f"{variant} runtime dependencies missing from rootfs provisioning",
+                    )
 
 
 if __name__ == "__main__":
