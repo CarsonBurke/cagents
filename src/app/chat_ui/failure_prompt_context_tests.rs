@@ -220,6 +220,70 @@ fn distinct_prompt_carriers_keep_identical_errors_and_exact_original_sources() {
         assert_eq!(runtime.failure_details(&incident.key).as_deref(), Some(raw));
     }
     assert_eq!(runtime.snapshot.items.len(), 6);
+
+    // Normalizing the multipart parent must not absorb simultaneous children
+    // whose separate scoped provider carriers report the exact same body.
+    let child = |id: &str| chat::Subagent {
+        id: id.into(),
+        kind: "reviewer".into(),
+        description: "Synthetic child failure".into(),
+        model: None,
+        status: chat::ToolStatus::Failed,
+        waiting: false,
+        detail: raw.into(),
+        background: true,
+        items: vec![Arc::new(error("child-error:0"))],
+    };
+    let original_parent = runtime.snapshot.items.clone();
+    let mut children = (*handle.snapshot()).clone();
+    children.generation += 1;
+    children.subagents = vec![child("child-a"), child("child-b")];
+    handle.publish_snapshot_for_test(children);
+    runtime.refresh();
+    assert_eq!(
+        runtime.failure_ui.incidents.len(),
+        4,
+        "two parent message scopes and two distinct child scopes must all survive"
+    );
+    assert_eq!(
+        runtime
+            .failure_ui
+            .incidents
+            .iter()
+            .filter(|incident| incident.child_scope.is_none())
+            .count(),
+        2
+    );
+    for id in ["child-a", "child-b"] {
+        let incidents: Vec<_> = runtime
+            .failure_ui
+            .incidents
+            .iter()
+            .filter(|incident| incident.child_scope.as_deref() == Some(id))
+            .collect();
+        assert_eq!(
+            incidents.len(),
+            1,
+            "each child's exact item/detail echo joins only that child"
+        );
+        assert_eq!(
+            runtime.failure_details(&incidents[0].key).as_deref(),
+            Some(raw)
+        );
+    }
+    let keys: HashSet<_> = runtime
+        .failure_ui
+        .incidents
+        .iter()
+        .map(|incident| &incident.key)
+        .collect();
+    assert_eq!(keys.len(), 4);
+    assert!(
+        original_parent
+            .iter()
+            .zip(&runtime.snapshot.items)
+            .all(|(a, b)| Arc::ptr_eq(a, b))
+    );
 }
 
 #[test]
