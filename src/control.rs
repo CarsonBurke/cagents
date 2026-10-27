@@ -23,6 +23,8 @@ mod agents;
 mod channel_work;
 mod channels;
 mod chat;
+#[cfg(test)]
+mod project_channel_authority_tests;
 pub use chat::ChatCommand;
 mod format;
 pub use agents::AgentCommand;
@@ -2188,6 +2190,17 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
+    run_from_with_staged_lookup(arguments, crate::install_guard::staged_owner_bin)
+}
+
+fn run_from_with_staged_lookup<I, T>(
+    arguments: I,
+    mut staged_lookup: impl FnMut(&Path, bool) -> io::Result<Option<PathBuf>>,
+) -> ExitCode
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
     let arguments = arguments.into_iter().map(Into::into).collect::<Vec<_>>();
     let wants_json = arguments
         .iter()
@@ -2326,12 +2339,16 @@ where
         );
         return ExitCode::FAILURE;
     }
-    if !crate::device::is_remote() && routes_to_staged_owner(&cli.command) {
+    // Retain legacy write scope before installer recovery or an older CLI can
+    // handle the command. Reads and explicit-authority ChannelWork keep their
+    // original routing; a scoped legacy write uses this client's selected host.
+    let project_channel_context =
+        legacy_model_command_mutates(&cli.command).then(ProjectChannelContext::capture);
+    if !crate::device::is_remote()
+        && routes_to_staged_owner_as(&cli.command, project_channel_context.as_ref())
+    {
         let recover = !no_start && staged_command_requires_daemon(&cli.command);
-        match crate::install_guard::staged_owner_bin(
-            &std::env::current_exe().unwrap_or_default(),
-            recover,
-        ) {
+        match staged_lookup(&std::env::current_exe().unwrap_or_default(), recover) {
             Ok(Some(bin)) => {
                 use std::os::unix::process::CommandExt;
                 let mut command =
@@ -2387,7 +2404,7 @@ where
             return ExitCode::FAILURE;
         }
     }
-    match execute(cli.command) {
+    match execute_with_model_context(cli.command, project_channel_context) {
         Ok(output) => {
             let code = output.exit_code();
             emit_success(cli.json, output);
@@ -2450,6 +2467,13 @@ pub fn staged_ui_executable() -> io::Result<Option<PathBuf>> {
 }
 
 fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
+    execute_with_model_context(command, None)
+}
+
+fn execute_with_model_context(
+    command: TopCommand,
+    project_channel_context: Option<ProjectChannelContext>,
+) -> Result<CommandOutput, AppError> {
     match command {
         TopCommand::Completions { shell } => Ok(completions::execute(shell)),
         TopCommand::Diagnostics => {
@@ -2540,8 +2564,14 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
         } => launch_ui(new_window, window.as_deref(), source.as_deref()),
         TopCommand::Daemon { command } => execute_daemon(command),
         TopCommand::Terminal { command } => execute_terminal(command),
-        TopCommand::Project { command } => execute_project(command),
-        TopCommand::Channel { command } => execute_channel(command),
+        TopCommand::Project { command } => match project_channel_context {
+            Some(context) => execute_project_as(command, &context),
+            None => execute_project(command),
+        },
+        TopCommand::Channel { command } => match project_channel_context {
+            Some(context) => execute_channel_as(command, &context),
+            None => execute_channel(command),
+        },
         TopCommand::UpdateWorker { job_id } => {
             crate::update::run_worker(&job_id).map_err(|error| AppError::new("update", error))?;
             Ok(CommandOutput {
@@ -3456,6 +3486,111 @@ fn protocol_error(error: ControlError) -> AppError {
     }
 }
 
+/// Caller scope for the legacy shared-model CLI verbs. ChannelWork carries
+/// its own explicit authority and never enters this connection path.
+struct ProjectChannelContext {
+    authority: Authority,
+    remote: bool,
+    no_start: bool,
+}
+
+impl ProjectChannelContext {
+    fn capture() -> Self {
+        Self {
+            authority: Authority::from_environment(),
+            remote: crate::device::is_remote(),
+            no_start: daemon_autostart_disabled(),
+        }
+    }
+
+    fn connect(&self, mutation: bool) -> Result<ControlClient, AppError> {
+        self.connect_with(
+            mutation,
+            || {
+                if self.authority.token().is_some() {
+                    daemon_socket_path().map_err(|error| AppError::new("socket_path", error))
+                } else {
+                    // Keep the ordinary User's existing --no-start absence and
+                    // ownership checks, rather than weakening them to connect.
+                    control_daemon_socket()
+                }
+            },
+            control_daemon_socket,
+            ControlClient::connect,
+        )
+    }
+
+    fn admit_remote(&self) -> Result<(), AppError> {
+        if self.authority.token().is_some() && self.remote {
+            return Err(AppError::new(
+                "permission_denied",
+                "Project and channel commands from an agent session require your own terminal on the remote device",
+            ));
+        }
+        Ok(())
+    }
+
+    fn connect_with(
+        &self,
+        mutation: bool,
+        existing: impl FnOnce() -> Result<PathBuf, AppError>,
+        ready: impl FnOnce() -> Result<PathBuf, AppError>,
+        connect: impl FnOnce(&Path) -> Result<ControlClient, ControlError>,
+    ) -> Result<ControlClient, AppError> {
+        let scoped = self.authority.token().is_some();
+        self.admit_remote()?;
+        let socket = if scoped || self.no_start {
+            existing()?
+        } else {
+            ready()?
+        };
+        let mut client =
+            connect(&socket).map_err(|error| AppError::new("daemon_connection", error))?;
+        // Lists are deliberately global reads, including for an invalid or
+        // empty inherited capability. Only legacy mutations bind the stream.
+        if scoped && mutation {
+            client
+                .authenticate(self.authority.clone())
+                .map_err(protocol_error)?;
+        }
+        Ok(client)
+    }
+}
+
+fn legacy_model_command_mutates(command: &TopCommand) -> bool {
+    match command {
+        TopCommand::Project { command } => project_command_mutates(command),
+        TopCommand::Channel { command } => channel_command_mutates(command) == Some(true),
+        _ => false,
+    }
+}
+
+fn routes_to_staged_owner_as(
+    command: &TopCommand,
+    context: Option<&ProjectChannelContext>,
+) -> bool {
+    routes_to_staged_owner(command)
+        && !(legacy_model_command_mutates(command)
+            && context.is_some_and(|context| context.authority.token().is_some()))
+}
+
+fn project_command_mutates(command: &ProjectCommand) -> bool {
+    match command {
+        ProjectCommand::Open { .. } | ProjectCommand::Close { .. } => true,
+        ProjectCommand::List => false,
+    }
+}
+
+fn channel_command_mutates(command: &ChannelCommand) -> Option<bool> {
+    match command {
+        ChannelCommand::Spawn { .. }
+        | ChannelCommand::Move { .. }
+        | ChannelCommand::Close { .. } => Some(true),
+        ChannelCommand::List { .. } => Some(false),
+        ChannelCommand::Work { .. } => None,
+    }
+}
+
 /// Runs a shared-project verb against the daemon's registry.
 ///
 /// A project is a registry row rather than a window instruction, exactly as a
@@ -3465,6 +3600,25 @@ fn protocol_error(error: ControlError) -> AppError {
 /// `EditWorkspaceModel`, which carry whichever [`ModelEdit`] the verb means, so
 /// the wire protocol and the daemon's handler are untouched.
 fn execute_project(command: ProjectCommand) -> Result<CommandOutput, AppError> {
+    let context = ProjectChannelContext::capture();
+    execute_project_as(command, &context)
+}
+
+fn execute_project_as(
+    command: ProjectCommand,
+    context: &ProjectChannelContext,
+) -> Result<CommandOutput, AppError> {
+    // Remote path discovery can itself resolve a bridge; refuse its captured
+    // local-session scope before filesystem or device discovery as well.
+    context.admit_remote()?;
+    execute_project_with(command, |mutation| context.connect(mutation))
+}
+
+fn execute_project_with(
+    command: ProjectCommand,
+    connect: impl FnOnce(bool) -> Result<ControlClient, AppError>,
+) -> Result<CommandOutput, AppError> {
+    let mutation = project_command_mutates(&command);
     // Reject invalid filesystem paths before starting a daemon. The shared
     // registry then takes precedence over fresh Git discovery for open folders.
     let selected = match &command {
@@ -3473,9 +3627,7 @@ fn execute_project(command: ProjectCommand) -> Result<CommandOutput, AppError> {
         }
         ProjectCommand::List => None,
     };
-    let socket = control_daemon_socket()?;
-    let mut client = ControlClient::connect(&socket)
-        .map_err(|error| AppError::new("daemon_connection", error))?;
+    let mut client = connect(mutation)?;
     let model = selected
         .map(|_| client.read_workspace_model())
         .transpose()
@@ -3665,6 +3817,24 @@ fn execute_channel(command: ChannelCommand) -> Result<CommandOutput, AppError> {
         ChannelCommand::Work { command } => return channel_work::execute(command),
         command => command,
     };
+    let context = ProjectChannelContext::capture();
+    execute_channel_as(command, &context)
+}
+
+fn execute_channel_as(
+    command: ChannelCommand,
+    context: &ProjectChannelContext,
+) -> Result<CommandOutput, AppError> {
+    context.admit_remote()?;
+    execute_channel_with(command, |mutation| context.connect(mutation))
+}
+
+fn execute_channel_with(
+    command: ChannelCommand,
+    connect: impl FnOnce(bool) -> Result<ControlClient, AppError>,
+) -> Result<CommandOutput, AppError> {
+    let mutation = channel_command_mutates(&command)
+        .expect("ChannelWork is dispatched before legacy channel execution");
     // Reject invalid filesystem paths before starting a daemon. The shared
     // registry then takes precedence over fresh Git discovery for open folders.
     let selected = match &command {
@@ -3674,9 +3844,7 @@ fn execute_channel(command: ChannelCommand) -> Result<CommandOutput, AppError> {
         } => Some(project_directory(Some(path.clone()))?),
         _ => None,
     };
-    let socket = control_daemon_socket()?;
-    let mut client = ControlClient::connect(&socket)
-        .map_err(|error| AppError::new("daemon_connection", error))?;
+    let mut client = connect(mutation)?;
     let model = selected
         .map(|_| client.read_workspace_model())
         .transpose()
