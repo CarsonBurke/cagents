@@ -102,6 +102,21 @@ fn current_projection_rebinds_real_paired_native_owner_without_relaunch() {
     fixture.assert_one_provider();
     // Reattach through the same supported Host path after read-only inspection.
     restore(&fixture.host, CLIENT, &published).unwrap();
+    {
+        let state = fixture.host.lock().unwrap();
+        // Attaching the native chat did not attach observer 0 to its PTY.
+        // Cleanup must use authenticated ownership, not change that observer.
+        let observer = state.descriptor(0, issued.id).unwrap();
+        assert!(matches!(
+            &observer.session.continuity,
+            TerminalContinuity::DetachedSameBoot { .. }
+        ));
+        let projected = state.native_terminal_projection(issued.id).unwrap();
+        assert_eq!(published.terminal.as_ref(), Some(&projected));
+        assert_ne!(observer.session, projected);
+        assert!(!observer.upgrade_sources.contains(&projected));
+        assert_eq!(state.terminals[&issued.id].session, raw);
+    }
     // A successfully published Local attachment is committed: ordinary close
     // retires the original provider, rather than merely dropping the socket.
     crate::host::chat::process(
@@ -114,6 +129,167 @@ fn current_projection_rebinds_real_paired_native_owner_without_relaunch() {
         || !provider.is_current(),
         "ordinary close did not retire original provider",
     );
+}
+
+#[test]
+fn retained_close_refuses_changed_pair_fields_and_unissued_sources() {
+    if isolated("retained_close_refuses_changed_pair_fields_and_unissued_sources") {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    let acknowledged = fixture.acknowledged_for_retained_close();
+    let id = acknowledged.id;
+    let raw = fixture.raw();
+    for change in 0..2 {
+        {
+            let mut state = fixture.host.lock().unwrap();
+            let current = &mut state.terminals.get_mut(&id).unwrap().session;
+            if change == 0 {
+                current
+                    .launch
+                    .arguments
+                    .push("changed-after-native-ack".into());
+            } else {
+                current.owned_codex_listener = acknowledged.owned_codex_listener.clone();
+            }
+        }
+        fixture.assert_retained_close_refused(
+            &acknowledged,
+            &acknowledged,
+            "The paired terminal does not retain this exact native holder's source identity",
+        );
+        fixture
+            .host
+            .lock()
+            .unwrap()
+            .terminals
+            .get_mut(&id)
+            .unwrap()
+            .session = raw.clone();
+    }
+    for change in 0..3 {
+        let mut unissued = acknowledged.clone();
+        match change {
+            0 => {
+                unissued.proof.as_mut().unwrap().host_incarnation =
+                    HostIncarnation::new("unissued-owner")
+            }
+            1 => unissued
+                .terminal
+                .as_mut()
+                .unwrap()
+                .launch
+                .arguments
+                .push("unissued-launch".into()),
+            _ => {
+                unissued.terminal.as_mut().unwrap().owned_codex_listener =
+                    acknowledged.owned_codex_listener.clone()
+            }
+        }
+        fixture.assert_retained_close_refused(
+            &unissued,
+            &acknowledged,
+            "The completed native actor does not match this exact descriptor",
+        );
+    }
+    let (_, replacement) = fixture.extra_terminal();
+    let original = {
+        let mut state = fixture.host.lock().unwrap();
+        std::mem::replace(
+            &mut state.terminals.get_mut(&id).unwrap().handle,
+            replacement.clone(),
+        )
+    };
+    // Same source and map ID, genuinely different owned holder and worker.
+    fixture.assert_retained_close_refused(
+        &acknowledged,
+        &acknowledged,
+        "The original paired terminal holder was replaced; its replacement was not stopped",
+    );
+    assert!(original.holder_identity().unwrap().root.is_current());
+    assert!(replacement.holder_identity().unwrap().root.is_current());
+    fixture
+        .host
+        .lock()
+        .unwrap()
+        .terminals
+        .get_mut(&id)
+        .unwrap()
+        .handle = original;
+    assert_eq!(fixture.raw(), raw);
+}
+
+#[test]
+fn retained_close_uses_exact_completed_receipt_for_an_issued_alias() {
+    if isolated("retained_close_uses_exact_completed_receipt_for_an_issued_alias") {
+        return;
+    }
+    let fixture = Fixture::new();
+    let acknowledged = fixture.acknowledged_for_retained_close();
+    let terminal = acknowledged.terminal.as_ref().unwrap();
+    let holder = fixture.worker.holder_identity().unwrap().clone();
+    fixture
+        .worker
+        .close_with_receipt(terminal, &fixture.proof)
+        .unwrap();
+    wait_until(
+        || fixture.worker.is_completed(),
+        "paired worker did not complete",
+    );
+    assert!(
+        crate::terminal::holder::cleanup::confirmed_with_role(
+            terminal,
+            &holder,
+            &fixture.proof,
+            None
+        )
+        .unwrap()
+    );
+    {
+        let state = fixture.host.lock().unwrap();
+        assert!(state.native_terminal_projection(terminal.id).is_err());
+        let observer = state.descriptor(0, terminal.id).unwrap();
+        assert_ne!(&observer.session, terminal);
+        assert!(!observer.upgrade_sources.contains(terminal));
+    }
+    // A completed owner receipt binds the whole launch/listener source. Public
+    // callers cannot manufacture an alternate source just because it exited.
+    let mut unissued = acknowledged.clone();
+    unissued
+        .terminal
+        .as_mut()
+        .unwrap()
+        .launch
+        .arguments
+        .push("not-receipted".into());
+    fixture.assert_retained_close_refused(
+        &unissued,
+        &acknowledged,
+        "The completed native actor does not match this exact descriptor",
+    );
+    let (recovery, exited) =
+        crate::chat::native_holder::inspect(&fixture.native, &fixture.proof).unwrap();
+    assert!(!exited);
+    assert!(recovery.previous_sources.contains(&fixture.source));
+    assert_ne!(fixture.source, acknowledged);
+    // The old issued alias is authenticated by that same holder; cleanup uses
+    // its current acknowledged pair and the exact original worker receipt.
+    let (response, _, _) = crate::host::client::process_request(
+        &fixture.host,
+        CLIENT,
+        crate::terminal::ipc::ClientRequest::ChatCloseRetained {
+            session: fixture.source.clone(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(response, ServerResponse::Accepted));
+    wait_until(
+        || !fixture.native.root.is_current(),
+        "retained close did not retire original provider",
+    );
+    let state = fixture.host.lock().unwrap();
+    assert!(!state.chats.contains_key(&acknowledged.id));
+    assert!(!state.terminals.contains_key(&terminal.id));
 }
 
 #[test]
@@ -783,6 +959,53 @@ impl Fixture {
         self.host.lock().unwrap().terminals[&self.source.id]
             .session
             .clone()
+    }
+
+    fn acknowledged_for_retained_close(&self) -> Session {
+        restore(&self.host, CLIENT, &self.source).unwrap();
+        let (source, actor) = {
+            let state = self.host.lock().unwrap();
+            let record = &state.chats[&self.source.id];
+            (record.session.clone(), record.handle.clone())
+        };
+        wait_durable(&actor);
+        actor.preserve_for_restart().unwrap();
+        let (recovery, exited) =
+            crate::chat::native_holder::inspect(&self.native, &self.proof).unwrap();
+        assert!(!exited);
+        assert_eq!(recovery.source, source);
+        assert_eq!(
+            recovery.paired_holder.as_ref(),
+            self.worker.holder_identity()
+        );
+        source
+    }
+
+    fn assert_retained_close_refused(
+        &self,
+        requested: &Session,
+        acknowledged: &Session,
+        reason: &str,
+    ) {
+        let refusal = crate::host::client::process_request(
+            &self.host,
+            CLIENT,
+            crate::terminal::ipc::ClientRequest::ChatCloseRetained {
+                session: requested.clone(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(refusal.message, reason);
+        self.assert_one_provider();
+        let (recovery, exited) =
+            crate::chat::native_holder::inspect(&self.native, &self.proof).unwrap();
+        assert!(!exited);
+        assert_eq!(&recovery.source, acknowledged);
+        assert_eq!(recovery.server_process, self.original.server_process);
+        let state = self.host.lock().unwrap();
+        assert_eq!(&state.chats[&acknowledged.id].session, acknowledged);
+        assert!(!state.chat_spawning.contains_key(&acknowledged.id));
+        assert!(!state.native_closing.contains_key(&acknowledged.id));
     }
 
     fn extra_terminal(&mut self) -> (TerminalSession, TerminalHandle) {
