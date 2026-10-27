@@ -119,7 +119,11 @@ class InstallerPlatform(unittest.TestCase):
             trap.chmod(0o755)
         result = self.run_installer("glibc 2.34", args=("--purge" if purge else "--uninstall",))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse((self.prefix / "current").exists())
+        # Removing versions can leave a dangling current symlink; check the entry.
+        self.assertFalse(
+            os.path.lexists(self.prefix / "current"),
+            "removal left the current entry",
+        )
         self.assertFalse((self.prefix / "versions").exists())
         self.assertFalse((self.prefix / ".cagents-install-root").exists())
         self.assertEqual((self.prefix / "sentinel").read_bytes(), b"existing installation\n")
