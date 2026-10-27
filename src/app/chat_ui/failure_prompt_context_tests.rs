@@ -237,6 +237,16 @@ fn distinct_prompt_carriers_keep_identical_errors_and_exact_original_sources() {
     let original_parent = runtime.snapshot.items.clone();
     let mut children = (*handle.snapshot()).clone();
     children.generation += 1;
+    for id in ["child-a", "child-b"] {
+        let mut parent_call = text(id, chat::Role::Assistant, "");
+        parent_call.content = ItemContent::Tool {
+            name: "Agent".into(),
+            input: "Synthetic reviewer".into(),
+            output: String::new(),
+            status: chat::ToolStatus::Failed,
+        };
+        children.items.push(Arc::new(parent_call));
+    }
     children.subagents = vec![child("child-a"), child("child-b")];
     handle.publish_snapshot_for_test(children);
     runtime.refresh();
@@ -266,10 +276,37 @@ fn distinct_prompt_carriers_keep_identical_errors_and_exact_original_sources() {
             1,
             "each child's exact item/detail echo joins only that child"
         );
+        let incident = incidents[0];
         assert_eq!(
-            runtime.failure_details(&incidents[0].key).as_deref(),
-            Some(raw)
+            incident.sources,
+            vec![
+                Source::ChildItem(id.into(), "child-error:0".into()),
+                Source::ChildDetail(id.into()),
+            ],
+            "both exact source identities must survive, not merely their equal body"
         );
+        let (from_item, first) = runtime.failure_ui.child_item(id, "child-error:0").unwrap();
+        assert_eq!(from_item.key, incident.key);
+        assert!(first);
+        assert!(runtime.incident_has_child_detail(incident, id));
+        assert!(!runtime.incident_has_child_detail(
+            incident,
+            if id == "child-a" {
+                "child-b"
+            } else {
+                "child-a"
+            }
+        ));
+        for source in &incident.sources {
+            assert_eq!(runtime.failure_source(source), Some(raw));
+        }
+        // The real parent call ID exists after the multipart B prompt. Bind
+        // the child to that normalized parent context, exercising the lookup
+        // rather than the unrelated child:<id> fallback.
+        let expected_context = format!("message\0{b}:child:{id}:error:child-error");
+        let expected = State::metadata(provider, raw, false, &expected_context).unwrap();
+        assert_eq!(incident.key, expected.key);
+        assert_eq!(runtime.failure_details(&incident.key).as_deref(), Some(raw));
     }
     let keys: HashSet<_> = runtime
         .failure_ui
