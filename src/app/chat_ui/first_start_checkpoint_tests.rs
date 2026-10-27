@@ -717,7 +717,7 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
         .projects
         .push(crate::sidebar::SidebarProject::new(
             project,
-            crate::model::RepositoryId::new(),
+            crate::repository::RepositoryId::new(),
             "First send".into(),
             repository.clone(),
             vec![],
