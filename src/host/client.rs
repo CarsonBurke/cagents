@@ -1376,25 +1376,15 @@ pub(super) fn process_request(
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::WatchWorkspaceModel => {
-            let model = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .watch_model(client_id)?;
+            let model = super::workspace::snapshot(host, Some(client_id))?;
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
         }
         ClientRequest::ReadWorkspaceModel => {
-            let model = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .read_model()?;
+            let model = super::workspace::snapshot(host, None)?;
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
         }
         ClientRequest::EditWorkspaceModel { edit } => {
-            let model = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .edit_model(client_id, edit)?;
-            crate::daemon::wake();
+            let model = super::workspace::edit(host, client_id, edit)?;
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
         }
         ClientRequest::Spawn { session, options } => {
@@ -2743,11 +2733,91 @@ mod tests {
     fn notification_presence_reservation_fences_durable_pins_and_shutdown() {
         let (host, directory, session, handle) = retention_client_host("presence-retention");
         let id = session.id;
+        // A saved view claim must obey the same current-worker reservation,
+        // including after workspace SQL moves outside the HostState mutex.
+        use crate::workspace_model::views::{Change, Pane, Scope};
+        let channel = crate::model::ChannelId::new();
+        for edit in [
+            ModelEdit::OpenProject {
+                repository: directory.path().into(),
+                name: "retention-view".into(),
+                kind: Default::default(),
+            },
+            ModelEdit::CreateChannel {
+                id: channel,
+                repository: directory.path().into(),
+                title: "retention-view".into(),
+                title_source: Default::default(),
+            },
+        ] {
+            process_request(&host, 1, ClientRequest::EditWorkspaceModel { edit }).unwrap();
+        }
+        let pane = Pane {
+            id: crate::model::CardId::new(),
+            title: "retained terminal".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            scope: None,
+            kind: crate::model::CardKind::Terminal(session.clone()),
+        };
+        process_request(
+            &host,
+            1,
+            ClientRequest::EditWorkspaceModel {
+                edit: ModelEdit::SeedView {
+                    scope: Scope::Channel(channel),
+                    panes: vec![pane.clone()],
+                    closed: vec![],
+                },
+            },
+        )
+        .unwrap();
+        let before = host.lock().unwrap().read_model().unwrap();
+        let revision = before
+            .views
+            .iter()
+            .find(|view| view.scope == Scope::Channel(channel))
+            .unwrap()
+            .revision;
         {
             let mut state = host.lock().unwrap();
             state
                 .terminal_retirements
                 .insert(id, super::super::state::Retirement::submitting(handle));
+        }
+        let mut replacement = pane.clone();
+        replacement.title = "new title".into();
+        for edit in [
+            ModelEdit::SeedView {
+                scope: Scope::Channel(channel),
+                panes: vec![pane.clone()],
+                closed: vec![],
+            },
+            ModelEdit::ChangeView {
+                scope: Scope::Channel(channel),
+                expected_revision: revision,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Insert {
+                    pane: pane.clone(),
+                    before: None,
+                },
+            },
+            ModelEdit::ChangeView {
+                scope: Scope::Channel(channel),
+                expected_revision: revision,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Update {
+                    before: pane,
+                    pane: replacement,
+                },
+            },
+        ] {
+            let error = process_request(&host, 1, ClientRequest::EditWorkspaceModel { edit })
+                .unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+            assert!(error.retryable && error.message.contains("completing retirement"));
+            assert_eq!(host.lock().unwrap().read_model().unwrap(), before);
         }
         let registry = super::super::agent_execution::registry(&host).unwrap();
         for watch in [false, true] {
