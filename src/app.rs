@@ -14177,6 +14177,13 @@ impl Application for Cagents {
         // through the lightweight visibility/presence postlude below.
         #[rustfmt::skip]
         let task = (|| {
+        // Native selection Copy/Cut supersedes pending logical message Copy,
+        // even when this key's owned cycle will stop command routing below.
+        if let Message::KeyEvent { event: keyboard::Event::KeyPressed { key: keyboard::Key::Character(key), modifiers, .. }, .. } = &message
+            && modifiers.command() && (key.eq_ignore_ascii_case("c") || key.eq_ignore_ascii_case("x"))
+        {
+            chat_ui::invalidate_copy_intent();
+        }
         if let Message::KeyEvent { event, .. } = &message
             // An already owned physical cycle may be reported repeat:false.
             && (key_source.cycle().is_some()
@@ -16857,11 +16864,6 @@ impl Application for Cagents {
             Message::CancelDialog => self.cancel_form_dialog(),
             Message::TaggedKeyEvent { .. } => unreachable!("normalized at update entry"),
             Message::KeyEvent { event, captured } => {
-                if let keyboard::Event::KeyPressed { key: keyboard::Key::Character(key), modifiers, .. } = &event
-                    && modifiers.command() && (key.eq_ignore_ascii_case("c") || key.eq_ignore_ascii_case("x"))
-                {
-                    chat_ui::invalidate_copy_intent();
-                }
                 if let Some(task) = self.automation_approval_key(&event, captured) {
                     return task;
                 }
