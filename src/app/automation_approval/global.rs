@@ -636,6 +636,24 @@ impl Cagents {
         if state.key == Some(key) {
             return;
         }
+        if let Some(Read::Open {
+            key: queued,
+            id,
+            revision,
+            generation,
+            ..
+        }) = state.wanted.as_mut()
+            && Some(*queued) == state.key
+            && queued.identity == key.identity
+            && queued.epoch == key.epoch
+            && queued.sequence < key.sequence
+            && state.latest_open == Some((*queued, *id, *revision, *generation))
+        {
+            // A delivery may finish after an explicit notice was queued behind
+            // it. Keep that exact intent; its full consent still has to be read.
+            *queued = key;
+            state.latest_open = Some((key, *id, *revision, *generation));
+        }
         state.key = Some(key);
         state.total = Some(delivery.pending_automation_proposal_count);
         state.pending = delivery.pending_automation_proposals.clone();
