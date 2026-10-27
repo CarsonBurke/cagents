@@ -352,11 +352,27 @@ async fn original_verification_and_registration_cannot_close_a_newer_same_home_r
     assert_eq!(app.account_ui.logins[0].phase, LoginPhase::Verifying);
     drop(verification); // Provider work is deliberately never polled.
     drop(app.update(Message::RetryCard(card)));
-    let replacement = app.card_state(card).unwrap().clone();
-    let CardKind::Terminal(next) = &replacement.kind else {
+    let state = app.card_state_mut(card).unwrap();
+    let CardKind::Terminal(next) = &mut state.kind else {
         panic!()
     };
     assert_ne!(next.id, source.id);
+    // Complete the replacement's fixture custody using the same detached
+    // descriptor as offstrip_close_fixture. This is not a real daemon start.
+    next.continuity = TerminalContinuity::DetachedSameBoot {
+        host_session_id: crate::model::HostSessionId::new("replacement-host"),
+        boot_id: crate::model::BootId::new("replacement-boot"),
+        host_incarnation: crate::model::HostIncarnation::new("replacement-incarnation"),
+    };
+    state.residency = Residency::Hot;
+    drop(app.finish_terminal_start(card));
+    assert!(!app.terminal_start_in_flight(card));
+    assert!(!app.pending_terminal_spawn(card));
+    let replacement = app.card_state(card).unwrap().clone();
+    assert!(!matches!(
+        replacement.residency,
+        Residency::Hydrating { .. }
+    ));
     let registration = app.update(Message::AccountUi(Action::LoginVerified {
         key,
         cleanup: captured,
@@ -377,6 +393,21 @@ async fn original_verification_and_registration_cannot_close_a_newer_same_home_r
     assert_eq!(app.card_state(card), Some(&replacement));
     assert!(!app.pane_close_owned(card));
     assert!(app.terminal_close.is_none());
+
+    // Positive control: the otherwise identical current card is eligible
+    // for guarded close. Pending hydration cannot explain the stale refusal.
+    let close = app.close_card_unasked(card);
+    assert!(close.units() > 0);
+    let intent = app
+        .terminal_close
+        .as_ref()
+        .expect("replacement is close-eligible");
+    let CardKind::Terminal(next) = &replacement.kind else {
+        panic!()
+    };
+    assert_eq!(intent.terminal, next.id);
+    assert!(intent.pending);
+    drop(close); // No daemon request is polled by this fixture control.
 }
 
 #[test]
