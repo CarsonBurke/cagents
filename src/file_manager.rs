@@ -194,7 +194,8 @@ mod tests {
                 Ok(())
             });
         }
-        let url = Url::parse("https://example.test/private?token=secret#private").unwrap();
+        let url = Url::parse("https://alice:password@example.test/shown-path?token=secret#private")
+            .unwrap();
         let opening =
             tokio::spawn(async move { open_macos_url_with_opener(&url, false, opener).await });
         assert_eq!(
@@ -225,7 +226,7 @@ mod tests {
             error.starts_with("System opener did not respond"),
             "{error}"
         );
-        for sensitive in ["private", "token", "secret", "?", "#"] {
+        for sensitive in ["alice", "password", "private", "token", "secret", "?", "#"] {
             assert!(!error.contains(sensitive), "leaked {sensitive:?}: {error}");
         }
     }
