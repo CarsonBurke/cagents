@@ -707,7 +707,85 @@ pub(super) fn restore(
     proof: &HostSessionProof,
     owner: crate::daemon::holder_registry::Record,
 ) -> Result<ServerResponse, String> {
-    restore_actor(host, client, requested, proof, owner, true)
+    restore_actor(host, client, requested, proof, owner, true, None)
+}
+
+/// A failed cleanup attachment is not a user request to return to a terminal.
+/// Restore its still-running owner through normal installation, retaining the
+/// old cleanup record until the helper and durable registry acknowledge it.
+pub(super) fn recover_cleanup_attachment(
+    host: &SharedHost,
+    requested: &Session,
+) -> Result<(), String> {
+    super::super::account_lifecycle::ensure_idle(host).map_err(|error| error.message)?;
+    let (target, identity, proof, _reservation) = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let record = state
+            .chats
+            .get(&requested.id)
+            .ok_or("Cleanup owner disappeared")?;
+        if !record.handle.is_close_only()
+            || record.session.launch.provider != Provider::Claude
+            || record.handle.is_completed()
+            || state.shutting_down
+            || state.chat_handoffs.contains_key(&requested.id)
+            || state.native_closing.contains_key(&requested.id)
+        {
+            return Err("This conversation is not a running recoverable cleanup attachment".into());
+        }
+        let target = super::CloseTarget::from_record(record);
+        let identity = record
+            .handle
+            .actor_identity()
+            .ok_or("Cleanup lost its exact helper")?;
+        let proof = state.proof().clone();
+        let reservation = capacity::Reservation::closing(host, &mut state, requested)
+            .map_err(|error| error.message)?;
+        (target, identity, proof, reservation)
+    };
+    restore_actor(
+        host,
+        0,
+        requested,
+        &proof,
+        identity.record,
+        true,
+        Some(&target),
+    )?;
+    Ok(())
+}
+
+pub(in crate::host) fn recover_cleanup_attachments(host: &SharedHost) -> Vec<String> {
+    let sources = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .values()
+        .filter(|record| record.handle.is_close_only())
+        .map(|record| record.session.clone())
+        .collect::<Vec<_>>();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut failures = Vec::new();
+    for source in sources {
+        if Instant::now() >= deadline {
+            failures.push("Conversation recovery reached its preview deadline; existing ownership was preserved.".into());
+            break;
+        }
+        if recover_cleanup_attachment(host, &source).is_err() && failures.len() < 40 {
+            failures.push(format!("Conversation {} could not reconnect after an unfinished close; its provider and recovery evidence were preserved.", source.id));
+        }
+    }
+    failures
+}
+
+#[cfg(test)]
+pub(super) fn restore_cleanup_for_test(
+    host: &SharedHost,
+    requested: &Session,
+    proof: &HostSessionProof,
+    owner: crate::daemon::holder_registry::Record,
+) -> Result<ServerResponse, String> {
+    restore_actor(host, 0, requested, proof, owner, false, None)
 }
 
 fn restore_actor(
@@ -717,6 +795,7 @@ fn restore_actor(
     proof: &HostSessionProof,
     owner: crate::daemon::holder_registry::Record,
     publish_snapshot: bool,
+    replacing: Option<&super::CloseTarget>,
 ) -> Result<ServerResponse, String> {
     let inspection = Handle::inspect_remote(&owner, proof.clone())?;
     if inspection.identity.record != owner
@@ -724,6 +803,20 @@ fn restore_actor(
         || inspection.source.launch.provider != Provider::Claude
     {
         return Err("The retained Claude actor identity changed during inspection".into());
+    }
+    if let Some(target) = replacing {
+        target
+            .require_current(host)
+            .map_err(|error| error.message)?;
+        if target.handle.actor_identity().as_ref() != Some(&inspection.identity)
+            || !inspection.state.installed
+            || inspection.state.completed
+            || !inspection.state.owns_work
+            || inspection.state.close.closing
+            || inspection.state.close.exited
+        {
+            return Err("The cleanup helper no longer owns a running provider; retirement evidence was preserved".into());
+        }
     }
     if !publish_snapshot {
         verify_close_ownership(
@@ -825,12 +918,13 @@ fn restore_actor(
             Publication::Close
         },
     )?;
+    let after_generation = handle.observe_next_update();
     let observation = Observation {
-        after_generation: handle.observe_next_update(),
+        after_generation,
         ..Observation::default()
     };
     let previous_sources = super::native_recovery::retained_upgrade_sources(sources, &session);
-    let record = Record {
+    let mut record = Record {
         execution_instance: identity.instance,
         console_recipe: inspection.execution_console,
         paired_terminal: paired.clone(),
@@ -870,7 +964,13 @@ fn restore_actor(
     if state.shutting_down
         || state.proof() != proof
         || !pair_unchanged
-        || state.chats.contains_key(&id)
+        || match replacing {
+            Some(target) => state
+                .chats
+                .get(&id)
+                .is_none_or(|current| !target.matches(current)),
+            None => state.chats.contains_key(&id),
+        }
         || state
             .chat_spawning
             .get(&id)
@@ -878,12 +978,40 @@ fn restore_actor(
     {
         return Err("Daemon ownership changed before retained Claude registration; the provider remains owned by its holder".into());
     }
+    if replacing.is_some() {
+        // Failed legacy attachments may already have observers in another
+        // window. Preserve those authorized subscriptions, rebasing their
+        // notification fence onto the actual new attachment's generation.
+        let previous = state.chats.get(&id).expect("replacement was validated");
+        record.subscribers.extend(previous.subscribers.clone());
+        record.observations = record
+            .subscribers
+            .keys()
+            .map(|&client| {
+                (
+                    client,
+                    Observation {
+                        epoch: previous
+                            .observations
+                            .get(&client)
+                            .map_or(0, |observation| observation.epoch),
+                        after_generation,
+                        notified: false,
+                    },
+                )
+            })
+            .collect();
+    }
+    let visible = record.subscribers.values().any(|visible| *visible);
     let retired = state.chats.insert(id, record);
     state.upgrade_chats.insert(id, previous_sources);
     state.native_adoption_failures.clear(id);
     state.inventory_generation += 1;
     drop(state);
     drop(retired);
+    if visible {
+        handle.set_visible(true);
+    }
     handle.wake_retained_outcomes();
     super::super::state::retire_unattached_upgrade_chat(host, id);
     Ok(response)
@@ -1012,7 +1140,7 @@ fn close_with_target(
                     .into(),
             );
         }
-        restore_actor(host, 0, requested, &proof, owner.clone(), false)?;
+        restore_actor(host, 0, requested, &proof, owner.clone(), false, None)?;
     }
     let (handle, source, paired, target) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());

@@ -424,6 +424,116 @@ fn real_helper_resolution_adopts_an_unregistered_retained_owner_without_launchin
 }
 
 #[test]
+fn real_failed_cleanup_attachment_recovers_the_same_provider_without_closing_it() {
+    let Some(root) = isolated() else { return };
+    let mut fixture = Fixture::new(root);
+    fixture.rotate_host_without_discovery();
+    let proof = fixture.host.lock().unwrap().proof().clone();
+    // Exercise the actual authenticated cleanup adoption, stopping before any
+    // provider close. This is the state a refused cleanup preflight leaves.
+    retained_actor::restore_cleanup_for_test(
+        &fixture.host,
+        &fixture.original,
+        &proof,
+        fixture.identity.record.clone(),
+    )
+    .unwrap();
+    assert!(fixture.handle().is_close_only());
+    // Old119 also mislabeled this exact cleanup state as a terminal return.
+    fixture
+        .host
+        .lock()
+        .unwrap()
+        .chats
+        .get_mut(&fixture.original.id)
+        .unwrap()
+        .returning_terminal = true;
+    let mut other_account = fixture.original.clone();
+    other_account.launch.recipe.environment.insert(
+        "CLAUDE_CONFIG_DIR".into(),
+        fixture
+            .root
+            .join("other-account")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    assert!(fixture.resolve(11, &other_account).is_err());
+    assert!(fixture.handle().is_close_only());
+    let resolved = fixture.resolve(12, &fixture.original).unwrap();
+    let ServerResponse::ChatAttached { session, snapshot } = fixture.attach(12, &resolved).unwrap()
+    else {
+        panic!("expected exact restored attachment")
+    };
+    assert_eq!(session, resolved);
+    assert!(snapshot.ready);
+    assert!(!fixture.handle().is_close_only());
+    assert!(!fixture.host.lock().unwrap().chats[&resolved.id].returning_terminal);
+    assert_eq!(
+        fixture.handle().actor_identity(),
+        Some(fixture.identity.clone())
+    );
+    assert!(fixture.identity.record.holder.is_current());
+    assert!(fixture.identity.record.root.is_current());
+    fixture.no_prompt();
+
+    // Preserve an actual acknowledgement from this same registered connection.
+    // The following setup recreates the legacy failed-close proxy using only
+    // its existing subscriber bookkeeping, never a provider/proof/receipt.
+    process(
+        &fixture.host,
+        12,
+        ClientRequest::ChatAcknowledge {
+            chat_id: resolved.id,
+            epoch: 7,
+        },
+    )
+    .unwrap();
+    for preview in [false, true] {
+        let previous = fixture
+            .host
+            .lock()
+            .unwrap()
+            .chats
+            .remove(&resolved.id)
+            .unwrap();
+        retained_actor::restore_cleanup_for_test(
+            &fixture.host,
+            &resolved,
+            &proof,
+            fixture.identity.record.clone(),
+        )
+        .unwrap();
+        {
+            let mut state = fixture.host.lock().unwrap();
+            let cleanup = state.chats.get_mut(&resolved.id).unwrap();
+            cleanup.subscribers = previous.subscribers;
+            cleanup.observations = previous.observations;
+        }
+        assert!(fixture.handle().is_close_only());
+        if preview {
+            let impact = super::super::state::update::inspect(
+                &fixture.host,
+                crate::update::impact::Policy::WhenIdle,
+                true,
+            )
+            .unwrap();
+            assert!(
+                impact.ready(),
+                "recovered cleanup must be checkpointable: {impact:?}"
+            );
+        }
+        let attached = fixture.attach(12, &resolved).unwrap();
+        assert!(matches!(attached, ServerResponse::ChatAttached { .. }));
+        assert!(!fixture.handle().is_close_only());
+        assert_eq!(
+            fixture.host.lock().unwrap().chats[&resolved.id].observations[&12].epoch,
+            7
+        );
+    }
+    fixture.no_prompt();
+}
+
+#[test]
 fn real_retained_claude_update_preview_preserves_pre_id_and_active_turns() {
     let Some(root) = isolated() else { return };
     let mut fixture = Fixture::new(root);

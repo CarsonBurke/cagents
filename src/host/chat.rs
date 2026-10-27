@@ -2535,6 +2535,17 @@ fn process_inner(
             if let Some(response) = upgrade_resolution::attach(host, client, &session)? {
                 return Ok(response);
             }
+            let cleanup = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                validate_proof(session.proof.as_ref(), state.proof())?;
+                state
+                    .chats
+                    .get(&session.id)
+                    .is_some_and(|record| record.handle.is_close_only())
+            };
+            if cleanup {
+                retained_actor::recover_cleanup_attachment(host, &session).map_err(unavailable)?;
+            }
             let missing = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
                 validate_proof(session.proof.as_ref(), state.proof())?;

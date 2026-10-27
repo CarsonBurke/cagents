@@ -9,6 +9,10 @@ pub(in crate::host) fn inspect(
     policy: Policy,
     fence_actors: bool,
 ) -> Result<DaemonImpact, ProtocolError> {
+    // A refused close can leave an authenticated cleanup-only attachment.
+    // Reinstall its actual running owner before previewing checkpointability;
+    // never waive a pending handoff or pretend a failed close completed.
+    let cleanup_failures = super::super::chat::retained_actor::recover_cleanup_attachments(host);
     let (registry, handles, migrations) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         (
@@ -45,7 +49,7 @@ pub(in crate::host) fn inspect(
                 .collect::<Vec<_>>(),
         )
     };
-    let mut blockers = Vec::new();
+    let mut blockers = cleanup_failures;
     if let Some(registry) = registry {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         blockers.extend(registry.agent_update_blockers().map_err(upgrade_error)?);
