@@ -378,6 +378,31 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
 }
 
 #[test]
+fn repeated_private_cli_capture_does_not_renew_original_deadline() {
+    let root = tempfile::tempdir().unwrap();
+    let command = |script: &str| {
+        let mut spec = private_cli_capture::private_cli(root.path());
+        spec.program = "/bin/sh".into();
+        spec.arguments.clear();
+        spec.args(["-c", script])
+    };
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let output =
+        private_cli_capture::capture(command("sleep 2; printf first-poll"), deadline).unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"first-poll");
+
+    // This finite command fits a renewed four-second budget, but cannot
+    // finish in what remains after the first poll. Unlike a 300-second
+    // stall, it distinguishes a renewed budget from the original deadline.
+    let failure = private_cli_capture::capture(command("printf next-poll; exec sleep 3"), deadline)
+        .unwrap_err();
+    assert_eq!(failure.kind, cagents::process::ProcessFailureKind::TimedOut);
+    assert!(failure.started, "first poll exhausted the fixture budget");
+    assert_eq!(failure.stdout, b"next-poll");
+}
+
+#[test]
 fn failed_console_publication_retires_terminal_and_retains_idle_provider() {
     let fixture = Fixture::new();
     let project = fixture.root.path().join("project");
