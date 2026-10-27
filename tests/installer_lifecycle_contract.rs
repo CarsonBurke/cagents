@@ -317,8 +317,9 @@ if ! kill -TERM "$target"; then
 fi
 printf '%s\n' "$target" > "$FIXTURE_SIGNAL_DELIVERED" || exit 97
 trap - TERM
-sleep 1
-exit 8"#
+# A lost outer cancellation must allow publication to succeed. An unrelated
+# exit failure here would also roll back and hide broken signal forwarding.
+sleep 1"#
         } else if failure == "signal" {
             "kill -TERM \"$PPID\"; exit 8"
         } else {
