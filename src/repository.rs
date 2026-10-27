@@ -8,7 +8,9 @@
 mod managed_worktrees;
 #[cfg(test)]
 pub(crate) use managed_worktrees::{isolated_git_test, retained_managed_fixture_directory};
+mod worktree_control;
 mod worktree_setup_intent;
+pub(crate) use worktree_control::SetupCustody;
 pub use worktree_setup_intent::{WorktreeSetupIntent, WorktreeSetupPlan};
 
 use std::{
@@ -10865,6 +10867,9 @@ struct WorktreeJournal {
     /// journals written before it was recorded.
     #[serde(default)]
     admin_dir: Option<PathBuf>,
+    /// CLI ticket intent is durable before any Git effect; legacy rows have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    linear_issue: Option<crate::linear::context::LinkedIssue>,
     outcome: Option<WorktreeCreationOutcome>,
     warnings: Vec<ProcessFailure>,
     detail: String,
@@ -11274,9 +11279,57 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
         progress: &async_channel::Sender<WorktreeProgressEvent>,
     ) -> WorktreeOperationReport {
+        self.create_worktree_journaled_with_progress(
+            store,
+            request,
+            consent,
+            None,
+            generation,
+            cancellation,
+            |event| {
+                let _ = progress.try_send(event);
+            },
+        )
+    }
+
+    /// The daemon uses the same journal, child lease, settlement and PR guards
+    /// as the dialog, without resolving the UI graph or an async UI channel.
+    /// Run outside HostState and control admission; this performs blocking Git.
+    #[cfg(feature = "host")]
+    pub(crate) fn create_worktree_journaled_sync(
+        &self,
+        store: &StateStore,
+        request: &CreateWorktreeRequest,
+        linear: Option<crate::linear::context::LinkedIssue>,
+        generation: u64,
+        cancellation: &CancellationToken,
+        progress: impl Fn(WorktreeProgressEvent),
+    ) -> WorktreeOperationReport {
+        self.create_worktree_journaled_with_progress(
+            store,
+            request,
+            None,
+            linear,
+            generation,
+            cancellation,
+            progress,
+        )
+    }
+
+    #[cfg(any(feature = "ui", feature = "host"))]
+    fn create_worktree_journaled_with_progress(
+        &self,
+        store: &StateStore,
+        request: &CreateWorktreeRequest,
+        consent: Option<&PrWorktreeCreationConsent>,
+        linear: Option<crate::linear::context::LinkedIssue>,
+        generation: u64,
+        cancellation: &CancellationToken,
+        progress: impl Fn(WorktreeProgressEvent),
+    ) -> WorktreeOperationReport {
         let created_at = operation_timestamp();
         let emit = |stage| {
-            let _ = progress.try_send(WorktreeProgressEvent {
+            progress(WorktreeProgressEvent {
                 operation_id: request.operation_id,
                 generation,
                 stage,
@@ -11313,6 +11366,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 return failure_report(WorktreeOperationState::MalformedPayload, error.to_string());
             }
         };
+        journal.linear_issue = linear;
         if let Some(consent) = consent {
             if let Err(error) = consent.validate_request(&journal.request) {
                 emit(WorktreeProgressStage::Finished);
@@ -11744,6 +11798,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             existing_branch_oid,
             pr_checkout: None,
             admin_dir: None,
+            linear_issue: None,
             outcome: None,
             warnings: Vec::new(),
             detail: "Prepared durable worktree request".into(),
@@ -11877,7 +11932,30 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     return;
                 }
             }
-            journal.admin_dir = admin_dir;
+            let (admin, admin_root, checkout_root) = admin_dir.expect("verified linked checkout");
+            journal.admin_dir = Some(admin);
+            let publication = (|| -> Result<(), String> {
+                worktree_control::record_creation(&admin_root, journal.request.operation_id)
+                    .map_err(|error| error.to_string())?;
+                if let Some(issue) = &journal.linear_issue {
+                    crate::linear::context::ensure_link_for_creation(
+                        &journal.request.destination,
+                        &admin_root,
+                        &issue.issue_id,
+                        issue.workspace.as_deref(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                worktree_control::named(&admin_root).map_err(|error| error.to_string())?;
+                worktree_control::named(&checkout_root).map_err(|error| error.to_string())
+            })();
+            if let Err(error) = publication {
+                journal.state = WorktreeOperationState::ReconcileRequired;
+                journal.detail = format!(
+                    "Checkout retained; creation identity or ticket settlement needs reconciliation: {error}"
+                );
+                return;
+            }
             journal.state = WorktreeOperationState::Created;
             journal.outcome = Some(WorktreeCreationOutcome::Created {
                 worktree: residual.registered_worktree.expect("ownership checked"),
@@ -11913,13 +11991,20 @@ impl<E: ProcessExecutor> RepositoryService<E> {
 
     /// The created worktree's administrative directory, when the destination
     /// is evidently the worktree this journal created.
-    fn created_admin_dir(&self, journal: &WorktreeJournal) -> Option<PathBuf> {
+    fn created_admin_dir(
+        &self,
+        journal: &WorktreeJournal,
+    ) -> Option<(PathBuf, fs_safety::Root, fs_safety::Root)> {
         let token = CancellationToken::new();
         let destination = &journal.request.destination;
+        crate::secure_file::reject_symlink_components(destination).ok()?;
+        let checkout_root = fs_safety::Root::open(destination).ok()?;
         if fs::canonicalize(destination).ok().as_ref() != Some(destination) {
             return None;
         }
         let git_dir = self.git_dir(destination, &token).ok()?;
+        crate::secure_file::reject_symlink_components(&git_dir).ok()?;
+        let admin_root = fs_safety::Root::open(&git_dir).ok()?;
         // A linked worktree must resolve to its own administrative directory,
         // whose backlink names exactly this destination's .git file.
         if git_dir.parent() != Some(journal.common_dir.join("worktrees").as_path())
@@ -11938,7 +12023,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return None;
         }
         if journal.checkout_completed {
-            return Some(git_dir);
+            return (worktree_control::named(&admin_root).is_ok()
+                && worktree_control::named(&checkout_root).is_ok())
+            .then_some((git_dir, admin_root, checkout_root));
         }
         // HEAD and backlinks precede checkout in Git. Without a recorded
         // successful exit, require a real index and a clean index/worktree
@@ -11954,7 +12041,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     &token,
                 )
                 .is_ok_and(|output| output.stdout.is_empty());
-        clean.then_some(git_dir)
+        (clean
+            && worktree_control::named(&admin_root).is_ok()
+            && worktree_control::named(&checkout_root).is_ok())
+        .then_some((git_dir, admin_root, checkout_root))
     }
 
     /// Only the original live request may clean up its own Git lock. Startup
@@ -12015,8 +12105,31 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         &self,
         store: &StateStore,
     ) -> Result<Vec<WorktreeOperationReport>, StoreError> {
+        self.rehydrate_worktree_operation_rows(store, store.journaled_worktree_operations()?)
+    }
+
+    /// Service admission must not rescan all durable completed creations.
+    /// Reconcile only unresolved worktree rows; never replay their effects.
+    #[cfg(feature = "host")]
+    pub(crate) fn rehydrate_pending_worktree_operations(
+        &self,
+        store: &StateStore,
+    ) -> Result<Vec<WorktreeOperationReport>, StoreError> {
+        let operations = store
+            .operations_requiring_reconciliation()?
+            .into_iter()
+            .filter(|operation| operation.entity_kind == "worktree_creation")
+            .collect();
+        self.rehydrate_worktree_operation_rows(store, operations)
+    }
+
+    fn rehydrate_worktree_operation_rows(
+        &self,
+        store: &StateStore,
+        operations: Vec<PendingOperation>,
+    ) -> Result<Vec<WorktreeOperationReport>, StoreError> {
         let mut reports = Vec::new();
-        for operation in store.journaled_worktree_operations()? {
+        for operation in operations {
             let parsed = serde_json::from_value::<WorktreeJournal>(operation.payload.clone());
             let mut journal = match parsed {
                 Ok(journal)

@@ -163,6 +163,7 @@ mod tests {
             existing_branch_oid: None,
             pr_checkout: None,
             admin_dir: Some(common_dir.join("worktrees/topic")),
+            linear_issue: None,
             outcome: Some(WorktreeCreationOutcome::Created {
                 worktree: WorktreeRecord {
                     id: WorktreeId::new(),

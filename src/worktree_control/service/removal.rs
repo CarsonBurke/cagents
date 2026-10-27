@@ -1,0 +1,321 @@
+//! CLI removal preserves the current per-target host and Git/directory fences.
+use super::*;
+use crate::{
+    fs_safety,
+    process::{CommandSpec, ProcessExecutor},
+    worktree_cleanup::{FencedTarget, WindowPolicy, remove_fenced},
+    worktree_content::{self, Inspection, Verdict},
+};
+use std::os::unix::fs::MetadataExt;
+
+pub(crate) struct PreparedRemoval {
+    target: FencedTarget,
+    common: fs_safety::Root,
+    repository_root: fs_safety::Root,
+    request: worktree_content::Request,
+    inspection: Inspection,
+    unpushed: u64,
+    detached_only: u64,
+    force: bool,
+    delete_branch: bool,
+}
+
+impl PreparedRemoval {
+    pub(crate) fn path(&self) -> &Path {
+        &self.target.path
+    }
+
+    pub(super) fn prepare<E: ProcessExecutor>(
+        service: &Service<E>,
+        repository: PathBuf,
+        target: String,
+        resolved_path: Option<PathBuf>,
+        force: bool,
+        delete_branch: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, String> {
+        let repository = repository.canonicalize().map_err(|e| e.to_string())?;
+        let repository_root = fs_safety::Root::open(&repository).map_err(|e| e.to_string())?;
+        let records = service
+            .list_worktrees(&repository, cancellation)
+            .map_err(|e| e.to_string())?;
+        let candidate = resolved_path.or_else(|| {
+            if Path::new(&target).is_absolute() {
+                Some(PathBuf::from(&target))
+            } else {
+                records.first().map(|primary| primary.path.join(&target))
+            }
+        });
+        let canonical = candidate.as_ref().and_then(|path| path.canonicalize().ok());
+        let full_branch = format!("refs/heads/{target}");
+        let matching = records
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| {
+                record.branch.as_deref() == Some(full_branch.as_str())
+                    || canonical.as_ref() == Some(&record.path)
+            })
+            .collect::<Vec<_>>();
+        let (index, record) = match matching.as_slice() {
+            [one] => *one,
+            [] => {
+                return Err(
+                    "No matching worktree; use an exact branch or absolute worktree path".into(),
+                );
+            }
+            _ => return Err(
+                "The target names different branch and path worktrees; use the exact absolute path"
+                    .into(),
+            ),
+        };
+        if index == 0 || record.bare {
+            return Err("The primary checkout cannot be removed".into());
+        }
+        if record.lock.locked || record.prunable_reason.is_some() {
+            return Err("Locked or unavailable worktrees are preserved".into());
+        }
+        if record.path.to_str().is_none() {
+            return Err("The selected worktree path is not UTF-8; refusing a lossy target".into());
+        }
+        let target = FencedTarget::capture(&repository, &record.path, short_branch(record))?;
+        let common = fs_safety::Root::open(&target.common_dir).map_err(|e| e.to_string())?;
+        let request = worktree_content::Request {
+            path: record.path.clone(),
+            targets: Vec::new(),
+            merged_head: None,
+        };
+        let inspection =
+            worktree_content::inspect(&request, cancellation).map_err(|e| e.to_string())?;
+        let unpushed = commit_count(&record.path, false, cancellation)?;
+        let detached_only = if record.detached {
+            commit_count(&record.path, true, cancellation)?
+        } else {
+            0
+        };
+        permits(&inspection, unpushed, detached_only, force)?;
+        Ok(Self {
+            target,
+            common,
+            repository_root,
+            request,
+            inspection,
+            unpushed,
+            detached_only,
+            force,
+            delete_branch,
+        })
+    }
+
+    /// Caller has installed the daemon's existing worktree_removal::Reservation
+    /// for this exact path. Both callbacks run outside HostState: admission is
+    /// checked after the window census; final_check also proves no process can
+    /// still write the directory immediately before Git removes it.
+    pub(crate) fn remove(
+        self,
+        store: &StateStore,
+        admit: impl FnOnce(&[crate::instance::VerifiedWindow]) -> Result<(), String>,
+        final_check: impl FnOnce() -> Result<(), String>,
+    ) -> Result<Removed, RemovalFailure> {
+        let Self {
+            target,
+            common,
+            repository_root,
+            request,
+            inspection,
+            unpushed,
+            detached_only,
+            force,
+            delete_branch,
+        } = self;
+        let cancellation = CancellationToken::new();
+        let path = target.path.clone();
+        let branch = target.branch.clone();
+        let mut rescue_branch = None;
+        let removed = remove_fenced(
+            target,
+            WindowPolicy::AllowNone,
+            admit,
+            || {
+                same_named_root(&common)?;
+                same_named_root(&repository_root)?;
+                let current = worktree_content::inspect(&request, &cancellation)
+                    .map_err(|e| e.to_string())?;
+                if current.token.is_none()
+                    || current.token != inspection.token
+                    || current.head != inspection.head
+                    || current.branch != inspection.branch
+                {
+                    return Err(
+                        "The worktree changed during removal; inspect it again before retrying"
+                            .into(),
+                    );
+                }
+                let current_unpushed = commit_count(&path, false, &cancellation)?;
+                let current_detached = if branch.is_none() {
+                    commit_count(&path, true, &cancellation)?
+                } else {
+                    0
+                };
+                if current_unpushed != unpushed || current_detached != detached_only {
+                    return Err(
+                        "Worktree reachability changed; inspect it again before retrying".into(),
+                    );
+                }
+                permits(&current, current_unpushed, current_detached, force)?;
+                final_check()?;
+                if current_detached != 0 {
+                    let head = current
+                        .head
+                        .as_deref()
+                        .ok_or("Detached history has no exact commit")?;
+                    let name = format!("cagents-rescue/{}", uuid::Uuid::new_v4());
+                    let command = crate::worktree_branch::git_command(repository_root.path())
+                        .args([
+                            "update-ref",
+                            &format!("refs/heads/{name}"),
+                            head,
+                            &"0".repeat(head.len()),
+                        ])
+                        .timeout(std::time::Duration::from_secs(10));
+                    SystemProcessExecutor
+                        .execute(&command, &cancellation)
+                        .and_then(|output| output.require_success(&command.program))
+                        .map_err(|e| e.reported_detail())?;
+                    rescue_branch = Some(name);
+                }
+                Ok(())
+            },
+            force,
+            std::time::Duration::from_secs(10 * 60),
+        );
+        let removed = match removed {
+            Ok(removed) => removed,
+            Err(error) => {
+                return Err(RemovalFailure {
+                    path,
+                    rescue_branch,
+                    error,
+                    outcome_unknown: true,
+                });
+            }
+        };
+        // A successful remove_fenced result proves Git registration and exact
+        // directory removal even if the original Git return was nonzero.
+        // A failure above never certifies rollback or permits automatic retry.
+        let mut warnings = Vec::new();
+        if let Err(failures) =
+            crate::repository::release_deleted_worktree_creations(store, &removed)
+        {
+            warnings.push(format!(
+                "Worktree removed; creation receipt retirement needs review: {}",
+                failures
+                    .into_iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
+        let mut result = Removed {
+            path,
+            branch_deleted: None,
+            rescue_branch,
+            warnings,
+            branch_error: None,
+        };
+        if delete_branch && let Some(branch) = branch {
+            // Separate safe branch deletion never inherits --force's file-loss
+            // consent. Retain original common/repository descriptors throughout.
+            let deletion = same_named_root(&common)
+                .and_then(|_| same_named_root(&repository_root))
+                .and_then(|_| {
+                    crate::worktree_branch::delete_branch_checked_at(
+                        &common.process_path(),
+                        &branch,
+                        false,
+                        inspection.head.as_deref(),
+                        &cancellation,
+                    )
+                    .map_err(|e| e.detail)
+                });
+            match deletion {
+                Ok(()) => result.branch_deleted = Some(branch),
+                Err(error) => {
+                    result.branch_error =
+                        Some(format!("Worktree removed; branch retained: {error}"))
+                }
+            }
+        }
+        Ok(result)
+    }
+}
+
+fn same_named_root(root: &fs_safety::Root) -> Result<(), String> {
+    let held = root.metadata().map_err(|e| e.to_string())?;
+    let named = std::fs::symlink_metadata(root.path()).map_err(|e| e.to_string())?;
+    if !named.is_dir() || (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+        return Err(
+            "The original repository directory was replaced; no new mutation was authorized".into(),
+        );
+    }
+    Ok(())
+}
+fn commit_count(
+    path: &Path,
+    detached: bool,
+    cancellation: &CancellationToken,
+) -> Result<u64, String> {
+    let mut command = crate::worktree_branch::git_command(path).args([
+        "rev-list",
+        "--count",
+        "HEAD",
+        "--not",
+        "--remotes",
+    ]);
+    if detached {
+        command = command.args(["--branches", "--tags"]);
+    }
+    let command: CommandSpec = command
+        .timeout(std::time::Duration::from_secs(30))
+        .output_limits(4096, 64 * 1024);
+    let output = SystemProcessExecutor
+        .execute(&command, cancellation)
+        .and_then(|output| output.require_success(&command.program))
+        .map_err(|e| e.reported_detail())?;
+    std::str::from_utf8(&output.stdout)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .ok_or_else(|| "Git did not return a bounded commit count".into())
+}
+fn permits(
+    inspection: &Inspection,
+    unpushed: u64,
+    detached: u64,
+    force: bool,
+) -> Result<(), String> {
+    if let Verdict::Blocked(reason) = &inspection.verdict {
+        return Err(format!("Worktree removal refused: {reason}"));
+    }
+    if inspection.token.is_none() {
+        return Err("No complete content inspection is available; worktree retained".into());
+    }
+    if !force
+        && (inspection.staged != 0
+            || inspection.modified != 0
+            || inspection.untracked != 0
+            || inspection.ignored_total != 0
+            || unpushed != 0
+            || detached != 0
+            || matches!(inspection.verdict, Verdict::Unsaved { .. }))
+    {
+        return Err(format!(
+            "Worktree contains {} staged, {} modified, {} untracked, {} ignored entries, {} unpushed and {} detached-only commits; pass --force to confirm discarding this work",
+            inspection.staged,
+            inspection.modified,
+            inspection.untracked,
+            inspection.ignored_total,
+            unpushed,
+            detached
+        ));
+    }
+    Ok(())
+}

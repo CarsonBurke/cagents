@@ -4,7 +4,7 @@ use super::*;
 const MAX_EXCLUDE_BYTES: u64 = 4 * 1024 * 1024;
 
 impl<E: ProcessExecutor> RepositoryService<E> {
-    fn managed_primary_checkout(
+    pub(crate) fn managed_primary_checkout(
         &self,
         repository: &Path,
         cancellation: &CancellationToken,

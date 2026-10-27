@@ -613,6 +613,32 @@ fn prepare_with_checkpoint(
     )
 }
 
+/// Use the current anonymous-copy/index fences, additionally binding every
+/// publication to the creator's original retained checkout/admin/common roots.
+#[cfg(feature = "host")]
+pub(crate) fn prepare_for_creation(
+    primary: &Path,
+    destination: &Path,
+    plan: &SetupPlan,
+    custody: &crate::repository::SetupCustody,
+    cancel: &CancellationToken,
+) -> Result<SetupPreparation, SetupError> {
+    prepare_with_authority_checkpoints(
+        primary,
+        destination,
+        plan,
+        false,
+        cancel,
+        || {},
+        |_, _, _| {},
+        |checkout| {
+            custody
+                .matches_checkout(&checkout.target, &checkout.admin, &checkout.common)
+                .map_err(error)
+        },
+    )
+}
+
 fn prepare_with_checkpoints(
     primary: &Path,
     destination: &Path,
@@ -620,7 +646,29 @@ fn prepare_with_checkpoints(
     skip: bool,
     cancel: &CancellationToken,
     after_checkout_capture: impl FnOnce(),
+    before_copy_publication: impl FnMut(&fs_safety::Root, &fs::File, &Path),
+) -> Result<SetupPreparation, SetupError> {
+    prepare_with_authority_checkpoints(
+        primary,
+        destination,
+        plan,
+        skip,
+        cancel,
+        after_checkout_capture,
+        before_copy_publication,
+        |_| Ok(()),
+    )
+}
+
+fn prepare_with_authority_checkpoints(
+    primary: &Path,
+    destination: &Path,
+    plan: &SetupPlan,
+    skip: bool,
+    cancel: &CancellationToken,
+    after_checkout_capture: impl FnOnce(),
     mut before_copy_publication: impl FnMut(&fs_safety::Root, &fs::File, &Path),
+    authority: impl Fn(&SetupCheckout) -> Result<(), SetupError>,
 ) -> Result<SetupPreparation, SetupError> {
     if skip {
         return Ok(SetupPreparation {
@@ -644,6 +692,7 @@ fn prepare_with_checkpoints(
     let source = fs_safety::Root::open(primary).map_err(error)?;
     let checkout = SetupCheckout::capture(destination, &common)?;
     after_checkout_capture();
+    authority(&checkout)?;
     let target = &checkout.target;
     let mut result = SetupPreparation::default();
     let mut found = BTreeSet::new();
@@ -667,6 +716,7 @@ fn prepare_with_checkpoints(
         }
     }
     checkout.check()?;
+    authority(&checkout)?;
     let index_lock =
         GitFileLock::acquire_at(&checkout.admin, std::ffi::OsStr::new("index")).map_err(error)?;
     let index = SetupIndex::capture(&checkout.admin)?;
@@ -735,6 +785,7 @@ fn prepare_with_checkpoints(
         // Establish anonymous-file support before creating copy directories.
         // Its inode stays unnamed until exact-FD no-replace publication; a
         // shared parent cannot replace a temporary source or cleanup target.
+        authority(&checkout)?;
         let mut output = fs_safety::create_anonymous_in(&target, 0o600).map_err(error)?;
         let parent = fs_safety::create_directories_beneath(
             &target,
@@ -773,7 +824,9 @@ fn prepare_with_checkpoints(
             index_lock.check().map_err(error)?;
             index.check(&checkout.admin)?;
             permissions.check(&input)?;
+            authority(&checkout)?;
             before_copy_publication(&parent, &output, &path);
+            authority(&checkout)?;
             fs_safety::link_anonymous_new(
                 &parent,
                 &output,
@@ -801,6 +854,7 @@ fn prepare_with_checkpoints(
     }
     check_cancel(cancel)?;
     checkout.check()?;
+    authority(&checkout)?;
     current(primary, plan)?;
     if !is_trusted(primary, plan, cancel)? {
         return Err(SetupError::TrustRequired);
