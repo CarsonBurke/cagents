@@ -3774,7 +3774,7 @@ impl RepositoryRuntime {
                 .is_some_and(|(path, _)| path == &identity.path)
     }
 
-    /// The accepted restored buffer keeps its focus handoff until the app can
+    /// An accepted foreground buffer keeps its focus handoff until the app can
     /// mount it. Reading the file can finish before the first viewport arrives.
     pub fn take_restored_editor_focus(&mut self, card: CardId) -> Option<widget::Id> {
         let identity = self.pending_editor_focus.as_ref()?;
@@ -6226,9 +6226,12 @@ impl RepositoryRuntime {
                 // user deliberately captures a range in the replacement.
                 self.find_selection_revision = None;
                 self.find_selection_candidate = None;
-                let restored_focus = self
-                    .restores_editor_navigation(&identity)
-                    .then(|| identity.clone());
+                // Fresh navigation needs the same loading-to-editor handoff
+                // as a restored caret. Background reads clear this request
+                // before returning to the shell; they never claim input.
+                let loaded_focus = (matches!(self.document, DocumentState::Loading { .. })
+                    || self.restores_editor_navigation(&identity))
+                .then(|| identity.clone());
                 self.document = match result {
                     Ok(LoadedFile {
                         source,
@@ -6311,6 +6314,7 @@ impl RepositoryRuntime {
                     }
                 };
                 if let DocumentState::Editable(document) = &mut self.document {
+                    self.pending_editor_focus = loaded_focus;
                     if let Some((path, editor)) = self.pending_editor_navigation.take()
                         && self.selected.as_ref().is_some_and(|file| file.path == path)
                     {
@@ -6323,7 +6327,6 @@ impl RepositoryRuntime {
                             position: position(editor.caret),
                             selection: editor.selection.map(position),
                         });
-                        self.pending_editor_focus = restored_focus;
                         self.viewports.editor = text_editor::ScrollPosition {
                             line: editor.scroll_line,
                             vertical: editor.scroll_vertical,
