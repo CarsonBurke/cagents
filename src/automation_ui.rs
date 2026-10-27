@@ -2276,22 +2276,16 @@ impl State {
             } else {
                 "The agent may change files and use tools allowed by these permissions. Confirm only this displayed launch configuration."
             }));
-            content = content.push(
-                widget::row::with_children(vec![
-                    button("Cancel", Action::CancelConfirmation, !busy),
-                    if matches!(confirmation.request, Request::Remove { .. }) {
-                        crate::ui_controls::button::destructive("Remove automation")
-                            .on_press_maybe(
-                                (!busy).then_some(Action::Confirm(confirmation.generation)),
-                            )
-                            .into()
-                    } else {
-                        button("Confirm", Action::Confirm(confirmation.generation), !busy)
-                    },
-                ])
-                .spacing(space::S)
-                .wrap(),
-            );
+            content = content.push(action_row(vec![
+                button("Cancel", Action::CancelConfirmation, !busy),
+                if matches!(confirmation.request, Request::Remove { .. }) {
+                    crate::ui_controls::button::destructive("Remove automation")
+                        .on_press_maybe((!busy).then_some(Action::Confirm(confirmation.generation)))
+                        .into()
+                } else {
+                    button("Confirm", Action::Confirm(confirmation.generation), !busy)
+                },
+            ]));
         } else if let Some(draft) = &self.draft {
             content = content.push(draft.view(busy, &self.models, self.error.as_deref(), width));
         } else {
@@ -2442,7 +2436,7 @@ impl State {
                         subject[16..24].copy_from_slice(&selected.revision.to_be_bytes());
                         content = content.push(crate::interaction::keyed_list_rows(vec![(
                             subject,
-                            widget::row::with_children(vec![
+                            action_row(vec![
                                 button("Edit", Action::Edit, !busy),
                                 if selected.enabled {
                                     button(
@@ -2480,10 +2474,7 @@ impl State {
                                         && selected.active_firing.is_none()
                                         && selected.blocked.is_none(),
                                 ),
-                            ])
-                            .spacing(space::S)
-                            .wrap()
-                            .into(),
+                            ]),
                         )]));
                     }
                 }
@@ -2660,7 +2651,7 @@ impl State {
                 // its native state for the same subject, retire it on replacement.
                 content = content.push(crate::interaction::keyed_list_rows(vec![(
                     subject,
-                    widget::row::with_children(vec![
+                    action_row(vec![
                         button(
                             "Cancel run",
                             Action::CancelRun {
@@ -2681,10 +2672,7 @@ impl State {
                                     .as_ref()
                                     .is_some_and(|agent| !agent.closed && agent.session.is_some()),
                         ),
-                    ])
-                    .spacing(space::S)
-                    .wrap()
-                    .into(),
+                    ]),
                 )]));
             }
         }
@@ -2946,16 +2934,12 @@ impl Draft {
                 })),
             );
         }
-        let fields = fields.push(
-            widget::row::with_children(vec![
-                button("Cancel", Action::CancelEdit, !busy),
-                crate::ui_controls::button::primary("Save automation")
-                    .on_press_maybe((!busy).then_some(Action::Save))
-                    .into(),
-            ])
-            .spacing(space::S)
-            .wrap(),
-        );
+        let fields = fields.push(action_row(vec![
+            button("Cancel", Action::CancelEdit, !busy),
+            crate::ui_controls::button::primary("Save automation")
+                .on_press_maybe((!busy).then_some(Action::Save))
+                .into(),
+        ]));
         widget::container(fields)
             .max_width(1040)
             .width(Length::Fill)
@@ -3307,6 +3291,12 @@ fn crumb_style() -> cosmic::theme::Button {
             ..appearance(focused, theme)
         }),
     }
+}
+
+// The pinned iced Row::wrap omits accessibility traversal. COSMIC's FlexRow
+// keeps wrapping and exposes the actual controls to assistive technology.
+fn action_row(children: Vec<Element<'_, Action>>) -> Element<'_, Action> {
+    widget::flex_row(children).spacing(space::S as u16).into()
 }
 
 fn button(label: &'static str, action: Action, enabled: bool) -> Element<'static, Action> {
@@ -4388,6 +4378,44 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn confirmation_and_draft_actions_remain_accessible_when_wrapped() {
+        for width in [280.0, 900.0] {
+            for (action, command) in [
+                (Action::Enable, "Confirm"),
+                (Action::Remove, "Remove automation"),
+            ] {
+                let mut state = State {
+                    selected: Some(automation()),
+                    ..Default::default()
+                };
+                assert!(state.update(action).is_none());
+                assert!(state.confirmation.is_some());
+                let controls = buttons(&state, width);
+                for label in ["Cancel", command] {
+                    assert!(
+                        controls
+                            .iter()
+                            .any(|(name, enabled)| name == label && *enabled),
+                        "{label} must remain accessible at width {width}: {controls:?}"
+                    );
+                }
+            }
+            let mut state = State::default();
+            assert!(state.update(Action::New).is_none());
+            assert!(state.draft.is_some());
+            let controls = buttons(&state, width);
+            for label in ["Cancel", "Save automation"] {
+                assert!(
+                    controls
+                        .iter()
+                        .any(|(name, enabled)| name == label && *enabled),
+                    "{label} must remain accessible at width {width}: {controls:?}"
+                );
+            }
+        }
     }
 
     fn run_of(owner: &Automation) -> RunDetail {
