@@ -1215,7 +1215,41 @@ mod tests {
                 .validate_child_adapter_key(&CanonicalItemKey::new(Some("two"), "same"))
                 .is_err()
         );
-        put(&mut store, "two", tool("same", "tool again", ""));
+        // The current port fences this old scoped identity even for a full item:
+        // a replay has no new generation proof after the source changed kind.
+        let replay = store
+            .apply(Event::SubagentItem {
+                id: "two".into(),
+                item: tool("same", "tool again", ""),
+            })
+            .unwrap();
+        assert!(replay.iter().any(|event| matches!(event,
+            Event::Error { message, fatal: false } if message.contains("removed or changed kind")
+        )));
+        assert!(
+            !replay
+                .iter()
+                .any(|event| matches!(event, Event::SubagentItem { .. }))
+        );
+        let key = CanonicalItemKey::new(Some("two"), "same");
+        assert!(
+            store
+                .validate_child_adapter_key(&key)
+                .unwrap_err()
+                .contains("changed kind")
+        );
+        assert!(store.child_adapter_item(&key).is_err());
+        assert_eq!(
+            store
+                .db
+                .query_row(
+                    "SELECT count(*) FROM child_tools WHERE agent='two' AND id='same'",
+                    [],
+                    |row| row.get::<_, usize>(0)
+                )
+                .unwrap(),
+            0
+        );
         store
             .apply(Event::SubagentTextDelta {
                 id: "two".into(),
@@ -1466,11 +1500,11 @@ mod tests {
                 delta: "lost prefix".into(),
             })
             .unwrap();
-        assert!(
-            store
-                .child_adapter_item(&CanonicalItemKey::new(Some("child"), "tool"))
-                .is_err()
-        );
+        let key = CanonicalItemKey::new(Some("child"), "tool");
+        // CanonicalItemReader::read flushes the matching batch before reading
+        // committed SQL. Exercise that boundary rather than the raw SQL helper.
+        assert!(store.flush_child_adapter_read(&key).is_err());
+        assert!(store.child_adapter_item(&key).is_err());
         assert!(store.child_tools_unavailable.is_some());
     }
 

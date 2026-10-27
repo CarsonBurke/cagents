@@ -608,7 +608,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let failed=adapter.receive(json!({"type":"user","uuid":"immediate-failure","message":{"content":[{"type":"tool_result","tool_use_id":"large-write","is_error":true,"content":"permission denied"}]}})).unwrap();
-        assert!(failed.events.iter().any(|event|matches!(event,Event::Error{message,fatal:false} if message.contains("input is unavailable"))));
+        assert!(failed.events.iter().any(|event|matches!(event,Event::Error{message,fatal:false} if message.contains("permission denied") && message.contains("exact original invocation is unavailable") && message.contains("full failed attempted changes were preserved"))));
         commit(&store, adapter.as_mut(), failed);
         let after = reader(&store)
             .read(&CanonicalItemKey::new(None, "large-write"))
@@ -643,7 +643,7 @@ mod tests {
             commit(&store, adapter.as_mut(), step);
         }
         let failed=adapter.receive(json!({"type":"user","uuid":"old-failure","message":{"content":[{"type":"tool_result","tool_use_id":"old-write","is_error":true,"content":"permission denied"}]}})).unwrap();
-        assert!(failed.events.iter().any(|event|matches!(event,Event::Error{message,fatal:false} if message.contains("permission denied") && message.contains("identity is unavailable"))));
+        assert!(failed.events.iter().any(|event|matches!(event,Event::Error{message,fatal:false} if message.contains("permission denied") && message.contains("exact original invocation is unavailable") && message.contains("full failed attempted changes were preserved"))));
         assert!(failed.events.iter().any(|event|matches!(event,Event::Item(Item{id,content:ItemContent::Changes{changes,status:crate::chat::ToolStatus::Failed},..}) if id=="old-write" && changes[0].diff.len()>3*1024*1024)));
         assert!(!failed.events.iter().any(|event|matches!(event,Event::Item(Item{id,content:ItemContent::Tool{..},..}) if id=="old-write")),"missing original metadata cannot become a synthetic Edit call");
         commit(&store, adapter.as_mut(), failed);
@@ -852,11 +852,17 @@ mod tests {
             .validate_key(&CanonicalItemKey::new(Some("two"), "same"))
             .unwrap();
         let result=adapter.receive(json!({"type":"user","uuid":"late","parent_tool_use_id":"one","message":{"content":[{"type":"tool_result","tool_use_id":"same","content":"late","is_error":false}]}})).unwrap();
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            Event::Subagent { id, waiting: Some(true), status: None, detail: Some(detail), .. }
+                if id == "one" && detail.contains("explicitly removed")
+        )));
         assert!(
-            result
+            !result
                 .events
                 .iter()
-                .any(|event| matches!(event, Event::Error { fatal: false, .. }))
+                .any(|event| matches!(event, Event::Error { .. })),
+            "canonical source refusal remains scoped to the exact child"
         );
         assert!(
             !result
@@ -907,11 +913,17 @@ mod tests {
         assert!(source.validate_cached_item(&key, &original).is_err());
         source.validate_cached_item(&key, &replacement).unwrap();
         let result=adapter.receive(json!({"type":"user","uuid":"late","parent_tool_use_id":"child","message":{"content":[{"type":"tool_result","tool_use_id":"patch","content":"created","is_error":false}]}})).unwrap();
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            Event::Subagent { id, waiting: Some(true), status: None, detail: Some(detail), .. }
+                if id == "child" && detail.contains("no longer matches its canonical source")
+        )));
         assert!(
-            result
+            !result
                 .events
                 .iter()
-                .any(|event| matches!(event, Event::Error { fatal: false, .. }))
+                .any(|event| matches!(event, Event::Error { .. })),
+            "canonical source refusal remains scoped to the exact child"
         );
         assert!(
             !result

@@ -9162,17 +9162,34 @@ mod tests {
         );
     }
 
-    /// A write too large for its input to be held, and an edit whose input
-    /// has since been pushed out by later calls, still fail as the tool they
-    /// were: the name is kept for as long as the call is.
+    /// Missing raw input must preserve the complete attempted changes rather
+    /// than invent a path-only invocation. Logical tool names remain bounded
+    /// separately from the shorter-lived permission input cache.
     #[test]
     fn a_failed_edit_keeps_its_name_without_its_input() {
         let mut adapter = Claude::default();
         let content = "x".repeat(chat::PermissionDenial::INPUT_LIMIT);
-        adapter.receive(json!({"type":"assistant","uuid":"a1","message":{"id":"msg-1","content":[
+        let initial = adapter.receive(json!({"type":"assistant","uuid":"a1","message":{"id":"msg-1","content":[
             {"type":"tool_use","id":"write","name":"Write","input":{"file_path":"big.txt","content":content}},
             {"type":"tool_use","id":"edit","name":"MultiEdit","input":{"file_path":"src/app.rs","edits":[{"old_string":"missing","new_string":"found"}]}},
         ]}})).unwrap();
+        let attempted: Vec<_> = initial
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Item(Item {
+                    id,
+                    content:
+                        ItemContent::Changes {
+                            changes,
+                            status: ToolStatus::Running,
+                        },
+                    ..
+                }) if id == "write" || id == "edit" => Some((id.clone(), changes.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(attempted.len(), 2);
         assert!(
             !adapter
                 .tool_inputs
@@ -9192,15 +9209,45 @@ mod tests {
             ("write", "Write", "big.txt"),
             ("edit", "MultiEdit", "src/app.rs"),
         ] {
+            assert_eq!(
+                adapter
+                    .edit_tools
+                    .get(&ScopedId::new(None, id))
+                    .map(String::as_str),
+                Some(name)
+            );
             let failed = adapter.receive(json!({"type":"user","uuid":format!("u-{id}"),"message":{"content":[{"type":"tool_result","tool_use_id":id,"is_error":true,"content":"denied"}]}})).unwrap();
+            let key = ScopedId::new(None, id);
+            assert_eq!(adapter.edit_tools.get(&key).map(String::as_str), Some(name));
+            let original = &attempted
+                .iter()
+                .find(|(item_id, _)| item_id == id)
+                .unwrap()
+                .1;
+            assert_eq!(original.len(), 1);
+            assert!(original[0].path.ends_with(path));
             assert_eq!(
                 items(&failed),
-                vec![ItemContent::Tool {
-                    name: name.into(),
-                    input: json!({"file_path": path}).to_string(),
-                    output: "denied".into(),
+                vec![ItemContent::Changes {
+                    changes: original.clone(),
                     status: ToolStatus::Failed,
                 }]
+            );
+            assert!(failed.events.iter().any(|event| matches!(event,
+                Event::Error { message, fatal: false }
+                    if message.contains("denied")
+                        && message.contains("exact original invocation is unavailable")
+                        && message.contains("full failed attempted changes were preserved")
+            )));
+            assert!(
+                !failed.events.iter().any(|event| matches!(
+                    event,
+                    Event::Item(Item {
+                        content: ItemContent::Tool { .. },
+                        ..
+                    })
+                )),
+                "missing input must not synthesize a replacement invocation"
             );
         }
         // The name is let go of with the call.
