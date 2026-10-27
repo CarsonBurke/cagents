@@ -22,7 +22,12 @@ fn standalone_editor_switches_a_complete_private_set_without_replacing_cagents()
         &mock.join("cargo"),
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "$CED_TEST_LOG"
-if [ "$1" = metadata ]; then printf '{"target_directory":"%s"}\n' "$CED_TEST_TARGET"; fi
+name=ceditor
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = --bin ]; then shift; name=$1; fi
+    shift
+done
+printf '{"reason":"compiler-artifact","target":{"name":"%s","kind":["bin"]},"executable":"%s/release/%s"}\n' "$name" "$CED_TEST_TARGET" "$name"
 "#,
     );
     let install = || {
@@ -91,9 +96,11 @@ if [ "$1" = metadata ]; then printf '{"target_directory":"%s"}\n' "$CED_TEST_TAR
         "other installed daemon"
     );
     let builds = fs::read_to_string(root.path().join("builds")).unwrap();
-    assert!(builds.contains("build --locked --release --no-default-features --bin cagents\n"));
+    assert!(builds.contains("build --locked --release --no-default-features --bin cagents --message-format=json-render-diagnostics\n"));
     assert!(builds.contains(
-        "build --locked --release --no-default-features --features host --bin cagentsd\n"
+        "build --locked --release --no-default-features --features host --bin cagentsd --message-format=json-render-diagnostics\n"
     ));
-    assert!(builds.contains("build --locked --release --package ceditor\n"));
+    assert!(builds.contains(
+        "build --locked --release --package ceditor --message-format=json-render-diagnostics\n"
+    ));
 }

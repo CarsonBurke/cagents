@@ -183,7 +183,8 @@ impl Handle {
             snapshot
                 .for_branch(branch, head)
                 .filter(|pull_request| {
-                    pull_request.state.0 == "MERGED" && Some(pull_request.head_ref_oid.as_str()) == head
+                    pull_request.state.0 == "MERGED"
+                        && Some(pull_request.head_ref_oid.as_str()) == head
                 })
                 .map(|pull_request| {
                     (
@@ -194,7 +195,9 @@ impl Handle {
                 })
         });
         let (merged_pull_request, targets, merged_head) = match merged {
-            Some((number, base, head)) => (Some(number), remote_branches(&path, &base)?, Some(head)),
+            Some((number, base, head)) => {
+                (Some(number), remote_branches(&path, &base)?, Some(head))
+            }
             None => (None, Vec::new(), None),
         };
         Ok(Subject {
