@@ -7154,9 +7154,9 @@ fn source_control_notices<'a>(
             widget::row::with_children(vec![
                 design::caption("Changes discarded. Backups kept.").into(),
                 widget::button::text("Undo discard")
-                    .on_press(SidebarAction::UndoDiscard {
+                    .on_press_maybe((!source.busy()).then_some(SidebarAction::UndoDiscard {
                         key: source.key.clone(),
-                    })
+                    }))
                     .into(),
             ])
             .spacing(space::XS),

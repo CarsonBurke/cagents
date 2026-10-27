@@ -14956,7 +14956,20 @@ impl Application for Cagents {
                         if confirmed && let Some((selection, approved)) = pending { self.enqueue_git_mutation(key, QueuedGitMutation::StageApproved { selection, approved }) } else { Task::none() }
                     }
                     SidebarAction::UndoDiscard { key } => {
-                        if !self.source_control_is_bound(&key) || self.folder_scope(&key) { return Task::none(); }
+                        // Undo consumes its receipt only when it can start now.
+                        // A queued Undo could be dropped by Cancel, permanently
+                        // hiding recovery while the original window is still open.
+                        if !self.source_control_is_bound(&key)
+                            || self.folder_scope(&key)
+                            || self.source_control_mutations.contains_key(&key.canonical_path)
+                            || self
+                                .sidebar_model
+                                .source_control
+                                .as_ref()
+                                .is_none_or(|source| source.busy())
+                        {
+                            return Task::none();
+                        }
                         let recovery = self.discard_recoveries.remove(&key.canonical_path);
                         if let Some(source) = self.sidebar_model.source_control.as_mut().filter(|source| source.key == key) { source.undo_discard_until_unix_ms = None; }
                         recovery.map_or_else(Task::none, |recovery| self.enqueue_git_mutation(key, QueuedGitMutation::UndoDiscard(recovery)))
@@ -28608,6 +28621,111 @@ mod tests {
                 .undo_discard_until_unix_ms,
             Some(u64::MAX)
         );
+        drop(app.update(Message::Sidebar(SidebarAction::UndoDiscard {
+            key: key.clone(),
+        })));
+        assert!(!app.discard_recoveries.contains_key(&key.canonical_path));
+        assert!(matches!(
+            app.source_control_mutations[&key.canonical_path].request,
+            Some(super::QueuedGitMutation::UndoDiscard(_))
+        ));
+    }
+
+    #[test]
+    fn busy_undo_keeps_its_receipt_when_pending_git_work_is_cancelled() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        app.active_workspace = Some(key.canonical_path.clone());
+        let recovery = Arc::new(crate::repository::DiscardRecovery {
+            worktree: key.canonical_path.clone(),
+            worktree_identity: (0, 0),
+            directories: std::collections::BTreeMap::new(),
+            entries: vec![crate::repository::DiscardRecoveryEntry {
+                path: crate::repository::RepoPath::parse("discarded.txt").unwrap(),
+                before: crate::repository::SavedEntry::Absent,
+                after: crate::repository::SavedEntry::Absent,
+                after_version: None,
+                trash: None,
+            }],
+            expires_unix_ms: u64::MAX,
+        });
+        app.discard_recoveries
+            .insert(key.canonical_path.clone(), recovery.clone());
+        app.sidebar_model
+            .source_control
+            .as_mut()
+            .unwrap()
+            .undo_discard_until_unix_ms = Some(u64::MAX);
+        // A delayed event from a removed worktree must not consume recovery
+        // belonging to the current binding at the same filesystem path.
+        let stale_key = ActiveWorktreeKey {
+            worktree_id: crate::model::WorktreeId::new(),
+            ..key.clone()
+        };
+        assert_ne!(stale_key, key);
+        drop(app.update(Message::Sidebar(SidebarAction::UndoDiscard {
+            key: stale_key,
+        })));
+        assert!(Arc::ptr_eq(
+            &app.discard_recoveries[&key.canonical_path],
+            &recovery
+        ));
+        assert_eq!(
+            app.sidebar_model
+                .source_control
+                .as_ref()
+                .unwrap()
+                .undo_discard_until_unix_ms,
+            Some(u64::MAX)
+        );
+        assert!(app.source_control_mutations.is_empty());
+
+        drop(app.enqueue_git_mutation(key.clone(), super::QueuedGitMutation::Stage(Vec::new())));
+        let operation = app.source_control_mutations[&key.canonical_path].id;
+        drop(app.update(Message::Sidebar(SidebarAction::UndoDiscard {
+            key: key.clone(),
+        })));
+        drop(
+            app.update(Message::Sidebar(SidebarAction::CancelGitMutation {
+                key: key.clone(),
+            })),
+        );
+        assert!(Arc::ptr_eq(
+            &app.discard_recoveries[&key.canonical_path],
+            &recovery
+        ));
+        assert!(
+            app.source_control_mutations[&key.canonical_path]
+                .pending
+                .is_empty()
+        );
+        assert_eq!(
+            app.source_control_mutations[&key.canonical_path].id,
+            operation
+        );
+        assert_eq!(
+            app.sidebar_model
+                .source_control
+                .as_ref()
+                .unwrap()
+                .undo_discard_until_unix_ms,
+            Some(u64::MAX)
+        );
+
+        // The model can remain busy while its operation map is being rebound.
+        // The same refusal must preserve the receipt during that interval.
+        app.source_control_mutations.remove(&key.canonical_path);
+        drop(app.update(Message::Sidebar(SidebarAction::UndoDiscard {
+            key: key.clone(),
+        })));
+        assert!(app.discard_recoveries.contains_key(&key.canonical_path));
+        app.sidebar_model
+            .source_control
+            .as_mut()
+            .unwrap()
+            .set_mutation(None);
         drop(app.update(Message::Sidebar(SidebarAction::UndoDiscard {
             key: key.clone(),
         })));
