@@ -72,6 +72,9 @@ impl Locations {
             self.current -= 1;
         }
     }
+    pub fn current(&self) -> Option<&Location> {
+        self.entries.get(self.current)
+    }
     pub fn peek(&self, forward: bool) -> Option<&Location> {
         let next = if forward {
             self.current.checked_add(1)?

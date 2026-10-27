@@ -6476,6 +6476,15 @@ impl RepositoryRuntime {
         })
     }
 
+    fn current_history_location(&self) -> Option<crate::editor_navigation::Location> {
+        self.current_location().or_else(|| {
+            self.locations
+                .current()
+                .filter(|location| self.selected_path() == Some(location.path.as_path()))
+                .cloned()
+        })
+    }
+
     pub fn remember_jump_origin(&mut self) {
         self.pending_jump_origin = self.current_location();
     }
@@ -6500,7 +6509,10 @@ impl RepositoryRuntime {
         if self.blocks_navigation() && self.selected_path() != Some(target.path.as_path()) {
             return Task::none();
         }
-        let Some(from) = self.current_location() else {
+        // An unavailable destination still owns a history entry. Allow Back
+        // to recover its last readable source without requiring an editor in
+        // the failed pane. A separately selected file cannot borrow that entry.
+        let Some(from) = self.current_history_location() else {
             return Task::none();
         };
         let Some(target) = self.locations.navigate(from, forward) else {
@@ -8626,7 +8638,25 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
         ),
         DocumentState::Loading => loading(),
         DocumentState::Failed { path, message } => {
-            information_state(format!("Could not open {}", path.display()), message)
+            let state =
+                crate::ui_controls::placeholder(format!("Could not open {}", path.display()))
+                    .icon(Icon::Info)
+                    .detail(message.as_str());
+            if runtime.current_history_location().is_some()
+                && runtime.locations.peek(false).is_some()
+            {
+                state
+                    .action(
+                        crate::ui_controls::button::secondary("Back to previous location")
+                            .on_press(RepositoryAction::NavigateLocation {
+                                card,
+                                forward: false,
+                            }),
+                    )
+                    .into()
+            } else {
+                state.into()
+            }
         }
         DocumentState::ReadOnly {
             path,
@@ -12775,6 +12805,111 @@ mod tests {
         };
         assert_eq!(document.content.text(), "outside");
         assert!(!document.history.can_undo());
+    }
+
+    #[tokio::test]
+    async fn location_history_recovers_from_failed_file_load_and_retries_forward() {
+        use cosmic::iced::advanced::renderer::Headless;
+        use cosmic::iced::{Rectangle, Size, mouse};
+
+        let root = tempfile::tempdir().unwrap();
+        let original = "first line\nsecond line\n";
+        std::fs::write(root.path().join("a.rs"), original).unwrap();
+        let card = CardId::new();
+        let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+            project: ProjectId::new(),
+            repository: root.path().to_path_buf(),
+            worktree: root.path().to_path_buf(),
+            selected_file: None,
+        });
+        let task = runtime.open_file_location(card, PathBuf::from("a.rs"), 1, 3, 0);
+        finish_navigation_task(&mut runtime, task).await;
+        let before = runtime.cursor_position();
+        let task = runtime.open_file_location(card, PathBuf::from("missing.rs"), 1, 2, 0);
+        finish_navigation_task(&mut runtime, task).await;
+        assert_eq!(runtime.selected_path(), Some(Path::new("missing.rs")));
+        assert!(matches!(runtime.document, DocumentState::Failed { .. }));
+        assert!(!runtime.blocks_navigation());
+
+        // The failed pane has no text editor to receive Alt+Left. Exercise its
+        // visible recovery button at actual advertised bounds in both widths.
+        let mut back = None;
+        let renderer =
+            cosmic::Renderer::new(Font::MONOSPACE, iced::Pixels(14.0), Some("tiny-skia"))
+                .await
+                .expect("a headless renderer");
+        for width in [320.0, 800.0] {
+            let mut element = editor_surface(card, &runtime);
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(width, 400.0)),
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                mouse::Cursor::Unavailable,
+            );
+            let button = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .find(|node| node.node().label() == Some("Back to previous location"))
+                .expect("the failed pane must expose a recovery action");
+            let bounds = button.node().bounds().unwrap();
+            assert!(bounds.x0 >= 0.0 && bounds.x1 <= f64::from(width));
+            assert!(bounds.y0 >= 0.0 && bounds.y1 <= 400.0);
+            let point = iced::Point::new(
+                ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+            );
+            let mut messages = Vec::new();
+            for event in [
+                iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left),
+                iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+            ] {
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &iced::Event::Mouse(event),
+                    Layout::new(&node),
+                    mouse::Cursor::Available(point),
+                    &renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &Rectangle::with_size(Size::new(width, 400.0)),
+                );
+            }
+            assert!(matches!(
+                messages.as_slice(),
+                [RepositoryAction::NavigateLocation { card: owner, forward: false }] if *owner == card
+            ));
+            back = messages.pop();
+        }
+        let task = runtime.update(back.unwrap());
+        finish_navigation_task(&mut runtime, task).await;
+        assert_eq!(runtime.selected_path(), Some(Path::new("a.rs")));
+        assert_eq!(runtime.editor_text().as_deref(), Some(original));
+        assert_eq!(runtime.cursor_position(), before);
+        assert!(!runtime.is_dirty());
+
+        // Failure does not consume the destination. Once it exists, ordinary
+        // Forward retries the original path and position through real loading.
+        let recovered = "new first\nnew second\n";
+        std::fs::write(root.path().join("missing.rs"), recovered).unwrap();
+        let task = runtime.update(RepositoryAction::NavigateLocation {
+            card,
+            forward: true,
+        });
+        finish_navigation_task(&mut runtime, task).await;
+        assert_eq!(runtime.selected_path(), Some(Path::new("missing.rs")));
+        assert_eq!(runtime.editor_text().as_deref(), Some(recovered));
+        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(1, 2)));
+        assert!(!runtime.is_dirty());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("a.rs")).unwrap(),
+            original
+        );
     }
 
     #[test]
