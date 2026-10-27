@@ -1,6 +1,8 @@
 use super::*;
 use crate::model::ChannelId;
 
+pub(super) mod selection;
+
 /// Ownership comes from the launch recipe, never a shell's current directory or
 /// OSC title. Component-aware matching also keeps `repo-fix` outside `repo`.
 pub(super) fn worktree_root<'a>(
@@ -374,6 +376,7 @@ impl Cagents {
             .iter()
             .find(|channel| channel.id == id)
             .expect("the channel directory resolved this same channel");
+        self.worktree_selection.cancel();
         if self.durable.active_channel == Some(id)
             && self.active_workspace.as_ref() == Some(&path)
             && self.workspace.order().eq(self
@@ -409,7 +412,7 @@ impl Cagents {
 
     /// Resolve filesystem aliases only when changing/restoring scope, never in
     /// the render path or by rewriting a hosted session's durable launch recipe.
-    fn refresh_worktree_owners(&mut self, selected: Option<&Path>) -> Option<PathBuf> {
+    fn collect_worktree_roots(&mut self) {
         // Deleted worktree rows disappear from navigation, not from ownership.
         // Otherwise a surviving nested session would fall into its parent repo.
         self.known_worktree_roots
@@ -436,6 +439,12 @@ impl Cagents {
                         _ => None,
                     }),
             );
+    }
+
+    fn refresh_worktree_owners(&mut self, selected: Option<&Path>) -> Option<PathBuf> {
+        #[cfg(test)]
+        self.worktree_selection.record_owner_read();
+        self.collect_worktree_roots();
         let roots = self
             .known_worktree_roots
             .iter()
@@ -512,7 +521,14 @@ impl Cagents {
         }) {
             #[cfg(test)]
             terminal_output_tests::record_folder_root_refresh();
-            self.refresh_worktree_owners(None);
+            if self.worktree_selection.is_active() {
+                // The active preparation's model fence will see this new
+                // boundary. Do not canonicalize a newly loaded Folder in the
+                // UI tail while that same filesystem worker may be stalled.
+                self.collect_worktree_roots();
+            } else {
+                self.refresh_worktree_owners(None);
+            }
         }
         let roots = self.indexed_worktree_roots();
         let channeled = self
@@ -702,6 +718,15 @@ impl Cagents {
             )));
             return (false, Task::none());
         }
+        self.worktree_selection.cancel();
+        self.commit_worktree_selection(path, create_if_empty)
+    }
+
+    fn commit_worktree_selection(
+        &mut self,
+        path: PathBuf,
+        create_if_empty: bool,
+    ) -> (bool, Task<Message>) {
         let roots = self
             .known_worktree_roots
             .iter()

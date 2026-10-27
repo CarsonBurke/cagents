@@ -309,9 +309,7 @@ impl Cagents {
         }).map(|owner| owner.state.id).collect()
     }
 
-    pub(super) fn sync_worktree_protections(&mut self) {
-        #[cfg(test)]
-        super::terminal_output_tests::record_protection();
+    pub(super) fn desired_worktree_protections(&self) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         if let Some(path) = &self.active_workspace {
             paths.push(path.clone());
@@ -348,6 +346,13 @@ impl Cagents {
                 paths.push(runtime.descriptor.worktree.clone());
             }
         }
+        paths
+    }
+
+    pub(super) fn sync_worktree_protections(&mut self) {
+        #[cfg(test)]
+        super::terminal_output_tests::record_protection();
+        let paths = self.desired_worktree_protections();
         if let Err(error) = self.worktree_protections.sync(paths) {
             tracing::debug!(%error, "automatic worktree cleanup unavailable until window scopes are protected");
         }
