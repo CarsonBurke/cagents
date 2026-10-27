@@ -553,6 +553,10 @@ pub struct ControlClient {
     /// Attaching is only how this client earns the right to close a chat; it
     /// reads nothing from the chat's notifications, so they are dropped.
     attached_chats: BTreeSet<TerminalId>,
+    /// Terminal streams this connection successfully requested. Their payloads
+    /// are not retained, but queued notifications can outlive a Detach reply,
+    /// so remember their IDs for this connection's lifetime.
+    terminal_streams: BTreeSet<TerminalId>,
 }
 
 /// Linux AF_UNIX backlog pressure returns EAGAIN without connecting. Retry
@@ -679,6 +683,7 @@ impl ControlClient {
             observed_notifications: VecDeque::new(),
             observed_work: None,
             attached_chats: BTreeSet::new(),
+            terminal_streams: BTreeSet::new(),
         })
     }
 
@@ -1060,6 +1065,7 @@ impl ControlClient {
             }
             response => return Err(unexpected_response("a spawned terminal", &response)),
         };
+        self.terminal_streams.insert(expected);
         self.read_attachment_replay(expected)?;
         Ok(terminal)
     }
@@ -1088,6 +1094,7 @@ impl ControlClient {
             }
             response => return Err(unexpected_response("a reserved terminal", &response)),
         };
+        self.terminal_streams.insert(terminal_id);
         self.read_attachment_replay(terminal_id)?;
         Ok(terminal)
     }
@@ -1423,6 +1430,7 @@ impl ControlClient {
             }
             response => return Err(unexpected_response("a terminal attachment", &response)),
         };
+        self.terminal_streams.insert(terminal_id);
         self.read_attachment_replay(terminal_id)?;
         Ok(terminal)
     }
@@ -1728,6 +1736,12 @@ impl ControlClient {
             | ServerMessage::ChatObserved { chat_id, .. }
             | ServerMessage::ChatActivity { chat_id, .. }
                 if self.attached_chats.contains(&chat_id) => {}
+            ServerMessage::Redraw { terminal_id, .. }
+            | ServerMessage::Snapshot { terminal_id, .. }
+            | ServerMessage::TerminalObserved { terminal_id, .. }
+            | ServerMessage::Event { terminal_id, .. }
+            | ServerMessage::Synchronized { terminal_id, .. }
+                if self.terminal_streams.contains(&terminal_id) => {}
             message => return Err(message),
         }
         Ok(())
@@ -5706,6 +5720,164 @@ mod tests {
         );
         server.join().unwrap();
     }
+    #[test]
+    fn requested_terminal_streams_do_not_break_later_rpc_or_accept_foreign_frames() {
+        for invalid in ["unknown", "proof", "request-id"] {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            server_stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            server_stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let pinned = proof("terminal-stream", "boot", "incarnation");
+            let recipe = LaunchRecipe {
+                program: "/bin/sh".into(),
+                arguments: Vec::new(),
+                working_directory: "/".into(),
+                environment: BTreeMap::new(),
+                unset_environment: Default::default(),
+            };
+            let terminal = TerminalDescriptor::relaunchable(TerminalId::new(), recipe, None);
+            let session = terminal.session.clone();
+            let expected = session.id;
+            let server = thread::spawn(move || {
+                let connect: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                write_frame(
+                    &mut server_stream,
+                    &connected_envelope(connect.request_id, pinned.clone(), pinned.clone()),
+                )
+                .unwrap();
+                let spawn: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert!(
+                    matches!(spawn.request, ClientRequest::Spawn { session, .. } if session.id == expected)
+                );
+                for (request_id, message) in [
+                    (
+                        Some(spawn.request_id),
+                        ServerMessage::Response {
+                            response: ServerResponse::Spawned {
+                                terminal: terminal.clone(),
+                            },
+                        },
+                    ),
+                    (
+                        None,
+                        ServerMessage::Synchronized {
+                            terminal_id: expected,
+                            generation: 0,
+                            event_sequence: 0,
+                        },
+                    ),
+                ] {
+                    write_frame(
+                        &mut server_stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: pinned.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+                }
+                let list: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert!(matches!(list.request, ClientRequest::List));
+                // These genuine terminal-stream message kinds remain legal
+                // after the first attachment replay and during a later RPC.
+                for message in [
+                    ServerMessage::Redraw {
+                        terminal_id: expected,
+                        generation: 1,
+                    },
+                    ServerMessage::Snapshot {
+                        terminal_id: expected,
+                        snapshot: TerminalSnapshot::full(&crate::terminal::RenderSnapshot::empty()),
+                    },
+                    ServerMessage::TerminalObserved {
+                        terminal_id: expected,
+                        epoch: 1,
+                    },
+                    ServerMessage::Event {
+                        terminal_id: expected,
+                        sequence: 1,
+                        event: crate::terminal::ipc::WireTerminalEvent::Bell,
+                    },
+                    ServerMessage::Synchronized {
+                        terminal_id: expected,
+                        generation: 1,
+                        event_sequence: 1,
+                    },
+                    ServerMessage::Response {
+                        response: ServerResponse::Listed {
+                            terminals: vec![terminal],
+                        },
+                    },
+                ] {
+                    let request_id = matches!(message, ServerMessage::Response { .. })
+                        .then_some(list.request_id);
+                    write_frame(
+                        &mut server_stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: pinned.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+                }
+                let list: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert!(matches!(list.request, ClientRequest::List));
+                let mut envelope = ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: None,
+                    proof: pinned,
+                    message: ServerMessage::Snapshot {
+                        terminal_id: if invalid == "unknown" {
+                            TerminalId::new()
+                        } else {
+                            expected
+                        },
+                        snapshot: TerminalSnapshot::full(&crate::terminal::RenderSnapshot::empty()),
+                    },
+                };
+                if invalid == "proof" {
+                    envelope.proof = proof("different", "boot", "incarnation");
+                }
+                if invalid == "request-id" {
+                    envelope.request_id = Some(list.request_id + 1);
+                }
+                write_frame(&mut server_stream, &envelope).unwrap();
+            });
+            let mut client = ControlClient::from_stream(client_stream).unwrap();
+            assert_eq!(
+                client
+                    .spawn(session, Default::default())
+                    .unwrap()
+                    .session
+                    .id,
+                expected
+            );
+            assert_eq!(client.list().unwrap()[0].session.id, expected);
+            let result = client.list();
+            assert!(match invalid {
+                "unknown" => matches!(
+                    result,
+                    Err(ControlError::UnexpectedMessage {
+                        actual: "snapshot",
+                        ..
+                    })
+                ),
+                "proof" => matches!(result, Err(ControlError::ProofMismatch)),
+                "request-id" => matches!(result, Err(ControlError::RequestIdMismatch { .. })),
+                _ => unreachable!(),
+            });
+            drop(client);
+            server.join().unwrap();
+        }
+    }
+
     /// Closing a chat attaches this connection to it, and the interrupt the
     /// close delivers is reported to every attached client before the answer.
     /// Neither the close nor the requests after it may mistake that report for
