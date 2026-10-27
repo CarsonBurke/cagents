@@ -23,6 +23,8 @@ use super::{
     state::{ClientId, SharedHost, send_error, spawn_terminal},
 };
 
+#[cfg(test)]
+mod device_request_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod explicit_authority_server_tests;
 
@@ -556,13 +558,17 @@ pub(super) fn process_request(
     // The GitHub read must not monopolize the exclusive admission fence. All
     // authorizing local state is checked again only after that fence is held.
     if let ClientRequest::DeviceOperation {
-        operation: crate::device_service::Operation::RemoveMergedWorktree { request },
+        operation:
+            crate::device_service::Operation::RemoveMergedWorktree {
+                request: removal_request,
+            },
     } = &request
     {
         let prepared = {
             let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
             ensure_control_open(host)?;
-            crate::worktree_cleanup::PreparedRemoval::prepare(request.clone())
+            super::agent_execution::terminals::admit(host, client_id, &request)?;
+            crate::worktree_cleanup::PreparedRemoval::prepare(removal_request.clone())
         };
         let removed = match prepared {
             Ok(prepared) => {
