@@ -69,10 +69,10 @@ fn chat_title<'a>(
     text: impl Into<Cow<'a, str>> + 'a,
 ) -> cosmic::widget::text::Text<'a, cosmic::Theme, cosmic::Renderer> {
     design::body(text)
-        .size(design::TEXT_PROSE)
+        .size(design::chat_size())
         .font(iced::Font {
             weight: iced::font::Weight::Semibold,
-            ..cosmic::font::default()
+            ..design::chat_font()
         })
 }
 

@@ -4706,6 +4706,12 @@ impl Application for Editor {
         vec![tab_strip(self)]
     }
     fn view(&self) -> Element<'_, Message> {
+        design::configure_typography(
+            &self.settings.interface_font_family,
+            self.settings.interface_font_size,
+            &self.settings.chat_font_family,
+            self.settings.chat_font_size,
+        );
         let mut body = Vec::new();
         // The COSMIC header above has no separator of its own: always rule
         // off the content below it, tabs or placeholder alike.

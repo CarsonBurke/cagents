@@ -705,7 +705,8 @@ fn notice_surface<'a>(
 /// foreground and the detail lines in the ambient one.
 fn notice_body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
     widget::selectable_text(text)
-        .size(design::TEXT_BODY)
+        .font(design::interface_font())
+        .size(design::interface_size())
         .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
         .width(Length::Fill)
         .into()
@@ -716,7 +717,8 @@ fn notice_body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
 /// `notice_surface_detail`.
 fn notice_detail<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
     widget::selectable_text(text)
-        .size(design::TEXT_CAPTION)
+        .font(design::interface_font())
+        .size(design::scaled_interface_size(design::TEXT_CAPTION))
         .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
         .width(Length::Fill)
         .class(cosmic::theme::Text::Custom(design::muted_text))
@@ -756,7 +758,8 @@ fn notice_detail_text<'a>(
     text: impl Into<Cow<'a, str>> + 'a,
 ) -> widget::SelectableText<'a> {
     widget::selectable_text(text)
-        .size(design::TEXT_CAPTION)
+        .font(design::interface_font())
+        .size(design::scaled_interface_size(design::TEXT_CAPTION))
         .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
         .width(Length::Fill)
         .class(cosmic::theme::Text::Color(severity.detail_color()))
@@ -2707,6 +2710,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::SettingsSearchChanged(_)
         | Message::SettingsChanged { .. }
         | Message::SettingsDraftChanged { .. }
+        | Message::SettingsNumberDraftChanged { .. }
         | Message::ResetSettings
         | Message::DismissStatus => true,
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
@@ -2774,6 +2778,7 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::SettingsSearchChanged(_)
                 | Message::SettingsChanged { .. }
                 | Message::SettingsDraftChanged { .. }
+                | Message::SettingsNumberDraftChanged { .. }
                 | Message::ResetSettings
                 | Message::ConfirmResetSettings
                 | Message::CancelResetSettings
@@ -2934,6 +2939,10 @@ pub enum SettingsField {
     Notifications(crate::notifications::Field),
     AppTheme,
     UiScale,
+    InterfaceFontFamily,
+    InterfaceFontSize,
+    ChatFontFamily,
+    ChatFontSize,
     TerminalLineHeight,
     TerminalPadding,
     TerminalScrollSize,
@@ -3069,6 +3078,10 @@ impl SettingsField {
             Self::Notifications(Field::WhileFocused) => "Notify while focused",
             Self::Notifications(Field::MessagePreviews) => "Show message previews",
             Self::AppTheme => "App theme",
+            Self::InterfaceFontFamily => "Interface font family",
+            Self::InterfaceFontSize => "Interface font size",
+            Self::ChatFontFamily => "Chat font family",
+            Self::ChatFontSize => "Chat font size",
             Self::UiScale => "Interface scale",
             Self::TerminalLineHeight => "Line height",
             Self::TerminalPadding => "Inner padding",
@@ -3077,7 +3090,7 @@ impl SettingsField {
             Self::TerminalCursorStyle => "Cursor shape",
             Self::TerminalTheme => "Color theme",
             Self::MaxHotCards => "Maximum hot panes",
-            Self::HibernationDelayMs => "Hibernation delay (ms)",
+            Self::HibernationDelayMs => "Hibernation delay",
             Self::WorkStaleAfterDays => "Stale after (days)",
             Self::TerminalFontSize => "Font size",
             Self::TerminalFontFamily => "Font family",
@@ -3156,6 +3169,8 @@ impl SettingsField {
             Self::Notifications(_) => SettingsCategory::Notifications,
             Self::AppTheme
             | Self::UiScale
+            | Self::InterfaceFontFamily
+            | Self::InterfaceFontSize
             | Self::ShowStatusBar
             | Self::ShowWorktreeChangesIcons
             | Self::AutoDeleteMergedWorktrees
@@ -3180,9 +3195,11 @@ impl SettingsField {
             | Self::DefaultWorktreePane
             | Self::DefaultChannelPane
             | Self::FocusFollowsMouse => SettingsCategory::General,
-            Self::ChatEnterSends | Self::ChatExpandToolGroups | Self::ChatContentFraction => {
-                SettingsCategory::NativeChat
-            }
+            Self::ChatFontFamily
+            | Self::ChatFontSize
+            | Self::ChatEnterSends
+            | Self::ChatExpandToolGroups
+            | Self::ChatContentFraction => SettingsCategory::NativeChat,
             Self::DefaultNativePaneFraction => SettingsCategory::Appearance,
             Self::EditorAutoSave
             | Self::EditorWrapLines
@@ -3341,9 +3358,15 @@ impl ShortcutDraft {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SettingsDraft {
+    /// Exact numeric text shown while editing, before unit conversion.
+    numeric_display: HashMap<SettingsField, String>,
     notifications: crate::notifications::Preferences,
     app_theme: String,
     ui_scale: String,
+    interface_font_family: String,
+    interface_font_size: String,
+    chat_font_family: String,
+    chat_font_size: String,
     terminal_line_height: String,
     terminal_padding: String,
     terminal_scroll_size: String,
@@ -3390,9 +3413,14 @@ struct SettingsDraft {
 impl SettingsDraft {
     fn from_settings(settings: &AppSettings) -> Self {
         Self {
+            numeric_display: HashMap::new(),
             notifications: settings.notifications,
             app_theme: settings.app_theme.key().into(),
             ui_scale: settings.ui_scale.to_string(),
+            interface_font_family: settings.interface_font_family.clone(),
+            interface_font_size: settings.interface_font_size.to_string(),
+            chat_font_family: settings.chat_font_family.clone(),
+            chat_font_size: settings.chat_font_size.to_string(),
             terminal_line_height: settings.terminal_line_height.to_string(),
             terminal_padding: settings.terminal_padding.to_string(),
             terminal_scroll_size: settings.terminal_scroll_size.to_string(),
@@ -3456,6 +3484,10 @@ impl SettingsDraft {
             SettingsField::Notifications(field) => self.notifications.set(field, value == "true"),
             SettingsField::AppTheme => self.app_theme = value,
             SettingsField::UiScale => self.ui_scale = value,
+            SettingsField::InterfaceFontFamily => self.interface_font_family = value,
+            SettingsField::InterfaceFontSize => self.interface_font_size = value,
+            SettingsField::ChatFontFamily => self.chat_font_family = value,
+            SettingsField::ChatFontSize => self.chat_font_size = value,
             SettingsField::TerminalLineHeight => self.terminal_line_height = value,
             SettingsField::TerminalPadding => self.terminal_padding = value,
             SettingsField::TerminalScrollSize => self.terminal_scroll_size = value,
@@ -3623,6 +3655,22 @@ fn settings_update(
     let value = raw_value.trim();
     let mut next = current.clone();
     let parsed = match field {
+        SettingsField::InterfaceFontFamily => {
+            next.interface_font_family = value.into();
+            Ok(())
+        }
+        SettingsField::InterfaceFontSize => value
+            .parse::<f32>()
+            .map(|size| next.interface_font_size = size)
+            .map_err(|_| "Enter a font size between 10 and 24.".into()),
+        SettingsField::ChatFontFamily => {
+            next.chat_font_family = value.into();
+            Ok(())
+        }
+        SettingsField::ChatFontSize => value
+            .parse::<f32>()
+            .map(|size| next.chat_font_size = size)
+            .map_err(|_| "Enter a font size between 8 and 40.".into()),
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
             Ok(())
@@ -3849,7 +3897,8 @@ fn settings_update(
                     Ok(())
                 }
                 None => Err(
-                    "Choose a preset or configure custom_terminal_theme in settings.toml.".into(),
+                    "Choose a preset, or configure a custom terminal palette in the settings file."
+                        .into(),
                 ),
             }
         }
@@ -4019,10 +4068,10 @@ fn settings_update(
     let attempted = next.clone();
     let next = match next.validate() {
         Ok(next) => next,
-        Err(error) => {
-            return SettingsDecision::Invalid(
-                refusal(field, &attempted).unwrap_or_else(|| error.to_string()),
-            );
+        Err(_) => {
+            return SettingsDecision::Invalid(refusal(field, &attempted).unwrap_or_else(|| {
+                format!("Choose a valid value for {}.", field.label().to_lowercase())
+            }));
         }
     };
     if next == *current {
@@ -4052,7 +4101,35 @@ fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
         ),
         SettingsField::MaxHotCards => format!("{label} must be a whole number, at least 1."),
         SettingsField::HibernationDelayMs => {
-            "Hibernation delay must be a whole number of milliseconds.".to_owned()
+            "Hibernation delay must be a non-negative number of seconds.".to_owned()
+        }
+        SettingsField::InterfaceFontSize => "Font size must be between 10 and 24.".to_owned(),
+        SettingsField::EditorFontSize
+        | SettingsField::ChatFontSize
+        | SettingsField::TerminalFontSize => "Font size must be between 8 and 40.".to_owned(),
+        SettingsField::EditorFontFamily
+        | SettingsField::InterfaceFontFamily
+        | SettingsField::ChatFontFamily => {
+            "Enter a font family name of at most 128 bytes, or leave it blank to use the default."
+                .to_owned()
+        }
+        SettingsField::BrowserSearchUrl => {
+            "Search URL must use HTTP or HTTPS and include {query}.".to_owned()
+        }
+        SettingsField::UiScale => "Interface scale must be between 80% and 150%.".to_owned(),
+        SettingsField::TerminalLineHeight => {
+            "Line height must be between 1 and 2 times the font size.".to_owned()
+        }
+        SettingsField::TerminalPadding => {
+            "Inner padding must be between 0 and 24 pixels.".to_owned()
+        }
+        SettingsField::TerminalScrollSpeed => {
+            "Scroll speed must be between 0.25 and 4 times the default.".to_owned()
+        }
+        SettingsField::ChatContentFraction
+        | SettingsField::DefaultNativePaneFraction
+        | SettingsField::DefaultColumnFraction => {
+            "Width must be a number between 25% and 100%.".to_owned()
         }
         SettingsField::WorkStaleAfterDays => format!(
             "{label} must be 1–{} days.",
@@ -4553,6 +4630,10 @@ pub enum Message {
         field: SettingsField,
         value: String,
     },
+    SettingsNumberDraftChanged {
+        field: SettingsField,
+        value: String,
+    },
     SettingsAutosave {
         field: SettingsField,
         generation: u64,
@@ -4867,7 +4948,7 @@ impl TerminalTitleSource {
 /// Widget ids and accessible names for one card.
 ///
 /// Both embed the card id and title, so they are built when a card appears or
-/// is renamed instead of once per rendered frame. Reusing an id also keeps the
+/// is renamed or typography changes, instead of once per rendered frame. Reusing an id keeps the
 /// card's accessibility node stable across frames.
 struct CardChrome {
     tooltip: String,
@@ -4887,6 +4968,7 @@ struct CardChrome {
     type_label: &'static str,
     title: String,
     title_width: f32,
+    typography_revision: u64,
     compact_title: Option<String>,
     terminal_ordinal_suffix: Option<String>,
     terminal_title_source: Option<TerminalTitleSource>,
@@ -4921,6 +5003,7 @@ impl CardChrome {
             type_label,
             title: title.to_owned(),
             title_width: chrome_ui::measure_tab_title(title),
+            typography_revision: design::typography_revision(),
             compact_title: None,
             terminal_ordinal_suffix: None,
             terminal_title_source: None,
@@ -4933,7 +5016,10 @@ impl CardChrome {
     }
 
     fn describes(&self, type_label: &str, title: &str, caption: &str) -> bool {
-        self.type_label == type_label && self.title == title && self.caption == caption
+        self.type_label == type_label
+            && self.title == title
+            && self.caption == caption
+            && self.typography_revision == design::typography_revision()
     }
 
     fn accessible_name(&self, focused: bool) -> &str {
@@ -5281,6 +5367,7 @@ pub struct Cagents {
     workspace_cycle_modifiers: keyboard::Modifiers,
     keyboard_modifiers: keyboard::Modifiers,
     settings_draft: SettingsDraft,
+    settings_font_choices: settings_ui::FontChoices,
     settings_feedback: Option<SettingsFeedback>,
     /// Whether the settings pane held focus after the last update, so the
     /// update that moves focus away can flush the drafts typed into it.
@@ -7895,6 +7982,13 @@ impl Cagents {
     /// Builds chrome for cards that appeared or were renamed, drops entries for
     /// cards the workspace no longer holds, and renames the window.
     fn sync_chrome(&mut self) -> Task<Message> {
+        // Configure before measuring caches, not only when view builds widgets.
+        design::configure_typography(
+            &self.settings.interface_font_family,
+            self.settings.interface_font_size,
+            &self.settings.chat_font_family,
+            self.settings.chat_font_size,
+        );
         self.terminal_working_directories
             .retain(|card, _| self.cards.contains_key(card));
         self.terminal_find
@@ -9938,6 +10032,8 @@ impl Cagents {
                 settings_ui::SettingsContext {
                     feedback: self.settings_feedback.as_ref(),
                     invalid: &self.settings_invalid,
+                    fonts: &self.settings_font_choices,
+                    terminal_font_size: self.settings.terminal_font_size,
                     accounts: self.default_account_choices(),
                     updates: self.update_summary(),
                     testing_notification: self.notification_ui.testing,
@@ -13364,6 +13460,12 @@ impl Cagents {
         };
     }
 
+    fn queue_number_setting_input(&mut self, field: SettingsField, value: String) -> Task<Message> {
+        let stored = settings_ui::number_setting_value(field, &value);
+        self.settings_draft.numeric_display.insert(field, value);
+        self.queue_setting_input(field, stored)
+    }
+
     fn queue_setting_input(&mut self, field: SettingsField, value: String) -> Task<Message> {
         self.settings_draft.set(field, value.clone());
         self.settings_generation = self.settings_generation.wrapping_add(1);
@@ -14003,6 +14105,7 @@ impl Application for Cagents {
             workspace_cycle_modifiers: keyboard::Modifiers::empty(),
             keyboard_modifiers: keyboard::Modifiers::empty(),
             settings_draft,
+            settings_font_choices: settings_ui::FontChoices::new(),
             settings_feedback: None,
             settings_pane_focused: false,
             reopen_utility: None,
@@ -17227,9 +17330,16 @@ impl Application for Cagents {
                 self.settings_search = query;
                 crate::settings_widgets::reveal_content_start()
             }
-            Message::SettingsChanged { field, value } => self.apply_setting_input(field, value),
+            Message::SettingsChanged { field, value } => {
+                self.settings_draft.numeric_display.remove(&field);
+                self.apply_setting_input(field, value)
+            }
             Message::SettingsDraftChanged { field, value } => {
+                self.settings_draft.numeric_display.remove(&field);
                 self.queue_setting_input(field, value)
+            }
+            Message::SettingsNumberDraftChanged { field, value } => {
+                self.queue_number_setting_input(field, value)
             }
             Message::SettingsAutosave { field, generation } => {
                 self.autosave_setting(field, generation)
@@ -18188,6 +18298,12 @@ impl Application for Cagents {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        design::configure_typography(
+            &self.settings.interface_font_family,
+            self.settings.interface_font_size,
+            &self.settings.chat_font_family,
+            self.settings.chat_font_size,
+        );
         let window_width = self.window_width;
         let sidebar_mode = self.projects_sidebar_mode();
         let sidebar = sidebar::view_cached(
@@ -28427,6 +28543,7 @@ mod tests {
             save_health: None,
             session_recovery: session_recovery::State::default(),
             settings_draft: SettingsDraft::from_settings(&settings),
+            settings_font_choices: settings_ui::FontChoices::new(),
             settings_base: settings.clone(),
             settings_save_generation: 0,
             settings_ack_generation: 0,

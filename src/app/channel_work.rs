@@ -3728,6 +3728,8 @@ mod tests {
                 settings_ui::SettingsContext {
                     feedback: app.settings_feedback.as_ref(),
                     invalid: &app.settings_invalid,
+                    fonts: &app.settings_font_choices,
+                    terminal_font_size: app.settings.terminal_font_size,
                     accounts: app.default_account_choices(),
                     updates: app.update_summary(),
                     testing_notification: app.notification_ui.testing,

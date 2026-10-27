@@ -30,8 +30,11 @@ pub fn text<'a, Message: Clone + 'static>(
     value: impl Into<Cow<'a, str>>,
 ) -> TextInput<'a, Message> {
     TextInput::new(placeholder, value)
-        .size(design::TEXT_BODY)
-        .line_height(iced::widget::text::LineHeight::Absolute(LINE_HEIGHT.into()))
+        .font(design::interface_font())
+        .size(design::interface_size())
+        .line_height(iced::widget::text::LineHeight::Absolute(
+            (design::interface_size() + 5.0).into(),
+        ))
         .padding([INSET_Y, space::S])
         .style(style())
 }
@@ -84,7 +87,7 @@ where
     Message: Clone + 'static,
 {
     widget::dropdown(options, selected, on_select)
-        .text_size(design::TEXT_BODY)
+        .text_size(design::interface_size())
         .padding([INSET_Y, space::S])
 }
 
@@ -92,7 +95,8 @@ where
 pub fn checkbox<'a, Message>(checked: bool) -> widget::Checkbox<'a, Message, cosmic::Theme> {
     widget::checkbox(checked)
         .size(design::ROW_ICON_SIZE)
-        .text_size(design::TEXT_BODY)
+        .font(design::interface_font())
+        .text_size(design::interface_size())
         .spacing(space::S)
 }
 
@@ -101,7 +105,8 @@ pub fn checkbox<'a, Message>(checked: bool) -> widget::Checkbox<'a, Message, cos
 pub fn toggle<'a, Message>(on: bool) -> widget::Toggler<'a, Message> {
     widget::toggler(on)
         .size(design::STATUS_ICON_SIZE)
-        .text_size(design::TEXT_BODY)
+        .font(design::interface_font())
+        .text_size(design::interface_size())
         .spacing(space::M)
 }
 
@@ -190,4 +195,6 @@ pub fn editor<'a, Message: Clone + 'static>(
     content: &'a cosmic::iced::widget::text_editor::Content<cosmic::Renderer>,
 ) -> TextEditor<'a, Message> {
     TextEditor::new(name, content)
+        .font(design::interface_font())
+        .size(design::interface_size())
 }

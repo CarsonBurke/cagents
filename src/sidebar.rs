@@ -4585,7 +4585,7 @@ mod cached_projects {
     use iced::{Event, Length, Rectangle, Size, Vector};
     use std::cell::RefCell;
 
-    type Dependency = (u64, bool, bool);
+    type Dependency = (u64, bool, bool, u64);
 
     pub(super) fn view<'a>(
         dependency: Dependency,
@@ -4858,7 +4858,12 @@ fn view_inner<'a>(
                 && !matches!(model.data_state, SidebarDataState::Error(_))
             {
                 cached_projects::view(
-                    (cache.generation(model, state), compact, modal_open),
+                    (
+                        cache.generation(model, state),
+                        compact,
+                        modal_open,
+                        design::typography_revision(),
+                    ),
                     move || project_list(model, state, compact, modal_open),
                 )
             } else {
@@ -9758,10 +9763,10 @@ fn changes_footer<'a>(
         crate::ui_controls::field::editor("Commit subject", &state.commit_draft.subject_composer.0)
             .placeholder("Commit subject")
             .id(chrome.commit_input_id.clone())
-            .font(cosmic::iced::Font::DEFAULT)
+            .font(design::interface_font())
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .height(Length::Fixed(design::TEXT_BODY * 1.3 + 16.0))
-            .size(design::TEXT_BODY)
+            .height(Length::Fixed(design::interface_size() * 1.3 + 16.0))
+            .size(design::interface_size())
             .padding([space::S, 10.0])
             .style(commit_description_style)
             .key_binding(move |press| {
@@ -9810,13 +9815,13 @@ fn changes_footer<'a>(
             .id(chrome.commit_description_id.clone())
             .height(Length::Fixed(
                 (state.commit_draft.composer.0.line_count().clamp(2, 4) as f32)
-                    * design::TEXT_BODY
+                    * design::interface_size()
                     * 1.3
                     + 16.0,
             ))
-            .font(cosmic::iced::Font::DEFAULT)
+            .font(design::interface_font())
             .style(commit_description_style)
-            .size(design::TEXT_BODY)
+            .size(design::interface_size())
             .padding([space::XS, space::S])
             .key_binding(move |press| {
                 if !matches!(
@@ -11175,13 +11180,15 @@ fn search_label(
     class: theme::Text,
     heading: bool,
 ) -> Element<'static, SidebarAction> {
+    let size = design::scaled_interface_size(size);
+    let line_height = cosmic::iced::widget::text::LineHeight::Absolute((size + 5.0).into());
     let font = cosmic::font::Font {
         weight: if heading {
             cosmic::iced::font::Weight::Medium
         } else {
             cosmic::iced::font::Weight::Normal
         },
-        ..cosmic::font::default()
+        ..design::interface_font()
     };
     let emphasis = cosmic::font::Font {
         weight: cosmic::iced::font::Weight::Bold,
@@ -11191,6 +11198,7 @@ fn search_label(
     if highlights.is_empty() {
         return widget::text::body(label.to_owned())
             .size(size)
+            .line_height(line_height)
             .font(font)
             .class(class)
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
@@ -11225,6 +11233,7 @@ fn search_label(
         widget::container(
             cosmic::iced::widget::rich_text(spans)
                 .size(size)
+                .line_height(line_height)
                 .font(font)
                 .class(class.clone())
                 .wrapping(cosmic::iced::widget::text::Wrapping::None)
@@ -11234,7 +11243,7 @@ fn search_label(
         .clip(true)
         .into()
     })
-    .height(size * 1.5)
+    .height(size + 5.0)
     .into()
 }
 
@@ -11279,7 +11288,7 @@ fn search_spans_width(
         content: &spans,
         bounds: Size::new(f32::INFINITY, f32::INFINITY),
         size: Pixels(size),
-        line_height: text::LineHeight::Relative(1.5),
+        line_height: text::LineHeight::Absolute((size + 5.0).into()),
         font,
         align_x: text::Alignment::Left,
         align_y: cosmic::iced::alignment::Vertical::Top,
@@ -17321,6 +17330,8 @@ pub(crate) mod tests {
 
     #[test]
     fn cached_project_list_preserves_actual_accessibility_press_focus_and_overlay_state() {
+        let _restore = design::typography_test_guard();
+        design::configure_typography("", 13.0, "", 14.0);
         use cosmic::iced::{
             Event, Point, Rectangle, Vector,
             advanced::{Shell, clipboard, mouse, widget::operation},
@@ -17358,10 +17369,13 @@ pub(crate) mod tests {
         let builds = Cell::new(0);
         let make = |generation, modal| {
             let (model, state, builds) = (&model, &state, &builds);
-            cached_projects::view((generation, false, modal), move || {
-                builds.set(builds.get() + 1);
-                project_list(model, state, false, modal)
-            })
+            cached_projects::view(
+                (generation, false, modal, design::typography_revision()),
+                move || {
+                    builds.set(builds.get() + 1);
+                    project_list(model, state, false, modal)
+                },
+            )
         };
         let mut element = make(1, false);
         assert_eq!(
@@ -17594,6 +17608,46 @@ pub(crate) mod tests {
                 .chain(nodes.children())
                 .any(|n| n.node().label() == Some(name.as_str()) && n.node().is_disabled())
         );
+
+        // A typography change rebuilds the actual cached project subtree even
+        // when its model generation, modal state and project name are unchanged.
+        // The subsequent identical frame must reuse that refreshed subtree.
+        use cosmic::iced::advanced::{text::Paragraph as _, widget::tree::Tag};
+        type Paragraph = <cosmic::Renderer as cosmic::iced::advanced::text::Renderer>::Paragraph;
+        type TextState = cosmic::iced::advanced::widget::text::State<Paragraph>;
+        fn project_text_size(tree: &Tree) -> Option<f32> {
+            if tree.tag == Tag::of::<TextState>() {
+                let paragraph = &tree.state.downcast_ref::<TextState>().paragraph;
+                if paragraph.content() == "Cagents" {
+                    return Some(paragraph.raw().size().0);
+                }
+            }
+            tree.children.iter().find_map(project_text_size)
+        }
+        assert_eq!(project_text_size(&tree), Some(13.0));
+        design::configure_typography("", 24.0, "", 14.0);
+        element = make(2, true);
+        tree.diff(element.as_widget_mut());
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert_eq!(
+            builds.get(),
+            3,
+            "font revision invalidates the retained cache"
+        );
+        assert_eq!(project_text_size(&tree), Some(24.0));
+        assert!(
+            tree.find(&id).is_some(),
+            "the real button identity survives"
+        );
+        element = make(2, true);
+        tree.diff(element.as_widget_mut());
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert_eq!(builds.get(), 3, "unchanged typography reuses the cache");
+        assert_eq!(project_text_size(&tree), Some(24.0));
     }
 
     #[test]
@@ -20997,6 +21051,49 @@ pub(crate) mod tests {
             "failure requires explicit retry, not an automatic loop"
         );
         assert!(previous.can_load_history());
+    }
+
+    #[test]
+    fn settings_interface_typography_reaches_plain_and_highlighted_sidebar_identity_labels() {
+        use super::*;
+        use cosmic::iced::advanced::{layout, widget::Tree};
+        let _restore = design::typography_test_guard();
+        let renderer = headless_renderer();
+        let height = |query| {
+            let mut label = search_label(
+                "Project fixture",
+                query,
+                CHILD_ROW_TEXT_SIZE,
+                theme::Text::Default,
+                false,
+            );
+            let mut tree = Tree::new(label.as_widget());
+            label
+                .as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0)),
+                )
+                .size()
+                .height
+        };
+        design::configure_typography("", 13.0, "", 14.0);
+        let small = [height(""), height("fixture")];
+        design::configure_typography("", 24.0, "", 14.0);
+        let large = [height(""), height("fixture")];
+        for (small, large) in small.into_iter().zip(large) {
+            assert!(large > small, "sidebar identity must follow interface size");
+            assert!(
+                large <= WORKTREE_ROW_HEIGHT,
+                "largest line box must fit its row"
+            );
+            assert_eq!(
+                large, 29.0,
+                "plain and highlighted labels use the same absolute line box"
+            );
+        }
+        design::configure_typography("", 13.0, "", 14.0);
     }
 }
 

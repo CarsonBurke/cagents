@@ -21,7 +21,8 @@ pub(super) fn capture_document_link(
 
 pub(super) fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
     widget::selectable_text(text)
-        .size(design::TEXT_BODY)
+        .font(design::chat_font())
+        .size(design::chat_size())
         .width(Length::Fill)
         .into()
 }
@@ -29,8 +30,8 @@ pub(super) fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Messag
 fn transcript_body(text: impl Into<String>, target: Target) -> Element<'static, Message> {
     widget::container(selectable_prose::plain(
         text,
-        design::TEXT_BODY,
-        iced::Font::default(),
+        design::chat_size(),
+        design::chat_font(),
         target,
     ))
     .width(Length::Fill)
@@ -471,8 +472,8 @@ fn notice_entry(message: &str, target: Target, identity: u64) -> Element<'static
                         .color(design::warning_color(&cosmic::theme::active())),
                 ]
                 .into(),
-                design::TEXT_CAPTION.into(),
-                iced::Font::default(),
+                (design::interface_size() * design::TEXT_CAPTION / design::TEXT_BODY).into(),
+                design::interface_font(),
                 target,
                 None,
                 selectable_prose::Logical { identity, start: 0 },
@@ -1688,7 +1689,7 @@ impl Runtime {
                         .width(Length::Fill)
                         .into(),
                     design::heading(Self::native_child_status(agent))
-                        .size(design::TEXT_CAPTION)
+                        .size(design::scaled_interface_size(design::TEXT_CAPTION))
                         .into(),
                 ])
                 .spacing(step::GAP_S)
@@ -2551,7 +2552,9 @@ impl Runtime {
         // which counting newlines could not see. The ceiling keeps a very
         // long paste from squeezing the transcript out, past which the editor
         // scrolls as before.
-        let composer_ceiling = 12.0 * COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_PADDING;
+        let composer_ceiling = 12.0 * COMPOSER_LINE_HEIGHT * design::chat_size()
+            / design::TEXT_PROSE
+            + 2.0 * COMPOSER_PADDING;
         let suggestion = if available && !transitioning {
             self.prompt_suggestion()
         } else {
@@ -2561,7 +2564,7 @@ impl Runtime {
         let placeholder = suggestion.map_or(placeholder, |suggestion| suggestion.text.as_str());
         let suggestion_hint: Element<'_, Message> = if suggestion.is_some() {
             widget::text("Tab to use suggestion")
-                .size(design::TEXT_CAPTION)
+                .size(design::scaled_interface_size(design::TEXT_CAPTION))
                 .into()
         } else {
             iced::widget::Space::new().height(0).into()
@@ -2596,7 +2599,8 @@ impl Runtime {
             crate::ui_controls::field::editor("Message", &self.composer)
                 .id(card_control_id(target.card, "chat-composer"))
                 .placeholder(placeholder)
-                .size(design::TEXT_PROSE)
+                .size(design::chat_size())
+                .font(design::chat_font())
                 .height(Length::Shrink)
                 .max_height(composer_ceiling)
                 // The editor scrolls once the draft passes the ceiling, and
@@ -2882,7 +2886,7 @@ impl Runtime {
                 } else {
                     state.to_owned()
                 })
-                .size(design::TEXT_CAPTION)
+                .size(design::scaled_interface_size(design::TEXT_CAPTION))
                 .class(
                     if glyph == Some(Icon::Warning) && !transitioning && self.pending.is_none() {
                         cosmic::theme::Text::Custom(design::warning_text)
@@ -3792,6 +3796,7 @@ impl Runtime {
             dark,
             self.syntax_theme as u8,
             self.failure_ui.revision,
+            design::typography_revision(),
         )
             .hash(&mut hasher);
         for incident in &self.failure_ui.incidents {
@@ -4350,7 +4355,7 @@ impl Runtime {
         let body: Element<'a, Message> = if let Some(prepared) = &queued.presentation.prepared {
             let mut settings =
                 design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
-            settings.style.font = iced::Font::default();
+            settings.style.font = design::chat_font();
             if prepared.full.len() > 2048 {
                 let flow = queued.presentation.flow.markdown_entry(
                     logical.identity,
@@ -4531,7 +4536,7 @@ impl Runtime {
                 let text = prompt.shown(expanded);
                 let mut settings =
                     design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
-                settings.style.font = iced::Font::default();
+                settings.style.font = design::chat_font();
                 if text.len() > 2048 {
                     let flow = self.presentation_cache()[&item.id]
                         .flow_cache
@@ -4557,7 +4562,10 @@ impl Runtime {
             } else {
                 // This bounded nonselectable preview cannot certify a full
                 // source/catalog before preparation accepts the current Item.
-                widget::text(fallback).size(design::TEXT_PROSE).into()
+                widget::text(fallback)
+                    .font(design::chat_font())
+                    .size(design::chat_size())
+                    .into()
             };
             if long {
                 widget::column::with_children(vec![
@@ -5243,7 +5251,7 @@ fn field_view<'a>(
         )))
         .name(field.label.as_str())
         .secure(field.secret)
-        .size(design::TEXT_BODY)
+        .size(design::interface_size())
         .on_input_maybe(available.then_some(move |value| {
             action(Action::Field(
                 target,

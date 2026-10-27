@@ -10,9 +10,9 @@ pub(super) fn measure_tab_title(title: &str) -> f32 {
     let paragraph = <cosmic::Renderer as text::Renderer>::Paragraph::with_text(text::Text {
         content: title,
         bounds: Size::new(f32::INFINITY, f32::INFINITY),
-        size: Pixels(design::TEXT_BODY),
-        line_height: text::LineHeight::Absolute(Pixels(design::LINE_BODY)),
-        font: cosmic::font::default(),
+        size: Pixels(design::interface_size()),
+        line_height: text::LineHeight::Absolute(Pixels(design::interface_size() + 5.0)),
+        font: design::interface_font(),
         align_x: text::Alignment::Left,
         align_y: iced::alignment::Vertical::Top,
         shaping: text::Shaping::default(),
@@ -219,6 +219,192 @@ mod tests {
         app.workspace.resize_viewport(width);
         drop(app.sync_chrome());
         app
+    }
+
+    #[test]
+    fn mounted_tab_width_tracks_interface_size_and_family_without_a_title_change() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        const TITLE: &str = "Native tab";
+        struct TitleBounds(Option<iced::Rectangle>);
+        impl Operation for TitleBounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                if text == TITLE {
+                    self.0 = Some(bounds);
+                }
+            }
+        }
+        let _typography = design::typography_test_guard();
+        let renderer = super::super::tests::headless_renderer();
+        let mut app = tab_fixture(1, 1600.0);
+        let id = app.durable.cards[0].id;
+        app.chrome_ui.user_titles.insert(id, TITLE.into());
+        app.settings.interface_font_family.clear();
+        app.settings.interface_font_size = 13.0;
+        drop(app.sync_chrome());
+        let initial_font = design::interface_font();
+        let initial_revision = app.card_chrome[&id].typography_revision;
+        let initial_width = app.card_chrome[&id].title_width;
+        let initial_tab_width = app.tab_strip_geometry().1;
+        // Lay out the actual body widget independently of the measurement
+        // helper, so a stale/default font in that helper cannot validate itself.
+        let body_size = |font| {
+            let mut body: Element<'_, Message> = design::body(TITLE)
+                .font(font)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into();
+            let mut tree = Tree::new(body.as_widget());
+            body.as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(
+                        iced::Size::ZERO,
+                        iced::Size::new(f32::INFINITY, f32::INFINITY),
+                    ),
+                )
+                .size()
+        };
+        let assert_mounted = |app: &Cagents| {
+            let width = app.tab_strip_geometry().1;
+            let mut header = app.column_header(id, true, width);
+            let mut tree = Tree::new(header.as_widget());
+            let size = iced::Size::new(width, design::PRIMARY_CONTROL_SIZE);
+            let node = header.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(size, size),
+            );
+            let mut title = TitleBounds(None);
+            header
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut title);
+            let bounds = title.0.expect("the actual mounted tab title");
+            let intrinsic = body_size(design::interface_font());
+            assert!(bounds.width + 0.1 >= intrinsic.width);
+            assert!(bounds.height + 0.1 >= intrinsic.height);
+            assert!((app.card_chrome[&id].title_width - intrinsic.width).abs() < 0.1);
+        };
+        assert_mounted(&app);
+
+        // sync_chrome must apply new settings before refreshing its cache;
+        // neither a label change nor an intervening view call is required.
+        app.settings.interface_font_size = 24.0;
+        drop(app.sync_chrome());
+        assert_eq!(design::interface_size(), 24.0);
+        assert!(app.card_chrome[&id].typography_revision > initial_revision);
+        assert!(app.card_chrome[&id].title_width > initial_width);
+        assert!(app.tab_strip_geometry().1 > initial_tab_width);
+        assert_mounted(&app);
+
+        let sized_revision = app.card_chrome[&id].typography_revision;
+        let sized_width = app.card_chrome[&id].title_width;
+        let family = design::installed_font_families(false)
+            .iter()
+            .find(|family| {
+                let font = iced::Font {
+                    family: iced::font::Family::Name(family.as_str()),
+                    ..initial_font
+                };
+                font.family != initial_font.family
+                    && (body_size(font).width - sized_width).abs() > 0.1
+            })
+            .expect("an installed family has different actual metrics for the fixture title");
+        app.settings.interface_font_family = family.clone();
+        drop(app.sync_chrome());
+        assert_eq!(
+            design::interface_font().family,
+            iced::font::Family::Name(family.as_str())
+        );
+        assert!(app.card_chrome[&id].typography_revision > sized_revision);
+        assert!((app.card_chrome[&id].title_width - sized_width).abs() > 0.1);
+        assert_mounted(&app);
+        let stable_revision = app.card_chrome[&id].typography_revision;
+        drop(app.sync_chrome());
+        assert_eq!(app.card_chrome[&id].typography_revision, stable_revision);
+    }
+
+    #[test]
+    fn numbered_terminal_caption_fits_the_retained_header_at_maximum_interface_size() {
+        use iced::advanced::{
+            Layout, layout,
+            text::Paragraph as _,
+            widget::{Operation, Tree, tree::Tag},
+        };
+        type Paragraph = <cosmic::Renderer as iced::advanced::text::Renderer>::Paragraph;
+        type TextState = iced::advanced::widget::text::State<Paragraph>;
+        fn caption_line(tree: &Tree, suffix: &str) -> Option<f32> {
+            if tree.tag == Tag::of::<TextState>() {
+                let text = &tree.state.downcast_ref::<TextState>().paragraph;
+                if text.content() == suffix {
+                    let paragraph = text.raw();
+                    return Some(paragraph.line_height().to_absolute(paragraph.size()).0);
+                }
+            }
+            tree.children
+                .iter()
+                .find_map(|child| caption_line(child, suffix))
+        }
+        struct CaptionBounds<'a>(&'a str, Option<iced::Rectangle>);
+        impl Operation for CaptionBounds<'_> {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                if text == self.0 {
+                    self.1 = Some(bounds);
+                }
+            }
+        }
+        let _typography = design::typography_test_guard();
+        let renderer = super::super::tests::headless_renderer();
+        let mut app = tab_fixture(1, 1600.0);
+        let card = app.durable.cards[0].id;
+        let mut tree = Tree::empty();
+        for size in [13.0, 24.0] {
+            app.settings.interface_font_size = size;
+            drop(app.sync_chrome());
+            let suffix = app.card_chrome[&card]
+                .terminal_ordinal_suffix
+                .as_deref()
+                .expect("natural terminal title keeps its number")
+                .trim();
+            let width = app.tab_strip_geometry().1;
+            assert!(
+                width >= design::TAB_MIN_WIDTH,
+                "exercise the actual separate ordinal caption"
+            );
+            let mut header = app.column_header(card, true, width);
+            tree.diff(header.as_widget_mut());
+            let bounds = iced::Size::new(width, design::PRIMARY_CONTROL_SIZE);
+            let node = header.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(bounds, bounds),
+            );
+            let line = caption_line(&tree, suffix).expect("actual mounted ordinal text paragraph");
+            let mut caption = CaptionBounds(suffix, None);
+            header
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut caption);
+            let actual = caption.1.expect("actual ordinal layout bounds");
+            assert!(
+                line <= actual.height + 0.1,
+                "caption line {line} clipped by {actual:?} at {size}px"
+            );
+            assert!(actual.y >= -0.1 && actual.y + actual.height <= bounds.height + 0.1);
+            assert!(
+                line <= size + 5.0 && line > design::scaled_interface_size(design::TEXT_CAPTION)
+            );
+            if size == 13.0 {
+                assert_eq!(line, 17.0, "default caption geometry stays unchanged");
+            }
+        }
     }
 
     #[test]

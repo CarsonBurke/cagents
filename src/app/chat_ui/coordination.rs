@@ -1239,7 +1239,7 @@ impl Runtime {
             };
             controls.push(
                 design::heading(detail)
-                    .size(design::TEXT_CAPTION)
+                    .size(design::scaled_interface_size(design::TEXT_CAPTION))
                     .class(tone)
                     .into(),
             );
