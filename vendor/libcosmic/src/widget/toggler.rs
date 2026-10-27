@@ -332,7 +332,7 @@ impl<'a, Message> Widget<Message, crate::Theme, crate::Renderer> for Toggler<'a,
                 && modifiers.is_empty()
                 && matches!(
                     key.as_ref(),
-                    keyboard::Key::Named(keyboard::key::Named::Space | keyboard::key::Named::Enter)
+                    keyboard::Key::Named(keyboard::key::Named::Enter)
                         | keyboard::Key::Character(" ")
                 ) =>
             {

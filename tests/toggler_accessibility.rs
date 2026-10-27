@@ -178,7 +178,6 @@ fn switches_retain_native_identity_and_route_focus_activation_and_disabled_state
     let targets: Vec<_> = ids.iter().cloned().map(NodeId::from).collect();
     let activation_keys = [
         keyboard::Key::Character(" ".into()),
-        keyboard::Key::Named(keyboard::key::Named::Space),
         keyboard::Key::Named(keyboard::key::Named::Enter),
     ];
     let space = || {
