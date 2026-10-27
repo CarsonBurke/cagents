@@ -122,9 +122,43 @@ async fn dirty_buffer_survives_change_deletion_and_explicit_reload() {
     let path = root.path().join("live.txt");
     std::fs::write(&path, "disk").unwrap();
     let (card, mut runtime) = opened(root.path(), "live.txt").await;
-    if let DocumentState::Editable(document) = &mut runtime.document {
-        document.replace_text("my unsaved edits");
+    for action in [
+        RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::SelectAll,
+        },
+        RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(
+                "my unsaved edits".into(),
+            ))),
+        },
+        RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::SelectAll,
+        },
+        RepositoryAction::OpenFind { card },
+        RepositoryAction::FindQueryChanged {
+            card,
+            query: "unsaved".into(),
+        },
+        RepositoryAction::FindSelectionChanged {
+            card,
+            enabled: true,
+        },
+        RepositoryAction::FindInputFocus {
+            card,
+            focused: true,
+        },
+    ] {
+        let task = runtime.update(action);
+        settle(&mut runtime, task).await;
     }
+    assert_eq!(runtime.find_total, 1);
+    let scope = runtime.find_selection;
+    let candidate = runtime.find_selection_candidate;
+    let cursor = runtime.cursor_position();
+
     std::fs::write(&path, "external").unwrap();
     while !runtime.has_save_conflict() {
         change(card, &mut runtime).await;
@@ -134,12 +168,86 @@ async fn dirty_buffer_survives_change_deletion_and_explicit_reload() {
     change(card, &mut runtime).await;
     assert_eq!(runtime.editor_text().as_deref(), Some("my unsaved edits"));
     assert!(runtime.has_save_conflict());
+    // The actual asynchronous read fails while the same native watch remains
+    // responsible for later recreation. Reload is a proposed replacement.
+    let task = runtime.update(RepositoryAction::Reload { card });
+    settle(&mut runtime, task).await;
+    assert_eq!(runtime.editor_text().as_deref(), Some("my unsaved edits"));
+    assert!(runtime.is_dirty() && runtime.blocks_navigation());
+    assert!(
+        runtime
+            .save_error()
+            .unwrap()
+            .contains("your edits were kept")
+    );
+    assert_eq!(runtime.cursor_position(), cursor);
+    assert_eq!(runtime.find_query, "unsaved");
+    assert_eq!(runtime.find_selection, scope);
+    assert_eq!(runtime.find_selection_candidate, candidate);
+    assert_eq!(runtime.find_total, 1);
+    assert!(runtime.find_error.is_none());
+    assert_eq!(runtime.loaded_focus_target(card), Some(find_focus_id(card)));
+    assert_eq!(
+        runtime.take_restored_editor_focus(card),
+        Some(find_focus_id(card))
+    );
+    let task = runtime.update(RepositoryAction::Undo { card });
+    settle(&mut runtime, task).await;
+    assert_eq!(runtime.editor_text().as_deref(), Some("disk"));
+    let task = runtime.update(RepositoryAction::Redo { card });
+    settle(&mut runtime, task).await;
+    assert_eq!(runtime.editor_text().as_deref(), Some("my unsaved edits"));
+    std::fs::write(&path, "replacement").unwrap();
+    let task = runtime.update(RepositoryAction::Reload { card });
+    let mut stream = iced::runtime::task::into_stream(task).unwrap();
+    let mut completed_read = None;
+    while let Some(action) = stream.next().await {
+        if let iced::runtime::Action::Output(action) = action {
+            assert!(matches!(action, RepositoryAction::FileLoadedAt { .. }));
+            assert!(completed_read.replace(action).is_none());
+        }
+    }
+    // Remove the file after the armed read completes but before its result is
+    // delivered. The obsolete watched result cannot release the predecessor.
+    let completed_read = completed_read.unwrap();
+    let RepositoryAction::FileLoadedAt { result, .. } = &completed_read else {
+        unreachable!()
+    };
+    let stamped_revision = result.as_ref().unwrap().watch_revision.unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let watch = runtime.document_watch.as_ref().unwrap().clone();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while watch.revision() == stamped_revision {
+            watch.receiver().recv().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let task = runtime.update(completed_read);
+    assert!(matches!(&runtime.document,
+        DocumentState::Loading { predecessor: Some(document) }
+            if document.content.text() == "my unsaved edits"));
+    settle(&mut runtime, task).await;
+    assert_eq!(runtime.editor_text().as_deref(), Some("my unsaved edits"));
+    assert!(!runtime.original_read_attested);
+    assert!(
+        runtime
+            .save_error()
+            .unwrap()
+            .contains("your edits were kept")
+    );
+    assert!(
+        watch.error().is_none(),
+        "native registration survives rollback"
+    );
     std::fs::write(&path, "replacement").unwrap();
     let task = runtime.update(RepositoryAction::Reload { card });
     settle(&mut runtime, task).await;
     text(card, &mut runtime, "replacement").await;
     assert!(!runtime.is_dirty());
     assert!(!runtime.has_save_conflict());
+    std::fs::write(&path, "live after recovery").unwrap();
+    text(card, &mut runtime, "live after recovery").await;
 }
 #[tokio::test]
 async fn background_read_cannot_overwrite_edits_or_newer_selection() {

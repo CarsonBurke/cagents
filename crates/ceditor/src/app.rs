@@ -3681,8 +3681,11 @@ impl Application for Editor {
                             }
                         }
                     }
-                    if focus_loaded {
-                        tasks.push(tab.runtime.focus_editor(id).map(cosmic::Action::App));
+                    if focus_loaded && let Some(target) = tab.runtime.loaded_focus_target(id) {
+                        tasks.push(workspace_widget::focus_after_loading(
+                            cagents::repository_widget::editor_focus_id(id),
+                            target,
+                        ));
                     }
                     if find_preferences_changed {
                         let (options, preserve) = self.tab(id).unwrap().runtime.find_preferences();
