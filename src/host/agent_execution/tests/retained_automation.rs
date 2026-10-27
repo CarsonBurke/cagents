@@ -3,6 +3,7 @@ use super::*;
 
 const TEST: &str = "host::agent_execution::tests::retained_automation::completed_retained_automation_retires_only_after_exact_idle_close";
 const MODE: &str = "CAGENTS_RETAINED_AUTOMATION_TEST";
+const SCOPE: &str = "CAGENTS_RETAINED_AUTOMATION_AUTHORITY_PRESENCE";
 
 fn wait_until(mut condition: impl FnMut() -> bool, reason: &str) {
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -35,12 +36,28 @@ fn completed_retained_automation_retires_only_after_exact_idle_close() {
                 .expect("retained automation requires the same-head cagentsd executable"),
         );
         assert!(helper.is_absolute());
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        // Keep opaque delegation and the selected helper by normal inheritance;
+        // every remaining input belongs to this private fixture.
+        for (name, _) in std::env::vars_os() {
+            if name != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV)
+                && name != std::ffi::OsStr::new("CAGENTS_TEST_RETAINED_ACTOR_HELPER")
+            {
+                command.env_remove(name);
+            }
+        }
+        let output = command
             .args(["--exact", TEST, "--nocapture"])
-            .env_clear()
             .env(MODE, "fixture")
+            .env(
+                SCOPE,
+                if Authority::from_environment() != Authority::default() {
+                    "present"
+                } else {
+                    "absent"
+                },
+            )
             .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
-            .env("CAGENTS_TEST_RETAINED_ACTOR_HELPER", helper)
             .env("CAGENTS_EXECUTION_FIXTURE", root)
             .env("HOME", root.join("home"))
             .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
@@ -64,7 +81,26 @@ fn completed_retained_automation_retires_only_after_exact_idle_close() {
         return;
     }
 
+    let inherited = match std::env::var(SCOPE).as_deref() {
+        Ok("present") => true,
+        Ok("absent") => false,
+        _ => panic!("retained automation fixture lost its authority presence marker"),
+    };
+    assert_eq!(
+        Authority::from_environment() != Authority::default(),
+        inherited,
+        "retained automation child lost its inherited authority scope"
+    );
     let (host, request, path) = fixture();
+    if inherited {
+        assert!(
+            matches!(
+                process(&host, Authority::from_environment(), Operation::List),
+                Err(error) if error == "This agent session authority is no longer registered"
+            ),
+            "an unrelated inherited delegation must not acquire this private registry's authority"
+        );
+    }
     host.lock().unwrap().native_chat_capacity = 1;
     let proof = host.lock().unwrap().proof().clone();
     let paths = crate::daemon::RuntimePaths::discover().unwrap();
@@ -127,6 +163,22 @@ fn completed_retained_automation_retires_only_after_exact_idle_close() {
     assert_eq!(capacity().used, 1);
     assert!(identity.record.holder.is_current());
     assert!(identity.record.root.is_current());
+    {
+        use std::os::unix::fs::MetadataExt;
+        let selected = std::fs::metadata(
+            std::env::var_os("CAGENTS_TEST_RETAINED_ACTOR_HELPER")
+                .expect("retained fixture lost its matched helper"),
+        )
+        .unwrap();
+        let running =
+            std::fs::metadata(format!("/proc/{}/exe", identity.record.holder.pid)).unwrap();
+        assert_eq!(
+            (running.dev(), running.ino()),
+            (selected.dev(), selected.ino()),
+            "retained holder must execute the selected matched helper"
+        );
+        assert!(identity.record.holder.is_current());
+    }
 
     let idle = handle.snapshot(None).unwrap();
     assert!(idle.ready && !idle.busy && !idle.waiting && idle.requests.is_empty());

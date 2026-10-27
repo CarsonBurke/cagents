@@ -626,13 +626,25 @@ stop until ownership is resolved. Removing the chosen account or replacing the
 target directory cannot silently redirect a future run to another account or
 directory. Closing a project pauses its schedules.
 
-**Run history** includes runs from removed definitions. It pages through
-their original names, times, outcomes, and bounded results. Opening history does
-not start or attach a provider. **Open agent** explicitly opens a still-live
-session; completed fresh sessions remain readable in history. A completion alert
-opens its run under **Automations**, with a trail back to the list, and
-survives provider cleanup. Removing a definition prevents future runs and
-retains its past runs.
+**Run history** pages through original names, times, outcomes, and bounded
+results. Consecutive scheduled skips with the same reason and execution revision
+share one entry showing the actual occurrence count and first/last times. A
+manual request, successful run or different reason starts another entry. A
+name-only edit keeps a group's original name. Downtime summaries do not invent
+a count of occurrences that were never individually recorded.
+
+Each automation retains up to 500 settled history entries; active or unresolved
+ownership and cleanup evidence remain until resolved. Removed automations keep
+eligible history for 30 days, after which its details and unreferenced execution
+revisions are removed. An old manual request ID still cannot run again when its
+details expire: retries report that the original request was recorded. Use a new
+request ID only for an intentional new run.
+
+Opening history does not start or attach a provider. **Open agent** explicitly
+opens a still-live session; retained completed sessions remain readable in
+history. A completion alert opens its run under **Automations**, with a trail
+back to the list, and survives provider cleanup. Removing a definition prevents
+future runs without bypassing active ownership or cleanup.
 
 The same operations are available without a window:
 

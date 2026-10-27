@@ -620,6 +620,39 @@ mod tests {
         crate::terminal::ipc::write_frame(&mut Vec::new(), &envelope).unwrap();
     }
 
+    // Exercise the actual 11 -> 12 body on a fresh published schema 11 database, then
+    // reopen through strict schema 12 admission and every remaining migration.
+    // Repeated calls own distinct files; the source is never header-relabelled.
+    fn migrate_published_mailbox(source: Registry) -> Registry {
+        let path = super::super::automation_proposals::published_fixture_from_rows(&source, 11);
+        assert_ne!(path, source.path);
+        drop(source);
+        let mut db = Connection::open(&path).unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")
+            .unwrap();
+        assert_eq!(
+            db.pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            11
+        );
+        assert_eq!(db.query_row::<u64,_,_>("SELECT count(*) FROM sqlite_schema WHERE name IN ('mailbox_attention_heads','retired_view_panes','compacted_view_operations','compacted_view_operation_scopes')",[],|row|row.get(0)).unwrap(), 0);
+        let tx = db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        migrate_attention(&tx).unwrap();
+        tx.pragma_update(None, "user_version", 12).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            db.pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            12
+        );
+        drop(db);
+        let migrated = Registry::at(&path).unwrap();
+        super::super::schema::require_current(&migrated.db).unwrap();
+        migrated
+    }
+
     #[test]
     fn pruning_an_eligible_head_cannot_promote_a_prematurely_read_held_reply() {
         let (mut registry, _directory) = registry();
@@ -663,22 +696,7 @@ mod tests {
         registry
             .acknowledge_messages(Some(recipient), None, &Receipt { ids: vec![held.id] }, 50)
             .unwrap();
-        registry
-            .db
-            .execute_batch(
-                "DROP TABLE channel_work_operations;
-                DROP TABLE channel_work_entries;
-                DROP TABLE channel_work_homes;
-                DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;",
-            )
-            .unwrap();
-        let tx = registry
-            .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .unwrap();
-        migrate_attention(&tx).unwrap();
-        tx.pragma_update(None, "user_version", 12).unwrap();
-        tx.commit().unwrap();
+        let mut registry = migrate_published_mailbox(registry);
         assert_eq!(
             registry.reconcile_message_attention(200).unwrap()[&recipient],
             older.id
@@ -689,17 +707,7 @@ mod tests {
             .db
             .execute("DELETE FROM messages WHERE id=?1", [ask.id.to_string()])
             .unwrap();
-        registry
-            .db
-            .execute_batch("DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;")
-            .unwrap();
-        let tx = registry
-            .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .unwrap();
-        migrate_attention(&tx).unwrap();
-        tx.pragma_update(None, "user_version", 12).unwrap();
-        tx.commit().unwrap();
+        let mut registry = migrate_published_mailbox(registry);
         assert_eq!(
             registry.reconcile_message_attention(200).unwrap()[&recipient],
             older.id
@@ -899,22 +907,7 @@ mod tests {
         let last = message(Party::user(), party(recipient), 1);
         registry.post_message(&first).unwrap();
         registry.post_message(&last).unwrap();
-        registry
-            .db
-            .execute_batch(
-                "DROP TABLE channel_work_operations;
-                DROP TABLE channel_work_entries;
-                DROP TABLE channel_work_homes;
-                DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;",
-            )
-            .unwrap();
-        let tx = registry
-            .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .unwrap();
-        migrate_attention(&tx).unwrap();
-        tx.pragma_update(None, "user_version", 12).unwrap();
-        tx.commit().unwrap();
+        let mut registry = migrate_published_mailbox(registry);
         assert_eq!(
             registry.reconcile_message_attention(200).unwrap()[&recipient],
             last.id

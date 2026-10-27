@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Condvar, Mutex, Weak},
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use uuid::Uuid;
@@ -62,10 +62,10 @@ struct Inner {
     // One lazy startup census catches receipts left after a committed result
     // followed by daemon loss. Each wake visits at most 32 owned directories.
     cleanup: Mutex<Option<std::fs::ReadDir>>,
-    // The journal is bounded. Polling must not resurrect a blocked run after
-    // newer unrelated events evict its durable replay identity.
-    attention: Mutex<BTreeMap<crate::model::RunId, crate::notifications::Evidence>>,
-    // Only the scheduler advances the one in-flight durable journal transfer.
+    // Only transactionally pending source edges are transferred. Original
+    // journal receipts stay owned until exact source acknowledgement succeeds.
+    attention: Mutex<AttentionTransfer>,
+    // The independent no-run lifecycle transfer owns its original receipt.
     notifications: Mutex<notifications::Transfer>,
 }
 
@@ -77,11 +77,29 @@ pub(in crate::host) struct Broker {
     thread: Option<JoinHandle<()>>,
 }
 
+fn warn_history_maintenance(error: &str) {
+    let diagnostic: String = error
+        .chars()
+        .flat_map(char::escape_default)
+        .take(512)
+        .collect();
+    tracing::warn!(error = %diagnostic, "automation history maintenance is temporarily unavailable");
+}
+
 impl Broker {
     pub(super) fn start(host: &SharedHost, root: PathBuf) -> Result<Self, String> {
         let cleanup = std::fs::read_dir(&root).map_err(|error| error.to_string())?;
         let registry = agent_execution::registry(host)?;
-        let attention = initial_attention(&registry.lock().unwrap_or_else(|p| p.into_inner()))?;
+        // Registry admission already succeeded. Optional history housekeeping
+        // must not prevent durable delivery or normal coordinator startup.
+        let now = service::now()?;
+        if let Err(error) = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .maintain_automation_history(now)
+        {
+            warn_history_maintenance(&error);
+        }
         let handle = Handle(Arc::new(Inner {
             host: Arc::downgrade(host),
             registry,
@@ -89,7 +107,7 @@ impl Broker {
             wake: Wake::default(),
             workers: Mutex::new(BTreeMap::new()),
             cleanup: Mutex::new(Some(cleanup)),
-            attention: Mutex::new(attention),
+            attention: Mutex::default(),
             notifications: Mutex::default(),
         }));
         let owner = handle.clone();
@@ -222,11 +240,17 @@ impl Handle {
             return Ok(());
         }
         if let Err(error) = crate::host::client::ensure_control_open(host) {
-            self.0
-                .registry
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .fail_automation_start(claim.firing.id, error.message, service::now()?, false)?;
+            let now = service::now()?;
+            let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
+            registry.fail_automation_start(claim.firing.id, error.message, now, false)?;
+            if claim.definition.precheck.is_some() {
+                // This branch precedes any Worker::launch attempt or proof file.
+                registry.confirm_unlaunched_automation_precheck(
+                    claim.firing.id,
+                    claim.firing.revision,
+                    now,
+                )?;
+            }
             return Ok(());
         }
         let directory =
@@ -236,11 +260,17 @@ impl Handle {
                 }) {
                 Ok(directory) => directory,
                 Err(error) => {
-                    self.0
-                        .registry
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .fail_automation_start(claim.firing.id, error, service::now()?, true)?;
+                    let now = service::now()?;
+                    let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
+                    registry.fail_automation_start(claim.firing.id, error, now, true)?;
+                    if claim.definition.precheck.is_some() {
+                        // Target/account refusal happened before Worker::launch.
+                        registry.confirm_unlaunched_automation_precheck(
+                            claim.firing.id,
+                            claim.firing.revision,
+                            now,
+                        )?;
+                    }
                     return Ok(());
                 }
             };
@@ -282,6 +312,22 @@ impl Handle {
                             service::now()?,
                             false,
                         )?;
+                        drop(registry);
+                        // Failed launch may have written partial private proof.
+                        // Retain actual Worker::retire custody even if no child
+                        // spawned; directory absence alone is not our ACK.
+                        self.0
+                            .workers
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(
+                                claim.firing.id,
+                                Worker::recover(
+                                    &self.0.root,
+                                    claim.firing.id,
+                                    claim.firing.revision,
+                                ),
+                            );
                     }
                 }
             }
@@ -290,7 +336,53 @@ impl Handle {
     }
 
     fn run(&self) {
-        self.run_with(|host| self.tick(host));
+        let mut maintained = Instant::now();
+        self.run_with(|host| self.tick_with_history_maintenance(host, &mut maintained));
+    }
+
+    fn tick_with_history_maintenance(
+        &self,
+        host: &SharedHost,
+        maintained: &mut Instant,
+    ) -> Result<Duration, String> {
+        if maintained.elapsed() >= Duration::from_secs(60) {
+            match self.maintain_history_under_control(host) {
+                Ok(false) => {} // No attempt while the control writer owns admission.
+                result => {
+                    // Failure is an attempted pass too. Preserve the finite
+                    // retry interval instead of warning on every fast tick.
+                    *maintained = Instant::now();
+                    if let Err(error) = result {
+                        warn_history_maintenance(&error);
+                    }
+                }
+            }
+        }
+        // Optional maintenance cannot gate either transfer or actual work.
+        // Errors from those real-work paths retain their existing handling.
+        self.tick(host)
+    }
+
+    fn maintain_history_under_control(&self, host: &SharedHost) -> Result<bool, String> {
+        let control = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .control_gate
+            .clone();
+        let _control = match control.try_read() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+        };
+        if crate::host::client::ensure_control_open(host).is_err() {
+            return Ok(false);
+        }
+        self.0
+            .registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .maintain_removed_automation_history(service::now()?)?;
+        Ok(true)
     }
 
     fn run_with(&self, mut tick: impl FnMut(&SharedHost) -> Result<Duration, String>) {
@@ -320,12 +412,38 @@ impl Handle {
         }
     }
 
+    fn transfer_attention(&self, host: &SharedHost) -> Option<Duration> {
+        // Attention custody is independent of execution admission. Never poll
+        // journal receipts behind the shutdown/update control writer, which
+        // may be joining this coordinator. No receiver wait crosses any gate.
+        let notifications = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .notifications
+            .clone();
+        {
+            let mut attention = self.0.attention.lock().unwrap_or_else(|p| p.into_inner());
+            match attention.pump(&self.0.registry, notifications.as_ref()) {
+                Ok(delay) => delay,
+                Err(error) => {
+                    // Storage failures are reported only when the bounded
+                    // local retry is due, never once per ordinary tick.
+                    tracing::warn!(%error, "automation attention is awaiting durable acknowledgement");
+                    Some(attention.retry_remaining())
+                }
+            }
+        }
+    }
+
     fn tick(&self, host: &SharedHost) -> Result<Duration, String> {
+        let attention_delay = self.transfer_attention(host);
         // Receipt polling must remain possible while shutdown owns control.
         // Neither the HostState guard nor the control gate reaches advance().
         let notification_delay = self.advance_notifications(host);
-        self.tick_under_control(host)
-            .map(|delay| delay.min(notification_delay))
+        self.tick_under_control(host).map(|delay| {
+            let delay = delay.min(notification_delay);
+            attention_delay.map_or(delay, |attention| delay.min(attention))
+        })
     }
 
     fn advance_notifications(&self, host: &SharedHost) -> Duration {
@@ -377,13 +495,6 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .active_automation_firings()?;
         let owners: std::collections::BTreeSet<_> = active.iter().map(|firing| firing.id).collect();
-        let runs: std::collections::BTreeSet<_> =
-            active.iter().filter_map(|firing| firing.run).collect();
-        self.0
-            .attention
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .retain(|run, _| runs.contains(run));
         let mut checking = false;
         let candidates = self
             .0
@@ -397,23 +508,35 @@ impl Handle {
         for id in candidates {
             // A manual request can add a worker after the active census. The
             // absent snapshot entry alone never authorizes deleting its proof.
-            if self
+            let revision = self
                 .0
                 .registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .retired_automation_precheck(id)?
-                .is_none()
-            {
+                .retired_automation_precheck(id)?;
+            let Some(revision) = revision else {
                 continue;
-            }
+            };
             let mut workers = self.0.workers.lock().unwrap_or_else(|p| p.into_inner());
             let Some(worker) = workers.get_mut(&id) else {
                 continue;
             };
             match worker.retire() {
                 Ok(true) => {
-                    workers.remove(&id);
+                    // Keep this reaped Worker until the SQLite ACK commits.
+                    // On ACK error the next tick retries retire(true), without
+                    // launching anything or losing cleanup custody.
+                    drop(workers);
+                    self.0
+                        .registry
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .confirm_retired_automation_precheck(id, revision, service::now()?)?;
+                    self.0
+                        .workers
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&id);
                 }
                 Ok(false) => {} // Reap/reclaim again on the next bounded tick.
                 Err(error) => {
@@ -435,22 +558,6 @@ impl Handle {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .reconcile_automation_run(run, now)?;
-                let detail = self
-                    .0
-                    .registry
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .automation_run_detail(firing.id)?;
-                if let Some(event) = run_attention(&detail) {
-                    let mut attention = self.0.attention.lock().unwrap_or_else(|p| p.into_inner());
-                    if attention.get(&run) != Some(&event.evidence)
-                        && let Some(notifications) =
-                            &host.lock().unwrap_or_else(|p| p.into_inner()).notifications
-                    {
-                        attention.insert(run, event.evidence.clone());
-                        notifications.record(event);
-                    }
-                }
                 if let Some(firing) = reconciled.filter(|firing| firing.release_pending) {
                     checking |= self.release_run(host, &firing, now)?;
                 }
@@ -534,13 +641,18 @@ impl Handle {
         let delay = next.map_or(Duration::from_secs(60), |due| {
             Duration::from_millis(due.saturating_sub(now).max(50))
         });
-        // Wall-clock changes are noticed at least once a minute. Only actual
-        // precheck owners require subsecond receipt observation.
-        Ok(delay.min(if checking {
+        // Wall-clock changes are noticed at least once a minute. Precheck
+        // observation and outstanding journal receipts shorten the next wake.
+        let delay = delay.min(if checking {
             Duration::from_millis(250)
         } else {
             Duration::from_secs(60)
-        }))
+        });
+        drop(_control);
+        // Reconciliation above may have committed a new source edge. Transfer
+        // it before sleeping, outside the execution-admission guard as well.
+        let attention_delay = self.transfer_attention(host);
+        Ok(attention_delay.map_or(delay, |attention| delay.min(attention)))
     }
 
     fn release_run(&self, host: &SharedHost, firing: &Firing, now: u64) -> Result<bool, String> {
@@ -696,17 +808,27 @@ impl Handle {
             let Some(revision) = revision else {
                 continue;
             };
-            let mut worker = Worker::recover(&self.0.root, id, revision);
+            let mut workers = self.0.workers.lock().unwrap_or_else(|p| p.into_inner());
+            let worker = workers
+                .entry(id)
+                .or_insert_with(|| Worker::recover(&self.0.root, id, revision));
             match worker.retire() {
-                Ok(true) => {}
-                Ok(false) => {
+                Ok(true) => {
+                    // Retire the actual mapped owner, including its Child. A
+                    // recovered observer cannot replace that reaping custody.
+                    drop(workers);
+                    self.0
+                        .registry
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .confirm_retired_automation_precheck(id, revision, service::now()?)?;
                     self.0
                         .workers
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .entry(id)
-                        .or_insert(worker);
+                        .remove(&id);
                 }
+                Ok(false) => {} // Keep the actual mapped owner for retry.
                 Err(error) => {
                     tracing::warn!(%id, %error, "retired precheck files could not be reclaimed")
                 }
@@ -716,64 +838,196 @@ impl Handle {
     }
 }
 
-fn initial_attention(
-    registry: &crate::host::model::Registry,
-) -> Result<BTreeMap<crate::model::RunId, crate::notifications::Evidence>, String> {
-    let mut attention = BTreeMap::new();
-    // Existing terminal/waiting states are history, even if cleanup remains
-    // blocked. Startup cannot reannounce them after journal eviction.
-    for firing in registry.active_automation_firings()? {
-        if let Some(run) = firing.run
-            && let Some(event) = run_attention(&registry.automation_run_detail(firing.id)?)
-        {
-            attention.insert(run, event.evidence);
-        }
-    }
-    Ok(attention)
+// Bound both receipt ownership and work per scheduler wake. The durable source
+// query has the same maximum; an unavailable journal cannot grow daemon memory.
+const MAX_ATTENTION_IN_FLIGHT: usize = 100;
+
+enum AttentionCommit {
+    Waiting(std::sync::mpsc::Receiver<Result<(), String>>),
+    Committed,
 }
 
-fn run_attention(detail: &crate::automations::RunDetail) -> Option<crate::notifications::Event> {
-    use crate::{
-        agent_execution::{HostedSession, Origin, State},
-        notifications::{Event, Evidence, Kind, Target},
-    };
-    let run = detail.run.as_ref()?;
-    let agent = detail.agent.as_ref()?;
-    if run.agent != agent.id
-        || detail.firing.run != Some(run.id)
-        || !matches!(agent.origin, Origin::Automation { id } if id == detail.firing.automation)
-    {
-        return None;
-    }
-    let kind = match run.state {
-        State::Succeeded => Kind::Succeeded,
-        State::Failed => Kind::Failed,
-        State::Interrupted => Kind::Interrupted,
-        State::Cancelled => Kind::Cancelled,
-        State::Waiting => Kind::Waiting,
-        _ => return None,
-    };
-    let source_session = agent.session.as_ref().map(|session| match session {
-        HostedSession::Chat(session) => session.id,
-        HostedSession::Terminal(session) => session.id,
-    });
-    Some(Event {
-        content: None,
-        target: Target::AgentRun(run.id),
-        source_session,
-        provider: Some(agent.spec.provider),
-        directory: Some(agent.spec.target.directory.clone()),
-        destination: None,
-        evidence: Evidence {
-            key: if kind == Kind::Waiting {
-                format!("{}:waiting:{}", run.id, run.revision)
-            } else {
-                run.id.to_string()
-            },
-            kind,
-        },
-    })
+#[derive(Default)]
+struct AttentionTransfer {
+    in_flight: BTreeMap<crate::host::model::AutomationAttentionReceipt, AttentionCommit>,
+    retry_at: Option<Instant>,
+    retry_delay: Duration,
 }
+
+enum AttentionProgress {
+    Idle,
+    Waiting,
+    Retry,
+}
+
+impl AttentionTransfer {
+    fn defer_retry(&mut self) -> Duration {
+        self.retry_delay = if self.retry_delay.is_zero() {
+            Duration::from_secs(1)
+        } else {
+            self.retry_delay
+                .saturating_mul(2)
+                .min(Duration::from_secs(30))
+        };
+        self.retry_at = Some(Instant::now() + self.retry_delay);
+        self.retry_delay
+    }
+
+    fn retry_remaining(&self) -> Duration {
+        self.retry_at
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::from_secs(1))
+    }
+
+    /// No journal wait occurs here. Queue admission is bounded, and receipts
+    /// are polled before taking the registry lock. A committed receipt survives
+    /// a source-ACK storage failure so the next wake can retry that ACK alone.
+    fn pump(
+        &mut self,
+        registry: &agent_execution::SharedRegistry,
+        notifications: Option<&crate::host::notifications::Handle>,
+    ) -> Result<Option<Duration>, String> {
+        if self
+            .retry_at
+            .is_some_and(|deadline| deadline > Instant::now())
+        {
+            // A send/storage cooldown never stops observing original receipt
+            // completion. Defer database retries, not ownership bookkeeping.
+            self.poll_receipts(registry, false)?;
+            let delay = self.retry_remaining();
+            return Ok(Some(
+                if self
+                    .in_flight
+                    .values()
+                    .any(|state| matches!(state, AttentionCommit::Waiting(_)))
+                {
+                    delay.min(Duration::from_millis(250))
+                } else {
+                    delay
+                },
+            ));
+        }
+        self.retry_at = None;
+        match self.pump_ready(registry, notifications) {
+            Ok(AttentionProgress::Retry) => Ok(Some(self.defer_retry())),
+            Ok(progress) => {
+                self.retry_delay = Duration::ZERO;
+                Ok(match progress {
+                    AttentionProgress::Idle => None,
+                    AttentionProgress::Waiting => Some(Duration::from_millis(250)),
+                    AttentionProgress::Retry => unreachable!(),
+                })
+            }
+            Err(error) => {
+                self.defer_retry();
+                Err(error)
+            }
+        }
+    }
+
+    fn poll_receipts(
+        &mut self,
+        registry: &agent_execution::SharedRegistry,
+        acknowledge: bool,
+    ) -> Result<bool, String> {
+        use std::sync::mpsc::TryRecvError;
+
+        let mut retry = false;
+        let receipts = self.in_flight.keys().copied().collect::<Vec<_>>();
+        for receipt in receipts {
+            let state = self.in_flight.get_mut(&receipt).expect("captured receipt");
+            match state {
+                AttentionCommit::Waiting(receiver) => match receiver.try_recv() {
+                    Ok(Ok(())) => *state = AttentionCommit::Committed,
+                    Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+                        // The journal did not prove commit. The source row is
+                        // still durable; retry only that pending evidence.
+                        self.in_flight.remove(&receipt);
+                        retry = true;
+                        continue;
+                    }
+                    Err(TryRecvError::Empty) => continue,
+                },
+                AttentionCommit::Committed => {}
+            }
+        }
+        if acknowledge {
+            let committed = self
+                .in_flight
+                .iter()
+                .filter_map(|(receipt, state)| {
+                    matches!(state, AttentionCommit::Committed).then_some(*receipt)
+                })
+                .collect::<Vec<_>>();
+            if !committed.is_empty() {
+                registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .ack_automation_attention_batch(&committed)?;
+                // Retire proof only after the whole transaction commits. Any
+                // failure retains every Committed entry for ACK-only retry.
+                // An exact stale ACK can never remove a replacement edge.
+                for receipt in committed {
+                    self.in_flight.remove(&receipt);
+                }
+            }
+        }
+
+        Ok(retry)
+    }
+
+    fn pump_ready(
+        &mut self,
+        registry: &agent_execution::SharedRegistry,
+        notifications: Option<&crate::host::notifications::Handle>,
+    ) -> Result<AttentionProgress, String> {
+        if self.poll_receipts(registry, true)? {
+            return Ok(AttentionProgress::Retry);
+        }
+        // The first page may consist entirely of these original in-flight
+        // edges. At capacity do not acquire a source write transaction merely
+        // to rediscover them. Keep the full page limit below when partially
+        // occupied, so an in-flight prefix cannot starve later source rows.
+        if self.in_flight.len() == MAX_ATTENTION_IN_FLIGHT {
+            return Ok(AttentionProgress::Waiting);
+        }
+        let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        // A short Immediate source transaction also excludes writers using a
+        // separate execution connection. A stale loaded edge must not enqueue
+        // after its committed replacement. Handle admission is only a bounded
+        // queue operation; no journal/receiver wait runs inside this callback.
+        registry.with_pending_automation_attention(MAX_ATTENTION_IN_FLIGHT, |pending| {
+            let busy = !pending.is_empty() || !self.in_flight.is_empty();
+            if !busy {
+                return Ok(AttentionProgress::Idle);
+            }
+            let Some(notifications) = notifications else {
+                return Ok(AttentionProgress::Retry);
+            };
+            for pending in pending {
+                if self.in_flight.contains_key(&pending.receipt) {
+                    continue;
+                }
+                if self.in_flight.len() == MAX_ATTENTION_IN_FLIGHT {
+                    break;
+                }
+                match notifications.record_committed(pending.event) {
+                    Ok(receiver) => {
+                        self.in_flight
+                            .insert(pending.receipt, AttentionCommit::Waiting(receiver));
+                    }
+                    // Full/stopped queues leave the source untouched. Do not
+                    // make backpressure fail an unrelated scheduling tick.
+                    Err(_) => return Ok(AttentionProgress::Retry),
+                }
+            }
+            Ok(AttentionProgress::Waiting)
+        })
+    }
+}
+
+#[cfg(test)]
+mod attention_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1379,7 +1633,7 @@ mod tests {
     }
 
     #[test]
-    fn automation_attention_baselines_history_but_distinguishes_new_waiting_edges() {
+    fn automation_attention_keeps_new_edges_durable_without_backfilling_acknowledged_history() {
         use crate::{
             agent_execution::{State, Update},
             automations::DirectoryIdentity,
@@ -1426,7 +1680,12 @@ mod tests {
             )
             .unwrap();
         let accepted = claim.accepted.unwrap();
-        assert!(run_attention(&registry.automation_run_detail(claim.firing.id).unwrap()).is_none());
+        assert!(
+            registry
+                .pending_automation_attention(100)
+                .unwrap()
+                .is_empty()
+        );
         let run = registry
             .update_agent_run(
                 accepted.run.id,
@@ -1440,11 +1699,16 @@ mod tests {
         let run = registry
             .update_agent_run(run.id, run.revision, Update::Waiting, 400)
             .unwrap();
-        let first =
-            run_attention(&registry.automation_run_detail(claim.firing.id).unwrap()).unwrap();
-        assert_eq!(
-            initial_attention(&registry).unwrap()[&run.id],
-            first.evidence
+        let first = registry
+            .pending_automation_attention(100)
+            .unwrap()
+            .remove(0);
+        assert!(registry.ack_automation_attention(first.receipt).unwrap());
+        assert!(
+            registry
+                .pending_automation_attention(100)
+                .unwrap()
+                .is_empty()
         );
         let run = registry
             .update_agent_run(run.id, run.revision, Update::Resumed, 500)
@@ -1452,10 +1716,17 @@ mod tests {
         let run = registry
             .update_agent_run(run.id, run.revision, Update::Waiting, 600)
             .unwrap();
-        let second =
-            run_attention(&registry.automation_run_detail(claim.firing.id).unwrap()).unwrap();
-        assert_ne!(first.evidence.key, second.evidence.key);
-        assert_eq!(first.target(), second.target());
+        let second = registry
+            .pending_automation_attention(100)
+            .unwrap()
+            .remove(0);
+        assert_ne!(first.event.evidence.key, second.event.evidence.key);
+        assert_eq!(first.event.target(), second.event.target());
+        assert!(!registry.ack_automation_attention(first.receipt).unwrap());
+        assert_eq!(
+            registry.pending_automation_attention(100).unwrap()[0].receipt,
+            second.receipt
+        );
         registry
             .update_agent_run(
                 run.id,
@@ -1467,20 +1738,26 @@ mod tests {
                 700,
             )
             .unwrap();
-        let finished =
-            run_attention(&registry.automation_run_detail(claim.firing.id).unwrap()).unwrap();
+        let finished = registry
+            .pending_automation_attention(100)
+            .unwrap()
+            .remove(0);
         assert_eq!(
-            finished.evidence.kind,
+            finished.event.evidence.kind,
             crate::notifications::Kind::Interrupted
         );
         assert_eq!(
-            finished.source_session(),
+            finished.event.source_session(),
             None,
             "pre-attachment evidence needs no fabricated session"
         );
-        assert_eq!(
-            initial_attention(&registry).unwrap()[&run.id],
-            finished.evidence
+        assert!(!registry.ack_automation_attention(second.receipt).unwrap());
+        assert!(registry.ack_automation_attention(finished.receipt).unwrap());
+        assert!(
+            registry
+                .pending_automation_attention(100)
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -1586,8 +1863,9 @@ mod tests {
             "journal progress uses the existing finite wait, not read-triggered wakes"
         );
         assert!(
-            handle.0.attention.lock().unwrap().is_empty(),
+            handle.0.attention.lock().unwrap().in_flight.is_empty(),
             "a no-run event cannot invent AgentRun attention"
         );
     }
+    include!("broker/history_tests.rs");
 }

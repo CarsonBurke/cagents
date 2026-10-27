@@ -6,6 +6,12 @@ use serde::{Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
 use super::{Registry, automation_audit, automation_notifications};
+
+mod history;
+
+pub(super) fn migrate_history(tx: &Transaction<'_>) -> Result<(), String> {
+    history::migrate(tx)
+}
 use crate::automations::LifecycleCause;
 use crate::automations::{
     Automation, Definition, Firing, FiringState, HistoryCursor, HistoryPage, MAX_HISTORY_PAGE,
@@ -124,6 +130,7 @@ impl Registry {
             &self.db,
             id,
             &occurrence_key(revision, &crate::automations::Trigger::Manual { request }),
+            revision,
         )?;
         if previous
             .as_ref()
@@ -273,6 +280,7 @@ impl Registry {
                 params![run_id.to_string(), run.revision, encode(&run)?],
             )
             .map_err(|e| e.to_string())?;
+            super::automation_attention::stage(&tx, &run)?;
             let mut agent: crate::agent_execution::Agent = decode(
                 &tx.query_row(
                     "SELECT record FROM agents WHERE id=?1",
@@ -320,6 +328,12 @@ impl Registry {
         }
         tx.execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
             .map_err(|e| e.to_string())?;
+        history::prune(
+            &tx,
+            Some(firing.automation),
+            now_ms,
+            crate::automations::HISTORY_RETAINED_ROWS,
+        )?;
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -534,6 +548,12 @@ impl Registry {
                 Some(firing.id),
             )?;
         }
+        history::prune(
+            &tx,
+            Some(automation.id),
+            now_ms,
+            crate::automations::HISTORY_RETAINED_ROWS,
+        )?;
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -627,6 +647,7 @@ impl Registry {
                 params![run.id.to_string(), run.revision, encode(&run)?],
             )
             .map_err(|error| error.to_string())?;
+            super::automation_attention::stage(tx, &run)?;
             if current_agent.session.is_none() {
                 let mut agent = current_agent.clone();
                 agent.closed = true;
@@ -648,6 +669,12 @@ impl Registry {
             write_automation(tx, &automation)?;
             tx.execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
                 .map_err(|error| error.to_string())?;
+            history::prune(
+                tx,
+                Some(firing.automation),
+                now_ms,
+                crate::automations::HISTORY_RETAINED_ROWS,
+            )?;
             return Ok(false);
         }
         Ok(true)
@@ -730,11 +757,18 @@ impl Registry {
                 "Older scheduled occurrences were skipped. Next eligible occurrence: {} ({})",
                 next.local, automation.definition.schedule.timezone
             )),
+            skipped_occurrences: None,
         };
         insert_firing(&tx, &firing, &key)?;
         automation.next = Some(next);
         automation.updated_ms = now_ms;
         write_automation(&tx, &automation)?;
+        history::prune(
+            &tx,
+            Some(id),
+            now_ms,
+            crate::automations::HISTORY_RETAINED_ROWS,
+        )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(firing)
     }
@@ -999,6 +1033,12 @@ impl Registry {
             },
             None,
         )?;
+        history::prune(
+            &tx,
+            Some(automation.id),
+            now_ms,
+            crate::automations::HISTORY_RETAINED_ROWS,
+        )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(automation)
     }
@@ -1037,6 +1077,12 @@ impl Registry {
             params![id.to_string(), now_ms],
         )
         .map_err(|error| error.to_string())?;
+        history::prune(
+            &tx,
+            Some(automation.id),
+            now_ms,
+            crate::automations::HISTORY_RETAINED_ROWS,
+        )?;
         tx.commit().map_err(|error| error.to_string())
     }
 
@@ -1270,7 +1316,7 @@ impl Registry {
             .map_err(|error| error.to_string())?;
         let mut automation = read_automation(&tx, id)?;
         let key = occurrence_key(expected_execution_revision, &trigger);
-        if let Some(firing) = read_firing_key(&tx, id, &key)? {
+        if let Some(firing) = read_firing_key(&tx, id, &key, expected_execution_revision)? {
             if firing.revision != expected_execution_revision {
                 return Err(
                     "This request ID already belongs to another automation revision".into(),
@@ -1346,6 +1392,7 @@ impl Registry {
             run: None,
             skip: None,
             diagnostic: None,
+            skipped_occurrences: None,
         };
         let definition = automation.definition.clone();
         if !project_open {
@@ -1369,7 +1416,11 @@ impl Registry {
         } else {
             automation.active_firing = Some(firing.id);
         }
-        insert_firing(&tx, &firing, &key)?;
+        history::insert_or_coalesce(&tx, &mut firing, &key)?;
+        if !project_open && definition.precheck.is_some() {
+            // Project refusal is terminal before any Worker could launch.
+            history::record_never_launched(&tx, &firing)?;
+        }
         let accepted = if firing.state == FiringState::Prechecking && definition.precheck.is_none()
         {
             accept_firing(&tx, &mut automation, &mut firing, &definition, &key, now_ms)?
@@ -1393,6 +1444,12 @@ impl Registry {
                 Some(firing.id),
             )?;
         }
+        history::prune(
+            &tx,
+            Some(id),
+            now_ms,
+            crate::automations::HISTORY_RETAINED_ROWS,
+        )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(Claimed {
             firing,
@@ -1443,6 +1500,12 @@ impl Registry {
             // The exact cleanup receipt settles only this precheck's stale
             // pending attention, never a newer pause or another firing.
             automation_notifications::suppress_precheck(&tx, automation.id, firing.id)?;
+            history::prune(
+                &tx,
+                Some(automation.id),
+                now_ms,
+                crate::automations::HISTORY_RETAINED_ROWS,
+            )?;
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(None);
         }
@@ -1499,6 +1562,12 @@ impl Registry {
                 Some(firing.id),
             )?;
         }
+        history::prune(
+            &tx,
+            Some(automation.id),
+            now_ms,
+            crate::automations::HISTORY_RETAINED_ROWS,
+        )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(accepted)
     }
@@ -1639,7 +1708,13 @@ fn read_firing(db: &Connection, id: Uuid) -> Result<Firing, String> {
         .map_err(|error| error.to_string())?;
     decode(&record)
 }
-fn read_firing_key(db: &Connection, id: Uuid, key: &str) -> Result<Option<Firing>, String> {
+fn read_firing_key(
+    db: &Connection,
+    id: Uuid,
+    key: &str,
+    revision: u64,
+) -> Result<Option<Firing>, String> {
+    history::require_unretired_manual_key(db, id, key, revision)?;
     db.query_row(
         "SELECT record FROM automation_firings WHERE automation=?1 AND occurrence_key=?2",
         params![id.to_string(), key],
@@ -1651,7 +1726,7 @@ fn read_firing_key(db: &Connection, id: Uuid, key: &str) -> Result<Option<Firing
     .transpose()
 }
 fn insert_firing(tx: &Transaction<'_>, firing: &Firing, key: &str) -> Result<(), String> {
-    tx.execute("INSERT INTO automation_firings(id,automation,revision,occurrence_key,record,created_ms,state,run_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+    tx.execute("INSERT INTO automation_firings(id,automation,revision,occurrence_key,record,created_ms,state,run_id,previous_firing) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,(SELECT id FROM automation_firings WHERE automation=?2 ORDER BY rowid DESC LIMIT 1))",
         params![firing.id.to_string(), firing.automation.to_string(), firing.revision, key, encode(firing)?, firing.created_ms, encode(&firing.state)?, firing.run.map(|id| id.to_string())])
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -2372,6 +2447,13 @@ mod tests {
             .set_automation_enabled(automation.id, 1, None, false, 201)
             .unwrap();
         assert!(!registry.claim_agent_dispatch(&accepted, 202).unwrap());
+        let pending = registry.pending_automation_attention(100).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].receipt.run, accepted.run.id);
+        assert_eq!(
+            pending[0].event.evidence.kind,
+            crate::notifications::Kind::Cancelled
+        );
         assert_eq!(
             registry.agent_run(accepted.run.id).unwrap().state,
             crate::agent_execution::State::Cancelled
@@ -2519,6 +2601,13 @@ mod tests {
         registry
             .fail_automation_start(claim.firing.id, "Target was replaced".into(), 201, true)
             .unwrap();
+        let pending = registry.pending_automation_attention(100).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].receipt.run, accepted.run.id);
+        assert_eq!(
+            pending[0].event.evidence.kind,
+            crate::notifications::Kind::Failed
+        );
         assert_eq!(
             registry.agent_run(accepted.run.id).unwrap().state,
             crate::agent_execution::State::Failed
@@ -2554,6 +2643,11 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
+            registry.pending_automation_attention(100).unwrap()[0].receipt,
+            pending[0].receipt
+        );
+        assert_eq!(registry.pending_automation_attention(100).unwrap().len(), 1);
+        assert_eq!(
             registry.agent_run(accepted.run.id).unwrap().state,
             crate::agent_execution::State::Accepted
         );
@@ -2561,6 +2655,91 @@ mod tests {
             registry.automation(automation.id).unwrap().active_firing,
             Some(second.firing.id)
         );
+    }
+
+    #[test]
+    fn attention_staging_failure_rolls_back_direct_start_failure_and_dispatch_cancellation() {
+        for dispatch_cancellation in [false, true] {
+            let (mut registry, _directory, definition) = fixture();
+            let automation = registry
+                .create_automation(definition, 100, test_identity())
+                .unwrap();
+            let claim = registry
+                .claim_automation(
+                    automation.id,
+                    1,
+                    None,
+                    crate::automations::Trigger::Manual {
+                        request: Uuid::new_v4(),
+                    },
+                    None,
+                    true,
+                    200,
+                )
+                .unwrap();
+            let accepted = claim.accepted.unwrap();
+            if dispatch_cancellation {
+                registry
+                    .set_automation_enabled(automation.id, 1, None, false, 201)
+                    .unwrap();
+            }
+            let before_model = registry.model().unwrap();
+            let before_definition = registry.automation(automation.id).unwrap();
+            let before_firing = registry.automation_firing(claim.firing.id).unwrap();
+            registry
+                .db
+                .execute_batch(
+                    "CREATE TEMP TRIGGER fail_attention BEFORE INSERT ON automation_run_attention
+                BEGIN SELECT RAISE(ABORT, 'fixture attention staging failure'); END;",
+                )
+                .unwrap();
+            if dispatch_cancellation {
+                assert!(registry.claim_agent_dispatch(&accepted, 202).is_err());
+            } else {
+                assert!(
+                    registry
+                        .fail_automation_start(claim.firing.id, "Rejected".into(), 202, true)
+                        .is_err()
+                );
+            }
+            assert_eq!(registry.agent_run(accepted.run.id).unwrap(), accepted.run);
+            assert_eq!(registry.agent(accepted.agent.id).unwrap(), accepted.agent);
+            assert_eq!(
+                registry.automation(automation.id).unwrap(),
+                before_definition
+            );
+            assert_eq!(
+                registry.automation_firing(claim.firing.id).unwrap(),
+                before_firing
+            );
+            assert_eq!(registry.model().unwrap(), before_model);
+            assert!(
+                registry
+                    .pending_automation_attention(100)
+                    .unwrap()
+                    .is_empty()
+            );
+            registry
+                .db
+                .execute_batch("DROP TRIGGER fail_attention")
+                .unwrap();
+            let expected = if dispatch_cancellation {
+                assert!(!registry.claim_agent_dispatch(&accepted, 202).unwrap());
+                crate::notifications::Kind::Cancelled
+            } else {
+                registry
+                    .fail_automation_start(claim.firing.id, "Rejected".into(), 202, true)
+                    .unwrap();
+                crate::notifications::Kind::Failed
+            };
+            assert_eq!(
+                registry.pending_automation_attention(100).unwrap()[0]
+                    .event
+                    .evidence
+                    .kind,
+                expected
+            );
+        }
     }
 
     #[test]
@@ -3615,24 +3794,14 @@ mod tests {
 
     #[test]
     fn automation_lifecycle_audit_upgrade_does_not_attribute_missing_legacy_events() {
-        let (mut registry, directory, definition) = fixture();
+        let (mut registry, _directory, definition) = fixture();
         let created = registry
             .create_automation(definition, 100, test_identity())
             .unwrap();
-        registry
-            .db
-            .execute_batch(
-                "DROP TABLE automation_notifications;
-                 DROP TABLE channel_work_placement_epochs;
-                DROP TABLE channel_work_placement_clock;
-                DROP TABLE channel_work_operations;
-                DROP TABLE channel_work_entries;
-                DROP TABLE channel_work_homes;
-                DROP TABLE automation_lifecycle; PRAGMA user_version=15;",
-            )
-            .unwrap();
+        let legacy_path =
+            super::super::automation_proposals::published_fixture_from_rows(&registry, 15);
         drop(registry);
-        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let mut registry = Registry::at(&legacy_path).unwrap();
         let legacy = registry.automation_audit(created.id, None, 100).unwrap();
         assert!(legacy.events.is_empty() && legacy.earlier_events_unavailable);
         registry
@@ -3643,7 +3812,7 @@ mod tests {
         assert_eq!(current.events.len(), 1);
         assert_eq!(current.events[0].cause, LifecycleCause::Disabled);
         drop(registry);
-        let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let registry = Registry::at(&legacy_path).unwrap();
         assert_eq!(
             registry.automation_audit(created.id, None, 100).unwrap(),
             current
@@ -4314,4 +4483,5 @@ mod tests {
         );
         assert!(!registry.automation(created.id).unwrap().enabled);
     }
+    include!("automations/history_tests.rs");
 }

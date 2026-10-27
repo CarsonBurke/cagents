@@ -195,7 +195,10 @@ use crate::{
 /// compatibility: replace the matched daemon before sending the new budgets.
 /// Version 127 combines both contracts in the matched set. Version 126 is
 /// reserved for the separate native Goal integration and is not adopted here.
-pub const PROTOCOL_VERSION: u16 = 127;
+/// Version 130 combines the current no-run/retention matched set with exact
+/// skipped-occurrence count/ranges appended to Firing. Neither predecessor's
+/// positional postcard ABI identifies this combined set; all executables match.
+pub const PROTOCOL_VERSION: u16 = 130;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

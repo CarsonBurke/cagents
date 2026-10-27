@@ -505,6 +505,19 @@ pub enum SkipReason {
     Disabled,
 }
 
+/// Actual consecutive scheduled skips, not an estimate of missed downtime slots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedOccurrences {
+    pub count: u64,
+    pub first_occurrence_ms: u64,
+    pub last_occurrence_ms: u64,
+}
+
+/// Detailed settled history is bounded independently of unresolved ownership
+/// and compact lifetime manual-request replay proofs.
+pub const HISTORY_RETAINED_ROWS: usize = 500;
+pub const REMOVED_HISTORY_RETENTION_DAYS: u64 = 30;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Firing {
     pub id: Uuid,
@@ -529,6 +542,10 @@ pub struct Firing {
     pub skip: Option<SkipReason>,
     /// Bounded process/validation diagnostic, never a duplicate transcript.
     pub diagnostic: Option<String>,
+    /// First identity/name remain stable; trigger and finish time describe the
+    /// most recent exact occurrence. Legacy and unenumerated downtime rows use None.
+    #[serde(default)]
+    pub skipped_occurrences: Option<SkippedOccurrences>,
 }
 
 #[cfg(test)]
@@ -677,3 +694,7 @@ pub struct HistoryPage {
     pub firings: Vec<Firing>,
     pub next: Option<HistoryCursor>,
 }
+
+#[cfg(test)]
+#[path = "automations/history_wire_tests.rs"]
+mod history_wire_tests;

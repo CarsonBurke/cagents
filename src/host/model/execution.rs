@@ -11,6 +11,11 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
+const AGENTS_FOR_ORIGIN: &str =
+    "SELECT record FROM agents WHERE closed = 0 AND origin = ?1 ORDER BY rowid DESC LIMIT 1024";
+const ACTIVE_AGENTS: &str =
+    "SELECT record FROM agents WHERE closed = 0 ORDER BY rowid DESC LIMIT 1024";
+
 /// The host proves this actor state before inspecting or retiring authority.
 #[derive(Clone, Copy)]
 pub(in crate::host) enum ResidentRelease {
@@ -1078,18 +1083,30 @@ impl Registry {
     }
 
     pub(crate) fn agents(&self, origin: Option<&Origin>) -> Result<Vec<Agent>, String> {
-        let origin = origin.map(encode).transpose()?;
-        let mut statement = self
-            .db
-            .prepare(
-                "SELECT record FROM agents WHERE closed = 0 AND (?1 IS NULL OR origin = ?1)
-             ORDER BY rowid DESC LIMIT 1024",
-            )
-            .map_err(|error| error.to_string())?;
-        let records = statement
-            .query_map([origin], |row| row.get::<_, String>(0))
-            .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
-            .map_err(|error| error.to_string())?;
+        // Keep the origin predicate indexable instead of hiding it behind an
+        // optional-parameter OR that scans unrelated callers' records.
+        let records = match origin {
+            Some(origin) => {
+                let mut statement = self
+                    .db
+                    .prepare(AGENTS_FOR_ORIGIN)
+                    .map_err(|error| error.to_string())?;
+                statement
+                    .query_map([encode(origin)?], |row| row.get::<_, String>(0))
+                    .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+                    .map_err(|error| error.to_string())?
+            }
+            None => {
+                let mut statement = self
+                    .db
+                    .prepare(ACTIVE_AGENTS)
+                    .map_err(|error| error.to_string())?;
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+                    .map_err(|error| error.to_string())?
+            }
+        };
         records.iter().map(|record| decode(record)).collect()
     }
 
@@ -1227,6 +1244,7 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        super::schema::require_current(&tx)?;
         let authority: Option<String> = tx
             .query_row(
                 "SELECT source FROM agent_authorities WHERE session_id = ?1",
@@ -1288,6 +1306,7 @@ impl Registry {
                         .ok_or("Agent run revision exhausted")?;
                     tx.execute("UPDATE agent_runs SET state = 'cancelled', revision = ?2, record = ?3 WHERE id = ?1",
                         params![run.id.to_string(), run.revision, encode(&run)?]).map_err(|e| e.to_string())?;
+                    super::automation_attention::stage(&tx, &run)?;
                 }
                 // ChatClose and daemon shutdown retire through this path before
                 // the execution service can reach close_agent. Commit the pane
@@ -1326,6 +1345,7 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        super::schema::require_current(&tx)?;
         let mut agent = read_agent(&tx, id)?;
         if &agent.origin != origin {
             return Err("This caller does not own the agent".into());
@@ -1533,6 +1553,7 @@ pub(super) fn update_agent_run_in(
         ],
     )
     .map_err(|error| error.to_string())?;
+    super::automation_attention::stage(tx, &run)?;
     tx.execute(
         "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
         [],
@@ -2014,25 +2035,10 @@ mod tests {
             if !proven {
                 // Upgrade an older store containing only the already-ended
                 // descriptor. Migration must not invent historical proof.
-                registry
-                    .db
-                    .execute_batch(
-                        "DROP TABLE automation_notifications;
-                         DROP TABLE channel_work_placement_epochs;
-                         DROP TABLE channel_work_placement_clock;
-                         DROP TABLE channel_work_operations;
-                         DROP TABLE channel_work_entries;
-                         DROP TABLE channel_work_homes;
-                         DROP TABLE automation_lifecycle;
-                         DROP TABLE native_actor_retirements;
-                         DROP TABLE native_actor_ownerships;
-                         DROP TABLE native_actor_cursors;
-                         DROP TABLE shared_view_terminal_sources;
-                         PRAGMA user_version=12;",
-                    )
-                    .unwrap();
+                let legacy =
+                    super::super::automation_proposals::published_fixture_from_rows(&registry, 12);
                 drop(registry);
-                registry = Registry::at(&_directory.path().join("model.sqlite3")).unwrap();
+                registry = Registry::at(&legacy).unwrap();
             }
             let before = registry.model().unwrap();
             let run = registry.agent_run(accepted.run.id).unwrap();
@@ -2318,13 +2324,108 @@ mod tests {
             })
             .unwrap();
         let before = registry.model().unwrap();
-        registry.db.execute_batch("CREATE TRIGGER reject_agent_close BEFORE UPDATE OF closed ON agents BEGIN SELECT RAISE(FAIL, 'fixture close failure'); END;").unwrap();
+        registry.db.execute_batch("CREATE TEMP TRIGGER reject_agent_close BEFORE UPDATE OF closed ON agents BEGIN SELECT RAISE(FAIL, 'fixture close failure'); END;").unwrap();
         assert!(
             registry
                 .close_agent(&Origin::User, accepted.agent.id)
-                .is_err()
+                .unwrap_err()
+                .contains("fixture close failure")
         );
         assert_eq!(registry.model().unwrap(), before);
+    }
+
+    #[test]
+    fn process_retirement_and_automation_attention_commit_or_roll_back_together() {
+        let (mut registry, _directory, request) = fixture();
+        let Destination::New(spec) = request.destination else {
+            unreachable!()
+        };
+        let definition = serde_json::from_value(serde_json::json!({
+            "name":"Fixture", "prompt":"Fixture prompt", "agent":spec,
+            "schedule":{"pattern":{"daily":{"hour":9,"minute":0}},"timezone":"UTC"},
+            "session_mode":"fresh","precheck":null
+        }))
+        .unwrap();
+        let automation = registry
+            .create_automation(
+                definition,
+                100,
+                crate::automations::DirectoryIdentity {
+                    device: 1,
+                    inode: 1,
+                },
+            )
+            .unwrap();
+        let accepted = registry
+            .claim_automation(
+                automation.id,
+                1,
+                None,
+                crate::automations::Trigger::Manual {
+                    request: uuid::Uuid::new_v4(),
+                },
+                None,
+                true,
+                200,
+            )
+            .unwrap()
+            .accepted
+            .unwrap();
+        let retained = source();
+        registry
+            .bind_agent(accepted.agent.id, None, retained.clone())
+            .unwrap();
+        let started = registry
+            .update_agent_run(
+                accepted.run.id,
+                accepted.run.revision,
+                Update::Started {
+                    provider_key: "fixture".into(),
+                },
+                300,
+            )
+            .unwrap();
+        let waiting = registry
+            .update_agent_run(started.id, started.revision, Update::Waiting, 400)
+            .unwrap();
+        let original = registry
+            .pending_automation_attention(100)
+            .unwrap()
+            .remove(0);
+        registry
+            .db
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_attention BEFORE INSERT ON automation_run_attention
+            BEGIN SELECT RAISE(ABORT, 'fixture attention staging failure'); END;",
+            )
+            .unwrap();
+        assert!(registry.retire_agent_process(&retained, 500).is_err());
+        assert_eq!(registry.agent_run(waiting.id).unwrap(), waiting);
+        assert!(!registry.agent(accepted.agent.id).unwrap().closed);
+        let pending = registry.pending_automation_attention(100).unwrap();
+        assert_eq!(pending[0].receipt, original.receipt);
+        assert_eq!(
+            pending[0].event, original.event,
+            "failed replacement retains the previous edge"
+        );
+        registry
+            .db
+            .execute_batch("DROP TRIGGER fail_attention")
+            .unwrap();
+        assert!(registry.retire_agent_process(&retained, 500).unwrap());
+        assert!(registry.agent(accepted.agent.id).unwrap().closed);
+        let cancelled = registry.agent_run(waiting.id).unwrap();
+        assert_eq!(cancelled.state, State::Cancelled);
+        let pending = registry.pending_automation_attention(100).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].receipt.run, waiting.id);
+        assert_eq!(pending[0].receipt.revision, cancelled.revision);
+        assert_eq!(
+            pending[0].event.evidence.kind,
+            crate::notifications::Kind::Cancelled
+        );
+        assert_eq!(pending[0].event.source_session, Some(retained.id()));
+        assert!(!registry.ack_automation_attention(original.receipt).unwrap());
     }
 
     #[test]
@@ -2360,8 +2461,13 @@ mod tests {
             let run = registry.agent_run(accepted.run.id).unwrap();
             let retained = registry.agent(accepted.agent.id).unwrap().session.unwrap();
             if reject_close {
-                registry.db.execute_batch("CREATE TRIGGER reject_process_retirement BEFORE UPDATE OF closed ON agents BEGIN SELECT RAISE(FAIL, 'fixture close failure'); END;").unwrap();
-                assert!(registry.retire_agent_process(&retained, 4).is_err());
+                registry.db.execute_batch("CREATE TEMP TRIGGER reject_process_retirement BEFORE UPDATE OF closed ON agents BEGIN SELECT RAISE(FAIL, 'fixture close failure'); END;").unwrap();
+                assert!(
+                    registry
+                        .retire_agent_process(&retained, 4)
+                        .unwrap_err()
+                        .contains("fixture close failure")
+                );
                 assert_eq!(registry.model().unwrap(), before);
             } else {
                 assert!(registry.retire_agent_process(&retained, 4).unwrap());
@@ -2380,6 +2486,198 @@ mod tests {
                 assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
             }
         }
+    }
+
+    #[test]
+    fn retirement_writer_admission_refuses_changed_header_or_layout_before_dml() {
+        for process in [false, true] {
+            for future in [false, true] {
+                let (mut registry, _directory, accepted, pane) = console_pane_fixture();
+                let scope = crate::workspace_model::views::Scope::Channel(
+                    accepted.agent.channel().unwrap(),
+                );
+                registry
+                    .apply(&ModelEdit::SeedView {
+                        scope: scope.clone(),
+                        panes: vec![pane.clone()],
+                        closed: vec![],
+                    })
+                    .unwrap();
+                publish_console(&mut registry, &scope, &pane, &ended_console(&pane)).unwrap();
+                let agent = registry.agent(accepted.agent.id).unwrap();
+                let source = agent.session.as_ref().unwrap();
+                let authority = registry.register_agent_authority(source).unwrap();
+                let before = registry.model().unwrap();
+                let run = registry.agent_run(accepted.run.id).unwrap();
+                let proof: (String, Option<String>) = registry
+                    .db
+                    .query_row(
+                        "SELECT source, ended FROM shared_view_terminal_sources WHERE pane=?1",
+                        [crate::model::CardId::from_uuid(agent.id.as_uuid()).to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                let other = Connection::open(&registry.path).unwrap();
+                if future {
+                    other
+                        .pragma_update(None, "user_version", super::super::SCHEMA_VERSION + 1)
+                        .unwrap();
+                } else {
+                    other
+                        .execute_batch(
+                            "ALTER TABLE projects ADD COLUMN unknown_retirement_payload TEXT;",
+                        )
+                        .unwrap();
+                }
+                // total_changes also observes DML that a later error rolls back:
+                // unchanged final rows alone would not prove admission came first.
+                let changes = registry.db.total_changes();
+                let result = if process {
+                    registry.retire_agent_process(source, 4).map(drop)
+                } else {
+                    registry.close_agent(&Origin::User, agent.id).map(drop)
+                };
+                assert!(result.unwrap_err().contains(if future {
+                    "newer than supported"
+                } else {
+                    "layout"
+                }));
+                assert_eq!(
+                    registry.db.total_changes(),
+                    changes,
+                    "rejected retirement attempted DML"
+                );
+                assert!(registry.db.is_autocommit());
+                assert_eq!(registry.model().unwrap(), before);
+                assert_eq!(registry.agent(agent.id).unwrap(), agent);
+                assert_eq!(registry.agent_run(run.id).unwrap(), run);
+                assert_eq!(
+                    registry.agent_authority_source(&authority).unwrap(),
+                    Some(source.clone())
+                );
+                let after: (String, Option<String>) = registry
+                    .db
+                    .query_row(
+                        "SELECT source, ended FROM shared_view_terminal_sources WHERE pane=?1",
+                        [crate::model::CardId::from_uuid(agent.id.as_uuid()).to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(after, proof);
+            }
+        }
+    }
+
+    #[test]
+    fn caller_filtered_agents_seek_the_existing_origin_index() {
+        let (registry, _directory, _) = fixture();
+        let plan = registry
+            .db
+            .prepare(&format!("EXPLAIN QUERY PLAN {AGENTS_FOR_ORIGIN}"))
+            .unwrap()
+            .query_map([encode(&Origin::User).unwrap()], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("; ");
+        assert!(plan.contains("SEARCH"), "{plan}");
+        assert!(plan.contains("agents_by_origin"), "{plan}");
+        // The original global active listing also needs its own recency path:
+        // an origin-first index cannot order unrelated active callers by rowid.
+        let plan = registry
+            .db
+            .prepare(&format!("EXPLAIN QUERY PLAN {ACTIVE_AGENTS}"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("; ");
+        assert!(plan.contains("SEARCH"), "{plan}");
+        assert!(plan.contains("agents_open_by_recency"), "{plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+    }
+
+    #[test]
+    fn agent_listings_preserve_origin_closed_order_limit_and_decode_errors() {
+        let (mut registry, _directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let origin = Origin::Child {
+            parent: Lineage(crate::model::TerminalId::new()),
+        };
+        let mut inserted = vec![accepted.agent.clone()];
+        let tx = registry.db.transaction().unwrap();
+        // Exercise the listing contract without starting thousands of providers
+        // or weakening execution admission/capacity limits.
+        for index in 0..2300 {
+            let mut agent = accepted.agent.clone();
+            agent.id = AgentId::new();
+            agent.name = None;
+            agent.origin = if index % 2 == 0 {
+                origin.clone()
+            } else {
+                Origin::User
+            };
+            agent.closed = index % 11 == 0;
+            tx.execute(
+                "INSERT INTO agents(id,origin,record,closed) VALUES(?1,?2,?3,?4)",
+                params![
+                    agent.id.to_string(),
+                    encode(&agent.origin).unwrap(),
+                    encode(&agent).unwrap(),
+                    agent.closed
+                ],
+            )
+            .unwrap();
+            inserted.push(agent);
+        }
+        tx.commit().unwrap();
+        let expected = |filter: Option<&Origin>| {
+            inserted
+                .iter()
+                .rev()
+                .filter(|agent| {
+                    !agent.closed && filter.is_none_or(|origin| &agent.origin == origin)
+                })
+                .take(1024)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(registry.agents(None).unwrap(), expected(None));
+        assert_eq!(
+            registry.agents(Some(&origin)).unwrap(),
+            expected(Some(&origin))
+        );
+        assert_eq!(
+            registry.agents(Some(&Origin::User)).unwrap(),
+            expected(Some(&Origin::User))
+        );
+        assert_eq!(registry.agents(Some(&origin)).unwrap().len(), 1024);
+        assert!(
+            registry
+                .agents(Some(&Origin::Child {
+                    parent: Lineage(crate::model::TerminalId::new())
+                }))
+                .unwrap()
+                .is_empty()
+        );
+        // A malformed record belonging to another caller must not poison this
+        // caller's listing; either matching path must still report decode errors.
+        registry
+            .db
+            .execute(
+                "INSERT INTO agents(id,origin,record,closed) VALUES(?1,?2,'{}',0)",
+                params![AgentId::new().to_string(), encode(&Origin::User).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(
+            registry.agents(Some(&origin)).unwrap(),
+            expected(Some(&origin))
+        );
+        assert!(registry.agents(Some(&Origin::User)).is_err());
+        assert!(registry.agents(None).is_err());
     }
 
     #[test]
@@ -2975,7 +3273,7 @@ mod tests {
 
     #[test]
     fn legacy_registry_migrates_names_and_enforces_uniqueness_at_the_store() {
-        let (mut registry, directory, request) = fixture();
+        let (mut registry, _directory, request) = fixture();
         let first = registry.submit_agent(&Origin::User, &request, 1).unwrap();
         let mut legacy = serde_json::to_value(&first.agent).unwrap();
         legacy.as_object_mut().unwrap().remove("name");
@@ -2986,21 +3284,9 @@ mod tests {
                 params![first.agent.id.to_string(), legacy.to_string()],
             )
             .unwrap();
-        registry
-            .db
-            .execute_batch(
-                "DROP TABLE automation_notifications;
-                 DROP TABLE channel_work_placement_epochs;
-                 DROP TABLE channel_work_placement_clock;
-                 DROP TABLE channel_work_operations;
-                 DROP TABLE channel_work_entries;
-                 DROP TABLE channel_work_homes;
-                 DROP TABLE automation_lifecycle;
-                 DROP INDEX agents_by_name; PRAGMA user_version=9;",
-            )
-            .unwrap();
+        let legacy = super::super::automation_proposals::published_fixture_from_rows(&registry, 9);
         drop(registry);
-        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let mut registry = Registry::at(&legacy).unwrap();
         assert_eq!(registry.agent(first.agent.id).unwrap().name, None);
         let mut named = request;
         named.name = Some("reviewer".into());
