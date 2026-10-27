@@ -17,6 +17,7 @@ rustfmt --edition 2024 --check \
     src/modules.rs \
     src/terminal/worker/bounded_input_tests.rs \
     src/host/model/views/placement_tests.rs \
+    src/host/model/schema/history_tests.rs \
     tests/support/iced_tree.rs \
     tests/support/repository_scale.rs || included_status=$?
 
