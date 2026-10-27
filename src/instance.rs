@@ -223,7 +223,7 @@ mod prepared_readiness_tests {
     #[test]
     fn prepared_ready_file_does_not_advertise_until_original_descriptor_commits() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("ready");
+        let path = root.path().canonicalize().unwrap().join("ready");
         let prepared = prepare_owned_lock(&path).unwrap();
         let identity = prepared.0.metadata().unwrap();
         let other = owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).unwrap();
@@ -241,7 +241,7 @@ mod prepared_readiness_tests {
     #[test]
     fn refused_commit_returns_the_same_owned_descriptor_without_reopen() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("ready");
+        let path = root.path().canonicalize().unwrap().join("ready");
         let prepared = prepare_owned_lock(&path).unwrap();
         let original_fd = prepared.0.as_raw_fd();
         let original = prepared.0.metadata().unwrap();
@@ -264,9 +264,10 @@ mod prepared_readiness_tests {
     #[test]
     fn readiness_preparation_preserves_existing_nofollow_validation() {
         let root = tempfile::tempdir().unwrap();
-        let target = root.path().join("target");
+        let base = root.path().canonicalize().unwrap();
+        let target = base.join("target");
         std::fs::write(&target, b"unchanged").unwrap();
-        let link = root.path().join("ready");
+        let link = base.join("ready");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(prepare_owned_lock(&link).is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");

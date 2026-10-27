@@ -1137,7 +1137,7 @@ mod tests {
 
     struct Fixture {
         app: Cagents,
-        root: tempfile::TempDir,
+        _root: tempfile::TempDir,
         runtime: PathBuf,
         old: PathBuf,
         next: PathBuf,
@@ -1160,9 +1160,10 @@ mod tests {
 
     fn fixture() -> Fixture {
         let root = tempfile::tempdir().unwrap();
-        let runtime = root.path().join("runtime");
-        let old = root.path().join("old");
-        let next = root.path().join("next");
+        let base = root.path().canonicalize().unwrap();
+        let runtime = base.join("runtime");
+        let old = base.join("old");
+        let next = base.join("next");
         for path in [&runtime, &old, &next] {
             std::fs::create_dir(path).unwrap();
         }
@@ -1180,7 +1181,7 @@ mod tests {
         no_effect(app.update(retired(retirement)));
         Fixture {
             app,
-            root,
+            _root: root,
             runtime,
             old,
             next,
@@ -1301,7 +1302,7 @@ mod tests {
         let initial_cards = f.app.durable.cards.len();
         let mut last = f.next.clone();
         for index in 0..11 {
-            last = f.root.path().join(format!("choice-{index}"));
+            last = f.old.parent().unwrap().join(format!("choice-{index}"));
             std::fs::create_dir(&last).unwrap();
             folder(&mut f.app, &last);
             no_effect(open(&mut f.app, &last));
@@ -1359,7 +1360,7 @@ mod tests {
             if accepted {
                 drop(f.app.open_utility_card(CardKind::Settings));
             } else {
-                let missing = f.root.path().join("missing");
+                let missing = f.old.parent().unwrap().join("missing");
                 let (selected, task) = f.app.select_worktree_checked(missing, false);
                 assert!(!selected);
                 no_effect(task);
@@ -1465,7 +1466,7 @@ mod tests {
         let first = f.app.navigate_worktree(f.next.clone(), false, None);
         let worker = std::thread::spawn(move || prepared(first));
         entered.recv_timeout(Duration::from_secs(3)).unwrap();
-        let extra = f.root.path().join("arrived-folder");
+        let extra = f.old.parent().unwrap().join("arrived-folder");
         std::fs::create_dir(&extra).unwrap();
         folder(&mut f.app, &extra);
         // Exercise the same ordinary structural tail after a repository reply.
@@ -1487,9 +1488,66 @@ mod tests {
     }
 
     #[test]
+    fn automatic_repository_reload_preserves_explicit_navigation_without_ui_owner_io() {
+        let mut f = fixture();
+        let (entered, release, starts) = blocked(&mut f.app);
+        let ui_reads = Arc::new(AtomicUsize::new(0));
+        let reads = ui_reads.clone();
+        f.app.worktree_selection.owner_read = Some(Arc::new(move || {
+            reads.fetch_add(1, AtomicOrdering::SeqCst);
+        }));
+        let first = f.app.navigate_worktree(f.next.clone(), false, None);
+        let worker = std::thread::spawn(move || prepared(first));
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        let generation = f.app.worktree_selection.generation;
+        let project = f
+            .app
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|project| project.repository == f.old)
+            .unwrap()
+            .id;
+        f.app.repository_generations.insert(project, 1);
+        let loaded = LoadedRepository {
+            project: ProjectState {
+                id: project,
+                generation: 0,
+                name: "refreshed folder".into(),
+                repository: f.old.clone(),
+                kind: ProjectKind::Folder,
+                existence: Existence::Open,
+            },
+            repository: None,
+            worktrees: Vec::new(),
+            github: GitHubAvailability::NotAssociated,
+            review_repository: None,
+            head_repositories: HashMap::new(),
+        };
+        // Exercise the real accepted automatic-load branch and its full tail.
+        // Returned unrelated enrichment tasks are not run by this owning test.
+        drop(f.app.update(Message::RepositoryLoaded {
+            open_cards: false,
+            project_id: project,
+            generation: 1,
+            result: Ok(Box::new(loaded)),
+        }));
+        assert_eq!(f.app.worktree_selection.generation, generation);
+        assert_eq!(f.app.active_workspace.as_ref(), Some(&f.old));
+        assert_eq!(ui_reads.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(starts.load(AtomicOrdering::SeqCst), 1);
+        release.send(()).unwrap();
+        let retirement = f.app.update(worker.join().unwrap());
+        assert_eq!(f.app.active_workspace.as_ref(), Some(&f.next));
+        no_effect(f.app.update(retired(retirement)));
+        assert_eq!(starts.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(ui_reads.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
     fn same_named_directory_replacement_after_acquisition_refuses_the_receipt() {
         let mut f = fixture();
-        let moved = f.root.path().join("old-next-inode");
+        let moved = f.old.parent().unwrap().join("old-next-inode");
         let replacement = f.next.clone();
         f.app.worktree_selection.after_acquire = Some(Arc::new(move |path| {
             assert_eq!(path, replacement);
@@ -1528,7 +1586,7 @@ mod tests {
         let first = f.app.reconcile_navigation_protections();
         let retirement = f.app.update(prepared(first));
         no_effect(f.app.update(retired(retirement)));
-        let missing = f.root.path().join("missing");
+        let missing = f.old.parent().unwrap().join("missing");
         let message = prepared(f.app.navigate_worktree(missing, false, None));
         let retirement = f.app.update(message);
         assert!(f.app.worktree_selection.failed_sync.is_some());

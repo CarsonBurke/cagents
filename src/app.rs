@@ -14842,7 +14842,14 @@ impl Application for Cagents {
                             // into distinct worktrees after session restoration.
                             // Only the project holding the scope can move it,
                             // and re-selecting resolves every card's owner.
-                            task = if let Some(channel) = self.durable.active_channel {
+                            task = if self.worktree_selection.is_active() {
+                                // An automatic reload must neither block input
+                                // nor supersede an accepted explicit selection.
+                                // Its new roots/rows invalidate that same worker's
+                                // snapshot before any scope/default-pane commit.
+                                self.collect_worktree_roots();
+                                Task::none()
+                            } else if let Some(channel) = self.durable.active_channel {
                                 self.select_channel(channel)
                             } else {
                                 self.select_worktree(active, false)

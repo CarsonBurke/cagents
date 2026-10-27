@@ -5034,8 +5034,9 @@ mod prepared_navigation_tests {
             ),
         ] {
             let root = tempfile::tempdir().unwrap();
-            let profile = root.path().join("profile");
-            let project = root.path().join("project");
+            let base = root.path().canonicalize().unwrap();
+            let profile = base.join("profile");
+            let project = base.join("project");
             std::fs::create_dir(&profile).unwrap();
             std::fs::create_dir(&project).unwrap();
             let prepared = worker_prepared(&profile, &project, contents);
@@ -5061,8 +5062,9 @@ mod prepared_navigation_tests {
     #[test]
     fn prepared_none_survives_empty_snapshots_hide_show_and_later_provider_policy() {
         let root = tempfile::tempdir().unwrap();
-        let profile = root.path().join("profile");
-        let project = root.path().join("project");
+        let base = root.path().canonicalize().unwrap();
+        let profile = base.join("profile");
+        let project = base.join("project");
         std::fs::create_dir(&profile).unwrap();
         std::fs::create_dir(&project).unwrap();
         let prepared = worker_prepared(&profile, &project, "profile = 'unknown'\n");
@@ -5123,8 +5125,9 @@ mod prepared_navigation_tests {
     #[test]
     fn changed_launch_cannot_reuse_prepared_policy_or_trigger_an_implicit_config_read() {
         let root = tempfile::tempdir().unwrap();
-        let profile = root.path().join("profile");
-        let project = root.path().join("project");
+        let base = root.path().canonicalize().unwrap();
+        let profile = base.join("profile");
+        let project = base.join("project");
         std::fs::create_dir(&profile).unwrap();
         std::fs::create_dir(&project).unwrap();
         let prepared = worker_prepared(
@@ -5193,9 +5196,10 @@ mod prepared_navigation_tests {
     #[test]
     fn navigation_default_provider_matches_post_discard_scope_instead_of_old_placeholder() {
         let root = tempfile::tempdir().unwrap();
-        let old = root.path().join("old");
-        let next = root.path().join("next");
-        let other = root.path().join("other");
+        let base = root.path().canonicalize().unwrap();
+        let old = base.join("old");
+        let next = base.join("next");
+        let other = base.join("other");
         for path in [&old, &next, &other] {
             std::fs::create_dir(path).unwrap();
         }
@@ -5203,11 +5207,8 @@ mod prepared_navigation_tests {
         app.known_worktree_roots
             .extend([old.clone(), next.clone(), other.clone()]);
         let fixture_session = |provider: Provider, directory: &Path| {
-            let account = Account::managed(
-                Provider::Codex,
-                uuid::Uuid::new_v4(),
-                root.path().join("profile"),
-            );
+            let account =
+                Account::managed(Provider::Codex, uuid::Uuid::new_v4(), base.join("profile"));
             let mut session = chat::fresh_session(
                 Provider::Codex,
                 TerminalId::new(),
