@@ -26,6 +26,7 @@ pub struct TextInput<'a, Message> {
     private: bool,
     on_input: Option<Rc<dyn Fn(String) -> Message + 'a>>,
     on_focus: Option<Message>,
+    submits: bool,
 }
 
 struct State {
@@ -78,6 +79,7 @@ impl<'a, Message: Clone + 'static> TextInput<'a, Message> {
             private: false,
             on_input: None,
             on_focus: None,
+            submits: false,
         }
     }
     pub fn name(mut self, name: impl Into<Cow<'a, str>>) -> Self {
@@ -117,6 +119,7 @@ impl<'a, Message: Clone + 'static> TextInput<'a, Message> {
     }
     pub fn on_submit(mut self, callback: impl Fn(String) -> Message + 'a) -> Self {
         self.inner = self.inner.on_submit(callback);
+        self.submits = true;
         self
     }
     pub fn on_submit_maybe(self, callback: Option<impl Fn(String) -> Message + 'a>) -> Self {
@@ -427,6 +430,26 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextInput<'_
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if self.submits
+            && !shell.is_event_captured()
+            && matches!(
+                event,
+                Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
+                    key: cosmic::iced::keyboard::Key::Named(
+                        cosmic::iced::keyboard::key::Named::Enter
+                    ),
+                    repeat: true,
+                    ..
+                })
+            )
+            && tree.children[0]
+                .state
+                .downcast_ref::<widget::text_input::State>()
+                .is_focused()
+        {
+            shell.capture_event();
+            return;
+        }
         if let Event::A11y(id, request) = event {
             let own = tree.state.downcast_ref::<State>();
             if own.owns(id) {
@@ -813,5 +836,227 @@ mod tests {
         assert_eq!(state.run_id, old);
         state.bind(None, "Device name");
         assert_ne!(state.run_id, old);
+    }
+
+    #[test]
+    fn submit_fields_ignore_only_focused_enter_repeat_and_keep_native_editing() {
+        use cosmic::iced::{advanced::widget::operation, keyboard};
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let enter = |repeat| {
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat,
+            })
+        };
+        fn submit(value: String) -> String {
+            format!("submit:{value}")
+        }
+        for submits in [false, true] {
+            let id = Id::new("activation.form.name");
+            let mut input = TextInput::new("Name", "draft")
+                .id(id.clone())
+                .on_input(|value| format!("edit:{value}"))
+                .on_unfocus("blur".to_owned())
+                .on_submit_maybe(submits.then_some(submit as fn(String) -> String));
+            let mut tree = Tree::new(&input as &dyn Widget<String, Theme, Renderer>);
+            let node = input.layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(320.0, 80.0)),
+            );
+            let bounds = node.bounds();
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            input.update(
+                &mut tree,
+                &enter(true),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &bounds,
+            );
+            assert!(
+                !shell.is_event_captured(),
+                "unfocused fields cannot consume another control's repeat"
+            );
+            assert!(messages.is_empty());
+            input.operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut operation::focusable::focus::<()>(id.clone()),
+            );
+            let mut shell = Shell::new(&mut messages);
+            input.update(
+                &mut tree,
+                &enter(true),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &bounds,
+            );
+            assert_eq!(
+                shell.redraw_request(),
+                if submits {
+                    cosmic::iced::window::RedrawRequest::Wait
+                } else {
+                    cosmic::iced::window::RedrawRequest::NextFrame
+                },
+                "without a submit action, native Enter handling is unchanged"
+            );
+            assert!(messages.is_empty());
+            input.update(
+                &mut tree,
+                &enter(false),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+            assert_eq!(
+                messages,
+                if submits {
+                    vec!["submit:draft"]
+                } else {
+                    vec![]
+                }
+            );
+            messages.clear();
+            // Ordinary key repeat still edits through COSMIC's actual callback.
+            let character = Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character("x".into()),
+                modified_key: keyboard::Key::Character("x".into()),
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: Some("x".into()),
+                repeat: true,
+            });
+            input.update(
+                &mut tree,
+                &character,
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+            assert_eq!(messages.len(), 1);
+            let edited = messages.pop().unwrap();
+            assert!(edited.starts_with("edit:"));
+            assert_eq!(edited.trim_start_matches("edit:").replace('x', ""), "draft");
+            assert_eq!(edited.matches('x').count(), 1);
+            for key in [keyboard::key::Named::Escape, keyboard::key::Named::Tab] {
+                input.operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut operation::focusable::focus::<()>(id.clone()),
+                );
+                let event = Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(key.clone()),
+                    modified_key: keyboard::Key::Named(key),
+                    physical_key: keyboard::key::Physical::Unidentified(
+                        keyboard::key::NativeCode::Unidentified,
+                    ),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                });
+                input.update(
+                    &mut tree,
+                    &event,
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &bounds,
+                );
+                assert_eq!(
+                    messages,
+                    ["blur"],
+                    "Escape and Tab retain native field ownership callbacks"
+                );
+                messages.clear();
+            }
+        }
+    }
+
+    #[test]
+    fn multiline_editor_keeps_repeated_enter_as_native_edit_actions() {
+        use cosmic::iced::{advanced::widget::operation, keyboard, widget::text_editor};
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut content = text_editor::Content::with_text("draft");
+        let mut messages = Vec::new();
+        {
+            let id = Id::new("activation.multiline");
+            let mut editor = TextEditor::new("Instructions", &content)
+                .id(id.clone())
+                .on_action(|action| action);
+            let mut tree = Tree::new(&editor as &dyn Widget<text_editor::Action, Theme, Renderer>);
+            let node = editor.layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(320.0, 160.0)),
+            );
+            editor.operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut operation::focusable::focus::<()>(id),
+            );
+            for _ in 0..2 {
+                let event = Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                    modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                    physical_key: keyboard::key::Physical::Unidentified(
+                        keyboard::key::NativeCode::Unidentified,
+                    ),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: true,
+                });
+                editor.update(
+                    &mut tree,
+                    &event,
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &node.bounds(),
+                );
+            }
+        }
+        assert_eq!(
+            messages.len(),
+            2,
+            "multiline Enter repeat remains editing, not a command guard"
+        );
+        for action in messages {
+            content.perform(action);
+        }
+        let text = content.text();
+        assert_eq!(text.matches('\n').count(), 2);
+        assert_eq!(text.replace('\n', ""), "draft");
     }
 }

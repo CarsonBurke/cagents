@@ -145,7 +145,7 @@ impl<'a, Message: Clone + 'a> From<Button<'a, Message>> for Element<'a, Message>
         if let Some(id) = id {
             button = button.id(id);
         }
-        button.into()
+        crate::interaction::non_repeating_activation(button)
     }
 }
 
@@ -290,6 +290,266 @@ mod tests {
                 );
             }
             assert_eq!(messages.len(), usize::from(message.is_some()));
+        }
+    }
+
+    fn enter_event(repeat: bool) -> iced::Event {
+        use iced::keyboard;
+        iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat,
+        })
+    }
+
+    #[test]
+    fn labelled_buttons_keep_fresh_keyboard_pointer_and_assistive_activations() {
+        use iced::{
+            Event, Size,
+            advanced::{clipboard, widget::operation},
+            mouse,
+            runtime::{UserInterface, user_interface::Cache},
+        };
+        use iced_accessibility::{
+            A11yId,
+            accesskit::{Action, ActionRequest, TreeId},
+        };
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        for constructor in [
+            primary as fn(&'static str) -> Button<'static, u8>,
+            secondary,
+            destructive,
+            quiet,
+        ] {
+            for enabled in [false, true] {
+                let id = widget::Id::new("activation.primary");
+                let mut ui = UserInterface::build(
+                    constructor("Apply")
+                        .id(id.clone())
+                        .on_press_maybe(enabled.then_some(1)),
+                    Size::new(320.0, 80.0),
+                    Cache::new(),
+                    &mut renderer,
+                );
+                ui.operate(
+                    &renderer,
+                    &mut operation::focusable::focus::<()>(id.clone()),
+                );
+                let mut messages = Vec::new();
+                ui.update(
+                    &[enter_event(true)],
+                    mouse::Cursor::Unavailable,
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                assert!(
+                    messages.is_empty(),
+                    "a held Enter cannot activate a labelled button"
+                );
+                for key in [
+                    iced::keyboard::key::Named::Tab,
+                    iced::keyboard::key::Named::Escape,
+                ] {
+                    let mut event = enter_event(false);
+                    if let Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                        key: native,
+                        modified_key,
+                        ..
+                    }) = &mut event
+                    {
+                        *native = iced::keyboard::Key::Named(key.clone());
+                        *modified_key = iced::keyboard::Key::Named(key);
+                    }
+                    let (_, statuses) = ui.update(
+                        &[event],
+                        mouse::Cursor::Unavailable,
+                        &mut renderer,
+                        &mut clipboard::Null,
+                        &mut messages,
+                    );
+                    assert_eq!(statuses, [iced::event::Status::Ignored]);
+                    assert!(
+                        messages.is_empty(),
+                        "button filtering must leave Tab and Escape to their owners"
+                    );
+                }
+                ui.update(
+                    &[enter_event(false)],
+                    mouse::Cursor::Unavailable,
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                assert_eq!(messages, if enabled { vec![1] } else { vec![] });
+                messages.clear();
+                // Assistive Click remains a real activation and clears the native press.
+                let event = Event::A11y(
+                    id.clone(),
+                    ActionRequest {
+                        action: Action::Click,
+                        target_tree: TreeId::ROOT,
+                        target_node: A11yId::from(id).into(),
+                        data: None,
+                    },
+                );
+                ui.update(
+                    &[event],
+                    mouse::Cursor::Unavailable,
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                assert_eq!(messages, if enabled { vec![1] } else { vec![] });
+                messages.clear();
+                let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+                let bounds = nodes
+                    .root()
+                    .iter()
+                    .chain(nodes.children())
+                    .find(|node| {
+                        node.node().role() == iced_accessibility::accesskit::Role::Button
+                            && node.node().label() == Some("Apply")
+                    })
+                    .unwrap()
+                    .node()
+                    .bounds()
+                    .unwrap();
+                let cursor = mouse::Cursor::Available(iced::Point::new(
+                    ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                    ((bounds.y0 + bounds.y1) / 2.0) as f32,
+                ));
+                ui.update(
+                    &[
+                        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                    ],
+                    cursor,
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                assert_eq!(messages, if enabled { vec![1] } else { vec![] });
+            }
+        }
+    }
+
+    #[test]
+    fn opening_native_batch_does_not_commit_replacement_and_held_enter_repeat_is_inert() {
+        use iced::{
+            Event, Size,
+            advanced::{clipboard, widget::operation},
+            keyboard, mouse,
+            runtime::{UserInterface, user_interface::Cache},
+        };
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let size = Size::new(320.0, 80.0);
+        for pointer_down_opener in [false, true] {
+            let open_id = widget::Id::new("activation.open");
+            let original: Element<'_, u8> = if pointer_down_opener {
+                widget::button::custom(crate::design::body("Open"))
+                    .id(open_id.clone())
+                    .on_press_down(1)
+                    .into()
+            } else {
+                primary("Open").id(open_id.clone()).on_press(1).into()
+            };
+            let mut ui = UserInterface::build(original, size, Cache::new(), &mut renderer);
+            let cursor = mouse::Cursor::Available(iced::Point::new(8.0, 8.0));
+            let opening = if pointer_down_opener {
+                vec![Event::Mouse(mouse::Event::ButtonPressed(
+                    mouse::Button::Left,
+                ))]
+            } else {
+                ui.operate(&renderer, &mut operation::focusable::focus::<()>(open_id));
+                vec![enter_event(false)]
+            };
+            let mut messages = Vec::new();
+            ui.update(
+                &opening,
+                cursor,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert_eq!(
+                messages,
+                [1],
+                "only the old widget emits the genuine opening action"
+            );
+            // Like iced-winit, finish the old input batch, consume its message,
+            // and then rebuild the application view from the real native cache.
+            let cache = ui.into_cache();
+            let confirm = widget::Id::new("activation.confirm");
+            let replacement = crate::ui_controls::owned(
+                "confirmation",
+                primary("Confirm").id(confirm.clone()).on_press(2),
+            );
+            let mut ui = UserInterface::build(replacement, size, cache, &mut renderer);
+            ui.operate(&renderer, &mut operation::focusable::focus::<()>(confirm));
+            messages.clear();
+            ui.update(
+                &[Event::Window(iced::window::Event::RedrawRequested(
+                    iced::time::Instant::now(),
+                ))],
+                cursor,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert!(
+                messages.is_empty(),
+                "the actual redraw second pass is not an input replay"
+            );
+            let release = if pointer_down_opener {
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+            } else {
+                ui.update(
+                    &[enter_event(true)],
+                    cursor,
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                Event::Keyboard(keyboard::Event::KeyReleased {
+                    key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                    modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                    physical_key: keyboard::key::Physical::Unidentified(
+                        keyboard::key::NativeCode::Unidentified,
+                    ),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                })
+            };
+            ui.update(
+                &[release],
+                cursor,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert!(
+                messages.is_empty(),
+                "the opener's held input cannot confirm the replacement"
+            );
+            ui.update(
+                &[enter_event(false)],
+                cursor,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert_eq!(
+                messages,
+                [2],
+                "a distinct fresh Enter completes the newly focused task"
+            );
         }
     }
 }
