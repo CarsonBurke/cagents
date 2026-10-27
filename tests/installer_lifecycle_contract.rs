@@ -305,8 +305,16 @@ esac
     if let Some(failure) = publish_failure.filter(|failure| *failure != "pre-cas-candidate") {
         let fail = if failure == "current-changed" {
             "/usr/bin/ln -snf versions/independent \"$FIXTURE_PREFIX/current\"; exit 8"
-        } else if failure == "outer-signal" {
-            "kill -TERM \"$(cat \"$FIXTURE_OUTER_PID_FILE\")\"; sleep 1; exit 8"
+        } else if matches!(failure, "outer-signal" | "outer-signal-invalid-target") {
+            r#"target=$(cat "$FIXTURE_OUTER_PID_FILE") || exit 97
+if [ "$FIXTURE_REJECT_SIGNAL" = true ]; then target=not-a-pid; fi
+if ! kill -TERM "$target"; then
+  printf '%s\n' "$target" > "$FIXTURE_SIGNAL_REJECTED"
+  exit 97
+fi
+printf '%s\n' "$target" > "$FIXTURE_SIGNAL_DELIVERED" || exit 97
+sleep 1
+exit 8"#
         } else if failure == "signal" {
             "kill -TERM \"$PPID\"; exit 8"
         } else {
@@ -396,7 +404,21 @@ esac
     let runtime = home.path().join("runtime");
     fs::create_dir(&runtime).unwrap();
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    let outer_signal = matches!(
+        publish_failure,
+        Some("outer-signal" | "outer-signal-invalid-target")
+    );
     let mut command = Command::new("sh");
+    if outer_signal {
+        // Publish from the child before the installer can reach the signal
+        // fixture. exec preserves this PID as the actual outer installer.
+        command.args([
+            "-c",
+            r#"printf '%s\n' "$$" > "$FIXTURE_OUTER_PID_FILE" || exit 97
+exec sh "$@""#,
+            "installer-signal-fixture",
+        ]);
+    }
     command.arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"));
     if stage_only {
         command.arg("--stage-only");
@@ -447,6 +469,18 @@ esac
         )
         .env("FIXTURE_OUTER_PID_FILE", home.path().join("outer-pid"))
         .env(
+            "FIXTURE_SIGNAL_DELIVERED",
+            home.path().join("signal-delivered"),
+        )
+        .env(
+            "FIXTURE_SIGNAL_REJECTED",
+            home.path().join("signal-rejected"),
+        )
+        .env(
+            "FIXTURE_REJECT_SIGNAL",
+            (publish_failure == Some("outer-signal-invalid-target")).to_string(),
+        )
+        .env(
             "CAGENTS_REPOSITORY",
             if download == Some("public") {
                 "fixture/public-cagents"
@@ -472,8 +506,34 @@ esac
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    fs::write(home.path().join("outer-pid"), output.id().to_string()).unwrap();
+    let outer_pid = output.id();
     let output = output.wait_with_output().unwrap();
+    if outer_signal {
+        assert_eq!(
+            fs::read_to_string(home.path().join("outer-pid")).unwrap(),
+            format!("{outer_pid}\n")
+        );
+        if publish_failure == Some("outer-signal-invalid-target") {
+            assert_eq!(
+                fs::read_to_string(home.path().join("signal-delivered"))
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::NotFound,
+                "a rejected injection must never count as delivered"
+            );
+            assert_eq!(
+                fs::read_to_string(home.path().join("signal-rejected")).unwrap(),
+                "not-a-pid\n"
+            );
+        } else {
+            assert_eq!(
+                fs::read_to_string(home.path().join("signal-delivered"))
+                    .expect("outer interruption requires successful signal delivery"),
+                format!("{outer_pid}\n")
+            );
+            assert!(!home.path().join("signal-rejected").exists());
+        }
+    }
     if coordinator == "none" || coordinator == "stage-unsupported" {
         assert!(!output.status.success());
         assert!(
@@ -689,6 +749,18 @@ fn unsupported_coordinators_refuse_before_mutating_the_installation() {
 #[test]
 fn interrupting_the_outer_installer_waits_for_inner_rollback() {
     coordinated_release_fixture(true, 2, Some("outer-signal"), None, None, "installed");
+}
+
+#[test]
+fn rejected_outer_signal_injection_cannot_count_as_delivered() {
+    coordinated_release_fixture(
+        true,
+        2,
+        Some("outer-signal-invalid-target"),
+        None,
+        None,
+        "installed",
+    );
 }
 
 #[test]
