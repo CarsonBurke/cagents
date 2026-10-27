@@ -248,6 +248,15 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         );
     }
 
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        self.native.a11y_nodes(layout, &tree.children[0], cursor)
+    }
+
     fn overlay<'a>(
         &'a mut self,
         tree: &'a mut Tree,
@@ -410,6 +419,393 @@ mod tests {
                 );
             }
         }
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct MenuAction(usize);
+
+    impl widget::menu::Action for MenuAction {
+        type Message = usize;
+        fn message(&self) -> usize {
+            self.0
+        }
+    }
+
+    // The real native menu, retained Tree and Overlay layout, with no fake
+    // accessibility nodes or dispatch shim. Events follow overlay-before-base
+    // delivery just as UserInterface does. No app/daemon/provider is launched.
+    struct NativeMenu {
+        element: Element<'static, usize>,
+        tree: Tree,
+        renderer: Renderer,
+        row: layout::Node,
+        viewport: Rectangle,
+        anchor: Point,
+    }
+
+    impl NativeMenu {
+        fn new(count: usize, viewport: Size, anchor: Point) -> Self {
+            let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let entries = (0..count)
+                .map(|index| {
+                    if index == 1 {
+                        widget::menu::Item::ButtonDisabled(
+                            "Copy branch (detached HEAD)".to_owned(),
+                            None,
+                            MenuAction(index),
+                        )
+                    } else {
+                        widget::menu::Item::Button(
+                            format!("Action {index}"),
+                            None,
+                            MenuAction(index),
+                        )
+                    }
+                })
+                .collect();
+            let mut element = surface(widget::menu::items(
+                &std::collections::HashMap::new(),
+                entries,
+            ));
+            let mut tree = Tree::new(element.as_widget());
+            element.as_widget_mut().diff(&mut tree);
+            let row = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(viewport, viewport),
+            );
+            Self {
+                element,
+                tree,
+                renderer,
+                row,
+                viewport: Rectangle::with_size(viewport),
+                anchor,
+            }
+        }
+
+        fn event(&mut self, event: Event, cursor: mouse::Cursor) -> Vec<usize> {
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            {
+                let widget = self.element.as_widget_mut();
+                if let Some(mut overlay) = widget.overlay(
+                    &mut self.tree,
+                    Layout::new(&self.row),
+                    &self.renderer,
+                    &self.viewport,
+                    Vector::ZERO,
+                ) {
+                    let node = overlay
+                        .as_overlay_mut()
+                        .layout(&self.renderer, self.viewport.size());
+                    overlay.as_overlay_mut().update(
+                        &event,
+                        Layout::new(&node),
+                        cursor,
+                        &self.renderer,
+                        &mut clipboard::Null,
+                        &mut shell,
+                    );
+                }
+            }
+            if !shell.is_event_captured() {
+                self.element.as_widget_mut().update(
+                    &mut self.tree,
+                    &event,
+                    Layout::new(&self.row),
+                    cursor,
+                    &self.renderer,
+                    &mut clipboard::Null,
+                    &mut shell,
+                    &self.viewport,
+                );
+            }
+            drop(shell);
+            self.measure();
+            messages
+        }
+
+        fn measure(&mut self) {
+            self.row = self.element.as_widget_mut().layout(
+                &mut self.tree,
+                &self.renderer,
+                &layout::Limits::new(self.viewport.size(), self.viewport.size()),
+            );
+            if let Some(mut overlay) = self.element.as_widget_mut().overlay(
+                &mut self.tree,
+                Layout::new(&self.row),
+                &self.renderer,
+                &self.viewport,
+                Vector::ZERO,
+            ) {
+                let _ = overlay
+                    .as_overlay_mut()
+                    .layout(&self.renderer, self.viewport.size());
+            }
+        }
+
+        fn open(&mut self) {
+            assert!(
+                self.event(
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+                    mouse::Cursor::Available(self.anchor)
+                )
+                .is_empty()
+            );
+            assert!(
+                self.event(
+                    Event::Window(window::Event::RedrawRequested(Instant::now())),
+                    mouse::Cursor::Available(self.anchor)
+                )
+                .is_empty()
+            );
+        }
+
+        fn focused(&mut self) -> Option<Id> {
+            #[derive(Default)]
+            struct Focus(Option<Id>);
+            impl Operation for Focus {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn focusable(
+                    &mut self,
+                    id: Option<&Id>,
+                    _: Rectangle,
+                    state: &mut dyn operation::Focusable,
+                ) {
+                    if state.is_focused() {
+                        self.0 = id.cloned();
+                    }
+                }
+            }
+            let mut focus = Focus::default();
+            if let Some(mut overlay) = self.element.as_widget_mut().overlay(
+                &mut self.tree,
+                Layout::new(&self.row),
+                &self.renderer,
+                &self.viewport,
+                Vector::ZERO,
+            ) {
+                let node = overlay
+                    .as_overlay_mut()
+                    .layout(&self.renderer, self.viewport.size());
+                overlay
+                    .as_overlay_mut()
+                    .operate(Layout::new(&node), &self.renderer, &mut focus);
+            }
+            focus.0
+        }
+
+        fn replace_owned(&mut self, owner: u64, offset: usize) {
+            let entries = (0..3)
+                .map(|index| {
+                    widget::menu::Item::Button(
+                        format!("Action {index}"),
+                        None,
+                        MenuAction(index + offset),
+                    )
+                })
+                .collect();
+            self.element = crate::ui_controls::owned(
+                owner,
+                surface(widget::menu::items(
+                    &std::collections::HashMap::new(),
+                    entries,
+                )),
+            );
+            self.tree.diff(self.element.as_widget_mut());
+            self.measure();
+        }
+
+        fn nodes(&self) -> iced_accessibility::A11yTree {
+            self.element.as_widget().a11y_nodes(
+                Layout::new(&self.row),
+                &self.tree,
+                mouse::Cursor::Unavailable,
+            )
+        }
+
+        fn named(&self, name: &str) -> iced_accessibility::A11yNode {
+            let nodes = self.nodes();
+            nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|n| n.node().label() == Some(name))
+                .expect(name)
+                .clone()
+        }
+
+        fn action(
+            &mut self,
+            node: &iced_accessibility::A11yNode,
+            action: iced_accessibility::accesskit::Action,
+        ) -> Vec<usize> {
+            use iced_accessibility::accesskit::{ActionRequest, NodeId, TreeId};
+            let target: NodeId = node.id().clone().into();
+            self.event(
+                Event::A11y(
+                    Id::from(target.0),
+                    ActionRequest {
+                        action,
+                        target_tree: TreeId::ROOT,
+                        target_node: target,
+                        data: None,
+                    },
+                ),
+                mouse::Cursor::Unavailable,
+            )
+        }
+    }
+
+    #[test]
+    fn context_menu_exports_named_real_buttons_and_targets_at_without_hover() {
+        use iced_accessibility::accesskit::{Action, Role};
+        let mut menu = NativeMenu::new(3, Size::new(900.0, 650.0), Point::new(880.0, 620.0));
+        assert!(
+            menu.nodes().root().is_empty(),
+            "closed native menu has no advertised targets"
+        );
+        menu.open();
+        let disabled = menu.named("Copy branch (detached HEAD)");
+        assert_eq!(disabled.node().role(), Role::Button);
+        assert!(disabled.node().is_disabled());
+        let current = menu.named("Action 2");
+        assert_eq!(current.node().role(), Role::Button);
+        assert!(current.node().supports_action(Action::Click));
+        assert_ne!(current.id(), disabled.id());
+        assert!(menu.action(&disabled, Action::Click).is_empty());
+        assert!(menu.action(&disabled, Action::Focus).is_empty());
+        assert!(
+            menu.focused().is_none(),
+            "disabled Focus cannot borrow native focus"
+        );
+        let first = menu.named("Action 0").node().bounds().unwrap();
+        let point = Point::new(
+            ((first.x0 + first.x1) / 2.0) as f32,
+            ((first.y0 + first.y1) / 2.0) as f32,
+        );
+        assert!(
+            menu.event(
+                Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                mouse::Cursor::Available(point)
+            )
+            .is_empty()
+        );
+        // A different row is really hovered. No AXFocus has selected Action2;
+        // Click must use its advertised numeric ID with an unavailable cursor.
+        assert_eq!(menu.action(&current, Action::Click), [2]);
+        assert!(
+            menu.nodes().root().is_empty(),
+            "ordinary action retires the open menu"
+        );
+        assert!(menu.action(&current, Action::Click).is_empty());
+        menu.open();
+        let current = menu.named("Action 2");
+        assert!(menu.action(&current, Action::Focus).is_empty());
+        let current_id: iced_accessibility::accesskit::NodeId = current.id().clone().into();
+        assert_eq!(menu.focused(), Some(Id::from(current_id.0)));
+        assert_eq!(menu.action(&current, Action::Click), [2]);
+    }
+
+    #[test]
+    fn context_menu_reopen_renews_actual_ids_but_redraw_keeps_them() {
+        use iced_accessibility::accesskit::Action;
+        let mut menu = NativeMenu::new(3, Size::new(900.0, 650.0), Point::new(20.0, 20.0));
+        menu.open();
+        let old = menu.named("Action 0");
+        assert!(
+            menu.event(
+                Event::Window(window::Event::RedrawRequested(Instant::now())),
+                mouse::Cursor::Unavailable
+            )
+            .is_empty()
+        );
+        assert_eq!(menu.named("Action 0").id(), old.id());
+        assert_eq!(menu.action(&old, Action::Click), [0]);
+        // Reopen this SAME native widget/Tree, not a newly built fixture.
+        menu.open();
+        let current = menu.named("Action 0");
+        assert_ne!(current.id(), old.id());
+        assert!(menu.action(&old, Action::Click).is_empty());
+        assert_eq!(menu.action(&current, Action::Click), [0]);
+    }
+
+    #[test]
+    fn context_menu_scroll_and_resize_publish_only_the_actual_visible_slice() {
+        use iced_accessibility::accesskit::Action;
+        let mut menu = NativeMenu::new(40, Size::new(360.0, 220.0), Point::new(20.0, 20.0));
+        menu.open();
+        let first = menu.named("Action 0");
+        assert!(
+            menu.event(
+                Event::Mouse(mouse::Event::WheelScrolled {
+                    delta: mouse::ScrollDelta::Lines { x: 0.0, y: -30.0 }
+                }),
+                mouse::Cursor::Available(Point::new(230.0, 110.0))
+            )
+            .is_empty()
+        );
+        assert!(
+            menu.action(&first, Action::Click).is_empty(),
+            "scrolled-out numeric target is retired"
+        );
+        menu.viewport = Rectangle::with_size(Size::new(320.0, 180.0));
+        menu.measure();
+        let nodes = menu.nodes();
+        let buttons: Vec<_> = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter(|n| {
+                n.node().role() == iced_accessibility::accesskit::Role::Button
+                    && !n.node().is_disabled()
+            })
+            .collect();
+        assert!(!buttons.is_empty());
+        for button in &buttons {
+            let b = button.node().bounds().unwrap();
+            assert!(
+                b.x0 >= 0.0 && b.y0 >= 0.0 && b.x1 <= 320.01 && b.y1 <= 180.01,
+                "actual visible bounds: {b:?}"
+            );
+        }
+        let current = (*buttons.last().unwrap()).clone();
+        let expected: usize = current
+            .node()
+            .label()
+            .unwrap()
+            .strip_prefix("Action ")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(menu.action(&current, Action::Click), [expected]);
+    }
+    #[test]
+    fn context_menu_exact_owner_retires_same_count_callbacks_and_ids() {
+        use iced_accessibility::accesskit::Action;
+        let mut menu = NativeMenu::new(3, Size::new(900.0, 650.0), Point::new(20.0, 20.0));
+        menu.replace_owned(1, 0);
+        menu.open();
+        let old = menu.named("Action 0");
+        // Real native cache/diff with the same semantic owner retains IDs.
+        menu.replace_owned(1, 0);
+        assert_eq!(menu.named("Action 0").id(), old.id());
+        assert_eq!(menu.action(&old, Action::Click), [0]);
+        menu.open();
+        let old = menu.named("Action 0");
+        // Same labels/count, new owner and callback. The complete menu subtree
+        // must retire, not keep its old pointer/AX target in a recycled row.
+        menu.replace_owned(2, 100);
+        assert!(menu.nodes().root().is_empty());
+        assert!(menu.action(&old, Action::Click).is_empty());
+        menu.open();
+        let current = menu.named("Action 0");
+        assert_ne!(old.id(), current.id());
+        assert!(menu.action(&old, Action::Focus).is_empty());
+        assert!(menu.focused().is_none());
+        assert_eq!(menu.action(&current, Action::Click), [100]);
     }
 }
 

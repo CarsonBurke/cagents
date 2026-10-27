@@ -253,7 +253,7 @@ pub fn menu_items<
                     let l: Cow<'static, str> = label.into();
                     let key = find_key(&action, key_binds);
                     let mut items = vec![
-                        widget::text(l)
+                        widget::text(l.clone())
                             .ellipsize(iced_core::text::Ellipsize::Middle(
                                 iced_core::text::EllipsizeHeightLimit::Lines(1),
                             ))
@@ -275,7 +275,7 @@ pub fn menu_items<
                         );
                     }
 
-                    let menu_button = menu_button(items).on_press(action.message());
+                    let menu_button = menu_button(items).name(l).on_press(action.message());
 
                     trees.push(MenuTree::<Message>::from(Element::from(menu_button)));
                 }
@@ -285,7 +285,7 @@ pub fn menu_items<
                     let key = find_key(&action, key_binds);
 
                     let mut items = vec![
-                        widget::text(l)
+                        widget::text(l.clone())
                             .ellipsize(iced_core::text::Ellipsize::Middle(
                                 iced_core::text::EllipsizeHeightLimit::Lines(1),
                             ))
@@ -307,11 +307,12 @@ pub fn menu_items<
                         );
                     }
 
-                    let menu_button = menu_button(items);
+                    let menu_button = menu_button(items).name(l);
 
                     trees.push(MenuTree::<Message>::from(Element::from(menu_button)));
                 }
                 MenuItem::CheckBox(label, icon, value, action) => {
+                    let label: Cow<'static, str> = label.into();
                     let key = find_key(&action, key_binds);
                     let mut items = vec![
                         if value {
@@ -331,7 +332,7 @@ pub fn menu_items<
                                 .into()
                         },
                         widget::space::horizontal().width(spacing.space_xxs).into(),
-                        widget::text(label)
+                        widget::text(label.clone())
                             .ellipsize(iced_core::text::Ellipsize::Middle(
                                 iced_core::text::EllipsizeHeightLimit::Lines(1),
                             ))
@@ -355,7 +356,7 @@ pub fn menu_items<
                     }
 
                     trees.push(MenuTree::from(Element::from(
-                        menu_button(items).on_press(action.message()),
+                        menu_button(items).name(label).on_press(action.message()),
                     )));
                 }
                 MenuItem::Folder(label, children) => {
@@ -375,6 +376,7 @@ pub fn menu_items<
                                     .icon()
                                     .into(),
                             ])
+                            .name(l)
                             .class(
                                 // Menu folders have no on_press so they take on the disabled style by default
                                 if children.is_empty() {

@@ -272,6 +272,8 @@ impl<Message: 'static + Clone> Widget<Message, crate::Theme, crate::Renderer>
         state.menu_bar_state.inner.with_data_mut(|inner| {
             menu_roots_diff(self.context_menu.as_mut().unwrap(), &mut inner.tree);
         });
+        #[cfg(feature = "a11y")]
+        menu::Menu::<'_, Message>::clear_accessibility(&state.menu_bar_state);
 
         // if let Some(ref mut context_menus) = self.context_menu {
         //     for (menu, tree) in context_menus
@@ -416,6 +418,25 @@ impl<Message: 'static + Clone> Widget<Message, crate::Theme, crate::Renderer>
             {
                 state.context_cursor = cursor.position().unwrap_or_default();
                 let state = tree.state.downcast_mut::<LocalState>();
+                #[cfg(feature = "a11y")]
+                if let Some(roots) = &mut self.context_menu {
+                    for root in roots.iter() {
+                        for item in root.flattern() {
+                            item.item.element.with_data_mut(|element| {
+                                if element.as_widget().id().is_some() {
+                                    element
+                                        .as_widget_mut()
+                                        .set_id(iced_core::widget::Id::unique());
+                                }
+                            });
+                        }
+                    }
+                    state.menu_bar_state.inner.with_data_mut(|inner| {
+                        inner.tree = Tree::empty();
+                        menu_roots_diff(roots, &mut inner.tree);
+                        inner.reset();
+                    });
+                }
                 state.menu_bar_state.inner.with_data_mut(|state| {
                     state.open = true;
                     state.view_cursor = cursor;
@@ -527,8 +548,34 @@ impl<Message: 'static + Clone> Widget<Message, crate::Theme, crate::Renderer>
         state: &Tree,
         p: mouse::Cursor,
     ) -> iced_accessibility::A11yTree {
-        let c_state = &state.children[0];
-        self.content.as_widget().a11y_nodes(layout, c_state, p)
+        let content = self
+            .content
+            .as_widget()
+            .a11y_nodes(layout, &state.children[0], p);
+        // A separate native popup publishes its own Menu Widget tree. Avoid
+        // exporting its surface-local coordinates into the parent window.
+        #[cfg(wayland_platform)]
+        if matches!(WINDOWING_SYSTEM.get(), Some(WindowingSystem::Wayland))
+            && self.window_id != window::Id::NONE
+            && self.on_surface_action.is_some()
+        {
+            return content;
+        }
+        let local = state.state.downcast_ref::<LocalState>();
+        let menu = self
+            .context_menu
+            .as_ref()
+            .map(|roots| {
+                menu::Menu::accessibility_nodes_for(
+                    roots,
+                    &local.menu_bar_state,
+                    window::Id::NONE,
+                    p,
+                    Vector::ZERO,
+                )
+            })
+            .unwrap_or_default();
+        iced_accessibility::A11yTree::join([content, menu].into_iter())
     }
 }
 
@@ -560,4 +607,15 @@ pub struct LocalState {
     context_cursor: Point,
     fingers_pressed: HashSet<Finger>,
     menu_bar_state: MenuBarState,
+}
+
+impl Drop for LocalState {
+    fn drop(&mut self) {
+        // A native popup holds an Rc clone of this menu state. Replacing its
+        // owning widget must retire its targets too, even while that popup's
+        // surface is awaiting ordinary platform retirement.
+        self.menu_bar_state
+            .inner
+            .with_data_mut(|state| state.reset());
+    }
 }
