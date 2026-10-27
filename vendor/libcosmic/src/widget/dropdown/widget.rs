@@ -19,7 +19,7 @@ use iced_widget::pick_list::{self, Catalog};
 use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 pub type DropdownView<Message> = Arc<dyn Fn() -> Element<'static, Message> + Send + Sync>;
@@ -83,7 +83,7 @@ where
         on_selected: impl Fn(usize) -> Message + 'static + Send + Sync,
     ) -> Self {
         Self {
-            id: None,
+            id: Some(Id::unique()),
             on_selected: Arc::new(on_selected),
             selections,
             icons: Cow::Borrowed(&[]),
@@ -183,7 +183,30 @@ where
     fn diff(&mut self, tree: &mut Tree) {
         let state = tree.state.downcast_mut::<State>();
 
-        let mut selections_changed = state.selections.len() != self.selections.len();
+        // Retained menus belong to the exact choices and selected source.
+        // An index must never migrate to a replacement/reordered list.
+        if state.selected != self.selected
+            || state
+                .source
+                .iter()
+                .map(String::as_str)
+                .ne(self.selections.iter().map(AsRef::as_ref))
+        {
+            state.source_epoch.fetch_add(1, Ordering::SeqCst);
+            state.source = self
+                .selections
+                .iter()
+                .map(|value| value.as_ref().to_owned())
+                .collect();
+            state.selected = self.selected;
+            if self.selections.is_empty() {
+                state.focused = false;
+            }
+            if state.is_open.load(Ordering::SeqCst) {
+                state.close_operation = true;
+                state.open_operation = false;
+            }
+        }
 
         state
             .selections
@@ -199,7 +222,6 @@ where
                 continue;
             }
 
-            selections_changed = true;
             state.hashes[i] = text_hash;
             state.selections[i].update(Text {
                 content: selection.as_ref(),
@@ -214,11 +236,6 @@ where
                 wrapping: text::Wrapping::default(),
                 ellipsize: text::Ellipsize::default(),
             });
-        }
-
-        if state.is_open.load(Ordering::SeqCst) && selections_changed {
-            state.close_operation = true;
-            state.open_operation = true;
         }
     }
 
@@ -329,13 +346,25 @@ where
     fn operate(
         &mut self,
         tree: &mut Tree,
-        _layout: Layout<'_>,
+        layout: Layout<'_>,
         _renderer: &crate::Renderer,
         operation: &mut dyn iced_core::widget::Operation,
     ) {
-        // TODO: double check operation handling
-        // let state = tree.state.downcast_mut::<State>();
-        // operation.custom(state, self.id.as_ref());
+        if !self.selections.is_empty() {
+            operation.focusable(
+                self.id.as_ref(),
+                layout.bounds(),
+                tree.state.downcast_mut::<State>(),
+            );
+        }
+    }
+
+    fn id(&self) -> Option<Id> {
+        self.id.clone()
+    }
+
+    fn set_id(&mut self, id: Id) {
+        self.id = Some(id);
     }
 
     fn overlay<'b>(
@@ -352,6 +381,9 @@ where
         }
 
         let state = tree.state.downcast_mut::<State>();
+        if state.close_operation {
+            return None;
+        }
 
         overlay(
             layout,
@@ -410,6 +442,10 @@ pub struct State {
     hashes: Vec<u64>,
     selections: Vec<crate::Plain>,
     popup_id: window::Id,
+    focused: bool,
+    source: Vec<String>,
+    selected: Option<usize>,
+    source_epoch: Arc<AtomicU64>,
 }
 
 impl State {
@@ -429,6 +465,10 @@ impl State {
             popup_id: window::Id::unique(),
             close_operation: false,
             open_operation: false,
+            focused: false,
+            source: Vec::new(),
+            selected: None,
+            source_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -436,6 +476,22 @@ impl State {
 impl Default for State {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl iced_core::widget::operation::Focusable for State {
+    fn is_focused(&self) -> bool {
+        self.focused
+    }
+    fn focus(&mut self) {
+        self.focused = true;
+    }
+    fn unfocus(&mut self) {
+        self.focused = false;
+        if self.is_open.load(Ordering::SeqCst) {
+            self.close_operation = true;
+            self.source_epoch.fetch_add(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -566,10 +622,17 @@ pub fn update<
     let open = |shell: &mut Shell<'_, Message>,
                 state: &mut State,
                 on_selected: Arc<dyn Fn(usize) -> Message + Send + Sync + 'static>| {
+        if selections.is_empty() {
+            return;
+        }
+        state.source_epoch.fetch_add(1, Ordering::SeqCst);
+        state.menu.reveal();
         state.is_open.store(true, Ordering::Relaxed);
         shell.request_redraw();
         let mut hovered_guard = state.hovered_option.lock().unwrap();
-        *hovered_guard = selected;
+        *hovered_guard = selected
+            .filter(|index| *index < selections.len())
+            .or(Some(0));
         let id = window::Id::unique();
         state.popup_id = id;
         #[cfg(wayland_platform)]
@@ -672,16 +735,45 @@ pub fn update<
 
     if state.open_operation {
         state.open_operation = false;
-        state.is_open.store(true, Ordering::SeqCst);
         if (refresh && is_open) || (!refresh && !is_open) {
             open(shell, state, on_selected.clone());
         }
     }
 
     match event {
+        Event::Keyboard(keyboard::Event::KeyPressed {
+            key,
+            modifiers,
+            repeat,
+            ..
+        }) if state.focused && modifiers.is_empty() && menu::activation_key(key) => {
+            if !repeat && !state.is_open.load(Ordering::SeqCst) {
+                open(shell, state, on_selected);
+            }
+            shell.capture_event();
+        }
+        Event::Keyboard(keyboard::Event::KeyPressed {
+            key:
+                keyboard::Key::Named(keyboard::key::Named::ArrowDown | keyboard::key::Named::ArrowUp),
+            modifiers,
+            ..
+        }) if state.focused && modifiers.is_empty() => {
+            if !state.is_open.load(Ordering::SeqCst) {
+                open(shell, state, on_selected);
+            }
+            shell.capture_event();
+        }
+        Event::Keyboard(keyboard::Event::KeyReleased { key, modifiers, .. })
+            if state.focused && modifiers.is_empty() && menu::activation_key(key) =>
+        {
+            shell.capture_event()
+        }
         Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
         | Event::Touch(touch::Event::FingerPressed { .. }) => {
             let is_open = state.is_open.load(Ordering::Relaxed);
+            if !cursor.is_over(layout.bounds()) {
+                state.focused = false;
+            }
             if is_open {
                 // Event wasn't processed by overlay, so cursor was clicked either outside it's
                 // bounds or on the drop-down, either way we close the overlay.
@@ -693,6 +785,7 @@ pub fn update<
                 }
                 shell.capture_event();
             } else if cursor.is_over(layout.bounds()) {
+                state.focused = !selections.is_empty();
                 open(shell, state, on_selected);
                 shell.capture_event();
             }
@@ -780,6 +873,7 @@ where
         None,
         close_on_selected,
     )
+    .keyboard(state.is_open.clone(), state.source_epoch.clone())
     .width(width)
     .padding(padding)
     .text_size(text_size);
@@ -833,6 +927,7 @@ where
             None,
             close_on_selected,
         )
+        .keyboard(state.is_open.clone(), state.source_epoch.clone())
         .width({
             let measure = |_label: &str, selection_paragraph: &crate::Paragraph| -> f32 {
                 selection_paragraph.min_width().round()
@@ -887,11 +982,16 @@ pub fn draw<'a, S>(
     let bounds = layout.bounds();
     let is_mouse_over = cursor.is_over(bounds);
 
-    let style = if is_mouse_over {
+    let mut style = if is_mouse_over {
         theme.style(&(), pick_list::Status::Hovered)
     } else {
         theme.style(&(), pick_list::Status::Active)
     };
+
+    if state.focused {
+        style.border.width = style.border.width.max(2.0);
+        style.border.color = theme.cosmic().accent_color().into();
+    }
 
     iced_core::Renderer::fill_quad(
         renderer,
