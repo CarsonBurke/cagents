@@ -21,6 +21,8 @@ use crate::{
 };
 
 const PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
+// A busy window must keep saving even when changes never leave a debounce gap.
+const PERSIST_MAX_DELAY: Duration = Duration::from_secs(1);
 const PERSIST_RETRY_INITIAL: Duration = Duration::from_millis(100);
 const PERSIST_RETRY_MAX: Duration = Duration::from_secs(2);
 const PERSIST_MAX_AUTOMATIC_ATTEMPTS: u32 = 4;
@@ -268,6 +270,7 @@ pub struct QuarantinedWrite {
 #[derive(Debug, Clone, Copy)]
 struct PersistenceConfig {
     debounce: Duration,
+    max_delay: Duration,
     retry_initial: Duration,
     retry_max: Duration,
     max_automatic_attempts: u32,
@@ -278,6 +281,7 @@ impl Default for PersistenceConfig {
     fn default() -> Self {
         Self {
             debounce: PERSIST_DEBOUNCE,
+            max_delay: PERSIST_MAX_DELAY,
             retry_initial: PERSIST_RETRY_INITIAL,
             retry_max: PERSIST_RETRY_MAX,
             max_automatic_attempts: PERSIST_MAX_AUTOMATIC_ATTEMPTS,
@@ -2558,6 +2562,7 @@ fn persistence_loop(
     config: PersistenceConfig,
 ) -> WriterExit {
     let mut due: Option<Instant> = None;
+    let mut oldest_change: Option<Instant> = None;
     let mut retry_delay = config.retry_initial;
     let mut attempts_this_cycle = 0_u32;
     let mut retry_exhausted = false;
@@ -2642,7 +2647,8 @@ fn persistence_loop(
                 retry_exhausted,
                 attempts_this_cycle,
                 Instant::now(),
-                config.debounce,
+                config,
+                &mut oldest_change,
             );
         }
         let closure_queries = std::mem::take(&mut state.closure_queries);
@@ -2686,6 +2692,7 @@ fn persistence_loop(
                 store.compact_closed_cards();
                 store.checkpoint_wal_if_large();
                 due = None;
+                oldest_change = None;
                 retry_delay = config.retry_initial;
                 attempts_this_cycle = 0;
                 rebases_remaining = PERSIST_REBASES_PER_BATCH;
@@ -2911,13 +2918,15 @@ fn schedule_flush_after_changes(
     retry_exhausted: bool,
     attempts_this_cycle: u32,
     now: Instant,
-    debounce: Duration,
+    config: PersistenceConfig,
+    oldest_change: &mut Option<Instant>,
 ) -> Option<Instant> {
     if received_changes && !retry_exhausted && attempts_this_cycle == 0 {
-        // Preserve the trailing debounce for ordinary changes. Once a flush
-        // has failed, keep its retry deadline stable instead of letting a
-        // stream of new snapshots postpone recovery forever.
-        Some(now + debounce)
+        // Preserve the trailing debounce for short bursts, but never move the
+        // oldest pending batch's cap, even if this arrival is already overdue.
+        // A failed flush keeps its existing retry deadline and backoff instead.
+        let first = oldest_change.get_or_insert(now);
+        Some((now + config.debounce).min(*first + config.max_delay))
     } else {
         current_due
     }
@@ -2997,7 +3006,7 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
-    use rusqlite::Connection;
+    use rusqlite::{Connection, OptionalExtension};
 
     use tempfile::tempdir;
 
@@ -3190,6 +3199,7 @@ mod tests {
     fn fast_persistence_config(max_automatic_attempts: u32) -> PersistenceConfig {
         PersistenceConfig {
             debounce: Duration::ZERO,
+            max_delay: PERSIST_MAX_DELAY,
             retry_initial: Duration::from_millis(1),
             retry_max: Duration::from_millis(1),
             max_automatic_attempts,
@@ -3397,6 +3407,8 @@ mod tests {
     #[test]
     fn new_changes_trail_debounce_without_postponing_an_active_retry() {
         let now = Instant::now();
+        let config = PersistenceConfig::default();
+        let mut oldest_change = Some(now - Duration::from_millis(100));
         let old_debounce = now + Duration::from_millis(10);
         let new_debounce = now + Duration::from_millis(250);
         assert_eq!(
@@ -3406,7 +3418,8 @@ mod tests {
                 false,
                 0,
                 now,
-                Duration::from_millis(250),
+                config,
+                &mut oldest_change,
             ),
             Some(new_debounce)
         );
@@ -3419,10 +3432,158 @@ mod tests {
                 false,
                 1,
                 now,
-                Duration::from_millis(250),
+                config,
+                &mut oldest_change,
             ),
             Some(retry_due)
         );
+        assert_eq!(oldest_change, Some(now - Duration::from_millis(100)));
+        assert_eq!(
+            schedule_flush_after_changes(None, true, true, 4, now, config, &mut oldest_change,),
+            None,
+            "new changes must not restart an exhausted retry cycle"
+        );
+    }
+
+    #[test]
+    fn continuous_changes_cannot_postpone_the_oldest_pending_save() {
+        let start = Instant::now();
+        let config = PersistenceConfig::default();
+        let mut oldest_change = None;
+        let mut due = None;
+        for elapsed_ms in [0, 200, 400, 600, 800, 1_000, 1_200] {
+            let now = start + Duration::from_millis(elapsed_ms);
+            due =
+                schedule_flush_after_changes(due, true, false, 0, now, config, &mut oldest_change);
+            assert_eq!(
+                due,
+                Some((now + config.debounce).min(start + config.max_delay))
+            );
+            assert_eq!(oldest_change, Some(start));
+            if elapsed_ms >= 1_000 {
+                assert!(due.unwrap() <= now, "an overdue arrival must still flush");
+            }
+        }
+        let overdue = due;
+        assert_eq!(
+            schedule_flush_after_changes(
+                due,
+                false,
+                false,
+                0,
+                start + Duration::from_secs(2),
+                config,
+                &mut oldest_change,
+            ),
+            overdue,
+            "a timer wake must preserve the pending deadline"
+        );
+    }
+
+    #[test]
+    fn idle_wakes_do_not_start_a_save_batch() {
+        let now = Instant::now();
+        let config = PersistenceConfig::default();
+        let mut oldest_change = None;
+        assert_eq!(
+            schedule_flush_after_changes(None, false, false, 0, now, config, &mut oldest_change),
+            None
+        );
+        assert_eq!(oldest_change, None);
+        let next = now + Duration::from_secs(10);
+        assert_eq!(
+            schedule_flush_after_changes(None, true, false, 0, next, config, &mut oldest_change),
+            Some(next + config.debounce)
+        );
+        assert_eq!(oldest_change, Some(next));
+    }
+
+    #[test]
+    fn continuous_snapshots_commit_before_the_producer_stops() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("continuous.sqlite3");
+        let boot = BootId::new("continuous-save");
+        let store = StateStore::open(&path, boot.clone()).unwrap();
+        let mut state = workspace();
+        let mut first = state.clone();
+        first.cards[0].title = "ordered first".into();
+        let mut second = state.clone();
+        second.cards[0].title = "ordered second".into();
+        let queue = Arc::new((
+            Mutex::new(QueueState {
+                conversions: VecDeque::from([
+                    ConversionCheckpoint::Snapshot(Arc::new(first)),
+                    ConversionCheckpoint::Snapshot(Arc::new(second)),
+                ]),
+                ..QueueState::default()
+            }),
+            Condvar::new(),
+        ));
+        let last_error = Arc::new(Mutex::new(None));
+        let worker_queue = Arc::clone(&queue);
+        let worker_error = Arc::clone(&last_error);
+        let worker = thread::spawn(move || {
+            let (health_tx, _health_rx) = async_channel::unbounded();
+            persistence_loop(
+                store,
+                empty_writes(),
+                worker_queue,
+                worker_error,
+                &mut HealthPublisher::new(health_tx),
+                PersistenceConfig {
+                    // A deadline shorter than this trailing gap proves the cap,
+                    // even if a loaded test host pauses the producer briefly.
+                    debounce: Duration::from_secs(30),
+                    max_delay: Duration::from_millis(50),
+                    ..PersistenceConfig::default()
+                },
+            )
+        });
+        let reader = Connection::open(&path).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut committed_while_producing = false;
+        let mut sequence = 0;
+        while Instant::now() < deadline {
+            state.cards[0].title = format!("streaming {sequence}");
+            sequence += 1;
+            {
+                let mut pending = queue.0.lock().unwrap();
+                pending.latest = Some(Arc::new(state.clone()));
+                queue.1.notify_one();
+            }
+            let generation = reader
+                .query_row(
+                    "SELECT generation FROM workspaces WHERE workspace_id = ?1",
+                    [state.id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap();
+            // Both ordered snapshots and a coalesced autosave must have
+            // committed while updates continue, without a flush barrier.
+            if generation.is_some_and(|generation| generation >= 3) {
+                committed_while_producing = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        state.cards[0].title = "final snapshot".into();
+        {
+            let mut pending = queue.0.lock().unwrap();
+            pending.latest = Some(Arc::new(state.clone()));
+            pending.shutdown = true;
+            queue.1.notify_one();
+        }
+        assert!(matches!(worker.join().unwrap(), WriterExit::Shutdown(_)));
+        assert!(last_error.lock().unwrap().is_none());
+        assert!(
+            committed_while_producing,
+            "continuous changes starved saves until the producer stopped"
+        );
+        let reopened = StateStore::open(&path, boot).unwrap();
+        let restored = reopened.load_workspace(state.id, None).unwrap().unwrap();
+        assert_eq!(restored.cards[0].title, "final snapshot");
+        reopened.shutdown().unwrap();
     }
 
     #[test]
