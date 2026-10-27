@@ -345,6 +345,7 @@ pub(crate) struct HostState {
     /// Long Git/copy/setup work runs outside control admission but remains
     /// owned until committed outcomes and terminal custody are published.
     pub(super) worktree_mutations: usize,
+    pub(super) setup_starts: BTreeMap<crate::model::CardId, super::worktree_control::SetupStart>,
     upgrade: Option<PreparedUpgrade>,
     pub(super) upgrade_chats: BTreeMap<TerminalId, Vec<crate::upgrade::handoff::ChatSource>>,
     pub(super) chat_resolutions: BTreeMap<ClientId, super::chat::upgrade_resolution::Attempt>,
@@ -420,6 +421,7 @@ impl HostState {
             account_lifecycle: Default::default(),
             worktree_removals: Default::default(),
             worktree_mutations: 0,
+            setup_starts: Default::default(),
             proof: Arc::new(proof),
             terminals: BTreeMap::new(),
             spawning: BTreeSet::new(),
@@ -833,6 +835,9 @@ impl HostState {
             model_unavailable(error)
         })?;
         if applied.changed {
+            for start in self.setup_starts.values() {
+                start.observe(&applied.model);
+            }
             self.announce_model_edit(origin, applied.model.sequence, &edit);
         }
         Ok(applied.model)
@@ -4375,6 +4380,9 @@ fn start_terminal_view_owned_authorized(
         terminal_id,
         worker: OnceLock::new(),
     });
+    let setup_withdrawal = setup_authority
+        .as_ref()
+        .and_then(|authority| authority.pane_withdrawal.clone());
     let config = TerminalConfig {
         agent_authority,
         columns: options.columns,
@@ -4509,6 +4517,22 @@ fn start_terminal_view_owned_authorized(
                 "Ordinary exit retained the original startup owner; explicitly Close that actor",
                 false,
             ));
+        }
+        if let Some((pane, withdrawn)) = &setup_withdrawal {
+            if withdrawn.load(Ordering::Acquire) {
+                state.cancel_spawn(terminal_id);
+                drop(state);
+                // Only this unpublished original worker is stopped. Never
+                // resurrect a pane the user withdrew while startup waited.
+                let _ = handle.shutdown();
+                drop(handle);
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    "Setup pane was closed during startup; its original holder is settling cleanup",
+                    false,
+                ));
+            }
+            state.setup_starts.remove(pane);
         }
         if let Some(pane) = pending_pane {
             let validation =

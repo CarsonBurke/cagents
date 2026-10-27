@@ -10,6 +10,8 @@ mod managed_worktrees;
 pub(crate) use managed_worktrees::{isolated_git_test, retained_managed_fixture_directory};
 mod worktree_control;
 mod worktree_setup_intent;
+#[cfg(all(test, feature = "host"))]
+pub(crate) use worktree_control::fail_next_setup_publication_sync_for_test;
 #[cfg(feature = "host")]
 pub(crate) use worktree_control::{
     SetupCustody, creation_marker as worktree_creation_marker, publish_setup_family_reaped,

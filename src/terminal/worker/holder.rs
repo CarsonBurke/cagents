@@ -101,6 +101,10 @@ enum Request {
         #[serde(default)]
         setup: Option<crate::terminal::holder::setup::Binding>,
     },
+    /// Setup-only second phase; ordinary Spawn never waits for it.
+    CommitSetup {
+        binding: crate::terminal::holder::setup::Binding,
+    },
     /// The daemon no longer needs the terminal. The holder exits, closing its
     /// master; any process still on the terminal is hung up.
     Release,
@@ -132,6 +136,10 @@ enum Request {
 
 #[derive(Debug, Serialize, Deserialize)]
 enum Report {
+    /// Original typed setup authority is retained, no PTY/root exists yet.
+    SetupReady {
+        binding: crate::terminal::holder::setup::Binding,
+    },
     ScreenCached,
     AdoptionCommitted,
     /// Protocol 5 carries PTY master, root pidfd, and original launch directory.
@@ -374,7 +382,7 @@ fn spawn_reserved(
     // after a pre-start error/timeout. Claim immediately before the first send;
     // once claimed, only the exact holder's family proof can settle the run.
     if let Some(authority) = &setup {
-        authority.claim_delivery()?;
+        authority.claim_request()?;
     }
     let started = crate::descriptor_frame::send_json_with_fds_until(
         &holder.control,
@@ -391,6 +399,36 @@ fn spawn_reserved(
         crate::descriptor_frame::FrameByteOrder::LittleEndian,
     )
     .and_then(|()| {
+        if let Some(authority) = &setup {
+            let (ready, descriptors) =
+                crate::descriptor_frame::receive_json_with_fds_until::<Report>(
+                    &holder.control,
+                    deadline,
+                    MAX_FRAME as usize,
+                    0,
+                    crate::descriptor_frame::FrameByteOrder::LittleEndian,
+                )?;
+            match ready {
+                Report::SetupReady { binding }
+                    if descriptors.is_empty() && binding == authority.binding => {}
+                Report::Failed(message) => return Err(message),
+                _ => return Err("Setup holder did not retain its exact startup authority".into()),
+            }
+            #[cfg(test)]
+            authority.checkpoint_ready()?;
+            authority.claim_commit()?;
+            crate::descriptor_frame::send_json_with_fds_until(
+                &holder.control,
+                &Request::CommitSetup {
+                    binding: authority.binding.clone(),
+                },
+                &[],
+                deadline,
+                MAX_FRAME as usize,
+                0,
+                crate::descriptor_frame::FrameByteOrder::LittleEndian,
+            )?;
+        }
         crate::descriptor_frame::receive_json_with_fds_until::<Report>(
             &holder.control,
             deadline,
@@ -550,9 +588,16 @@ pub(super) fn adopt_recoverable(
             socket.display()
         ));
     };
-    let is_setup = expected_setup_source
-        .as_ref()
-        .is_some_and(|source| crate::upgrade::is_worktree_setup_recipe(&source.launch));
+    let is_setup = expected_setup_source.as_ref().is_some_and(|source| {
+        crate::upgrade::is_worktree_setup_recipe(&source.launch)
+            && source
+                .launch
+                .environment
+                .contains_key("CAGENTS_WORKTREE_SETUP_CREATION_ID")
+    });
+    // Pre-generation accepted setup holders remain attachable without replay;
+    // they grant no canonical generation/family proof. New journaled setup
+    // carrying a creation ID always requires its original typed binding.
     if is_setup != setup.is_some()
         || setup.as_ref().is_some_and(|binding| {
             protocol < 6
@@ -1338,6 +1383,11 @@ fn serve(control: UnixStream) -> i32 {
         None if descriptors.is_empty()
             && !recovery.as_ref().is_some_and(|recovery| {
                 crate::upgrade::is_worktree_setup_recipe(&recovery.source.launch)
+                    && recovery
+                        .source
+                        .launch
+                        .environment
+                        .contains_key("CAGENTS_WORKTREE_SETUP_CREATION_ID")
             }) =>
         {
             None
@@ -1365,6 +1415,34 @@ fn serve(control: UnixStream) -> i32 {
         Ok(pin) => pin,
         Err(error) => return fail(error),
     };
+    if let Some(authority) = &setup {
+        let ready = Report::SetupReady {
+            binding: authority.binding().clone(),
+        };
+        let deadline = Instant::now() + START_TIMEOUT;
+        if let Err(error) = crate::descriptor_frame::send_json_with_fds_until(
+            &control,
+            &ready,
+            &[],
+            deadline,
+            MAX_FRAME as usize,
+            0,
+            crate::descriptor_frame::FrameByteOrder::LittleEndian,
+        ) {
+            return fail(format!("retain setup startup: {error}"));
+        }
+        let commit = crate::descriptor_frame::receive_json_with_fds_until::<Request>(
+            &control,
+            deadline,
+            MAX_FRAME as usize,
+            0,
+            crate::descriptor_frame::FrameByteOrder::LittleEndian,
+        );
+        if !matches!(commit, Ok((Request::CommitSetup { binding }, descriptors)) if descriptors.is_empty() && &binding == authority.binding())
+        {
+            return fail("Setup startup was cancelled before its original holder commit; no shell was started".into());
+        }
+    }
     // Isolate this execed keeper before the PTY root and all of its tools
     // inherit its cgroup. A failed request retains the existing launch path.
     let _ = crate::daemon::process_scope::enroll_holder();

@@ -94,12 +94,25 @@ fn execute_with<E: ProcessExecutor>(
             let records = service
                 .list_worktrees(&repository, &cancellation)
                 .map_err(|e| e.to_string())?;
+            let primary = service
+                .managed_primary_checkout(&repository, &cancellation)
+                .map_err(|error| error.to_string())?;
             let mut worktrees = Vec::new();
             for (index, record) in records
                 .iter()
                 .enumerate()
                 .filter(|(_, record)| !record.bare)
             {
+                // Git's first entry can name separate metadata; the verified
+                // primary helper resolves the actual checkout for display and
+                // status. Metadata is still the shared project registry key.
+                let mut actual = record.clone();
+                if index == 0
+                    && let Some(primary) = &primary
+                {
+                    actual.path = primary.clone();
+                }
+                let record = &actual;
                 let mut row = match entry(service, record, index == 0, &cancellation) {
                     Ok(row) => row,
                     Err(error) => Entry {

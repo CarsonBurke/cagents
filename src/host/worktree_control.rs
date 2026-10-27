@@ -49,6 +49,61 @@ impl Drop for Active {
     }
 }
 
+/// Exact pending pane membership, observed from the already-applied model.
+/// No SQL or filesystem work runs in this HostState cancellation hook.
+pub(super) struct SetupStart {
+    scope: crate::workspace_model::views::Scope,
+    pane: crate::workspace_model::views::Pane,
+    withdrawn: Arc<std::sync::atomic::AtomicBool>,
+    authority: crate::terminal::holder::setup::Authority,
+}
+impl SetupStart {
+    pub(super) fn observe(&self, model: &crate::workspace_model::WorkspaceModel) {
+        let present = model
+            .views
+            .iter()
+            .find(|view| view.scope == self.scope)
+            .is_some_and(|view| {
+                view.panes.iter().any(|pane| {
+                    pane.id == self.pane.id
+                        && pane.scope == self.pane.scope
+                        && match (&pane.kind, &self.pane.kind) {
+                            (
+                                crate::model::CardKind::Terminal(actual),
+                                crate::model::CardKind::Terminal(expected),
+                            ) => actual.id == expected.id && actual.launch == expected.launch,
+                            _ => false,
+                        }
+                })
+            });
+        if !present {
+            // Linearize withdrawal against the exact same commit CAS.
+            // HostState only cancels; the original startup guard publishes
+            // its resulting no-launch disposition outside this lock.
+            let _ = self.authority.cancel_before_commit();
+            self.withdrawn
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+struct SetupPaneReservation {
+    host: SharedHost,
+    pane: crate::model::CardId,
+    withdrawn: Arc<std::sync::atomic::AtomicBool>,
+}
+impl Drop for SetupPaneReservation {
+    fn drop(&mut self) {
+        let mut state = self.host.lock().unwrap_or_else(|p| p.into_inner());
+        if state
+            .setup_starts
+            .get(&self.pane)
+            .is_some_and(|start| Arc::ptr_eq(&start.withdrawn, &self.withdrawn))
+        {
+            state.setup_starts.remove(&self.pane);
+        }
+    }
+}
+
 enum LiveHandle {
     Chat(crate::chat::runtime::Handle),
     Terminal(crate::terminal::TerminalHandle),
@@ -87,6 +142,8 @@ struct Caller {
     origin: Origin,
     issuing: Option<crate::model::TerminalId>,
     source: Option<crate::model::LaunchRecipe>,
+    accepted_project: Option<PathBuf>,
+    accepted_agent: Option<crate::model::AgentId>,
     root: Option<crate::fs_safety::Root>,
     common: Option<crate::fs_safety::Root>,
     handle: Option<LiveHandle>,
@@ -113,6 +170,23 @@ fn same_directory(
     let right = right.metadata().map_err(|e| e.to_string())?;
     Ok((left.dev(), left.ino()) == (right.dev(), right.ino()))
 }
+/// Bind to the accepted registered project at admission. This is not a claim
+/// about a historical Git-common inode at provider launch: Root1770 attests
+/// the launch directory only. Once accepted, both roots remain held and named.
+fn verify_project_scope(accepted: &Path, selected: &crate::fs_safety::Root) -> Result<(), String> {
+    // Agent targets are accepted canonical project registry keys (the Git
+    // common directory), not a fresh interpretation of a checkout's .git.
+    let expected = crate::fs_safety::Root::open(accepted).map_err(|error| error.to_string())?;
+    same_named(&expected)?;
+    same_named(selected)?;
+    if !same_directory(&expected, selected)? {
+        return Err(
+            "The selected repository is outside this agent's accepted project scope".into(),
+        );
+    }
+    Ok(())
+}
+
 impl Caller {
     fn resolve(host: &SharedHost, client: ClientId, authority: Authority) -> Result<Self, String> {
         let (origin, issuing) =
@@ -133,6 +207,23 @@ impl Caller {
                 "Worktree operations require the exact live issuing session or the user".into(),
             );
         }
+        // The live launch-directory pin is necessary provenance, not project
+        // scope. Only a previously accepted managed-agent target grants this
+        // new worktree surface to an agent. Legacy scripts keep their existing
+        // capabilities but cannot acquire project mutation by changing .git.
+        let accepted = if let Some(id) = issuing {
+            let registry = agent_execution::registry(host)?;
+            let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+            Some(registry.agent_for_session(id)?.ok_or(
+                "This issuing session has no accepted project scope for worktree operations",
+            )?)
+        } else {
+            None
+        };
+        let accepted_project = accepted
+            .as_ref()
+            .map(|agent| agent.spec.target.repository.clone());
+        let accepted_agent = accepted.as_ref().map(|agent| agent.id);
         let handle = if let Some(id) = issuing {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             Some(if let Some(record) = state.chats.get(&id) {
@@ -171,6 +262,8 @@ impl Caller {
             origin,
             issuing,
             source,
+            accepted_project,
+            accepted_agent,
             root,
             common,
             handle,
@@ -184,6 +277,18 @@ impl Caller {
             .map_err(|error| error.message)?;
         if current != (self.origin.clone(), self.issuing) {
             return Err("The issuing worktree caller changed".into());
+        }
+        if let Some(id) = self.issuing {
+            let registry = agent_execution::registry(host)?;
+            let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+            let accepted = registry
+                .agent_for_session(id)?
+                .ok_or("The issuing session no longer has an accepted project scope")?;
+            if self.accepted_agent != Some(accepted.id)
+                || self.accepted_project.as_ref() != Some(&accepted.spec.target.repository)
+            {
+                return Err("The issuing session's accepted project scope changed".into());
+            }
         }
         if let Some(handle) = &self.handle {
             if !self.issuing.is_some_and(|id| handle.current(host, id)) {
@@ -222,6 +327,11 @@ impl Caller {
             if !same_directory(common, &selected)? {
                 return Err("The issuing checkout now resolves to another repository".into());
             }
+            let accepted = self
+                .accepted_project
+                .as_ref()
+                .ok_or("The issuing session has no accepted project scope")?;
+            verify_project_scope(accepted, common)?;
         }
         Ok(())
     }
@@ -238,7 +348,8 @@ impl Caller {
 
 /// Root Git mutations in the selected original common descriptor. The durable
 /// journal retains ordinary canonical paths, never a process-local /proc path.
-/// Read discovery stays unchanged; checkout status keeps its own worktree.
+/// Every command selecting that common root is pinned, including future Git
+/// effect verbs. Checkout status keeps its own worktree authority.
 struct PinnedGit {
     common: Arc<crate::fs_safety::Root>,
 }
@@ -253,23 +364,7 @@ impl crate::process::ProcessExecutor for PinnedGit {
         let at = anchored.arguments.windows(2).position(|pair| {
             pair[0] == OsStr::new("-C") && Path::new(&pair[1]) == self.common.path()
         });
-        let mutation = anchored
-            .arguments
-            .windows(2)
-            .any(|pair| pair[0] == OsStr::new("worktree") && pair[1] == OsStr::new("add"))
-            || anchored
-                .arguments
-                .iter()
-                .any(|arg| matches!(arg.to_str(), Some("fetch" | "update-ref")))
-            || anchored.arguments.windows(2).any(|pair| {
-                pair[0] == OsStr::new("branch")
-                    && pair[1]
-                        .to_str()
-                        .is_some_and(|arg| arg.starts_with("--set-upstream"))
-            });
-        if let Some(at) = at
-            && mutation
-        {
+        if let Some(at) = at {
             same_named(&self.common).map_err(|error| {
                 crate::process::process_failure(
                     command,
@@ -280,11 +375,38 @@ impl crate::process::ProcessExecutor for PinnedGit {
             })?;
             anchored.arguments[at + 1] = self.common.process_path().into_os_string();
         }
-        crate::process::ProcessExecutor::execute(
+        let mut output = crate::process::ProcessExecutor::execute(
             &crate::process::SystemProcessExecutor,
             &anchored,
             cancellation,
-        )
+        )?;
+        // Git can report its /proc descriptor locator for these two discovery
+        // queries. Canonical durable journal paths must remain ordinary paths;
+        // normalize only a successful single-directory result that physically
+        // equals this retained common root. Never rewrite arbitrary output.
+        if at.is_some()
+            && output.success
+            && anchored
+                .arguments
+                .iter()
+                .any(|arg| matches!(arg.to_str(), Some("--git-common-dir" | "--git-dir")))
+        {
+            if let Ok(text) = std::str::from_utf8(&output.stdout) {
+                let path = Path::new(text.trim_end_matches('\n'));
+                if let Ok(metadata) = std::fs::metadata(path) {
+                    if let Ok(held) = self.common.metadata() {
+                        if metadata.is_dir()
+                            && (metadata.dev(), metadata.ino()) == (held.dev(), held.ino())
+                        {
+                            use std::os::unix::ffi::OsStrExt;
+                            output.stdout = self.common.path().as_os_str().as_bytes().to_vec();
+                            output.stdout.push(b'\n');
+                        }
+                    }
+                }
+            }
+        }
+        Ok(output)
     }
 }
 fn selected(operation: &mut Operation) -> Option<&mut PathBuf> {
@@ -308,11 +430,24 @@ fn journal() -> Result<StateStore, String> {
     .map_err(|e| e.to_string())
 }
 fn live_sessions(host: &SharedHost, path: &Path) -> Result<Vec<TerminalId>, String> {
-    Ok(agent_execution::live_sessions(host)
-        .into_iter()
-        .filter(|entry| entry.directory == path || entry.directory.starts_with(path))
-        .map(|entry| entry.id)
-        .collect())
+    let within = |directory: &Path| directory == path || directory.starts_with(path);
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let mut sessions = std::collections::BTreeSet::new();
+    for (id, record) in &state.chats {
+        if !record.handle.is_completed() && within(&record.session.launch.recipe.working_directory)
+        {
+            sessions.insert(*id);
+        }
+    }
+    for (id, record) in &state.terminals {
+        if !record.handle.is_completed()
+            && (within(record.current_directory())
+                || within(&record.execution_launch().working_directory))
+        {
+            sessions.insert(*id);
+        }
+    }
+    Ok(sessions.into_iter().collect())
 }
 
 /// Called after the ordinary startup/account/removal admission checks under a
@@ -390,6 +525,14 @@ pub(super) fn process(
             })
         }
         Execution::Reply { mut reply, setup } => {
+            if let Reply::ResolvedRepository { repository } = &reply {
+                let resolved = RepositoryService::system("git")
+                    .common_dir(repository, &CancellationToken::new())
+                    .map_err(|error| refused(error.to_string()))?;
+                let resolved = crate::fs_safety::Root::open(&resolved)
+                    .map_err(|error| refused(error.to_string()))?;
+                caller.permits(&resolved).map_err(refused)?;
+            }
             // Preserve a typed committed/uncertain creation even when a later
             // permission/publication step fails. It must never invite replay.
             let post = caller.verify(host, client).and_then(|_| {
@@ -398,6 +541,21 @@ pub(super) fn process(
                     .map_or(Ok(()), |common| caller.permits(common))
             });
             if let Err(error) = post {
+                if matches!(
+                    reply,
+                    Reply::Created(_)
+                        | Reply::CreationFailed(crate::worktree_control::CreationFailure {
+                            may_have_effects: true,
+                            ..
+                        })
+                ) {
+                    // Pure invalidation of the existing original project does
+                    // not reopen it or grant another setup launch after loss
+                    // of permission, and must still expose committed effects.
+                    if let Some(common) = &common {
+                        let _ = notify_inventory(host, client, common.path());
+                    }
+                }
                 if !record_failure(&mut reply, error.clone()) {
                     return Err(refused(error));
                 }
@@ -445,6 +603,8 @@ pub(super) fn process(
                             last_exit: None,
                         },
                     };
+                    let mut published_pane = None;
+                    let mut pane_reservation = None;
                     let accepted = prepared.custody.start(
                         &RepositoryService::system("git"),
                         &store,
@@ -481,17 +641,87 @@ pub(super) fn process(
                                 &recipe.working_directory,
                             )
                             .map_err(|e| e.message)?;
-                            super::state::spawn_reviewed_setup(host, client, session, authority)
-                                .map(|descriptor| descriptor.session)
-                                .map_err(|error| error.message)
+                            drop(_shared);
+                            let common = common
+                                .as_ref()
+                                .ok_or("Setup has no retained repository authority")?;
+                            super::client::ensure_control_open(host)
+                                .map_err(|error| error.message)?;
+                            published_pane = Some(publish_setup_pane(
+                                host,
+                                client,
+                                common.path(),
+                                &session,
+                                None,
+                            )?);
+                            let pane = published_pane.as_ref().expect("published exact setup pane");
+                            let withdrawn = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let registration = gate.read().unwrap_or_else(|p| p.into_inner());
+                            super::client::ensure_control_open(host)
+                                .map_err(|error| error.message)?;
+                            host.lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .setup_starts
+                                .insert(
+                                    pane.id,
+                                    SetupStart {
+                                        scope: crate::workspace_model::views::Scope::Worktree {
+                                            repository: common.path().to_owned(),
+                                            path: recipe.working_directory.clone(),
+                                        },
+                                        pane: pane.clone(),
+                                        withdrawn: withdrawn.clone(),
+                                        authority: authority.clone(),
+                                    },
+                                );
+                            pane_reservation = Some(SetupPaneReservation {
+                                host: host.clone(),
+                                pane: pane.id,
+                                withdrawn: withdrawn.clone(),
+                            });
+                            let mut authority = authority;
+                            authority.pane_withdrawal = Some((pane.id, withdrawn));
+                            drop(registration);
+                            // A close before token registration is seen in this
+                            // fresh model read; later closes cancel via the
+                            // accepted-edit hook. Neither gate nor HostState
+                            // is held through this SQLite/view hydration.
+                            let latest = agent_execution::registry(host)?
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .model()?;
+                            if let Some(start) = host
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .setup_starts
+                                .get(&pane.id)
+                            {
+                                start.observe(&latest);
+                            }
+                            let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
+                            super::client::ensure_control_open(host)
+                                .map_err(|error| error.message)?;
+                            super::state::spawn_reviewed_setup(
+                                host,
+                                client,
+                                session.clone(),
+                                authority,
+                            )
+                            .map(|descriptor| descriptor.session)
+                            .map_err(|error| error.message)
                         },
                     );
                     match accepted {
                         Ok(session) => {
                             set_setup_terminal(&mut reply, session.clone());
                             if let Some(common) = &common
-                                && let Err(error) =
-                                    publish_setup_pane(host, client, common.path(), &session)
+                                && let Err(error) = publish_setup_pane(
+                                    host,
+                                    client,
+                                    common.path(),
+                                    &session,
+                                    published_pane.as_ref(),
+                                )
                             {
                                 record_failure(
                                     &mut reply,
@@ -610,14 +840,17 @@ fn publish_setup_pane(
     client: ClientId,
     repository: &Path,
     session: &crate::model::TerminalSession,
-) -> Result<(), String> {
+    before: Option<&crate::workspace_model::views::Pane>,
+) -> Result<crate::workspace_model::views::Pane, String> {
     use crate::workspace_model::views::{Change, Pane, Scope};
     let scope = Scope::Worktree {
         repository: repository.to_owned(),
         path: session.launch.working_directory.clone(),
     };
     let pane = Pane {
-        id: crate::model::CardId::new(),
+        id: before
+            .map(|pane| pane.id)
+            .unwrap_or_else(crate::model::CardId::new),
         title: "Worktree setup".into(),
         user_title: None,
         pending_terminal_start: false,
@@ -628,11 +861,45 @@ fn publish_setup_pane(
     let registry = agent_execution::registry(host)?;
     let (edit, applied) = {
         let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        let mut pane = pane.clone();
+        let current = if let Some(before) = before {
+            let model = registry.model()?;
+            let current = model
+                .views
+                .iter()
+                .find(|view| view.scope == scope)
+                .and_then(|view| {
+                    view.panes
+                        .iter()
+                        .find(|candidate| candidate.id == before.id)
+                })
+                .cloned()
+                .ok_or("The original setup pane was withdrawn; it was not reopened")?;
+            if !matches!(&current.kind, crate::model::CardKind::Terminal(terminal) if terminal.id == session.id && terminal.launch == session.launch)
+            {
+                return Err("Setup pane now belongs to another source".into());
+            }
+            pane.title = current.title.clone();
+            pane.user_title = current.user_title.clone();
+            pane.width_fraction = current.width_fraction;
+            Some(current)
+        } else {
+            None
+        };
         let edit = ModelEdit::ChangeView {
             expected_revision: registry.view_revision(&scope)?,
             scope,
             operation: uuid::Uuid::new_v4(),
-            change: Change::Insert { pane, before: None },
+            change: current
+                .as_ref()
+                .map(|before| Change::Update {
+                    before: before.clone(),
+                    pane: pane.clone(),
+                })
+                .unwrap_or_else(|| Change::Insert {
+                    pane: pane.clone(),
+                    before: None,
+                }),
         };
         let applied = registry.apply(&edit)?;
         (edit, applied)
@@ -642,5 +909,88 @@ fn publish_setup_pane(
             .unwrap_or_else(|p| p.into_inner())
             .announce_model_edit(client, applied.model.sequence, &edit);
     }
-    Ok(())
+    Ok(pane)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process::{ProcessExecutor, SystemProcessExecutor};
+
+    #[test]
+    fn accepted_project_refuses_an_original_checkout_redirected_to_another_repo() {
+        if crate::repository::test_fixture::isolated_fixture_case(concat!(
+            module_path!(),
+            "::accepted_project_refuses_an_original_checkout_redirected_to_another_repo"
+        )) {
+            return;
+        }
+        let fixture = tempfile::tempdir_in("/var/tmp").unwrap();
+        let a = fixture.path().join("a");
+        let b = fixture.path().join("b");
+        let common_a = fixture.path().join("a.git");
+        let common_b = fixture.path().join("b.git");
+        for (checkout, common) in [(&a, &common_a), (&b, &common_b)] {
+            let output = SystemProcessExecutor
+                .execute(
+                    &crate::worktree_branch::git_command(fixture.path())
+                        .args(["init", "-q", "--separate-git-dir"])
+                        .arg(common)
+                        .arg(checkout)
+                        .timeout(std::time::Duration::from_secs(10)),
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+            assert!(
+                output.success,
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let original_directory = crate::fs_safety::Root::open(&a).unwrap();
+        let service = RepositoryService::system("git");
+        let original_common = service
+            .common_dir(
+                &original_directory.process_path(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        let held = crate::fs_safety::Root::open(&original_common).unwrap();
+        verify_project_scope(&common_a, &held).unwrap();
+        let before = original_directory.metadata().unwrap();
+        std::fs::write(a.join(".git"), format!("gitdir: {}\n", common_b.display())).unwrap();
+        let after = original_directory.metadata().unwrap();
+        assert_eq!(
+            (before.dev(), before.ino()),
+            (after.dev(), after.ino()),
+            "the original launch directory itself did not change"
+        );
+        let redirected = service
+            .common_dir(
+                &original_directory.process_path(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        let redirected = crate::fs_safety::Root::open(&redirected).unwrap();
+        assert!(
+            verify_project_scope(&common_a, &redirected)
+                .unwrap_err()
+                .contains("accepted project scope")
+        );
+        verify_project_scope(&common_a, &held).unwrap();
+        let parked = fixture.path().join("parked-a.git");
+        std::fs::rename(&common_a, &parked).unwrap();
+        std::fs::rename(&common_b, &common_a).unwrap();
+        let command =
+            crate::worktree_branch::git_command(&common_a).args(["rev-parse", "--git-common-dir"]);
+        let failure = PinnedGit {
+            common: Arc::new(held),
+        }
+        .execute(&command, &CancellationToken::new())
+        .unwrap_err();
+        assert!(
+            !failure.started,
+            "replacement common must be rejected before Git starts"
+        );
+    }
 }

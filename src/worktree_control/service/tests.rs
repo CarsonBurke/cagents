@@ -1,4 +1,5 @@
-//! In-process service contracts with real Git; no daemon, UI, PTY or provider.
+//! Isolated real-Git service contracts, including two controlled setup-holder
+//! PTY cases. No application, UI or provider is launched.
 use super::*;
 use crate::process::{CommandSpec, ProcessExecutor, ProcessFailure, ProcessOutput};
 use std::{ffi::OsStr, fs};
@@ -325,6 +326,17 @@ fn removal_rechecks_real_content_and_preserves_a_late_busy_owner() {
         .len(),
         40
     );
+    let replacement = fixture.create("topic");
+    assert_eq!(replacement.path, created.path);
+    assert_ne!(replacement.operation_id, created.operation_id);
+    assert_eq!(
+        prepare()
+            .remove(&fixture.store, |_| Ok(()), || Ok(()))
+            .unwrap()
+            .path,
+        replacement.path
+    );
+    assert!(!replacement.path.exists());
 }
 
 #[test]
@@ -838,4 +850,354 @@ fn explicit_skip_can_recover_an_unreadable_current_plan_without_replay() {
     assert!(updated.skip && updated.copy_done);
     assert_eq!(updated.run_id, Some(run_id));
     assert_eq!(fs::read_to_string(configuration).unwrap(), invalid);
+}
+
+fn prepared_setup(fixture: &Fixture, branch: &str, command: &str) -> (Created, PreparedSetup) {
+    fs::create_dir_all(fixture.repository.join(".cagents")).unwrap();
+    let commands = toml::Value::Array(vec![toml::Value::String(command.into())]);
+    fs::write(
+        fixture.repository.join(".cagents/worktree.toml"),
+        format!("setup = {commands}\n"),
+    )
+    .unwrap();
+    let plan = crate::worktree_setup::load(&fixture.repository)
+        .unwrap()
+        .unwrap();
+    crate::worktree_setup::trust(&fixture.repository, &plan, &CancellationToken::new()).unwrap();
+    let Execution::Reply {
+        reply: Reply::Created(created),
+        setup: Some(prepared),
+    } = fixture.execute(fixture.operation(branch, false))
+    else {
+        panic!("reviewed setup was not prepared");
+    };
+    (created, prepared)
+}
+fn skip_original(fixture: &Fixture, created: &Created, run: OperationId) {
+    let Execution::Reply {
+        reply:
+            Reply::SetupPrepared {
+                skip: true,
+                run_id,
+                error: None,
+                ..
+            },
+        setup: None,
+    } = fixture.execute(Operation::ResumeSetup {
+        repository: fixture.repository.clone(),
+        path: created.path.clone(),
+        creation_id: created.operation_id,
+        expected_run: Some(run),
+        expected_fingerprint: None,
+        trust: false,
+        skip: true,
+    })
+    else {
+        panic!("proved no-launch setup could not be explicitly skipped");
+    };
+    assert_ne!(run, run_id);
+}
+#[test]
+fn reserved_rename_sync_failure_proves_no_launch_and_allows_fresh_review() {
+    if isolated(concat!(
+        module_path!(),
+        "::reserved_rename_sync_failure_proves_no_launch_and_allows_fresh_review"
+    )) {
+        return;
+    }
+    let fixture = Fixture::new();
+    let (created, prepared) =
+        prepared_setup(&fixture, "reserve-fault", "printf forbidden > executed");
+    let run = prepared.custody.run;
+    let invoked = std::cell::Cell::new(false);
+    crate::repository::fail_next_setup_publication_sync_for_test();
+    let result = prepared.custody.start(
+        &RepositoryService::system("git"),
+        &fixture.store,
+        crate::model::TerminalId::new(),
+        prepared.recipe.as_ref().unwrap(),
+        |_| {
+            invoked.set(true);
+            Ok(())
+        },
+    );
+    assert!(result.unwrap_err().contains("after rename"));
+    assert!(
+        !invoked.get(),
+        "no child callback may cross failed Reserved publication"
+    );
+    assert!(!created.path.join("executed").exists());
+    drop(prepared);
+    skip_original(&fixture, &created, run);
+}
+
+fn registered_source(
+    recipe: crate::model::LaunchRecipe,
+    terminal: crate::model::TerminalId,
+    proof: &crate::model::HostSessionProof,
+) -> crate::model::TerminalSession {
+    crate::model::TerminalSession {
+        id: terminal,
+        owned_codex_listener: None,
+        recovery_origin: None,
+        predecessor: None,
+        launch: recipe,
+        transcript_path: None,
+        resume_hint: None,
+        continuity: crate::model::TerminalContinuity::DetachedSameBoot {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        },
+    }
+}
+fn holder_proof() -> crate::model::HostSessionProof {
+    crate::model::HostSessionProof {
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+        host_session_id: crate::model::HostSessionId::new("worktree-custody-fixture"),
+        host_incarnation: crate::model::HostIncarnation::new(uuid::Uuid::new_v4().to_string()),
+    }
+}
+fn setup_config(
+    source: &crate::model::TerminalSession,
+    authority: crate::terminal::holder::setup::Authority,
+) -> crate::terminal::TerminalConfig {
+    crate::terminal::TerminalConfig {
+        initially_visible: false,
+        setup_authority: Some(authority),
+        holder_recovery: Some(crate::terminal::holder::Recovery {
+            source: source.clone(),
+            previous_sources: Vec::new(),
+            relaunches: Vec::new(),
+            options: Default::default(),
+            execution_environment: None,
+            execution_recipe: None,
+        }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn ready_setup_cancelled_before_commit_cannot_create_a_root_and_releases_original_lease() {
+    if isolated(concat!(
+        module_path!(),
+        "::ready_setup_cancelled_before_commit_cannot_create_a_root_and_releases_original_lease"
+    )) {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    fixture._root.disable_cleanup(true);
+    let (created, prepared) =
+        prepared_setup(&fixture, "ready-cancel", "printf forbidden > executed");
+    let run = prepared.custody.run;
+    let proof = holder_proof();
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let _owner = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let terminal = crate::model::TerminalId::new();
+    let recipe = prepared.recipe.as_ref().unwrap();
+    let source = registered_source(recipe.clone(), terminal, &proof);
+    let (ready, observed) = crossbeam_channel::bounded(1);
+    let (resume, proceed) = crossbeam_channel::bounded(1);
+    std::thread::scope(|scope| {
+        let mut worker = None;
+        let outcome = prepared.custody.start(
+            &RepositoryService::system("git"),
+            &fixture.store,
+            terminal,
+            recipe,
+            |authority| {
+                let config =
+                    setup_config(&source, authority.with_commit_checkpoint(ready, proceed));
+                worker =
+                    Some(scope.spawn(move || {
+                        crate::terminal::TerminalHandle::spawn(source, config, |_| {})
+                    }));
+                observed
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .map_err(|_| "actual original holder never reached Ready".to_owned())?;
+                // Ready proves actual typed descriptors/subreaper exist, but no
+                // PTY/root does. This original attempt must permanently cancel a
+                // late worker before its CommitSetup CAS and private wire send.
+                Err::<(), _>("injected supervisor startup failure after actual Ready".to_owned())
+            },
+        );
+        assert!(outcome.unwrap_err().contains("after actual Ready"));
+        resume.send(()).unwrap();
+        assert!(worker.take().unwrap().join().unwrap().is_err());
+    });
+    assert!(
+        !created.path.join("executed").exists(),
+        "cancelled worker executed a late shell"
+    );
+    drop(prepared);
+    skip_original(&fixture, &created, run);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while crate::daemon::child_reaper::has_outstanding_ownership() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "original Ready holder ownership remains; fixture retained at {}",
+            fixture._root.path().display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    fixture._root.disable_cleanup(false);
+}
+
+#[test]
+fn canonical_journal_writer_fences_run_replacement_through_startup() {
+    if isolated(concat!(
+        module_path!(),
+        "::canonical_journal_writer_fences_run_replacement_through_startup"
+    )) {
+        return;
+    }
+    let fixture = Fixture::new();
+    let (created, prepared) =
+        prepared_setup(&fixture, "writer-fence", "printf forbidden > executed");
+    let service = RepositoryService::system("git");
+    let original = service
+        .worktree_setup_creation(&fixture.store, created.operation_id)
+        .unwrap()
+        .unwrap()
+        .request
+        .unwrap()
+        .setup_intent
+        .unwrap();
+    let other = StateStore::open(
+        fixture._root.path().join("journal.sqlite3"),
+        fixture.store.current_boot_id().clone(),
+    )
+    .unwrap();
+    let (entered, begin) = crossbeam_channel::bounded(1);
+    let (trying, attempted) = crossbeam_channel::bounded(1);
+    let (finished, observed) = crossbeam_channel::bounded(1);
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            begin.recv().unwrap();
+            let mut next = original.clone();
+            next.run_id = Some(OperationId::new());
+            trying.send(()).unwrap();
+            let result = service.update_worktree_setup_intent(
+                &other,
+                created.operation_id,
+                Some(&original),
+                next,
+            );
+            finished.send(result.is_ok()).unwrap();
+        });
+        let result = prepared.custody.start(
+            &service,
+            &fixture.store,
+            crate::model::TerminalId::new(),
+            prepared.recipe.as_ref().unwrap(),
+            |_| {
+                entered.send(()).unwrap();
+                attempted.recv().unwrap();
+                assert!(
+                    matches!(
+                        observed.recv_timeout(std::time::Duration::from_millis(100)),
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout)
+                    ),
+                    "another SQLite connection replaced an in-flight original run"
+                );
+                Err::<(), _>("injected no-launch end of startup".into())
+            },
+        );
+        assert!(result.is_err());
+        assert!(
+            observed
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+        );
+        worker.join().unwrap();
+    });
+    assert!(!created.path.join("executed").exists());
+}
+
+#[test]
+fn setup_root_exit_reaps_escaped_descendant_before_reporting_completion() {
+    if isolated(concat!(
+        module_path!(),
+        "::setup_root_exit_reaps_escaped_descendant_before_reporting_completion"
+    )) {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    fixture._root.disable_cleanup(true);
+    let script = "import os,signal,time\npid=os.fork()\nif pid==0:\n os.setsid();signal.signal(signal.SIGHUP,signal.SIG_IGN)\n with open('escaped.pid.tmp','w') as f: f.write(str(os.getpid()));f.flush();os.fsync(f.fileno())\n os.rename('escaped.pid.tmp','escaped.pid')\n while True: time.sleep(1)\nelse:\n while not os.path.exists('escaped.pid'): time.sleep(.005)\n print('fixture-ready',flush=True)\n input()\n";
+    let command = format!("/usr/bin/python3 -c '{}'", script.replace('\'', "'\\''"));
+    let (created, prepared) = prepared_setup(&fixture, "family-cleanup", &command);
+    let proof = holder_proof();
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let _owner = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let terminal = crate::model::TerminalId::new();
+    let recipe = prepared.recipe.as_ref().unwrap();
+    let source = registered_source(recipe.clone(), terminal, &proof);
+    let handle = prepared
+        .custody
+        .start(
+            &RepositoryService::system("git"),
+            &fixture.store,
+            terminal,
+            recipe,
+            |authority| {
+                crate::terminal::TerminalHandle::spawn(
+                    source.clone(),
+                    setup_config(&source, authority),
+                    |_| {},
+                )
+                .map_err(|error| error.to_string())
+            },
+        )
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !created.path.join("escaped.pid").exists() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let pid: i32 = fs::read_to_string(created.path.join("escaped.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let descendant = crate::daemon::holder_registry::Process::read(pid).unwrap();
+    assert!(descendant.is_current());
+    handle.input(b"\n".to_vec()).unwrap();
+    let events = handle.events();
+    let mut successful_exit = false;
+    while std::time::Instant::now() < deadline {
+        if let Ok(event) = events.recv_timeout(std::time::Duration::from_millis(100)) {
+            if let crate::terminal::TerminalEvent::Exited {
+                exit_code: 0,
+                signal: None,
+                ..
+            } = event
+            {
+                assert!(
+                    !descendant.is_current(),
+                    "setup success preceded exact escaped-descendant cleanup"
+                );
+                successful_exit = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        successful_exit,
+        "original setup root did not report successful exit after family cleanup"
+    );
+    assert!(!descendant.is_current());
+    let holder = handle.holder_identity().unwrap().holder.clone();
+    handle.close_with_receipt(&source, &proof).unwrap();
+    let release_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while holder.is_current() {
+        assert!(
+            std::time::Instant::now() < release_deadline,
+            "original setup holder retained; fixture preserved at {}",
+            fixture._root.path().display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    drop(handle);
+    drop(prepared);
+    fixture._root.disable_cleanup(false);
 }

@@ -2343,11 +2343,11 @@ impl StateStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        let current: Option<(String, String, String, String)> = transaction.query_row(
-            "SELECT entity_kind,action,status,payload_json FROM pending_operations WHERE operation_id=?1",
-            [expected.id.to_string()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        let current: Option<(String, String, String, String, String, u64)> = transaction.query_row(
+            "SELECT entity_kind,action,status,payload_json,entity_id,base_generation FROM pending_operations WHERE operation_id=?1",
+            [expected.id.to_string()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
         ).optional().map_err(|error| error.to_string())?;
-        let Some((kind, action, status, payload)) = current else {
+        let Some((kind, action, status, payload, entity_id, generation)) = current else {
             return Err("Original setup operation disappeared before startup".into());
         };
         let payload: serde_json::Value =
@@ -2356,6 +2356,8 @@ impl StateStore {
             || action != "create"
             || status != "applied"
             || payload != expected.payload
+            || entity_id != expected.entity_id
+            || generation != expected.base_generation
         {
             return Err(
                 "Setup creation or reviewed run changed before startup; nothing was replayed"

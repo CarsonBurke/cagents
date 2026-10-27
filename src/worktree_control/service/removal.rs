@@ -40,11 +40,20 @@ impl PreparedRemoval {
         let records = service
             .list_worktrees(&repository, cancellation)
             .map_err(|e| e.to_string())?;
+        let primary = service
+            .managed_primary_checkout(&repository, cancellation)
+            .map_err(|error| error.to_string())?;
+        if primary.as_ref().is_some_and(|primary| {
+            resolved_path.as_ref() == Some(primary)
+                || Path::new(&target).canonicalize().ok().as_ref() == Some(primary)
+        }) {
+            return Err("The primary checkout cannot be removed".into());
+        }
         let candidate = resolved_path.or_else(|| {
             if Path::new(&target).is_absolute() {
                 Some(PathBuf::from(&target))
             } else {
-                records.first().map(|primary| primary.path.join(&target))
+                primary.as_ref().map(|primary| primary.join(&target))
             }
         });
         let canonical = candidate.as_ref().and_then(|path| path.canonicalize().ok());
@@ -136,14 +145,22 @@ impl PreparedRemoval {
         // before removing anything, then repeat its generation check at commit.
         let expected_creation = (|| -> Result<Option<OperationId>, String> {
             let service = RepositoryService::system("git");
+            let mut known = Vec::new();
             for row in store.journaled_worktree_operations().map_err(|error| error.to_string())? {
-                let Ok((_, report)) = service.worktree_setup_creation_from_row(&row) else { continue };
-                if report.request.as_ref().is_some_and(|request| request.destination == self.target.path && request.setup_intent.is_some()) {
-                    if crate::repository::worktree_creation_marker(&self.admin).map_err(|error| error.to_string())? != report.operation_id { return Err("Original setup generation evidence is missing or changed; retain this checkout for recovery".into()); }
-                    return Ok(Some(report.operation_id));
+                let Ok((common, report)) = service.worktree_setup_creation_from_row(&row) else { continue };
+                if common == self.common.path() && report.request.as_ref().is_some_and(|request| request.destination == self.target.path) {
+                    known.push(report.operation_id);
                 }
             }
-            Ok(None)
+            if known.is_empty() { return Ok(None); }
+            // Journal order is not generation order: removed checkouts retain
+            // their durable receipts, and the same managed path may be reused.
+            let marker = crate::repository::worktree_creation_marker(&self.admin)
+                .map_err(|error| format!("Original setup generation evidence is unavailable; retain this checkout for recovery: {error}"))?;
+            if !known.contains(&marker) {
+                return Err("Original setup generation evidence does not match a retained creation; retain this checkout for recovery".into());
+            }
+            Ok(Some(marker))
         })().map_err(|error| RemovalFailure { path: self.target.path.clone(), rescue_branch: None, error, outcome_unknown: false })?;
         let Self {
             target,

@@ -90,19 +90,24 @@ pub(crate) fn isolated_fixture_case(qualified: &str) -> bool {
     }
     let stdout = String::from_utf8_lossy(&stdout);
     let stderr = String::from_utf8_lossy(&stderr);
-    assert!(success, "owning case {case}: {status}\n{stdout}\n{stderr}");
-    assert!(
-        stdout
-            .lines()
-            .any(|line| line.contains(&format!("test {case} ... ok"))),
-        "actual named owning test did not pass: {stdout}\n{stderr}"
-    );
-    assert!(
-        stdout
-            .lines()
-            .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
-        "exact selector must run one owning case: {stdout}\n{stderr}"
-    );
+    let named = stdout
+        .lines()
+        .any(|line| line.contains(&format!("test {case} ... ok")));
+    let one = stdout
+        .lines()
+        .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;"));
+    if !success || !named || !one {
+        // A controlled holder may still retain these exact authority files.
+        // Preserve original evidence on every failed owning-child outcome;
+        // outer execution custody decides when cleanup is actually proved.
+        let runtime = runtime.keep();
+        let data = data.keep();
+        panic!(
+            "owning case {case}: {status}; named={named}, exact_one={one}; retained runtime={}, data={}\n{stdout}\n{stderr}",
+            runtime.display(),
+            data.display()
+        );
+    }
     print!("{stdout}");
     eprint!("{stderr}");
     true

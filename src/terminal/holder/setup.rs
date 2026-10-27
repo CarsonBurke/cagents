@@ -30,6 +30,14 @@ pub(crate) struct Authority {
     pub(crate) lease: Arc<File>,
     pub(crate) protection: Vec<Arc<File>>,
     delivery: Arc<std::sync::atomic::AtomicU8>,
+    pub(crate) pane_withdrawal: Option<(crate::model::CardId, Arc<std::sync::atomic::AtomicBool>)>,
+    #[cfg(test)]
+    before_commit: Option<
+        Arc<(
+            crossbeam_channel::Sender<()>,
+            crossbeam_channel::Receiver<()>,
+        )>,
+    >,
 }
 impl Authority {
     pub(crate) fn new(
@@ -44,11 +52,14 @@ impl Authority {
             lease,
             protection,
             delivery: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            pane_withdrawal: None,
+            #[cfg(test)]
+            before_commit: None,
         }
     }
     /// Exactly one worker may cross the authority-delivery boundary. A startup
     /// that was positively cancelled before this point can never launch later.
-    pub(crate) fn claim_delivery(&self) -> Result<(), String> {
+    pub(crate) fn claim_request(&self) -> Result<(), String> {
         self.delivery
             .compare_exchange(
                 0,
@@ -61,16 +72,61 @@ impl Authority {
                 "Setup startup was cancelled before authority delivery; no command was sent".into()
             })
     }
-    pub(crate) fn cancel_before_delivery(&self) -> Option<NoLaunch> {
+    #[cfg(test)]
+    pub(crate) fn with_commit_checkpoint(
+        mut self,
+        ready: crossbeam_channel::Sender<()>,
+        resume: crossbeam_channel::Receiver<()>,
+    ) -> Self {
+        self.before_commit = Some(Arc::new((ready, resume)));
+        self
+    }
+    #[cfg(test)]
+    pub(crate) fn checkpoint_ready(&self) -> Result<(), String> {
+        if let Some(checkpoint) = &self.before_commit {
+            checkpoint
+                .0
+                .send(())
+                .map_err(|_| "Setup Ready checkpoint owner disappeared".to_owned())?;
+            checkpoint
+                .1
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|_| "Setup Ready checkpoint was not resumed".to_owned())?;
+        }
+        Ok(())
+    }
+    pub(crate) fn claim_commit(&self) -> Result<(), String> {
+        if self
+            .pane_withdrawal
+            .as_ref()
+            .is_some_and(|(_, withdrawn)| withdrawn.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Err("The setup pane was closed before its original holder commit; no command was started".into());
+        }
         self.delivery
             .compare_exchange(
-                0,
+                1,
                 2,
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
             )
-            .ok()
-            .map(|_| NoLaunch(self.binding.clone()))
+            .map(|_| ())
+            .map_err(|_| {
+                "Setup startup was cancelled before its exact holder commit; no command was started"
+                    .into()
+            })
+    }
+    pub(crate) fn cancel_before_commit(&self) -> Option<NoLaunch> {
+        // Request receipt alone cannot start a shell. Only the exact holder's
+        // Ready followed by this worker's commit CAS crosses that boundary.
+        match self.delivery.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |state| matches!(state, 0 | 1).then_some(3),
+        ) {
+            Ok(_) | Err(3) => Some(NoLaunch(self.binding.clone())),
+            Err(_) => None, // An attempted exact holder commit is uncertain.
+        }
     }
     /// Typed Spawn order only. Started/Attached preserve their original3slots.
     pub(crate) fn files(&self) -> impl Iterator<Item = &Arc<File>> {

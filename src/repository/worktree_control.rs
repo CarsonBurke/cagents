@@ -114,11 +114,24 @@ fn publish(root: &fs_safety::Root, name: &str, bytes: &[u8], new: bool) -> io::R
             fs_safety::rename_within(root, &temporary, OsStr::new(name))
                 .map_err(io::Error::other)?;
         }
+        #[cfg(test)]
+        if FAIL_AFTER_RENAME.with(|fail| fail.replace(false)) {
+            return Err(io::Error::other(
+                "injected setup publication directory-sync failure after rename",
+            ));
+        }
         fs_safety::sync_directory(root)?;
         named(root)
     })();
     let _ = fs_safety::unlink_within(root, &temporary);
     result
+}
+
+#[cfg(test)]
+thread_local! { static FAIL_AFTER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(all(test, feature = "host"))]
+pub(crate) fn fail_next_setup_publication_sync_for_test() {
+    FAIL_AFTER_RENAME.with(|fail| fail.set(true));
 }
 
 /// A marker is inventory evidence only; callers still prove registration and
@@ -600,13 +613,21 @@ pub(crate) fn publish_setup_family_reaped(
     binding: &crate::terminal::holder::setup::Binding,
     _proof: &crate::terminal::holder::setup::ReapedFamily,
 ) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(&binding.admin_path).map_err(|error| error.to_string())?;
+    publish_reaped_disposition(admin, binding)
+}
+#[cfg(feature = "host")]
+fn publish_reaped_disposition(
+    admin: &fs_safety::Root,
+    binding: &crate::terminal::holder::setup::Binding,
+) -> Result<(), String> {
+    // Cleanup publishes only through the original held directory. Relocating
+    // its pathname cannot strand an already reaped family or redirect proof
+    // into a replacement namespace. Launch validation remains strictly named.
+    let (_pin, held_admin) = held_admin_root(admin).map_err(|error| error.to_string())?;
+    let admin = &held_admin;
     let held = admin.metadata().map_err(|error| error.to_string())?;
-    if !metadata.is_dir()
-        || (metadata.dev(), metadata.ino()) != binding.admin
-        || (held.dev(), held.ino()) != binding.admin
-    {
-        return Err("Original setup administrative generation changed".into());
+    if (held.dev(), held.ino()) != binding.admin {
+        return Err("Original setup administrative identity changed".into());
     }
     let mut state = read_disposition(admin, binding.creation).map_err(|error| error.to_string())?;
     let completed = Phase::FamilyReaped {
@@ -614,13 +635,37 @@ pub(crate) fn publish_setup_family_reaped(
         terminal: binding.terminal,
         lease: binding.lease,
     };
+    if state.phase
+        == (Phase::NotLaunched {
+            run: binding.run,
+            terminal: binding.terminal,
+            lease: binding.lease,
+        })
+    {
+        // The canonical startup permanently cancelled commit before a shell
+        // could run. This original holder independently has ECHILD as well.
+        fs_safety::sync_directory(admin).map_err(|error| error.to_string())?;
+        let after = read_disposition(admin, binding.creation).map_err(|error| error.to_string())?;
+        if after != state {
+            return Err("Original no-launch setup disposition changed after sync".into());
+        }
+        return Ok(());
+    }
     if state.phase == completed {
         // A prior rename may have succeeded before directory fsync failed.
         // Only this exact holder's new ECHILD proof may finish its own write.
         fs_safety::sync_directory(admin).map_err(|error| error.to_string())?;
         return verify_completed_setup_holder(admin, binding);
     }
-    verify_reserved_setup_holder(admin, binding)?;
+    if state.phase
+        != (Phase::Reserved {
+            run: binding.run,
+            terminal: binding.terminal,
+            lease: binding.lease,
+        })
+    {
+        return Err("Another setup execution owns this cleanup disposition".into());
+    }
     state.phase = completed;
     publish(
         admin,
@@ -630,6 +675,15 @@ pub(crate) fn publish_setup_family_reaped(
     )
     .map_err(|error| error.to_string())?;
     verify_completed_setup_holder(admin, binding)
+}
+#[cfg(feature = "host")]
+fn held_admin_root(admin: &fs_safety::Root) -> io::Result<(fs::File, fs_safety::Root)> {
+    let pin = admin.retained_directory()?;
+    let root = fs_safety::Root::open(&PathBuf::from(format!(
+        "/proc/self/fd/{}/.",
+        pin.as_raw_fd()
+    )))?;
+    Ok((pin, root))
 }
 #[cfg(feature = "host")]
 fn verify_completed_setup_holder(
@@ -646,9 +700,9 @@ fn verify_completed_setup_holder(
     {
         return Err("Setup cleanup publication changed".into());
     }
-    let named = fs::symlink_metadata(&binding.admin_path).map_err(|error| error.to_string())?;
-    if !named.is_dir() || (named.dev(), named.ino()) != binding.admin {
-        return Err("Original setup administrative generation changed after publication".into());
+    let held = admin.metadata().map_err(|error| error.to_string())?;
+    if (held.dev(), held.ino()) != binding.admin {
+        return Err("Original setup administrative identity changed after publication".into());
     }
     Ok(())
 }
@@ -705,27 +759,40 @@ struct NoLaunchGuard<'a> {
 #[cfg(feature = "host")]
 impl Drop for NoLaunchGuard<'_> {
     fn drop(&mut self) {
-        let Some(proof) = self.authority.cancel_before_delivery() else {
+        let Some(proof) = self.authority.cancel_before_commit() else {
             return;
         };
         let binding = proof.binding();
         let result = (|| -> Result<(), String> {
-            if read_disposition(&self.custody.admin, binding.creation)
-                .map_err(|error| error.to_string())?
+            let (_pin, admin) =
+                held_admin_root(&self.custody.admin).map_err(|error| error.to_string())?;
+            let held = admin.metadata().map_err(|error| error.to_string())?;
+            if (held.dev(), held.ino()) != binding.admin {
+                return Err("Original no-launch administrative identity changed".into());
+            }
+            if read_disposition(&admin, binding.creation).map_err(|error| error.to_string())?
                 == self.predecessor
             {
                 return Ok(());
             }
-            verify_reserved_setup_holder(&self.custody.admin, binding)?;
-            let mut state = read_disposition(&self.custody.admin, binding.creation)
-                .map_err(|error| error.to_string())?;
+            let mut state =
+                read_disposition(&admin, binding.creation).map_err(|error| error.to_string())?;
+            if state.phase
+                != (Phase::Reserved {
+                    run: binding.run,
+                    terminal: binding.terminal,
+                    lease: binding.lease,
+                })
+            {
+                return Err("Another setup execution owns this no-launch disposition".into());
+            }
             state.phase = Phase::NotLaunched {
                 run: binding.run,
                 terminal: binding.terminal,
                 lease: binding.lease,
             };
             publish(
-                &self.custody.admin,
+                &admin,
                 EXECUTION,
                 &serde_json::to_vec(&state).map_err(|error| error.to_string())?,
                 false,
@@ -735,5 +802,115 @@ impl Drop for NoLaunchGuard<'_> {
         if let Err(error) = result {
             tracing::warn!(%error, "Setup startup was cancelled before delivery but disposition publication remains uncertain; original Reserved evidence is retained");
         }
+    }
+}
+
+#[cfg(all(test, feature = "host"))]
+mod tests {
+    use super::*;
+    fn original() -> (
+        tempfile::TempDir,
+        fs_safety::Root,
+        crate::terminal::holder::setup::Binding,
+    ) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let admin = fs_safety::Root::open(temp.path()).unwrap();
+        let creation = OperationId::new();
+        record_creation(&admin, creation).unwrap();
+        let lease = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(temp.path().join("original.lease"))
+            .unwrap();
+        let binding = crate::terminal::holder::setup::Binding {
+            creation,
+            run: OperationId::new(),
+            terminal: crate::model::TerminalId::new(),
+            admin_path: temp.path().to_owned(),
+            admin: lease_file_identity(&admin.retained_directory().unwrap()).unwrap(),
+            lease: lease_file_identity(&lease).unwrap(),
+            protection: vec![lease_file_identity(&lease).unwrap()],
+        };
+        let state = Disposition {
+            creation,
+            admin: binding.admin,
+            phase: Phase::Reserved {
+                run: binding.run,
+                terminal: binding.terminal,
+                lease: binding.lease,
+            },
+        };
+        publish(
+            &admin,
+            EXECUTION,
+            &serde_json::to_vec(&state).unwrap(),
+            false,
+        )
+        .unwrap();
+        (temp, admin, binding)
+    }
+    #[test]
+    fn exact_family_publication_can_finish_its_rename_after_directory_sync_failure() {
+        let (_temp, admin, binding) = original();
+        fail_next_setup_publication_sync_for_test();
+        assert!(
+            publish_reaped_disposition(&admin, &binding)
+                .unwrap_err()
+                .contains("after rename")
+        );
+        assert_eq!(
+            read_disposition(&admin, binding.creation).unwrap().phase,
+            Phase::FamilyReaped {
+                run: binding.run,
+                terminal: binding.terminal,
+                lease: binding.lease
+            }
+        );
+        publish_reaped_disposition(&admin, &binding).unwrap();
+        let mut stale = binding.clone();
+        stale.run = OperationId::new();
+        assert!(
+            publish_reaped_disposition(&admin, &stale).is_err(),
+            "another run cannot reuse the completed write"
+        );
+    }
+    #[test]
+    fn interrupted_disposition_first_initialization_only_finishes_same_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let admin = fs_safety::Root::open(temp.path()).unwrap();
+        let creation = OperationId::new();
+        fail_next_setup_publication_sync_for_test();
+        assert!(record_creation(&admin, creation).is_err());
+        assert!(marker(&admin).is_err());
+        assert!(removal_is_quiescent(&admin).is_err());
+        assert!(record_creation(&admin, OperationId::new()).is_err());
+        record_creation(&admin, creation).unwrap();
+        assert_eq!(marker(&admin).unwrap(), creation);
+        assert!(removal_is_quiescent(&admin).is_ok());
+    }
+    #[test]
+    fn cleanup_publication_uses_original_admin_after_rename_without_touching_replacement() {
+        let (temp, admin, binding) = original();
+        let parent = tempfile::tempdir().unwrap();
+        let parked = parent.path().join("original-admin");
+        fs::rename(temp.path(), &parked).unwrap();
+        fs::create_dir(temp.path()).unwrap();
+        publish_reaped_disposition(&admin, &binding).unwrap();
+        let original = fs_safety::Root::open(&parked).unwrap();
+        assert_eq!(
+            read_disposition(&original, binding.creation).unwrap().phase,
+            Phase::FamilyReaped {
+                run: binding.run,
+                terminal: binding.terminal,
+                lease: binding.lease
+            }
+        );
+        assert!(
+            !temp.path().join(EXECUTION).exists(),
+            "replacement namespace cannot acquire original cleanup evidence"
+        );
     }
 }
