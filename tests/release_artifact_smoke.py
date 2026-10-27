@@ -4,14 +4,22 @@ import json
 import fcntl
 import os
 from pathlib import Path
+import select
+import shlex
+import shutil
+import signal
+import socket
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SMOKE = ROOT / "scripts/smoke-release-artifacts"
 PREPARE = ROOT / "scripts/prepare-release-smoke-rootfs"
+ENTRYPOINT = ROOT / "packaging/smoke-release-artifact"
 VERSION = "1.2.3"
 ARTIFACTS = (
     f"cagents_{VERSION}_amd64.deb",
@@ -196,16 +204,20 @@ class SmokeBoundary(unittest.TestCase):
         cache.mkdir(mode=0o700)
         digest = "6bc2cde3930ad088b3bb46fa45279e96d25bc3810f209850ecbe4722711874f9"
         marker = cache / ".cagents-release-smoke-cache"
-        old = f"cagents-release-smoke-v1 ubuntu-24.04.3 amd64 {digest}\n"
+        old = f"cagents-release-smoke-v2 ubuntu-24.04.3 amd64 {digest}\n"
         marker.write_text(old)
         root = cache / "rootfs"
         root.mkdir()
+        (root / "opt").mkdir()
+        provision_marker = root / "opt/.cagents-release-smoke-provisioned-v2"
+        provision_marker.write_text(old)
         sentinel = root / "existing-data"
         sentinel.write_text("preserve\n")
         result = self.invoke(PREPARE, ["--cache", str(cache)])
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cache marker does not match", result.stderr)
         self.assertEqual(marker.read_text(), old)
+        self.assertEqual(provision_marker.read_text(), old)
         self.assertEqual(sentinel.read_text(), "preserve\n")
         self.assertEqual(self.recorded(), [])
         self.assertFalse(self.network_calls.exists())
@@ -215,7 +227,7 @@ class SmokeBoundary(unittest.TestCase):
         cache.mkdir(mode=0o700)
         digest = "6bc2cde3930ad088b3bb46fa45279e96d25bc3810f209850ecbe4722711874f9"
         (cache / ".cagents-release-smoke-cache").write_text(
-            f"cagents-release-smoke-v2 ubuntu-24.04.3 amd64 {digest}\n"
+            f"cagents-release-smoke-v3 ubuntu-24.04.3 amd64 {digest}\n"
         )
         with (cache / ".lock").open("w") as held:
             fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -224,6 +236,147 @@ class SmokeBoundary(unittest.TestCase):
             self.assertIn("another preparation", result.stderr)
         self.assertEqual(self.recorded(), [])
         self.assertFalse(self.network_calls.exists())
+
+
+@unittest.skipUnless(
+    sys.platform == "linux" and hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"),
+    "Linux pidfds required",
+)
+class ShutdownOrdering(unittest.TestCase):
+    def check_shutdown(self, mode):
+        self.assertIsNotNone(shutil.which("jq"), "jq is required for the real smoke predicates")
+        real_readlink = shutil.which("readlink")
+        self.assertIsNotNone(real_readlink, "readlink is required for the real identity guard")
+        source = ENTRYPOINT.read_text()
+        # Exercise the actual identity guard and shutdown stanza. Only redirect
+        # their /tmp receipts into this test's private directory.
+        guard = source[source.index("    same_daemon() {"):source.index('    "$daemon_cli" --json terminal list')]
+        start = source.index('    "$daemon_cli" --json daemon stop-for-rebuild --including-subagents > /tmp/stop')
+        shutdown = source[start:source.index("    daemon_cli=\n", start)]
+        with tempfile.TemporaryDirectory(prefix="smoke-stop-", dir="/var/tmp") as temporary:
+            directory = Path(temporary)
+            endpoint = directory / "socket"
+            acknowledged = directory / "stopping"
+            observed = directory / "identity-observed"
+            premature = directory / "premature-status"
+            processes = []
+
+            def owned_process(*args, **kwargs):
+                process = subprocess.Popen(*args, **kwargs)
+                processes.append((process, None))
+                processes[-1] = (process, os.pidfd_open(process.pid))
+                return process
+
+            try:
+                daemon = owned_process(
+                    [sys.executable, "-c",
+                     "import signal,socket,sys\nfrom pathlib import Path\n"
+                     "listener=socket.socket(socket.AF_UNIX)\nlistener.bind(sys.argv[1])\nlistener.listen(8)\n"
+                     "signal.signal(signal.SIGTERM,lambda *_:Path(sys.argv[2]).write_text('stopping'))\n"
+                     "print('ready',flush=True)\nsys.stdin.readline()\nlistener.close()\n",
+                     str(endpoint), str(acknowledged)],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                self.assertTrue(select.select([daemon.stdout], [], [], 5)[0], "fixture listener did not start")
+                self.assertEqual(daemon.stdout.readline(), "ready\n")
+                epoch = Path(f"/proc/{daemon.pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+                executable = os.readlink(f"/proc/{daemon.pid}/exe")
+                tools = directory / "bin"
+                tools.mkdir()
+                readlink = tools / "readlink"
+                readlink.write_text(
+                    '#!/bin/sh\nvalue=$(' + shlex.quote(real_readlink) + ' "$@") || exit $?\n'
+                    'printf "%s\\n" "$value"\n'
+                    'if [ "$1" = "/proc/$SMOKE_PID/exe" ]; then : > "$SMOKE_OBSERVED"; fi\n'
+                )
+                readlink.chmod(0o755)
+                cli = tools / "fixture-cli"
+                cli.write_text(
+                    f"#!{sys.executable}\n"
+                    "import json,os,signal,socket,sys\nfrom pathlib import Path\n"
+                    "if sys.argv[1:]==['--json','daemon','stop-for-rebuild','--including-subagents']:\n"
+                    " p=int(os.environ['SMOKE_PID']);fd=os.pidfd_open(p)\n"
+                    " assert Path(f'/proc/{p}/stat').read_text().rsplit(')',1)[1].split()[19]==os.environ['SMOKE_EPOCH']\n"
+                    " signal.pidfd_send_signal(fd,signal.SIGTERM);os.close(fd)\n"
+                    " print(json.dumps(dict(ok=True,command='daemon.stop_for_rebuild',data=dict(stopped=True))))\n"
+                    "elif sys.argv[1:]==['--json','daemon','status']:\n"
+                    " connection=socket.socket(socket.AF_UNIX);connection.settimeout(1)\n"
+                    " try: connection.connect(os.environ['SMOKE_SOCKET'])\n"
+                    " except (FileNotFoundError,ConnectionRefusedError): pass\n"
+                    " else:\n"
+                    "  Path(os.environ['SMOKE_PREMATURE']).write_text('status while original listener alive')\n"
+                    "  print('protocol: Connection reset by peer (os error 104)',file=sys.stderr);sys.exit(1)\n"
+                    " finally: connection.close()\n"
+                    " if os.environ['SMOKE_MODE']=='error':\n"
+                    "  print('unexpected status failure',file=sys.stderr);sys.exit(23)\n"
+                    " print(json.dumps(dict(ok=True,command='daemon.status',data=dict(running=os.environ['SMOKE_MODE']=='replacement'))))\n"
+                    "else: sys.exit(97)\n"
+                )
+                cli.chmod(0o755)
+                environment = os.environ | dict(
+                    PATH=f"{tools}:{os.environ['PATH']}", SMOKE_PID=str(daemon.pid), SMOKE_EPOCH=epoch,
+                    SMOKE_EXECUTABLE=executable, SMOKE_CLI=str(cli), SMOKE_SOCKET=str(endpoint),
+                    SMOKE_OBSERVED=str(observed), SMOKE_PREMATURE=str(premature), SMOKE_MODE=mode,
+                )
+                script = (
+                    'set -euo pipefail\npid=$SMOKE_PID\nstart=$SMOKE_EPOCH\n'
+                    'daemon_executable=$SMOKE_EXECUTABLE\ndaemon_cli=$SMOKE_CLI\n'
+                    'fail() { printf "%s\\n" "$*" >&2; exit 1; }\n'
+                    + guard + shutdown.replace("/tmp/status", shlex.quote(str(directory / "status")))
+                    .replace("/tmp/stop", shlex.quote(str(directory / "stop")))
+                )
+                smoke = owned_process(
+                    ["/bin/bash", "-c", script], env=environment,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                deadline = time.monotonic() + 5
+                while not (acknowledged.exists() and observed.exists()):
+                    if smoke.poll() is not None or time.monotonic() >= deadline:
+                        self.assertFalse(premature.exists(), "status queried the original closing listener before the identity wait")
+                        self.fail("shutdown must observe the real original identity before polling status")
+                    time.sleep(0.01)
+                self.assertIsNone(daemon.poll(), "fixture must remain alive until the identity wait")
+                # This barrier, not a scheduling delay, holds the original socket
+                # open until the production same_daemon wait has actually begun.
+                with socket.socket(socket.AF_UNIX) as connection:
+                    connection.settimeout(1)
+                    connection.connect(str(endpoint))
+                daemon.stdin.write("exit\n")
+                daemon.stdin.flush()
+                daemon.wait(timeout=5)
+                stdout, stderr = smoke.communicate(timeout=10)
+                self.assertFalse(premature.exists(), "status queried the original closing listener")
+                return smoke.returncode, stdout, stderr
+            finally:
+                for process, pidfd in reversed(processes):
+                    try:
+                        if process.poll() is None:
+                            if pidfd is None:
+                                # pidfd acquisition failed, but this direct child
+                                # remains ours and unreaped, so its PID cannot recycle.
+                                process.kill()
+                            else:
+                                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                        process.wait(timeout=5)
+                    finally:
+                        if pidfd is not None:
+                            os.close(pidfd)
+                        for stream in (process.stdin, process.stdout, process.stderr):
+                            if stream is not None:
+                                stream.close()
+
+    def test_async_stop_waits_for_original_process_before_status(self):
+        code, stdout, stderr = self.check_shutdown("stopped")
+        self.assertEqual(code, 0, stdout + stderr)
+
+    def test_nonzero_status_failure_is_not_ignored(self):
+        code, _, stderr = self.check_shutdown("error")
+        self.assertEqual(code, 23, stderr)
+        self.assertIn("unexpected status failure", stderr)
+
+    def test_running_replacement_status_is_not_accepted_as_stopped(self):
+        code, _, stderr = self.check_shutdown("replacement")
+        self.assertNotEqual(code, 0, stderr)
 
 
 if __name__ == "__main__":
