@@ -1597,6 +1597,28 @@ mod tests {
                                 clamped.top < old.top,
                                 "the shortened native list must reproduce offset clamping"
                             );
+                            assert!(app.resume_ui.reader.lock().unwrap().pending.is_some());
+                            // The real redraw callback reports this layout-only
+                            // clamp before queued reveal effects are consumed.
+                            messages.clear();
+                            after.as_widget_mut().update(
+                                &mut tree,
+                                &iced::Event::Window(iced::window::Event::RedrawRequested(
+                                    iced::time::Instant::now(),
+                                )),
+                                Layout::new(&node),
+                                iced::mouse::Cursor::Unavailable,
+                                &renderer,
+                                &mut iced::advanced::clipboard::Null,
+                                &mut iced::advanced::Shell::new(&mut messages),
+                                &iced::Rectangle::with_size(size),
+                            );
+                            let reader = app.resume_ui.reader.lock().unwrap();
+                            assert_eq!(reader.viewport.unwrap().top, clamped.top);
+                            assert!(
+                                reader.pending.is_some(),
+                                "a layout clamp is not manual input"
+                            );
                         }
                         iced::futures::executor::block_on(async {
                             for task in std::iter::once(first)
