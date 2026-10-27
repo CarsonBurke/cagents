@@ -31,6 +31,8 @@ pub(in crate::app) struct State {
     after_retire: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     before_retire: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    followup_effects: Option<Vec<Task<Message>>>,
 }
 
 impl State {
@@ -1085,16 +1087,9 @@ impl Cagents {
                                     }
                                 }
                                 drop(slot);
-                                // Follow-up effects carry existing card/scope
-                                // identities. Start them only after old owned
-                                // filesystem capabilities have actually retired.
-                                return self
-                                    .retire_worktree_navigation(
-                                        generation,
-                                        retirement,
-                                        Some(receipt),
-                                    )
-                                    .chain(task);
+                                return self.finish_worktree_navigation(
+                                    generation, retirement, receipt, task,
+                                );
                             }
                         }
                     }
@@ -1118,6 +1113,28 @@ impl Cagents {
         }
         drop(slot);
         self.retire_worktree_navigation(generation, retirement, Some(receipt))
+    }
+
+    fn finish_worktree_navigation(
+        &mut self,
+        generation: u64,
+        retirement: Retirement,
+        receipt: Receipt,
+        followup: Task<Message>,
+    ) -> Task<Message> {
+        let retirement = self.retire_worktree_navigation(generation, retirement, Some(receipt));
+        #[cfg(test)]
+        if let Some(effects) = &mut self.worktree_selection.followup_effects {
+            // Owning headless fixtures record the real independent effects
+            // without starting a terminal/daemon or provider. The ordinary
+            // application and other fixtures retain concurrent Task semantics.
+            effects.push(followup);
+            return retirement;
+        }
+        // New guards already protect the installed scope. Slow old-FD/watcher
+        // retirement must not postpone hydration, focus, skills or rebind work.
+        // Only the next filesystem admission waits for original-worker join.
+        Task::batch([retirement, followup])
     }
 
     fn retire_worktree_navigation(
@@ -1210,6 +1227,7 @@ mod tests {
             .use_fixture_runtime(runtime.clone());
         drop(app.select_worktree(old.clone(), false));
         app.worktree_selection.local_window = true;
+        app.worktree_selection.followup_effects = Some(Vec::new());
         app.worktree_selection.runtime = Some(runtime.clone());
         app.settings.default_worktree_pane = settings::DefaultPane::Terminal;
         let initial = app.reconcile_navigation_protections();
@@ -1740,6 +1758,46 @@ mod tests {
         assert_eq!(f.app.worktree_selection.active, active);
         no_effect(f.app.update(retired(retirement)));
         assert!(f.app.worktree_selection.active.is_none());
+    }
+
+    #[test]
+    fn accepted_followup_runs_while_original_filesystem_retirement_is_blocked() {
+        let mut f = fixture();
+        f.app.worktree_selection.followup_effects = None;
+        let (entered, receive) = crossbeam_channel::bounded(1);
+        let (release, wait) = crossbeam_channel::bounded(1);
+        f.app.worktree_selection.before_retire = Some(Arc::new(move || {
+            entered.send(()).unwrap();
+            wait.recv_timeout(Duration::from_secs(10)).unwrap();
+        }));
+        let message = prepared(f.app.navigate_worktree(f.next.clone(), false, None));
+        let Message::WorktreeNavigationPrepared {
+            generation,
+            receipt,
+        } = message
+        else {
+            unreachable!()
+        };
+        let worker = receipt.client.join.lock().unwrap().take().unwrap();
+        let shared = receipt.client.shared.clone();
+        let task = f.app.finish_worktree_navigation(
+            generation,
+            Retirement::default(),
+            receipt,
+            cosmic::task::message(Message::SettingsSearchChanged("independent effect".into())),
+        );
+        let delivered = matching(task, |message| {
+            matches!(message,
+            Message::SettingsSearchChanged(text) if text == "independent effect")
+        });
+        assert!(matches!(delivered, Message::SettingsSearchChanged(_)));
+        receive.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(!worker.is_finished());
+        assert!(f.app.worktree_selection.is_active());
+        assert!(shared.slot.lock().unwrap().result.is_some());
+        release.send(()).unwrap();
+        executor().block_on(worker).unwrap();
+        assert!(shared.slot.lock().unwrap().result.is_none());
     }
 
     #[test]
