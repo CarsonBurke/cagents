@@ -1265,13 +1265,25 @@ fn read_local_with_plan(
             .iter()
             .map(|(record, _)| record.id)
             .collect::<Vec<_>>();
+        // A census refreshes listing metadata, but a failed status attempt
+        // still needs the preceding last-known scalar data. Match both the
+        // identity and path so a different checkout cannot inherit it.
+        let mut previous_status = std::mem::take(&mut snapshot.worktrees)
+            .into_iter()
+            .map(|(record, status)| ((record.id, record.path), status))
+            .collect::<HashMap<_, _>>();
         let listing_read = next_status_read();
         snapshot.worktrees = git
             .list_worktrees(&snapshot.repository.common_dir, &cancellation)
             .map_err(|error| error.to_string())?
             .into_iter()
             .filter(|record| record.bare || worktree_ui::worktree_directory_available(&record.path))
-            .map(|record| (record, None))
+            .map(|record| {
+                let status = previous_status
+                    .remove(&(record.id, record.path.clone()))
+                    .flatten();
+                (record, status)
+            })
             .collect();
         let listed = snapshot
             .worktrees
@@ -2067,6 +2079,88 @@ mod tests {
             .unwrap();
         assert!(row.status_error.is_none());
         assert_eq!(row.dirty.as_ref().unwrap().untracked, 1);
+    }
+
+    #[test]
+    fn topology_failure_retains_last_known_counts_through_repository_reload() {
+        const TEST: &str = "app::git_ui::tests::topology_failure_retains_last_known_counts_through_repository_reload";
+        if crate::repository::test_fixture::isolated_fixture_case(TEST) {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repository");
+        let initial = fixture(&root);
+        let project = ProjectId::new();
+        let id = initial.worktrees[0].0.id;
+        let cancel = CancellationToken::default();
+        fs::write(root.join("new.txt"), "last-known untracked file\n").unwrap();
+        let (baseline, _) = read_local(
+            project,
+            initial,
+            git_watch::Change {
+                worktrees: [id].into(),
+                untracked: true,
+                ..Default::default()
+            },
+            cancel.clone(),
+        )
+        .unwrap();
+        assert_eq!(baseline.worktrees[0].1.as_ref().unwrap().dirty.untracked, 1);
+        let key = ActiveWorktreeKey {
+            project_id: project,
+            worktree_id: id,
+            canonical_path: root.clone(),
+        };
+        let mut app = app_with_status_snapshot(baseline.clone(), &key);
+        fs::write(root.join(".git/index"), b"invalid index\n").unwrap();
+        let failed = read_local(
+            project,
+            baseline,
+            git_watch::Change {
+                topology: true,
+                ..Default::default()
+            },
+            cancel,
+        )
+        .unwrap();
+        assert!(failed.0.status_errors.contains_key(&id));
+        drop(app.update(Message::GitUi(Action::Read {
+            project,
+            generation: 9,
+            result: Ok(failed),
+        })));
+        let row = &app.sidebar_model.projects[0].worktrees[0];
+        assert!(row.status_error.is_some());
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 1);
+
+        app.repository_generations.insert(project, 10);
+        let task = app.repository_read_task(root, project, 10, false, Some(ProjectKind::Git));
+        let loaded = super::super::tests::task_app_message(task);
+        assert!(matches!(
+            &loaded,
+            Message::RepositoryLoaded { result: Ok(_), .. }
+        ));
+        drop(app.update(loaded));
+        let row = &app.sidebar_model.projects[0].worktrees[0];
+        assert!(row.status_error.is_some(), "failure remains explicit");
+        assert_eq!(
+            row.dirty
+                .as_ref()
+                .expect("reload keeps last-known counts")
+                .untracked,
+            1
+        );
+        let entry = &app.refresh_ui.git.entries[&project];
+        assert!(entry.snapshot.status_errors.contains_key(&id));
+        assert_eq!(
+            entry.snapshot.worktrees[0]
+                .1
+                .as_ref()
+                .unwrap()
+                .dirty
+                .untracked,
+            1
+        );
     }
 
     #[test]
