@@ -2252,12 +2252,7 @@ impl ClientHandle {
         if let Some(id) = snapshot.session_id.clone() {
             session.launch.session_id = Some(id);
         }
-        if matches!(
-            snapshot.native_continuity,
-            super::NativeContinuity::Durable { .. }
-        ) {
-            session.native_continuity = snapshot.native_continuity.clone();
-        }
+        session.learn_native_continuity(&snapshot.native_continuity);
         session
     }
     pub(crate) fn upgrade_recovery(&self) -> Option<&(Session, Session)> {

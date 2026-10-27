@@ -4496,15 +4496,10 @@ impl Runtime {
     fn refresh_session(&mut self) {
         let Some(handle) = self.handle() else { return };
         let observed = handle.session();
-        if observed.launch.session_id.is_some() {
-            self.session.launch.session_id = observed.launch.session_id;
+        if let Some(id) = &observed.launch.session_id {
+            self.session.launch.session_id = Some(id.clone());
         }
-        if matches!(
-            observed.native_continuity,
-            chat::NativeContinuity::Durable { .. }
-        ) {
-            self.session.native_continuity = observed.native_continuity;
-        }
+        self.session.learn_native_continuity_from(&observed);
     }
     /// Why this chat cannot be swapped for its terminal view right now.
     ///
@@ -6762,15 +6757,10 @@ impl Cagents {
             let mut session = runtime.session.clone();
             if let Some(handle) = runtime.handle() {
                 let observed = handle.session();
-                if observed.launch.session_id.is_some() {
-                    session.launch.session_id = observed.launch.session_id;
+                if let Some(id) = &observed.launch.session_id {
+                    session.launch.session_id = Some(id.clone());
                 }
-                if matches!(
-                    observed.native_continuity,
-                    chat::NativeContinuity::Durable { .. }
-                ) {
-                    session.native_continuity = observed.native_continuity;
-                }
+                session.learn_native_continuity_from(&observed);
             }
             return Some(session);
         }
@@ -18788,33 +18778,38 @@ mod tests {
 
     #[test]
     fn late_native_ownership_is_saved_even_while_the_chat_is_hidden() {
-        for visible in [true, false] {
-            let mut app = crate::app::tests::context_inspector_test_app(false);
-            let card = live_chat(&mut app, Some(KNOWN_THREAD));
-            let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
-                unreachable!()
-            };
-            let target = runtime.target;
-            runtime.show(visible);
-            let handle = runtime.handle().unwrap().clone();
-            let mut snapshot = (*handle.snapshot()).clone();
-            snapshot.generation += 1;
-            snapshot.native_continuity = chat::NativeContinuity::Durable {
-                provider_version: "0.157.1".into(),
-            };
-            handle.replace_snapshot_for_test(snapshot);
-            let _ = app.update(Message::ChatUi(Action::Wake(target, Wake::Activity)));
-            let CardKind::Chat(saved) = &app.card_state(card).unwrap().kind else {
-                unreachable!()
-            };
-            assert!(matches!(
-                saved.native_continuity,
-                chat::NativeContinuity::Durable { .. }
-            ));
-            assert_eq!(
-                app.chat_return_session(card).unwrap().native_continuity,
-                saved.native_continuity
-            );
+        for provider in [Provider::Codex, Provider::Claude] {
+            for visible in [true, false] {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                let card = live_chat_for_provider(&mut app, provider, Some(KNOWN_THREAD));
+                let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+                    unreachable!()
+                };
+                let target = runtime.target;
+                runtime.show(visible);
+                let handle = runtime.handle().unwrap().clone();
+                let mut snapshot = (*handle.snapshot()).clone();
+                snapshot.generation += 1;
+                let capability = match provider {
+                    Provider::Codex => chat::NativeContinuity::Durable {
+                        provider_version: "0.157.1".into(),
+                    },
+                    Provider::Claude => chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
+                    _ => unreachable!(),
+                };
+                snapshot.native_continuity = capability.clone();
+                handle.replace_snapshot_for_test(snapshot);
+                let _ = app.update(Message::ChatUi(Action::Wake(target, Wake::Activity)));
+                let CardKind::Chat(saved) = &app.card_state(card).unwrap().kind else {
+                    unreachable!()
+                };
+                assert_eq!(saved.native_continuity, capability);
+                assert!(saved.has_valid_native_continuity());
+                assert_eq!(
+                    app.chat_return_session(card).unwrap().native_continuity,
+                    saved.native_continuity
+                );
+            }
         }
     }
 

@@ -825,7 +825,35 @@ impl Session {
     }
 
     pub fn has_valid_native_continuity(&self) -> bool {
-        match &self.native_continuity {
+        self.valid_native_continuity(&self.native_continuity)
+    }
+
+    /// Import an installed capability observed on this exact authenticated
+    /// attachment. A missing capability never revokes one already recorded.
+    /// Validation applies to the resulting descriptor, including pre-ID
+    /// Claude actors; a valid ReconnectOnly source alone grants nothing.
+    pub(crate) fn learn_native_continuity(&mut self, observed: &NativeContinuity) {
+        if observed.retains_provider() && self.valid_native_continuity(observed) {
+            self.native_continuity = observed.clone();
+        }
+    }
+
+    /// Runtime projections may learn provider identity/capability, but may
+    /// never borrow it from another allocation, account or daemon epoch.
+    pub(crate) fn learn_native_continuity_from(&mut self, observed: &Self) {
+        if self.id == observed.id
+            && self.proof == observed.proof
+            && self.launch.provider == observed.launch.provider
+            && self.launch.recipe == observed.launch.recipe
+            && self.terminal == observed.terminal
+            && self.owned_codex_listener == observed.owned_codex_listener
+        {
+            self.learn_native_continuity(&observed.native_continuity);
+        }
+    }
+
+    fn valid_native_continuity(&self, continuity: &NativeContinuity) -> bool {
+        match continuity {
             NativeContinuity::ReconnectOnly => true,
             NativeContinuity::RetainedClaudeActor { protocol } => {
                 *protocol == 2
@@ -2335,6 +2363,48 @@ mod retained_native_pair_tests {
             host_session_id: proof.host_session_id.clone(),
             boot_id: proof.boot_id.clone(),
             host_incarnation: proof.host_incarnation.clone(),
+        }
+    }
+
+    #[test]
+    fn observed_retained_capability_requires_the_exact_valid_owner_and_never_downgrades() {
+        for confirmed in [false, true] {
+            let (observed, _) = pair(confirmed);
+            let mut source = observed.clone();
+            source.native_continuity = NativeContinuity::ReconnectOnly;
+            for mutation in 0..5 {
+                let mut foreign = observed.clone();
+                match mutation {
+                    0 => foreign.id = TerminalId::new(),
+                    1 => foreign.proof.as_mut().unwrap().host_incarnation = "another-owner".into(),
+                    2 => foreign.launch.provider = Provider::Codex,
+                    3 => {
+                        foreign
+                            .launch
+                            .recipe
+                            .environment
+                            .insert("CLAUDE_CONFIG_DIR".into(), "/another-account".into());
+                    }
+                    _ => foreign.launch.recipe.arguments.push("--different".into()),
+                }
+                let mut retained = source.clone();
+                retained.learn_native_continuity_from(&foreign);
+                assert_eq!(retained, source);
+            }
+            let mut missing_proof = source.clone();
+            missing_proof.proof = None;
+            missing_proof.learn_native_continuity(&observed.native_continuity);
+            assert_eq!(
+                missing_proof.native_continuity,
+                NativeContinuity::ReconnectOnly
+            );
+            source.learn_native_continuity_from(&observed);
+            assert_eq!(source, observed);
+            assert!(source.has_valid_native_continuity());
+            source.learn_native_continuity(&NativeContinuity::ReconnectOnly);
+            assert_eq!(source, observed);
+            source.learn_native_continuity(&NativeContinuity::RetainedClaudeActor { protocol: 3 });
+            assert_eq!(source, observed);
         }
     }
 
