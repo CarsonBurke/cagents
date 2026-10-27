@@ -491,6 +491,12 @@ pub(super) fn process(
     };
     caller.verify(host, client).map_err(not_started)?;
     let store = journal().map_err(not_started)?;
+    let invalidate_restored = matches!(
+        &operation,
+        Operation::StaleLock { unlock: true, .. }
+            | Operation::SetDisposableIgnoredDirectories { .. }
+            | Operation::DeleteBranch { .. }
+    );
     let execution = match &common {
         Some(common) => service::execute(
             &RepositoryService::new(
@@ -509,8 +515,14 @@ pub(super) fn process(
             &store,
             |path| live_sessions(host, path),
         ),
+    };
+    if invalidate_restored && let Some(common) = &common {
+        // A service error can follow a committed unlock/config/ref mutation.
+        // Invalidate only the already admitted inventory on either outcome;
+        // this grants no project, pane, focus or additional execution authority.
+        let _ = notify_inventory(host, client, common.path());
     }
-    .map_err(refused)?;
+    let execution = execution.map_err(refused)?;
     match execution {
         Execution::Remove(removal) => {
             caller.verify(host, client).map_err(refused)?;
@@ -933,6 +945,158 @@ fn publish_setup_pane(
 mod tests {
     use super::*;
     use crate::process::{ProcessExecutor, SystemProcessExecutor};
+
+    #[test]
+    fn restored_mutations_invalidate_watchers_even_after_committed_branch_cleanup_failure() {
+        if crate::repository::test_fixture::isolated_fixture_case(concat!(
+            module_path!(),
+            "::restored_mutations_invalidate_watchers_even_after_committed_branch_cleanup_failure"
+        )) {
+            return;
+        }
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let repository = directory.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        let git = |arguments: &[&str]| {
+            let command = crate::worktree_branch::git_command(&repository)
+                .args([
+                    "-c",
+                    "user.name=fixture",
+                    "-c",
+                    "user.email=fixture@localhost",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .args(arguments.iter().copied())
+                .timeout(std::time::Duration::from_secs(15));
+            let output = SystemProcessExecutor
+                .execute(&command, &CancellationToken::new())
+                .unwrap();
+            assert!(
+                output.success,
+                "git {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .trim_end()
+                .to_owned()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
+        std::fs::write(repository.join("tracked"), b"base").unwrap();
+        git(&["add", "tracked"]);
+        git(&["commit", "-qm", "base"]);
+        git(&["branch", "partial"]);
+        git(&[
+            "config",
+            "branch.partial.description",
+            "retain if cleanup fails",
+        ]);
+        let head = git(&["rev-parse", "refs/heads/partial"]);
+        let common = RepositoryService::system("git")
+            .common_dir(&repository, &CancellationToken::new())
+            .unwrap();
+        let proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("worktree-inventory-fixture"),
+            host_incarnation: crate::model::HostIncarnation::new("worktree-inventory-fixture"),
+            boot_id: crate::model::BootId::new("fixture"),
+        };
+        let registry =
+            crate::host::model::Registry::at(&directory.path().join("registry.sqlite3")).unwrap();
+        let mut state = crate::host::state::HostState::new(proof);
+        state.install_model(registry);
+        state.register_client(1);
+        let before = state.read_model().unwrap();
+        let host = Arc::new(crate::host::state::HostLock::new(state));
+        for (index, operation) in [
+            Operation::SetDisposableIgnoredDirectories {
+                repository: repository.clone(),
+                path: repository.clone(),
+                directories: vec!["cache".into()],
+            },
+            Operation::GetDisposableIgnoredDirectories {
+                repository: repository.clone(),
+                path: repository.clone(),
+            },
+            Operation::DeleteBranch {
+                repository: repository.clone(),
+                branch: "partial".into(),
+                force: true,
+                expected_oid: Some(head),
+            },
+            Operation::StaleLock {
+                repository: repository.clone(),
+                path: repository.clone(),
+                unlock: true,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let delivery = {
+                let mut state = host.lock().unwrap();
+                let id = 10 + index as u64;
+                let delivery = state.register_client(id);
+                state.watch_model(id).unwrap();
+                delivery
+            };
+            if index == 2 {
+                // Git commits the branch ref removal before its native config
+                // cleanup encounters this owned lock. The existing deletion
+                // primitive must retain and report that partial result.
+                std::fs::write(common.join("config.lock"), b"owned fixture lock").unwrap();
+            }
+            let active = admit(&host, operation.mutates()).unwrap();
+            let result = process(&host, 1, Authority::default(), operation, active);
+            if index == 2 {
+                assert!(
+                    matches!(
+                        result,
+                        Ok(Reply::BranchDeleteFailed {
+                            outcome_unknown: true,
+                            ..
+                        })
+                    ),
+                    "{result:?}"
+                );
+                assert!(
+                    git(&["branch", "--list", "partial"]).is_empty(),
+                    "causal post-effect control: ref was actually deleted"
+                );
+                assert_eq!(
+                    git(&["config", "--get", "branch.partial.description"]),
+                    "retain if cleanup fails"
+                );
+                std::fs::remove_file(common.join("config.lock")).unwrap();
+            } else if index == 3 {
+                assert!(result.is_err(), "an unproved lock remains refused");
+            } else {
+                assert!(result.is_ok(), "{result:?}");
+            }
+            // Never wait indefinitely if the invalidation regresses.
+            delivery.close_after_drain();
+            if index == 1 {
+                assert!(delivery.pop().is_none(), "policy reads are not mutations");
+            } else {
+                let edge = delivery.pop().expect("every admitted restored mutation needs an inventory edge, including partial/failed results");
+                assert!(
+                    matches!(edge.message, crate::terminal_ipc::ServerMessage::WorkspaceModelEdited { edit: ModelEdit::WorktreesChanged { repository }, .. } if repository == common)
+                );
+                assert!(
+                    delivery.pop().is_none(),
+                    "one invalidation per restored mutation"
+                );
+            }
+        }
+        let after = host.lock().unwrap().read_model().unwrap();
+        assert_eq!(
+            after.sequence, before.sequence,
+            "invalidation does not edit or open a project/pane"
+        );
+        assert_eq!(after.projects, before.projects);
+        assert_eq!(after.views, before.views);
+    }
 
     #[test]
     fn unbound_script_scope_and_authenticated_user_downgrade_are_refused() {
