@@ -2562,6 +2562,8 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
         RepositoryAction::FilesLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
             | RepositoryAction::FileLoadedAt { .. }
+            | RepositoryAction::DocumentChanged { .. }
+            | RepositoryAction::DocumentReloaded { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::SaveFinished { .. }
@@ -17815,6 +17817,16 @@ impl Application for Cagents {
             )
             .map(Message::Lsp),
         );
+        subscriptions.extend(
+            self.cards
+                .iter()
+                .filter_map(|(&card, runtime)| match runtime {
+                    CardRuntime::Repository(runtime) => {
+                        Some(runtime.document_subscription(card).map(Message::Repository))
+                    }
+                    _ => None,
+                }),
+        );
         subscriptions.extend(operation_subscriptions);
         if let Some(window) = self.core.main_window_id()
             && (self.workspace.is_animating() || self.context_inspector_transition.is_some())
@@ -27918,6 +27930,7 @@ mod tests {
         // says so far better than an unwrap would.
         if let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) {
             let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
                 .build()
                 .expect("executor");
             while let Some(action) = executor.block_on(stream.next()) {
@@ -28058,6 +28071,62 @@ mod tests {
         assert_eq!(
             focused(&app, ready),
             Some(repository_widget::editor_focus_id(pane))
+        );
+    }
+
+    #[test]
+    fn fresh_editor_load_returns_keyboard_without_saved_navigation() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("notes.txt"), "fresh source\n").unwrap();
+        let (mut app, pane) = editing_repository_app();
+        let view = RepositoryView {
+            project: ProjectId::new(),
+            repository: directory.path().into(),
+            worktree: directory.path().into(),
+            selected_file: None,
+        };
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .iter_mut()
+            .find(|card| card.id == pane)
+            .unwrap()
+            .kind = CardKind::Repository(view.clone());
+        let mut runtime = RepositoryRuntime::new_directory(view);
+        // This is the public action emitted after sidebar navigation resolves
+        // its file list, without saved caret or viewport metadata.
+        let load = runtime.update(RepositoryAction::OpenFile {
+            card: pane,
+            path: "notes.txt".into(),
+        });
+        app.cards
+            .insert(pane, CardRuntime::Repository(Box::new(runtime)));
+        app.window_width = 1900.0;
+        let update = app.workspace.resize_viewport(1200.0);
+        drop(app.apply_viewport(update, false, false));
+        assert!(app.card_holds_keyboard(pane));
+        let placeholder = app.card_header_widget_id(pane);
+        let mut messages = cosmic::iced::runtime::task::into_stream(load).unwrap();
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut tasks = Vec::new();
+        let mut completed_read = false;
+        while let Some(action) = executor.block_on(messages.next()) {
+            if let cosmic::iced::runtime::Action::Output(action) = action {
+                completed_read |= matches!(&action, RepositoryAction::FileLoadedAt { .. });
+                tasks.push(app.update(Message::Repository(action)));
+            }
+        }
+        assert!(
+            completed_read,
+            "the actual file worker must answer the open"
+        );
+        let initial = iced::widget::operation::focus(placeholder).map(cosmic::Action::App);
+        assert_eq!(
+            focused(&app, initial.chain(Task::batch(tasks))),
+            Some(repository_widget::editor_focus_id(pane)),
+            "a freshly opened editor must receive typing without a body click"
         );
     }
 
