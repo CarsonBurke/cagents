@@ -716,7 +716,7 @@ impl<'b, Message: Clone + 'static> Menu<'b, Message> {
                     {
                         return;
                     }
-                    item.item.update(
+                    item.item.clone().update(
                         tree,
                         event,
                         layout,
