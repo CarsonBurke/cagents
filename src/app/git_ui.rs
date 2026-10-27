@@ -2218,12 +2218,26 @@ mod tests {
                     result: Ok((snapshot, plan)),
                 })
             };
-            let failure =
-                super::super::tests::task_app_message(app.source_control_snapshot_task(key));
-            assert!(
-                matches!(&failure, Message::SourceControlLoaded { result: Err(failure), .. } if failure.status_read.is_some()),
-                "actual later Git status failure owns only an error marker"
-            );
+            // Exercise the actual status API and production result boundary.
+            // A fresh full-snapshot task would fail its earlier config lookup
+            // on this already-missing root, before admitting a status attempt.
+            let read = next_status_read();
+            let error = RepositoryService::system("git")
+                .status_projection(
+                    &linked,
+                    true,
+                    sidebar::STATUS_DISPLAY_LIMIT,
+                    &CancellationToken::default(),
+                )
+                .unwrap_err();
+            let failure = Message::SourceControlLoaded {
+                key,
+                request: app.refresh_ui.source_generation,
+                result: Err(SourceControlReadFailure {
+                    message: error.to_string(),
+                    status_read: Some(read),
+                }),
+            };
             drop(app.update(failure));
             drop(app.update(omitted));
             let rows = &app.sidebar_model.project(project).unwrap().worktrees;
