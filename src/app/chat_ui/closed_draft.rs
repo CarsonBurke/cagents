@@ -28,9 +28,15 @@ impl Cagents {
     pub(in crate::app) fn sync_closed_chat_draft(&mut self, card: CardId) {
         let closed = self.chat_closed_elsewhere(card);
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
+            if closed {
+                runtime.dictation.retire();
+            }
             runtime.closed_elsewhere = closed;
         }
         if let Some(runtime) = self.chat_ui.parked.get_mut(&card) {
+            if closed {
+                runtime.dictation.retire();
+            }
             runtime.closed_elsewhere = closed;
         }
     }
@@ -144,6 +150,8 @@ mod tests {
     use crate::workspace_model::views::{Pane, Scope, View};
     use cosmic::iced::futures::{FutureExt, StreamExt};
 
+    const COMPLETED_REPORT: &str = "The completed report stays readable.";
+
     fn fixture(draft: &str) -> (Cagents, Target, crate::model::ChannelId, Arc<ClientHandle>) {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         drop(app.new_native_chat(Provider::Claude, Some(PathBuf::from("/project"))));
@@ -171,7 +179,7 @@ mod tests {
                     at: Some(42),
                     started_at: None,
                     content: ItemContent::Text {
-                        text: "The completed report stays readable.".into(),
+                        text: COMPLETED_REPORT.into(),
                         thinking: false,
                         phase: chat::Phase::Final,
                     },
@@ -248,7 +256,7 @@ mod tests {
         result
     }
 
-    fn visible_text(app: &Cagents, card: CardId) -> Vec<String> {
+    fn visible_text(app: &mut Cagents, card: CardId) -> Vec<String> {
         use iced::advanced::{
             Layout, layout,
             widget::{Operation, Tree},
@@ -262,20 +270,148 @@ mod tests {
             fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
                 self.0.push(text.to_owned());
             }
+            fn custom(
+                &mut self,
+                _: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                // Rich Markdown is a native selectable widget, not an iced
+                // Text. Inspect its mounted state, as transcript selection
+                // does, rather than consulting the retained logical items.
+                if let Some(prose) = state.downcast_ref::<selectable_prose::State>() {
+                    self.0.push(prose.plain.to_string());
+                }
+            }
         }
+        // These tests set the local error directly instead of dispatching a
+        // provider callback. Run the same postlude as handle_chat_ui, then
+        // settle the real asynchronous presentation before inspecting widgets.
+        app.reconcile_chat_failure_presentations();
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+            panic!("retained chat fixture");
+        };
+        assert!(
+            runtime.visible.load(Ordering::Relaxed),
+            "native report inspection requires the visible retained card"
+        );
+        preparation::drain_fixture(runtime);
+        assert!(
+            runtime.cache.get("completed-report").is_some_and(|cached| {
+                !cached.placeholder && !cached.preparing && cached.document.is_some()
+            }),
+            "the real presentation worker must finish before native inspection"
+        );
         let renderer = crate::app::tests::headless_renderer();
         let mut element = app.chat_view(card);
         let mut tree = Tree::new(element.as_widget());
+        let viewport = iced::Rectangle::with_size(iced::Size::new(900.0, 980.0));
         let node = element.as_widget_mut().layout(
             &mut tree,
             &renderer,
-            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(900.0, 980.0)),
+            &layout::Limits::new(iced::Size::ZERO, viewport.size()),
         );
         let mut text = Texts::default();
         element
             .as_widget_mut()
             .operate(&mut tree, Layout::new(&node), &renderer, &mut text);
+        assert!(
+            text.0.iter().any(|plain| plain == COMPLETED_REPORT),
+            "the exact completed report must own a mounted native selectable state: {:?}",
+            text.0,
+        );
+        // The completed report must also be exposed by the actual native
+        // accessibility tree, in the visible viewport. A logical snapshot or
+        // a cached Markdown source would not establish this presentation.
+        let accessible = element.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            iced::mouse::Cursor::Unavailable,
+        );
+        let report = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .find(|node| {
+                node.node().role() == iced_accessibility::accesskit::Role::Label
+                    && node.node().value() == Some(COMPLETED_REPORT)
+            })
+            .expect("completed report is exposed by the mounted native prose widget");
+        let bounds = report.node().bounds().expect("native report bounds");
+        let bounds = iced::Rectangle {
+            x: bounds.x0 as f32,
+            y: bounds.y0 as f32,
+            width: (bounds.x1 - bounds.x0) as f32,
+            height: (bounds.y1 - bounds.y0) as f32,
+        };
+        assert!(bounds.width > 0.0 && bounds.height > 0.0, "{bounds:?}");
+        assert!(
+            bounds.intersection(&viewport).is_some(),
+            "completed report must be visible: {bounds:?} in {viewport:?}"
+        );
         text.0
+    }
+
+    fn assert_visible_button(app: &Cagents, card: CardId, label: &str) {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let renderer = crate::app::tests::headless_renderer();
+        let mut element = app.chat_view(card);
+        let mut tree = Tree::new(element.as_widget());
+        let viewport = iced::Size::new(900.0, 980.0);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, viewport),
+        );
+        let accessible = element.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            iced::mouse::Cursor::Unavailable,
+        );
+        let controls: Vec<_> = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .filter(|node| {
+                node.node().role() == iced_accessibility::accesskit::Role::Button
+                    && node.node().label() == Some(label)
+            })
+            .collect();
+        assert_eq!(controls.len(), 1, "one mounted accessible copy control");
+        let bounds = controls[0].node().bounds().expect("native copy bounds");
+        assert!(
+            bounds.x1 > bounds.x0
+                && bounds.y1 > bounds.y0
+                && bounds.x0 < f64::from(viewport.width)
+                && bounds.y0 < f64::from(viewport.height)
+                && bounds.x1 > 0.0
+                && bounds.y1 > 0.0,
+            "copy control must be in the actual viewport: {bounds:?}"
+        );
+    }
+
+    #[test]
+    fn canonical_remote_close_retires_dictation_without_editing_retained_draft() {
+        let (mut app, target, channel, _) = fixture("unsent draft");
+        let current = app.chat_runtime_mut(target).unwrap();
+        let ticket =
+            current
+                .dictation
+                .capture_for_test(target, current.revision, &current.composer);
+        retire(&mut app, channel, target.card);
+        assert!(runtime(&app, target).closed_elsewhere);
+        assert!(runtime(&app, target).dictation.phase().is_none());
+        drop(app.handle_chat_ui(Action::Dictation(
+            target,
+            super::super::dictation::Action::Finished(super::super::dictation::Delivery::new(
+                ticket.clone(),
+                Ok(crate::speech::Transcript {
+                    ticket,
+                    text: "late transcript".into(),
+                }),
+            )),
+        )));
+        assert_eq!(runtime(&app, target).unsent_text(), "unsent draft");
     }
 
     #[test]
@@ -300,8 +436,17 @@ mod tests {
         assert!(app.card_state(target.card).unwrap().existence.is_open());
         app.chat_runtime_mut(target).unwrap().error =
             Some("Exact native chat is not hosted; explicit recovery is required".into());
-        let text = visible_text(&app, target.card).join("\n");
-        assert!(text.contains("Closed · draft retained"), "{text}");
+        let text = visible_text(&mut app, target.card).join("\n");
+        assert!(
+            text.contains("The completed report stays readable."),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Closed in another window. Your conversation and unsent draft are kept here."
+            ),
+            "{text}"
+        );
         assert!(
             text.contains("Copy draft") && text.contains("Discard draft text"),
             "{text}"
@@ -325,11 +470,29 @@ mod tests {
             "Finished with error"
         );
         assert!(!runtime(&app, target).expected_remote_close_error(error));
-        assert!(
-            visible_text(&app, target.card)
-                .join("\n")
-                .contains("Finished with error")
+        let text = visible_text(&mut app, target.card).join("\n");
+        assert!(text.contains(error), "{text}");
+        let incident = runtime(&app, target)
+            .failure_ui
+            .incidents
+            .iter()
+            .find(|incident| {
+                runtime(&app, target)
+                    .failure_details(&incident.key)
+                    .as_deref()
+                    == Some(error)
+            })
+            .expect("current failure notice");
+        assert_visible_button(
+            &app,
+            target.card,
+            &format!("Copy original diagnostics for {}", incident.summary),
         );
+        assert!(
+            text.contains("The completed report stays readable."),
+            "{text}"
+        );
+        assert!(!text.contains("Closed in another window."), "{text}");
         let pane = app.workspace_model.views[0].panes[0].clone();
         // A source tombstone can also be a transfer. Destination ownership wins.
         let mut destination = View::empty(crate::model::ChannelId::new());

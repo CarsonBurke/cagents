@@ -15,6 +15,8 @@ use cosmic::iced::{
 use cosmic::{Element, Renderer, Theme, widget};
 use serde::Deserialize;
 
+mod composer_popover;
+pub use composer_popover::composer_popover;
 mod context_menu;
 mod keyed_list;
 mod list_navigation;
@@ -108,6 +110,15 @@ pub fn keyed_list_rows<'a, Message: 'a>(
     rows: Vec<([u8; 32], Element<'a, Message>)>,
 ) -> Element<'a, Message> {
     keyed_list::view(rows)
+}
+
+/// Keyed horizontal controls retain native focus when their order changes.
+pub fn keyed_control_row<'a, Message: 'a>(
+    controls: Vec<([u8; 32], Element<'a, Message>)>,
+    spacing: f32,
+    on_focus: impl Fn(Option<[u8; 32]>) + 'a,
+) -> Element<'a, Message> {
+    keyed_list::horizontal_observed(controls, spacing, Some(Box::new(on_focus)))
 }
 
 /// A filter field at the head of a keyboard list. Down enters its first

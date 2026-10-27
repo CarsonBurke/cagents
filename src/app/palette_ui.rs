@@ -2605,12 +2605,9 @@ mod tests {
     }
 
     #[test]
-    fn main_work_hides_diagnostics_and_refuses_queued_rows_until_conversations_returns() {
+    fn pr_inspector_overlay_hides_diagnostics_and_refuses_queued_rows_until_closed() {
         let (mut app, card) = diagnostic_palette_fixture();
-        drop(app.update_palette(Action::Open));
-        drop(app.update_palette(Action::Query(">Next diagnostic".into())));
-        let queued = click_diagnostic_palette_row(&app, card, true);
-        drop(app.update_palette(Action::Close));
+        app.context_inspector_open = false;
         let channel = crate::model::ChannelId::new();
         app.workspace_model.identity = uuid::Uuid::new_v4();
         app.workspace_model
@@ -2622,15 +2619,28 @@ mod tests {
                 title_source: Default::default(),
                 ordinal: 1,
             });
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        drop(app.update(Message::WindowResized(640.0, 900.0)));
+        let focused = app.workspace.focused();
+        drop(app.update_palette(Action::Open));
+        drop(app.update_palette(Action::Query(">Next diagnostic".into())));
+        let queued = click_diagnostic_palette_row(&app, card, true);
+        drop(app.update_palette(Action::Close));
         drop(app.open_channel_work(channel));
-        assert!(app.channel_work_is_main());
+        assert!(app.context_inspector_open);
+        assert_eq!(app.context_tab, ContextTab::PullRequest);
+        assert_eq!(app.channel_work.view.home().unwrap().channel, channel);
+        assert!(app.context_inspector_is_overlay());
+        assert!(!app.workspace_surfaces_visible());
+        assert_eq!(app.workspace.focused(), focused);
         drop(app.update_palette(Action::Open));
         drop(app.update_palette(Action::Query(">diagnostic".into())));
         assert!(app.palette_entries().is_empty());
         assert_eq!(app.palette.selected, None);
         drop(app.update(Message::Palette(Action::Submit)));
         drop(app.update(queued));
-        assert!(app.channel_work_is_main());
+        assert!(app.context_inspector_open && app.context_inspector_is_overlay());
+        assert_eq!(app.workspace.focused(), focused);
         assert_eq!(
             diagnostic_cursor(&app, card),
             Some(crate::lsp::LspPosition::new(0, 0))
@@ -2638,7 +2648,11 @@ mod tests {
 
         let owner = app.channel_work.view.owner().unwrap();
         drop(app.update_channel_work(crate::channel_work_ui::Action::Close(owner)));
-        assert!(!app.channel_work_is_main());
+        assert!(!app.context_inspector_open);
+        drop(app.advance_context_inspector_transition(Instant::now() + DIALOG_TRANSITION_DURATION));
+        assert!(!app.context_inspector_is_overlay());
+        assert!(app.workspace_surfaces_visible());
+        assert_eq!(app.workspace.focused(), focused);
         drop(app.update_palette(Action::Open));
         drop(app.update_palette(Action::Query(">Next diagnostic".into())));
         let message = click_diagnostic_palette_row(&app, card, true);

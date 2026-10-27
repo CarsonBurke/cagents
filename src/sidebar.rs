@@ -449,7 +449,6 @@ pub struct SidebarChannel {
     pub deletion: Option<RowDeletion>,
     folded_title: Box<str>,
     open_id: Id,
-    delete_id: Id,
     delete_name: Box<str>,
     accessible_name: Box<str>,
     tooltip: Box<str>,
@@ -515,7 +514,6 @@ impl SidebarChannel {
             deletion: None,
             folded_title: fold(&title),
             open_id: entity_id("channel.open", id),
-            delete_id: entity_id("channel.delete", id),
             delete_name: format!("Delete channel {title}").into_boxed_str(),
             accessible_name: format!(
                 "Open channel {title}, {contents}{}{}",
@@ -798,8 +796,6 @@ impl SidebarWorktree {
             folded_path: fold(&path.to_string_lossy()),
             folded_pr_title: None,
             open_id: entity_id("worktree.open", id),
-            delete_id: entity_id("worktree.delete", id),
-            delete_name: format!("Delete merged worktree {label}").into_boxed_str(),
             paneless_accessible_name: paneless_name(&accessible_name),
             accessible_name: accessible_name.into_boxed_str(),
             tooltip: format!(
@@ -968,7 +964,6 @@ impl SidebarWorktree {
         let label = worktree_display_name(&self.path, self.branch.as_deref(), self.detached);
         if label != self.chrome.label.as_ref() {
             self.chrome.folded_label = fold(&label);
-            self.chrome.delete_name = format!("Delete merged worktree {label}").into_boxed_str();
             self.chrome.label = label.into();
         }
         self.chrome.dirty_badge =
@@ -1091,8 +1086,6 @@ struct WorktreeChrome {
     folded_path: Box<str>,
     folded_pr_title: Option<Box<str>>,
     open_id: Id,
-    delete_id: Id,
-    delete_name: Box<str>,
     label: Box<str>,
     accessible_name: Box<str>,
     /// `accessible_name` for the row with nothing open, which is most rows in
@@ -2828,6 +2821,7 @@ impl Eq for AttentionProjection {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SidebarState {
+    channel_actions: Option<(ChannelId, u32)>,
     rows: selection::Selection,
     query: String,
     filter: SidebarFilter,
@@ -3851,10 +3845,35 @@ impl SidebarState {
         !self.collapsed_projects.contains(&project)
     }
 
-    /// Applies only local, pure presentation transitions. Commands such as
-    /// opening a worktree, staging, or pushing remain for the application.
+    /// The exact channel incarnation whose menu is open.
+    pub fn channel_actions_open(&self, channel: ChannelId, ordinal: u32) -> bool {
+        self.channel_actions == Some((channel, ordinal))
+    }
+
+    /// Applies only local presentation transitions; commands stay in the app.
     pub fn apply(&mut self, action: &SidebarAction) {
+        if !matches!(
+            action,
+            SidebarAction::ChannelActions { .. } | SidebarAction::CloseChannelActions { .. }
+        ) {
+            self.channel_actions = None;
+        }
         match action {
+            SidebarAction::ChannelActions {
+                channel_id,
+                creation_ordinal,
+                open,
+            } => {
+                self.channel_actions = open.then_some((*channel_id, *creation_ordinal));
+            }
+            SidebarAction::CloseChannelActions {
+                channel_id,
+                creation_ordinal,
+            } => {
+                if self.channel_actions == Some((*channel_id, *creation_ordinal)) {
+                    self.channel_actions = None;
+                }
+            }
             SidebarAction::SearchChanged(query) => self.query.clone_from(query),
             SidebarAction::SetFilter(filter) => self.set_filter(*filter),
             SidebarAction::HideReadAttention => self.retained_attention.clear(),
@@ -4100,6 +4119,15 @@ pub enum ChangeGroupCommand {
 /// Not `Eq`: the resize request carries a width, and widths are measurements.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SidebarAction {
+    ChannelActions {
+        channel_id: ChannelId,
+        creation_ordinal: u32,
+        open: bool,
+    },
+    CloseChannelActions {
+        channel_id: ChannelId,
+        creation_ordinal: u32,
+    },
     ChangeGroup {
         key: ActiveWorktreeKey,
         area: ChangeArea,
@@ -4493,6 +4521,7 @@ pub struct NavigationCache(std::cell::RefCell<(Option<NavigationSnapshot>, u64)>
 /// Keeping them out of this snapshot bounds comparisons and copies by the
 /// number of navigation entities, even in a very large repository.
 struct NavigationSnapshot {
+    channel_actions: Option<(ChannelId, u32)>,
     projects: Vec<SidebarProject>,
     editors: Vec<SidebarEditor>,
     rows: selection::Selection,
@@ -4515,7 +4544,8 @@ struct NavigationSnapshot {
 
 impl NavigationSnapshot {
     fn matches(&self, model: &SidebarModel, state: &SidebarState) -> bool {
-        self.projects == model.projects
+        self.channel_actions == state.channel_actions
+            && self.projects == model.projects
             && self.editors == model.external_editors
             && self.rows == state.rows
             && self.query == state.query
@@ -4537,6 +4567,7 @@ impl NavigationSnapshot {
 
     fn capture(model: &SidebarModel, state: &SidebarState) -> Self {
         Self {
+            channel_actions: state.channel_actions,
             projects: model.projects.clone(),
             editors: model.external_editors.clone(),
             rows: state.rows.clone(),
@@ -6207,7 +6238,7 @@ fn project_view<'a>(
                 crate::workspace_model::NavigationItem::Channel(channel.id),
                 SelectionRow::Channel(channel.id),
                 RowInteraction::selectable(
-                    channel_view(
+                    channel_view_with_actions(
                         channel,
                         project.state.channel_listing(channel),
                         modal_open,
@@ -6217,6 +6248,7 @@ fn project_view<'a>(
                             .rows
                             .group_size(SelectionRow::Channel(channel.id)),
                         &project.state.query,
+                        project.state.channel_actions == Some((channel.id, channel.ordinal)),
                     ),
                     SelectionRow::Channel(channel.id),
                     project.state,
@@ -6505,7 +6537,7 @@ fn compact_project<'a>(
         members.push((
             SelectionRow::Channel(channel.id),
             RowInteraction::selectable(
-                channel_view(
+                channel_view_with_actions(
                     channel,
                     project.state.channel_listing(channel),
                     modal_open,
@@ -6515,6 +6547,7 @@ fn compact_project<'a>(
                         .rows
                         .group_size(SelectionRow::Channel(channel.id)),
                     &project.state.query,
+                    project.state.channel_actions == Some((channel.id, channel.ordinal)),
                 ),
                 SelectionRow::Channel(channel.id),
                 project.state,
@@ -6704,17 +6737,35 @@ fn worktree_glyph_tone(pull_request: Option<PullRequestTone>, ink: RowInk) -> Gl
     }
 }
 
-/// The one live indicator a channel row shows in its reserved slot.
-///
-/// Attention outranks the chat count: a channel whose agent is working or
-/// waiting is the reason to look at the sidebar at all, and the count stays in
-/// the row's accessible name and tooltip either way.
+/// Channel activity has one small stable slot. Conversation counts belong to
+/// the row's explicit accessible name and tooltip, not an unlabeled badge that
+/// changes meaning when an agent starts or an unread update arrives.
 fn channel_indicator(
     channel: &SidebarChannel,
-    compact: bool,
+    _compact: bool,
 ) -> Option<Element<'static, SidebarAction>> {
-    attention_indicator(channel.attention, compact)
-        .or_else(|| (channel.chats > 1).then(|| design::caption(channel.chats.to_string()).into()))
+    let state = channel.attention.state()?;
+    let indicator = match state {
+        AttentionState::Working => {
+            crate::ui_controls::activity_spinner(f32::from(ROW_ICON_SIZE), design::warning_color)
+                .into()
+        }
+        AttentionState::Waiting => status_icon(
+            Icon::Warning,
+            "An agent is waiting for input",
+            BadgeTone::Warning,
+        ),
+        AttentionState::Failed => {
+            status_icon(Icon::Error, "Unread failed agent update", BadgeTone::Danger)
+        }
+        AttentionState::Unread => {
+            status_icon(Icon::Attention, "Unread agent update", BadgeTone::Neutral)
+        }
+    };
+    Some(crate::interaction::tooltip(
+        indicator,
+        channel.attention.description(),
+    ))
 }
 
 /// Waiting is a live state, independent of whether its notification was read.
@@ -6833,6 +6884,15 @@ fn with_deletion_name<'a>(
     }
 }
 
+pub fn channel_more_focus_id(channel: ChannelId, ordinal: u32) -> Id {
+    Id::new(format!("channel.more-{channel}-{ordinal}"))
+}
+
+pub fn channel_delete_focus_id(channel: ChannelId, ordinal: u32) -> Id {
+    Id::new(format!("channel.delete-{channel}-{ordinal}"))
+}
+
+#[cfg(test)]
 fn channel_view(
     channel: &SidebarChannel,
     listing: Listing,
@@ -6840,6 +6900,26 @@ fn channel_view(
     compact: bool,
     selection_count: Option<usize>,
     query: &str,
+) -> Element<'static, SidebarAction> {
+    channel_view_with_actions(
+        channel,
+        listing,
+        modal_open,
+        compact,
+        selection_count,
+        query,
+        false,
+    )
+}
+
+fn channel_view_with_actions(
+    channel: &SidebarChannel,
+    listing: Listing,
+    modal_open: bool,
+    compact: bool,
+    selection_count: Option<usize>,
+    query: &str,
+    actions_open: bool,
 ) -> Element<'static, SidebarAction> {
     let grid = RowGrid::child(compact);
     let deletion = channel.deletion.as_ref();
@@ -6898,18 +6978,55 @@ fn channel_view(
             },
             inert,
         ));
-    let action = row_quick_delete(
-        crate::interaction::tooltip(action, channel.tooltip.to_string()),
-        &channel.delete_name,
-        gated(
-            SidebarAction::DeleteChannel {
-                channel_id: channel.id,
-            },
-            inert,
-        ),
-        channel.delete_id.clone(),
-        compact,
-    );
+    let action = crate::interaction::tooltip(action, channel.tooltip.to_string());
+    let action = if compact {
+        action
+    } else {
+        let close = SidebarAction::CloseChannelActions {
+            channel_id: channel.id,
+            creation_ordinal: channel.ordinal,
+        };
+        let more = button::icon(Icon::More)
+            .class(sidebar_button_style(false))
+            .id(channel_more_focus_id(channel.id, channel.ordinal))
+            .name(format!("Actions for channel {}", channel.title))
+            .width(24.0)
+            .height(WORKTREE_ROW_HEIGHT)
+            .padding(0)
+            .on_press_maybe(gated(
+                SidebarAction::ChannelActions {
+                    channel_id: channel.id,
+                    creation_ordinal: channel.ordinal,
+                    open: !actions_open,
+                },
+                inert,
+            ));
+        let popup = (actions_open && !inert).then(|| {
+            let delete = crate::ui_controls::button::quiet("Delete channel…")
+                .id(channel_delete_focus_id(channel.id, channel.ordinal))
+                .name(format!("{}…", channel.delete_name))
+                .width(Length::Fill)
+                .on_press(SidebarAction::DeleteChannel {
+                    channel_id: channel.id,
+                });
+            crate::interaction::focused_escape(widget::container(delete).width(180.0), {
+                let close = close.clone();
+                move || close.clone()
+            })
+        });
+        let actions = crate::interaction::composer_popover(
+            crate::interaction::tooltip(more, "Channel actions"),
+            popup,
+            close,
+        );
+        // Both buttons have permanent measured slots. Hover, activity and keyboard
+        // focus cannot move the title, replace its status, or expose a destructive
+        // action directly beneath a navigation click.
+        widget::row::with_children(vec![action, actions])
+            .align_y(Alignment::Center)
+            .width(Length::Fill)
+            .into()
+    };
     crate::reorder::channel_target(
         grid.mount(with_deletion_retry(
             channel_context_controls(action, channel.id, inert, selection_count),
@@ -6927,40 +7044,6 @@ fn channel_view(
         channel.id,
         !inert,
     )
-}
-
-/// Keep the row's primary button and its destructive quick action separate.
-/// The compact rail reuses its indicator slot while hovered; an expanded row
-/// reserves the button width so the label continues to ellipsize correctly.
-fn row_quick_delete<'a>(
-    content: Element<'static, SidebarAction>,
-    label: &str,
-    action: Option<SidebarAction>,
-    id: Id,
-    compact: bool,
-) -> Element<'static, SidebarAction> {
-    let width = if compact {
-        ROW_STATUS_WIDTH
-    } else {
-        ICON_CONTROL_SIZE
-    };
-    let control = button::icon(Icon::Delete)
-        .class(sidebar_button_style(false))
-        .id(id)
-        .name(label.to_owned())
-        .width(width)
-        .height(WORKTREE_ROW_HEIGHT)
-        .padding(0)
-        .on_press_maybe(action);
-    let controls = widget::container(
-        widget::container(crate::interaction::tooltip(control, label.to_owned()))
-            .class(theme::Container::Primary)
-            .width(width)
-            .height(WORKTREE_ROW_HEIGHT),
-    )
-    .align_right(Length::Fill)
-    .into();
-    RowInteraction::actions(content, controls, if compact { 0.0 } else { width })
 }
 
 /// The commands a channel row offers on right-click.
@@ -6995,14 +7078,6 @@ fn channel_context_controls<'a>(
             entries.insert(
                 0,
                 Item::Button(
-                    "Channel work".into(),
-                    None,
-                    ChannelContextCommand(channel_id, false, ChannelMenuCommand::Work),
-                ),
-            );
-            entries.insert(
-                0,
-                Item::Button(
                     "Rename channel…".into(),
                     None,
                     ChannelContextCommand(channel_id, false, ChannelMenuCommand::Rename),
@@ -7029,7 +7104,6 @@ struct ChannelContextCommand(ChannelId, bool, ChannelMenuCommand);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChannelMenuCommand {
-    Work,
     Delete,
     Rename,
     MarkRead,
@@ -7040,9 +7114,6 @@ impl widget::menu::Action for ChannelContextCommand {
 
     fn message(&self) -> SidebarAction {
         match self.2 {
-            ChannelMenuCommand::Work => {
-                return SidebarAction::OpenChannelWork { channel_id: self.0 };
-            }
             ChannelMenuCommand::Rename => return SidebarAction::RenameChannel(self.0),
             ChannelMenuCommand::MarkRead => return SidebarAction::MarkChannelRead(self.0),
             ChannelMenuCommand::Delete => {}
@@ -7311,28 +7382,8 @@ fn worktree_view<'a>(
         crate::interaction::hover(action)
     };
     let action = crate::interaction::tooltip(action, chrome.tooltip.to_string());
-    let action = if !primary
-        && worktree
-            .pull_request()
-            .is_some_and(|pr| pr.state == Some(WorktreePullRequestState::Merged))
-    {
-        row_quick_delete(
-            action,
-            &chrome.delete_name,
-            gated(
-                SidebarAction::ProjectCommand {
-                    project_id,
-                    worktree_id: Some(worktree.id),
-                    command: ProjectCommand::Delete,
-                },
-                inert,
-            ),
-            chrome.delete_id.clone(),
-            compact,
-        )
-    } else {
-        action
-    };
+    // Deletion is an intentional context-menu or focused-row command. A
+    // merged PR must not turn the status slot into a hover-only trash target.
     grid.mount(with_deletion_retry(
         context_controls(
             action,
@@ -13647,75 +13698,268 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn channel_hover_delete_targets_its_row_without_opening_it_in_both_densities() {
-        use cosmic::iced::{
-            Event, Point, Rectangle,
-            advanced::{Shell, clipboard},
-            mouse,
-        };
+    fn channel_more_exposes_confirmation_gated_delete_without_hover_or_navigation() {
+        use cosmic::iced::{self, Event, keyboard, mouse};
+        use iced::advanced::widget::operation;
         let channel = SidebarChannel::new(
             ChannelId::new(),
             "Investigation".into(),
             false,
             None,
             false,
-            1,
+            2,
             true,
-            1,
+            7,
         );
-        for (compact, modal) in [(false, false), (true, false), (false, true), (true, true)] {
-            let renderer = headless_renderer();
-            let mut element = channel_view(&channel, Listing::Live, modal, compact, Some(1), "");
-            let mut tree = Tree::new(&element);
-            let width = if compact { COMPACT_ROW_WIDTH } else { 240.0 };
-            let viewport = Rectangle::with_size(Size::new(width, WORKTREE_ROW_HEIGHT));
-            let limits = layout::Limits::new(Size::ZERO, viewport.size());
-            let node = element
-                .as_widget_mut()
-                .layout(&mut tree, &renderer, &limits);
-            let cursor = mouse::Cursor::Available(Point::new(width - 8.0, 16.0));
-            let mut messages = Vec::new();
-            element.as_widget_mut().update(
-                &mut tree,
-                &Event::Mouse(mouse::Event::CursorMoved {
-                    position: cursor.position().unwrap(),
-                }),
-                Layout::new(&node),
-                cursor,
-                &renderer,
-                &mut clipboard::Null,
-                &mut Shell::new(&mut messages),
-                &viewport,
+        let mut renderer = headless_renderer();
+        let enter = Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        });
+        let mut state = SidebarState::default();
+        let model = SidebarModel::ready(SidebarMode::Expanded, Vec::new());
+        let navigation = NavigationCache::default();
+        let closed_generation = navigation.generation(&model, &state);
+        state.apply(&SidebarAction::ChannelActions {
+            channel_id: channel.id,
+            creation_ordinal: 7,
+            open: true,
+        });
+        assert_ne!(
+            navigation.generation(&model, &state),
+            closed_generation,
+            "opening the menu invalidates the actual cached navigation subtree"
+        );
+        state.apply(&SidebarAction::CloseChannelActions {
+            channel_id: channel.id,
+            creation_ordinal: 7,
+        });
+        let mut cache = iced::runtime::user_interface::Cache::new();
+        for open in [false, true] {
+            let mut ui = iced::runtime::UserInterface::build(
+                channel_view_with_actions(&channel, Listing::Live, false, false, Some(1), "", open),
+                Size::new(240.0, 200.0),
+                cache,
+                &mut renderer,
             );
-            let node = element
-                .as_widget_mut()
-                .layout(&mut tree, &renderer, &limits);
-            for event in [
-                mouse::Event::ButtonPressed(mouse::Button::Left),
-                mouse::Event::ButtonReleased(mouse::Button::Left),
+            ui.draw(
+                &mut renderer,
+                &cosmic::theme::active(),
+                &iced::advanced::renderer::Style::default(),
+                mouse::Cursor::Unavailable,
+            );
+            let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+            let delete = nodes.root().iter().chain(nodes.children()).find(|n| {
+                n.node().role() == iced_accessibility::accesskit::Role::Button
+                    && n.node().label() == Some("Delete channel Investigation…")
+            });
+            assert_eq!(
+                delete.is_some(),
+                open,
+                "Delete is exposed only after intentional More"
+            );
+            if let Some(node) = delete {
+                let bounds = node.node().bounds().unwrap();
+                assert!(bounds.x1 > bounds.x0 && bounds.y1 > bounds.y0);
+            }
+            let id = if open {
+                channel_delete_focus_id(channel.id, channel.ordinal)
+            } else {
+                channel_more_focus_id(channel.id, channel.ordinal)
+            };
+            ui.operate(&renderer, &mut operation::focusable::focus::<()>(id));
+            let mut messages = Vec::new();
+            ui.update(
+                &[enter.clone()],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut messages,
+            );
+            let expected = if open {
+                SidebarAction::DeleteChannel {
+                    channel_id: channel.id,
+                }
+            } else {
+                SidebarAction::ChannelActions {
+                    channel_id: channel.id,
+                    creation_ordinal: 7,
+                    open: true,
+                }
+            };
+            assert_eq!(
+                messages,
+                vec![expected.clone()],
+                "native Enter must never open the row underneath"
+            );
+            state.apply(&expected);
+            assert_eq!(state.channel_actions_open(channel.id, 7), !open);
+            cache = ui.into_cache();
+        }
+        state.apply(&SidebarAction::ChannelActions {
+            channel_id: channel.id,
+            creation_ordinal: 8,
+            open: true,
+        });
+        state.apply(&SidebarAction::CloseChannelActions {
+            channel_id: channel.id,
+            creation_ordinal: 7,
+        });
+        assert!(
+            state.channel_actions_open(channel.id, 8),
+            "stale close cannot close replacement incarnation"
+        );
+        state.apply(&SidebarAction::OpenChannel {
+            channel_id: channel.id,
+        });
+        assert!(
+            !state.channel_actions_open(channel.id, 8),
+            "navigation retires the menu"
+        );
+        for compact in [false, true] {
+            let blocked = channel_view_with_actions(
+                &channel,
+                Listing::Live,
+                true,
+                compact,
+                Some(1),
+                "",
+                true,
+            );
+            assert!(
+                frame_enter_presses(&renderer, blocked).is_empty(),
+                "a modal blocks every row action"
+            );
+        }
+    }
+
+    #[test]
+    fn channel_title_status_and_more_bounds_stay_fixed_across_hover_activity_and_chat_counts() {
+        use cosmic::iced::{
+            Event, Point, Rectangle,
+            advanced::{Shell, clipboard, widget::Operation},
+            mouse,
+        };
+        #[derive(Default)]
+        struct Bounds(BTreeMap<String, Rectangle>, Vec<Rectangle>);
+        impl Operation for Bounds {
+            fn traverse(&mut self, f: &mut dyn FnMut(&mut dyn Operation)) {
+                f(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&Id>,
+                bounds: Rectangle,
+                _: &mut dyn cosmic::iced::advanced::widget::operation::Focusable,
+            ) {
+                if let Some(id) = id {
+                    self.0.insert(id.to_string(), bounds);
+                }
+            }
+            fn text(&mut self, _: Option<&Id>, bounds: Rectangle, text: &str) {
+                if text.contains("Investigation") {
+                    self.1.push(bounds);
+                }
+            }
+        }
+        let renderer = headless_renderer();
+        for width in [160.0, 240.0, 480.0] {
+            let mut previous = None;
+            for attention in [
+                AttentionSummary::default(),
+                AttentionSummary {
+                    working: 1,
+                    ..Default::default()
+                },
+                AttentionSummary {
+                    waiting: 1,
+                    unread: 2,
+                    ..Default::default()
+                },
+                AttentionSummary {
+                    failed: 1,
+                    unread: 2,
+                    ..Default::default()
+                },
             ] {
+                let channel = SidebarChannel::new(
+                    ChannelId::from_uuid(Uuid::from_u128(900)),
+                    "Investigation with a long channel name and Unicode 水".into(),
+                    true,
+                    attention.activity(),
+                    false,
+                    2,
+                    true,
+                    1,
+                )
+                .with_attention(attention);
+                assert!(channel.accessible_name.contains("2 chats"));
+                assert!(channel.tooltip.contains("2 chats"));
+                let mut element = channel_view(&channel, Listing::Live, false, false, Some(1), "");
+                let mut tree = Tree::new(&element);
+                let viewport = Rectangle::with_size(Size::new(width, WORKTREE_ROW_HEIGHT));
+                let limits = layout::Limits::new(Size::ZERO, viewport.size());
+                let mut node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let mut before = Bounds::default();
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut before,
+                );
+                let more =
+                    before.0[&channel_more_focus_id(channel.id, channel.ordinal).to_string()];
+                let row = before.0[&channel.open_id.to_string()];
+                assert_eq!(more.width, 24.0);
+                assert!(more.x >= row.x + row.width && more.x + more.width <= width + 0.01);
+                assert!(!before.1.is_empty(), "real mounted title text");
+                assert!(
+                    before
+                        .1
+                        .iter()
+                        .all(|b| b.width > 20.0 && b.x + b.width <= row.x + row.width)
+                );
+                if let Some((old_row, old_more, ref old_text)) = previous {
+                    assert_eq!((row, more, &before.1), (old_row, old_more, old_text));
+                }
+                previous = Some((row, more, before.1.clone()));
+                let mut messages = Vec::new();
                 element.as_widget_mut().update(
                     &mut tree,
-                    &Event::Mouse(event),
+                    &Event::Mouse(mouse::Event::CursorMoved {
+                        position: Point::new(width - 8.0, 16.0),
+                    }),
                     Layout::new(&node),
-                    cursor,
+                    mouse::Cursor::Available(Point::new(width - 8.0, 16.0)),
                     &renderer,
                     &mut clipboard::Null,
                     &mut Shell::new(&mut messages),
                     &viewport,
                 );
+                node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let mut after = Bounds::default();
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut after,
+                );
+                assert_eq!(before.0, after.0);
+                assert_eq!(before.1, after.1);
+                assert!(
+                    messages.is_empty(),
+                    "hover never publishes deletion/navigation"
+                );
             }
-            assert_eq!(
-                messages,
-                if modal {
-                    Vec::new()
-                } else {
-                    vec![SidebarAction::DeleteChannel {
-                        channel_id: channel.id,
-                    }]
-                },
-                "compact={compact}, modal={modal}"
-            );
         }
     }
 
@@ -13780,15 +14024,15 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn only_merged_nonprimary_worktree_rows_expose_delete_quick_action() {
+    fn worktree_pr_lifecycle_never_replaces_status_with_hover_delete() {
         let renderer = headless_renderer();
         let mut worktree = worktree(3, "feature", false);
         let mut pr = project().pull_requests.remove(0);
-        for (state, primary, expected) in [
-            (WorktreePullRequestState::Open, false, false),
-            (WorktreePullRequestState::Closed, false, false),
-            (WorktreePullRequestState::Merged, true, false),
-            (WorktreePullRequestState::Merged, false, true),
+        for (state, primary) in [
+            (WorktreePullRequestState::Open, false),
+            (WorktreePullRequestState::Closed, false),
+            (WorktreePullRequestState::Merged, true),
+            (WorktreePullRequestState::Merged, false),
         ] {
             pr.state = Some(state);
             worktree.set_pull_request(pr.clone());
@@ -13823,7 +14067,10 @@ pub(crate) mod tests {
                     .label()
                     .is_some_and(|name| name == "Delete merged worktree feature")
             });
-            assert_eq!(has_delete, expected, "{state:?}, primary={primary}");
+            assert!(
+                !has_delete,
+                "deletion needs an explicit menu/keyboard intent: {state:?}, primary={primary}"
+            );
         }
     }
 

@@ -1,0 +1,829 @@
+//! Real adapter request/response fixtures. No app-server or provider is started.
+use super::*;
+use crate::chat::goal::{Operation, ReadState, Snapshot, Status, Support};
+
+fn adapter() -> Codex {
+    // Codex owns alias cleanup through Drop; struct update cannot move its
+    // non-Copy fields out of a temporary default value.
+    let mut adapter = Codex::default();
+    adapter.thread = Some("thread-exact".into());
+    adapter.cwd = PathBuf::from("/tmp");
+    adapter.expected_home = std::fs::canonicalize("/tmp").unwrap();
+    adapter.ready = true;
+    adapter.attached = true;
+    adapter.direct_input = true;
+    adapter.goal_resume_admission = GoalResumeAdmission::OriginalScope;
+    adapter
+}
+
+fn raw_goal(thread: &str, objective: &str, status: &str) -> Value {
+    json!({"threadId":thread,"objective":objective,"status":status,
+        "tokenBudget":null,"tokensUsed":17,"timeUsedSeconds":4,
+        "createdAt":50,"updatedAt":2})
+}
+
+fn snapshot(adapter: &mut Codex) -> Snapshot {
+    adapter.goal_state().unwrap().snapshot()
+}
+
+fn published(step: &Step) -> &Snapshot {
+    step.events
+        .iter()
+        .find_map(|event| match event {
+            Event::Goal(snapshot) => Some(snapshot),
+            _ => None,
+        })
+        .expect("actual adapter must publish its goal observation")
+}
+
+fn command(adapter: &mut Codex, operation: Operation) -> Step {
+    let observed = snapshot(adapter);
+    adapter
+        .command(Command::Goal {
+            thread_id: observed.thread_id,
+            revision: observed.revision,
+            operation,
+        })
+        .unwrap()
+}
+
+fn attach(adapter: &mut Codex) -> Step {
+    let initialize = adapter.initialize().unwrap();
+    let initialized = adapter
+        .receive(json!({"id":initialize.writes[0]["id"],
+        "result":{"codexHome":adapter.expected_home,"userAgent":"fixture"}}))
+        .unwrap();
+    let resume = initialized
+        .writes
+        .iter()
+        .find(|frame| frame["method"] == "thread/resume")
+        .unwrap();
+    assert_eq!(resume["params"]["threadId"], "thread-exact");
+    let attached = adapter
+        .receive(json!({"id":resume["id"],"result":{
+        "thread":{"id":"thread-exact","canAcceptDirectInput":true,"status":{"type":"idle"}},
+        "initialTurnsPage":{"data":[],"nextCursor":null}}}))
+        .unwrap();
+    let skills = initialized
+        .writes
+        .iter()
+        .find(|frame| frame["method"] == "skills/list")
+        .unwrap();
+    adapter
+        .receive(json!({"id":skills["id"],"result":{"data":[]}}))
+        .unwrap();
+    assert!(adapter.ready);
+    attached
+}
+
+#[test]
+fn goal_work_respects_direct_input_while_exact_read_and_stop_remain_usable() {
+    let mut adapter = adapter();
+    adapter.direct_input = false;
+    for operation in [
+        Operation::SetObjective("Do more work".into()),
+        Operation::Resume,
+    ] {
+        let before = snapshot(&mut adapter);
+        assert!(
+            adapter
+                .command(Command::Goal {
+                    thread_id: before.thread_id,
+                    revision: before.revision,
+                    operation,
+                })
+                .unwrap_err()
+                .contains("does not accept new goal work")
+        );
+        assert!(adapter.pending.is_empty());
+        assert!(!snapshot(&mut adapter).pending);
+    }
+    for (operation, reply) in [
+        (
+            Operation::Get,
+            json!({"goal":raw_goal("thread-exact","Original objective","active")}),
+        ),
+        (
+            Operation::Pause,
+            json!({"goal":raw_goal("thread-exact","Original objective","paused")}),
+        ),
+        (Operation::Clear, json!({"cleared":true})),
+    ] {
+        let issued = command(&mut adapter, operation);
+        assert_eq!(issued.writes.len(), 1);
+        assert_ne!(issued.writes[0]["method"], "turn/start");
+        let result = adapter
+            .receive(json!({"id":issued.writes[0]["id"],"result":reply}))
+            .unwrap();
+        assert!(!published(&result).pending);
+    }
+}
+
+#[test]
+fn native_goal_commands_correlate_exact_thread_and_publish_only_actual_responses() {
+    let mut adapter = adapter();
+    for (operation, method, reply) in [
+        (Operation::Get, "thread/goal/get", json!({"goal":null})),
+        (
+            Operation::SetObjective("Finish 🦀 safely".into()),
+            "thread/goal/set",
+            json!({"goal":raw_goal("thread-exact","Finish 🦀 safely","active")}),
+        ),
+        (
+            Operation::Pause,
+            "thread/goal/set",
+            json!({"goal":raw_goal("thread-exact","Finish 🦀 safely","paused")}),
+        ),
+        (
+            Operation::Resume,
+            "thread/goal/set",
+            json!({"goal":raw_goal("thread-exact","Finish 🦀 safely","complete")}),
+        ),
+        (
+            Operation::Clear,
+            "thread/goal/clear",
+            json!({"cleared":true}),
+        ),
+    ] {
+        let before = snapshot(&mut adapter);
+        let issued = command(&mut adapter, operation.clone());
+        assert_eq!(issued.writes.len(), 1);
+        let frame = &issued.writes[0];
+        assert_eq!(frame["method"], method);
+        assert_eq!(frame["params"]["threadId"], "thread-exact");
+        assert!(frame["params"].get("tokenBudget").is_none());
+        if !matches!(operation, Operation::SetObjective(_)) {
+            assert!(frame["params"].get("objective").is_none());
+        }
+        assert_eq!(
+            published(&issued).read,
+            before.read,
+            "dispatch is not confirmation"
+        );
+        assert!(published(&issued).pending);
+        assert!(command_busy(&mut adapter));
+        let received = adapter
+            .receive(json!({"id":frame["id"],"result":reply}))
+            .unwrap();
+        let actual = published(&received);
+        assert!(!actual.pending);
+        assert!(!actual.uncertain);
+        assert_eq!(actual.support, Support::Supported);
+        if operation == Operation::Resume {
+            assert!(
+                matches!(&actual.read, ReadState::Known(Some(goal)) if goal.status == Status::Complete)
+            );
+        }
+        assert!(
+            received.writes.is_empty(),
+            "no automatic turn, goal retry or prompt"
+        );
+    }
+    assert_eq!(snapshot(&mut adapter).read, ReadState::Known(None));
+}
+
+fn command_busy(adapter: &mut Codex) -> bool {
+    let current = snapshot(adapter);
+    adapter
+        .command(Command::Goal {
+            thread_id: current.thread_id,
+            revision: current.revision,
+            operation: Operation::Get,
+        })
+        .is_err()
+}
+
+#[test]
+fn notification_wins_over_early_reply_without_releasing_physical_slot_or_newer_request() {
+    let mut adapter = adapter();
+    let issued = command(&mut adapter, Operation::SetObjective("original".into()));
+    let observed = adapter
+        .receive(json!({"method":"thread/goal/updated","params":{
+        "threadId":"thread-exact","goal":raw_goal("thread-exact","newer","blocked")}}))
+        .unwrap();
+    assert!(published(&observed).pending);
+    assert!(command_busy(&mut adapter));
+    let released = adapter
+        .receive(json!({"id":issued.writes[0]["id"],"result":{
+        "goal":raw_goal("thread-exact","original","active")}}))
+        .unwrap();
+    assert!(
+        matches!(&published(&released).read, ReadState::Known(Some(goal)) if goal.objective == "newer")
+    );
+    assert!(!published(&released).pending);
+    let next = command(&mut adapter, Operation::Clear);
+    assert!(
+        adapter
+            .receive(json!({"id":issued.writes[0]["id"],"result":{"goal":null}}))
+            .is_err()
+    );
+    assert!(
+        snapshot(&mut adapter).pending,
+        "duplicate old reply cannot release successor"
+    );
+    let cleared = adapter
+        .receive(json!({"method":"thread/goal/cleared","params":{"threadId":"thread-exact"}}))
+        .unwrap();
+    assert_eq!(published(&cleared).read, ReadState::Known(None));
+    assert!(published(&cleared).pending);
+    let stale = adapter
+        .receive(json!({"id":next.writes[0]["id"],"result":{"cleared":false}}))
+        .unwrap();
+    assert_eq!(published(&stale).read, ReadState::Known(None));
+    assert!(!published(&stale).uncertain);
+    assert!(!published(&stale).pending);
+}
+
+#[test]
+fn queued_controls_require_current_observation_even_after_response_only_replacement() {
+    let mut adapter = adapter();
+    let get = command(&mut adapter, Operation::Get);
+    adapter.receive(json!({"id":get.writes[0]["id"],"result":{"goal":raw_goal("thread-exact","A","paused")}})).unwrap();
+    let old = snapshot(&mut adapter);
+    let set = command(&mut adapter, Operation::SetObjective("B".into()));
+    adapter.receive(json!({"id":set.writes[0]["id"],"result":{"goal":raw_goal("thread-exact","B","active")}})).unwrap();
+    assert!(
+        adapter
+            .command(Command::Goal {
+                thread_id: old.thread_id,
+                revision: old.revision,
+                operation: Operation::Clear
+            })
+            .is_err()
+    );
+    let current = snapshot(&mut adapter);
+    assert!(
+        adapter
+            .command(Command::Goal {
+                thread_id: "foreign".into(),
+                revision: current.revision,
+                operation: Operation::Clear
+            })
+            .is_err()
+    );
+    assert_eq!(snapshot(&mut adapter), current);
+    assert_eq!(
+        command(&mut adapter, Operation::Clear).writes[0]["method"],
+        "thread/goal/clear"
+    );
+}
+
+#[test]
+fn malformed_current_observations_invalidate_cache_but_foreign_threads_do_not() {
+    let mut adapter = adapter();
+    let read = command(&mut adapter, Operation::Get);
+    adapter.receive(json!({"id":read.writes[0]["id"],"result":{"goal":raw_goal("thread-exact","A","active")}})).unwrap();
+    let before = snapshot(&mut adapter);
+    let foreign = adapter
+        .receive(json!({"method":"thread/goal/updated","params":{
+        "threadId":"other","goal":raw_goal("other","foreign","complete")}}))
+        .unwrap();
+    assert!(foreign.events.is_empty());
+    assert_eq!(snapshot(&mut adapter), before);
+    let pending = command(&mut adapter, Operation::Get);
+    let invalid = adapter
+        .receive(json!({"method":"thread/goal/updated","params":{
+        "threadId":"thread-exact","goal":raw_goal("wrong-inner","foreign","complete")}}))
+        .unwrap();
+    assert_eq!(published(&invalid).read, ReadState::Unknown);
+    assert!(published(&invalid).pending);
+    assert!(
+        invalid
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Error { fatal: false, .. }))
+    );
+    let late = adapter
+        .receive(json!({"id":pending.writes[0]["id"],"result":{"goal":null}}))
+        .unwrap();
+    assert_eq!(published(&late).read, ReadState::Unknown);
+    assert!(!published(&late).pending);
+    let retry = command(&mut adapter, Operation::Get);
+    let malformed = adapter
+        .receive(json!({"id":retry.writes[0]["id"],"result":{
+        "goal":raw_goal("other","foreign","complete")}}))
+        .unwrap();
+    assert!(published(&malformed).uncertain);
+    assert_eq!(published(&malformed).read, ReadState::Unknown);
+    assert!(!published(&malformed).pending);
+    assert!(malformed.writes.is_empty());
+}
+
+#[test]
+fn attach_and_reconnect_read_optional_goal_without_blocking_unsupported_chat() {
+    let mut adapter = adapter();
+    let attached = attach(&mut adapter);
+    let read = attached
+        .writes
+        .iter()
+        .find(|frame| frame["method"] == "thread/goal/get")
+        .unwrap();
+    assert!(published(&attached).pending);
+    assert!(attached.writes.iter().all(|frame| !matches!(
+        frame["method"].as_str(),
+        Some("turn/start" | "thread/goal/set" | "thread/goal/clear")
+    )));
+    let unavailable = adapter
+        .receive(json!({"id":read["id"],"error":{"code":-32601,"message":"method not found"}}))
+        .unwrap();
+    assert_eq!(published(&unavailable).support, Support::Unsupported);
+    assert!(!published(&unavailable).uncertain);
+    assert!(
+        unavailable
+            .events
+            .iter()
+            .all(|event| !matches!(event, Event::Error { fatal: true, .. }))
+    );
+    assert!(adapter.ready);
+    assert!(
+        adapter
+            .command(Command::Goal {
+                thread_id: "thread-exact".into(),
+                revision: published(&unavailable).revision,
+                operation: Operation::SetObjective("No fallback".into())
+            })
+            .is_err()
+    );
+    let prompt = adapter
+        .command(Command::Prompt {
+            text: "ordinary chat".into(),
+            attachments: vec![],
+            mode: PromptMode::Send,
+        })
+        .unwrap();
+    assert_eq!(prompt.writes[0]["method"], "turn/start");
+    // A fresh handshake may be a newer app-server. Check, never replay mutations.
+    let reattached = attach(&mut adapter);
+    assert_eq!(
+        reattached
+            .writes
+            .iter()
+            .filter(|frame| frame["method"] == "thread/goal/get")
+            .count(),
+        1
+    );
+    assert!(reattached.writes.iter().all(|frame| !matches!(
+        frame["method"].as_str(),
+        Some("thread/goal/set" | "thread/goal/clear")
+    )));
+}
+
+#[test]
+fn reconnect_keeps_unresolved_goal_slot_and_never_replays_a_mutation() {
+    let mut adapter = adapter();
+    let issued = command(&mut adapter, Operation::Pause);
+    let attached = attach(&mut adapter);
+    assert!(published(&attached).pending);
+    assert_eq!(published(&attached).read, ReadState::Unknown);
+    assert!(attached.writes.iter().all(|frame| {
+        !frame["method"]
+            .as_str()
+            .unwrap()
+            .starts_with("thread/goal/")
+    }));
+    assert!(command_busy(&mut adapter));
+    let resolved = adapter
+        .receive(json!({"id":issued.writes[0]["id"],"error":{"code":-32000,"message":"unknown"}}))
+        .unwrap();
+    assert!(!published(&resolved).pending);
+    assert_eq!(published(&resolved).read, ReadState::Unknown);
+    assert!(resolved.writes.is_empty());
+    assert_eq!(
+        command(&mut adapter, Operation::Get).writes[0]["method"],
+        "thread/goal/get"
+    );
+}
+
+#[test]
+fn failed_request_admission_and_invalid_direct_objective_do_not_reserve_a_slot() {
+    let mut adapter = adapter();
+    let before = snapshot(&mut adapter);
+    assert!(
+        adapter
+            .command(Command::Goal {
+                thread_id: before.thread_id.clone(),
+                revision: before.revision,
+                operation: Operation::SetObjective("🦀".repeat(4_001))
+            })
+            .is_err()
+    );
+    assert_eq!(snapshot(&mut adapter), before);
+    for id in 0..MAX_PENDING {
+        adapter.pending.insert(id.to_string(), Pending::Other);
+    }
+    assert!(
+        adapter
+            .command(Command::Goal {
+                thread_id: before.thread_id.clone(),
+                revision: before.revision,
+                operation: Operation::Get
+            })
+            .is_err()
+    );
+    assert_eq!(snapshot(&mut adapter), before);
+    adapter.pending.clear();
+    adapter.next_id = u64::MAX;
+    assert!(
+        adapter
+            .command(Command::Goal {
+                thread_id: before.thread_id.clone(),
+                revision: before.revision,
+                operation: Operation::Get
+            })
+            .is_err()
+    );
+    assert_eq!(snapshot(&mut adapter), before);
+}
+
+/// The runtime cannot authenticate initialize's server identity until the
+/// initialize response is decoded. Unknown advisory must still allow this
+/// metadata request, without loading or resuming the retained thread.
+fn begin_legacy_restore(adapter: &mut Codex) -> Step {
+    adapter.set_goal_resume_admission(GoalResumeAdmission::Unavailable);
+    let initialize = adapter.initialize().unwrap();
+    let step = adapter
+        .receive(json!({"id":initialize.writes[0]["id"],"result":{
+            "codexHome":adapter.expected_home,"userAgent":"fixture"}}))
+        .unwrap();
+    assert!(adapter.server_identity().is_some());
+    assert!(!adapter.ready);
+    assert!(step.writes.iter().all(|frame| !matches!(
+        frame["method"].as_str(),
+        Some("thread/resume" | "thread/start" | "turn/start")
+    )));
+    assert_eq!(
+        step.writes
+            .iter()
+            .filter(|frame| frame["method"] == "thread/goal/get")
+            .count(),
+        1
+    );
+    step
+}
+
+#[test]
+fn legacy_restore_reads_before_resume_and_requires_positive_inactive_native_truth() {
+    for status in [
+        None,
+        Some("paused"),
+        Some("complete"),
+        Some("active"),
+        Some("blocked"),
+        Some("usageLimited"),
+        Some("budgetLimited"),
+    ] {
+        let mut adapter = adapter();
+        let initialized = begin_legacy_restore(&mut adapter);
+        let get = initialized
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "thread/goal/get")
+            .unwrap();
+        // Real runtime refresh occurs before this receive, after identity was
+        // established by the preceding initialize response.
+        adapter.set_goal_resume_admission(GoalResumeAdmission::InactiveOnly);
+        let result = adapter
+            .receive(json!({"id":get["id"],"result":{
+            "goal":status.map(|status| raw_goal("thread-exact", "Original goal", status))}}))
+            .unwrap();
+        let inactive = matches!(status, None | Some("paused" | "complete"));
+        assert_eq!(
+            result
+                .writes
+                .iter()
+                .any(|frame| frame["method"] == "thread/resume"),
+            inactive,
+            "{status:?}"
+        );
+        assert_eq!(adapter.goal_resume_pending, !inactive);
+        assert!(!adapter.ready, "metadata is not an attached native session");
+        assert!(result.writes.iter().all(|frame| !matches!(
+            frame["method"].as_str(),
+            Some("turn/start" | "thread/goal/set")
+        )));
+        assert!(
+            adapter
+                .command(Command::Prompt {
+                    text: "retain ordinary input".into(),
+                    attachments: vec![],
+                    mode: PromptMode::Send
+                })
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn blocked_legacy_restore_keeps_native_pause_and_clear_without_claiming_ready() {
+    for clear in [false, true] {
+        let mut adapter = adapter();
+        let initialized = begin_legacy_restore(&mut adapter);
+        let get = initialized
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "thread/goal/get")
+            .unwrap();
+        adapter.set_goal_resume_admission(GoalResumeAdmission::InactiveOnly);
+        let active = adapter
+            .receive(json!({"id":get["id"],"result":{
+            "goal":raw_goal("thread-exact", "Original goal", "active")}}))
+            .unwrap();
+        assert!(active.writes.is_empty());
+        assert!(adapter.goal_resume_pending && !adapter.ready);
+        let before = snapshot(&mut adapter);
+        assert!(
+            adapter
+                .command(Command::Goal {
+                    thread_id: before.thread_id,
+                    revision: before.revision,
+                    operation: Operation::Resume
+                })
+                .is_err()
+        );
+        let stop = command(
+            &mut adapter,
+            if clear {
+                Operation::Clear
+            } else {
+                Operation::Pause
+            },
+        );
+        assert_eq!(
+            stop.writes[0]["method"],
+            if clear {
+                "thread/goal/clear"
+            } else {
+                "thread/goal/set"
+            }
+        );
+        assert!(stop.writes[0]["params"].get("objective").is_none());
+        let reply = if clear {
+            json!({"cleared":true})
+        } else {
+            json!({"goal":raw_goal("thread-exact", "Original goal", "paused")})
+        };
+        let stopped = adapter
+            .receive(json!({"id":stop.writes[0]["id"],"result":reply}))
+            .unwrap();
+        assert_eq!(stopped.writes.len(), 1);
+        assert_eq!(stopped.writes[0]["method"], "thread/resume");
+        assert_eq!(stopped.writes[0]["params"]["threadId"], "thread-exact");
+        assert!(!adapter.ready);
+    }
+}
+
+#[test]
+fn unavailable_scope_unknown_or_unsupported_goal_never_falls_back_to_legacy_resume() {
+    for reply in [
+        json!({"result":{"goal":null}}),
+        json!({"error":{"code":-32601,"message":"not implemented"}}),
+        json!({"error":{"code":-32000,"message":"temporarily unavailable"}}),
+        json!({"result":{"goal":raw_goal("foreign-thread", "Wrong source", "paused")}}),
+    ] {
+        let mut adapter = adapter();
+        let initialized = begin_legacy_restore(&mut adapter);
+        let get = initialized
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "thread/goal/get")
+            .unwrap();
+        // Even a positive None cannot restore failed physical authority.
+        adapter.set_goal_resume_admission(
+            if reply["result"]["goal"].is_null() && reply.get("result").is_some() {
+                GoalResumeAdmission::Unavailable
+            } else {
+                GoalResumeAdmission::InactiveOnly
+            },
+        );
+        let mut frame = reply;
+        frame["id"] = get["id"].clone();
+        let blocked = adapter.receive(frame).unwrap();
+        assert!(blocked.writes.is_empty());
+        assert!(adapter.goal_resume_pending && !adapter.ready);
+        assert!(!published(&blocked).pending);
+        assert!(
+            blocked.events.iter().all(|event| !matches!(
+                event,
+                Event::Error { fatal: true, .. } | Event::Ready(true)
+            ))
+        );
+    }
+}
+
+#[test]
+fn disabled_native_goal_errors_preserve_uncertainty_and_explain_only_the_exact_signature() {
+    const DISABLED: &str = "Goals are disabled in this Codex connection. Enable Goals in the selected Codex configuration before starting a new connection. Your input is kept.";
+    for operation in [
+        Operation::Get,
+        Operation::SetObjective("Original objective kept".into()),
+        Operation::Clear,
+    ] {
+        let mut adapter = adapter();
+        let get = command(&mut adapter, Operation::Get);
+        adapter
+            .receive(json!({"id":get.writes[0]["id"], "result":{
+                "goal":raw_goal("thread-exact", "Original observed goal", "paused")
+            }}))
+            .unwrap();
+        let before = snapshot(&mut adapter);
+        let issued = command(&mut adapter, operation.clone());
+        assert_eq!(issued.writes.len(), 1);
+        assert_eq!(issued.writes[0]["params"]["threadId"], "thread-exact");
+        assert_eq!(
+            issued.writes[0]["method"],
+            match &operation {
+                Operation::Get => "thread/goal/get",
+                Operation::SetObjective(_) => "thread/goal/set",
+                Operation::Clear => "thread/goal/clear",
+                _ => unreachable!(),
+            }
+        );
+        if let Operation::SetObjective(objective) = &operation {
+            assert_eq!(issued.writes[0]["params"]["objective"], objective.as_str());
+        }
+        let resolved = adapter
+            .receive(json!({"id":issued.writes[0]["id"], "error":{
+                "code":-32600,"message":"goals feature is disabled","data":null
+            }}))
+            .unwrap();
+        let actual = published(&resolved);
+        assert!(!actual.pending && actual.uncertain);
+        assert_eq!(actual.read, before.read);
+        assert_eq!(actual.support, before.support);
+        assert_eq!(
+            actual.last_result,
+            Some(chat::goal::Completion {
+                revision: before.revision,
+                outcome: chat::goal::Outcome::Uncertain,
+            })
+        );
+        assert!(
+            resolved.writes.is_empty(),
+            "no retry, prompt or config mutation"
+        );
+        assert!(adapter.ready);
+        assert!(adapter.pending.is_empty());
+        let errors = resolved
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Error { message, fatal } => Some((message.as_str(), *fatal)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(errors, vec![(DISABLED, false)]);
+        // The original RPC really resolved. Only a new explicit Check can
+        // claim the now-free slot; the diagnostic does not enqueue one.
+        let check = command(&mut adapter, Operation::Get);
+        assert_eq!(check.writes.len(), 1);
+        assert_eq!(check.writes[0]["method"], "thread/goal/get");
+    }
+    for (code, message, unsupported) in [
+        (-32600, "unrelated invalid request", false),
+        (-32600, "Goals feature is disabled", false),
+        (-32000, "goals feature is disabled", false),
+        (-32601, "goals feature is disabled", true),
+    ] {
+        let mut adapter = adapter();
+        let issued = command(&mut adapter, Operation::Get);
+        let resolved = adapter
+            .receive(json!({"id":issued.writes[0]["id"], "error":{
+                "code":code,"message":message
+            }}))
+            .unwrap();
+        let actual = published(&resolved);
+        assert!(!actual.pending);
+        assert_eq!(actual.support == Support::Unsupported, unsupported);
+        assert_eq!(actual.uncertain, !unsupported);
+        assert!(resolved.writes.is_empty());
+        assert!(
+            !resolved
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { .. }))
+        );
+    }
+}
+
+#[test]
+fn disabled_goal_diagnostics_cannot_cross_newer_observations_or_a_rebound_actor() {
+    for reconnect in [false, true] {
+        let mut adapter = adapter();
+        let issued = command(&mut adapter, Operation::Clear);
+        if reconnect {
+            let reattached = attach(&mut adapter);
+            assert!(published(&reattached).pending);
+            assert_eq!(published(&reattached).read, ReadState::Unknown);
+        } else {
+            let newer = adapter.receive(json!({"method":"thread/goal/updated", "params":{
+                "threadId":"thread-exact", "goal":raw_goal("thread-exact", "New observation", "blocked")
+            }})).unwrap();
+            assert!(published(&newer).pending);
+            assert!(!published(&newer).uncertain);
+        }
+        let current = snapshot(&mut adapter);
+        assert!(current.pending);
+        let released = adapter
+            .receive(json!({"id":issued.writes[0]["id"], "error":{
+                "code":-32600,"message":"goals feature is disabled"
+            }}))
+            .unwrap();
+        let actual = published(&released);
+        assert!(
+            !actual.pending,
+            "old actual completion releases only its physical slot"
+        );
+        assert_eq!(actual.read, current.read);
+        assert_eq!(actual.support, current.support);
+        assert_eq!(actual.uncertain, current.uncertain);
+        if reconnect {
+            assert!(actual.last_result.is_none());
+        }
+        assert!(released.writes.is_empty());
+        assert!(
+            !released
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { .. }))
+        );
+        // The suppression is observation-scoped, not a permanently muted
+        // connection: a fresh exact Check refusal must still explain itself.
+        let check = command(&mut adapter, Operation::Get);
+        let current = adapter
+            .receive(json!({"id":check.writes[0]["id"], "error":{
+                "code":-32600,"message":"goals feature is disabled"
+            }}))
+            .unwrap();
+        assert!(!published(&current).pending);
+        assert!(published(&current).uncertain);
+        assert_eq!(current.events.iter().filter(|event| matches!(event,
+            Event::Error { fatal: false, message } if message == "Goals are disabled in this Codex connection. Enable Goals in the selected Codex configuration before starting a new connection. Your input is kept."
+        )).count(), 1);
+        assert!(current.writes.is_empty());
+    }
+}
+
+#[test]
+fn disabled_automatic_goal_probe_is_quiet_but_explicit_check_explains_and_chat_stays_usable() {
+    let mut adapter = adapter();
+    let attached = attach(&mut adapter);
+    let reads = attached
+        .writes
+        .iter()
+        .filter(|frame| frame["method"] == "thread/goal/get")
+        .collect::<Vec<_>>();
+    assert_eq!(reads.len(), 1);
+    let automatic = adapter
+        .receive(json!({"id":reads[0]["id"], "error":{
+            "code":-32600, "message":"goals feature is disabled"
+        }}))
+        .unwrap();
+    assert!(!published(&automatic).pending);
+    assert!(published(&automatic).uncertain);
+    assert_eq!(published(&automatic).read, ReadState::Unknown);
+    assert!(
+        automatic.writes.is_empty(),
+        "optional metadata failure does not retry or start work"
+    );
+    assert!(
+        !automatic
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Error { .. }))
+    );
+    assert!(adapter.ready && adapter.attached && adapter.direct_input);
+
+    let explicit = command(&mut adapter, Operation::Get);
+    assert_eq!(explicit.writes.len(), 1);
+    assert_eq!(explicit.writes[0]["method"], "thread/goal/get");
+    let checked = adapter
+        .receive(json!({"id":explicit.writes[0]["id"], "error":{
+            "code":-32600, "message":"goals feature is disabled"
+        }}))
+        .unwrap();
+    assert!(!published(&checked).pending);
+    assert!(published(&checked).uncertain);
+    assert_eq!(published(&checked).read, ReadState::Unknown);
+    assert_eq!(checked.events.iter().filter(|event| matches!(event,
+        Event::Error { fatal: false, message } if message == "Goals are disabled in this Codex connection. Enable Goals in the selected Codex configuration before starting a new connection. Your input is kept."
+    )).count(), 1);
+    assert!(
+        !checked
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Error { fatal: true, .. }))
+    );
+    assert!(checked.writes.is_empty());
+    // This fixture has original-scope admission. The optional observation is
+    // not a global ordinary-chat policy or a synthesized absent Goal.
+    let ordinary = adapter
+        .command(Command::Prompt {
+            text: "Explicit ordinary chat remains ordinary".into(),
+            attachments: vec![],
+            mode: PromptMode::Send,
+        })
+        .unwrap();
+    assert_eq!(ordinary.writes.len(), 1);
+    assert_eq!(ordinary.writes[0]["method"], "turn/start");
+    assert_eq!(ordinary.writes[0]["params"]["threadId"], "thread-exact");
+}

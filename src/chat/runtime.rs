@@ -24,6 +24,8 @@ mod child_text_copy;
 #[cfg(test)]
 pub(crate) mod courier_tests;
 mod execution;
+#[cfg(test)]
+mod goal_tests;
 mod handle;
 pub use handle::Handle;
 #[cfg(test)]
@@ -227,6 +229,7 @@ enum NativeOwnership {
     Adopted(
         super::native_holder::Holder,
         crate::daemon::holder_registry::Process,
+        Option<super::protocol::ServerIdentity>,
     ),
 }
 impl LocalHandle {
@@ -239,7 +242,9 @@ impl LocalHandle {
         session_id: Option<String>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        Self::start_inner(spec, adapter, initial, store, session_id, None, notify)
+        Self::start_with_scope(
+            spec, adapter, initial, store, session_id, None, None, notify,
+        )
     }
 
     /// Retain an actual native holder after closing the fixture's local actor.
@@ -260,7 +265,7 @@ impl LocalHandle {
     }
 
     pub(crate) fn start_owned(
-        spec: ProcessSpec,
+        mut spec: ProcessSpec,
         adapter: Box<dyn Adapter>,
         initial: Step,
         store: Store,
@@ -269,13 +274,21 @@ impl LocalHandle {
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         let id = source.launch.session_id.clone();
-        Self::start_inner(
+        spec.remove_unset_environment();
+        let scope = crate::account::scope::LaunchAccountScope::resolve(
+            source.launch.provider,
+            &spec.working_directory,
+            |name| spec.environment.get(name).map(std::ffi::OsString::from),
+        )
+        .ok();
+        Self::start_with_scope(
             spec,
             adapter,
             initial,
             store,
             id,
             Some(NativeOwnership::New(source, recovery_environment)),
+            scope,
             notify,
         )
     }
@@ -293,28 +306,21 @@ impl LocalHandle {
             .server_process
             .ok_or("Missing retained app-server process identity")?;
         spec.environment = recovery.execution_environment.0;
-        Self::start_inner(
+        // Private holder metadata is the only original account evidence here.
+        // Resolving the restored path would capture a replacement home.
+        Self::start_with_scope(
             spec,
             adapter,
             initial,
             store,
             recovery.confirmed_thread,
-            Some(NativeOwnership::Adopted(holder, server)),
+            Some(NativeOwnership::Adopted(
+                holder,
+                server,
+                recovery.server_identity,
+            )),
+            recovery.goal_account_scope,
             notify,
-        )
-    }
-
-    fn start_inner(
-        spec: ProcessSpec,
-        adapter: Box<dyn Adapter>,
-        initial: Step,
-        store: Store,
-        session_id: Option<String>,
-        ownership: Option<NativeOwnership>,
-        notify: impl Fn(Update) + Send + Sync + 'static,
-    ) -> Result<Self, String> {
-        Self::start_with_scope(
-            spec, adapter, initial, store, session_id, ownership, None, notify,
         )
     }
 
@@ -353,7 +359,7 @@ impl LocalHandle {
         initial: Step,
         store: Store,
         session_id: Option<String>,
-        ownership: Option<NativeOwnership>,
+        mut ownership: Option<NativeOwnership>,
         launch_account_scope: Option<crate::account::scope::LaunchAccountScope>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
@@ -397,21 +403,74 @@ impl LocalHandle {
             }
         }
         let expected_native_peer = match &ownership {
-            Some(NativeOwnership::Adopted(_, server)) => Some(server.clone()),
+            Some(NativeOwnership::Adopted(_, server, _)) => Some(server.clone()),
             _ => None,
         };
         let adopted_native = expected_native_peer.is_some();
         let native_installed = Arc::new(AtomicBool::new(false));
         let provider_process = Arc::new(Mutex::new(None));
-        let native_holder = match ownership {
+        // This is the original spawn FD (or the authenticated holder's FD),
+        // never a new open of the current working-directory spelling. Keep it
+        // separate from ExecutionContext: restored contexts retain run custody.
+        // Only an actual old adopted holder can use inactive-only recovery.
+        // A fresh launch or a retained tuple that failed validation must never
+        // downgrade to this path.
+        let goal_legacy_server = match &ownership {
+            Some(NativeOwnership::Adopted(_, _, server)) if launch_account_scope.is_none() => {
+                server.clone()
+            }
+            _ => None,
+        };
+        let mut goal_directory = match &mut ownership {
+            Some(NativeOwnership::Adopted(holder, _, _)) => holder.pinned_launch_directory().ok(),
+            _ => spec
+                .execution
+                .as_ref()
+                .and_then(|context| context.pinned_launch_directory().ok()),
+        };
+        // Freshness comes from the once-claimed accepted launch, not from a
+        // newly spawned holder or a missing old descriptor. Claim on every
+        // marked entry, including contexts whose original FD is already set.
+        let fresh_goal_source = match &ownership {
+            Some(NativeOwnership::New(source, _)) => match &spec.execution {
+                Some(context) if context.claim_fresh_native_spawn(source)? => Some(source.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let mut native_holder = match ownership {
             Some(NativeOwnership::New(source, _))
                 if matches!(spec.transport, TransportSpec::OwnedUnixWebSocket { .. }) =>
             {
-                Some(super::native_holder::spawn(spec.clone(), source)?)
+                Some(super::native_holder::spawn_with_account_scope(
+                    spec.clone(),
+                    source,
+                    launch_account_scope.clone(),
+                )?)
             }
-            Some(NativeOwnership::Adopted(holder, _)) => Some(holder),
+            Some(NativeOwnership::Adopted(holder, _, _)) => Some(holder),
             _ => None,
         };
+        if let Some(source) = fresh_goal_source {
+            // Retrieve the holder's actual inherited spawn FD. Neither a
+            // current pathname nor a replacement execution context is proof.
+            let (identity, directory) = native_holder
+                .as_mut()
+                .ok_or("Fresh native goal scope has no holder")?
+                .pinned_launch_directory()?;
+            let context = spec
+                .execution
+                .as_ref()
+                .ok_or("Fresh native goal scope has no admitted context")?;
+            if let Some(expected) = context.directory_identity()? {
+                if expected != identity {
+                    return Err("Native holder directory differs from its fresh admission".into());
+                }
+            } else {
+                context.retain_fresh_spawn_directory(&source, directory.clone())?;
+            }
+            goal_directory = Some((identity, directory));
+        }
         let (wake, reader) = UnixStream::pair().map_err(|e| e.to_string())?;
         nonblocking(&wake)?;
         nonblocking(&reader)?;
@@ -474,6 +533,8 @@ impl LocalHandle {
                 let mut actor = Actor {
                     launch_context: spec.execution.clone(),
                     launch_account_scope,
+                    goal_directory,
+                    goal_legacy_server,
                     working_directory: spec.working_directory.clone(),
                     child: None,
                     native_holder,
@@ -1859,7 +1920,150 @@ fn nonblocking(fd: &impl AsRawFd) -> Result<(), String> {
     }
     Ok(())
 }
+type GoalDirectory = (
+    crate::agent_execution::DirectoryIdentity,
+    Arc<std::fs::File>,
+);
+
+/// Work-authorizing goal operations require both original physical pins. A
+/// retained pathname or a later account selection cannot replace either pin.
+fn validate_goal_work(
+    scope: Option<&crate::account::scope::LaunchAccountScope>,
+    server: Option<&super::protocol::ServerIdentity>,
+    context: Option<&super::protocol::ExecutionContext>,
+    directory: Option<&GoalDirectory>,
+    working_directory: &std::path::Path,
+) -> Result<(), String> {
+    let scope = scope.ok_or("The original goal account scope is unavailable")?;
+    if scope.provider != crate::agent::Provider::Codex {
+        return Err("Native goals require the original Codex account scope".into());
+    }
+    let server = server.ok_or("The initialized goal server account identity is unavailable")?;
+    if server.canonical_home != scope.canonical_home {
+        return Err(
+            "The original goal account scope does not match this initialized server".into(),
+        );
+    }
+    validate_goal_directory(context, directory, working_directory)?;
+    scope.revalidate()
+}
+
+fn validate_goal_directory(
+    context: Option<&super::protocol::ExecutionContext>,
+    directory: Option<&GoalDirectory>,
+    working_directory: &std::path::Path,
+) -> Result<(), String> {
+    let context = context.ok_or("The original goal launch context is unavailable")?;
+    let (identity, directory) =
+        directory.ok_or("The original goal launch-directory descriptor is unavailable")?;
+    super::protocol::validate_launch_directory(directory, *identity)?;
+    if context.directory_identity()? != Some(*identity) {
+        return Err("The goal launch directory does not match its admitted context".into());
+    }
+    context.verify_directory(working_directory)
+}
+
+fn goal_resume_admission(
+    scope: Option<&crate::account::scope::LaunchAccountScope>,
+    server: Option<&super::protocol::ServerIdentity>,
+    legacy_server: Option<&super::protocol::ServerIdentity>,
+    context: Option<&super::protocol::ExecutionContext>,
+    directory: Option<&GoalDirectory>,
+    working_directory: &std::path::Path,
+) -> super::protocol::GoalResumeAdmission {
+    use super::protocol::GoalResumeAdmission;
+    if validate_goal_work(scope, server, context, directory, working_directory).is_ok() {
+        GoalResumeAdmission::OriginalScope
+    } else if scope.is_none()
+        && legacy_server.is_some()
+        && server == legacy_server
+        && validate_goal_directory(context, directory, working_directory).is_ok()
+    {
+        GoalResumeAdmission::InactiveOnly
+    } else {
+        GoalResumeAdmission::Unavailable
+    }
+}
+
+fn goal_is_confirmed_inactive(goal: Option<&super::goal::Snapshot>, thread: &str) -> bool {
+    use super::goal::{ReadState, Status, Support};
+    goal.is_some_and(|snapshot| {
+        snapshot.thread_id == thread
+            && snapshot.support == Support::Supported
+            && !snapshot.pending
+            && !snapshot.uncertain
+            && match &snapshot.read {
+                ReadState::Known(None) => true,
+                ReadState::Known(Some(goal)) => {
+                    goal.thread_id == thread
+                        && matches!(goal.status, Status::Paused | Status::Complete)
+                }
+                ReadState::Unknown => false,
+            }
+    })
+}
+
+/// Validate the actual outgoing resume frames against the latest observation
+/// in this step. A fresh inactive read must be able to replace an older Active
+/// snapshot; a newer Unknown must never fall back to an older paused value.
+fn validate_goal_resume_step(
+    admission: super::protocol::GoalResumeAdmission,
+    state: &Snapshot,
+    step: &Step,
+) -> Result<(), String> {
+    use super::protocol::GoalResumeAdmission;
+    if admission == GoalResumeAdmission::OriginalScope {
+        return Ok(());
+    }
+    for frame in step
+        .writes
+        .iter()
+        .filter(|frame| frame["method"] == "thread/resume")
+    {
+        let thread = frame["params"]["threadId"]
+            .as_str()
+            .ok_or("Goal resume requires the exact original thread")?;
+        let latest = step
+            .events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                Event::Goal(goal) if goal.thread_id == thread => Some(goal),
+                _ => None,
+            })
+            .or_else(|| state.goal.as_ref().filter(|goal| goal.thread_id == thread));
+        if admission != GoalResumeAdmission::InactiveOnly
+            || state.session_id.as_deref() != Some(thread)
+            || !goal_is_confirmed_inactive(latest, thread)
+        {
+            return Err("The original Goal resume authority or a confirmed inactive goal is unavailable; check, pause or clear the original goal before resuming".into());
+        }
+    }
+    Ok(())
+}
+
+/// Goal observations add a constraint; they never make a busy actor idle.
+fn goal_readiness(goal: Option<&super::goal::Snapshot>) -> Option<UpdateReadiness> {
+    use super::goal::{ReadState, Status, Support};
+    let goal = goal?;
+    if goal.pending || goal.uncertain || goal.support != Support::Supported {
+        return Some(UpdateReadiness::Unready);
+    }
+    match &goal.read {
+        ReadState::Known(Some(goal)) => match goal.status {
+            Status::Active | Status::Blocked | Status::UsageLimited | Status::BudgetLimited => {
+                Some(UpdateReadiness::Busy)
+            }
+            Status::Paused | Status::Complete => None,
+        },
+        ReadState::Unknown => Some(UpdateReadiness::Unready),
+        ReadState::Known(None) => None,
+    }
+}
+
 struct Actor {
+    goal_directory: Option<GoalDirectory>,
+    goal_legacy_server: Option<super::protocol::ServerIdentity>,
     launch_account_scope: Option<crate::account::scope::LaunchAccountScope>,
     launch_context: Option<Arc<super::protocol::ExecutionContext>>,
     working_directory: std::path::PathBuf,
@@ -1972,6 +2176,20 @@ fn accepts_prompt(state: &Snapshot) -> bool {
 }
 
 impl Actor {
+    fn goal_resume_admission(&self) -> super::protocol::GoalResumeAdmission {
+        goal_resume_admission(
+            self.launch_account_scope.as_ref(),
+            self.adapter.server_identity(),
+            self.goal_legacy_server.as_ref(),
+            self.launch_context.as_deref(),
+            self.goal_directory.as_ref(),
+            &self.working_directory,
+        )
+    }
+    fn refresh_goal_resume_admission(&mut self) {
+        let admission = self.goal_resume_admission();
+        self.adapter.set_goal_resume_admission(admission);
+    }
     /// A history reader owns no process, network connection, or execution
     /// authority. It keeps the ordinary bounded store and paging contract.
     fn run_history(&mut self, initial: Step) -> Result<(), String> {
@@ -2051,6 +2269,7 @@ impl Actor {
                 }
                 let busy = self.state.lock().unwrap_or_else(|p| p.into_inner()).busy;
                 if busy && !interrupt_sent && self.pending.is_empty() {
+                    self.refresh_goal_resume_admission();
                     match self.adapter.command(Command::Interrupt) {
                         Ok(step) => {
                             self.step(step)?;
@@ -2100,6 +2319,7 @@ impl Actor {
                 partial_started = None;
                 parsed += 1;
                 self.first_frame = true;
+                self.refresh_goal_resume_admission();
                 let step = self.adapter.receive(frame)?;
                 self.provider_step(step)?;
             }
@@ -2498,6 +2718,29 @@ impl Actor {
                     continue;
                 }
             }
+            // Read, pause and clear remain usable on this exact live actor
+            // after either pathname is lost. The adapter still fences thread
+            // and observation revision for every goal command.
+            let goal_work = matches!(
+                &command,
+                Command::Goal {
+                    operation: super::goal::Operation::SetObjective(_)
+                        | super::goal::Operation::Resume,
+                    ..
+                }
+            );
+            if goal_work
+                && let Err(error) = validate_goal_work(
+                    self.launch_account_scope.as_ref(),
+                    self.adapter.server_identity(),
+                    self.launch_context.as_deref(),
+                    self.goal_directory.as_ref(),
+                    &self.working_directory,
+                )
+            {
+                let _ = reply.send(Err(error));
+                continue;
+            }
             let authorizes_work = match &command {
                 Command::Prompt { .. }
                 | Command::Compact
@@ -2520,11 +2763,15 @@ impl Actor {
             }
             if authorizes_work
                 && let Some(scope) = &self.launch_account_scope
+                // Codex capture adds goal authority, without changing the
+                // existing ordinary-prompt account-home policy.
+                && scope.provider != crate::agent::Provider::Codex
                 && let Err(error) = scope.revalidate()
             {
                 let _ = reply.send(Err(error));
                 continue;
             }
+            self.refresh_goal_resume_admission();
             let prepared = match run {
                 Some(run) => self.adapter.command_for_run(run, command),
                 None => self.adapter.command(command),
@@ -2565,6 +2812,8 @@ impl Actor {
     fn update_readiness(&self, state: &Snapshot) -> UpdateReadiness {
         if !state.ready || state.exited || !self.pending.is_empty() || !self.output.is_empty() {
             UpdateReadiness::Unready
+        } else if let Some(readiness) = goal_readiness(state.goal.as_ref()) {
+            readiness
         } else if state.is_working() || state.waiting || !state.requests.is_empty() {
             UpdateReadiness::Busy
         } else {
@@ -2583,12 +2832,12 @@ impl Actor {
         }
     }
     fn provider_step(&mut self, step: Step) -> Result<(), String> {
-        // An account report is not output of this conversation, so it does
-        // not mark an offscreen pane as having something new to read.
+        // Account and goal-control observations are not conversation output;
+        // checking their current state must not create offscreen unread text.
         let observed = step
             .events
             .iter()
-            .any(|event| !matches!(event, Event::AccountUsage(_)));
+            .any(|event| !matches!(event, Event::AccountUsage(_) | Event::Goal(_)));
         let identity = step.events.iter().rev().find_map(|event| match event {
             Event::Session { id, .. } => Some(Some(id.clone())),
             Event::Reset { .. } => Some(None),
@@ -2660,15 +2909,59 @@ impl Actor {
                     .notification_preview = Arc::new(preview.clone());
             }
         }
-        // A new Codex thread is created asynchronously after initialize; check
-        // its RPC boundary too. Interrupts, denials and cleanup remain usable
-        // even if the approved directory disappears or is replaced.
-        if step
+        // Inspect the entire step before enqueueing any frame. A resume can
+        // restore autonomous work between ordinary turns. Fresh scoped actors
+        // and trusted holder restorations must retain both original pins.
+        // Old holders with no tuple require a bound original server and a
+        // positively inactive current observation. Unknown/unsupported is not
+        // permission to resume merely to discover the old goal.
+        let starts = step
             .writes
             .iter()
-            .any(|frame| frame["method"] == "thread/start")
-            && let Some(context) = &self.launch_context
-        {
+            .any(|frame| frame["method"] == "thread/start");
+        let resumes = step
+            .writes
+            .iter()
+            .any(|frame| frame["method"] == "thread/resume");
+        let goal_work = step.writes.iter().any(|frame| {
+            frame["method"] == "thread/goal/set"
+                && (frame["params"].get("objective").is_some()
+                    || frame["params"]["status"] == "active")
+        });
+        if goal_work {
+            validate_goal_work(
+                self.launch_account_scope.as_ref(),
+                self.adapter.server_identity(),
+                self.launch_context.as_deref(),
+                self.goal_directory.as_ref(),
+                &self.working_directory,
+            )?;
+        }
+        if resumes {
+            let admission = self.goal_resume_admission();
+            if admission == super::protocol::GoalResumeAdmission::Unavailable {
+                // Preserve the concrete physical refusal for fresh/trusted
+                // actors and the existing original-directory diagnostics.
+                if self.launch_account_scope.is_some() || self.goal_legacy_server.is_none() {
+                    validate_goal_work(
+                        self.launch_account_scope.as_ref(),
+                        self.adapter.server_identity(),
+                        self.launch_context.as_deref(),
+                        self.goal_directory.as_ref(),
+                        &self.working_directory,
+                    )?;
+                } else {
+                    validate_goal_directory(
+                        self.launch_context.as_deref(),
+                        self.goal_directory.as_ref(),
+                        &self.working_directory,
+                    )?;
+                }
+            }
+            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            validate_goal_resume_step(admission, &state, &step)?;
+        }
+        if starts && let Some(context) = &self.launch_context {
             context.verify_directory(&self.working_directory)?;
         }
         for value in step.writes {
@@ -2760,6 +3053,7 @@ impl Actor {
                     | Event::TurnFinished { .. }
                     | Event::Usage(_)
                     | Event::Session { .. }
+                    | Event::Goal(_)
             )
             .then(|| event.clone());
             let events = if frame_error.is_some() {
@@ -3173,7 +3467,15 @@ fn apply_projected_event(
         Event::InterruptMode(mode) => state.interrupt_mode = Some(mode),
         Event::BranchPoints(points) => state.branch_points = points,
         Event::Forked(id) => state.forked = Some(id),
+        Event::Goal(goal) => {
+            // Delayed observations for another thread cannot contaminate the
+            // current actor. Domain/adapter owns physical request sequencing.
+            if state.session_id.as_deref() == Some(goal.thread_id.as_str()) {
+                state.goal = Some(goal);
+            }
+        }
         Event::Reset { reason } => {
+            state.goal = None;
             state.finished_at = None;
             state.prompt_suggestion = None;
             state.branch_points.clear();
@@ -3203,6 +3505,7 @@ fn apply_projected_event(
         }
         Event::Session { id, title } => {
             if state.session_id.as_deref() != Some(id.as_str()) {
+                state.goal = None;
                 state.prompt_suggestion = None;
                 state.title = title;
             } else if title.is_some() {
@@ -3761,6 +4064,108 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
 
 #[cfg(test)]
 mod tests {
+    fn codex_child_name_adapter(directory: &std::path::Path) -> Box<dyn Adapter> {
+        let launch = super::super::Launch {
+            provider: crate::agent::Provider::Codex,
+            session_id: Some("parent-exact".into()),
+            recipe: crate::model::LaunchRecipe {
+                program: "codex".into(),
+                arguments: Vec::new(),
+                working_directory: directory.into(),
+                environment: BTreeMap::from([(
+                    "CODEX_HOME".into(),
+                    directory.to_str().unwrap().into(),
+                )]),
+                unset_environment: Default::default(),
+            },
+        };
+        // Parse real adapter publications without starting a process or socket.
+        super::super::protocol::codex::create_with_listener(&launch, directory.join("unused.sock"))
+            .unwrap()
+            .1
+    }
+
+    #[test]
+    fn codex_child_nickname_survives_role_only_blank_and_reconnected_publications() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut adapter = codex_child_name_adapter(directory.path());
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        let started = adapter
+            .receive(json!({"method":"thread/started","params":{"thread":{
+                "id":"child-exact","parentThreadId":"parent-exact","agentNickname":"Scout",
+                "agentRole":"worker","status":{"type":"active"}
+            }}}))
+            .unwrap();
+        for event in started.events {
+            apply_event(&mut state, &mut indices, event);
+        }
+        assert_eq!(state.subagents[0].kind, "Scout");
+        for nickname in [Value::Null, json!(""), json!(" \t\n")] {
+            let sparse = adapter
+                .receive(json!({"method":"thread/started","params":{"thread":{
+                    "id":"child-exact","parentThreadId":"parent-exact","agentNickname":nickname,
+                    "agentRole":"worker","status":{"type":"active"}
+                }}}))
+                .unwrap();
+            assert!(sparse.events.iter().any(|event| matches!(event,
+                Event::Subagent { kind, .. } if kind.is_empty()
+            )));
+            for event in sparse.events {
+                apply_event(&mut state, &mut indices, event);
+            }
+            assert_eq!(state.subagents[0].kind, "Scout");
+        }
+        // Restored metadata retains its name when a newly connected adapter
+        // discovers the same child before the server supplies its nickname.
+        state = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        let mut reconnected = codex_child_name_adapter(directory.path());
+        let sparse = reconnected
+            .receive(json!({"method":"thread/started","params":{"thread":{
+                "id":"child-exact","parentThreadId":"parent-exact","agentRole":"worker"
+            }}}))
+            .unwrap();
+        for event in sparse.events {
+            apply_event(&mut state, &mut indices, event);
+        }
+        assert_eq!(state.subagents[0].kind, "Scout");
+        assert_eq!(state.subagents[0].id, "child-exact");
+    }
+
+    #[test]
+    fn codex_unnamed_children_project_exact_ids_without_role_or_task_as_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut adapter = codex_child_name_adapter(directory.path());
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        for (id, nickname) in [
+            ("role-only", Value::Null),
+            ("blank-nickname", json!(" \t\n")),
+        ] {
+            let mut metadata = json!({
+                "id":id,"parentThreadId":"parent-exact","agentRole":"worker",
+                "message":"Review the implementation","status":{"type":"active"},
+                "model":"gpt-child"
+            });
+            if !nickname.is_null() {
+                metadata["agentNickname"] = nickname;
+            }
+            let discovered = adapter
+                .receive(json!({"method":"thread/started","params":{"thread":metadata}}))
+                .unwrap();
+            for event in discovered.events {
+                apply_event(&mut state, &mut indices, event);
+            }
+            let child = state.subagents.iter().find(|child| child.id == id).unwrap();
+            assert!(child.kind.is_empty());
+            assert_eq!(child.description, "Review the implementation");
+            assert_eq!(child.model.as_deref(), Some("gpt-child"));
+            assert_eq!(child.status, ToolStatus::Running);
+            assert!(child.background);
+        }
+        assert_eq!(state.subagents.len(), 2);
+    }
+
     #[test]
     fn typed_provider_error_items_keep_full_provenance_and_ids_through_store_hydration() {
         let mut store = Store::new().unwrap();

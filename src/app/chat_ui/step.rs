@@ -426,9 +426,21 @@ impl Runtime {
         // A step that worked with another agent says what it did in the
         // conversation's own names rather than reprinting its command.
         let coordinated = cached.coordination.as_deref();
-        let (verb, label) = match coordinated {
-            Some(coordinated) => coordinated.line(&|id| self.agent_name(id)),
-            None => (
+        let skill = cached.preview.skill.as_deref();
+        let (verb, label) = match (coordinated, skill) {
+            (_, Some(skill)) => (
+                match item.content.status() {
+                    Some(ToolStatus::Running) => "Using skill",
+                    Some(ToolStatus::Failed) => "Failed skill",
+                    Some(ToolStatus::Denied) => "Denied skill",
+                    Some(ToolStatus::Stopped) => "Stopped skill",
+                    _ => "Used skill",
+                }
+                .to_owned(),
+                skill.to_owned(),
+            ),
+            (Some(coordinated), _) => coordinated.line(&|id| self.agent_name(id)),
+            (None, _) => (
                 turn::step_verb(&item.content).to_owned(),
                 turn::step_label(&item.content).to_owned(),
             ),
@@ -475,7 +487,7 @@ impl Runtime {
             }
         } else if matches!(item.content, ItemContent::Tool { .. }) {
             preview.push(design::body(label.clone()).into());
-            if !cached.preview.text.is_empty() {
+            if skill.is_none() && !cached.preview.text.is_empty() {
                 preview.push(cached.preview.view());
             }
         } else {
@@ -502,6 +514,10 @@ impl Runtime {
                 .align_y(Alignment::Start),
         )
         .name(name)
+        .id(card_control_id(
+            target.card,
+            &format!("chat-step-{}-{}", target.generation, item.id),
+        ))
         .class(crate::ui_controls::control_style(open, None))
         .padding([GAP_XS as u16, GAP_S as u16])
         .width(Length::Fill)

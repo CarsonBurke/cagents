@@ -3,7 +3,7 @@
 //! https://github.com/openai/codex/tree/rust-v0.153.4/codex-rs/app-server-protocol
 //! Pending requests are replayed to joining connections with the original ID;
 //! the first answer wins (app-server/src/outgoing_message.rs). Never auto-answer.
-use super::{Adapter, ProcessSpec, ServerIdentity, Step, TransportSpec};
+use super::{Adapter, GoalResumeAdmission, ProcessSpec, ServerIdentity, Step, TransportSpec};
 use crate::account::{self, LiveReport};
 use crate::chat::{
     self, Answer, Attachment, Capabilities, ChangeKind, Choice, Command, CommandAction, Event,
@@ -14,7 +14,12 @@ use serde_json::{Value, json};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::{collections::BTreeMap, path::PathBuf};
 
+mod goal;
 mod images;
+
+#[cfg(test)]
+#[path = "codex/goal_tests.rs"]
+mod goal_tests;
 
 /// The Codex configuration key for a thread's reasoning effort. A launch
 /// recipe names it as `--config model_reasoning_effort=<effort>`, the way the
@@ -421,6 +426,9 @@ fn create_inner(
             server_identity: None,
             retained_identity,
             thread: launch.session_id.clone(),
+            goal: None,
+            goal_resume_admission: GoalResumeAdmission::Unavailable,
+            goal_resume_pending: false,
             start,
             alias,
             cwd: launch.recipe.working_directory.clone(),
@@ -479,6 +487,10 @@ fn create_inner(
 
 #[derive(Clone)]
 enum Pending {
+    Goal {
+        request: chat::goal::Request,
+        explicit: bool,
+    },
     LoginRecovery {
         failure: String,
         expected: Option<crate::account::Identity>,
@@ -566,6 +578,10 @@ struct Codex {
     server_identity: Option<ServerIdentity>,
     retained_identity: Option<ServerIdentity>,
     thread: Option<String>,
+    goal: Option<chat::goal::State>,
+    goal_resume_admission: GoalResumeAdmission,
+    /// Keep metadata/stop controls usable while legacy restore lacks authority.
+    goal_resume_pending: bool,
     start: Value,
     alias: Option<PathBuf>,
     cwd: PathBuf,
@@ -659,6 +675,116 @@ impl Drop for Codex {
     }
 }
 impl Codex {
+    fn goal_state(&mut self) -> Result<&mut chat::goal::State, String> {
+        let thread = self
+            .thread
+            .as_ref()
+            .ok_or("The original Codex thread is unavailable")?;
+        if self.goal.is_none() {
+            self.goal =
+                Some(chat::goal::State::new(thread.clone()).map_err(|error| error.to_string())?);
+        }
+        let state = self.goal.as_mut().expect("goal state was initialized");
+        if state.snapshot().thread_id != *thread {
+            return Err("The original Codex goal thread changed".into());
+        }
+        Ok(state)
+    }
+
+    fn publish_goal(&self, step: &mut Step) {
+        if let Some(state) = &self.goal {
+            step.events.push(Event::Goal(state.snapshot()));
+        }
+    }
+
+    fn request_goal(
+        &mut self,
+        step: &mut Step,
+        thread: &str,
+        revision: u64,
+        operation: chat::goal::Operation,
+        explicit: bool,
+    ) -> Result<(), String> {
+        if self.thread.as_deref() != Some(thread) {
+            return Err("The goal control belongs to a different Codex thread".into());
+        }
+        let (method, params) = goal::request(thread, &operation)?;
+        // Check transport capacity before reserving the domain's physical slot.
+        // No fallible transport allocation remains after begin_for succeeds.
+        if self.pending.len() >= MAX_PENDING || self.next_id == u64::MAX {
+            return Err("Too many outstanding Codex requests".into());
+        }
+        let request = self
+            .goal_state()?
+            .begin_for(thread, revision, operation)
+            .map_err(|error| error.to_string())?;
+        self.call(step, method, params, Pending::Goal { request, explicit })?;
+        self.publish_goal(step);
+        Ok(())
+    }
+
+    fn read_goal(&mut self, step: &mut Step) -> Result<(), String> {
+        let state = self.goal_state()?;
+        // A reconnect never replays an unresolved mutation or releases its slot.
+        if state.pending().is_some() || state.support() == chat::goal::Support::Unsupported {
+            self.publish_goal(step);
+            return Ok(());
+        }
+        let snapshot = state.snapshot();
+        self.request_goal(
+            step,
+            &snapshot.thread_id,
+            snapshot.revision,
+            chat::goal::Operation::Get,
+            false,
+        )
+    }
+
+    /// Preparing an attach is not authority: the runtime rechecks the exact
+    /// physical scope and this step's observation immediately before writing.
+    fn resume_after_goal_read(&mut self, step: &mut Step) -> Result<(), String> {
+        if !self.goal_resume_pending {
+            return Ok(());
+        }
+        let admitted = match self.goal_resume_admission {
+            GoalResumeAdmission::OriginalScope => true,
+            GoalResumeAdmission::InactiveOnly => self.goal.as_ref().is_some_and(|state| {
+                let observation = state.snapshot();
+                observation.support == chat::goal::Support::Supported
+                    && !observation.pending
+                    && !observation.uncertain
+                    && matches!(
+                        observation.read,
+                        chat::goal::ReadState::Known(None)
+                            | chat::goal::ReadState::Known(Some(chat::goal::Goal {
+                                status: chat::goal::Status::Paused | chat::goal::Status::Complete,
+                                ..
+                            }))
+                    )
+            }),
+            GoalResumeAdmission::Unavailable => false,
+        };
+        if admitted {
+            self.call(step, "thread/resume", json!({"threadId":self.thread,"excludeTurns":true,"initialTurnsPage":{"limit":20,"sortDirection":"desc","itemsView":"full"}}), Pending::Attach)?;
+            self.goal_resume_pending = false;
+        } else {
+            let detail = if self
+                .goal
+                .as_ref()
+                .is_some_and(|state| state.support() == chat::goal::Support::Unsupported)
+            {
+                "This Codex server does not support native Goal controls; restore still needs original scope or a confirmed inactive goal"
+            } else {
+                "Codex restore needs original scope or a confirmed inactive goal; Goal status, Pause and Clear remain available"
+            };
+            step.events.push(Event::Status {
+                busy: false,
+                detail: detail.into(),
+            });
+        }
+        Ok(())
+    }
+
     fn discover_child(
         &mut self,
         id: &str,
@@ -732,10 +858,14 @@ impl Codex {
             waiting: None,
             detail: None,
             id: id.into(),
+            // Roles describe capabilities, not identity. Empty sparse metadata
+            // preserves a known nickname in the runtime; an unnamed child
+            // otherwise uses its exact ID in navigation.
             kind: metadata["agentNickname"]
                 .as_str()
-                .or_else(|| metadata["agentRole"].as_str())
-                .unwrap_or(if discovered { "Codex agent" } else { "" })
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or_default()
                 .into(),
             description: metadata["message"]
                 .as_str()
@@ -1666,6 +1796,10 @@ impl Adapter for Codex {
         }
     }
 
+    fn set_goal_resume_admission(&mut self, admission: GoalResumeAdmission) {
+        self.goal_resume_admission = admission;
+    }
+
     fn server_identity(&self) -> Option<&ServerIdentity> {
         self.server_identity.as_ref()
     }
@@ -1715,15 +1849,41 @@ impl Adapter for Codex {
         let mut step = Step::default();
         self.ready = false;
         self.attached = false;
+        self.goal_resume_pending = false;
+        if let Some(state) = &mut self.goal {
+            let thread = self
+                .thread
+                .clone()
+                .ok_or("The original Codex thread is unavailable")?;
+            state.rebind(thread).map_err(|error| error.to_string())?;
+            self.publish_goal(&mut step);
+        }
         self.call(&mut step, "initialize", json!({"clientInfo":{"name":"cagents","title":"cagents native chat","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}), Pending::Initialize)?;
         Ok(step)
     }
     fn command(&mut self, command: Command) -> Result<Step, String> {
         let mut step = Step::default();
-        if !self.ready {
+        let blocked_restore_control = self.goal_resume_pending
+            && self.server_identity.is_some()
+            && matches!(
+                &command,
+                Command::Goal {
+                    operation: chat::goal::Operation::Get
+                        | chat::goal::Operation::Pause
+                        | chat::goal::Operation::Clear,
+                    ..
+                }
+            );
+        if !self.ready && !blocked_restore_control {
             return Err("Codex native connection is not ready".into());
         }
         match command {
+            Command::Goal { thread_id, revision, operation } => {
+                if matches!(operation, chat::goal::Operation::SetObjective(_) | chat::goal::Operation::Resume) && !self.direct_input {
+                    return Err("This Codex thread does not accept new goal work".into());
+                }
+                self.request_goal(&mut step, &thread_id, revision, operation, true)?;
+            }
             Command::Prompt { text, attachments, mode } => {
                 if !self.direct_input { return Err("This Codex thread does not advertise direct input support".into()); }
                 let input = self.input(text, attachments.clone())?;
@@ -1904,6 +2064,48 @@ impl Adapter for Codex {
                 }
                 return Ok(step);
             }
+            if let Pending::Goal { request, explicit } = pending {
+                // The exact RPC resolved (including an invalid response). Only
+                // this request can release its slot; notification epochs decide
+                // whether its observation may still be adopted.
+                let disabled = frame.get("error").is_some_and(|error| {
+                    error["code"].as_i64() == Some(-32600)
+                        && error["message"].as_str() == Some("goals feature is disabled")
+                });
+                let result = if let Some(error) = frame.get("error") {
+                    Err(if error["code"].as_i64() == Some(-32601) {
+                        chat::goal::Failure::Unsupported
+                    } else {
+                        chat::goal::Failure::Unavailable
+                    })
+                } else {
+                    frame
+                        .get("result")
+                        .ok_or(chat::goal::Failure::Unavailable)
+                        .and_then(|result| {
+                            goal::response(request.thread_id(), request.operation(), result)
+                                .map_err(|_| chat::goal::Failure::Unavailable)
+                        })
+                };
+                let current = if let Some(state) = &mut self.goal {
+                    state
+                        .complete(&request, result)
+                        .map_err(|error| error.to_string())?
+                } else {
+                    false
+                };
+                self.publish_goal(&mut step);
+                // An optional attach probe is not a user Goal request. Keep
+                // its unconfirmed state without creating an unsolicited notice.
+                if current && explicit && disabled {
+                    step.events.push(Event::Error {
+                        message: "Goals are disabled in this Codex connection. Enable Goals in the selected Codex configuration before starting a new connection. Your input is kept.".into(),
+                        fatal: false,
+                    });
+                }
+                self.resume_after_goal_read(&mut step)?;
+                return Ok(step);
+            }
             if matches!(pending, Pending::History { .. }) {
                 self.history_loading = false;
             }
@@ -2047,6 +2249,7 @@ impl Adapter for Codex {
                 .get("result")
                 .ok_or("Codex RPC response is missing result/error")?;
             match pending {
+                Pending::Goal { .. } => unreachable!("goal responses are handled above"),
                 Pending::LoginRecovery {
                     failure,
                     expected,
@@ -2100,7 +2303,15 @@ impl Adapter for Codex {
                     step.writes
                         .push(json!({"method":"initialized","params":{}}));
                     if self.thread.is_some() {
-                        self.call(&mut step, "thread/resume", json!({"threadId":self.thread,"excludeTurns":true,"initialTurnsPage":{"limit":20,"sortDirection":"desc","itemsView":"full"}}), Pending::Attach)?;
+                        self.goal_resume_pending = true;
+                        if self.goal_resume_admission == GoalResumeAdmission::OriginalScope {
+                            self.resume_after_goal_read(&mut step)?;
+                        } else {
+                            // Get does not load or resume an existing thread. A
+                            // missing legacy tuple must never discover its goal
+                            // by starting it first.
+                            self.read_goal(&mut step)?;
+                        }
                     } else {
                         self.call(
                             &mut step,
@@ -2175,6 +2386,14 @@ impl Adapter for Codex {
                         self.history(&mut step, None)?;
                     }
                     self.finish_setup(&mut step);
+                    // Optional metadata read, never a goal mutation or prompt.
+                    // Runtime admission guards the earlier native resume write.
+                    if let Err(message) = self.read_goal(&mut step) {
+                        step.events.push(Event::Error {
+                            message,
+                            fatal: false,
+                        });
+                    }
                 }
                 Pending::Models => {
                     for value in array(result, "data")? {
@@ -2722,6 +2941,36 @@ impl Adapter for Codex {
                 }
                 let content = self.children.get_mut(id).unwrap().receive(frame.clone())?;
                 self.child_step(id, content, &mut step)?;
+            }
+            return Ok(step);
+        }
+        if matches!(method, "thread/goal/updated" | "thread/goal/cleared") {
+            let Some(original) = self.thread.clone() else {
+                return Ok(step);
+            };
+            match goal::notification(&original, method, params) {
+                Ok(Some(observation)) => {
+                    self.goal_state()?
+                        .observe(&original, observation)
+                        .map_err(|error| error.to_string())?;
+                    self.publish_goal(&mut step);
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    // Malformed current-thread data cannot leave an old goal
+                    // looking confirmed. Rebinding the same exact thread drops
+                    // only its observation; an unresolved physical RPC remains.
+                    self.goal_state()?
+                        .rebind(original)
+                        .map_err(|error| error.to_string())?;
+                    self.publish_goal(&mut step);
+                    step.events.push(Event::Error {
+                        message:
+                            "Codex returned an invalid goal observation; check its current state"
+                                .into(),
+                        fatal: false,
+                    });
+                }
             }
             return Ok(step);
         }
@@ -5812,6 +6061,9 @@ mod tests {
             server_identity: None,
             retained_identity: None,
             thread: Some("thread-exact".into()),
+            goal: None,
+            goal_resume_admission: GoalResumeAdmission::OriginalScope,
+            goal_resume_pending: false,
             start: json!({}),
             alias: None,
             cwd: PathBuf::from("/tmp"),
@@ -6212,6 +6464,32 @@ mod tests {
         assert!(sparse.events.iter().any(
             |event| matches!(event, Event::Subagent {kind, status:None, ..} if kind.is_empty())
         ));
+    }
+
+    #[test]
+    fn child_identity_uses_only_reported_nonblank_nickname_without_guessing_roles() {
+        let mut parent = adapter();
+        for (nickname, expected) in [
+            (Value::Null, ""),
+            (json!(""), ""),
+            (json!(" \t\n"), ""),
+            (json!(" Scout "), "Scout"),
+            // A real nickname may happen to equal a role or the old default.
+            (json!("worker"), "worker"),
+            (json!("Codex agent"), "Codex agent"),
+        ] {
+            let mut step = Step::default();
+            parent
+                .discover_child(
+                    "child",
+                    &json!({"agentNickname":nickname,"agentRole":"worker"}),
+                    &mut step,
+                )
+                .unwrap();
+            assert!(step.events.iter().any(|event| matches!(event,
+                Event::Subagent { id, kind, .. } if id == "child" && kind == expected
+            )));
+        }
     }
 
     #[test]
@@ -7150,6 +7428,7 @@ mod tests {
             spec.transport,
             TransportSpec::UnixWebSocket { .. }
         ));
+        adapter.set_goal_resume_admission(GoalResumeAdmission::OriginalScope);
         let initialize = adapter.initialize().unwrap();
         let step = adapter.receive(json!({"id":initialize.writes[0]["id"],"result":{"userAgent":"codex","codexHome":directory.path()}})).unwrap();
         let resume = step

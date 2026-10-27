@@ -42,6 +42,607 @@ fn quota(reset: &str, request: &str) -> String {
     )
 }
 
+fn session_limit(reset: &str) -> String {
+    format!("You've hit your session limit · resets {reset} (America/Vancouver)")
+}
+
+#[derive(Default)]
+struct FailureSurface {
+    text: Vec<String>,
+    buttons: Vec<(String, iced_accessibility::accesskit::Rect)>,
+    size: iced::Size,
+}
+
+fn failure_surface(runtime: &Runtime, key: &str, width: f32) -> FailureSurface {
+    use iced::advanced::{
+        Layout, layout,
+        widget::{Operation, Tree},
+    };
+    impl Operation for FailureSurface {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+            self.text.push(text.to_owned());
+        }
+        fn custom(
+            &mut self,
+            _: Option<&widget::Id>,
+            _: iced::Rectangle,
+            state: &mut dyn std::any::Any,
+        ) {
+            if let Some(prose) = state.downcast_ref::<selectable_prose::State>() {
+                self.text.push(prose.plain.to_string());
+            }
+        }
+    }
+    let renderer = crate::app::tests::headless_renderer();
+    let incident = runtime
+        .failure_ui
+        .incidents
+        .iter()
+        .find(|incident| incident.key == key)
+        .unwrap();
+    let mut element = runtime.failure_view(incident);
+    let mut tree = Tree::new(element.as_widget());
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 12000.0)),
+    );
+    let mut result = FailureSurface {
+        size: node.size(),
+        ..FailureSurface::default()
+    };
+    element
+        .as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut result);
+    let accessible =
+        element
+            .as_widget()
+            .a11y_nodes(Layout::new(&node), &tree, iced::mouse::Cursor::Unavailable);
+    result.buttons = accessible
+        .root()
+        .iter()
+        .chain(accessible.children())
+        .filter(|node| node.node().role() == iced_accessibility::accesskit::Role::Button)
+        .filter_map(|node| Some((node.node().label()?.to_owned(), node.node().bounds()?)))
+        .collect();
+    result
+}
+
+fn click_failure_action(runtime: &Runtime, key: &str, label: &str) -> Action {
+    use iced::advanced::clipboard;
+    use iced::runtime::{UserInterface, user_interface::Cache};
+    let renderer = &mut crate::app::tests::headless_renderer();
+    let incident = runtime
+        .failure_ui
+        .incidents
+        .iter()
+        .find(|incident| incident.key == key)
+        .unwrap();
+    let mut ui = UserInterface::build(
+        runtime.failure_view(incident),
+        iced::Size::new(260.0, 900.0),
+        Cache::new(),
+        renderer,
+    );
+    let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+    let bounds = nodes
+        .root()
+        .iter()
+        .chain(nodes.children())
+        .find(|node| {
+            node.node().role() == iced_accessibility::accesskit::Role::Button
+                && node.node().label() == Some(label)
+        })
+        .and_then(|node| node.node().bounds())
+        .expect("actual accessible diagnostic control");
+    let point = iced::Point::new(
+        ((bounds.x0 + bounds.x1) / 2.0) as f32,
+        ((bounds.y0 + bounds.y1) / 2.0) as f32,
+    );
+    let mut actions = Vec::new();
+    for (phase, event) in [
+        ("move", iced::mouse::Event::CursorMoved { position: point }),
+        (
+            "down",
+            iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left),
+        ),
+        (
+            "up",
+            iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+        ),
+    ] {
+        let mut messages = Vec::new();
+        ui.update(
+            &[iced::Event::Mouse(event)],
+            iced::mouse::Cursor::Available(point),
+            renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        if phase != "up" {
+            assert!(
+                messages.is_empty(),
+                "diagnostic action publishes only on release ({phase})"
+            );
+        }
+        for message in messages {
+            match message {
+                Message::ChatUi(action) => actions.push(action),
+                _ => panic!("unexpected diagnostic widget callback"),
+            }
+        }
+    }
+    assert_eq!(actions.len(), 1, "one actual diagnostic control activation");
+    actions.pop().unwrap()
+}
+
+#[test]
+fn session_limit_notice_is_compact_once_without_redundant_diagnostic_actions() {
+    let raw = session_limit("3:40pm");
+    let envelope = serde_json::json!({
+        "type": "error",
+        "error": {"type": "rate_limit_error", "message": raw},
+    })
+    .to_string();
+    let (mut runtime, handle) = frame_cost::live_runtime(&[
+        item("prompt", Role::User, "Continue this review"),
+        provider_error("limit", Provider::Claude, &raw),
+    ]);
+    let mut snapshot = runtime.snapshot.as_ref().clone();
+    snapshot.generation += 1;
+    snapshot.error = Some(envelope.clone());
+    handle.publish_snapshot_for_test(snapshot.clone());
+    runtime.refresh();
+    assert_eq!(runtime.failure_ui.incidents.len(), 1);
+    let incident = &runtime.failure_ui.incidents[0];
+    let key = incident.key.clone();
+    assert_eq!(
+        incident.kind,
+        Some(chat::failure::FailureKind::AccountLimit)
+    );
+    assert_eq!(
+        incident.summary,
+        "Claude usage limit reached · resets 3:40pm (America/Vancouver)"
+    );
+    assert_eq!(
+        runtime.failure_details(&key),
+        Some(format!("{raw}\n\n---\n\n{envelope}"))
+    );
+    for width in [260.0, 720.0] {
+        let surface = failure_surface(&runtime, &key, width);
+        let visible = surface.text.join("\n");
+        assert_eq!(
+            visible.matches("resets 3:40pm (America/Vancouver)").count(),
+            1,
+            "{width}px: {visible}"
+        );
+        assert!(!visible.contains("Review the details"));
+        assert!(
+            surface.buttons.is_empty(),
+            "redundant details must not mount actions at {width}px: {:?}",
+            surface.buttons
+        );
+        assert!(
+            surface.size.width <= width && surface.size.height <= 180.0,
+            "compact notice at {width}px: {:?}",
+            surface.size
+        );
+    }
+    let (_, status) = runtime.conversation_status(false);
+    assert!(
+        !status.contains("limit") && !status.contains("error") && !status.contains("Error"),
+        "the same incident must not repeat in the status footer: {status}"
+    );
+    let revision = runtime.failure_ui.revision;
+    snapshot.generation += 1;
+    handle.publish_snapshot_for_test(snapshot);
+    runtime.refresh();
+    assert_eq!(runtime.failure_ui.incidents.len(), 1);
+    assert_eq!(runtime.failure_ui.revision, revision);
+    assert_eq!(
+        runtime.snapshot.items.len(),
+        2,
+        "original history is retained"
+    );
+    let mut snapshot = runtime.snapshot.as_ref().clone();
+    snapshot.busy = true;
+    snapshot.error = Some(raw.clone());
+    snapshot.subagents = vec![
+        child("independent-worker", ToolStatus::Running, false),
+        child("waiting-worker", ToolStatus::Running, true),
+    ];
+    for detail in [
+        raw.clone(),
+        "You have hit your session limit · resets 3:40pm (America/Vancouver)".into(),
+    ] {
+        snapshot.generation += 1;
+        snapshot.detail = detail;
+        handle.publish_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        let (icon, status) = runtime.conversation_status(false);
+        assert_eq!(icon, Some(Icon::AgentWorking));
+        assert_eq!(status, "Working · 1 working · 1 waiting");
+        assert!(
+            !status.contains("resets"),
+            "the represented reset must not repeat"
+        );
+        assert_eq!(runtime.failure_ui.incidents.len(), 1);
+        assert_eq!(runtime.failure_details(&key).as_deref(), Some(raw.as_str()));
+    }
+    snapshot.generation += 1;
+    snapshot.detail = session_limit("4:40pm");
+    handle.publish_snapshot_for_test(snapshot.clone());
+    runtime.refresh();
+    let (icon, status) = runtime.conversation_status(false);
+    assert_eq!(icon, Some(Icon::AgentWorking));
+    assert!(
+        status.contains("You've hit your session limit") && status.contains("resets 4:40pm"),
+        "a distinct reset detail is not the represented incident: {status}"
+    );
+    assert!(status.ends_with(" · 1 working · 1 waiting"), "{status}");
+    snapshot.generation += 1;
+    snapshot.detail = "Reading the patch in src/lib.rs".into();
+    handle.publish_snapshot_for_test(snapshot);
+    runtime.refresh();
+    assert_eq!(
+        runtime.conversation_status(false),
+        (
+            Some(Icon::AgentWorking),
+            "Reading the patch in src/lib.rs · 1 working · 1 waiting".into()
+        )
+    );
+    let mut snapshot = runtime.snapshot.as_ref().clone();
+    snapshot.generation += 1;
+    snapshot.busy = false;
+    snapshot.detail.clear();
+    snapshot.subagents = vec![child("independent-worker", ToolStatus::Running, false)];
+    handle.publish_snapshot_for_test(snapshot);
+    runtime.refresh();
+    assert_eq!(
+        runtime.conversation_status(false),
+        (Some(Icon::AgentWorking), "1 working".into())
+    );
+    runtime.selected_subagent = Some("independent-worker".into());
+    assert_eq!(
+        runtime.conversation_status(false),
+        (
+            Some(Icon::AgentWorking),
+            "Account limit reached · 1 working".into()
+        ),
+        "parent failure remains discoverable when its notice is outside the selected child's transcript"
+    );
+}
+
+#[test]
+fn session_limit_distinct_diagnostics_remain_accessible_exact_and_owned() {
+    use iced::futures::StreamExt;
+    let a = format!("{}\nrequest-id: first-limit", session_limit("3:40pm"));
+    let b = format!(
+        "{}\nrequest-id: second-limit\nretry-after: 42",
+        session_limit("3:40pm")
+    );
+    let envelope = format!("Claude: rate_limit\n{b}");
+    let original = format!("{a}\n\n---\n\n{b}\n\n---\n\n{envelope}");
+    let (mut runtime, handle) = frame_cost::live_runtime(&[
+        item("prompt", Role::User, "Continue this review"),
+        provider_error("first-limit", Provider::Claude, &a),
+        provider_error("second-limit", Provider::Claude, &b),
+    ]);
+    let mut snapshot = runtime.snapshot.as_ref().clone();
+    snapshot.generation += 1;
+    snapshot.error = Some(envelope);
+    handle.publish_snapshot_for_test(snapshot.clone());
+    runtime.refresh();
+    assert_eq!(runtime.failure_ui.incidents.len(), 1);
+    let target = runtime.target;
+    let incident = &runtime.failure_ui.incidents[0];
+    let key = incident.key.clone();
+    let summary = incident.summary.clone();
+    assert_eq!(
+        runtime.failure_details(&key).as_deref(),
+        Some(original.as_str())
+    );
+    for width in [260.0, 720.0] {
+        let surface = failure_surface(&runtime, &key, width);
+        let labels: Vec<_> = surface
+            .buttons
+            .iter()
+            .map(|(label, _)| label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                format!("Show technical details for {summary}"),
+                format!("Copy original diagnostics for {summary}")
+            ]
+        );
+        for (_, bounds) in &surface.buttons {
+            assert!(
+                bounds.x0 >= 0.0
+                    && bounds.x1 <= f64::from(width)
+                    && bounds.y1 > bounds.y0
+                    && bounds.y1 - bounds.y0 <= 32.0,
+                "small accessible diagnostic action at {width}px: {bounds:?}"
+            );
+        }
+        assert!(
+            !surface.text.join("\n").contains("request-id:"),
+            "originals remain behind intentional disclosure"
+        );
+    }
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.cards
+        .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+    let toggle = click_failure_action(
+        app.chat_runtime_mut(target).unwrap(),
+        &key,
+        &format!("Show technical details for {summary}"),
+    );
+    assert!(
+        matches!(&toggle, Action::ToggleFailure(owner, actual) if *owner == target && actual == &key)
+    );
+    let toggle = app.handle_chat_ui(toggle);
+    assert_eq!(toggle.units(), 0, "disclosure performs no provider work");
+    {
+        let live = app.chat_runtime_mut(target).unwrap();
+        assert!(live.failure_ui.expanded.contains(&key));
+        assert_eq!(live.failure_preview(&key), Some((original.as_str(), false)));
+        let surface = failure_surface(live, &key, 260.0);
+        assert!(
+            surface
+                .buttons
+                .iter()
+                .any(|(label, _)| label == &format!("Hide technical details for {summary}"))
+        );
+        let visible = surface.text.join("\n");
+        assert!(visible.contains("request-id: first-limit"));
+        assert!(visible.contains("request-id: second-limit"));
+        assert!(visible.contains("retry-after: 42"));
+    }
+    let copy = click_failure_action(
+        app.chat_runtime_mut(target).unwrap(),
+        &key,
+        &format!("Copy original diagnostics for {summary}"),
+    );
+    assert!(
+        matches!(&copy, Action::CopyFailure(owner, actual) if *owner == target && actual == &key)
+    );
+    let copied = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let task = app.handle_chat_ui(copy);
+            let mut effects =
+                iced::runtime::task::into_stream(task).expect("actual diagnostic Copy action");
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while let Some(effect) = effects.next().await {
+                    if let iced::runtime::Action::Clipboard(
+                        iced::runtime::clipboard::Action::Write { contents, .. },
+                    ) = effect
+                    {
+                        return contents;
+                    }
+                }
+                panic!("Copy diagnostics must publish the original sources");
+            })
+            .await
+            .expect("bounded clipboard effect")
+        });
+    assert_eq!(copied, original);
+    let stale = Target {
+        generation: target.generation + 1,
+        ..target
+    };
+    let expanded = app
+        .chat_runtime_mut(target)
+        .unwrap()
+        .failure_ui
+        .expanded
+        .clone();
+    for action in [
+        Action::ToggleFailure(stale, key.clone()),
+        Action::CopyFailure(stale, key.clone()),
+    ] {
+        assert_eq!(
+            app.handle_chat_ui(action).units(),
+            0,
+            "foreign generation has no effect"
+        );
+    }
+    assert_eq!(
+        app.chat_runtime_mut(target).unwrap().failure_ui.expanded,
+        expanded
+    );
+    snapshot.generation += 1;
+    snapshot.items.truncate(1);
+    snapshot.error = None;
+    handle.publish_snapshot_for_test(snapshot);
+    let live = app.chat_runtime_mut(target).unwrap();
+    live.refresh();
+    assert!(live.failure_ui.incidents.is_empty());
+    assert!(live.failure_details(&key).is_none());
+    let expanded = live.failure_ui.expanded.clone();
+    for action in [
+        Action::ToggleFailure(target, key.clone()),
+        Action::CopyFailure(target, key),
+    ] {
+        assert_eq!(
+            app.handle_chat_ui(action).units(),
+            0,
+            "retired source key has no effect"
+        );
+    }
+    assert_eq!(
+        app.chat_runtime_mut(target).unwrap().failure_ui.expanded,
+        expanded
+    );
+}
+
+#[test]
+fn diagnostic_native_press_cannot_transfer_to_a_replacement_incident() {
+    use iced::advanced::clipboard;
+    use iced::runtime::{UserInterface, user_interface::Cache};
+    fn bounds(
+        ui: &UserInterface<'_, Message, cosmic::Theme, cosmic::Renderer>,
+        label: &str,
+    ) -> iced_accessibility::accesskit::Rect {
+        let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+        nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| {
+                node.node().role() == iced_accessibility::accesskit::Role::Button
+                    && node.node().label() == Some(label)
+            })
+            .and_then(|node| node.node().bounds())
+            .expect("actual diagnostic button bounds")
+    }
+    for (copy, replace) in [(false, false), (false, true), (true, false), (true, true)] {
+        let a = format!("{}\nrequest-id: original", session_limit("3:40pm"));
+        let (mut runtime, handle) =
+            frame_cost::live_runtime(&[provider_error("limit", Provider::Claude, &a)]);
+        let target = runtime.target;
+        let old_key = runtime.failure_ui.incidents[0].key.clone();
+        let label = |runtime: &Runtime| {
+            format!(
+                "{} {}",
+                if copy {
+                    "Copy original diagnostics for"
+                } else {
+                    "Show technical details for"
+                },
+                runtime.failure_ui.incidents[0].summary
+            )
+        };
+        let mut renderer = crate::app::tests::headless_renderer();
+        let viewport = iced::Size::new(260.0, 900.0);
+        let (cache, pointer) = {
+            let mut ui = UserInterface::build(
+                runtime.failure_view(&runtime.failure_ui.incidents[0]),
+                viewport,
+                Cache::new(),
+                &mut renderer,
+            );
+            let hit = bounds(&ui, &label(&runtime));
+            assert!(
+                hit.x0 >= 0.0
+                    && hit.x1 <= f64::from(viewport.width)
+                    && hit.x1 > hit.x0
+                    && hit.y1 > hit.y0
+            );
+            let pointer = iced::Point::new(
+                ((hit.x0 + hit.x1) / 2.0) as f32,
+                ((hit.y0 + hit.y1) / 2.0) as f32,
+            );
+            let mut messages = Vec::new();
+            ui.update(
+                &[iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                    iced::mouse::Button::Left,
+                ))],
+                iced::mouse::Cursor::Available(pointer),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert!(messages.is_empty(), "mouseDown must not disclose or copy");
+            (ui.into_cache(), pointer)
+        };
+        if replace {
+            let b = format!("{}\nrequest-id: replacement", session_limit("4:40pm"));
+            let mut snapshot = runtime.snapshot.as_ref().clone();
+            snapshot.generation += 1;
+            snapshot.items = vec![Arc::new(provider_error(
+                "replacement",
+                Provider::Claude,
+                &b,
+            ))];
+            handle.publish_snapshot_for_test(snapshot);
+            runtime.refresh();
+            assert_ne!(runtime.failure_ui.incidents[0].key, old_key);
+        }
+        let current_key = runtime.failure_ui.incidents[0].key.clone();
+        let mut ui = UserInterface::build(
+            runtime.failure_view(&runtime.failure_ui.incidents[0]),
+            viewport,
+            cache,
+            &mut renderer,
+        );
+        let hit = bounds(&ui, &label(&runtime));
+        assert!(
+            f64::from(pointer.x) >= hit.x0
+                && f64::from(pointer.x) <= hit.x1
+                && f64::from(pointer.y) >= hit.y0
+                && f64::from(pointer.y) <= hit.y1,
+            "replacement remains under the same held pointer"
+        );
+        let mut messages = Vec::new();
+        ui.update(
+            &[iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                iced::mouse::Button::Left,
+            ))],
+            iced::mouse::Cursor::Available(pointer),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        let assert_current = |messages: &[Message]| {
+            assert_eq!(
+                messages.len(),
+                1,
+                "exactly one native diagnostic activation"
+            );
+            match &messages[0] {
+                Message::ChatUi(Action::CopyFailure(owner, key)) if copy => {
+                    assert_eq!((*owner, key), (target, &current_key))
+                }
+                Message::ChatUi(Action::ToggleFailure(owner, key)) if !copy => {
+                    assert_eq!((*owner, key), (target, &current_key))
+                }
+                _ => panic!("unexpected native diagnostic action"),
+            }
+        };
+        if replace {
+            assert!(
+                messages.is_empty(),
+                "a held original press cannot act on the replacement"
+            );
+        } else {
+            assert_current(&messages);
+        }
+        messages.clear();
+        for (down, event) in [
+            (
+                true,
+                iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left),
+            ),
+            (
+                false,
+                iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+            ),
+        ] {
+            ui.update(
+                &[iced::Event::Mouse(event)],
+                iced::mouse::Cursor::Available(pointer),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            if down {
+                assert!(
+                    messages.is_empty(),
+                    "fresh mouseDown does not invoke a diagnostic action"
+                );
+            }
+        }
+        assert_current(&messages);
+    }
+}
+
 #[test]
 fn equivalent_provider_failures_and_replay_have_one_projection_and_keep_original_sources() {
     let a = quota("1:30pm", "first");
@@ -76,8 +677,8 @@ fn equivalent_provider_failures_and_replay_have_one_projection_and_keep_original
 
 #[test]
 fn different_resets_and_separate_user_exchanges_keep_distinct_history() {
-    let early = quota("1:30pm", "early");
-    let later = quota("2:30pm", "later");
+    let early = session_limit("3:40pm");
+    let later = session_limit("4:40pm");
     let (runtime, _) = frame_cost::live_runtime(&[
         item("p1", Role::User, "First request"),
         provider_error("e1", Provider::Claude, &early),
@@ -110,12 +711,14 @@ fn tool_service_errors_and_quoted_provider_errors_do_not_become_account_failures
         item("user", Role::User, &quoted),
         item("answer", Role::Assistant, &quoted),
         item("system-quotation", Role::System, &quoted),
+        provider_error("other-provider", Provider::Codex, &session_limit("3:40pm")),
     ]);
     assert!(runtime.failure_ui.incidents.is_empty());
     assert!(!runtime.cache["service"].diagnostic);
     assert!(!runtime.cache["user"].diagnostic);
     assert!(!runtime.cache["answer"].diagnostic);
     assert!(!runtime.cache["system-quotation"].diagnostic);
+    assert!(!runtime.cache["other-provider"].diagnostic);
 }
 
 #[test]
@@ -482,22 +1085,22 @@ fn one_working_child_remains_in_the_footer_while_the_parent_waits_or_is_blocked(
         publish(&mut snapshot),
         (
             Some(Icon::AgentWorking),
-            "Account limit reached · 1 working".into(),
+            "Waiting for you · 1 working".into(),
         )
     );
     snapshot.subagents[0].waiting = true;
     assert_eq!(
         publish(&mut snapshot),
         (
-            Some(Icon::Warning),
-            "Account limit reached · 1 waiting".into(),
+            Some(Icon::AgentWaiting),
+            "Waiting for you · 1 waiting".into(),
         )
     );
     snapshot.subagents[0].status = ToolStatus::Succeeded;
     snapshot.subagents[0].waiting = false;
     assert_eq!(
         publish(&mut snapshot),
-        (Some(Icon::Warning), "Account limit reached".into())
+        (Some(Icon::AgentWaiting), "Waiting for you".into())
     );
     snapshot.error = None;
     for status in [
@@ -539,14 +1142,18 @@ fn mixed_blocked_waiting_and_working_children_do_not_hide_real_work_or_clear_par
     runtime.refresh();
     let (icon, status) = runtime.conversation_status(false);
     assert_eq!(icon, Some(Icon::AgentWorking));
-    for text in [
-        "Account limit reached",
-        "1 working",
-        "1 waiting",
-        "1 failed",
-    ] {
+    for text in ["1 working", "1 waiting", "1 failed"] {
         assert!(status.contains(text), "{status}");
     }
+    assert!(!status.contains("Account limit reached"), "{status}");
+    assert!(
+        runtime
+            .failure_ui
+            .incidents
+            .iter()
+            .any(|incident| runtime.failure_details(&incident.key).as_deref()
+                == snapshot.error.as_deref())
+    );
     snapshot.generation += 1;
     snapshot.detail = "Background command completed".into();
     handle.publish_snapshot_for_test(snapshot.clone());
@@ -558,7 +1165,11 @@ fn mixed_blocked_waiting_and_working_children_do_not_hide_real_work_or_clear_par
     runtime.refresh();
     let (icon, status) = runtime.conversation_status(false);
     assert_ne!(icon, Some(Icon::AgentWorking));
-    assert!(status.contains("Account limit reached"));
+    assert!(!status.contains("Account limit reached"));
+    assert!(
+        status.contains("1 waiting") && status.contains("1 failed"),
+        "{status}"
+    );
     assert!(!status.contains("working"));
 }
 
@@ -585,7 +1196,14 @@ fn generic_local_error_does_not_mask_an_active_provider_failure_in_the_footer() 
         runtime.refresh();
         assert_eq!(
             runtime.conversation_status(false),
-            (Some(Icon::AgentWorking), format!("{label} · 1 working"))
+            (
+                Some(Icon::AgentWorking),
+                if label == "Account limit reached" {
+                    "Subagents working".into()
+                } else {
+                    format!("{label} · 1 working")
+                }
+            )
         );
         let details: Vec<_> = runtime
             .failure_ui
@@ -614,7 +1232,14 @@ fn generic_local_error_does_not_mask_an_active_provider_failure_in_the_footer() 
         runtime.reconcile_failure_ui();
         assert_eq!(
             runtime.conversation_status(false),
-            (Some(Icon::AgentWorking), format!("{label} · 1 working"))
+            (
+                Some(Icon::AgentWorking),
+                if label == "Account limit reached" {
+                    "1 working".into()
+                } else {
+                    format!("{label} · 1 working")
+                }
+            )
         );
 
         // Clearing provider state must not promote a historical failure into
@@ -725,6 +1350,422 @@ fn historical_auth_diagnostics_survive_without_reactivating_recovery_after_new_w
             .all(|incident| !incident.active_recovery)
     );
     assert_eq!(runtime.failure_details(&old_key).as_deref(), Some(raw));
+}
+
+#[test]
+fn selected_waiting_child_limit_is_compact_in_full_view_and_preserves_diagnostics_and_draft() {
+    use iced::advanced::{clipboard, widget::operation};
+    use iced::futures::StreamExt;
+    use iced::runtime::{UserInterface, user_interface::Cache};
+    type Ui<'a> = UserInterface<'a, Message, cosmic::Theme, cosmic::Renderer>;
+    fn mount<'a>(
+        live: &'a Runtime,
+        shortcuts: &'a crate::settings::KeyboardShortcuts,
+        width: f32,
+        cache: Cache,
+        renderer: &mut cosmic::Renderer,
+    ) -> Ui<'a> {
+        let mut ui = UserInterface::build(
+            live.view(
+                None,
+                false,
+                true,
+                shortcuts,
+                width,
+                Place {
+                    name: "selected-child-fixture".into(),
+                    branch: None,
+                    channel: None,
+                },
+                true,
+                None,
+                Vec::new(),
+            ),
+            iced::Size::new(width, 1200.0),
+            cache,
+            renderer,
+        );
+        ui.draw(
+            renderer,
+            &cosmic::theme::active(),
+            &iced::advanced::renderer::Style::default(),
+            iced::mouse::Cursor::Unavailable,
+        );
+        ui
+    }
+    fn surface(ui: &mut Ui<'_>, renderer: &cosmic::Renderer) -> FailureSurface {
+        let mut result = FailureSurface::default();
+        ui.operate(renderer, &mut result);
+        let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+        result.buttons = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter(|node| node.node().role() == iced_accessibility::accesskit::Role::Button)
+            .filter_map(|node| Some((node.node().label()?.to_owned(), node.node().bounds()?)))
+            .collect();
+        result
+    }
+    fn activate(
+        ui: &mut Ui<'_>,
+        renderer: &mut cosmic::Renderer,
+        target: Target,
+        key: &str,
+        label: &str,
+        copy: bool,
+    ) -> Vec<Action> {
+        let bounds = surface(ui, renderer)
+            .buttons
+            .into_iter()
+            .find(|(name, _)| name == label)
+            .expect("real full-view diagnostic action")
+            .1;
+        let point = iced::Point::new(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        let mut result = Vec::new();
+        let mut activated = false;
+        for (phase, event) in [
+            ("move", iced::mouse::Event::CursorMoved { position: point }),
+            (
+                "down",
+                iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left),
+            ),
+            (
+                "up",
+                iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+            ),
+        ] {
+            let mut messages = Vec::new();
+            ui.update(
+                &[iced::Event::Mouse(event)],
+                iced::mouse::Cursor::Available(point),
+                renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            let mut blurred = false;
+            for message in messages {
+                let Message::ChatUi(action) = message else {
+                    panic!("only chat UI callbacks")
+                };
+                match &action {
+                    Action::Composer(owner, text_editor::Action::ClearSelection) => {
+                        assert_eq!(*owner, target);
+                        assert!(!blurred, "at most one exact native blur per event");
+                        blurred = true;
+                    }
+                    Action::ToggleFailure(owner, actual)
+                        if !copy && *owner == target && actual == key =>
+                    {
+                        assert_eq!(phase, "up");
+                        assert!(!activated);
+                        activated = true;
+                    }
+                    Action::CopyFailure(owner, actual)
+                        if copy && *owner == target && actual == key =>
+                    {
+                        assert_eq!(phase, "up");
+                        assert!(!activated);
+                        activated = true;
+                    }
+                    _ => panic!("unexpected full-view diagnostic callback"),
+                }
+                result.push(action);
+            }
+        }
+        assert!(activated, "actual button release must activate");
+        result
+    }
+    for width in [260.0, 720.0] {
+        for diagnostics in [false, true] {
+            let (mut live, handle) = frame_cost::live_runtime(&[]);
+            let raw = if diagnostics {
+                format!(
+                    "{}\nrequest-id: selected-child-A\nOriginal exchange must remain readable to its last line.",
+                    session_limit("3:40pm")
+                )
+            } else {
+                session_limit("3:40pm")
+            };
+            let connection = "Connection reset by peer\nrequest-id: selected-distinct-connection";
+            let mut selected = child("selected-child", ToolStatus::Running, true);
+            selected.detail = raw.clone();
+            selected.items.push(Arc::new(provider_error(
+                "selected-connection",
+                Provider::Claude,
+                connection,
+            )));
+            selected.items.push(Arc::new(provider_error(
+                "selected-limit-history",
+                Provider::Claude,
+                &raw,
+            )));
+            let mut other = child("failed-other", ToolStatus::Failed, false);
+            other.detail = "Connection reset by peer\nrequest-id: unrelated-child-error".into();
+            let mut snapshot = live.snapshot.as_ref().clone();
+            snapshot.generation += 1;
+            snapshot.error =
+                Some("Connection reset by peer\nrequest-id: independent-parent-error".into());
+            snapshot.subagents = vec![
+                selected,
+                child("active-other", ToolStatus::Running, false),
+                other,
+            ];
+            handle.publish_snapshot_for_test(snapshot);
+            live.refresh();
+            live.selected_subagent = Some("selected-child".into());
+            live.replace_draft(text_editor::Content::with_text("keep beta [Image 17] tail"));
+            attachment_draft::move_to(
+                &mut live.composer,
+                text_editor::Cursor {
+                    position: text_editor::Position { line: 0, column: 9 },
+                    selection: Some(text_editor::Position { line: 0, column: 5 }),
+                },
+            );
+            live.attachments.push(Attachment {
+                path: "/fixture/composer-image.png".into(),
+                reference: Some(chat::ImageReference {
+                    id: uuid::Uuid::new_v4(),
+                    number: 17,
+                    device: uuid::Uuid::new_v4(),
+                    name: "Original composer image".into(),
+                    sha256: "a".repeat(64),
+                    extension: "png".into(),
+                }),
+            });
+            let incident = live
+                .failure_ui
+                .incidents
+                .iter()
+                .find(|incident| live.incident_has_child_detail(incident, "selected-child"))
+                .unwrap();
+            let key = incident.key.clone();
+            let summary = incident.summary.clone();
+            assert_eq!(live.failure_details(&key).as_deref(), Some(raw.as_str()));
+            assert!(
+                live.failure_ui
+                    .child_item("selected-child", "selected-connection")
+                    .is_some()
+            );
+            assert!(
+                live.failure_ui
+                    .incidents
+                    .iter()
+                    .any(|incident| live.incident_has_child_detail(incident, "failed-other"))
+            );
+            assert_eq!(
+                live.timeline_activity(false),
+                Some((Some(Icon::AgentWaiting), "Waiting".into()))
+            );
+            let before = (
+                live.composer.text(),
+                live.composer.cursor(),
+                live.attachments.clone(),
+                live.revision,
+                live.next_command,
+            );
+            let preserve = |live: &Runtime| {
+                assert_eq!(
+                    (
+                        live.composer.text(),
+                        live.composer.cursor(),
+                        live.attachments.clone(),
+                        live.revision,
+                        live.next_command
+                    ),
+                    before
+                );
+                assert!(live.pending.is_none() && live.queued.is_none());
+                assert_eq!(live.selected_subagent.as_deref(), Some("selected-child"));
+            };
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.context_inspector_open = false;
+            let mut target = live.target;
+            target.card = app.workspace.focused().unwrap();
+            live.target = target;
+            app.card_state_mut(target.card).unwrap().kind = CardKind::Chat(live.session.clone());
+            app.cards
+                .insert(target.card, CardRuntime::Chat(Box::new(live)));
+            let shortcuts = crate::settings::KeyboardShortcuts::default();
+            let mut renderer = crate::app::tests::headless_renderer();
+            let (mut cache, actions) = {
+                let live = app.chat_runtime_mut(target).unwrap();
+                let mut ui = mount(live, &shortcuts, width, Cache::new(), &mut renderer);
+                let full = surface(&mut ui, &renderer);
+                let text = full.text.join("\n");
+                assert_eq!(
+                    text.matches("resets 3:40pm (America/Vancouver)").count(),
+                    1,
+                    "full selected view at{width}px: {text}"
+                );
+                assert!(
+                    !text.contains("request-id:"),
+                    "raw originals stay behind deliberate disclosure: {text}"
+                );
+                assert!(
+                    text.contains("Waiting")
+                        && text.contains("Connection interrupted")
+                        && text.contains("1 working")
+                        && text.contains("1 waiting"),
+                    "selected status, independent parent/child activity remain truthful: {text}"
+                );
+                assert!(
+                    text.contains("Image 17"),
+                    "actual composer attachment chip remains mounted"
+                );
+                let label = format!("Show technical details for {summary}");
+                assert_eq!(
+                    full.buttons
+                        .iter()
+                        .filter(|(name, _)| name == &label)
+                        .count(),
+                    usize::from(diagnostics)
+                );
+                assert_eq!(
+                    full.buttons
+                        .iter()
+                        .filter(
+                            |(name, _)| name == &format!("Copy original diagnostics for {summary}")
+                        )
+                        .count(),
+                    usize::from(diagnostics)
+                );
+                preserve(live);
+                let actions = if diagnostics {
+                    ui.operate(
+                        &renderer,
+                        &mut operation::focusable::focus::<()>(card_control_id(
+                            target.card,
+                            "chat-composer",
+                        )),
+                    );
+                    activate(&mut ui, &mut renderer, target, &key, &label, false)
+                } else {
+                    Vec::new()
+                };
+                (ui.into_cache(), actions)
+            };
+            for action in actions {
+                assert_eq!(app.handle_chat_ui(action).units(), 0);
+                preserve(app.chat_runtime_mut(target).unwrap());
+            }
+            if diagnostics {
+                let actions = {
+                    let live = app.chat_runtime_mut(target).unwrap();
+                    assert!(live.failure_ui.expanded.contains(&key));
+                    assert_eq!(live.failure_preview(&key), Some((raw.as_str(), false)));
+                    let mut ui = mount(live, &shortcuts, width, cache, &mut renderer);
+                    let full = surface(&mut ui, &renderer);
+                    let text = full.text.join("\n");
+                    assert!(
+                        text.contains(&raw),
+                        "full native selected view includes complete expanded original"
+                    );
+                    let label = format!("Copy original diagnostics for {summary}");
+                    let bounds = full
+                        .buttons
+                        .iter()
+                        .find(|(name, _)| name == &label)
+                        .unwrap()
+                        .1;
+                    assert!(
+                        bounds.x0 >= 0.0
+                            && bounds.x1 <= f64::from(width)
+                            && bounds.y1 > bounds.y0
+                            && bounds.y1 <= 1200.0
+                    );
+                    let actions = activate(&mut ui, &mut renderer, target, &key, &label, true);
+                    cache = ui.into_cache();
+                    actions
+                };
+                for action in actions {
+                    let copy = matches!(action, Action::CopyFailure(..));
+                    let task = app.handle_chat_ui(action);
+                    if copy {
+                        let copied = tokio::runtime::Builder::new_current_thread()
+                            .enable_time()
+                            .build()
+                            .unwrap()
+                            .block_on(async {
+                                let mut stream = iced::runtime::task::into_stream(task)
+                                    .expect("actual Copy effect");
+                                tokio::time::timeout(Duration::from_secs(1), async {
+                                    while let Some(effect) = stream.next().await {
+                                        if let iced::runtime::Action::Clipboard(
+                                            iced::runtime::clipboard::Action::Write {
+                                                contents,
+                                                ..
+                                            },
+                                        ) = effect
+                                        {
+                                            return contents;
+                                        }
+                                    }
+                                    panic!("Copy must retain the exact original");
+                                })
+                                .await
+                                .expect("bounded Copy effect")
+                            });
+                        assert_eq!(copied, raw);
+                    } else {
+                        assert_eq!(task.units(), 0);
+                    }
+                    preserve(app.chat_runtime_mut(target).unwrap());
+                }
+            }
+            let mut snapshot = app
+                .chat_runtime_mut(target)
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .clone();
+            snapshot.generation += 1;
+            snapshot.subagents[0].waiting = false;
+            snapshot.subagents[0].detail =
+                "Reading the selected patch without losing progress".into();
+            handle.publish_snapshot_for_test(snapshot);
+            let live = app.chat_runtime_mut(target).unwrap();
+            live.refresh();
+            assert_eq!(
+                live.timeline_activity(false),
+                Some((
+                    Some(Icon::AgentWorking),
+                    "Reading the selected patch without losing progress".into()
+                ))
+            );
+            let mut ui = mount(live, &shortcuts, width, cache, &mut renderer);
+            let text = surface(&mut ui, &renderer).text.join("\n");
+            assert!(text.contains("Reading the selected patch without losing progress"));
+            assert!(
+                text.contains("resets 3:40pm"),
+                "authentic prior limit history remains readable"
+            );
+            assert!(
+                live.failure_ui
+                    .incidents
+                    .iter()
+                    .all(|incident| !live.incident_has_child_detail(incident, "selected-child")),
+                "current ordinary progress is not a historical ChildDetail source"
+            );
+            assert_eq!(live.failure_details(&key).as_deref(), Some(raw.as_str()));
+            assert!(
+                live.failure_ui
+                    .child_item("selected-child", "selected-limit-history")
+                    .is_some()
+            );
+            assert!(
+                live.failure_ui
+                    .child_item("selected-child", "selected-connection")
+                    .is_some()
+            );
+            assert_eq!(live.composer.text(), before.0);
+            assert_eq!(live.composer.cursor(), before.1);
+            assert_eq!(live.attachments, before.2);
+            assert!(live.pending.is_none() && live.queued.is_none());
+        }
+    }
 }
 
 #[test]

@@ -1123,6 +1123,195 @@ fn upgrade_restore_isolates_a_retained_conversation_whose_rollout_is_missing() {
     cleanup.0.clear();
 }
 
+/// The ordinary public fresh-chat route owns the same original directory as
+/// its provider. It neither borrows AgentSubmit admission nor recaptures a
+/// replacement pathname when a later Goal command authorizes work.
+#[test]
+fn public_fresh_codex_goal_uses_the_original_holder_directory_and_refuses_replacement() {
+    const NAME: &str = "host::state::native_upgrade_tests::public_fresh_codex_goal_uses_the_original_holder_directory_and_refuses_replacement";
+    if std::env::var(MODE).as_deref() != Ok("fresh-goal") {
+        return run_isolated(NAME, "fresh-goal");
+    }
+    let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_UPGRADE_ROOT").unwrap());
+    let program = install_provider(&root);
+    let proof = HostSessionProof {
+        host_session_id: HostSessionId::new("fresh-goal-fixture"),
+        host_incarnation: HostIncarnation::new("fresh-goal-incarnation"),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+    };
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let host = Arc::new(crate::host::state::HostLock::new(HostState::new(
+        proof.clone(),
+    )));
+    host.lock().unwrap().install_model(
+        crate::host::model::Registry::at(&root.join("fresh-goal-model.sqlite3")).unwrap(),
+    );
+    let mut requested = provider_session(&root, &program, &proof);
+    requested.reset_owned_codex_listener();
+    assert!(requested.proof.is_none() && requested.owned_codex_listener.is_none());
+    let id = requested.id;
+    let start = || ClientRequest::ChatStart {
+        session: requested.clone(),
+        source: None,
+        terminate_source: false,
+        execution_environment: Default::default(),
+    };
+    let (response, _, _) = super::super::client::process_request(&host, 1, start()).unwrap();
+    let ServerResponse::ChatAttached { session, .. } = response else {
+        panic!("public fresh ChatStart must attach its actual actor");
+    };
+    assert!(requested.resolved_to_owned_codex_listener(&session));
+    let handle = host.lock().unwrap().chats[&id].handle.clone();
+    struct Close(SharedHost, Option<TerminalId>);
+    impl Drop for Close {
+        fn drop(&mut self) {
+            if let Some(chat_id) = self.1 {
+                let _ = super::super::client::process_request(
+                    &self.0,
+                    1,
+                    ClientRequest::ChatClose { chat_id },
+                );
+            }
+        }
+    }
+    let mut close = Close(host.clone(), Some(id));
+    wait_durable(&handle);
+    wait_until(
+        || {
+            handle
+                .snapshot(None)
+                .and_then(|snapshot| snapshot.goal)
+                .is_some_and(|goal| {
+                    goal.support == crate::chat::goal::Support::Supported
+                        && !goal.pending
+                        && matches!(goal.read, crate::chat::goal::ReadState::Known(None))
+                })
+        },
+        "fresh actor did not publish its actual provider Goal observation",
+    );
+    let socket = registry::socket(&registry::directory(Kind::Native).unwrap(), id);
+    let original = registry::evidence(&socket, Kind::Native).unwrap().unwrap();
+    assert!(original.root.is_current() && original.holder.is_current());
+    let (identity, pin) = handle.pinned_launch_directory().unwrap();
+    assert_eq!(
+        identity,
+        crate::agent_execution::DirectoryIdentity::from_metadata(
+            &fs::metadata(root.join("project")).unwrap()
+        )
+    );
+    let observed = handle.snapshot(None).unwrap().goal.unwrap();
+    let command =
+        |observation: &crate::chat::goal::Snapshot, operation| ClientRequest::ChatCommand {
+            chat_id: id,
+            command: crate::chat::Command::Goal {
+                thread_id: observation.thread_id.clone(),
+                revision: observation.revision,
+                operation,
+            },
+        };
+    let objective = "Keep this exact ordinary GUI conversation";
+    let (response, _, _) = super::super::client::process_request(
+        &host,
+        1,
+        command(
+            &observed,
+            crate::chat::goal::Operation::SetObjective(objective.into()),
+        ),
+    )
+    .expect("public fresh GoalSet must reach the original provider");
+    assert!(matches!(response, ServerResponse::Accepted));
+    wait_until(
+        || {
+            handle
+                .snapshot(None)
+                .and_then(|snapshot| snapshot.goal)
+                .is_some_and(|goal| {
+                    !goal.pending
+                        && !goal.uncertain
+                        && matches!(goal.read, crate::chat::goal::ReadState::Known(Some(ref value))
+                        if value.thread_id == THREAD && value.objective == objective)
+                })
+        },
+        "provider did not confirm the exact public GoalSet",
+    );
+    assert!(host.lock().unwrap().chats[&id].handle.same_actor(&handle));
+    assert!(!host.lock().unwrap().native_actor_startups.contains_key(&id));
+    let launches = || {
+        fs::read_to_string(root.join("provider-launches"))
+            .unwrap()
+            .lines()
+            .count()
+    };
+    let goal_sets = || {
+        fs::read_to_string(root.join("provider-requests"))
+            .unwrap()
+            .lines()
+            .filter(|method| *method == "thread/goal/set")
+            .count()
+    };
+    assert_eq!(launches(), 1);
+    assert_eq!(goal_sets(), 1);
+    // Replaying the pristine request is not another fresh admission once this
+    // exact ID has a live owner, even though its original tuple was pristine.
+    assert!(super::super::client::process_request(&host, 1, start()).is_err());
+    assert_eq!(launches(), 1);
+    assert!(host.lock().unwrap().chats[&id].handle.same_actor(&handle));
+    fs::rename(root.join("project"), root.join("original-project")).unwrap();
+    fs::create_dir(root.join("project")).unwrap();
+    assert_eq!(handle.pinned_launch_directory().unwrap().0, identity);
+    assert_eq!(
+        crate::agent_execution::DirectoryIdentity::from_metadata(&pin.metadata().unwrap()),
+        identity
+    );
+    let current = handle.snapshot(None).unwrap().goal.unwrap();
+    let refusal = super::super::client::process_request(
+        &host,
+        1,
+        command(
+            &current,
+            crate::chat::goal::Operation::SetObjective("must not reach replacement".into()),
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(
+        refusal.code,
+        crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable
+    );
+    assert!(refusal.message.contains("approved agent directory changed"));
+    assert_eq!(
+        goal_sets(),
+        1,
+        "replacement refusal must precede provider mutation"
+    );
+    // Read-only GoalGet stays available on the same actor after the path loss.
+    super::super::client::process_request(
+        &host,
+        1,
+        command(&current, crate::chat::goal::Operation::Get),
+    )
+    .unwrap();
+    wait_until(
+        || {
+            handle
+                .snapshot(None)
+                .and_then(|snapshot| snapshot.goal)
+                .is_some_and(|goal| !goal.pending)
+        },
+        "read-only GoalGet did not settle after path replacement",
+    );
+    assert_eq!(goal_sets(), 1);
+    assert_eq!(launches(), 1);
+    super::super::client::process_request(&host, 1, ClientRequest::ChatClose { chat_id: id })
+        .unwrap();
+    wait_until(
+        || handle.is_completed() && !original.root.is_current() && !original.holder.is_current(),
+        "public close did not settle the original provider and holder",
+    );
+    assert!(!host.lock().unwrap().chats.contains_key(&id));
+    close.1 = None;
+}
+
 /// Runs `test` again in a private runtime, data and provider home, in `mode`.
 fn run_isolated(test: &str, mode: &str) {
     let directory = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -1142,6 +1331,10 @@ fn run_isolated(test: &str, mode: &str) {
         .args(["--exact", test, "--nocapture"])
         .env_clear()
         .env(MODE, mode)
+        .env(
+            "CAGENTS_UPGRADE_GOAL_FIXTURE",
+            if mode == "fresh-goal" { "1" } else { "0" },
+        )
         .env("CAGENTS_UPGRADE_ROOT", root)
         .env("CAGENTS_UPGRADE_EXE", std::env::current_exe().unwrap())
         .env("HOME", root.join("home"))
@@ -1272,6 +1465,8 @@ fn completed_local_adapter(root: &std::path::Path) -> crate::chat::runtime::Hand
 }
 
 fn provider() {
+    let goals = std::env::var("CAGENTS_UPGRADE_GOAL_FIXTURE").as_deref() == Ok("1");
+    let mut goal: Option<Value> = None;
     let socket = std::env::var_os("CAGENTS_UPGRADE_SOCKET").unwrap();
     let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
     // The retained server remains alive after the actor disconnects. Only an
@@ -1313,7 +1508,7 @@ fn provider() {
             }
             let result = match frame["method"].as_str().unwrap() {
                 "initialize" => {
-                    json!({"userAgent":"cagents/0.157.1 (Linux)", "codexHome":std::env::var("CODEX_HOME").unwrap()})
+                    json!({"userAgent": if goals { "cagents/0.162.0 (Linux)" } else { "cagents/0.157.1 (Linux)" }, "codexHome":std::env::var("CODEX_HOME").unwrap()})
                 }
                 "thread/start" | "thread/resume" => {
                     json!({"thread":{"id":THREAD,"canAcceptDirectInput":true,"status":{"type":"idle"}},"model":"fixture-model"})
@@ -1323,6 +1518,16 @@ fn provider() {
                     json!({"data":[],"nextCursor":null})
                 }
                 "model/list" | "skills/list" => json!({"data":[]}),
+                "thread/goal/get" if goals => json!({"goal":goal}),
+                "thread/goal/set" if goals => {
+                    assert_eq!(frame["params"]["threadId"], THREAD);
+                    assert!(frame["params"].get("tokenBudget").is_none());
+                    let objective = frame["params"]["objective"].as_str().unwrap();
+                    goal = Some(json!({"threadId":THREAD,"objective":objective,
+                        "status":"active","tokenBudget":null,"tokensUsed":0,
+                        "timeUsedSeconds":0,"createdAt":1,"updatedAt":1}));
+                    json!({"goal":goal})
+                }
                 method => panic!("unexpected provider request {method}"),
             };
             if websocket

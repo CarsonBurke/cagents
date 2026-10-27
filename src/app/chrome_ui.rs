@@ -2756,14 +2756,7 @@ impl Cagents {
         &'a self,
         content: Element<'a, Message>,
     ) -> Element<'a, Message> {
-        let header = if self.channel_work_is_main() {
-            let actions = widget::row::with_children(self.workflow_header()).spacing(space::XXS);
-            self.native_header(
-                iced::widget::Space::new().into(),
-                Some(actions.into()),
-                true,
-            )
-        } else {
+        let header = {
             let (_, tab_width) = self.tab_strip_geometry();
             let tabs = self
                 .workspace
@@ -2801,9 +2794,6 @@ impl Cagents {
             )
         };
         let mut rows = vec![header];
-        if let Some(channel) = self.channel_home_bar() {
-            rows.push(channel);
-        }
         rows.push(crate::design::horizontal_rule().into());
         rows.push(content);
         widget::column::with_children(rows)
@@ -2812,86 +2802,12 @@ impl Cagents {
             .into()
     }
 
-    fn channel_home_bar(&self) -> Option<Element<'_, Message>> {
-        let (home, title) = self.channel_home()?;
-        let generation = self.channel_home_generation();
-        let workspace = self.workspace_view_generation;
-        let work = self.channel_work_is_main();
-        let compact = self.window_width < 800.0;
-        let mut navigation = Vec::new();
-        for (label, surface, selected) in [
-            ("Conversations", channel_work::Surface::Conversations, !work),
-            ("Work", channel_work::Surface::Work, work),
-        ] {
-            let action = Message::ChannelWorkNavigation(channel_work::Navigation {
-                home,
-                generation,
-                workspace,
-                surface,
-            });
-            navigation.push(crate::ui_controls::owned(
-                (home, generation, workspace, surface),
-                crate::ui_controls::view_tab(
-                    crate::ui_controls::ViewTab {
-                        label: label.into(),
-                        description: format!("{label} for channel {title}").into(),
-                        count: None,
-                        selected,
-                        id: None,
-                        on_press: (!self.modal_is_open()).then_some(action),
-                    },
-                    compact,
-                    None,
-                ),
-            ));
-        }
-        let navigation = widget::row::with_children(navigation)
-            .spacing(space::XXS)
-            .align_y(Alignment::Center);
-        let identity = widget::column::with_children(vec![
-            design::caption("CHANNEL").into(),
-            design::heading(if title.is_empty() {
-                "Untitled channel".to_owned()
-            } else {
-                title
-            })
-            .width(Length::Fill)
-            .into(),
-        ])
-        .spacing(space::XXS)
-        .width(Length::Fill);
-        let content: Element<'_, Message> = if work {
-            // Work's fixed leaf header already displays the captured channel
-            // title. Do not repeat it or narrow it beside the navigation.
-            navigation.into()
-        } else if compact {
-            widget::column::with_children(vec![identity.into(), navigation.into()])
-                .spacing(space::XS)
-                .into()
-        } else {
-            widget::row::with_children(vec![identity.into(), navigation.into()])
-                .spacing(space::S)
-                .align_y(Alignment::Center)
-                .into()
-        };
-        Some(
-            widget::container(content)
-                .padding([space::XS, space::S])
-                .width(Length::Fill)
-                .into(),
-        )
-    }
-
     pub(super) fn workflow_header(&self) -> Vec<Element<'_, Message>> {
         if self.context_inspector_is_overlay() {
             return Vec::new();
         }
         let mut actions = Vec::with_capacity(8);
-        let total = if self.channel_work_is_main() {
-            0
-        } else {
-            self.workspace.cards().len()
-        };
+        let total = self.workspace.cards().len();
         if should_show_card_navigator(total) {
             let current = self
                 .workspace
@@ -2970,8 +2886,7 @@ impl Cagents {
             )
             .into(),
             widget::row::with_children(
-                (!panel_owns_shared_controls && !self.channel_work_is_main())
-                    .then(|| self.sidebar_toggle()),
+                (!panel_owns_shared_controls).then(|| self.sidebar_toggle()),
             )
             .into(),
         ]
@@ -3343,44 +3258,22 @@ impl Cagents {
         model: Option<inspector::InspectorModel>,
         width: f32,
     ) -> Element<'_, Message> {
-        if !self.channel_work_is_main() && self.channel_work.view.is_open() {
-            let end = widget::row::with_children(vec![
-                self.attention_and_notice_controls(),
-                widget::row::with_children(self.update_control()).into(),
-            ])
-            .spacing(space::XXS)
-            .align_y(Alignment::Center)
-            .into();
-            let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
-            return widget::column::with_children(vec![
-                heading,
-                crate::interaction::focused_escape(
-                    self.channel_work
-                        .view
-                        .view(
-                            width,
-                            (self.window_height - design::HEADER_CONTENT_HEIGHT).max(0.0),
-                        )
-                        .map(Message::ChannelWork),
-                    || Message::ChannelWorkEscape,
-                ),
-            ])
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
-        }
         let indicators = self.context_rail_indicators();
         let tabs = widget::row::with_children(
             ContextTab::ALL
                 .into_iter()
                 .filter(|tab| {
                     !self.active_folder_scope()
-                        || !matches!(tab, ContextTab::Changes | ContextTab::PullRequest)
+                        || (*tab != ContextTab::Changes
+                            && (*tab != ContextTab::PullRequest
+                                || self.durable.active_channel.is_some()))
                 })
                 .map(|tab| {
                     let selected = self.context_tab == tab;
                     let enabled = !self.modal_is_open()
-                        && (tab != ContextTab::PullRequest || self.active_workspace.is_some());
+                        && (tab != ContextTab::PullRequest
+                            || self.active_workspace.is_some()
+                            || self.durable.active_channel.is_some());
                     let icon = match tab {
                         ContextTab::Files => Icon::Folder,
                         ContextTab::Changes => Icon::Changes,
@@ -3445,20 +3338,6 @@ impl Cagents {
         .align_y(Alignment::Center)
         .into();
         let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
-        let tabs = widget::row::with_children(vec![
-            tabs.into(),
-            crate::ui_controls::button::secondary("Channel work")
-                .name("Open current channel work")
-                .on_press_maybe(
-                    self.durable
-                        .active_channel
-                        .filter(|_| !self.modal_is_open())
-                        .map(Message::OpenChannelWork),
-                )
-                .into(),
-        ])
-        .align_y(Alignment::Center)
-        .spacing(space::XS);
         let tabs = widget::container(tabs)
             .padding([0.0, space::S])
             .center_y(design::HEADER_CONTENT_HEIGHT)
@@ -3531,6 +3410,18 @@ impl Cagents {
                 self.modal_is_open(),
             )
             .map(Message::Sidebar),
+            ContextTab::PullRequest
+                if self.durable.active_channel.is_some() && self.channel_work.view.is_open() =>
+            {
+                self.channel_work
+                    .view
+                    .context_view_for_home(
+                        width,
+                        (self.window_height - 2.0 * design::HEADER_HEIGHT).max(0.0),
+                        self.channel_work.view.home() == self.selected_channel_work_home(),
+                    )
+                    .map(Message::ChannelWork)
+            }
             ContextTab::PullRequest => self.pull_request_panel(width),
             ContextTab::Details => model.map_or_else(
                 || {

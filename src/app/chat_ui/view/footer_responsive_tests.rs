@@ -1,0 +1,588 @@
+//! Exercise the real app reading-column clamp, footer and native keyboard path.
+//! Tasks that could launch a provider are never run; this is an unsent draft.
+use super::*;
+use iced::advanced::{
+    clipboard,
+    widget::{Operation, operation},
+};
+use iced::futures::{FutureExt, StreamExt};
+use iced::runtime::{UserInterface, user_interface::Cache};
+use iced_accessibility::accesskit::Role;
+
+type Ui<'a> = UserInterface<'a, Message, cosmic::Theme, cosmic::Renderer>;
+
+#[derive(Default)]
+struct Probe {
+    footer: Option<(widget::Id, iced::Rectangle)>,
+    focused: Option<widget::Id>,
+}
+impl Operation for Probe {
+    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+        visit(self);
+    }
+    fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
+        if let Some((wanted, saved)) = &mut self.footer
+            && id == Some(wanted)
+        {
+            *saved = bounds;
+        }
+    }
+    fn focusable(
+        &mut self,
+        id: Option<&widget::Id>,
+        _: iced::Rectangle,
+        state: &mut dyn operation::Focusable,
+    ) {
+        if state.is_focused() {
+            self.focused = id.cloned();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Activation {
+    Footer,
+    Model,
+    DefaultModel,
+}
+fn enter(
+    ui: &mut Ui<'_>,
+    renderer: &mut cosmic::Renderer,
+    target: Target,
+    expected: Activation,
+    width: f32,
+) -> (Action, Vec<Action>) {
+    let mut activated = None;
+    let mut cleanup = Vec::new();
+    let mut diagnostics = Vec::new();
+    // Focusable::unfocus leaves a native ClearSelection pending. Keep each
+    // event's cleanup separate from the one actual button/search activation.
+    for (phase, event) in [
+        (
+            "Enter down",
+            keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            },
+        ),
+        (
+            "Enter release",
+            keyboard::Event::KeyReleased {
+                key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+            },
+        ),
+    ] {
+        let mut before = Probe::default();
+        ui.operate(renderer, &mut before);
+        let mut messages = Vec::new();
+        let (_, statuses) = ui.update(
+            &[iced::Event::Keyboard(event)],
+            iced::mouse::Cursor::Unavailable,
+            renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        let mut after = Probe::default();
+        ui.operate(renderer, &mut after);
+        diagnostics.push(format!(
+            "{phase}: focus {:?} -> {:?}, status {statuses:?}, {} callbacks",
+            before.focused,
+            after.focused,
+            messages.len()
+        ));
+        let mut blurred = false;
+        for message in messages {
+            let Message::ChatUi(action) = message else {
+                panic!("{width}px {expected:?} {phase}: unexpected message {message:?}")
+            };
+            let owner = match (&action, expected) {
+                (Action::Composer(owner, text_editor::Action::ClearSelection), _) => {
+                    assert_eq!(
+                        *owner, target,
+                        "{width}px {expected:?} {phase}: exact blur owner"
+                    );
+                    assert!(
+                        !blurred,
+                        "{width}px {expected:?} {phase}: one native blur per event"
+                    );
+                    blurred = true;
+                    cleanup.push(action);
+                    continue;
+                }
+                (Action::FooterPicker(owner, true), Activation::Footer)
+                | (Action::ModelPicker(owner, true), Activation::Model)
+                | (Action::DraftModel(owner, Provider::Codex, None), Activation::DefaultModel) => {
+                    *owner
+                }
+                (Action::Composer(_, event), _) => panic!(
+                    "{width}px {expected:?} {phase}: only native blur is allowed, received {}",
+                    composer_event_name(event)
+                ),
+                _ => panic!("{width}px {expected:?} {phase}: unexpected activation {action:?}"),
+            };
+            assert_eq!(
+                owner, target,
+                "{width}px {expected:?} {phase}: exact activation owner"
+            );
+            assert!(
+                activated.replace(action).is_none(),
+                "{width}px {expected:?}: exactly one activation"
+            );
+        }
+    }
+    (
+        activated.unwrap_or_else(|| panic!(
+            "{width}px {expected:?}: native Enter emits exactly one expected activation; {diagnostics:?}"
+        )),
+        cleanup,
+    )
+}
+
+fn type_model_character(
+    ui: &mut Ui<'_>,
+    renderer: &mut cosmic::Renderer,
+    target: Target,
+    width: f32,
+    character: &'static str,
+    physical: keyboard::key::Code,
+    expected_query: &str,
+) -> (Action, Vec<Action>) {
+    let key = keyboard::Key::Character(character.into());
+    let mut query = None;
+    let mut cleanup = Vec::new();
+    // Exercise the focused native field, then rebuild from the actual emitted
+    // query before the next character. No reducer action is reconstructed.
+    for (phase, event) in [
+        (
+            "character down",
+            keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key.clone(),
+                physical_key: keyboard::key::Physical::Code(physical),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: Some(character.into()),
+                repeat: false,
+            },
+        ),
+        (
+            "character release",
+            keyboard::Event::KeyReleased {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Code(physical),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+            },
+        ),
+    ] {
+        let mut messages = Vec::new();
+        let (_, statuses) = ui.update(
+            &[iced::Event::Keyboard(event)],
+            iced::mouse::Cursor::Unavailable,
+            renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        let mut blurred = false;
+        for message in messages {
+            if let Message::ChatUi(Action::Composer(owner, text_editor::Action::ClearSelection)) =
+                &message
+            {
+                assert_eq!(
+                    *owner, target,
+                    "{width}px model search {phase}: exact blur owner"
+                );
+                assert!(
+                    !blurred,
+                    "{width}px model search {phase}: one native blur per event"
+                );
+                blurred = true;
+                let Message::ChatUi(action) = message else {
+                    unreachable!()
+                };
+                cleanup.push(action);
+                continue;
+            }
+            let Message::ChatUi(action @ Action::ModelQuery(_, _)) = message else {
+                panic!("{width}px model search {phase}: unexpected callback {message:?}")
+            };
+            let Action::ModelQuery(owner, value) = &action else {
+                unreachable!()
+            };
+            assert_eq!(*owner, target, "{width}px model search: exact query owner");
+            assert_eq!(value, expected_query, "{width}px native model search query");
+            assert!(
+                query.replace(action).is_none(),
+                "{width}px model search: one query per character"
+            );
+        }
+        if phase == "character down" {
+            assert!(
+                query.is_some(),
+                "{width}px native model search character emits a query: {statuses:?}"
+            );
+        }
+    }
+    (
+        query.expect("native character emits exactly one model query"),
+        cleanup,
+    )
+}
+fn composer_event_name(event: &text_editor::Action) -> &'static str {
+    match event {
+        text_editor::Action::Click(_) => "Composer::Click",
+        text_editor::Action::Drag(_) => "Composer::Drag",
+        text_editor::Action::Move(_) => "Composer::Move",
+        text_editor::Action::Select(_) => "Composer::Select",
+        text_editor::Action::SelectWord => "Composer::SelectWord",
+        text_editor::Action::SelectLine => "Composer::SelectLine",
+        text_editor::Action::SelectAll => "Composer::SelectAll",
+        text_editor::Action::ClearSelection => "Composer::ClearSelection",
+        text_editor::Action::Scroll { .. } => "Composer::Scroll",
+        text_editor::Action::Edit(_) => "Composer::Edit (payload omitted)",
+    }
+}
+fn settle_blur(app: &mut Cagents, target: Target, cleanup: Vec<Action>) {
+    for blur in cleanup {
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&target.card) else {
+            panic!("same chat draft")
+        };
+        let before = (
+            runtime.composer.text(),
+            runtime.composer.cursor(),
+            runtime.attachments.clone(),
+            runtime.revision,
+            runtime.next_command,
+        );
+        let task = app.handle_chat_ui(blur);
+        assert_eq!(task.units(), 0, "native blur schedules no effects");
+        drop(task);
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&target.card) else {
+            unreachable!()
+        };
+        assert_eq!(
+            (
+                runtime.composer.text(),
+                runtime.composer.cursor(),
+                runtime.attachments.clone(),
+                runtime.revision,
+                runtime.next_command
+            ),
+            before
+        );
+    }
+}
+
+fn focus(ui: &mut Ui<'_>, renderer: &cosmic::Renderer, id: widget::Id) {
+    ui.operate(renderer, &mut operation::focusable::focus::<()>(id.clone()));
+    assert_focus(ui, renderer, id);
+}
+
+fn assert_focus(ui: &mut Ui<'_>, renderer: &cosmic::Renderer, id: widget::Id) {
+    let mut focused = Probe::default();
+    ui.operate(renderer, &mut focused);
+    assert_eq!(
+        focused.focused,
+        Some(id),
+        "the real native control owns Enter"
+    );
+}
+
+fn focus_effects(ui: &mut Ui<'_>, renderer: &cosmic::Renderer, task: Task<Message>) {
+    assert_eq!(
+        task.units(),
+        1,
+        "opening the picker schedules one focus effect"
+    );
+    if let Some(mut effects) = iced::runtime::task::into_stream(task) {
+        while let Some(effect) = effects
+            .next()
+            .now_or_never()
+            .expect("opening the model picker only emits immediate native focus")
+        {
+            let iced::runtime::Action::Widget(mut operation) = effect else {
+                panic!("opening the picker must not start a provider or send a message")
+            };
+            ui.operate(renderer, operation.as_mut());
+        }
+    }
+}
+
+fn group_bounds(ui: &mut Ui<'_>) -> Option<[iced::Rectangle; 4]> {
+    let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+    let find = |role, label| {
+        nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| node.node().role() == role && node.node().label() == Some(label))
+            .and_then(|node| node.node().bounds())
+            .map(|rect| iced::Rectangle {
+                x: rect.x0 as f32,
+                y: rect.y0 as f32,
+                width: (rect.x1 - rect.x0) as f32,
+                height: (rect.y1 - rect.y0) as f32,
+            })
+    };
+    Some([
+        find(Role::Button, "Choose a model")?,
+        find(Role::Button, "Choose reasoning effort")?,
+        find(Role::Paragraph, "50%")?,
+        find(Role::Paragraph, "$1.25")?,
+    ])
+}
+
+#[test]
+fn real_chat_footer_keeps_right_group_visible_and_narrow_model_selection_keyboard_reachable() {
+    let mut renderer = crate::app::tests::headless_renderer();
+    for width in [260.0, 620.0, 640.0, 720.0, 1200.0] {
+        let directory = tempfile::Builder::new()
+            .prefix("cagents-footer-with-long-project-context-")
+            .tempdir()
+            .unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        app.settings.default_native_pane_fraction = 1.0;
+        drop(app.new_native_chat(Provider::Codex, Some(directory.path().into())));
+        let card = app.workspace.focused().unwrap();
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(width),
+        }));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+            panic!("a real new chat draft")
+        };
+        assert!(runtime.is_draft());
+        assert!(runtime.visible.load(Ordering::Relaxed));
+        let target = runtime.target;
+        runtime.replace_draft(text_editor::Content::with_text("Keep this 🦀 unsent draft"));
+        attachment_draft::move_to(
+            &mut runtime.composer,
+            text_editor::Cursor {
+                position: text_editor::Position { line: 0, column: 4 },
+                selection: Some(text_editor::Position { line: 0, column: 0 }),
+            },
+        );
+        runtime
+            .attachments
+            .push(Attachment::file(directory.path().join("reference.txt")));
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.capabilities.model_selection = true;
+        snapshot.capabilities.reasoning_selection = true;
+        snapshot.models = vec![chat::Model {
+            id: "fixture-model".into(),
+            label: "A deliberately long model label".into(),
+            reasoning: vec!["low".into(), "high".into()],
+        }];
+        snapshot.selected_model = Some("fixture-model".into());
+        snapshot.reasoning = Some("high".into());
+        snapshot.usage.context_limit = 200_000;
+        snapshot.usage.context_tokens = 100_000;
+        snapshot.usage.cost_microusd = Some(1_250_000);
+        let before = (
+            runtime.composer.text(),
+            runtime.composer.cursor(),
+            runtime.attachments.clone(),
+            runtime.revision,
+            runtime.next_command,
+        );
+        let viewport = iced::Size::new(width, 760.0);
+        let mut ui =
+            UserInterface::build(app.chat_view(card), viewport, Cache::new(), &mut renderer);
+        let mut footer = Probe {
+            footer: Some((
+                card_control_id(card, "chat-footer"),
+                iced::Rectangle::default(),
+            )),
+            ..Default::default()
+        };
+        ui.operate(&renderer, &mut footer);
+        let footer = footer.footer.unwrap().1;
+        assert!(footer.width > 0.0 && footer.width <= width);
+        assert!(footer.width <= design::READABLE_MEASURE + 2.0 * step::GAP_M);
+        assert!(
+            (footer.width - width.min(design::READABLE_MEASURE + 2.0 * step::GAP_M)).abs() <= 1.0,
+            "the real chat_view uses the capped reading width: {width}: {footer:?}"
+        );
+        let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+        let more = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| {
+                node.node().role() == Role::Button
+                    && node.node().label() == Some("Conversation details and settings")
+            })
+            .and_then(|node| node.node().bounds());
+        if width >= 640.0 {
+            assert!(more.is_none(), "wide details are visible without More");
+            let group = group_bounds(&mut ui)
+                .expect("model, effort, usage and cost are visible in the real app footer");
+            for bounds in group {
+                assert!(bounds.width > 0.0 && bounds.height > 0.0);
+                assert!(
+                    bounds.x >= footer.x
+                        && bounds.x + bounds.width <= footer.x + footer.width + 1.0,
+                    "{width}: {bounds:?} outside {footer:?}"
+                );
+                assert!(
+                    bounds.y >= footer.y
+                        && bounds.y + bounds.height <= footer.y + footer.height + 1.0
+                );
+            }
+            for pair in group.windows(2) {
+                assert!(
+                    pair[0].x + pair[0].width <= pair[1].x,
+                    "{width}: right-group controls overlap: {pair:?}"
+                );
+            }
+            assert!(
+                group[0].x > footer.x + footer.width / 3.0,
+                "context and model group have flexible separation"
+            );
+            assert!(
+                (group[3].x + group[3].width
+                    - (footer.x + footer.width - step::GAP_M - COMPOSER_PADDING))
+                    .abs()
+                    <= 1.0,
+                "cost anchors the right edge"
+            );
+        } else {
+            let more = more.expect("narrow footer exposes its actual More trigger");
+            assert!(more.x1 > more.x0 && more.y1 > more.y0);
+            assert!(
+                more.x0 >= f64::from(footer.x)
+                    && more.x1 <= f64::from(footer.x + footer.width)
+                    && more.y0 >= f64::from(footer.y)
+                    && more.y1 <= f64::from(footer.y + footer.height),
+                "{width}: the real More trigger stays inside the footer: {more:?} in {footer:?}"
+            );
+            assert!(
+                group_bounds(&mut ui).is_none(),
+                "narrow details are initially folded"
+            );
+            focus(
+                &mut ui,
+                &renderer,
+                card_control_id(card, "chat-footer-details"),
+            );
+            let (activation, cleanup) =
+                enter(&mut ui, &mut renderer, target, Activation::Footer, width);
+            let cache = ui.into_cache();
+            settle_blur(&mut app, target, cleanup);
+            drop(app.handle_chat_ui(activation));
+            ui = UserInterface::build(app.chat_view(card), viewport, cache, &mut renderer);
+            // Operate lays out the actual popup before AX inspects its subtree.
+            focus(
+                &mut ui,
+                &renderer,
+                card_control_id(card, "chat-model-picker"),
+            );
+            let group =
+                group_bounds(&mut ui).expect("More exposes all four details through native AX");
+            for bounds in group {
+                assert!(bounds.width > 0.0 && bounds.height > 0.0);
+                assert!(
+                    bounds.x >= 0.0 && bounds.x + bounds.width <= width + 1.0,
+                    "{width}: wrapped detail remains in the private viewport: {bounds:?}"
+                );
+                assert!(bounds.y >= 0.0 && bounds.y + bounds.height <= viewport.height);
+            }
+            for pair in group.windows(2) {
+                assert!(
+                    pair[0].y + pair[0].height <= pair[1].y
+                        || pair[0].x + pair[0].width <= pair[1].x,
+                    "{width}: wrapped details must not overlap: {pair:?}"
+                );
+            }
+        }
+        focus(
+            &mut ui,
+            &renderer,
+            card_control_id(card, "chat-model-picker"),
+        );
+        let (activation, cleanup) = enter(&mut ui, &mut renderer, target, Activation::Model, width);
+        let cache = ui.into_cache();
+        settle_blur(&mut app, target, cleanup);
+        let task = app.handle_chat_ui(activation);
+        let mut ui = UserInterface::build(app.chat_view(card), viewport, cache, &mut renderer);
+        focus_effects(&mut ui, &renderer, task);
+        let mut focused = Probe::default();
+        ui.operate(&renderer, &mut focused);
+        assert_eq!(
+            focused.focused,
+            Some(card_control_id(card, "chat-model-search"))
+        );
+        // An empty search intentionally has no implicit first choice. Name
+        // Codex through native typing so Enter chooses its offered default.
+        // Each real query callback is reduced before the next frame; retaining
+        // native focus across those rebuilds is part of the keyboard contract.
+        for (character, physical, query) in [
+            ("c", keyboard::key::Code::KeyC, "c"),
+            ("o", keyboard::key::Code::KeyO, "co"),
+            ("d", keyboard::key::Code::KeyD, "cod"),
+            ("e", keyboard::key::Code::KeyE, "code"),
+            ("x", keyboard::key::Code::KeyX, "codex"),
+        ] {
+            let (query_action, cleanup) = type_model_character(
+                &mut ui,
+                &mut renderer,
+                target,
+                width,
+                character,
+                physical,
+                query,
+            );
+            let cache = ui.into_cache();
+            settle_blur(&mut app, target, cleanup);
+            let task = app.handle_chat_ui(query_action);
+            assert_eq!(task.units(), 0, "native model query schedules no effects");
+            drop(task);
+            ui = UserInterface::build(app.chat_view(card), viewport, cache, &mut renderer);
+            assert_focus(
+                &mut ui,
+                &renderer,
+                card_control_id(card, "chat-model-search"),
+            );
+        }
+        let (choice, cleanup) = enter(
+            &mut ui,
+            &mut renderer,
+            target,
+            Activation::DefaultModel,
+            width,
+        );
+        drop(ui);
+        settle_blur(&mut app, target, cleanup);
+        drop(app.handle_chat_ui(choice));
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+            unreachable!()
+        };
+        assert!(runtime.snapshot.selected_model.is_none());
+        assert_eq!(
+            (
+                runtime.composer.text(),
+                runtime.composer.cursor(),
+                runtime.attachments.clone(),
+                runtime.revision,
+                runtime.next_command
+            ),
+            before
+        );
+        assert!(runtime.pending.is_none() && runtime.queued.is_none());
+    }
+}

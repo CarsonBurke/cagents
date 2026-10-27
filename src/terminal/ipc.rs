@@ -193,9 +193,13 @@ use crate::{
 /// default, up to 1 GiB). Published protocol-119 hosts reject values above
 /// 1,000,000, so their unchanged positional field encoding is not sufficient
 /// compatibility: replace the matched daemon before sending the new budgets.
+/// Version 126 adds typed, original-thread goal controls and observations.
 /// Version 127 combines both contracts in the matched set. Version 126 is
-/// reserved for the separate native Goal integration and is not adopted here.
-pub const PROTOCOL_VERSION: u16 = 127;
+/// reserved for the separate native Goal integration in that predecessor.
+/// Version 132 combines those accepted notification and terminal-budget
+/// contracts with typed Goal requests and snapshot fields. All three
+/// executables must match; version-127 peers lack the Goal payloads.
+pub const PROTOCOL_VERSION: u16 = 132;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -2090,6 +2094,89 @@ mod tests {
     use crate::model::{BootId, HostIncarnation, HostSessionId};
 
     use super::*;
+
+    #[test]
+    fn goal_controls_and_native_results_keep_their_original_wire_binding() {
+        use crate::chat::{Command, goal};
+        let chat_id = TerminalId::new();
+        let revision = u64::MAX - 1;
+        for operation in [
+            goal::Operation::Get,
+            goal::Operation::SetObjective("Preserve 🦀 and\noriginal scope".into()),
+            goal::Operation::Pause,
+            goal::Operation::Resume,
+            goal::Operation::Clear,
+        ] {
+            let request = ClientEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: 29,
+                proof: Some(proof("original-session", "original-boot", "original-host")),
+                request: ClientRequest::ChatCommand {
+                    chat_id,
+                    command: Command::Goal {
+                        thread_id: "original-thread".into(),
+                        revision,
+                        operation,
+                    },
+                },
+            };
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &request).unwrap();
+            assert_eq!(
+                read_frame::<ClientEnvelope>(&mut Cursor::new(bytes))
+                    .unwrap()
+                    .unwrap(),
+                request
+            );
+        }
+        for outcome in [
+            goal::Outcome::Confirmed,
+            goal::Outcome::Uncertain,
+            goal::Outcome::Unsupported,
+        ] {
+            let response = ServerResponse::ChatSnapshot {
+                chat_id,
+                snapshot: Some(crate::chat::Snapshot {
+                    session_id: Some("original-thread".into()),
+                    goal: Some(goal::Snapshot {
+                        thread_id: "original-thread".into(),
+                        revision: u64::MAX,
+                        support: goal::Support::Supported,
+                        read: goal::ReadState::Known(None),
+                        pending: false,
+                        uncertain: outcome != goal::Outcome::Confirmed,
+                        last_result: Some(goal::Completion { revision, outcome }),
+                    }),
+                    ..Default::default()
+                }),
+            };
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &response).unwrap();
+            assert_eq!(
+                read_frame::<ServerResponse>(&mut Cursor::new(bytes))
+                    .unwrap()
+                    .unwrap(),
+                response
+            );
+        }
+        // The existing dispatch acknowledgement carries no native goal result.
+        assert_ne!(
+            serde_json::to_value(ServerResponse::Accepted).unwrap(),
+            serde_json::to_value(goal::Completion {
+                revision,
+                outcome: goal::Outcome::Confirmed,
+            })
+            .unwrap()
+        );
+        let mut legacy = serde_json::to_value(crate::chat::Snapshot::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("goal");
+        assert!(
+            serde_json::from_value::<crate::chat::Snapshot>(legacy)
+                .unwrap()
+                .goal
+                .is_none()
+        );
+    }
 
     #[test]
     fn scrollback_options_keep_legacy_json_and_positional_wire_bytes() {

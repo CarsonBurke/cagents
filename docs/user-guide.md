@@ -873,6 +873,50 @@ After a confirmed close, or a kernel boot change, the picker resumes the exact
 conversation from disk. Missing ownership evidence within the same boot keeps
 the conversation available and explains the refusal without starting a writer.
 
+### Compose a message
+
+Use **+** beside the draft to attach files or images, search skills, and choose
+conversation actions. The menu follows the current provider's capabilities;
+actions such as plan mode appear when supported. Search narrows the choices,
+the arrow keys move between them, Enter chooses one, and Escape closes the menu.
+Skills insert their invocation into the draft so you can finish the message
+before sending it.
+
+The microphone and send control sit beside the same draft. An empty draft shows
+**Stop** while the agent is working; use it to interrupt active work. Model and
+reasoning controls, reported usage, and cost sit below the composer. Temporary
+activity stays in the scrolling conversation so the composer remains available.
+
+### Local dictation
+
+Local dictation requires x86-64 Linux, PipeWire with its `pw-record` recording
+tool, and a working microphone input. Setup also uses `curl`, `tar`, and `bzip2`.
+It uses this computer's microphone, including when the conversation works on a
+remote device. Click the microphone to open setup, then choose
+**Download and set up** to approve the optional **821 MiB** speech download.
+Allow additional disk space for the speech
+files. Opening a conversation or setup does not start a download or recording.
+Setup shows its progress; **Cancel setup** stops it, and a failed setup offers
+**Retry setup**.
+
+Once setup says dictation is ready, press the microphone again to record. The
+composer shows a recording timer. Finish within the 60-second limit using the
+recording's **Stop** control to transcribe locally. This control finishes speech
+capture; the separate agent **Stop** control interrupts agent work. **Cancel**
+discards the recording or pending transcription. Escape also cancels dictation
+when the composer or a dictation control has focus and no picker is taking that
+key.
+
+Recognized text goes into the draft at the caret or selection where recording
+started. You can keep editing; if those edits make the original insertion
+position ambiguous, the text is kept until you choose **Insert here** or
+**Discard**. **Insert here** inserts at the current caret or replaces the current
+selection. Existing attachments stay attached. Dictation never sends the
+message: review the draft and send it yourself. Sending, replacing, or leaving
+the draft cancels its active dictation; opening an image viewer keeps the same
+draft available. If capture fails, check the desktop input device and access
+before trying again.
+
 ### Image references and local image storage
 
 Pasted and selected images receive stable **Image N** labels. Their inline
@@ -906,6 +950,54 @@ image bytes, original filenames or private source paths. Omit `--device`, or
 use `--device local`; the command always addresses this physical device.
 Provider history that does not retain verifiable image data cannot reconstruct
 a trusted reference from its label alone.
+
+### Inspect an image
+
+Click an inline preview to enlarge that image. The viewer occupies the
+conversation area while the same composer stays usable below it. Opening,
+browsing, and closing the viewer keep the draft, its caret or selection, and
+its attachments; browsing an image does not attach it to your message.
+
+Use the previous/next controls or thumbnail strip to browse available previews.
+**Fit** shows the whole image; **100%** shows it at actual size. Scroll over the
+image to zoom, or click the image to focus it before pressing `+` / `−`. Drag to
+pan. With the viewer focused, Left/Right browse,
+`0` fits, `1` selects actual size, and Escape closes it. These viewer shortcuts
+stay with the viewer: typing and arrow keys in the composer continue to edit
+your draft. Use the close button to return to the transcript at any time.
+
+**Open externally** opens an available original in another application. Remote
+images remain in the device-aware viewer and cannot be opened through a
+matching local path. If a preview fails, use **Retry preview**; **Load preview**
+requests an image whose preview has not loaded yet.
+
+### Native goals
+
+Codex conversations can use the provider's native goal controls. Enter `/goal`
+or `/goal status` to open the goal panel and check its current state. Use
+`/goal set <objective>` to set an objective, or `/goal <objective>` when its
+first word is not a control name. Objectives can contain up to 4,000 Unicode
+characters. Explicit `set` also permits an objective such as `pause`.
+
+The panel shows the provider's objective, status, tokens and reported time used.
+**Check**, **Pause**, **Resume** and **Clear** act on that same conversation;
+`/goal pause`, `/goal resume` and `/goal clear` expose the same controls.
+Pause and Clear do not interrupt an already running turn; use the ordinary
+Stop control when that is also needed. Cagents supplies no implicit goal
+budget, and does not change the selected account, model or permissions.
+
+Goal commands use Send. Queue, Steer, attachments and unfinished pastes retain
+the input and explain what needs attention. An accepted dispatch is not provider
+confirmation: a failed or uncertain request keeps the text for inspection and
+is never automatically resent as a prompt. The panel distinguishes current
+state from the last observation. Unsupported providers or versions explain the
+limitation rather than sending literal `/goal` text.
+
+Restoring a goal can start autonomous work. Cagents preserves the original
+account and directory evidence before permitting that work. Older retained
+sessions without that evidence first check their goal without resuming the
+thread; active or unknown state keeps execution blocked. Where supported,
+Check, Pause and Clear remain available to recover the original conversation.
 
 ### Messages, branches, and child agents
 
@@ -954,8 +1046,12 @@ and restores that message as an editable draft in the branched conversation.
 Its steering control chooses delivery between tool calls or after the current
 turn completes, using OMP's own interrupt mode.
 
-Child agent tabs show isolated transcripts and lifecycle status for all three
-providers. Codex child approvals remain explicit and are labeled as child
+Child agent tabs use the agent's name and a status icon. Tabs group reported
+statuses: working, waiting, failed or denied, then settled. **Choose subagent** opens
+the full searchable list, with filters for working agents or those needing
+attention. Selecting an agent opens its isolated transcript; choose the
+**Conversation** tab to return to the parent. Codex child approvals remain
+explicit and are labeled as child
 requests. OMP child activity is read-only: its installed RPC API has no child
 messaging, stop, or restart command. Large optional child histories are omitted
 without disconnecting the parent, while live activity remains available.
@@ -1123,8 +1219,9 @@ and path so the producer can supply a concrete supported image.
   Escape closes find. Matching prose is highlighted and matching tools expand.
 - While an agent is working, messages you send wait in the queue above the
   composer. `Up` in an empty composer (or `Alt+Up` with a draft) takes the
-  newest one back to edit. Escape in the composer interrupts active
-  work when no picker is open. `Ctrl+End` returns to the latest messages;
+  newest one back to edit. Escape in the composer cancels active dictation
+  first; otherwise it interrupts agent work when no picker is open.
+  `Ctrl+End` returns to the latest messages;
   **New activity** indicates messages received while reading earlier history.
 - Type `@` to search tracked files by name. Attachment chips show the file name,
   offer removal, and reveal the full path on hover. Up on the first line

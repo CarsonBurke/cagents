@@ -97,6 +97,11 @@ struct LaunchOwnership {
 pub(crate) struct ExecutionContext {
     pub directory: Option<std::sync::Arc<std::fs::File>>,
     expected_directory: Option<crate::agent_execution::DirectoryIdentity>,
+    // Only a once-claimed fresh acceptance may retain the holder's original
+    // spawn FD. These private cells are never reconstructed from a pathname.
+    fresh_native_session: std::sync::OnceLock<crate::model::TerminalId>,
+    fresh_spawn_claimed: std::sync::OnceLock<Result<(), String>>,
+    fresh_spawn_directory: std::sync::OnceLock<std::sync::Arc<std::fs::File>>,
     ownership: std::sync::Mutex<LaunchOwnership>,
     provider_directory: std::sync::Mutex<Option<PathBuf>>,
 }
@@ -153,7 +158,7 @@ impl ExecutionContext {
     pub(crate) fn directory_identity(
         &self,
     ) -> Result<Option<crate::agent_execution::DirectoryIdentity>, String> {
-        match &self.directory {
+        match self.directory_descriptor() {
             Some(directory) => directory
                 .metadata()
                 .map(|metadata| {
@@ -166,7 +171,73 @@ impl ExecutionContext {
         }
     }
     pub(crate) fn directory_descriptor(&self) -> Option<std::sync::Arc<std::fs::File>> {
-        self.directory.clone()
+        self.directory
+            .clone()
+            .or_else(|| self.fresh_spawn_directory.get().cloned())
+    }
+    /// Called only after the accepted fresh session has been allocated and its
+    /// once-only dispatch claim committed. A new helper is not itself admission.
+    pub(crate) fn admit_fresh_native_directory(
+        &self,
+        source: &super::Session,
+    ) -> Result<(), String> {
+        if source.launch.provider != crate::agent::Provider::Codex
+            || source.launch.session_id.is_some()
+            || source.native_continuity != super::NativeContinuity::ReconnectOnly
+            || self.expected_directory.is_some()
+        {
+            return Err("Only a fresh accepted conversation may pin a new spawn directory".into());
+        }
+        self.fresh_native_session
+            .set(source.id)
+            .map_err(|_| "Fresh native directory admission was already issued".into())
+    }
+    /// Every marked native spawn, including a context that already has a pin,
+    /// must claim this exact session once before selecting a directory or child.
+    pub(crate) fn claim_fresh_native_spawn(&self, source: &super::Session) -> Result<bool, String> {
+        let Some(session) = self.fresh_native_session.get() else {
+            return Ok(false);
+        };
+        let admission = if *session != source.id
+            || source.launch.session_id.is_some()
+            || source.launch.provider != crate::agent::Provider::Codex
+            || self.expected_directory.is_some()
+        {
+            Err("The native spawn does not belong to this fresh acceptance".to_owned())
+        } else {
+            Ok(())
+        };
+        self.fresh_spawn_claimed
+            .set(admission.clone())
+            .map_err(|_| "The fresh native spawn attempt was already consumed".to_owned())?;
+        admission.map(|()| true)
+    }
+    /// Retain the actual FD already selected by this claimed native spawn.
+    /// Legacy/recovered contexts cannot mint authority from a current pathname.
+    pub(crate) fn retain_fresh_spawn_directory(
+        &self,
+        source: &super::Session,
+        directory: std::sync::Arc<std::fs::File>,
+    ) -> Result<(), String> {
+        if self.fresh_native_session.get() != Some(&source.id)
+            || !matches!(self.fresh_spawn_claimed.get(), Some(Ok(())))
+            || source.launch.session_id.is_some()
+            || source.launch.provider != crate::agent::Provider::Codex
+            || self.expected_directory.is_some()
+            || self.directory.is_some()
+        {
+            return Err(
+                "The original spawn directory does not belong to this fresh acceptance".into(),
+            );
+        }
+        let identity = crate::agent_execution::DirectoryIdentity::from_metadata(
+            &directory.metadata().map_err(|error| error.to_string())?,
+        );
+        validate_launch_directory(&directory, identity)?;
+        self.fresh_spawn_directory
+            .set(directory)
+            .map_err(|_| "The original native spawn directory is already pinned".to_owned())?;
+        self.verify_directory(&source.launch.recipe.working_directory)
     }
     /// Return the descriptor used by spawn, never a new lookup of its pathname.
     pub(crate) fn pinned_launch_directory(
@@ -329,9 +400,22 @@ pub struct ServerIdentity {
     pub canonical_home: PathBuf,
     pub reported_home: String,
 }
+
+/// Advisory preparation for a native resume. The runtime rechecks authority at
+/// the actual write boundary; this value never authorizes a write by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GoalResumeAdmission {
+    OriginalScope,
+    /// An original legacy actor may resume only after a side-effect-free read
+    /// positively establishes that its goal cannot continue automatically.
+    InactiveOnly,
+    #[default]
+    Unavailable,
+}
 /// An adapter is confined to one daemon worker. No UI state, subprocesses,
 /// unbounded transcript storage, credentials, or global mutable state live here.
 pub trait Adapter: Send {
+    fn set_goal_resume_admission(&mut self, _admission: GoalResumeAdmission) {}
     /// Private launch selection, distinct from a provider-confirmed session.
     /// Only a provider with a retained bootstrap contract supplies this value.
     fn prepared_launch_identity(&self) -> Option<claude::PreparedIdentity> {
@@ -459,6 +543,122 @@ mod launch_tests {
         assert!(ExecutionContext::capture(&alias).is_err());
         assert!(ExecutionContext::capture(&alias.join("file")).is_err());
         assert!(ExecutionContext::capture(std::path::Path::new("/")).is_ok());
+    }
+
+    #[test]
+    fn fresh_native_spawn_pin_is_once_only_and_preserves_existing_cleanup_custody() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("original");
+        std::fs::create_dir(&path).unwrap();
+        let source = super::super::Session {
+            id: crate::model::TerminalId::new(),
+            launch: super::super::Launch {
+                provider: crate::agent::Provider::Codex,
+                recipe: crate::model::LaunchRecipe {
+                    program: "codex".into(),
+                    arguments: Vec::new(),
+                    working_directory: path.clone(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                session_id: None,
+            },
+            proof: None,
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        let pin = ExecutionContext::capture(&path)
+            .unwrap()
+            .directory_descriptor()
+            .unwrap();
+        let identity =
+            crate::agent_execution::DirectoryIdentity::from_metadata(&pin.metadata().unwrap());
+        let legacy = ExecutionContext::new(None);
+        assert!(!legacy.claim_fresh_native_spawn(&source).unwrap());
+        assert!(
+            legacy
+                .retain_fresh_spawn_directory(&source, pin.clone())
+                .is_err()
+        );
+        assert!(
+            legacy.directory_descriptor().is_none(),
+            "a new holder alone is not fresh admission"
+        );
+        let restored = ExecutionContext::restored(identity);
+        assert!(restored.admit_fresh_native_directory(&source).is_err());
+        assert!(!restored.claim_fresh_native_spawn(&source).unwrap());
+        assert!(
+            restored
+                .retain_fresh_spawn_directory(&source, pin.clone())
+                .is_err()
+        );
+        assert!(restored.directory_descriptor().is_none());
+        let mut resumed = source.clone();
+        resumed.launch.session_id = Some("original-thread".into());
+        assert!(
+            ExecutionContext::new(None)
+                .admit_fresh_native_directory(&resumed)
+                .is_err()
+        );
+        let context = Arc::new(ExecutionContext::new(None));
+        let same_context = context.clone();
+        let cleanup = Arc::new(Cleanup(Mutex::new(LaunchOutcome::Uncertain)));
+        context.claim_owner(cleanup.clone());
+        context.admit_fresh_native_directory(&source).unwrap();
+        assert!(context.admit_fresh_native_directory(&source).is_err());
+        assert!(context.claim_fresh_native_spawn(&source).unwrap());
+        context
+            .retain_fresh_spawn_directory(&source, pin.clone())
+            .unwrap();
+        assert!(Arc::ptr_eq(&context, &same_context));
+        assert!(Arc::ptr_eq(&pin, &context.directory_descriptor().unwrap()));
+        assert_eq!(context.pinned_launch_directory().unwrap().0, identity);
+        assert_eq!(
+            context.reconcile_cleanup().unwrap(),
+            LaunchOutcome::Uncertain
+        );
+        assert!(
+            context.claim_fresh_native_spawn(&source).is_err(),
+            "even a populated original pin cannot authorize another spawn"
+        );
+        let mut another_session = source.clone();
+        another_session.id = crate::model::TerminalId::new();
+        assert!(context.claim_fresh_native_spawn(&another_session).is_err());
+        assert!(
+            context
+                .retain_fresh_spawn_directory(&source, pin.clone())
+                .is_err()
+        );
+        // Renaming/replacement never changes the retained original FD.
+        std::fs::rename(&path, root.path().join("moved")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(context.directory_identity().unwrap(), Some(identity));
+        assert!(context.verify_directory(&path).is_err());
+        assert!(
+            context
+                .retain_fresh_spawn_directory(
+                    &source,
+                    Arc::new(std::fs::File::open(&path).unwrap())
+                )
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&pin, &context.directory_descriptor().unwrap()));
+        *cleanup.0.lock().unwrap() = LaunchOutcome::TeardownProved;
+        assert_eq!(
+            context.reconcile_cleanup().unwrap(),
+            LaunchOutcome::TeardownProved
+        );
+        assert_eq!(Arc::strong_count(&cleanup), 1);
+        // A wrong session consumes its attempt, without installing any FD.
+        let invalid = ExecutionContext::new(None);
+        invalid.admit_fresh_native_directory(&source).unwrap();
+        let mut other = source.clone();
+        other.id = crate::model::TerminalId::new();
+        assert!(invalid.claim_fresh_native_spawn(&other).is_err());
+        assert!(invalid.claim_fresh_native_spawn(&source).is_err());
+        assert!(invalid.retain_fresh_spawn_directory(&source, pin).is_err());
+        assert!(invalid.directory_descriptor().is_none());
     }
 
     #[test]

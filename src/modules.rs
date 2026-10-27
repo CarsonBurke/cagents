@@ -120,6 +120,8 @@ pub mod settings_widgets;
 #[cfg(feature = "ui")]
 pub mod sidebar;
 #[cfg(feature = "ui")]
+pub(crate) mod speech;
+#[cfg(feature = "ui")]
 pub mod splitter;
 #[cfg(feature = "ui")]
 mod sticky_tree;

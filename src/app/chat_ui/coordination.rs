@@ -1,10 +1,10 @@
 //! Drawing what an agent did to work with other agents.
 //!
 //! A message one agent sends another is the mirror of the delivery the other
-//! receives, and is drawn as one: a card that names its recipient and shows
-//! the message as prose, instead of a `Ran` row whose message is a quoted
-//! shell argument. Starting an agent is drawn the same way, its prompt being
-//! the part worth reading. Every other coordinating step stays one line of
+//! receives, and is drawn as one: a row that names its recipient, instead of
+//! a `Ran` row whose message is a quoted shell argument. Prompts and tool
+//! payloads open intentionally; starting an agent does not paste its internal
+//! instructions into the conversation. Every other coordinating step stays one line of
 //! the step strip, but says what it did - "Waited for reviewer" - rather than
 //! reprinting the command that did it.
 //!
@@ -31,6 +31,7 @@ pub(super) struct Prepared {
     prompts: Vec<Option<markdown::Content>>,
     brief: Option<markdown::Content>,
     answers: Vec<markdown::Content>,
+    answer_summaries: Vec<String>,
     documents: Vec<prose_document::Data>,
     #[cfg(test)]
     pub(super) created_on: std::thread::ThreadId,
@@ -78,11 +79,27 @@ impl Prepared {
         {
             answers.push(parse(&run.result)?);
         }
+        let answer_summaries = reading
+            .outcome
+            .messages
+            .iter()
+            .map(|message| message.body.as_str())
+            .chain(
+                reading
+                    .outcome
+                    .run
+                    .as_ref()
+                    .filter(|run| !run.result.is_empty())
+                    .map(|run| run.result.as_str()),
+            )
+            .map(concise_result)
+            .collect();
         let mut prepared = Self {
             reading,
             prompts,
             brief,
             answers,
+            answer_summaries,
             documents: vec![],
             #[cfg(test)]
             created_on: std::thread::current().id(),
@@ -238,11 +255,17 @@ impl Coordinated {
         parts
     }
 
-    /// What copying the card takes: the message, or the prompt.
+    /// A completed delegation copies its authentic result; otherwise copy
+    /// the message or prompt, never the surrounding transport receipt.
     pub(super) fn copy_text(&self) -> Option<String> {
         match &self.reading.kind {
             Kind::Message(message) => message.body.inline().map(str::to_owned),
             Kind::Spawn(spawn) => {
+                if let Some(run) = &self.reading.outcome.run
+                    && !run.result.is_empty()
+                {
+                    return Some(run.result.clone());
+                }
                 let prompts: Vec<&str> = spawn
                     .agents
                     .iter()
@@ -258,7 +281,7 @@ impl Coordinated {
     pub(super) fn glyph(&self) -> Option<Icon> {
         Some(match &self.reading.kind {
             Kind::Message(_) => Icon::Send,
-            Kind::Spawn(_) => Icon::Agent,
+            Kind::Spawn(_) => return None,
             Kind::Act(Act::Inbox { .. }) => Icon::Chat,
             Kind::Act(Act::Linear { .. }) => Icon::Comment,
             Kind::Act(Act::Sessions | Act::Whoami | Act::Agents) => Icon::Users,
@@ -294,19 +317,15 @@ impl Coordinated {
                 Act::Wait { agents } if agents.is_empty() => ("Waited for", "agents".into()),
                 Act::Wait { agents } => ("Waited for", names(agents)),
                 Act::Requests { agent } => ("Read what", format!("{} is asking", name(agent))),
-                Act::Answer {
-                    agent,
-                    request,
-                    action,
-                } => (
+                Act::Answer { agent, action, .. } => (
                     "Answered",
-                    format!("{}'s request {request} with {action}", name(agent)),
+                    format!("{}'s request with {action}", name(agent)),
                 ),
                 Act::Interrupt { agent } => ("Interrupted", name(agent)),
                 Act::Close { agents } => ("Closed", names(agents)),
                 Act::Resume { agents } => ("Resumed", names(agents)),
-                Act::Stop { task } => ("Stopped", format!("background task {task}")),
-                Act::Output { task } => ("Read the output of", format!("task {task}")),
+                Act::Stop { .. } => ("Stopped", "background task".into()),
+                Act::Output { .. } => ("Read the output of", "background task".into()),
                 Act::Linear { verb, subject } => (verb, subject.clone()),
                 Act::Cli(path) => ("Ran", format!("cagents {path}").trim_end().to_owned()),
             },
@@ -317,7 +336,7 @@ impl Coordinated {
     /// The step's line with agents named by their IDs, for a summary formed
     /// where the conversation's subagents are not to hand.
     pub(super) fn summary(&self) -> String {
-        let (verb, label) = self.line(&|id| short_id(id).to_owned());
+        let (verb, label) = self.line(&|_| "agent".to_owned());
         if label.is_empty() {
             verb
         } else {
@@ -336,22 +355,26 @@ fn message_verb(kind: OutboundKind) -> &'static str {
     }
 }
 
-/// An ID's first eight characters, which is how the CLI prints one. A name,
-/// such as `reviewer-2`, is kept whole.
-fn short_id(id: &str) -> &str {
-    if !is_identifier(id) {
-        return id;
+/// Prepared beside Markdown, never by laying out a clipped full report.
+fn concise_result(text: &str) -> String {
+    let first = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let mut chars = first.chars();
+    let mut summary: String = chars.by_ref().take(160).collect();
+    if chars.next().is_some() {
+        summary.push('…');
     }
-    id.char_indices().nth(8).map_or(id, |(end, _)| &id[..end])
+    summary
 }
 
 /// Whom started agents are, as one phrase.
 fn started(spawn: &Spawn) -> String {
     match spawn.agents.as_slice() {
-        [only] => [&only.name, &only.kind]
-            .into_iter()
-            .find(|name| !name.is_empty())
-            .map_or_else(|| "an agent".to_owned(), |name| name.clone()),
+        [only] if !only.name.trim().is_empty() => only.name.clone(),
+        [_] => "an agent".to_owned(),
         agents => format!("{} agents", agents.len()),
     }
 }
@@ -368,8 +391,8 @@ struct Recipient {
 impl Recipient {
     fn plain(&self) -> String {
         match (&self.session, self.name.is_empty()) {
-            (Some(session), true) => format!("session {}", short_id(session)),
-            (Some(session), false) => format!("{} ({})", self.name, short_id(session)),
+            (Some(_), true) => "conversation".to_owned(),
+            (Some(_), false) => self.name.clone(),
             (None, _) => self.name.clone(),
         }
     }
@@ -407,7 +430,7 @@ fn recipient(
     };
     match message.kind {
         OutboundKind::Report => named("the conversation that started it".into()),
-        OutboundKind::Reply => named(format!("message {}", short_id(&message.to))),
+        OutboundKind::Reply => named("a message".to_owned()),
         OutboundKind::Prompt if !reading.subagents.is_empty() => named(
             reading
                 .subagents
@@ -416,7 +439,7 @@ fn recipient(
                 .collect::<Vec<_>>()
                 .join(", "),
         ),
-        OutboundKind::Prompt => named(format!("agent {}", message.to)),
+        OutboundKind::Prompt => named("an agent".to_owned()),
         _ if message.to == "parent" => named("the session that started it".into()),
         // A `cagents` recipient is a session ID, or a prefix of one.
         _ if reading.cli && is_identifier(&message.to) => Recipient {
@@ -444,7 +467,6 @@ fn arrival(arrival: Arrival) -> &'static str {
 
 /// How a run stands, and which agent runs it, as one status line.
 fn run_line(run: &Run) -> Option<(String, Tone)> {
-    let agent = (!run.agent.is_empty()).then(|| format!("agent {}", run.agent));
     let tone = match run.state {
         Some(State::Failed | State::Interrupted) => Tone::Error,
         Some(State::Cancelled) => Tone::Warning,
@@ -457,12 +479,7 @@ fn run_line(run: &Run) -> Option<(String, Tone)> {
         }
         state
     });
-    match (agent, state) {
-        (Some(agent), Some(state)) => Some((format!("{state} as {agent}"), tone)),
-        (Some(agent), None) => Some((format!("Launch accepted as {agent}"), tone)),
-        (None, Some(state)) => Some((state, tone)),
-        (None, None) => None,
-    }
+    state.map(|state| (state, tone))
 }
 
 /// How a started agent's run stands, as a reader would say it.
@@ -497,50 +514,6 @@ fn last_line(output: &str) -> &str {
         .unwrap_or_default()
 }
 
-/// Describe only metadata reported for this launch; native children do not
-/// inherit the parent model merely because they share a provider.
-fn spawn_identity(reading: &Coordination, spawn: &Spawn, observed_model: Option<&str>) -> String {
-    let mut parts = vec![
-        if reading.cli {
-            "cagents agent"
-        } else {
-            "Native subagent"
-        }
-        .to_owned(),
-    ];
-    if !spawn.provider.is_empty() {
-        parts.push(spawn.provider.clone());
-    }
-    parts.push(
-        observed_model
-            .filter(|model| !model.trim().is_empty())
-            .unwrap_or(if spawn.model.is_empty() {
-                "Model not reported"
-            } else {
-                &spawn.model
-            })
-            .to_owned(),
-    );
-    if !spawn.effort.is_empty() {
-        parts.push(spawn.effort.clone());
-    }
-    if reading.cli {
-        parts.push(match &spawn.placement {
-            Some(crate::agent_execution::Placement::Channel(channel)) => {
-                format!("Channel {channel}")
-            }
-            Some(crate::agent_execution::Placement::Worktree { path, .. }) => {
-                format!("Worktree view {}", path.display())
-            }
-            None => spawn.channel.as_ref().map_or_else(
-                || "View not reported".to_owned(),
-                |channel| format!("Channel {channel}"),
-            ),
-        });
-    }
-    parts.join(" · ")
-}
-
 fn muted_glyph(icon: Icon) -> Element<'static, Message> {
     widget::icon(icon.handle())
         .size(14)
@@ -568,6 +541,7 @@ enum BackgroundState {
     Working,
     Waiting,
     Failed,
+    Denied,
     Stopped,
     Finished,
 }
@@ -578,6 +552,7 @@ impl BackgroundState {
             Self::Working => "Working",
             Self::Waiting => "Waiting for you",
             Self::Failed => "Failed",
+            Self::Denied => "Denied",
             Self::Stopped => "Stopped",
             Self::Finished => "Finished",
         }
@@ -587,6 +562,7 @@ impl BackgroundState {
         match self {
             Self::Working | Self::Waiting => ToolStatus::Running,
             Self::Failed => ToolStatus::Failed,
+            Self::Denied => ToolStatus::Denied,
             Self::Stopped => ToolStatus::Stopped,
             Self::Finished => ToolStatus::Succeeded,
         }
@@ -607,21 +583,16 @@ fn status_caption(text: String, tone: Tone) -> Element<'static, Message> {
 }
 
 impl Runtime {
-    /// What an agent of this conversation is called: its subagent's type or
-    /// description where this conversation lists it, else its short ID.
+    /// A reported name is identity; task prose and transport IDs are details.
     pub(super) fn agent_name(&self, id: &str) -> String {
         self.snapshot
             .subagents
             .iter()
             .find(|agent| agent.id == id)
-            .map(|agent| {
-                [&agent.kind, &agent.description]
-                    .into_iter()
-                    .find(|name| !name.is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| short_id(id).to_owned())
-            })
-            .unwrap_or_else(|| short_id(id).to_owned())
+            .map(|agent| agent.kind.trim())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Agent")
+            .to_owned()
     }
 
     /// A message or a started agent, drawn as a card that shows its text.
@@ -668,8 +639,40 @@ impl Runtime {
             ),
             Kind::Act(_) => {}
         }
-        rows.push(self.card_footer(item, cached, coordinated, status != reported));
-        rows.extend(raw);
+        let spawn = matches!(coordinated.reading.kind, Kind::Spawn(_));
+        if !spawn {
+            rows.push(self.card_footer(item, cached, coordinated, status != reported));
+        }
+        if let Some(raw) = raw {
+            let key = format!("{}#tool-call", item.id);
+            let open = self.part_unfolded(&key)
+                || self.part_unfolded(&format!("{}#input", item.id))
+                || self.part_unfolded(&format!("{}#output", item.id));
+            rows.push(
+                widget::button::custom(design::caption(if open {
+                    "Hide tool call"
+                } else {
+                    "Tool call"
+                }))
+                .name(format!(
+                    "{} original tool call",
+                    if open { "Hide" } else { "Show" }
+                ))
+                .id(card_control_id(
+                    self.target.card,
+                    &format!(
+                        "coordination-{}-{}-tool-call",
+                        self.target.generation, item.id
+                    ),
+                ))
+                .class(crate::ui_controls::control_style(open, None))
+                .on_press(action(Action::Unfold(self.target, key)))
+                .into(),
+            );
+            if open {
+                rows.push(raw);
+            }
+        }
         let card = widget::container(
             widget::column::with_children(rows)
                 .spacing(step::GAP_S)
@@ -682,20 +685,25 @@ impl Runtime {
             [design::RADIUS_M; 4],
             true,
         ))
-        .padding([step::GAP_S as u16, step::GAP_M as u16])
+        .padding(if spawn {
+            [step::GAP_XS as u16, step::GAP_S as u16]
+        } else {
+            [step::GAP_S as u16, step::GAP_M as u16]
+        })
         .width(Length::Fill);
-        widget::container(view::message_actions(
-            card.into(),
-            self.message_copy(item),
-            Alignment::Start,
-        ))
-        .max_width(design::READABLE_MEASURE)
-        .width(Length::Fill)
-        .into()
+        let card: Element<'a, Message> = if spawn {
+            card.into()
+        } else {
+            view::message_actions(card.into(), self.message_copy(item), Alignment::Start)
+        };
+        widget::container(card)
+            .max_width(design::READABLE_MEASURE)
+            .width(Length::Fill)
+            .into()
     }
 
     /// The glyph or spinner a card's heading opens with.
-    fn card_indicator(&self, status: ToolStatus, icon: Icon) -> Element<'static, Message> {
+    fn card_indicator(&self, status: ToolStatus) -> Element<'static, Message> {
         match status {
             ToolStatus::Running => crate::ui_controls::activity_spinner(14.0, design::accent_color),
             ToolStatus::Failed => widget::icon(Icon::Error.handle())
@@ -706,39 +714,90 @@ impl Runtime {
                     }
                 })))
                 .into(),
-            _ => muted_glyph(icon),
+            ToolStatus::Succeeded => muted_glyph(Icon::Check),
+            ToolStatus::Denied => muted_glyph(Icon::Unavailable),
+            ToolStatus::Stopped => muted_glyph(Icon::Cancel),
+        }
+    }
+
+    fn coordination_name(&self, coordinated: &Coordinated, spawn: &Spawn) -> String {
+        let observed: Vec<_> = coordinated
+            .reading
+            .subagents
+            .iter()
+            .filter_map(|id| {
+                self.snapshot
+                    .subagents
+                    .iter()
+                    .find(|agent| &agent.id == id)
+                    .map(|agent| agent.kind.trim())
+                    .filter(|name| !name.is_empty())
+            })
+            .collect();
+        let names = if observed.is_empty() {
+            spawn
+                .agents
+                .iter()
+                .map(|agent| agent.name.trim())
+                .filter(|name| !name.is_empty())
+                .collect()
+        } else {
+            observed
+        };
+        if names.is_empty() {
+            "Agent".to_owned()
+        } else {
+            names.join(", ")
+        }
+    }
+
+    fn coordination_status(&self, coordinated: &Coordinated, reported: ToolStatus) -> &'static str {
+        if let Some(state) = self.background_state(coordinated) {
+            return state.caption();
+        }
+        if let Kind::Spawn(spawn) = &coordinated.reading.kind
+            && coordinated.reading.cli
+            && !spawn.waits
+            && reported == ToolStatus::Succeeded
+        {
+            return coordinated
+                .reading
+                .outcome
+                .run
+                .as_ref()
+                .and_then(|run| run.state)
+                .map_or("Launch accepted", state_phrase);
+        }
+        match coordinated.reading.status(reported) {
+            ToolStatus::Running => "Working",
+            ToolStatus::Succeeded => "Finished",
+            ToolStatus::Failed => "Failed",
+            ToolStatus::Denied => "Denied",
+            ToolStatus::Stopped => "Stopped",
         }
     }
 
     /// A recipient's name and session, the session a link to its pane
     /// while it runs.
     fn session_link(&self, recipient: &Recipient) -> Vec<Element<'static, Message>> {
-        let mut parts: Vec<Element<'static, Message>> = Vec::new();
-        if !recipient.name.is_empty() {
-            parts.push(chat_title(recipient.name.clone()).into());
-        }
-        let Some(session) = &recipient.session else {
-            return parts;
-        };
-        let shown = short_id(session);
-        let label: Element<'static, Message> = if recipient.name.is_empty() {
-            chat_title(format!("session {shown}")).into()
+        let label = if recipient.name.is_empty() {
+            "Conversation".to_owned()
         } else {
-            design::caption(shown.to_owned())
-                .font(iced::Font::MONOSPACE)
-                .into()
+            recipient.name.clone()
         };
-        parts.push(if recipient.live {
-            widget::button::custom(label)
+        let title = chat_title(label.clone());
+        vec![if let Some(session) = &recipient.session
+            && recipient.live
+        {
+            widget::button::custom(title)
                 .class(crate::ui_controls::control_style(false, None))
                 .padding([0, step::GAP_XS as u16])
-                .name(format!("Go to session {shown}"))
+                .name(format!("Open conversation {label}"))
                 .on_press(action(Action::OpenSession(session.clone())))
                 .into()
         } else {
-            label
-        });
-        parts
+            title.into()
+        }]
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -757,7 +816,7 @@ impl Runtime {
         let name = |id: &str| self.agent_name(id);
         let recipient = recipient(message, reading, &name);
         let mut heading = vec![
-            self.card_indicator(status, Icon::Send),
+            self.card_indicator(status),
             design::caption(message_verb(message.kind)).into(),
         ];
         heading.extend(self.session_link(&recipient));
@@ -849,134 +908,112 @@ impl Runtime {
     ) {
         let reading = &coordinated.reading;
         let background = self.background_state(coordinated);
-        // Use the observed task state while a native launch tool is still
-        // settling, but keep an explicit launch failure visible.
+        let reported_run = reading
+            .outcome
+            .run
+            .as_ref()
+            .and_then(|run| run.state)
+            .map(|state| match state {
+                State::Accepted | State::Running | State::Waiting => ToolStatus::Running,
+                State::Succeeded => ToolStatus::Succeeded,
+                State::Failed | State::Interrupted => ToolStatus::Failed,
+                State::Cancelled => ToolStatus::Stopped,
+            });
         let indicator = match background
             .filter(|_| matches!(status, ToolStatus::Running | ToolStatus::Succeeded))
         {
             Some(BackgroundState::Waiting) => muted_glyph(Icon::AgentWaiting),
-            Some(state) => self.card_indicator(state.tool_status(), Icon::Agent),
-            None => self.card_indicator(status, Icon::Agent),
+            Some(state) => self.card_indicator(state.tool_status()),
+            None => self.card_indicator(if status == ToolStatus::Succeeded {
+                reported_run.unwrap_or(status)
+            } else {
+                status
+            }),
         };
-        // The task is what readers scan for. Agent origin and launch options
-        // belong on their own secondary line, not inside the task name.
-        let primary = match spawn.agents.as_slice() {
-            [agent] if !agent.name.trim().is_empty() && agent.name != agent.kind => {
-                agent.name.clone()
-            }
-            [agent] if !agent.description.trim().is_empty() => agent.description.clone(),
-            _ => started(spawn),
-        };
+        let names = self.coordination_name(coordinated, spawn);
         rows.push(
-            widget::row::with_children(vec![
-                indicator,
-                crate::interaction::tooltip(
-                    chat_title(Self::short_description(
-                        primary
-                            .lines()
-                            .map(str::trim)
-                            .find(|line| !line.is_empty())
-                            .unwrap_or(&primary),
-                        80,
-                    ))
-                    .width(Length::Fill),
-                    primary.clone(),
-                )
-                .into(),
-            ])
-            .spacing(step::GAP_S)
-            .align_y(Alignment::Center)
-            .into(),
-        );
-        let observed_model = if !reading.cli {
-            match reading.subagents.as_slice() {
-                [id] => self
-                    .snapshot
-                    .subagents
-                    .iter()
-                    .find(|agent| &agent.id == id)
-                    .and_then(|agent| agent.model.as_deref()),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let kind = match spawn.agents.as_slice() {
-            [agent] if !agent.kind.is_empty() && agent.kind != primary => {
-                format!(" · {}", agent.kind)
-            }
-            _ => String::new(),
-        };
-        rows.push(
-            design::caption(format!(
-                "{}{}",
-                spawn_identity(reading, spawn, observed_model),
-                kind,
-            ))
-            .into(),
-        );
-        if !spawn.directory.is_empty() {
-            rows.push(
-                design::caption(format!("in {}", spawn.directory))
-                    .font(iced::Font::MONOSPACE)
+            widget::flex_row(vec![
+                widget::row::with_children(vec![indicator, chat_title(names).into()])
+                    .spacing(step::GAP_S)
+                    .align_y(Alignment::Center)
                     .into(),
-            );
-        }
-        if let Some(brief) = &coordinated.brief {
+                self.card_footer(
+                    item,
+                    cached,
+                    coordinated,
+                    status != item.content.status().unwrap_or(status),
+                ),
+            ])
+            .spacing(step::GAP_S as u16)
+            .align_items(Alignment::Center)
+            .into(),
+        );
+
+        // Instructions are available in full only after an intentional
+        // disclosure. Find can independently open the exact existing part.
+        let details = self.item_expanded(&item.id);
+        if let Some(brief) = &coordinated.brief
+            && (details || self.part_unfolded(&format!("{}#brief", item.id)))
+        {
             rows.push(self.folded_markdown(item, cached, "brief", brief, "Shared brief", settings));
         }
-        let several = spawn.agents.len() > 1;
         for (index, (agent, prompt)) in spawn.agents.iter().zip(&coordinated.prompts).enumerate() {
-            let mut title: Vec<String> = Vec::new();
-            if several {
-                title.extend(
-                    [&agent.name, &agent.kind]
-                        .into_iter()
-                        .filter(|name| !name.is_empty())
-                        .cloned(),
-                );
+            let part = format!("prompt-{index}");
+            if !details && !self.part_unfolded(&format!("{}#{part}", item.id)) {
+                continue;
             }
-            if !agent.description.is_empty() && (several || agent.description != primary) {
-                title.push(agent.description.clone());
-            }
-            if !title.is_empty() {
-                rows.push(if several {
-                    chat_title(title.join(" · ")).into()
+            rows.push(
+                design::caption(if spawn.agents.len() == 1 {
+                    "Prompt".to_owned()
+                } else if agent.name.trim().is_empty() {
+                    format!("Prompt {}", index + 1)
                 } else {
-                    design::caption(title.join(" · ")).into()
-                });
-            }
+                    format!("Prompt for {}", agent.name)
+                })
+                .into(),
+            );
             rows.extend(self.text_block(
                 item,
                 cached,
-                &format!("prompt-{index}"),
+                &part,
                 &agent.prompt,
                 prompt.as_ref(),
-                "Show full prompt",
+                "Show prompt",
                 settings,
             ));
         }
-        // How the run went, as far as this step saw it.
-        let run = reading.outcome.run.as_ref();
-        let line = match status {
-            ToolStatus::Running if background.is_some() => None,
-            ToolStatus::Running if spawn.waits => Some(("Working…".to_owned(), Tone::Plain)),
-            ToolStatus::Running => Some(("Starting…".to_owned(), Tone::Plain)),
-            ToolStatus::Failed | ToolStatus::Denied | ToolStatus::Stopped => {
-                let reason = failure(reading, output);
-                Some((
-                    match status {
-                        ToolStatus::Stopped => "Stopped".to_owned(),
-                        _ if reason.is_empty() || run.is_some() => "Failed".to_owned(),
-                        _ => format!("Failed: {reason}"),
-                    },
-                    Tone::Error,
-                ))
+        if matches!(
+            status,
+            ToolStatus::Failed | ToolStatus::Denied | ToolStatus::Stopped
+        ) {
+            let reason = failure(reading, output);
+            if !reason.is_empty() {
+                rows.push(status_caption(reason.to_owned(), Tone::Error));
             }
-            _ => run.and_then(run_line),
-        };
-        if let Some((text, tone)) = line {
-            rows.push(status_caption(text, tone));
+        }
+        // A successful launch is not a successful child. Keep the child's
+        // actionable failure visible, without expanding its entire transcript.
+        for child in coordinated
+            .reading
+            .subagents
+            .iter()
+            .filter_map(|id| self.snapshot.subagents.iter().find(|child| &child.id == id))
+            .filter(|child| {
+                matches!(
+                    child.status,
+                    ToolStatus::Failed | ToolStatus::Denied | ToolStatus::Stopped
+                ) && !child.detail.trim().is_empty()
+            })
+        {
+            let detail = if details {
+                child.detail.clone()
+            } else {
+                concise_result(&child.detail)
+            };
+            rows.push(status_caption(
+                format!("{}: {detail}", self.agent_name(&child.id)),
+                Tone::Error,
+            ));
         }
         rows.extend(self.arrived(item, cached, coordinated, "From", settings));
         rows.extend(self.result(item, cached, coordinated, settings));
@@ -1009,7 +1046,9 @@ impl Runtime {
             Some(BackgroundState::Working)
         } else if any(ToolStatus::Failed) {
             Some(BackgroundState::Failed)
-        } else if any(ToolStatus::Stopped) || any(ToolStatus::Denied) {
+        } else if any(ToolStatus::Denied) {
+            Some(BackgroundState::Denied)
+        } else if any(ToolStatus::Stopped) {
             Some(BackgroundState::Stopped)
         } else {
             Some(BackgroundState::Finished)
@@ -1029,14 +1068,23 @@ impl Runtime {
             .answers
             .last()
             .filter(|_| !run.result.is_empty())?;
-        Some(self.answer_block(
-            item,
-            cached,
-            "result",
-            "Result".to_owned(),
-            result,
-            settings,
-        ))
+        Some(
+            self.answer_block(
+                item,
+                cached,
+                "result",
+                "Result".to_owned(),
+                result,
+                coordinated
+                    .answer_summaries
+                    .last()
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+                matches!(coordinated.reading.kind, Kind::Spawn(_))
+                    .then(|| Action::Copy(self.target, item.id.clone(), CopyPart::Text)),
+                settings,
+            ),
+        )
     }
 
     /// A message's or a prompt's text, folded to its opening when long.
@@ -1074,19 +1122,44 @@ impl Runtime {
         settings: markdown::Settings,
     ) -> Element<'static, Message> {
         let key = format!("{}#{part}", item.id);
+        if self.item_expanded(&item.id) {
+            return prose::content_view(
+                cached,
+                content,
+                settings,
+                self.target,
+                self.find.as_deref(),
+            );
+        }
         let open = self.part_unfolded(&key);
         let toggle =
             widget::button::custom(design::caption(if open { "Show less" } else { unfold }))
                 .class(crate::ui_controls::control_style(false, None))
+                .name(format!(
+                    "{} {part} details",
+                    if open { "Hide" } else { "Show" }
+                ))
+                .id(card_control_id(
+                    self.target.card,
+                    &format!(
+                        "coordination-{}-{}-part-{part}",
+                        self.target.generation, item.id
+                    ),
+                ))
                 .on_press(action(Action::Unfold(self.target, key)));
-        fold::fold(
-            prose::content_view(cached, content, settings, self.target, self.find.as_deref()),
-            toggle,
-            !open,
-            view::DELIVERY_FOLDED_HEIGHT,
-            step::GAP_S,
-            design::raised,
-        )
+        let mut rows: Vec<Element<'static, Message>> = vec![toggle.into()];
+        if open {
+            rows.push(prose::content_view(
+                cached,
+                content,
+                settings,
+                self.target,
+                self.find.as_deref(),
+            ));
+        }
+        widget::column::with_children(rows)
+            .spacing(step::GAP_XS)
+            .into()
     }
 
     /// Each message the step printed as having arrived, captioned with
@@ -1111,8 +1184,14 @@ impl Runtime {
                     item,
                     cached,
                     &format!("answer-{index}"),
-                    format!("{heading} {}", message.from),
+                    format!("{heading} {}", self.agent_name(&message.from)),
                     content,
+                    coordinated
+                        .answer_summaries
+                        .get(index)
+                        .map(String::as_str)
+                        .unwrap_or_default(),
+                    None,
                     settings,
                 )
             })
@@ -1128,33 +1207,70 @@ impl Runtime {
         part: &str,
         caption: String,
         content: &markdown::Content,
+        summary: &str,
+        copy: Option<Action>,
         settings: markdown::Settings,
     ) -> Element<'static, Message> {
-        widget::container(
-            widget::column::with_children(vec![
-                widget::row::with_children(vec![
-                    muted_glyph(Icon::Chat),
-                    design::caption(caption).into(),
-                ])
-                .spacing(step::GAP_XS)
-                .align_y(Alignment::Center)
+        let key = format!("{}#{part}", item.id);
+        let open = self.item_expanded(&item.id) || self.part_unfolded(&key);
+        let mut controls: Vec<Element<'static, Message>> = vec![design::caption(caption).into()];
+        if !self.item_expanded(&item.id) {
+            controls.push(
+                widget::button::custom(design::caption(if open {
+                    "Hide result"
+                } else {
+                    "Read result"
+                }))
+                .id(card_control_id(
+                    self.target.card,
+                    &format!("coordination-{}-{}-{part}", self.target.generation, item.id),
+                ))
+                .class(crate::ui_controls::control_style(open, None))
+                .on_press(action(Action::Unfold(self.target, key)))
                 .into(),
-                self.folded_markdown(item, cached, part, content, "Show more", settings),
-            ])
-            .spacing(step::GAP_XS),
-        )
-        .class(design::surface(
-            Some(design::sunken),
-            [design::RADIUS_M; 4],
-            false,
-        ))
-        .padding([step::GAP_S as u16, step::GAP_M as u16])
-        .width(Length::Fill)
-        .into()
+            );
+        }
+        if let Some(copy) = copy {
+            controls.push(
+                widget::button::custom(design::caption("Copy result"))
+                    .name("Copy original agent result")
+                    .id(card_control_id(
+                        self.target.card,
+                        &format!(
+                            "coordination-{}-{}-{part}-copy",
+                            self.target.generation, item.id
+                        ),
+                    ))
+                    .class(crate::ui_controls::control_style(false, None))
+                    .on_press(action(copy))
+                    .into(),
+            );
+        }
+        let mut rows = vec![
+            widget::flex_row(controls)
+                .spacing(step::GAP_XS as u16)
+                .align_items(Alignment::Center)
+                .into(),
+        ];
+        if !open && !summary.is_empty() {
+            rows.push(design::body(summary.to_owned()).into());
+        }
+        if open {
+            rows.push(prose::content_view(
+                cached,
+                content,
+                settings,
+                self.target,
+                self.find.as_deref(),
+            ));
+        }
+        widget::container(widget::column::with_children(rows).spacing(step::GAP_XS))
+            .padding([step::GAP_XS as u16, 0])
+            .width(Length::Fill)
+            .into()
     }
 
-    /// The card's last line: the subagent's transcript, where this
-    /// conversation has it, and the command behind the card.
+    /// Related actions stay together; source IDs stay in their callbacks.
     fn card_footer(
         &self,
         item: &chat::Item,
@@ -1167,133 +1283,142 @@ impl Runtime {
             let Some(agent) = self.snapshot.subagents.iter().find(|agent| &agent.id == id) else {
                 continue;
             };
+            let name = self.agent_name(&agent.id);
             let label = if coordinated.reading.subagents.len() == 1 {
                 "Transcript".to_owned()
             } else {
-                format!("Open {}", self.agent_name(&agent.id))
+                format!("Open {name}")
             };
             controls.push(
-                widget::button::custom(
-                    widget::row::with_children(vec![
-                        design::caption(label).into(),
-                        muted_glyph(Icon::Jump),
-                    ])
-                    .spacing(step::GAP_XS)
-                    .align_y(Alignment::Center),
-                )
-                .class(crate::ui_controls::control_style(false, None))
-                .padding([step::GAP_XS as u16, step::GAP_S as u16])
-                .on_press(action(Action::SelectSubagent(
-                    self.target,
-                    Some(agent.id.clone()),
-                )))
-                .into(),
+                widget::button::custom(design::caption(label))
+                    .name(format!("Open {name} transcript"))
+                    .id(card_control_id(
+                        self.target.card,
+                        &format!(
+                            "coordination-{}-{}-transcript-{}",
+                            self.target.generation, item.id, agent.id
+                        ),
+                    ))
+                    .class(crate::ui_controls::control_style(false, None))
+                    .padding([step::GAP_XS as u16, step::GAP_S as u16])
+                    .on_press(action(Action::SelectSubagent(
+                        self.target,
+                        Some(agent.id.clone()),
+                    )))
+                    .into(),
             );
         }
         let open = self.item_expanded(&item.id);
-        let source = match &item.content {
-            ItemContent::Command { .. } => "command",
-            _ => "tool call",
+        let name = match &coordinated.reading.kind {
+            Kind::Spawn(spawn) => self.coordination_name(coordinated, spawn),
+            _ => "message".into(),
         };
+        let state = self.coordination_status(
+            coordinated,
+            item.content.status().unwrap_or(ToolStatus::Succeeded),
+        );
         controls.push(
             widget::button::custom(design::caption(if open {
-                format!("Hide {source}")
+                "Hide details"
             } else {
-                format!("Show {source}")
+                "Details"
             }))
+            .name(format!(
+                "{} details for {name} ({state})",
+                if open { "Hide" } else { "Show" }
+            ))
+            .id(card_control_id(
+                self.target.card,
+                &format!(
+                    "coordination-{}-{}-details",
+                    self.target.generation, item.id
+                ),
+            ))
             .class(crate::ui_controls::control_style(open, None))
             .padding([step::GAP_XS as u16, step::GAP_S as u16])
             .on_press(action(Action::Toggle(self.target, item.id.clone())))
             .into(),
         );
-        // A step the CLI said failed is not "Completed" for its exit status,
-        // and an agent left running in the background is not done because
-        // its launch is.
-        let detail = if overruled {
-            Some("Failed".to_owned())
-        } else if let Kind::Spawn(spawn) = &coordinated.reading.kind
-            && coordinated.reading.cli
-            && !spawn.waits
-            && item.content.status() == Some(ToolStatus::Succeeded)
-        {
-            // Completing the launch command does not complete the separate
-            // session. Report its observed state, or only the accepted launch.
-            Some(
-                match coordinated.reading.outcome.run.as_ref() {
-                    Some(run) => run.state.map_or("Launch accepted", state_phrase),
-                    None => "Launch command finished",
-                }
-                .to_owned(),
-            )
-        } else {
-            self.background_state(coordinated)
-                .map(|state| state.caption().to_owned())
-                .or_else(|| cached.detail.clone())
-        };
-        if let Some(detail) = detail {
-            controls.push(widget::Space::new().width(Length::Fill).into());
-            let tone = match detail.as_str() {
-                "Failed" => cosmic::theme::Text::Custom(design::destructive_text),
-                "Waiting for you" => cosmic::theme::Text::Custom(design::warning_text),
-                _ => cosmic::theme::Text::default(),
-            };
-            controls.push(
-                design::heading(detail)
-                    .size(design::TEXT_CAPTION)
-                    .class(tone)
-                    .into(),
-            );
+        if !matches!(coordinated.reading.kind, Kind::Spawn(_)) {
+            if overruled {
+                controls.push(status_caption("Failed".into(), Tone::Error));
+            } else if let Some(detail) = &cached.detail {
+                controls.push(design::caption(detail.clone()).into());
+            }
         }
-        widget::row::with_children(controls)
-            .spacing(step::GAP_XS)
-            .align_y(Alignment::Center)
-            .width(Length::Fill)
+        widget::flex_row(controls)
+            .spacing(step::GAP_XS as u16)
+            .align_items(Alignment::Center)
             .into()
     }
 }
 
 #[cfg(test)]
-mod identity_tests {
+mod presentation_tests {
     use super::*;
 
     #[test]
-    fn launches_distinguish_native_children_and_separate_sessions_without_guessing() {
-        let mut spawn = Spawn::default();
-        let mut reading = Coordination {
-            kind: Kind::Spawn(spawn.clone()),
-            outcome: Default::default(),
+    fn result_preview_is_bounded_while_each_authentic_result_remains_exact() {
+        let result = format!(
+            "Verified Unicode λ result {}\nSecond authentic paragraph.",
+            "x".repeat(300)
+        );
+        let reading = Coordination {
+            kind: Kind::Act(Act::Agents),
+            outcome: crate::chat::coordination::Outcome {
+                run: Some(Run {
+                    result: result.clone(),
+                    ..Run::default()
+                }),
+                ..Default::default()
+            },
             subagents: Vec::new(),
             cli: false,
         };
+        let prepared = Prepared::new(reading);
+        assert_eq!(prepared.answer_summaries[0].chars().count(), 161);
+        assert!(prepared.answer_summaries[0].starts_with("Verified Unicode λ result"));
         assert_eq!(
-            spawn_identity(&reading, &spawn, None),
-            "Native subagent · Model not reported"
+            prepared.reading.outcome.run.as_ref().unwrap().result,
+            result
         );
-        assert_eq!(
-            spawn_identity(&reading, &spawn, Some("gpt-child-reported")),
-            "Native subagent · gpt-child-reported"
-        );
-        reading.cli = true;
-        assert_eq!(
-            spawn_identity(&reading, &spawn, None),
-            "cagents agent · Model not reported · View not reported"
-        );
-        spawn.provider = "codex".into();
-        spawn.model = "gpt-reported".into();
-        spawn.effort = "low".into();
-        let channel = crate::model::ChannelId::new();
-        spawn.channel = Some(channel);
-        assert_eq!(
-            spawn_identity(&reading, &spawn, None),
-            format!("cagents agent · codex · gpt-reported · low · Channel {channel}")
-        );
-        spawn.placement = Some(crate::agent_execution::Placement::Worktree {
-            repository: "/repo".into(),
-            path: "/repo/tree".into(),
+        assert_eq!(prepared.answers.len(), 1);
+    }
+
+    #[test]
+    fn completed_agent_copy_is_its_exact_result_instead_of_prompt_or_receipt() {
+        let result = "Distinct authentic result λ.\nSecond paragraph.";
+        let coordinated = Coordinated::new(Coordination {
+            kind: Kind::Spawn(Spawn {
+                agents: vec![crate::chat::coordination::Delegate {
+                    name: "Scout".into(),
+                    kind: "internal-type".into(),
+                    description: "Task prose".into(),
+                    prompt: Text::Inline("Private prompt instructions".into()),
+                }],
+                ..Spawn::default()
+            }),
+            outcome: crate::chat::coordination::Outcome {
+                run: Some(Run {
+                    agent: "transport-id".into(),
+                    result: result.into(),
+                    ..Run::default()
+                }),
+                ..Default::default()
+            },
+            subagents: Vec::new(),
+            cli: false,
         });
+        assert_eq!(coordinated.copy_text().as_deref(), Some(result));
         assert_eq!(
-            spawn_identity(&reading, &spawn, None),
-            "cagents agent · codex · gpt-reported · low · Worktree view /repo/tree"
+            coordinated
+                .parts()
+                .iter()
+                .find(|(part, _)| part == "prompt-0")
+                .unwrap()
+                .1,
+            "Private prompt instructions",
+            "disclosure keeps exact source independently of copy semantics"
         );
     }
 }

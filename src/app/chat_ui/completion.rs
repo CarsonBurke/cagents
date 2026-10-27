@@ -298,10 +298,14 @@ pub(super) fn candidates<'a>(snapshot: &'a Snapshot, token: &Token) -> Vec<Candi
             })
             .filter(|(name, _)| {
                 !name.eq_ignore_ascii_case(RESUME_COMMAND)
+                    && !name.eq_ignore_ascii_case("goal")
                     && !(permissions_available(snapshot)
                         && name.eq_ignore_ascii_case(PERMISSIONS_COMMAND))
             })
-            .chain([(RESUME_COMMAND, "Return to a saved conversation")]);
+            .chain([
+                (RESUME_COMMAND, "Return to a saved conversation"),
+                ("goal", "Inspect or change the native Codex thread goal"),
+            ]);
         // Compaction is a capability rather than an advertised command for
         // some providers; the composer answers to it either way, so the list
         // says so too.
@@ -329,6 +333,12 @@ pub(super) fn candidates<'a>(snapshot: &'a Snapshot, token: &Token) -> Vec<Candi
             }
         }
     }
+    // Count every catalog identity once. Duplicate names retain their exact
+    // provider paths even when a query happens to match only one candidate.
+    let mut name_counts = std::collections::HashMap::with_capacity(snapshot.skills.len());
+    for skill in &snapshot.skills {
+        *name_counts.entry(skill.name.as_str()).or_insert(0usize) += 1;
+    }
     for skill in &snapshot.skills {
         // The slash reaches every skill, because it is how a reader arriving
         // from any agent asks for one; the provider's own sigil reaches only
@@ -343,12 +353,7 @@ pub(super) fn candidates<'a>(snapshot: &'a Snapshot, token: &Token) -> Vec<Candi
             .and_then(|bare| rank(bare));
         if let Some(rank) = rank(&skill.name).into_iter().chain(spelled).min() {
             let linked = skill.invocation.starts_with("[$");
-            let unique = snapshot
-                .skills
-                .iter()
-                .filter(|other| other.name == skill.name)
-                .nth(1)
-                .is_none();
+            let unique = name_counts.get(skill.name.as_str()) == Some(&1);
             ranked.push((
                 rank,
                 Candidate {
@@ -931,7 +936,14 @@ mod tests {
         let snapshot = snapshot();
         assert_eq!(
             insertions(&snapshot, "/|"),
-            ["/clear", "/review", "/resume", "/commits", "/pr-review"]
+            [
+                "/clear",
+                "/review",
+                "/resume",
+                "/goal",
+                "/commits",
+                "/pr-review"
+            ]
         );
         // Mid-message a command would be sent as words; a skill still works.
         assert_eq!(insertions(&snapshot, "then /|"), ["/commits", "/pr-review"]);
@@ -1075,6 +1087,41 @@ mod tests {
         let (text, at) = marked("$steward-pr|");
         let row = candidates(&snapshot, &token(&text, at).unwrap()).remove(0);
         assert!(token(&text, at).unwrap().spells(&row, &snapshot.skills));
+    }
+
+    #[test]
+    fn large_catalog_preserves_duplicate_paths_and_short_unique_invocations() {
+        let mut snapshot = Snapshot {
+            skills: (0..4096)
+                .map(|index| Skill {
+                    name: format!("skill-{index:04}"),
+                    description: "Catalog skill".into(),
+                    invocation: format!("[$skill-{index:04}](/skills/{index}/SKILL.md)"),
+                })
+                .collect(),
+            ..Snapshot::default()
+        };
+        snapshot.skills.push(Skill {
+            name: "skill-0001".into(),
+            description: "A second exact provider identity".into(),
+            invocation: "[$skill-0001](/other/skill-0001/SKILL.md)".into(),
+        });
+        assert_eq!(
+            insertions(&snapshot, "/skill-0001|"),
+            [
+                "[$skill-0001](/skills/1/SKILL.md)",
+                "[$skill-0001](/other/skill-0001/SKILL.md)",
+            ]
+        );
+        assert_eq!(insertions(&snapshot, "/skill-0002|"), ["$skill-0002"]);
+        snapshot.skills.reverse();
+        assert_eq!(
+            insertions(&snapshot, "/skill-0001|"),
+            [
+                "[$skill-0001](/other/skill-0001/SKILL.md)",
+                "[$skill-0001](/skills/1/SKILL.md)",
+            ]
+        );
     }
 
     fn apply_at(draft: &str, insertion: &str) -> (String, Position) {

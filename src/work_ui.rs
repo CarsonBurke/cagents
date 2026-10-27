@@ -5,7 +5,7 @@
 //! The daemon owns the board and pushes each changed one; this state only
 //! filters and presents it. A pin is shown at once and confirmed by the next
 //! board, so a card moves the moment it is moved.
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use cosmic::{
     Element, Theme,
@@ -16,7 +16,7 @@ use cosmic::{
 use crate::{
     agent::ActivityState,
     design::{self, Tone, space},
-    model::TerminalId,
+    model::{CardId, ChannelId, ProjectId, TerminalId, WorktreeId},
     ui_controls::{Icon, badge, icon_button, placeholder, popover, popover_item},
     work::{
         ActivitySource, Board, CheckOutcome, Column, Forge, Item, ItemKey, PullRequestState, Review,
@@ -32,6 +32,8 @@ const COLUMN_MIN_WIDTH: f32 = 248.0;
 const COLUMN_WIDTH: f32 = 280.0;
 const SCOPE_MENU_WIDTH: f32 = 280.0;
 const CARD_MENU_WIDTH: f32 = 264.0;
+
+mod board_scroll;
 
 /// One card on the board, by what identifies it to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -53,6 +55,97 @@ impl CardRef {
     }
 }
 
+/// Prepared local navigation, never a path-derived claim of pane ownership.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum Destination {
+    Channel {
+        registry: uuid::Uuid,
+        project: ProjectId,
+        channel: ChannelId,
+        panes: Vec<(TerminalId, CardId)>,
+        worktree: Option<(WorktreeId, PathBuf)>,
+    },
+    Worktree {
+        project: ProjectId,
+        worktree: WorktreeId,
+        path: PathBuf,
+    },
+    PullRequest {
+        project: ProjectId,
+        number: u64,
+        url: String,
+    },
+    Unavailable(&'static str),
+}
+
+#[derive(Clone)]
+pub(crate) struct Navigation {
+    pub origin: CardId,
+    pub epoch: u64,
+    pub available: bool,
+    pub destinations: HashMap<CardRef, Destination>,
+}
+
+/// Both a rendered destination and the board facts that established its scope.
+/// Status/clock updates retain it; a different owner cancels native presses.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OpenCard {
+    pub(crate) card: CardRef,
+    pub(crate) origin: Option<CardId>,
+    pub(crate) available: bool,
+    epoch: u64,
+    pub(crate) destination: Destination,
+    worktree: Option<PathBuf>,
+    sessions: Vec<TerminalId>,
+    pull_request: Option<(u64, String)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenKind {
+    Primary,
+    Worktree,
+    PullRequest,
+}
+
+impl OpenCard {
+    pub(crate) fn of(item: &Item, navigation: Option<&Navigation>) -> Self {
+        let card = CardRef::of(item);
+        let mut sessions = item
+            .sessions
+            .iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        sessions.sort_unstable();
+        sessions.dedup();
+        Self {
+            destination: navigation
+                .and_then(|navigation| navigation.destinations.get(&card))
+                .cloned()
+                .unwrap_or(Destination::Unavailable(
+                    "This card has no current navigation target.",
+                )),
+            origin: navigation.map(|navigation| navigation.origin),
+            available: navigation.is_none_or(|navigation| navigation.available),
+            epoch: navigation.map_or(0, |navigation| navigation.epoch),
+            card,
+            worktree: item.worktree.as_ref().map(|worktree| worktree.path.clone()),
+            sessions,
+            pull_request: item
+                .pull_request
+                .as_ref()
+                .map(|pull_request| (pull_request.number, pull_request.url.clone())),
+        }
+    }
+
+    pub(crate) fn names(&self, item: &Item) -> bool {
+        let current = Self::of(item, None);
+        self.card == current.card
+            && self.worktree == current.worktree
+            && self.sessions == current.sessions
+            && self.pull_request == current.pull_request
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Layout {
     /// Columns of cards, one per [`Column`].
@@ -68,12 +161,13 @@ pub enum Watch {
     /// A board, and whether it is the first of its connection, whose
     /// revisions start where that daemon's do.
     Board {
+        epoch: u64,
         revision: u64,
         board: Arc<Board>,
         first: bool,
     },
     /// The subscription failed and is being retried.
-    Lost(String),
+    Lost { epoch: u64, error: String },
 }
 
 #[derive(Debug, Clone)]
@@ -89,11 +183,14 @@ pub enum Action {
     /// Rescans every project and polls GitHub now.
     Refresh,
     Refreshed(Result<(), String>),
-    /// The card's main action: its worktree, else its pull request.
-    Open(CardRef),
+    /// Opens the exact currently presented channel, worktree or pull request.
+    Open(OpenCard),
     Menu(Option<CardRef>),
-    OpenWorktree(CardRef),
-    OpenPullRequest(CardRef),
+    CloseMenu(CardRef),
+    PlacementMenu(CardRef, bool),
+    Details(CardRef),
+    OpenWorktree(OpenCard),
+    OpenPullRequest(OpenCard),
     OpenUrl(String),
     FocusSession(TerminalId),
     Copy(String),
@@ -116,20 +213,12 @@ impl Action {
 /// What only the application can do for this pane.
 #[derive(Debug, Clone)]
 pub enum Effect {
+    Open(OpenCard, OpenKind),
     Refresh,
     Pin {
         project: PathBuf,
         item: String,
         column: Option<Column>,
-    },
-    OpenWorktree {
-        project: PathBuf,
-        path: PathBuf,
-    },
-    OpenPullRequest {
-        project: PathBuf,
-        number: u64,
-        url: String,
     },
     OpenUrl(String),
     FocusSession(TerminalId),
@@ -145,6 +234,11 @@ pub struct State {
     /// Each card's searchable text, lowercase, in board order.
     search: Vec<String>,
     revision: u64,
+    /// Never reused, including across closing/reopening this pane.
+    watch_epoch: u64,
+    listening: bool,
+    /// Retained rows are historical until this listener receives a board.
+    awaiting_current: bool,
     /// Why the subscription is down, while it is retried.
     lost: Option<String>,
     scope: Option<PathBuf>,
@@ -152,6 +246,8 @@ pub struct State {
     query: String,
     layout: Layout,
     menu: Option<CardRef>,
+    placement_menu: bool,
+    details: Option<CardRef>,
     refreshing: bool,
     /// The last refresh or pin that failed.
     error: Option<String>,
@@ -164,20 +260,51 @@ impl State {
     pub fn reset(&mut self) {
         let scope = self.scope.take();
         let layout = self.layout;
+        let watch_epoch = self.watch_epoch;
         *self = Self {
             scope,
             layout,
+            watch_epoch,
             ..Self::default()
         };
     }
 
+    /// Synchronize actual visible demand before the first subscription and
+    /// after every application update. Suspending never cancels explicit work.
+    pub fn set_listening(&mut self, enabled: bool) {
+        if self.listening == enabled {
+            return;
+        }
+        self.listening = false;
+        self.awaiting_current = false;
+        self.lost = None;
+        if enabled && let Some(epoch) = self.watch_epoch.checked_add(1) {
+            self.watch_epoch = epoch;
+            self.listening = true;
+            self.awaiting_current = true;
+        }
+    }
+
+    pub fn listening_epoch(&self) -> Option<u64> {
+        self.listening.then_some(self.watch_epoch)
+    }
+
     pub fn update(&mut self, action: Action) -> Option<Effect> {
+        let open_kind = match &action {
+            Action::OpenWorktree(_) => OpenKind::Worktree,
+            Action::OpenPullRequest(_) => OpenKind::PullRequest,
+            _ => OpenKind::Primary,
+        };
         match action {
             Action::Watched(Watch::Board {
+                epoch,
                 revision,
                 board,
                 first,
             }) => {
+                if self.listening_epoch() != Some(epoch) {
+                    return None;
+                }
                 // A board pushed while the subscription was answered can
                 // arrive before the answer; the newer one stands.
                 if first || revision > self.revision {
@@ -199,14 +326,26 @@ impl State {
                     {
                         self.menu = None;
                     }
+                    if self
+                        .details
+                        .as_ref()
+                        .is_some_and(|card| !board.items.iter().any(|item| card.names(item)))
+                    {
+                        self.details = None;
+                    }
                     self.confirmed = Some(board.clone());
                     self.board = Some(board);
                     self.lost = None;
+                    self.awaiting_current = false;
                 }
                 None
             }
-            Action::Watched(Watch::Lost(error)) => {
+            Action::Watched(Watch::Lost { epoch, error }) => {
+                if self.listening_epoch() != Some(epoch) {
+                    return None;
+                }
                 self.lost = Some(error);
+                self.awaiting_current = true;
                 None
             }
             Action::Tick => {
@@ -243,35 +382,46 @@ impl State {
                 self.error = result.err();
                 None
             }
-            Action::Open(card) => {
-                let item = self.item(&card)?;
-                if item.worktree.is_some() {
-                    self.update(Action::OpenWorktree(card))
-                } else {
-                    self.update(Action::OpenPullRequest(card))
+            Action::Open(target)
+            | Action::OpenWorktree(target)
+            | Action::OpenPullRequest(target) => {
+                let item = self.item(&target.card)?;
+                if !target.available
+                    || !target.names(item)
+                    || (target.origin.is_some()
+                        && (target.epoch != self.watch_epoch || self.navigation_board().is_none()))
+                {
+                    return None;
                 }
+                Some(Effect::Open(target, open_kind))
             }
             Action::Menu(menu) => {
+                if let Some(card) = &menu {
+                    self.item(card)?;
+                }
                 self.menu = menu;
+                self.placement_menu = false;
                 None
             }
-            Action::OpenWorktree(card) => {
-                self.menu = None;
-                let item = self.item(&card)?;
-                Some(Effect::OpenWorktree {
-                    project: item.project.clone(),
-                    path: item.worktree.as_ref()?.path.clone(),
-                })
+            Action::CloseMenu(card) => {
+                if self.menu.as_ref() == Some(&card) {
+                    self.menu = None;
+                    self.placement_menu = false;
+                }
+                None
             }
-            Action::OpenPullRequest(card) => {
+            Action::PlacementMenu(card, open) => {
+                self.item(&card)?;
+                if self.menu.as_ref() == Some(&card) {
+                    self.placement_menu = open;
+                }
+                None
+            }
+            Action::Details(card) => {
+                self.item(&card)?;
                 self.menu = None;
-                let item = self.item(&card)?;
-                let pull_request = item.pull_request.as_ref()?;
-                Some(Effect::OpenPullRequest {
-                    project: item.project.clone(),
-                    number: pull_request.number,
-                    url: pull_request.url.clone(),
-                })
+                self.details = (self.details.as_ref() != Some(&card)).then_some(card);
+                None
             }
             Action::OpenUrl(url) => {
                 self.menu = None;
@@ -317,6 +467,12 @@ impl State {
             .find(|item| card.names(item))
     }
 
+    pub(crate) fn navigation_board(&self) -> Option<&Board> {
+        (self.listening && !self.awaiting_current && self.lost.is_none())
+            .then(|| self.board.as_deref())
+            .flatten()
+    }
+
     /// The cards in scope that match the query, newest activity first.
     fn visible(&self) -> impl Iterator<Item = &Item> {
         let query = self.query.trim().to_lowercase();
@@ -333,22 +489,31 @@ impl State {
     }
 
     pub fn view(&self) -> Element<'_, Action> {
-        crate::ui_controls::responsive(move |size| self.layout_view(size.width)).into()
+        crate::ui_controls::responsive(move |size| self.layout_view(size.width, None)).into()
     }
 
-    fn layout_view(&self, width: f32) -> Element<'_, Action> {
+    pub(crate) fn view_with_navigation(&self, navigation: Navigation) -> Element<'_, Action> {
+        crate::ui_controls::responsive(move |size| self.layout_view(size.width, Some(&navigation)))
+            .into()
+    }
+
+    fn layout_view<'a>(
+        &'a self,
+        width: f32,
+        navigation: Option<&Navigation>,
+    ) -> Element<'a, Action> {
         let header = self.header();
         let body = match &self.board {
             None => self.waiting(),
             Some(board) if board.projects.is_empty() => placeholder("No Git projects are open")
-                .icon(Icon::Branch.handle())
+                .icon(Icon::Folder.handle())
                 .detail(
                     "Open a Git project and its worktrees, branches and pull requests appear here.",
                 )
                 .into(),
             Some(_) => match self.layout {
-                Layout::Board => self.board_view(width),
-                Layout::List => self.list_view(),
+                Layout::Board => self.board_view(width, navigation),
+                Layout::List => self.list_view(navigation),
             },
         };
         widget::column::with_children(vec![header, design::horizontal_rule(), body])
@@ -358,6 +523,12 @@ impl State {
     }
 
     fn waiting(&self) -> Element<'_, Action> {
+        if !self.listening && self.watch_epoch == u64::MAX {
+            return placeholder("Work updates cannot restart")
+                .icon(Icon::Warning.handle())
+                .detail("Reopen this window to watch the Work board again.")
+                .into();
+        }
         match &self.lost {
             Some(error) => placeholder("The Work board is unavailable")
                 .icon(Icon::Warning.handle())
@@ -484,7 +655,7 @@ impl State {
             ];
             items.extend(projects.iter().map(|project| {
                 popover_item(
-                    Icon::Branch.handle(),
+                    Icon::Folder.handle(),
                     project.name.as_str(),
                     cards(count(Some(&project.repository))),
                     Action::Scope(Some(project.repository.clone())),
@@ -514,6 +685,14 @@ impl State {
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .into(),
         ];
+        if self.awaiting_current {
+            parts.push(design::caption("Updating Work…").into());
+        }
+        if !self.listening && self.watch_epoch == u64::MAX {
+            parts.push(warning(
+                "Work updates cannot restart; reopen this window.".to_owned(),
+            ));
+        }
         if let Some(error) = &self.lost {
             parts.push(warning(format!("Disconnected: {error}")));
         }
@@ -548,10 +727,8 @@ impl State {
                 _ => {}
             }
         }
-        if let Some(reason) = &board.linear_unavailable {
-            parts.push(warning(format!(
-                "Linear tickets could not be looked up: {reason}"
-            )));
+        if board.linear_unavailable.is_some() && self.visible().any(|item| item.linear.is_some()) {
+            parts.push(warning("Linked issue status unavailable".to_owned()));
         }
         Some(
             widget::row::with_children(parts)
@@ -562,7 +739,11 @@ impl State {
         )
     }
 
-    fn board_view(&self, width: f32) -> Element<'_, Action> {
+    fn board_view<'a>(
+        &'a self,
+        width: f32,
+        navigation: Option<&Navigation>,
+    ) -> Element<'a, Action> {
         let mut columns: [Vec<&Item>; 5] = Default::default();
         for item in self.visible() {
             columns[column_index(item.column)].push(item);
@@ -577,7 +758,7 @@ impl State {
         let lanes = Column::ALL
             .into_iter()
             .zip(columns)
-            .map(|(column, items)| self.lane(column, items, column_width))
+            .map(|(column, items)| self.lane(column, items, column_width, navigation))
             .collect::<Vec<_>>();
         let row = widget::row::with_children(lanes)
             .spacing(space::S)
@@ -586,8 +767,9 @@ impl State {
         if fits {
             row.width(Length::Fill).into()
         } else {
-            crate::interaction::horizontal_wheel(
+            board_scroll::view(
                 widget::scrollable::horizontal(row)
+                    .id(board_scroll::ID)
                     .direction(iced::widget::scrollable::Direction::Horizontal(
                         design::scrollbar(),
                     ))
@@ -602,6 +784,7 @@ impl State {
         column: Column,
         items: Vec<&'a Item>,
         width: Length,
+        navigation: Option<&Navigation>,
     ) -> Element<'a, Action> {
         let header = widget::row::with_children(vec![
             widget::container(widget::Space::new().width(8).height(8))
@@ -628,7 +811,7 @@ impl State {
                 widget::column::with_children(
                     items
                         .into_iter()
-                        .map(|item| self.card(item))
+                        .map(|item| self.item_view(item, false, navigation))
                         .collect::<Vec<_>>(),
                 )
                 .spacing(space::S)
@@ -656,10 +839,10 @@ impl State {
         .into()
     }
 
-    fn list_view(&self) -> Element<'_, Action> {
+    fn list_view<'a>(&'a self, navigation: Option<&Navigation>) -> Element<'a, Action> {
         let rows = self
             .visible()
-            .map(|item| self.row(item))
+            .map(|item| self.item_view(item, true, navigation))
             .collect::<Vec<_>>();
         if rows.is_empty() {
             return self.no_match();
@@ -683,7 +866,7 @@ impl State {
     fn no_match(&self) -> Element<'_, Action> {
         if self.query.trim().is_empty() {
             placeholder("No work in progress")
-                .icon(Icon::Branch.handle())
+                .icon(Icon::Grid.handle())
                 .detail("Worktrees, branches with commits and your open pull requests appear here.")
                 .into()
         } else {
@@ -697,230 +880,124 @@ impl State {
         }
     }
 
-    /// A board card: branch, pull request, then what is true of it now.
-    fn card<'a>(&'a self, item: &'a Item) -> Element<'a, Action> {
+    #[cfg(test)]
+    fn row<'a>(&'a self, item: &'a Item) -> Element<'a, Action> {
+        self.item_view(item, true, None)
+    }
+
+    /// The human title leads in both layouts; technical facts are disclosed
+    /// deliberately instead of competing with the title and lifecycle.
+    fn item_view<'a>(
+        &'a self,
+        item: &'a Item,
+        compact: bool,
+        navigation: Option<&Navigation>,
+    ) -> Element<'a, Action> {
         let card = CardRef::of(item);
-        let mut top = vec![
+        let target = OpenCard::of(item, navigation);
+        let title = item_title(item);
+        let open_label = match &target.destination {
+            Destination::PullRequest { number, .. } => {
+                format!("Open pull request #{number}: {title}")
+            }
+            _ => format!("Open {title}"),
+        };
+        let unavailable = if !target.available {
+            Some(
+                "Navigation is unavailable while this board is updating, another surface owns input, or a pane is closing.",
+            )
+        } else if let Destination::Unavailable(reason) = &target.destination {
+            Some(*reason)
+        } else {
+            None
+        };
+        let top = widget::row::with_children(vec![
             status_glyph(item),
-            design::heading(item.branch.as_deref().unwrap_or("Detached HEAD"))
-                .wrapping(iced::widget::text::Wrapping::None)
-                .ellipsize(iced::widget::text::Ellipsize::End(
-                    iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                ))
-                .width(Length::Fill)
-                .into(),
-        ];
-        if item.pinned {
-            top.push(crate::interaction::tooltip(
-                widget::icon(Icon::Lock.handle()).size(design::COMPACT_ICON_SIZE),
-                format!("Pinned; its state says {}", item.derived.label()),
-            ));
-        }
-        top.push(self.card_menu(item, &card));
-        let mut lines = vec![
-            widget::row::with_children(top)
-                .spacing(space::XS)
-                .align_y(Alignment::Center)
-                .into(),
-        ];
-        if let Some(pull_request) = &item.pull_request {
-            lines.push(
-                design::body(format!("#{} {}", pull_request.number, pull_request.title))
-                    .class(cosmic::theme::Text::Custom(design::muted_text))
+            crate::interaction::tooltip(
+                design::heading(title)
                     .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                     .ellipsize(iced::widget::text::Ellipsize::End(
                         iced::advanced::text::EllipsizeHeightLimit::Lines(2),
                     ))
-                    .width(Length::Fill)
-                    .into(),
-            );
-        }
-        let facts = self.facts(item);
-        if !facts.is_empty() {
-            lines.push(
-                widget::row::with_children(facts)
-                    .spacing(space::XS)
-                    .align_y(Alignment::Center)
-                    .wrap()
-                    .into(),
-            );
-        }
-        lines.push(self.footer(item));
-        let content = widget::column::with_children(lines).spacing(space::XS);
-        let selected = self.menu.as_ref() == Some(&card);
-        let button = widget::button::custom(content)
-            .name(format!("Open {}", item.label()))
-            .class(card_style(selected))
-            .padding(space::S)
-            .width(Length::Fill)
-            .on_press(Action::Open(card.clone()));
-        widget::mouse_area(crate::interaction::hover(button))
-            .on_right_press(Action::Menu(Some(card)))
-            .into()
-    }
-
-    /// A list row: the same facts as a card, on one line where they fit.
-    fn row<'a>(&'a self, item: &'a Item) -> Element<'a, Action> {
-        let card = CardRef::of(item);
-        let mut title = vec![
-            status_glyph(item),
-            design::heading(item.branch.as_deref().unwrap_or("Detached HEAD"))
-                .wrapping(iced::widget::text::Wrapping::None)
-                .into(),
-        ];
-        if let Some(pull_request) = &item.pull_request {
-            title.push(
-                design::body(format!("#{} {}", pull_request.number, pull_request.title))
-                    .class(cosmic::theme::Text::Custom(design::muted_text))
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .ellipsize(iced::widget::text::Ellipsize::End(
-                        iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                    ))
-                    .width(Length::Fill)
-                    .into(),
-            );
+                    .width(Length::Fill),
+                title.to_owned(),
+            ),
+        ])
+        .spacing(space::S)
+        .align_y(Alignment::Center);
+        let facts = widget::row::with_children(self.facts(item))
+            .spacing(space::XS)
+            .align_y(Alignment::Center)
+            .wrap();
+        let button = widget::button::custom(
+            widget::column::with_children(vec![top.into(), facts.into()]).spacing(space::XS),
+        )
+        .id(card_open_id(&card))
+        .name(unavailable.map_or(open_label.clone(), |reason| {
+            format!("{open_label} — unavailable: {reason}")
+        }))
+        .class(card_style(self.menu.as_ref() == Some(&card)))
+        .padding(if compact {
+            Padding::from([space::XS + space::XXS, space::S])
         } else {
-            title.push(widget::Space::new().width(Length::Fill).into());
+            Padding::from(space::S)
+        })
+        .width(Length::Fill)
+        .on_press_maybe(unavailable.is_none().then(|| Action::Open(target.clone())));
+        let button: Element<'a, Action> = match unavailable {
+            Some(reason) => crate::interaction::tooltip(button, reason).into(),
+            None => button.into(),
+        };
+        // The menu is a sibling, so its keyboard/pointer activation can never
+        // bubble into the main Open action.
+        let primary =
+            widget::row::with_children(vec![button.into(), self.card_menu(item, &card, &target)])
+                .spacing(space::XXS)
+                .align_y(Alignment::Center);
+        let mut content: Vec<Element<'a, Action>> = vec![primary.into()];
+        if self.details.as_ref() == Some(&card) {
+            content.push(self.item_details(item));
         }
-        title.push(badge(
-            item.column.label(),
-            Tone::Themed(column_tone(item.column)),
-        ));
-        title.push(
-            widget::container(
-                design::caption(age(self.now_unix_ms, activity_at(item), false))
-                    .class(cosmic::theme::Text::Custom(design::muted_text)),
-            )
-            .width(44)
-            .align_x(iced::alignment::Horizontal::Right)
-            .into(),
-        );
-        title.push(self.card_menu(item, &card));
-        let mut facts = self.facts(item);
-        if let Some(worktree) = &item.worktree {
-            facts.push(
-                design::caption(crate::app::display_path(&worktree.path))
-                    .class(cosmic::theme::Text::Custom(design::muted_text))
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .into(),
-            );
-        }
-        let mut lines = vec![
-            widget::row::with_children(title)
-                .spacing(space::S)
-                .align_y(Alignment::Center)
-                .into(),
-        ];
-        if !facts.is_empty() {
-            lines.push(
-                widget::container(
-                    widget::row::with_children(facts)
-                        .spacing(space::XS)
-                        .align_y(Alignment::Center)
-                        .wrap(),
-                )
-                .padding(Padding {
-                    left: f32::from(design::ROW_ICON_SIZE) + space::S,
-                    ..Padding::ZERO
-                })
-                .into(),
-            );
-        }
-        let selected = self.menu.as_ref() == Some(&card);
-        let button =
-            widget::button::custom(widget::column::with_children(lines).spacing(space::XS))
-                .name(format!("Open {}", item.label()))
-                .class(card_style(selected))
-                .padding([space::XS + space::XXS, space::S])
-                .width(Length::Fill)
-                .on_press(Action::Open(card.clone()));
-        widget::mouse_area(crate::interaction::hover(button))
-            .on_right_press(Action::Menu(Some(card)))
-            .into()
+        crate::ui_controls::owned(
+            target,
+            widget::mouse_area(widget::column::with_children(content).spacing(space::XXS))
+                .on_right_press(Action::Menu(Some(card))),
+        )
     }
 
-    /// The pills that say what is true of a card now.
+    /// One lifecycle summary, with only useful context and actionable facts.
+    /// Board placement and PR state remain independent in the underlying data.
     fn facts<'a>(&'a self, item: &'a Item) -> Vec<Element<'a, Action>> {
-        let mut facts = Vec::new();
+        let (label, tone) = lifecycle(item);
+        let mut facts = vec![badge(label, Tone::Themed(tone))];
         if self.scope.is_none() {
-            facts.push(badge(
-                item.project_name.as_str(),
-                Tone::Themed(design::muted_color),
-            ));
+            facts.push(design::caption(item.project_name.as_str()).into());
         }
-        if let Some(pull_request) = &item.pull_request {
-            let (label, tone): (&str, Toned) = match (pull_request.state, pull_request.draft) {
-                (PullRequestState::Open, true) => ("Draft", design::muted_color),
-                (PullRequestState::Open, false) => ("Open", design::success_color),
-                (PullRequestState::Merged, _) => ("Merged", design::accent_color),
-                (PullRequestState::Closed, _) => ("Closed", design::destructive_color),
-            };
-            facts.push(badge(label, Tone::Themed(tone)));
-            if pull_request.state == PullRequestState::Open {
-                if let Some((label, tone)) = pull_request.checks.and_then(|checks| {
-                    checks.outcome().map(|outcome| -> (String, Toned) {
-                        match outcome {
-                            CheckOutcome::Passing => {
-                                (format!("✓ {}", checks.passed), design::success_color)
-                            }
-                            CheckOutcome::Pending => (
-                                format!("● {} running", checks.pending),
-                                design::warning_color,
-                            ),
-                            CheckOutcome::Failing => (
-                                format!("✕ {} failing", checks.failed),
-                                design::destructive_color,
-                            ),
-                        }
-                    })
-                }) {
-                    facts.push(badge(label, Tone::Themed(tone)));
+        if let Some(pr) = &item.pull_request {
+            facts.push(design::caption(format!("#{}", pr.number)).into());
+            // Agent activity, draft status and CI/review are independent. Keep
+            // actionable failures visible even when another state leads.
+            if pr.state == PullRequestState::Open {
+                if pr.checks.and_then(|checks| checks.outcome()) == Some(CheckOutcome::Failing)
+                    && label != "Checks failed"
+                {
+                    facts.push(badge(
+                        "Checks failed",
+                        Tone::Themed(design::destructive_color),
+                    ));
                 }
-                if let Some(review) = pull_request.review {
-                    let (label, tone): (&str, Toned) = match review {
-                        Review::Approved => ("Approved", design::success_color),
-                        Review::ChangesRequested => {
-                            ("Changes requested", design::destructive_color)
-                        }
-                        Review::Required => ("Review required", design::muted_color),
-                    };
-                    facts.push(badge(label, Tone::Themed(tone)));
-                }
-                if !pull_request.contains_local_head && item.worktree.is_some() {
-                    facts.push(crate::interaction::tooltip(
-                        badge("Unpushed", Tone::Themed(design::warning_color)),
-                        "The worktree has commits the pull request does not",
+                if pr.review == Some(Review::ChangesRequested) && label != "Changes requested" {
+                    facts.push(badge(
+                        "Changes requested",
+                        Tone::Themed(design::warning_color),
                     ));
                 }
             }
         }
-        if let Some(ticket) = &item.linear
-            && let Some(identifier) = &ticket.identifier
-        {
-            let pill = badge(identifier.as_str(), Tone::Themed(design::accent_color));
-            facts.push(match &ticket.title {
-                Some(title) => crate::interaction::tooltip(pill, title.clone()),
-                None => pill,
-            });
-        }
-        if let Some(comparison) = &item.comparison
-            && (comparison.ahead > 0 || comparison.behind > 0)
-        {
-            let counts = match (comparison.ahead, comparison.behind) {
-                (ahead, 0) => format!("↑{ahead}"),
-                (0, behind) => format!("↓{behind}"),
-                (ahead, behind) => format!("↑{ahead} ↓{behind}"),
-            };
+        if item.pinned {
             facts.push(crate::interaction::tooltip(
-                design::caption(counts)
-                    .class(cosmic::theme::Text::Custom(design::muted_text))
-                    .wrapping(iced::widget::text::Wrapping::None),
-                format!(
-                    "{} ahead of and {} behind {}",
-                    commits(comparison.ahead),
-                    commits(comparison.behind),
-                    comparison.base
-                ),
+                widget::icon(Icon::Board.handle()).size(design::COMPACT_ICON_SIZE),
+                format!("Manually placed in {}", item.column.label()),
             ));
         }
         if let Some(dirty) = &item.dirty {
@@ -929,8 +1006,7 @@ impl State {
                     format!("{} conflicted", dirty.conflicted),
                     Tone::Themed(design::destructive_color),
                 ));
-            }
-            if dirty.paths > 0 {
+            } else if dirty.paths > 0 {
                 facts.push(crate::interaction::tooltip(
                     badge(
                         format!("{} changed", dirty.paths),
@@ -940,13 +1016,120 @@ impl State {
                 ));
             }
         }
-        if let Some(error) = &item.error {
-            facts.push(crate::interaction::tooltip(
-                badge("Unreadable", Tone::Themed(design::destructive_color)),
-                error.clone(),
+        facts
+    }
+
+    fn item_details<'a>(&'a self, item: &'a Item) -> Element<'a, Action> {
+        let line = |label: &str, value: String| -> Element<'a, Action> {
+            design::body(format!("{label}: {value}"))
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                .width(Length::Fill)
+                .into()
+        };
+        let mut rows = vec![
+            design::body(item_title(item))
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                .width(Length::Fill)
+                .into(),
+        ];
+        if let Some(pr) = &item.pull_request {
+            let state = match (pr.state, pr.draft) {
+                (PullRequestState::Open, true) => "Draft",
+                (PullRequestState::Open, false) => "Open",
+                (PullRequestState::Merged, _) => "Merged",
+                (PullRequestState::Closed, _) => "Closed",
+            };
+            rows.push(line("Pull request", format!("#{} · {state}", pr.number)));
+            if pr.state == PullRequestState::Merged && item.derived != Column::Landed {
+                let explanation = if item.has_live_agent() {
+                    "The pull request is merged; a session is still active in this worktree."
+                } else if item.dirty.as_ref().is_some_and(|dirty| dirty.paths > 0) {
+                    "The pull request is merged; uncommitted local changes remain."
+                } else if !pr.contains_local_head {
+                    "The pull request is merged; its merged history has not been confirmed to include this worktree's current head."
+                } else {
+                    "Pull request state and local work status are tracked independently."
+                };
+                rows.push(
+                    design::body(explanation)
+                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                        .width(Length::Fill)
+                        .into(),
+                );
+            }
+            if let Some(checks) = pr.checks {
+                rows.push(line(
+                    "Checks",
+                    format!(
+                        "{} passed · {} running · {} failed",
+                        checks.passed, checks.pending, checks.failed
+                    ),
+                ));
+            }
+            if let Some(review) = pr.review {
+                rows.push(line(
+                    "Review",
+                    match review {
+                        Review::Approved => "Approved",
+                        Review::ChangesRequested => "Changes requested",
+                        Review::Required => "Review required",
+                    }
+                    .to_owned(),
+                ));
+            }
+        }
+        rows.push(line("Local work", item.derived.label().to_owned()));
+        if item.pinned {
+            rows.push(line(
+                "Pinned board position",
+                item.column.label().to_owned(),
             ));
         }
-        facts
+        if let Some(branch) = &item.branch {
+            rows.push(line("Branch", branch.clone()));
+        }
+        if let Some(worktree) = &item.worktree {
+            rows.push(line(
+                "Worktree",
+                crate::app::display_path(&worktree.path).into_owned(),
+            ));
+        }
+        if let Some(comparison) = &item.comparison {
+            rows.push(line(
+                "Compared with base",
+                format!(
+                    "{} ahead and {} behind {}",
+                    commits(comparison.ahead),
+                    commits(comparison.behind),
+                    comparison.base,
+                ),
+            ));
+        }
+        if let Some(ticket) = &item.linear {
+            let title = ticket.title.as_deref().unwrap_or_default();
+            rows.push(line(
+                "Issue",
+                match &ticket.identifier {
+                    Some(identifier) => format!("{identifier} {title}").trim().to_owned(),
+                    None => title.to_owned(),
+                },
+            ));
+            if let Some(reason) = self
+                .board
+                .as_ref()
+                .and_then(|board| board.linear_unavailable.as_ref())
+            {
+                rows.push(line("Issue connection", reason.clone()));
+            }
+        }
+        if let Some(error) = &item.error {
+            rows.push(line("Could not refresh", error.clone()));
+        }
+        rows.push(self.footer(item));
+        widget::container(widget::column::with_children(rows).spacing(space::XS))
+            .padding(space::S)
+            .width(Length::Fill)
+            .into()
     }
 
     /// Live sessions on the left, the last activity on the right.
@@ -1009,21 +1192,46 @@ impl State {
     }
 
     /// The card's actions: open what it names, and move it between columns.
-    fn card_menu<'a>(&'a self, item: &'a Item, card: &CardRef) -> Element<'a, Action> {
+    fn card_menu<'a>(
+        &'a self,
+        item: &'a Item,
+        card: &CardRef,
+        target: &OpenCard,
+    ) -> Element<'a, Action> {
         let open = self.menu.as_ref() == Some(card);
-        let anchor = icon_button(Icon::More, "Card actions")
+        let anchor = icon_button(Icon::More, format!("Actions for {}", item_title(item)))
             .compact()
+            .id(card_actions_id(card))
             .selected(open)
-            .on_press(Action::Menu((!open).then(|| card.clone())));
+            .on_press(if open {
+                Action::CloseMenu(card.clone())
+            } else {
+                Action::Menu(Some(card.clone()))
+            });
         let content = open.then(|| {
-            let mut items: Vec<Element<'a, Action>> = Vec::new();
+            if self.placement_menu {
+                return self.placement_options(item, card);
+            }
+            let mut items: Vec<Element<'a, Action>> = vec![
+                popover_item(
+                    Icon::Info.handle(),
+                    if self.details.as_ref() == Some(card) {
+                        "Hide details"
+                    } else {
+                        "Show details"
+                    },
+                    "Branch, local status and activity",
+                    Action::Details(card.clone()),
+                )
+                .into(),
+            ];
             if let Some(worktree) = &item.worktree {
                 items.push(
                     popover_item(
                         Icon::OpenFolder.handle(),
                         "Open worktree",
                         crate::app::display_path(&worktree.path),
-                        Action::OpenWorktree(card.clone()),
+                        Action::OpenWorktree(target.clone()),
                     )
                     .into(),
                 );
@@ -1034,7 +1242,7 @@ impl State {
                         Icon::PullRequest.handle(),
                         "Open pull request",
                         format!("#{}", pull_request.number),
-                        Action::OpenPullRequest(card.clone()),
+                        Action::OpenPullRequest(target.clone()),
                     )
                     .into(),
                 );
@@ -1064,52 +1272,172 @@ impl State {
                 );
             }
             items.push(design::horizontal_rule());
-            for column in Column::ALL {
-                let current = item.pinned && item.column == column;
-                let description = if current {
-                    "Pinned here"
-                } else if column == item.derived {
-                    "Where its state puts it"
-                } else {
-                    "Pin here"
-                };
-                items.push(
-                    popover_item(
-                        if current {
-                            Icon::Check.handle()
-                        } else {
-                            Icon::Board.handle()
-                        },
-                        column.label(),
-                        description,
-                        Action::Pin(card.clone(), Some(column)),
-                    )
-                    .on_press_maybe((!current).then(|| Action::Pin(card.clone(), Some(column))))
-                    .into(),
-                );
-            }
-            if item.pinned {
-                items.push(
-                    popover_item(
-                        Icon::Undo.handle(),
-                        "Unpin",
-                        format!("Return to {}", item.derived.label()),
-                        Action::Pin(card.clone(), None),
-                    )
-                    .into(),
-                );
-            }
-            widget::column::with_children(items)
-                .width(CARD_MENU_WIDTH)
+            items.push(
+                popover_item(
+                    Icon::Board.handle(),
+                    "Board placement…",
+                    if item.pinned {
+                        format!("Manually placed in {}", item.column.label())
+                    } else {
+                        "Follows activity and pull request status".to_owned()
+                    },
+                    Action::PlacementMenu(card.clone(), true),
+                )
+                .into(),
+            );
+            widget::scrollable(widget::column::with_children(items).width(CARD_MENU_WIDTH))
+                .height(Length::Shrink)
                 .into()
         });
-        popover(
-            anchor,
-            content,
-            widget::popover::Position::Bottom,
-            Action::Menu(None),
-        )
+        crate::interaction::composer_popover(anchor, content, Action::CloseMenu(card.clone()))
     }
+
+    fn placement_options<'a>(&'a self, item: &'a Item, card: &CardRef) -> Element<'a, Action> {
+        let mut choices: Vec<Element<'a, Action>> = vec![
+            popover_item(
+                Icon::ChevronLeft.handle(),
+                "Back to actions",
+                "",
+                Action::PlacementMenu(card.clone(), false),
+            )
+            .into(),
+        ];
+        choices.push(
+            design::caption("Manual placement does not change pull request or session status.")
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                .width(Length::Fill)
+                .into(),
+        );
+        choices.push(
+            popover_item(
+                Icon::Undo.handle(),
+                "Follow activity",
+                format!("Automatic: {}", item.derived.label()),
+                Action::Pin(card.clone(), None),
+            )
+            .selected(!item.pinned)
+            .on_press_maybe(item.pinned.then(|| Action::Pin(card.clone(), None)))
+            .into(),
+        );
+        for column in Column::ALL {
+            let current = item.pinned && item.column == column;
+            choices.push(
+                popover_item(
+                    Icon::Board.handle(),
+                    match column {
+                        Column::Active => "Pin to Active",
+                        Column::InProgress => "Pin to In progress",
+                        Column::InReview => "Pin to In review",
+                        Column::Landed => "Pin to Landed",
+                        Column::Stale => "Pin to Stale",
+                    },
+                    if current {
+                        "Current manual placement"
+                    } else {
+                        ""
+                    },
+                    Action::Pin(card.clone(), Some(column)),
+                )
+                .selected(current)
+                .on_press_maybe((!current).then(|| Action::Pin(card.clone(), Some(column))))
+                .into(),
+            );
+        }
+        widget::scrollable(
+            widget::column::with_children(choices)
+                .width(CARD_MENU_WIDTH)
+                .spacing(space::XXS),
+        )
+        .height(Length::Shrink)
+        .into()
+    }
+}
+
+fn card_actions_id(card: &CardRef) -> widget::Id {
+    format!(
+        "work-actions:{}:{}",
+        card.project.display(),
+        card.key.storage_key()
+    )
+    .into()
+}
+
+fn card_open_id(card: &CardRef) -> widget::Id {
+    format!(
+        "work-open:{}:{}",
+        card.project.display(),
+        card.key.storage_key()
+    )
+    .into()
+}
+
+fn item_title(item: &Item) -> &str {
+    item.pull_request
+        .as_ref()
+        .map(|pr| pr.title.trim())
+        .filter(|title| !title.is_empty())
+        .or_else(|| {
+            item.linear
+                .as_ref()
+                .and_then(|issue| issue.title.as_deref())
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+        })
+        .or_else(|| {
+            item.branch
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+        })
+        .or_else(|| {
+            item.worktree
+                .as_ref()
+                .and_then(|worktree| worktree.path.file_name())
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+        })
+        .unwrap_or("Worktree")
+}
+
+/// A scan summary, not a rewrite of the daemon's independent work/PR state.
+fn lifecycle(item: &Item) -> (&'static str, Toned) {
+    if item.error.is_some() {
+        return ("Needs attention", design::destructive_color);
+    }
+    if item
+        .sessions
+        .iter()
+        .any(|session| session.state == ActivityState::Waiting)
+    {
+        return ("Needs input", design::warning_color);
+    }
+    if item
+        .sessions
+        .iter()
+        .any(|session| session.state == ActivityState::Working)
+    {
+        return ("Working", design::success_color);
+    }
+    if let Some(pr) = &item.pull_request {
+        return match (pr.state, pr.draft) {
+            (PullRequestState::Merged, _) => ("Merged", merged_color),
+            (PullRequestState::Closed, _) => ("Closed", design::muted_color),
+            (PullRequestState::Open, true) => ("Draft", design::muted_color),
+            (PullRequestState::Open, false)
+                if pr.checks.and_then(|checks| checks.outcome()) == Some(CheckOutcome::Failing) =>
+            {
+                ("Checks failed", design::destructive_color)
+            }
+            (PullRequestState::Open, false) if pr.review == Some(Review::ChangesRequested) => {
+                ("Changes requested", design::warning_color)
+            }
+            (PullRequestState::Open, false) if pr.review == Some(Review::Required) => {
+                ("Review needed", design::accent_color)
+            }
+            (PullRequestState::Open, false) => ("Open", design::success_color),
+        };
+    }
+    (item.derived.label(), column_tone(item.derived))
 }
 
 /// Whether `query`, already lowercase, appears in anything the card shows.
@@ -1189,6 +1517,16 @@ fn dot(tone: Toned) -> cosmic::theme::Container<'static> {
 /// What the card's leading glyph says at a glance: a working agent, else the
 /// pull request's state, else a branch.
 fn status_glyph<'a>(item: &Item) -> Element<'a, Action> {
+    if item.error.is_some() {
+        return glyph(Icon::Warning, design::destructive_color);
+    }
+    if item
+        .sessions
+        .iter()
+        .any(|session| session.state == ActivityState::Waiting)
+    {
+        return glyph(Icon::AgentWaiting, design::warning_color);
+    }
     if item
         .sessions
         .iter()
@@ -1200,13 +1538,6 @@ fn status_glyph<'a>(item: &Item) -> Element<'a, Action> {
         ))
         .center(Length::Fixed(f32::from(design::ROW_ICON_SIZE)))
         .into();
-    }
-    if item
-        .sessions
-        .iter()
-        .any(|session| session.state == ActivityState::Waiting)
-    {
-        return glyph(Icon::AgentWaiting, design::warning_color);
     }
     match &item.pull_request {
         Some(pull_request) => match pull_request.state {
@@ -1364,6 +1695,856 @@ mod tests {
     use super::*;
     use crate::work::{Comparison, Dirty, Project, PullRequest};
 
+    type Ui<'a> = iced::runtime::UserInterface<'a, Action, Theme, cosmic::Renderer>;
+
+    fn draw(ui: &mut Ui<'_>, renderer: &mut cosmic::Renderer) {
+        ui.draw(
+            renderer,
+            &cosmic::theme::active(),
+            &iced::advanced::renderer::Style::default(),
+            iced::mouse::Cursor::Unavailable,
+        );
+    }
+
+    fn labels(ui: &Ui<'_>) -> Vec<String> {
+        let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+        nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter_map(|node| node.node().label().map(str::to_owned))
+            .collect()
+    }
+
+    fn control_bounds(ui: &Ui<'_>, label: &str) -> iced::Rectangle {
+        let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+        let rect = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| node.node().label() == Some(label))
+            .unwrap_or_else(|| panic!("missing native control {label}"))
+            .node()
+            .bounds()
+            .unwrap();
+        iced::Rectangle {
+            x: rect.x0 as f32,
+            y: rect.y0 as f32,
+            width: (rect.x1 - rect.x0) as f32,
+            height: (rect.y1 - rect.y0) as f32,
+        }
+    }
+
+    fn press(ui: &mut Ui<'_>, renderer: &mut cosmic::Renderer, point: iced::Point) -> Vec<Action> {
+        let events = [
+            iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: point }),
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                iced::mouse::Button::Left,
+            )),
+        ];
+        let mut actions = Vec::new();
+        let _ = ui.update(
+            &events,
+            iced::mouse::Cursor::Available(point),
+            renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut actions,
+        );
+        actions
+    }
+
+    fn pull_request_item() -> Item {
+        let mut value = item("fix/internal-branch", "example");
+        value.pull_request = Some(PullRequest {
+            number: 42,
+            title: "Keep the readable task title 首要工作 visible".into(),
+            url: "https://github.com/example/project/pull/42".into(),
+            state: PullRequestState::Open,
+            draft: false,
+            head_oid: "abc".into(),
+            contains_local_head: false,
+            checks: None,
+            review: None,
+            updated_at: String::new(),
+        });
+        value
+    }
+
+    #[derive(Default)]
+    struct BoardScrollProbe {
+        entries: Vec<(
+            iced::advanced::widget::Id,
+            iced::Rectangle,
+            iced::Rectangle,
+            iced::Vector,
+        )>,
+    }
+
+    impl iced::advanced::widget::Operation for BoardScrollProbe {
+        fn traverse(
+            &mut self,
+            operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation),
+        ) {
+            operate(self);
+        }
+        fn scrollable(
+            &mut self,
+            id: Option<&iced::advanced::widget::Id>,
+            bounds: iced::Rectangle,
+            content: iced::Rectangle,
+            translation: iced::Vector,
+            _state: &mut dyn iced::advanced::widget::operation::Scrollable,
+        ) {
+            self.entries
+                .push((id.unwrap().clone(), bounds, content, translation));
+        }
+    }
+
+    #[derive(Default)]
+    struct BoardFocusProbe(Option<iced::advanced::widget::Id>);
+    impl iced::advanced::widget::Operation for BoardFocusProbe {
+        fn traverse(
+            &mut self,
+            operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation),
+        ) {
+            operate(self);
+        }
+        fn focusable(
+            &mut self,
+            id: Option<&iced::advanced::widget::Id>,
+            _bounds: iced::Rectangle,
+            state: &mut dyn iced::advanced::widget::operation::Focusable,
+        ) {
+            if state.is_focused() {
+                self.0 = id.cloned();
+            }
+        }
+    }
+
+    fn scroll_probe(ui: &mut Ui<'_>, renderer: &cosmic::Renderer) -> BoardScrollProbe {
+        let mut probe = BoardScrollProbe::default();
+        ui.operate(renderer, &mut probe);
+        probe
+    }
+
+    fn scroll_offsets(ui: &mut Ui<'_>, renderer: &cosmic::Renderer) -> (f32, f32) {
+        let probe = scroll_probe(ui, renderer);
+        let board = probe
+            .entries
+            .iter()
+            .find(|(id, _, _, _)| id == &iced::advanced::widget::Id::new(board_scroll::ID))
+            .unwrap();
+        let lane = probe
+            .entries
+            .iter()
+            .find(|(_, bounds, content, _)| content.height > bounds.height + 1.0)
+            .unwrap();
+        assert!(
+            board.2.width > board.1.width + 100.0,
+            "real horizontal overflow is required"
+        );
+        (board.3.x, lane.3.y)
+    }
+
+    fn wheel_board_state() -> State {
+        let mut state = State::default();
+        let items = (0..24)
+            .map(|index| {
+                let mut item = item(&format!("task-{index:02}"), "example");
+                item.column = Column::Active;
+                item.derived = Column::Active;
+                item
+            })
+            .collect();
+        connected(&mut state, 1, board(items));
+        state
+    }
+
+    fn board_event(
+        ui: &mut Ui<'_>,
+        renderer: &mut cosmic::Renderer,
+        event: iced::Event,
+        point: iced::Point,
+    ) {
+        let mut actions = Vec::new();
+        let _ = ui.update(
+            &[event],
+            iced::mouse::Cursor::Available(point),
+            renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut actions,
+        );
+        assert!(
+            actions.is_empty(),
+            "scroll/modifier input emitted unrelated actions: {actions:?}"
+        );
+        draw(ui, renderer);
+    }
+
+    fn wheel_event(delta: iced::mouse::ScrollDelta) -> iced::Event {
+        iced::Event::Mouse(iced::mouse::Event::WheelScrolled { delta })
+    }
+
+    #[test]
+    fn board_shift_wheel_routes_to_columns_without_stealing_vertical_lane_transactions() {
+        let state = wheel_board_state();
+        let original = state.board.as_ref().unwrap().clone();
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut ui = Ui::build(
+            state.board_view(800.0, None),
+            iced::Size::new(800.0, 420.0),
+            iced::runtime::user_interface::Cache::new(),
+            &mut renderer,
+        );
+        draw(&mut ui, &mut renderer);
+        let lane = scroll_probe(&mut ui, &renderer)
+            .entries
+            .into_iter()
+            .find(|(_, bounds, content, _)| content.height > bounds.height + 1.0)
+            .unwrap();
+        let point = lane.1.center();
+        assert_eq!(scroll_offsets(&mut ui, &renderer), (0.0, 0.0));
+        board_event(
+            &mut ui,
+            &mut renderer,
+            wheel_event(iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }),
+            point,
+        );
+        let vertical = scroll_offsets(&mut ui, &renderer);
+        assert_eq!(
+            vertical,
+            (0.0, 60.0),
+            "ordinary wheel scrolls inside the actual populated lane"
+        );
+        board_event(
+            &mut ui,
+            &mut renderer,
+            iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(
+                iced::keyboard::Modifiers::SHIFT,
+            )),
+            point,
+        );
+        board_event(
+            &mut ui,
+            &mut renderer,
+            wheel_event(iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }),
+            point,
+        );
+        assert_eq!(
+            scroll_offsets(&mut ui, &renderer),
+            (60.0, vertical.1),
+            "Shift must reach the board even during the lane's native wheel transaction"
+        );
+        board_event(
+            &mut ui,
+            &mut renderer,
+            iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(
+                iced::keyboard::Modifiers::empty(),
+            )),
+            point,
+        );
+        board_event(
+            &mut ui,
+            &mut renderer,
+            wheel_event(iced::mouse::ScrollDelta::Pixels { x: 0.0, y: -11.5 }),
+            point,
+        );
+        assert_eq!(
+            scroll_offsets(&mut ui, &renderer),
+            (60.0, vertical.1 + 11.5),
+            "return to vertical is immediate, without a transaction timeout"
+        );
+        assert!(Arc::ptr_eq(state.board.as_ref().unwrap(), &original));
+        assert_eq!(state.scope, None);
+        assert_eq!(state.layout, Layout::Board);
+    }
+
+    #[test]
+    fn board_wheel_requires_shift_for_native_x_and_preserves_pixel_motion_focus_and_cache() {
+        use iced::advanced::widget::{Id, operation};
+        let state = wheel_board_state();
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let size = iced::Size::new(800.0, 420.0);
+        let mut ui = Ui::build(
+            state.board_view(size.width, None),
+            size,
+            iced::runtime::user_interface::Cache::new(),
+            &mut renderer,
+        );
+        draw(&mut ui, &mut renderer);
+        let point = control_bounds(&ui, "Actions for task-00").center();
+        for delta in [
+            iced::mouse::ScrollDelta::Lines { x: -1.0, y: 0.0 },
+            iced::mouse::ScrollDelta::Pixels { x: -35.0, y: 0.0 },
+        ] {
+            board_event(&mut ui, &mut renderer, wheel_event(delta), point);
+            assert_eq!(scroll_offsets(&mut ui, &renderer), (0.0, 0.0));
+        }
+        board_event(
+            &mut ui,
+            &mut renderer,
+            wheel_event(iced::mouse::ScrollDelta::Pixels { x: -12.5, y: -7.5 }),
+            point,
+        );
+        assert_eq!(scroll_offsets(&mut ui, &renderer), (0.0, 7.5));
+        let focus = card_actions_id(&CardRef::of(&state.board.as_ref().unwrap().items[0]));
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(focus.clone()),
+        );
+        board_event(
+            &mut ui,
+            &mut renderer,
+            iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(
+                iced::keyboard::Modifiers::SHIFT,
+            )),
+            point,
+        );
+        board_event(
+            &mut ui,
+            &mut renderer,
+            wheel_event(iced::mouse::ScrollDelta::Pixels { x: -12.5, y: 12.5 }),
+            point,
+        );
+        assert_eq!(
+            scroll_offsets(&mut ui, &renderer),
+            (12.5, 7.5),
+            "real x wins rather than cancelling a diagonal trackpad gesture"
+        );
+        let cache = ui.into_cache();
+        let mut ui = Ui::build(
+            state.board_view(size.width, None),
+            size,
+            cache,
+            &mut renderer,
+        );
+        draw(&mut ui, &mut renderer);
+        board_event(
+            &mut ui,
+            &mut renderer,
+            wheel_event(iced::mouse::ScrollDelta::Lines { x: -1.0, y: 1.0 }),
+            point,
+        );
+        assert_eq!(
+            scroll_offsets(&mut ui, &renderer),
+            (72.5, 7.5),
+            "cached native Shift state and line scale survive rebuild"
+        );
+        board_event(
+            &mut ui,
+            &mut renderer,
+            iced::Event::Window(iced::window::Event::Unfocused),
+            point,
+        );
+        board_event(
+            &mut ui,
+            &mut renderer,
+            wheel_event(iced::mouse::ScrollDelta::Pixels { x: -3.0, y: -9.0 }),
+            point,
+        );
+        assert_eq!(
+            scroll_offsets(&mut ui, &renderer),
+            (72.5, 16.5),
+            "lost window focus cannot leave the board in Shift mode"
+        );
+        // Native widget operations remain available, independent of wheel policy.
+        ui.operate(
+            &renderer,
+            &mut operation::scrollable::scroll_by::<()>(
+                Id::new(board_scroll::ID),
+                operation::scrollable::AbsoluteOffset { x: 20.0, y: 0.0 },
+            ),
+        );
+        assert_eq!(scroll_offsets(&mut ui, &renderer), (92.5, 16.5));
+        let mut focused = BoardFocusProbe::default();
+        ui.operate(&renderer, &mut focused);
+        assert_eq!(focused.0, Some(focus));
+        board_event(
+            &mut ui,
+            &mut renderer,
+            iced::Event::Window(iced::window::Event::Focused),
+            point,
+        );
+        let mut actions = Vec::new();
+        let events = [
+            iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+                modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+                physical_key: iced::keyboard::key::Physical::Unidentified(
+                    iced::keyboard::key::NativeCode::Unidentified,
+                ),
+                location: iced::keyboard::Location::Standard,
+                modifiers: iced::keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            },
+            iced::keyboard::Event::KeyReleased {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+                modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+                physical_key: iced::keyboard::key::Physical::Unidentified(
+                    iced::keyboard::key::NativeCode::Unidentified,
+                ),
+                location: iced::keyboard::Location::Standard,
+                modifiers: iced::keyboard::Modifiers::empty(),
+            },
+        ]
+        .map(iced::Event::Keyboard);
+        let _ = ui.update(
+            &events,
+            iced::mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut actions,
+        );
+        assert!(
+            matches!(actions.as_slice(), [Action::Menu(Some(card))] if card == &CardRef::of(&state.board.as_ref().unwrap().items[0]))
+        );
+    }
+
+    #[test]
+    fn board_shift_wheel_ignores_captured_input_and_clipped_or_outside_hits() {
+        use iced::advanced::{Layout as NativeLayout, Shell, Widget, layout, widget::Tree};
+        let state = wheel_board_state();
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut element = state.board_view(800.0, None);
+        let mut tree = Tree::new(&element);
+        let bounds = iced::Rectangle::with_size(iced::Size::new(800.0, 420.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, bounds.size()),
+        );
+        let mut actions = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(
+                iced::keyboard::Modifiers::SHIFT,
+            )),
+            NativeLayout::new(&node),
+            iced::mouse::Cursor::Unavailable,
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut actions),
+            &bounds,
+        );
+        for (point, viewport, captured) in [
+            (bounds.center(), bounds, true),
+            (iced::Point::new(900.0, 300.0), bounds, false),
+            (
+                bounds.center(),
+                iced::Rectangle::new(iced::Point::new(0.0, 0.0), iced::Size::new(100.0, 100.0)),
+                false,
+            ),
+        ] {
+            let mut shell = Shell::new(&mut actions);
+            if captured {
+                shell.capture_event();
+            }
+            element.as_widget_mut().update(
+                &mut tree,
+                &wheel_event(iced::mouse::ScrollDelta::Pixels { x: -40.0, y: -20.0 }),
+                NativeLayout::new(&node),
+                iced::mouse::Cursor::Available(point),
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut shell,
+                &viewport,
+            );
+            let mut probe = BoardScrollProbe::default();
+            element.as_widget_mut().operate(
+                &mut tree,
+                NativeLayout::new(&node),
+                &renderer,
+                &mut probe,
+            );
+            assert!(
+                probe
+                    .entries
+                    .iter()
+                    .all(|(_, _, _, translation)| *translation == iced::Vector::ZERO),
+                "captured or invisible input must not move the board or its columns: {:?}",
+                probe.entries
+            );
+        }
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn compact_rows_keep_actionable_checks_and_reviews_during_agent_activity_and_drafts() {
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        for (activity, draft, review) in [
+            (Some(ActivityState::Working), false, None),
+            (
+                Some(ActivityState::Waiting),
+                false,
+                Some(Review::ChangesRequested),
+            ),
+            (None, true, Some(Review::ChangesRequested)),
+        ] {
+            let mut value = pull_request_item();
+            let pr = value.pull_request.as_mut().unwrap();
+            pr.draft = draft;
+            pr.review = review;
+            pr.checks = Some(crate::work::Checks {
+                passed: 2,
+                pending: 0,
+                failed: 1,
+            });
+            if let Some(activity) = activity {
+                value.sessions.push(crate::work::Session {
+                    id: TerminalId::new(),
+                    provider: None,
+                    title: Some("Ada".into()),
+                    state: activity,
+                });
+            }
+            let mut state = State::default();
+            connected(&mut state, 1, board(vec![value]));
+            for width in [260.0, 620.0] {
+                let shown = &state.board.as_ref().unwrap().items[0];
+                let mut ui = Ui::build(
+                    state.row(shown),
+                    iced::Size::new(width, 400.0),
+                    iced::runtime::user_interface::Cache::new(),
+                    &mut renderer,
+                );
+                draw(&mut ui, &mut renderer);
+                let visible = labels(&ui);
+                assert!(
+                    visible.iter().any(|label| label == "Checks failed"),
+                    "{visible:?}"
+                );
+                if review == Some(Review::ChangesRequested) {
+                    assert!(
+                        visible.iter().any(|label| label == "Changes requested"),
+                        "{visible:?}"
+                    );
+                }
+                assert!(
+                    !visible
+                        .iter()
+                        .any(|label| label.contains("fix/internal-branch"))
+                );
+                let more = control_bounds(&ui, &format!("Actions for {}", item_title(shown)));
+                assert!(more.width >= 20.0 && more.x + more.width <= width);
+                ui.draw(
+                    &mut renderer,
+                    &cosmic::theme::active(),
+                    &iced::advanced::renderer::Style::default(),
+                    iced::mouse::Cursor::Available(more.center()),
+                );
+                assert_eq!(
+                    control_bounds(&ui, &format!("Actions for {}", item_title(shown))),
+                    more,
+                    "hover must not change the menu/title geometry"
+                );
+                let actions = press(&mut ui, &mut renderer, more.center());
+                assert!(
+                    matches!(actions.as_slice(), [Action::Menu(Some(_))]),
+                    "More must never also open its parent row: {actions:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_card_exposes_destination_or_disabled_reason_and_keeps_menu_keyboard_separate() {
+        use iced::advanced::widget::operation;
+        for available in [true, false] {
+            let mut state = State::default();
+            connected(&mut state, 1, board(vec![pull_request_item()]));
+            let item = &state.board.as_ref().unwrap().items[0];
+            let card = CardRef::of(item);
+            let destination = if available {
+                Destination::PullRequest {
+                    project: ProjectId::new(),
+                    number: 42,
+                    url: item.pull_request.as_ref().unwrap().url.clone(),
+                }
+            } else {
+                Destination::Unavailable(
+                    "This card's sessions belong to different channels; choose a channel in the sidebar.",
+                )
+            };
+            let navigation = Navigation {
+                origin: CardId::new(),
+                epoch: state.watch_epoch,
+                available: true,
+                destinations: HashMap::from([(card.clone(), destination)]),
+            };
+            let target = OpenCard::of(item, Some(&navigation));
+            let expected_label = if available {
+                format!("Open pull request #42: {}", item_title(item))
+            } else {
+                format!(
+                    "Open {} — unavailable: This card's sessions belong to different channels; choose a channel in the sidebar.",
+                    item_title(item)
+                )
+            };
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let mut ui = Ui::build(
+                state.item_view(item, true, Some(&navigation)),
+                iced::Size::new(260.0, 400.0),
+                iced::runtime::user_interface::Cache::new(),
+                &mut renderer,
+            );
+            draw(&mut ui, &mut renderer);
+            let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+            let primary = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|node| {
+                    node.node().role() == iced_accessibility::accesskit::Role::Button
+                        && node.node().label() == Some(expected_label.as_str())
+                })
+                .expect("native primary control exposes useful scope or recovery");
+            assert_eq!(primary.node().is_disabled(), !available);
+            let bounds = control_bounds(&ui, &expected_label);
+            assert!(
+                bounds.width > 0.0
+                    && bounds.height > 0.0
+                    && bounds.x >= 0.0
+                    && bounds.x + bounds.width <= 260.0
+            );
+            drop(nodes);
+            ui.operate(
+                &renderer,
+                &mut operation::focusable::focus::<()>(card_open_id(&card)),
+            );
+            let key = iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter);
+            let mut actions = Vec::new();
+            ui.update(
+                &[iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: key.clone(),
+                    modified_key: key,
+                    physical_key: iced::keyboard::key::Physical::Code(
+                        iced::keyboard::key::Code::Enter,
+                    ),
+                    location: iced::keyboard::Location::Standard,
+                    modifiers: iced::keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                })],
+                iced::mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut actions,
+            );
+            if available {
+                assert!(matches!(actions.as_slice(), [Action::Open(actual)] if actual == &target));
+            } else {
+                assert!(
+                    actions.is_empty(),
+                    "disabled destination cannot activate through keyboard focus"
+                );
+            }
+            let more = control_bounds(&ui, &format!("Actions for {}", item_title(item)));
+            assert!(more.width >= 20.0 && more.x >= 0.0 && more.x + more.width <= 260.0);
+            assert!(
+                matches!(press(&mut ui, &mut renderer, more.center()).as_slice(), [Action::Menu(Some(actual))] if actual == &card),
+                "nested menu must not activate the primary destination"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_row_press_does_not_open_a_replacement_and_old_menu_close_keeps_the_current_owner() {
+        let mut second = pull_request_item();
+        second.key = ItemKey::Branch("second".into());
+        second.branch = Some("second".into());
+        let mut state = State::default();
+        connected(&mut state, 1, board(vec![pull_request_item(), second]));
+        let a = CardRef::of(&state.board.as_ref().unwrap().items[0]);
+        let b = CardRef::of(&state.board.as_ref().unwrap().items[1]);
+        let navigation = Navigation {
+            origin: CardId::new(),
+            epoch: state.watch_epoch,
+            available: true,
+            destinations: state
+                .board
+                .as_ref()
+                .unwrap()
+                .items
+                .iter()
+                .map(|item| {
+                    (
+                        CardRef::of(item),
+                        Destination::PullRequest {
+                            project: ProjectId::from_uuid(uuid::Uuid::nil()),
+                            number: 42,
+                            url: item.pull_request.as_ref().unwrap().url.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let size = iced::Size::new(400.0, 300.0);
+        let title = format!(
+            "Open pull request #42: {}",
+            item_title(&state.board.as_ref().unwrap().items[0])
+        );
+        let mut original = Ui::build(
+            state.item_view(
+                &state.board.as_ref().unwrap().items[0],
+                true,
+                Some(&navigation),
+            ),
+            size,
+            iced::runtime::user_interface::Cache::new(),
+            &mut renderer,
+        );
+        draw(&mut original, &mut renderer);
+        let hit = control_bounds(&original, &title).center();
+        let mut actions = Vec::new();
+        let _ = original.update(
+            &[iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                iced::mouse::Button::Left,
+            ))],
+            iced::mouse::Cursor::Available(hit),
+            &mut renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut actions,
+        );
+        assert!(actions.is_empty());
+        let cache = original.into_cache();
+        let mut replacement = Ui::build(
+            state.item_view(
+                &state.board.as_ref().unwrap().items[1],
+                true,
+                Some(&navigation),
+            ),
+            size,
+            cache,
+            &mut renderer,
+        );
+        draw(&mut replacement, &mut renderer);
+        let _ = replacement.update(
+            &[iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                iced::mouse::Button::Left,
+            ))],
+            iced::mouse::Cursor::Available(hit),
+            &mut renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut actions,
+        );
+        assert!(
+            actions.is_empty(),
+            "held press must not migrate to another card: {actions:?}"
+        );
+        assert!(
+            matches!(press(&mut replacement, &mut renderer, hit).as_slice(), [Action::Open(target)] if target.card == b)
+        );
+        drop(replacement);
+        state.update(Action::Menu(Some(a.clone())));
+        state.update(Action::Menu(Some(b.clone())));
+        state.update(Action::CloseMenu(a));
+        assert_eq!(state.menu.as_ref(), Some(&b));
+        state.update(Action::CloseMenu(b));
+        assert_eq!(state.menu, None);
+    }
+
+    #[test]
+    fn merged_active_details_explain_independent_states_and_do_not_mutate_the_board() {
+        let mut value = pull_request_item();
+        value.pull_request.as_mut().unwrap().state = PullRequestState::Merged;
+        value.sessions.push(crate::work::Session {
+            id: TerminalId::new(),
+            provider: None,
+            title: Some("Ada".into()),
+            state: ActivityState::Working,
+        });
+        value.pinned = true;
+        value.column = Column::InReview;
+        let mut state = State::default();
+        let original = board(vec![value]);
+        connected(&mut state, 1, original.clone());
+        let card = CardRef::of(&original.items[0]);
+        assert!(state.update(Action::Details(card.clone())).is_none());
+        assert_eq!(state.board.as_ref().unwrap().as_ref(), original.as_ref());
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let shown = &state.board.as_ref().unwrap().items[0];
+        let mut ui = Ui::build(
+            state.row(shown),
+            iced::Size::new(320.0, 1000.0),
+            iced::runtime::user_interface::Cache::new(),
+            &mut renderer,
+        );
+        draw(&mut ui, &mut renderer);
+        let shown_labels = labels(&ui);
+        assert!(shown_labels.iter().any(|label| label == "Working"));
+        assert!(
+            shown_labels
+                .iter()
+                .any(|label| label == "Pull request: #42 · Merged")
+        );
+        assert!(
+            shown_labels
+                .iter()
+                .any(|label| label.contains("a session is still active"))
+        );
+        assert!(
+            shown_labels
+                .iter()
+                .any(|label| label == "Pinned board position: In review")
+        );
+        drop(ui);
+        watched(&mut state, 2, board(vec![]));
+        assert_eq!(state.details, None);
+        assert!(state.update(Action::Details(card)).is_none());
+        assert_eq!(state.details, None);
+    }
+
+    #[test]
+    fn unrelated_linear_setup_is_absent_and_placement_is_an_intentional_disclosure() {
+        let mut state = State::default();
+        let mut snapshot = (*board(vec![pull_request_item()])).clone();
+        snapshot.linear_unavailable = Some("Set LINEAR_API_KEY or configure your keyring".into());
+        connected(&mut state, 1, Arc::new(snapshot));
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut status = Ui::build(
+            state.status().unwrap(),
+            iced::Size::new(620.0, 100.0),
+            iced::runtime::user_interface::Cache::new(),
+            &mut renderer,
+        );
+        draw(&mut status, &mut renderer);
+        assert!(
+            !labels(&status)
+                .iter()
+                .any(|label| label.contains("Linear") || label.contains("LINEAR_API_KEY"))
+        );
+        drop(status);
+        let card = CardRef::of(&state.board.as_ref().unwrap().items[0]);
+        state.update(Action::Menu(Some(card.clone())));
+        let shown = &state.board.as_ref().unwrap().items[0];
+        let mut ui = Ui::build(
+            state.card_menu(shown, &card, &OpenCard::of(shown, None)),
+            iced::Size::new(400.0, 600.0),
+            iced::runtime::user_interface::Cache::new(),
+            &mut renderer,
+        );
+        draw(&mut ui, &mut renderer);
+        let visible = labels(&ui);
+        assert!(
+            visible.iter().any(|label| label == "Show details"),
+            "{visible:?}"
+        );
+        assert!(
+            visible.iter().any(|label| label == "Board placement…"),
+            "{visible:?}"
+        );
+        assert!(!visible.iter().any(|label| label.starts_with("Pin to")));
+        let hit = control_bounds(&ui, "Show details").center();
+        let actions = press(&mut ui, &mut renderer, hit);
+        assert!(
+            matches!(actions.as_slice(), [Action::Details(actual)] if actual == &card),
+            "{actions:?}"
+        );
+    }
+
     fn item(branch: &str, project: &str) -> Item {
         Item {
             project: PathBuf::from(format!("/repos/{project}/.git")),
@@ -1413,7 +2594,9 @@ mod tests {
     }
 
     fn watched(state: &mut State, revision: u64, board: Arc<Board>) {
+        state.set_listening(true);
         state.update(Action::Watched(Watch::Board {
+            epoch: state.listening_epoch().unwrap(),
             revision,
             board,
             first: false,
@@ -1421,7 +2604,9 @@ mod tests {
     }
 
     fn connected(state: &mut State, revision: u64, board: Arc<Board>) {
+        state.set_listening(true);
         state.update(Action::Watched(Watch::Board {
+            epoch: state.listening_epoch().unwrap(),
             revision,
             board,
             first: true,
@@ -1539,6 +2724,181 @@ mod tests {
         assert_eq!(
             age(30 * 24 * 60 * minute, 27 * 24 * 60 * minute, false),
             "3d"
+        );
+    }
+
+    fn current_view_labels(state: &State) -> Vec<String> {
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut ui = Ui::build(
+            state.view(),
+            iced::Size::new(800.0, 800.0),
+            iced::runtime::user_interface::Cache::new(),
+            &mut renderer,
+        );
+        draw(&mut ui, &mut renderer);
+        labels(&ui)
+    }
+
+    #[test]
+    fn hidden_listener_cannot_publish_old_first_or_lost_and_reveal_waits_for_current_board() {
+        let mut state = State::default();
+        assert_eq!(state.listening_epoch(), None);
+        state.set_listening(true);
+        let original = state.listening_epoch().unwrap();
+        connected(
+            &mut state,
+            10,
+            board(vec![item("feat/original", "cagents")]),
+        );
+        assert!(!state.awaiting_current);
+        state.update(Action::Query("feat".into()));
+        state.update(Action::Layout(Layout::List));
+        assert!(matches!(
+            state.update(Action::Refresh),
+            Some(Effect::Refresh)
+        ));
+        let card = CardRef::of(&state.board.as_ref().unwrap().items[0]);
+        assert!(matches!(
+            state.update(Action::Pin(card.clone(), Some(Column::Stale))),
+            Some(Effect::Pin {
+                column: Some(Column::Stale),
+                ..
+            })
+        ));
+        let retained = state.board.clone().unwrap();
+        let old_first = Watch::Board {
+            epoch: original,
+            revision: 1_000,
+            board: board(vec![item("wrong", "elsewhere")]),
+            first: true,
+        };
+        state.set_listening(false);
+        state.update(Action::Watched(old_first.clone()));
+        state.update(Action::Watched(Watch::Lost {
+            epoch: original,
+            error: "old hidden connection".into(),
+        }));
+        assert!(Arc::ptr_eq(state.board.as_ref().unwrap(), &retained));
+        assert_eq!(state.listening_epoch(), None);
+        assert!(state.lost.is_none());
+        assert!(state.refreshing);
+
+        state.set_listening(true);
+        let current = state.listening_epoch().unwrap();
+        assert!(current > original);
+        state.set_listening(true);
+        assert_eq!(state.listening_epoch(), Some(current));
+        state.update(Action::Watched(old_first));
+        state.update(Action::Watched(Watch::Lost {
+            epoch: original,
+            error: "old queued failure".into(),
+        }));
+        assert!(Arc::ptr_eq(state.board.as_ref().unwrap(), &retained));
+        assert_eq!(state.item(&card).unwrap().column, Column::Stale);
+        assert!(state.refreshing);
+        assert_eq!(state.query, "feat");
+        assert_eq!(state.layout, Layout::List);
+        assert!(state.lost.is_none());
+        assert!(state.awaiting_current);
+        assert!(
+            current_view_labels(&state)
+                .iter()
+                .any(|label| label == "Updating Work…")
+        );
+
+        // A real current first reply can reset the daemon's revision. An old
+        // first reply cannot impersonate it even with a larger revision.
+        state.update(Action::Watched(Watch::Board {
+            epoch: current,
+            revision: 1,
+            board: board(vec![item("feat/current", "cagents")]),
+            first: true,
+        }));
+        assert_eq!(state.revision, 1);
+        assert_eq!(
+            state.visible().map(Item::label).collect::<Vec<_>>(),
+            ["feat/current"]
+        );
+        assert!(!state.awaiting_current);
+        assert!(
+            state.refreshing,
+            "visibility does not finish an explicit request"
+        );
+        assert!(
+            !current_view_labels(&state)
+                .iter()
+                .any(|label| label == "Updating Work…")
+        );
+        state.update(Action::Refreshed(Ok(())));
+        assert!(!state.refreshing);
+        state.update(Action::Pinned(Err("original pin refused".into())));
+        assert_eq!(state.error.as_deref(), Some("original pin refused"));
+        assert_eq!(
+            state.visible().map(Item::label).collect::<Vec<_>>(),
+            ["feat/current"]
+        );
+
+        state.update(Action::Watched(Watch::Lost {
+            epoch: current,
+            error: "current connection lost".into(),
+        }));
+        assert!(state.awaiting_current);
+        let shown = current_view_labels(&state);
+        assert!(shown.iter().any(|label| label == "Updating Work…"));
+        assert!(
+            shown
+                .iter()
+                .any(|label| label.contains("current connection lost"))
+        );
+        connected(
+            &mut state,
+            1,
+            board(vec![item("feat/reconnected", "cagents")]),
+        );
+        assert!(!state.awaiting_current);
+        assert!(state.lost.is_none());
+        assert_eq!(state.error.as_deref(), Some("original pin refused"));
+    }
+
+    #[test]
+    fn closing_and_exhausted_listener_epochs_never_reuse_queued_publication_authority() {
+        let mut state = State::default();
+        connected(&mut state, 1, board(vec![item("original", "cagents")]));
+        let first = state.listening_epoch().unwrap();
+        state.reset();
+        assert_eq!(state.listening_epoch(), None);
+        assert!(state.board.is_none());
+        state.set_listening(true);
+        let next = state.listening_epoch().unwrap();
+        assert!(next > first);
+        state.update(Action::Watched(Watch::Board {
+            epoch: first,
+            revision: 99,
+            board: board(vec![item("old closed pane", "cagents")]),
+            first: true,
+        }));
+        assert!(state.board.is_none());
+
+        // Exercise the checked boundary without looping or wrapping a token.
+        state.set_listening(false);
+        state.watch_epoch = u64::MAX - 1;
+        state.set_listening(true);
+        assert_eq!(state.listening_epoch(), Some(u64::MAX));
+        connected(&mut state, 1, board(vec![item("last epoch", "cagents")]));
+        state.reset();
+        state.set_listening(true);
+        assert_eq!(state.listening_epoch(), None);
+        state.update(Action::Watched(Watch::Board {
+            epoch: u64::MAX,
+            revision: 2,
+            board: board(vec![item("must not return", "cagents")]),
+            first: true,
+        }));
+        assert!(state.board.is_none());
+        assert!(
+            current_view_labels(&state)
+                .iter()
+                .any(|label| label == "Work updates cannot restart")
         );
     }
 }

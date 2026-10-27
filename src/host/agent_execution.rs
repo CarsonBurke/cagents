@@ -376,6 +376,11 @@ fn dispatch(
             .clone();
         session.claim_owned_codex_listener(&std::env::temp_dir(), &proof);
         session.proof = Some(proof);
+        if session.launch.provider == crate::agent::Provider::Codex {
+            context
+                .admit_fresh_native_directory(&session)
+                .map_err(before)?;
+        }
         registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -424,14 +429,20 @@ fn dispatch(
             })?
             .handle
             .clone();
-        let binding = registry
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .bind_agent(
+        let binding = (|| {
+            let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+            // Fresh native startup retained its actual spawn FD. Persist that
+            // identity before the first accepted prompt; binding failure uses
+            // the same exact actor teardown path below.
+            if let Some(identity) = context.directory_identity()? {
+                registry.pin_agent_directory(accepted.agent.id, identity)?;
+            }
+            registry.bind_agent(
                 accepted.agent.id,
                 None,
                 HostedSession::Chat(session.clone()),
-            );
+            )
+        })();
         if let Err(error) = binding {
             // Teardown is synchronous and uses the same exact actor retirement
             // path as UI close. A failed teardown retains the private launch

@@ -2,6 +2,11 @@
 //! does not decode base64, read a file, or copy a pixel buffer.
 use super::*;
 mod canvas;
+#[cfg(test)]
+mod gesture_tests;
+pub(super) fn canvas_focus_id() -> widget::Id {
+    widget::Id::new("chat.image-viewer.canvas")
+}
 
 // Keep the pixel lease in the decoded buffer itself: cached turns, galleries,
 // detached widget trees and renderer host buffers all clone it. Counting cache
@@ -114,26 +119,15 @@ fn decode_handle(bytes: &[u8], budget: &Budget, edge: Option<u32>, max_bytes: us
     if bytes.len() > max_bytes {
         return Loaded::Unavailable;
     }
-    let Some((width, height)) = image::ImageReader::new(std::io::Cursor::new(&bytes))
-        .with_guessed_format()
-        .ok()
-        .and_then(|reader| reader.into_dimensions().ok())
-    else {
-        return Loaded::Unavailable;
-    };
-    let pixels = u64::from(width) * u64::from(height);
-    if width == 0 || height == 0 || pixels > MAX_PIXELS {
-        return Loaded::Unavailable;
-    }
     let encoded = match reserve(&budget.encoded, bytes.len() as u32, false) {
         Ok(permit) => permit,
         Err(deferred) => return deferred,
     };
-    // Reserve before decode so temporary budget pressure can retry without
-    // repeatedly spending the two workers on full-size pixel conversion. The
-    // thumbnail never upscales and fits inside edge², even after orientation.
-    let retained_pixels = edge.map_or(pixels, |edge| pixels.min(u64::from(edge).pow(2)));
-    let mut pixels = match reserve(&budget.pixels, (retained_pixels * 4) as u32, true) {
+    // Constructing a decoder can inflate metadata before exposing dimensions.
+    // Admit that work too, and keep one decoder through conversion. Holding the
+    // existing whole budget serializes decoding, not the two worker/IO slots;
+    // it avoids partial-reservation upgrades while metadata remains live.
+    let _decode = match reserve(&budget.decode, DECODE_BUDGET as u32, false) {
         Ok(permit) => permit,
         Err(deferred) => return deferred,
     };
@@ -144,28 +138,38 @@ fn decode_handle(bytes: &[u8], budget: &Budget, edge: Option<u32>, max_bytes: us
             Err(_) => return Loaded::Unavailable,
         };
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(width);
-    limits.max_image_height = Some(height);
+    // Each axis of a positive image within the existing pixel-product limit
+    // fits this ceiling, without an unadmitted dimension-only constructor.
+    limits.max_image_width = Some(MAX_PIXELS as u32);
+    limits.max_image_height = Some(MAX_PIXELS as u32);
     limits.max_alloc = Some(MAX_DECODE_BYTES);
     reader.limits(limits);
     let Ok(mut decoder) = reader.into_decoder() else {
         return Loaded::Unavailable;
     };
+    let (width, height) = decoder.dimensions();
+    let pixel_count = u64::from(width) * u64::from(height);
     let decoded_bytes = decoder.total_bytes();
-    if decoder.dimensions() != (width, height) || decoded_bytes > MAX_DECODE_BYTES {
+    if width == 0 || height == 0 || pixel_count > MAX_PIXELS || decoded_bytes > MAX_DECODE_BYTES {
         return Loaded::Unavailable;
     }
-    // Account for the decoder's output and simultaneous RGBA conversion/rotation
-    // buffers. This bounds known pixel buffers across both workers, rather than
-    // assuming a four-byte pixel for 16-bit or floating-point source formats.
-    let rgba_bytes = u64::from(width) * u64::from(height) * 4;
-    let Some(decode_bytes) = decoded_bytes
-        .checked_add(rgba_bytes * 2)
-        .and_then(|total| u32::try_from(total).ok())
+    // Codec limits remain best-effort, not a universal RSS/GPU bound. Account
+    // conservatively for constructor/metadata scratch alongside decoded pixels
+    // and simultaneous RGBA conversion/rotation buffers. An impossible working
+    // set is unavailable, never a waiter requesting more than the budget.
+    let rgba_bytes = pixel_count * 4;
+    let Some(working_bytes) = MAX_DECODE_BYTES
+        .checked_add(decoded_bytes)
+        .and_then(|total| total.checked_add(rgba_bytes * 2))
     else {
         return Loaded::Unavailable;
     };
-    let _decode = match reserve(&budget.decode, decode_bytes, false) {
+    if working_bytes > DECODE_BUDGET as u64 {
+        return Loaded::Unavailable;
+    }
+    // The thumbnail never upscales and fits inside edge², even after orientation.
+    let retained_pixels = edge.map_or(pixel_count, |edge| pixel_count.min(u64::from(edge).pow(2)));
+    let mut pixels = match reserve(&budget.pixels, (retained_pixels * 4) as u32, true) {
         Ok(permit) => permit,
         Err(deferred) => return deferred,
     };
@@ -812,18 +816,145 @@ pub(super) fn subscriptions(runtime: &Runtime) -> Vec<Subscription<Message>> {
         .collect()
 }
 
+const IMAGE_LABEL_CHARS: usize = 120;
+const IMAGE_DETAIL_CHARS: usize = 160;
+
+// Bound the input before trimming, splitting or shaping it: provider metadata
+// can itself be a whole prompt or a data URL. Never clone its complete source.
+fn bounded_image_metadata(raw: &str, limit: usize) -> String {
+    let prefix: String = raw
+        .chars()
+        .take(limit + 1)
+        .take_while(|character| !matches!(character, '\n' | '\r'))
+        .filter(|character| !character.is_control())
+        .collect();
+    Runtime::short_description(prefix.trim(), limit)
+}
+fn inline_image_label(item: &chat::Item) -> String {
+    let ItemContent::Image {
+        description,
+        reference,
+        ..
+    } = &item.content
+    else {
+        return "Image".into();
+    };
+    let label = bounded_image_metadata(description, IMAGE_LABEL_CHARS);
+    if !label.is_empty()
+        && !label.starts_with("data:")
+        && !label.starts_with('/')
+        && !label.starts_with("file:")
+        && !label.starts_with("http:")
+        && !label.starts_with("https:")
+    {
+        label
+    } else {
+        reference
+            .as_ref()
+            .map(chat::ImageReference::label)
+            .unwrap_or_else(|| "Image".into())
+    }
+}
+fn inline_image_detail(raw: &str) -> String {
+    let prefix = bounded_image_metadata(raw, IMAGE_DETAIL_CHARS * 2);
+    // Diagnostics may carry absolute local/remote paths or an inline payload.
+    // Retain the useful reason while replacing path-like tokens before display.
+    let detail = prefix
+        .split_whitespace()
+        .map(|word| {
+            if word.contains('/') || word.contains('\\') || word.starts_with("data:") {
+                "[image]"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    bounded_image_metadata(&detail, IMAGE_DETAIL_CHARS)
+}
+
+// Paths and provider descriptions are untrusted metadata. In particular a
+// data URL is image content, never a filename to shape in a toolbar.
+fn gallery_label(
+    path: &str,
+    description: &str,
+    reference: Option<&chat::ImageReference>,
+) -> String {
+    let filename = (!path.starts_with("data:"))
+        .then(|| Path::new(path).file_name().and_then(|name| name.to_str()))
+        .flatten();
+    let label = reference
+        .map(|reference| reference.name.as_str())
+        .filter(|name| !name.trim().is_empty())
+        .or(filename.filter(|name| !name.trim().is_empty()))
+        .or_else(|| {
+            description
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+        })
+        .unwrap_or("Image");
+    bounded_image_metadata(label, IMAGE_LABEL_CHARS)
+}
+
+fn gallery_external_url(path: &str, root: &Path, remote: bool, managed: bool) -> Option<Url> {
+    // Managed paths are non-authority hints. Verified internal pixels never
+    // authorize a coincident local file, and remote files stay on their owner.
+    if managed || remote || path.starts_with("data:") {
+        return None;
+    }
+    // Preserve the existing conversation-cwd interpretation of relative hints;
+    // a URL-looking hint must not acquire new external authority here.
+    let path = Path::new(path);
+    if path.is_absolute() {
+        Url::from_file_path(path).ok()
+    } else {
+        Url::from_file_path(root.join(path)).ok()
+    }
+}
+
 struct Entry {
     id: String,
-    managed: bool,
-    path: String,
     label: String,
     handle: iced::widget::image::Handle,
+    // Resolve external authority once, after preview admission. Inline payloads
+    // and managed path hints are never retained or parsed by the gallery.
+    external: Option<Url>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) enum ViewerCommand {
+    Close,
+    Next(bool),
+    Fit,
+    ActualSize,
+    Select(usize),
+    External(usize),
+}
+impl ViewerCommand {
+    pub(super) fn action(self) -> Action {
+        match self {
+            Self::Close => Action::CloseImage,
+            Self::Next(forward) => Action::ImageNext(forward),
+            Self::Fit => Action::ImageFit,
+            Self::ActualSize => Action::ImageActualSize,
+            Self::Select(index) => Action::ImageSelect(index),
+            Self::External(_) => Action::ImageExternal,
+        }
+    }
+}
+fn next_gallery_identity() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 pub(in crate::app) struct Gallery {
+    identity: u64,
     entries: Vec<Entry>,
     selected: usize,
-    remote: bool,
     pub(super) reset: u64,
+    pub(super) actual_size: bool,
+    target: Option<Target>,
+    agent: Option<String>,
 }
 impl Gallery {
     pub(in crate::app) fn file(
@@ -832,19 +963,26 @@ impl Gallery {
         handle: iced::widget::image::Handle,
     ) -> Self {
         Self {
+            identity: next_gallery_identity(),
             entries: vec![Entry {
                 id: "file".into(),
-                managed: false,
                 // Keep non-UTF8 filenames and literal URL characters exact.
-                path: Url::from_file_path(&path)
-                    .map(|url| url.to_string())
-                    .unwrap_or_default(),
-                label: format!("{} · {}", device.unwrap_or("This device"), path.display()),
+                external: device
+                    .is_none()
+                    .then(|| Url::from_file_path(&path).ok())
+                    .flatten(),
+                label: format!(
+                    "{} · {}",
+                    device.unwrap_or("This device"),
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ),
                 handle,
             }],
             selected: 0,
-            remote: device.is_some(),
             reset: 0,
+            actual_size: false,
+            target: None,
+            agent: None,
         }
     }
     pub(super) fn new(runtime: &Runtime, id: &str) -> Option<Self> {
@@ -859,6 +997,7 @@ impl Gallery {
             }
             None => &runtime.snapshot.items,
         };
+        let remote = crate::device::is_remote();
         let entries: Vec<_> = items
             .iter()
             .filter_map(|item| {
@@ -870,37 +1009,73 @@ impl Gallery {
                 else {
                     return None;
                 };
+                // Unloaded history contributes no metadata work or owned
+                // strings: only already admitted pixel handles enter a gallery.
+                let handle = runtime.presentation_cache().get(&item.id)?.image.as_ref()?;
                 Some(Entry {
                     id: item.id.clone(),
-                    managed: reference.is_some(),
-                    path: if Path::new(path).is_absolute() || path.starts_with("data:image/") {
-                        path.clone()
-                    } else {
-                        runtime
-                            .session
-                            .launch
-                            .recipe
-                            .working_directory
-                            .join(path)
-                            .to_string_lossy()
-                            .into_owned()
-                    },
-                    label: if description.is_empty() {
-                        "Image".into()
-                    } else {
-                        description.clone()
-                    },
-                    handle: runtime.presentation_cache().get(&item.id)?.image.clone()?,
+                    label: gallery_label(path, description, reference.as_ref()),
+                    handle: handle.clone(),
+                    external: gallery_external_url(
+                        path,
+                        &runtime.session.launch.recipe.working_directory,
+                        remote,
+                        reference.is_some(),
+                    ),
                 })
             })
             .collect();
         let selected = entries.iter().position(|entry| entry.id == id)?;
         Some(Self {
+            identity: next_gallery_identity(),
             entries,
             selected,
-            remote: crate::device::is_remote(),
             reset: 0,
+            actual_size: false,
+            target: Some(runtime.target),
+            agent: runtime.selected_subagent.clone(),
         })
+    }
+    /// Device-file previews retain their dialog; transcript previews belong to
+    /// the exact runtime generation and agent that supplied the clicked image.
+    pub(super) fn callback(&self, command: ViewerCommand) -> Action {
+        Action::ImageViewer(self.identity, command)
+    }
+    fn message(&self, command: ViewerCommand) -> Message {
+        action(self.callback(command))
+    }
+    pub(super) fn accepts(
+        &self,
+        identity: u64,
+        runtime: Option<&Runtime>,
+        command: ViewerCommand,
+    ) -> bool {
+        self.identity == identity
+            // External opens the clicked source, never a later selection.
+            && !matches!(command, ViewerCommand::External(index) if index != self.selected)
+            && (self.is_modal()
+                || runtime.is_some_and(|runtime| {
+                    self.belongs_to(runtime) && runtime.visible.load(Ordering::Relaxed)
+                }))
+    }
+    pub(in crate::app) fn is_modal(&self) -> bool {
+        self.target.is_none()
+    }
+    #[cfg(test)]
+    pub(super) fn selected_handle_id(&self) -> iced::advanced::image::Id {
+        self.entries[self.selected].handle.id()
+    }
+    pub(in crate::app) fn target(&self) -> Option<Target> {
+        self.target
+    }
+    pub(super) fn belongs_to(&self, runtime: &Runtime) -> bool {
+        self.target == Some(runtime.target) && self.agent == runtime.selected_subagent
+    }
+    pub(super) fn select(&mut self, index: usize) {
+        if index < self.entries.len() && index != self.selected {
+            self.selected = index;
+            self.reset = self.reset.wrapping_add(1);
+        }
     }
     pub(in crate::app) fn next(&mut self, forward: bool) {
         self.selected = if forward {
@@ -911,74 +1086,191 @@ impl Gallery {
         self.reset = self.reset.wrapping_add(1);
     }
     pub(super) fn url(&self) -> Option<Url> {
-        let entry = &self.entries[self.selected];
-        // Managed snapshot paths are non-authority hints. The in-app viewer
-        // owns verified pixels; never hand an unverified hint to another app.
-        if entry.managed {
-            return None;
-        }
-        let path = &entry.path;
-        if Path::new(path).is_absolute() {
-            (!self.remote)
-                .then(|| Url::from_file_path(path).ok())
-                .flatten()
-        } else {
-            Url::parse(path).ok().filter(|url| {
-                matches!(url.scheme(), "http" | "https") || !self.remote && url.scheme() == "file"
-            })
-        }
+        self.entries[self.selected].external.clone()
+    }
+    // Native press/focus state belongs to this exact command. Generated IDs
+    // otherwise let COSMIC reuse a held press after gallery/strip replacement.
+    fn control_id(&self, command: ViewerCommand) -> widget::Id {
+        let role = match command {
+            ViewerCommand::Close => "close".into(),
+            ViewerCommand::Next(true) => "next".into(),
+            ViewerCommand::Next(false) => "previous".into(),
+            ViewerCommand::Fit => "fit".into(),
+            ViewerCommand::ActualSize => "actual-size".into(),
+            ViewerCommand::Select(index) => format!("select.{index}"),
+            ViewerCommand::External(index) => format!("external.{index}"),
+        };
+        widget::Id::new(format!("chat.image-viewer.{}.{}", self.identity, role))
+    }
+    fn control_icon<'a>(
+        &'a self,
+        icon: Icon,
+        label: &'static str,
+        command: ViewerCommand,
+    ) -> Element<'a, Message> {
+        crate::ui_controls::icon_button(icon, label)
+            .id(self.control_id(command))
+            .on_press(self.message(command))
+            .into()
     }
     pub(in crate::app) fn view(&self) -> Element<'_, Message> {
         let entry = &self.entries[self.selected];
-        let navigation = self.entries.len() > 1;
-        let toolbar = widget::row::with_children(vec![
-            icon(
-                Icon::ChevronLeft,
-                "Previous image (Left)",
-                navigation,
-                Action::ImageNext(false),
-            ),
-            design::caption(format!("{} / {}", self.selected + 1, self.entries.len())).into(),
-            icon(
-                Icon::ChevronRight,
-                "Next image (Right)",
-                navigation,
-                Action::ImageNext(true),
-            ),
-            iced::widget::Space::new().width(Length::Fill).into(),
+        let mut controls = Vec::new();
+        if self.entries.len() > 1 {
+            controls.extend([
+                self.control_icon(
+                    Icon::ChevronLeft,
+                    "Previous image (Left)",
+                    ViewerCommand::Next(false),
+                ),
+                design::caption(format!("{} / {}", self.selected + 1, self.entries.len())).into(),
+                self.control_icon(
+                    Icon::ChevronRight,
+                    "Next image (Right)",
+                    ViewerCommand::Next(true),
+                ),
+            ]);
+        }
+        controls.extend([
             crate::ui_controls::button::secondary("Fit")
-                .on_press(action(Action::ImageFit))
+                .id(self.control_id(ViewerCommand::Fit))
+                .on_press(self.message(ViewerCommand::Fit))
                 .into(),
-            crate::ui_controls::button::secondary("Open externally")
-                .on_press_maybe(self.url().map(|_| action(Action::ImageExternal)))
+            crate::ui_controls::button::secondary("100%")
+                .id(self.control_id(ViewerCommand::ActualSize))
+                .on_press(self.message(ViewerCommand::ActualSize))
                 .into(),
-            icon(Icon::Close, "Close image (Esc)", true, Action::CloseImage),
-        ])
-        .spacing(step::GAP_S)
-        .align_y(iced::Alignment::Center);
+            crate::interaction::tooltip(
+                crate::ui_controls::button::secondary("Open externally")
+                    .id(self.control_id(ViewerCommand::External(self.selected)))
+                    .on_press_maybe(
+                        entry
+                            .external
+                            .as_ref()
+                            .map(|_| self.message(ViewerCommand::External(self.selected))),
+                    ),
+                if entry.external.is_some() {
+                    "Open the original image in another application"
+                } else {
+                    "The original image is unavailable to external applications on this device"
+                },
+            ),
+            self.control_icon(Icon::Close, "Close image (Esc)", ViewerCommand::Close),
+        ]);
+        let toolbar = widget::flex_row(controls)
+            .spacing(step::GAP_XS as u16)
+            .align_items(iced::Alignment::Center);
         let viewer: Element<'_, Message> = iced::widget::image::Viewer::new(entry.handle.clone())
             .width(Length::Fill)
             .height(Length::Fill)
-            .content_fit(iced::ContentFit::Contain)
+            .content_fit(if self.actual_size {
+                iced::ContentFit::None
+            } else {
+                iced::ContentFit::Contain
+            })
             .min_scale(0.1)
             .max_scale(20.0)
             .into();
-        let canvas = canvas::resettable(self.reset, viewer);
-        dialog_ui::overlay(
-            dialog_ui::surface(
-                widget::column::with_children(vec![
-                    toolbar.into(),
-                    design::caption(entry.label.as_str()).into(),
-                    canvas.into(),
-                    design::caption("Scroll to zoom · Drag to pan · Left / Right to browse").into(),
-                ])
-                .spacing(step::GAP_S)
-                .height(Length::Fill),
-                f32::MAX,
-            ),
-            Some(action(Action::CloseImage)),
-            1.0,
-        )
+        let mut content = vec![
+            design::caption(entry.label.as_str()).into(),
+            toolbar.into(),
+            canvas::identified(self.identity, self.reset, &entry.label, viewer),
+        ];
+        if self.entries.len() > 1 {
+            // Reuse already admitted handles. Keep the strip small even if a
+            // conversation has many images; opening it never starts a decode.
+            let start = self
+                .selected
+                .saturating_sub(3)
+                .min(self.entries.len().saturating_sub(7));
+            let thumbs = self
+                .entries
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(7)
+                .map(|(index, entry)| {
+                    widget::button::custom(
+                        iced::widget::image(entry.handle.clone())
+                            .width(56)
+                            .height(40)
+                            .content_fit(iced::ContentFit::Contain),
+                    )
+                    .id(self.control_id(ViewerCommand::Select(index)))
+                    .class(crate::ui_controls::control_style(
+                        index == self.selected,
+                        None,
+                    ))
+                    .padding(2)
+                    .name(format!(
+                        "View {} · image {} of {}",
+                        entry.label,
+                        index + 1,
+                        self.entries.len()
+                    ))
+                    .selected(index == self.selected)
+                    .on_press(self.message(ViewerCommand::Select(index)))
+                    .into()
+                })
+                .collect::<Vec<Element<'_, Message>>>();
+            content.push(widget::flex_row(thumbs).spacing(step::GAP_XS as u16).into());
+        }
+        let dimensions = match &entry.handle {
+            iced::widget::image::Handle::Rgba { width, height, .. } => {
+                format!("{width} × {height} · ")
+            }
+            _ => String::new(),
+        };
+        content.push(
+            design::caption(format!("{dimensions}Scroll or + / − to zoom · Drag to pan")).into(),
+        );
+        let surface = crate::interaction::focused_key(
+            widget::container(
+                widget::column::with_children(content)
+                    .spacing(step::GAP_XS)
+                    .height(Length::Fill),
+            )
+            .padding(step::GAP_S)
+            .class(design::surface(
+                Some(design::raised),
+                [design::RADIUS_M; 4],
+                true,
+            ))
+            .width(Length::Fill)
+            .height(Length::Fill),
+            |event| {
+                let iced::keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
+                    return None;
+                };
+                if !modifiers.is_empty() {
+                    return None;
+                }
+                let command = match key {
+                    iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) => {
+                        ViewerCommand::Close
+                    }
+                    iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowLeft) => {
+                        ViewerCommand::Next(false)
+                    }
+                    iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowRight) => {
+                        ViewerCommand::Next(true)
+                    }
+                    iced::keyboard::Key::Character(key) if key == "0" => ViewerCommand::Fit,
+                    iced::keyboard::Key::Character(key) if key == "1" => ViewerCommand::ActualSize,
+                    _ => return None,
+                };
+                Some(self.message(command))
+            },
+        );
+        if self.is_modal() {
+            dialog_ui::overlay(
+                dialog_ui::surface(surface, f32::MAX),
+                Some(self.message(ViewerCommand::Close)),
+                1.0,
+            )
+        } else {
+            surface
+        }
     }
 }
 impl Runtime {
@@ -987,54 +1279,93 @@ impl Runtime {
         item: &chat::Item,
         cached: &CachedItem,
     ) -> Element<'static, Message> {
-        let label = match &item.content {
-            ItemContent::Image { description, .. } if !description.is_empty() => {
-                description.clone()
-            }
-            _ => "Image".into(),
-        };
+        let label = inline_image_label(item);
         let Some(handle) = &cached.image else {
-            return if cached.image_unavailable {
-                design::caption(
-                    cached
-                        .image_error
-                        .clone()
-                        .unwrap_or_else(|| format!("{label} · Preview unavailable")),
-                )
+            let placeholder: Element<'static, Message> = if cached.image_unavailable {
+                let detail = cached
+                    .image_error
+                    .as_deref()
+                    .map(inline_image_detail)
+                    .filter(|detail| !detail.is_empty());
+                let mut notices = vec![design::caption("Preview unavailable").into()];
+                if let Some(detail) = detail {
+                    notices.push(design::caption(detail).into());
+                }
+                let can_retry =
+                    matches!(&item.content, ItemContent::Image { path, .. } if !path.is_empty());
+                widget::column::with_children(notices.into_iter().chain(can_retry.then(|| {
+                    crate::ui_controls::button::secondary("Retry preview")
+                        .name(format!("Retry preview for {label}"))
+                        .on_press(action(Action::LoadImage(self.target, item.id.clone())))
+                        .into()
+                })))
+                .spacing(step::GAP_XS)
                 .into()
             } else if cached.image_wait.is_some() {
-                design::caption(format!("{label} · Waiting for preview memory…")).into()
+                design::caption("Waiting for preview memory…").into()
             } else if cached.image_source.is_some()
                 && interest(self)
                     .iter()
                     .any(|candidate| candidate.id == item.id)
             {
-                design::caption(format!("{label} · Loading preview…")).into()
+                design::caption("Loading preview…").into()
             } else {
                 widget::column::with_children(vec![
-                    design::caption(label).into(),
                     crate::ui_controls::button::secondary("Load preview")
+                        .name(format!("Load preview for {label}"))
                         .on_press(action(Action::LoadImage(self.target, item.id.clone())))
                         .into(),
                 ])
                 .spacing(step::GAP_XS)
                 .into()
             };
+            return widget::container(
+                widget::column::with_children(vec![
+                    widget::container(placeholder)
+                        .height(216)
+                        .width(Length::Fill)
+                        .center_y(Length::Fill)
+                        .padding(step::GAP_S)
+                        .class(design::surface(
+                            Some(design::raised),
+                            [design::RADIUS_M; 4],
+                            true,
+                        ))
+                        .into(),
+                    design::caption(label).into(),
+                ])
+                .spacing(step::GAP_XS)
+                .width(Length::Fill),
+            )
+            .width(Length::Fill)
+            .max_width(480)
+            .into();
         };
         let preview = iced::widget::image(handle.clone())
             .width(Length::Fill)
-            .height(280)
+            .height(216)
             .content_fit(iced::ContentFit::Contain);
-        widget::column::with_children(vec![
-            widget::button::custom(preview)
-                .class(crate::ui_controls::control_style(false, None))
-                .padding(0)
-                .on_press(action(Action::OpenImage(self.target, item.id.clone())))
-                .width(Length::Fill)
-                .into(),
-            design::caption(format!("{label} · Click to enlarge")).into(),
-        ])
-        .spacing(step::GAP_XS)
+        widget::container(
+            widget::column::with_children(vec![
+                widget::button::custom(preview)
+                    .name(format!("Inspect {label}"))
+                    .class(crate::ui_controls::control_style(false, None))
+                    .padding(0)
+                    .on_press_maybe(self.active_item(&item.id).cloned().map(|source| {
+                        action(Action::OpenImageFrom(
+                            self.target,
+                            self.selected_subagent.clone(),
+                            source,
+                        ))
+                    }))
+                    .width(Length::Fill)
+                    .into(),
+                design::caption(format!("{label} · Click to enlarge")).into(),
+            ])
+            .spacing(step::GAP_XS)
+            .width(Length::Fill),
+        )
+        .max_width(480)
         .width(Length::Fill)
         .into()
     }
@@ -1052,6 +1383,48 @@ pub(super) fn deferred_for_test() -> Loaded {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gallery_labels_never_shape_inline_payloads_and_bound_provider_metadata() {
+        let inline = format!("data:image/png;base64,{}", "a".repeat(1024 * 1024));
+        assert_eq!(
+            gallery_label(&inline, "Generated image", None),
+            "Generated image"
+        );
+        assert_eq!(gallery_label(&inline, "", None), "Image");
+        let label = gallery_label(&format!("/fixture/{}", "x".repeat(4096)), "", None);
+        assert!(label.chars().count() <= 121);
+        assert!(!label.contains("data:"));
+    }
+
+    #[cfg(feature = "integrated-browser")]
+    #[test]
+    fn browser_import_is_above_conversation_images_and_below_device_file_dialogs() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        drop(app.update(Message::BrowserImport(
+            crate::app::browser_import_ui::Action::Open,
+        )));
+        let mut gallery = Gallery::file(
+            PathBuf::from("/fixture/image.png"),
+            None,
+            iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
+        );
+        app.chat_ui.image_viewer = Some(gallery);
+        assert!(
+            !app.browser_import_on_top(),
+            "device-file images remain above import"
+        );
+        gallery = app.chat_ui.image_viewer.take().unwrap();
+        gallery.target = Some(Target {
+            card: app.workspace.focused().unwrap(),
+            generation: 0,
+        });
+        app.chat_ui.image_viewer = Some(gallery);
+        assert!(
+            app.browser_import_on_top(),
+            "pane-local images do not cover import"
+        );
+    }
+
     #[test]
     fn image_headers_bound_pixel_memory_and_reject_invalid_data() {
         let mut bytes = Vec::new();
@@ -1257,7 +1630,6 @@ mod tests {
         );
         assert!(remote.entries[0].label.contains("FW16 fixture"));
         let local = Gallery::file(path.clone(), None, handle.clone());
-        assert!(!remote.entries[0].managed && !local.entries[0].managed);
         assert_eq!(local.url().unwrap().to_file_path().unwrap(), path);
 
         use std::os::unix::ffi::OsStringExt;
@@ -1385,7 +1757,6 @@ mod tests {
             cached.image = bytes_handle(backend_bytes);
             runtime.cache.insert(item.id.clone(), cached);
             let gallery = Gallery::new(runtime, &item.id).unwrap();
-            assert!(gallery.entries[0].managed);
             assert!(
                 gallery.url().is_none(),
                 "verified internal pixels must never authorize a coincident external hint"
@@ -1413,12 +1784,146 @@ mod tests {
         cached.image = bytes_handle(png());
         runtime.cache.insert(item.id.clone(), cached);
         let gallery = Gallery::new(runtime, &item.id).unwrap();
-        assert_eq!(gallery.entries[0].path, path);
+        assert!(gallery.entries[0].external.is_none());
         assert!(
             gallery.url().is_none(),
             "inline pixels are not a local filename"
         );
     }
+    #[test]
+    fn large_inline_gallery_keeps_only_admitted_handles_and_small_metadata() {
+        use iced::advanced::{Layout, layout, mouse, widget::Tree};
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        drop(app.new_native_chat(Provider::Codex, Some(PathBuf::from("/tmp/gallery"))));
+        let card = app.workspace.focused().unwrap();
+        let CardRuntime::Chat(runtime) = app.cards.get_mut(&card).unwrap() else {
+            panic!("draft chat")
+        };
+        // The decoder accepts the exact original PNG pixels with trailing
+        // bytes. This exercises a real admitted image with a large legacy
+        // inline payload, not a renderer path that starts another decode.
+        let mut bytes = png();
+        bytes.resize(1024 * 1024, 0);
+        let inline = Arc::new(image_item(format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        )));
+        let budget = Budget::new(bytes.len(), 4);
+        let Loaded::Ready(handle) = bounded_handle(bytes, &budget) else {
+            panic!("original PNG pixels remain valid")
+        };
+        let handle_id = handle.id();
+        let mut cached = CachedItem::new(&inline.content, runtime.syntax_theme);
+        cached.image = Some(handle);
+        runtime.cache.insert(inline.id.clone(), cached);
+        let mut items: Vec<_> = (0..1000)
+            .map(|index| {
+                let mut item = image_item(format!("/not-loaded/{index}.png"));
+                if index == 0 {
+                    if let ItemContent::Image {
+                        path, description, ..
+                    } = &mut item.content
+                    {
+                        *path = format!("data:image/png;base64,{}", "a".repeat(1024 * 1024));
+                        *description = " ".repeat(1024 * 1024);
+                    }
+                }
+                item.id = format!("unloaded-{index}");
+                Arc::new(item)
+            })
+            .collect();
+        items.insert(500, inline.clone());
+        Arc::make_mut(&mut runtime.snapshot).items = items;
+        let source_owners = Arc::strong_count(&inline);
+        let mut gallery = Gallery::new(runtime, &inline.id).unwrap();
+        assert_eq!(
+            gallery.entries.len(),
+            1,
+            "unloaded history has no gallery entries"
+        );
+        assert_eq!(gallery.entries[0].id, inline.id);
+        assert_eq!(gallery.selected_handle_id(), handle_id);
+        assert_eq!(Arc::strong_count(&inline), source_owners);
+        assert!(Arc::ptr_eq(
+            runtime.active_item(&inline.id).unwrap(),
+            &inline
+        ));
+        assert!(gallery.entries[0].external.is_none());
+        assert!(gallery.entries[0].label.len() <= IMAGE_LABEL_CHARS * 4 + 3);
+        assert_eq!(budget.pixels.available_permits(), 0);
+        assert_eq!(budget.encoded.available_permits(), 1024 * 1024);
+        assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+
+        // Drop the transcript owner: repeated native layout and AX traversal
+        // must retain the same admitted handle and bounded visible metadata.
+        runtime.cache.get_mut(&inline.id).unwrap().image = None;
+        let renderer = crate::app::tests::headless_renderer();
+        for _ in 0..3 {
+            let mut element = gallery.view();
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 500.0)),
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                mouse::Cursor::Unavailable,
+            );
+            let nodes: Vec<_> = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .collect();
+            assert!(
+                nodes
+                    .iter()
+                    .any(|node| node.node().label() == Some("Open externally")
+                        && node.node().is_disabled())
+            );
+            assert!(nodes.iter().all(|node| {
+                [node.node().label(), node.node().value()]
+                    .into_iter()
+                    .flatten()
+                    .all(|text| text.len() < 512 && !text.contains("base64,"))
+            }));
+            assert_eq!(gallery.selected_handle_id(), handle_id);
+            assert_eq!(budget.pixels.available_permits(), 0);
+        }
+        gallery.next(true);
+        assert_eq!(gallery.selected_handle_id(), handle_id);
+        drop(gallery);
+        assert_eq!(
+            budget.pixels.available_permits(),
+            4,
+            "last gallery/tree owner releases exact pixels"
+        );
+    }
+
+    #[test]
+    fn gallery_external_authority_preserves_relative_hint_and_device_boundaries() {
+        let root = Path::new("/conversation");
+        for path in [
+            "images/literal #%*.png",
+            "https://example.invalid/image.png",
+            "file:///tmp/image.png",
+        ] {
+            assert_eq!(
+                gallery_external_url(path, root, false, false)
+                    .unwrap()
+                    .to_file_path()
+                    .unwrap(),
+                root.join(path),
+                "relative URL-looking hints retain their previous cwd interpretation"
+            );
+            assert!(gallery_external_url(path, root, true, false).is_none());
+            assert!(gallery_external_url(path, root, false, true).is_none());
+        }
+        let payload = format!("data:image/png;base64,{}", "a".repeat(1024 * 1024));
+        assert!(gallery_external_url(&payload, root, false, false).is_none());
+    }
+
     #[test]
     fn file_preview_rejects_fifos_without_waiting_for_a_writer() {
         let directory = tempfile::tempdir().unwrap();
@@ -1617,6 +2122,93 @@ mod tests {
         }
     }
     #[test]
+    fn decoder_metadata_is_admitted_before_construction_and_releases_its_leases() {
+        use image::ImageEncoder;
+        let mut bytes = Vec::new();
+        let mut encoder = image::codecs::png::PngEncoder::new(&mut bytes);
+        encoder.set_icc_profile(vec![0; 4096]).unwrap();
+        encoder
+            .write_image(&[1, 2, 3, 255], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        assert!(bytes.windows(4).any(|chunk| chunk == b"iCCP"));
+        assert!(
+            bytes.len() < 4096,
+            "the small fixture contains compressed metadata"
+        );
+        let mut chunk = 8; // Skip the PNG signature, then follow chunk lengths.
+        while &bytes[chunk + 4..chunk + 8] != b"IDAT" {
+            let length = u32::from_be_bytes(bytes[chunk..chunk + 4].try_into().unwrap()) as usize;
+            chunk += length + 12;
+        }
+        let truncated_metadata = bytes[..chunk].to_vec();
+        let budget = Budget::new(bytes.len(), 4);
+        for remaining in [0, 16] {
+            let busy = budget
+                .decode
+                .clone()
+                .try_acquire_many_owned((DECODE_BUDGET - remaining) as u32)
+                .unwrap();
+            // Sixteen bytes fit the old 1-pixel-only estimate, but cannot
+            // cover this decoder's live metadata. No metadata/RGBA work may
+            // bypass the existing transient admission because pixels are tiny.
+            assert!(matches!(
+                bounded_handle(bytes.clone(), &budget),
+                Loaded::Deferred(pressure)
+                    if !pressure.retained && pressure.permits as usize <= DECODE_BUDGET
+            ));
+            // Without admission, even malformed metadata must wait rather
+            // than constructing a decoder merely to reject its missing IDAT.
+            assert!(matches!(
+                bounded_handle(truncated_metadata.clone(), &budget),
+                Loaded::Deferred(_)
+            ));
+            assert_eq!(budget.encoded.available_permits(), bytes.len());
+            assert_eq!(budget.pixels.available_permits(), 4);
+            assert_eq!(budget.decode.available_permits(), remaining);
+            drop(busy);
+            assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+        }
+        assert!(matches!(
+            bounded_handle(truncated_metadata, &budget),
+            Loaded::Unavailable
+        ));
+        assert_eq!(budget.encoded.available_permits(), bytes.len());
+        assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+        assert_eq!(budget.pixels.available_permits(), 4);
+        let Loaded::Ready(handle) = bounded_handle(bytes.clone(), &budget) else {
+            panic!("the admitted tiny image with metadata must still decode");
+        };
+        let iced::widget::image::Handle::Rgba {
+            pixels,
+            width,
+            height,
+            ..
+        } = &handle
+        else {
+            unreachable!()
+        };
+        assert_eq!((*width, *height), (1, 1));
+        assert_eq!(pixels.as_ref(), &[1, 2, 3, 255]);
+        assert_eq!(budget.encoded.available_permits(), bytes.len());
+        assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+        assert_eq!(budget.pixels.available_permits(), 0);
+        drop(handle);
+        assert_eq!(budget.pixels.available_permits(), 4);
+
+        // Corrupt the IDAT stream after its metadata. Construction is admitted
+        // and the later decode error must release every transient/retained lease.
+        let mut damaged = bytes.clone();
+        damaged[chunk + 8] ^= 0xff;
+        assert!(matches!(
+            bounded_handle(damaged, &budget),
+            Loaded::Unavailable
+        ));
+        assert_eq!(budget.encoded.available_permits(), bytes.len());
+        assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+        assert_eq!(budget.pixels.available_permits(), 4);
+    }
+
+    #[test]
     fn decoded_preview_converts_high_depth_pixels_and_releases_transient_leases() {
         let mut bytes = Vec::new();
         image::write_buffer_with_format(
@@ -1643,8 +2235,12 @@ mod tests {
         assert_eq!(budget.pixels.available_permits(), 0);
         drop(pixels);
         assert_eq!(budget.pixels.available_permits(), 4);
-        let mut budget = Budget::new(bytes.len(), 4);
-        budget.decode = Arc::new(tokio::sync::Semaphore::new(15));
+        let budget = Budget::new(bytes.len(), 4);
+        let busy = budget
+            .decode
+            .clone()
+            .try_acquire_many_owned((DECODE_BUDGET - 15) as u32)
+            .unwrap();
         assert!(matches!(
             bounded_handle(bytes.clone(), &budget),
             Loaded::Deferred(_)
@@ -1652,6 +2248,8 @@ mod tests {
         assert_eq!(budget.encoded.available_permits(), bytes.len());
         assert_eq!(budget.pixels.available_permits(), 4);
         assert_eq!(budget.decode.available_permits(), 15);
+        drop(busy);
+        assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
         let budget = Budget::new(1024, 4);
         assert!(matches!(
             bounded_handle(png()[..40].to_vec(), &budget),
@@ -1678,16 +2276,18 @@ mod tests {
     fn gallery_navigation_wraps_and_resets_pan_and_zoom() {
         let entry = |id: &str| Entry {
             id: id.into(),
-            managed: false,
-            path: format!("/fixture/{id}.png"),
+            external: Url::from_file_path(format!("/fixture/{id}.png")).ok(),
             label: id.into(),
             handle: iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
         };
         let mut gallery = Gallery {
+            identity: next_gallery_identity(),
             entries: vec![entry("a"), entry("b")],
             selected: 0,
-            remote: false,
             reset: 0,
+            actual_size: false,
+            target: None,
+            agent: None,
         };
         gallery.next(false);
         assert_eq!(gallery.selected, 1);
@@ -1695,9 +2295,8 @@ mod tests {
         gallery.next(true);
         assert_eq!(gallery.selected, 0);
         assert_eq!(gallery.url().unwrap().as_str(), "file:///fixture/a.png");
-        gallery.remote = true;
         assert!(
-            gallery.url().is_none(),
+            gallery_external_url("/fixture/a.png", Path::new("/"), true, false).is_none(),
             "a remote path must never open a local file URL"
         );
     }

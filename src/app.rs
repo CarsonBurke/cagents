@@ -2695,6 +2695,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::OpenTerminalOutput(_)
         | Message::NewBrowser
         | Message::RetryCard(_)
+        | Message::RetrySharedChatAdmission(_)
         | Message::FocusAdjacent(_)
         | Message::FocusProjectSearch
         | Message::ToggleContextInspector
@@ -2721,7 +2722,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::AutomationUi(action) => !action.background() && !action.answers_draft_dialog(),
         Message::WorkUi(action) => !action.background(),
         Message::ChannelWork(action) => !action.background(),
-        Message::OpenChannelWork(_) | Message::ChannelWorkEscape | Message::ChannelWorkNavigation(_) => true,
+        Message::OpenChannelWork(_) => true,
         Message::UpdateUi(update_ui::Action::Apply) => true,
         Message::PullRequestUi(action) => !action.allowed_while_modal(),
         Message::PullRequestReview { action, .. } => !action.allowed_while_modal(),
@@ -2840,7 +2841,6 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             }
             | Message::ToggleContextInspector
             | Message::OpenChannelWork(_)
-            | Message::ChannelWorkNavigation(_)
             | Message::Repository(RepositoryAction::NewTerminal { .. })
             | Message::Repository(RepositoryAction::MarkdownLink { .. })
             | Message::Sidebar(
@@ -4574,6 +4574,7 @@ pub enum Message {
     },
     NativeWindowAction(cosmic::app::Action),
     ChatUi(chat_ui::Action),
+    RetrySharedChatAdmission(shared_views::SharedChatAdmissionRetry),
     UpdateUi(update_ui::Action),
     ChromeUi(chrome_ui::Action),
     ChannelUi(channel_ui::Action),
@@ -4592,9 +4593,7 @@ pub enum Message {
     WorkUi(crate::work_ui::Action),
     ChannelWork(crate::channel_work_ui::Action),
     OpenChannelWork(ChannelId),
-    ChannelWorkNavigation(channel_work::Navigation),
     ChannelWorkPoll,
-    ChannelWorkEscape,
     AutomationApproval(automation_approval::Action),
     /// The shell's light or dark mode changed, so a rendered document page no
     /// longer matches the surface it sits on.
@@ -8769,11 +8768,15 @@ impl Cagents {
         if synchronize_scroll && update.offset_changed {
             tasks.push(self.synchronize_workspace_scroll());
         }
+        let close_handoff = self.workspace.pending_widget_focus_is_close_handoff();
         if surfaces_visible && let Some(card) = self.workspace.take_widget_focus_request() {
-            tasks.push(
-                iced::widget::operation::focus(self.card_keyboard_focus(card))
-                    .map(cosmic::Action::App),
-            );
+            let target = self.card_keyboard_focus(card);
+            let focus = if close_handoff {
+                workspace_widget::focus_after_loading(target.clone(), target)
+            } else {
+                iced::widget::operation::focus(target)
+            };
+            tasks.push(focus.map(cosmic::Action::App));
         }
         tasks.push(context_overlay_task);
         tasks.push(self.restore_repository_editor_focus());
@@ -9947,7 +9950,7 @@ impl Cagents {
             ),
             Some(CardRuntime::Accounts) => self.accounts_pane(),
             Some(CardRuntime::Automations) => self.automation_ui.view().map(Message::AutomationUi),
-            Some(CardRuntime::Work) => self.work_ui.view().map(Message::WorkUi),
+            Some(CardRuntime::Work) => self.work_view(id),
             Some(CardRuntime::Completed) => {
                 self.ended_terminal_placeholder(id, ended_terminal(card))
             }
@@ -12089,6 +12092,27 @@ impl Cagents {
         self.update_ui.confirmation.is_some() || self.other_modal_is_open()
     }
 
+    /// Image callbacks belong to the surface that is currently accepting
+    /// input, not just the gallery generation that produced them.
+    fn image_viewer_owns_input(&self) -> bool {
+        if self.update_prepared {
+            return false;
+        }
+        let Some(gallery) = &self.chat_ui.image_viewer else {
+            return false;
+        };
+        if !gallery.is_modal() {
+            return !self.workspace_inputs_blocked();
+        }
+        // These are precisely the owners mounted before the device-file
+        // gallery in dialog(). Recovery/import/forms below it do not take its
+        // foreground keyboard or pointer actions.
+        !self.automation_approval_open()
+            && self.transient_work_close.is_none()
+            && !self.automation_ui.draft_dialog_open()
+            && !self.device_ui.open
+    }
+
     fn other_modal_is_open(&self) -> bool {
         self.form_dialog_is_open() || self.modal_over_form_dialogs()
     }
@@ -12157,7 +12181,7 @@ impl Cagents {
             || self.dirty_repository_close.is_some()
             || self.transient_work_close.is_some()
             || self.automation_ui.draft_dialog_open()
-            || self.chat_ui.image_viewer.is_some()
+            || self.chat_ui.image_viewer.as_ref().is_some_and(chat_ui::images::Gallery::is_modal)
             || self.terminal_paste.is_some()
             || self.terminal_close_dialog_visible()
             || self.settings_reset_confirm
@@ -12173,8 +12197,7 @@ impl Cagents {
     }
 
     fn context_inspector_visible(&self) -> bool {
-        !self.channel_work_is_main()
-            && (!self.sidebar_model.projects.is_empty() || !self.workspace.cards().is_empty())
+        (!self.sidebar_model.projects.is_empty() || !self.workspace.cards().is_empty())
             && (self.context_inspector_open || self.context_inspector_transition.is_some())
     }
 
@@ -12279,11 +12302,9 @@ impl Cagents {
     }
 
     fn workspace_inputs_blocked(&self) -> bool {
-        self.channel_work_is_main() || self.shell_inputs_blocked()
+        self.shell_inputs_blocked()
     }
 
-    // Shell navigation remains usable over main Work without admitting input
-    // to the conversation panes it replaces.
     fn shell_inputs_blocked(&self) -> bool {
         self.modal_is_open()
             || self.context_inspector_is_overlay()
@@ -12292,7 +12313,7 @@ impl Cagents {
     }
 
     fn workspace_surfaces_visible(&self) -> bool {
-        !self.channel_work_is_main() && !self.context_inspector_is_overlay()
+        !self.context_inspector_is_overlay()
     }
 
     fn enter_context_overlay(&mut self) -> Task<Message> {
@@ -13648,7 +13669,11 @@ impl Cagents {
             && self.transient_work_close.is_none()
             && !self.automation_ui.draft_dialog_open()
             && !self.device_ui.open
-            && self.chat_ui.image_viewer.is_none()
+            && !self
+                .chat_ui
+                .image_viewer
+                .as_ref()
+                .is_some_and(chat_ui::images::Gallery::is_modal)
             && self.terminal_paste.is_none()
             && !self.session_recovery.open()
             && !self.daemon_health_ui.confirmation
@@ -14081,6 +14106,7 @@ impl Application for Cagents {
             app.lifecycle = LifecycleManager::new(LifecycleBudget::default());
             app.context_inspector_open = false;
             let chrome = app.sync_chrome();
+            app.sync_work_watch_visibility();
             return (app, chrome);
         }
         let scope = app.restore_worktree_scope();
@@ -14124,6 +14150,7 @@ impl Application for Cagents {
         );
         let task = Task::batch(tasks);
         let chrome = app.sync_chrome();
+        app.sync_work_watch_visibility();
         (app, Task::batch([task, chrome]))
     }
 
@@ -14135,11 +14162,10 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
-        // Pane callbacks retain their rendering origin while queued. Unwrap
-        // once before all message-dependent policy and completion bookkeeping.
-        let (message, pane_origin) = match message {
-            Message::UtilityPaneUi(message) => (*message, true),
-            message => (message, false),
+        // Unwrap pane callbacks before message policy and completion bookkeeping.
+        let message = match message {
+            Message::UtilityPaneUi(message) => *message,
+            message => message,
         };
         let notice_control = self.notice_control_severity();
         let attention_scope_changed = matches!(
@@ -14153,9 +14179,6 @@ impl Application for Cagents {
         // through the lightweight visibility/presence postlude below.
         #[rustfmt::skip]
         let task = (|| {
-        if pane_origin && self.channel_work_is_main() {
-            return Task::none();
-        }
         self.reconcile_terminal_review_owner();
         self.cancel_stale_pr_creations();
         if let Some(notice) = crate::diagnostics::take_notice() {
@@ -14163,6 +14186,7 @@ impl Application for Cagents {
         }
         if crate::device::is_remote() {
             match &message {
+                Message::RetrySharedChatAdmission(_) => return Task::none(),
                 Message::GitUi(_)
                 | Message::ProjectUi(
                     project_ui::Action::EditorsLoaded(_) | project_ui::Action::AvatarLoaded { .. },
@@ -14196,6 +14220,12 @@ impl Application for Cagents {
                 _ => {}
             }
         }
+        if self.chat_ui.image_viewer.as_ref().and_then(chat_ui::images::Gallery::target)
+            .is_some_and(|target| !matches!(self.cards.get(&target.card),
+                Some(CardRuntime::Chat(runtime)) if runtime.target == target))
+        {
+            self.chat_ui.image_viewer = None;
+        }
         self.tab_history.observe(self.workspace.focused());
         // A workspace opened some other way while the switcher is held, by a
         // click on one of its rows or in the sidebar, is the choice. Anything
@@ -14205,7 +14235,7 @@ impl Application for Cagents {
             && (matches!(&message, Message::Sidebar(action) if WorkspaceDestination::from_action(action).is_some())
                 || self.update_prepared
                 || self.workspace_inputs_blocked()
-                || self.chat_ui.image_viewer.is_some())
+                || self.chat_ui.image_viewer.as_ref().is_some_and(chat_ui::images::Gallery::is_modal))
         {
             self.cancel_workspace_preview();
         }
@@ -14234,9 +14264,6 @@ impl Application for Cagents {
         {
             self.deferred_navigation.push_back(message);
             return Task::none();
-        }
-        if let Some(task) = self.intercept_channel_work_navigation(&message) {
-            return task;
         }
         if !self.workspace.is_animating() && self.context_inspector_transition.is_none() {
             // Whatever this message starts is measured from now. Its first
@@ -15193,6 +15220,22 @@ impl Application for Cagents {
                 if self.modal_is_open() && !answers_discard_confirmation(&action) {
                     return Task::none();
                 }
+                if let SidebarAction::ChannelActions { channel_id, creation_ordinal, .. }
+                    | SidebarAction::CloseChannelActions { channel_id, creation_ordinal } = &action
+                    && !self.sidebar_model.projects.iter()
+                        .flat_map(|project| &project.channels)
+                        .any(|channel| channel.id == *channel_id
+                            && channel.ordinal == *creation_ordinal
+                            && channel.deletion.is_none())
+                {
+                    return Task::none();
+                }
+                if let SidebarAction::ChannelActions { channel_id, creation_ordinal, open: false }
+                    | SidebarAction::CloseChannelActions { channel_id, creation_ordinal } = &action
+                    && !self.sidebar_state.channel_actions_open(*channel_id, *creation_ordinal)
+                {
+                    return Task::none();
+                }
                 if matches!(&action, SidebarAction::FilesPage { key, .. }
                     | SidebarAction::FilesQueryChanged { key, .. }
                     | SidebarAction::ToggleFilesFilter { key }
@@ -15694,6 +15737,19 @@ impl Application for Cagents {
                     SidebarAction::HideReadAttention => {
                         iced::widget::operation::focus(sidebar::attention_filter_focus_id())
                             .map(cosmic::Action::App)
+                    }
+                    SidebarAction::ChannelActions { channel_id, creation_ordinal, open } => {
+                        let target = if open {
+                            sidebar::channel_delete_focus_id(channel_id, creation_ordinal)
+                        } else {
+                            sidebar::channel_more_focus_id(channel_id, creation_ordinal)
+                        };
+                        iced::widget::operation::focus(target).map(cosmic::Action::App)
+                    }
+                    SidebarAction::CloseChannelActions { channel_id, creation_ordinal } => {
+                        iced::widget::operation::focus(
+                            sidebar::channel_more_focus_id(channel_id, creation_ordinal)
+                        ).map(cosmic::Action::App)
                     }
                     SidebarAction::SearchChanged(_)
                     | SidebarAction::SetFilter(_)
@@ -16831,6 +16887,31 @@ impl Application for Cagents {
                 if let Some(task) = self.automation_approval_key(&event, captured) {
                     return task;
                 }
+                if let keyboard::Event::ModifiersChanged(modifiers) = &event {
+                    self.keyboard_modifiers = *modifiers;
+                }
+                // Device-file images remain a dialog and do not start with
+                // a focused chat canvas. Keep their original modal keyboard
+                // contract without intercepting a conversation's composer.
+                if self.image_viewer_owns_input()
+                    && self.chat_ui.image_viewer.as_ref().is_some_and(chat_ui::images::Gallery::is_modal)
+                {
+                    if let keyboard::Event::KeyPressed { key, .. } = &event {
+                        match key {
+                            keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                                self.chat_ui.image_viewer = None;
+                            }
+                            keyboard::Key::Named(keyboard::key::Named::ArrowLeft) if !captured => {
+                                self.chat_ui.image_viewer.as_mut().unwrap().next(false);
+                            }
+                            keyboard::Key::Named(keyboard::key::Named::ArrowRight) if !captured => {
+                                self.chat_ui.image_viewer.as_mut().unwrap().next(true);
+                            }
+                            _ => {}
+                        }
+                    }
+                    return Task::none();
+                }
                 #[cfg(feature = "integrated-browser")]
                 if is_escape_press(&event) && self.browser_import_on_top() {
                     return self.update_browser_import(self.browser_import.escape_action());
@@ -16840,26 +16921,6 @@ impl Application for Cagents {
                 }
                 if let Some(task) = self.daemon_health_key_event(&event, captured) {
                     return task;
-                }
-                if let keyboard::Event::ModifiersChanged(modifiers) = &event {
-                    self.keyboard_modifiers = *modifiers;
-                }
-                if self.chat_ui.image_viewer.is_some() {
-                    if let keyboard::Event::KeyPressed { key, .. } = &event {
-                        match key {
-                            keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                                self.chat_ui.image_viewer = None
-                            }
-                            keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
-                                self.chat_ui.image_viewer.as_mut().unwrap().next(false);
-                            }
-                            keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
-                                self.chat_ui.image_viewer.as_mut().unwrap().next(true);
-                            }
-                            _ => {}
-                        }
-                    }
-                    return Task::none();
                 }
                 if !captured
                     && !self.workspace_inputs_blocked()
@@ -17206,12 +17267,18 @@ impl Application for Cagents {
             }
             Message::SelectContextTab(tab) => {
                 if self.active_folder_scope()
-                    && matches!(tab, ContextTab::Changes | ContextTab::PullRequest)
+                    && (tab == ContextTab::Changes
+                        || (tab == ContextTab::PullRequest && self.durable.active_channel.is_none()))
                 {
                     return Task::none();
                 }
                 let changed = self.context_tab != tab;
                 self.context_tab = tab;
+                if tab == ContextTab::PullRequest
+                    && let Some(channel) = self.durable.active_channel
+                {
+                    return self.open_channel_work(channel);
+                }
                 if changed && let Some(key) = self.sidebar_state.active_worktree().cloned() {
                     self.reload_source_control(&key)
                 } else {
@@ -17291,8 +17358,6 @@ impl Application for Cagents {
             Message::WorkUi(action) => self.update_work_ui(action),
             Message::ChannelWork(action) => self.update_channel_work(action),
             Message::OpenChannelWork(channel) => self.open_channel_work(channel),
-            Message::ChannelWorkNavigation(navigation) => self.channel_navigation(navigation),
-            Message::ChannelWorkEscape => self.escape_channel_work(),
             Message::ChannelWorkPoll => self.channel_work.view.refresh().map_or_else(Task::none, |effect| self.channel_work_effect(effect)),
             Message::GitUi(action) => self.update_git(action),
             Message::NotificationUi(action) => self.update_notifications(action),
@@ -17317,6 +17382,7 @@ impl Application for Cagents {
             }
             Message::NativeWindowAction(action) => Task::done(cosmic::Action::Cosmic(action)),
             Message::ChatUi(action) => self.handle_chat_ui(action),
+            Message::RetrySharedChatAdmission(retry) => self.retry_shared_chat_admission(retry),
             Message::ResetSettings => {
                 if self.settings_reset_confirm {
                     return Task::none();
@@ -17682,6 +17748,7 @@ impl Application for Cagents {
                 });
             self.sidebar_state.select_file(&source.key, selected);
         }
+        let channel_context = self.sync_channel_pull_request_context();
         let pull_request = self.sync_pull_request_inspector();
         // `view` cannot rebuild the chrome cache itself, so refresh it here.
         let chrome = self.sync_chrome();
@@ -17692,6 +17759,7 @@ impl Application for Cagents {
             binding,
             chrome,
             deferred,
+            channel_context,
             pull_request,
             notices,
             terminal_probes,
@@ -17704,6 +17772,7 @@ impl Application for Cagents {
         let activation = self.retry_notification_activation();
         let visibility = self.sync_visible_attention();
         self.sync_notification_presence();
+        self.sync_work_watch_visibility();
         Task::batch([task, activation, visibility])
     }
 
@@ -17906,7 +17975,9 @@ impl Application for Cagents {
                 1.0,
             ));
         }
-        if let Some(gallery) = &self.chat_ui.image_viewer {
+        if let Some(gallery) = &self.chat_ui.image_viewer
+            && gallery.is_modal()
+        {
             return Some(gallery.view());
         }
         if let Some(dialog) = self.terminal_paste_dialog() {
@@ -18231,20 +18302,7 @@ impl Application for Cagents {
             .flatten();
         let has_multiple_panes = self.workspace.cards().len() > 1;
 
-        let workspace: Element<'_, Message> = if self.channel_work_is_main() {
-            // Do not build terminal/chat/browser widgets under an invisible
-            // Conversations layer. Their runtimes remain hosted and hidden.
-            crate::ui_controls::responsive(move |size| {
-                crate::interaction::focused_escape(
-                    self.channel_work
-                        .view
-                        .view(size.width, size.height)
-                        .map(Message::ChannelWork),
-                    || Message::ChannelWorkEscape,
-                )
-            })
-            .into()
-        } else if self.workspace.cards().is_empty() {
+        let workspace: Element<'_, Message> = if self.workspace.cards().is_empty() {
             let directory = self
                 .terminal_directory()
                 .unwrap_or_else(|| STARTING_DIRECTORY.clone());
@@ -29287,6 +29345,73 @@ mod tests {
         reconcile_restored_projects(&mut projects, &mut worktrees, &[original.id]);
         assert_eq!(projects, vec![original]);
         assert_eq!(worktrees, expected);
+    }
+
+    #[test]
+    fn stale_channel_menu_close_cannot_steal_focus_from_another_current_menu() {
+        let mut app = context_inspector_test_app(false);
+        let project = ProjectId::new();
+        let a = ChannelId::new();
+        let b = ChannelId::new();
+        let mut sidebar_project = SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "Example".into(),
+            "/example/.git".into(),
+            Vec::new(),
+            Vec::new(),
+        );
+        for (id, title, ordinal) in [(a, "First", 1), (b, "Second", 2)] {
+            sidebar_project.channels.push(sidebar::SidebarChannel::new(
+                id,
+                title.into(),
+                false,
+                None,
+                false,
+                0,
+                true,
+                ordinal,
+            ));
+        }
+        app.sidebar_model.projects = vec![sidebar_project];
+        app.sidebar_state.apply(&SidebarAction::ChannelActions {
+            channel_id: a,
+            creation_ordinal: 1,
+            open: true,
+        });
+        app.sidebar_state.apply(&SidebarAction::ChannelActions {
+            channel_id: b,
+            creation_ordinal: 2,
+            open: true,
+        });
+        for stale in [
+            SidebarAction::CloseChannelActions {
+                channel_id: a,
+                creation_ordinal: 1,
+            },
+            SidebarAction::ChannelActions {
+                channel_id: a,
+                creation_ordinal: 1,
+                open: false,
+            },
+        ] {
+            let task = app.update(Message::Sidebar(stale));
+            assert_eq!(
+                task.units(),
+                0,
+                "a stale close must schedule no focus operation"
+            );
+            assert!(app.sidebar_state.channel_actions_open(b, 2));
+        }
+        let close = app.update(Message::Sidebar(SidebarAction::CloseChannelActions {
+            channel_id: b,
+            creation_ordinal: 2,
+        }));
+        assert!(!app.sidebar_state.channel_actions_open(b, 2));
+        assert!(
+            close.units() > 0,
+            "current close restores its own More focus"
+        );
     }
 
     #[test]

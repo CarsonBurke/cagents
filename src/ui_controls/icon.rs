@@ -98,6 +98,7 @@ icons! {
         InsertText => "insert-text",
         Keyboard => "keyboard",
         MergedPullRequest => "merged-pull-request",
+        Microphone => "microphone",
         Minus => "minus",
         OpenFile => "open-file",
         OpenFolder => "open-folder",
