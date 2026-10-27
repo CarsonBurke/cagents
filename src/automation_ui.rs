@@ -3418,6 +3418,8 @@ fn optional(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    mod manual_receipts;
+
     use super::*;
 
     fn automation() -> Automation {
