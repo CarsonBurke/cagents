@@ -5578,6 +5578,8 @@ impl State {
 
 #[cfg(test)]
 mod tests {
+    mod signin_cleanup;
+
     use super::*;
     use crate::account::WindowKind;
     use crate::app::tests::context_inspector_test_app;
