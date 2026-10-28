@@ -704,20 +704,31 @@ impl Cagents {
                         .spacing(space::S)
                         .into(),
                     );
-                    content.push(
-                        widget::scrollable(widget::column::with_children(rows).spacing(space::S))
-                            .height(Length::Fixed(360.0))
-                            .into(),
-                    );
-                    content.push(
-                        widget::row::with_children(vec![
-                            button("Cancel", Action::Cancel),
-                            button("Scan again", Action::Consent),
-                            button("Import selected", Action::Import),
-                        ])
-                        .spacing(space::S)
+                    content.push(widget::column::with_children(rows).spacing(space::S).into());
+                    let actions = widget::row::with_children(vec![
+                        button("Cancel", Action::Cancel),
+                        button("Scan again", Action::Consent),
+                        button("Import selected", Action::Import),
+                    ])
+                    .spacing(space::S);
+                    let selection = widget::column::with_children(vec![
+                        widget::scrollable(
+                            widget::column::with_children(content).spacing(space::L),
+                        )
+                        .height(Length::Fill)
                         .into(),
-                    );
+                        actions.into(),
+                    ])
+                    .spacing(space::L)
+                    .height(Length::Fill);
+                    return Some(dialog_ui::overlay(
+                        widget::container(dialog_ui::surface(selection, 620.0))
+                            .max_width(620.0)
+                            .max_height(640.0)
+                            .into(),
+                        Some(message(Action::Cancel)),
+                        1.0,
+                    ));
                 }
                 Phase::Finished(detail) => {
                     content.push(notice_body(detail.clone()));
