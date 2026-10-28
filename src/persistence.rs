@@ -2745,7 +2745,8 @@ pub(crate) fn read_open_migration_sessions_with_budget(
             supported: CURRENT_SCHEMA_VERSION,
         });
     }
-    let mut statement = transaction.prepare(
+    let (origin, listener, predecessor) = terminal_provenance_columns(version);
+    let mut statement = transaction.prepare(&format!(
         "SELECT CASE WHEN length(CAST(c.card_id AS BLOB)) <= 128 THEN c.card_id ELSE NULL END, c.kind_tag,
          CASE WHEN length(CAST(c.content_json AS BLOB)) <= 4194304 THEN c.content_json ELSE NULL END,
          CASE WHEN length(CAST(c.existence_json AS BLOB)) <= 4096 THEN c.existence_json ELSE 'null' END,
@@ -2753,14 +2754,14 @@ pub(crate) fn read_open_migration_sessions_with_budget(
          CASE WHEN c.kind_tag = 'chat' THEN length(CAST(c.content_json AS BLOB))
          ELSE (SELECT length(CAST(r.terminal_id AS BLOB)) + length(CAST(r.recipe_json AS BLOB))
                     + length(CAST(r.continuity_json AS BLOB)) + coalesce(length(CAST(r.resume_hint AS BLOB)),0)
-                    + coalesce(length(CAST(r.recovery_origin AS BLOB)),0) + coalesce(length(CAST(r.owned_codex_listener AS BLOB)),0)
-                    + coalesce(length(CAST(r.predecessor AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0)
+                    + coalesce(length(CAST({origin} AS BLOB)),0) + coalesce(length(CAST({listener} AS BLOB)),0)
+                    + coalesce(length(CAST({predecessor} AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0)
                FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=r.terminal_id WHERE r.card_id=c.card_id)
          END,
          CASE WHEN length(CAST(w.workspace_id AS BLOB)) <= 128 THEN w.workspace_id ELSE NULL END
          FROM cards c JOIN workspaces w ON w.workspace_id = c.workspace_id
-         WHERE c.kind_tag IN ('chat', 'terminal') ORDER BY c.card_id",
-    )?;
+         WHERE c.kind_tag IN ('chat', 'terminal') ORDER BY c.card_id"
+    ))?;
     let mut rows = statement.query([])?;
     let mut sessions = Vec::new();
     let mut retained =
@@ -2832,14 +2833,23 @@ pub(crate) fn read_migration_session_at(
     const MAX_DESCRIPTOR_BYTES: usize = 4 * 1024 * 1024;
     match kind {
         "terminal" => {
+            let version: u32 =
+                connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            if version > CURRENT_SCHEMA_VERSION {
+                return Err(StoreError::UnsupportedSchema {
+                    found: version,
+                    supported: CURRENT_SCHEMA_VERSION,
+                });
+            }
+            let (origin, listener, predecessor) = terminal_provenance_columns(version);
             // Check lengths in SQLite before allocating any descriptor fields
             // in Rust, including the nullable provenance and transcript path.
             let bounded:Option<bool>=connection.query_row(
-                "SELECT length(CAST(r.terminal_id AS BLOB)) + length(CAST(r.recipe_json AS BLOB))
+                &format!("SELECT length(CAST(r.terminal_id AS BLOB)) + length(CAST(r.recipe_json AS BLOB))
                     + length(CAST(r.continuity_json AS BLOB)) + coalesce(length(CAST(r.resume_hint AS BLOB)),0)
-                    + coalesce(length(CAST(r.recovery_origin AS BLOB)),0) + coalesce(length(CAST(r.owned_codex_listener AS BLOB)),0)
-                    + coalesce(length(CAST(r.predecessor AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0) <= ?2
-                 FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=r.terminal_id WHERE r.card_id=?1",
+                    + coalesce(length(CAST({origin} AS BLOB)),0) + coalesce(length(CAST({listener} AS BLOB)),0)
+                    + coalesce(length(CAST({predecessor} AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0) <= ?2
+                 FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=r.terminal_id WHERE r.card_id=?1"),
                 params![card.to_string(),MAX_DESCRIPTOR_BYTES as u64],|row|row.get(0)).optional()?;
             if bounded != Some(true) {
                 return Err(StoreError::corrupt_row(
@@ -2847,7 +2857,7 @@ pub(crate) fn read_migration_session_at(
                     "missing or oversized immutable descriptor",
                 ));
             }
-            load_terminal_record(connection, card).map(CardKind::Terminal)
+            load_terminal_record_at_schema(connection, card, version).map(CardKind::Terminal)
         }
         "chat" => from_json(
             "migration chat",
@@ -5460,13 +5470,44 @@ fn load_terminal(
 }
 
 fn load_terminal_record(connection: &Connection, card_id: CardId) -> Result<TerminalSession> {
+    load_terminal_record_at_schema(connection, card_id, CURRENT_SCHEMA_VERSION)
+}
+
+// Read-only upgrade inspection must not run DDL against old window copies.
+// Missing historical fields mean no recorded provenance, never new authority.
+fn terminal_provenance_columns(version: u32) -> (&'static str, &'static str, &'static str) {
+    (
+        if version >= 5 {
+            "r.recovery_origin"
+        } else {
+            "NULL"
+        },
+        if version >= 8 {
+            "r.owned_codex_listener"
+        } else {
+            "NULL"
+        },
+        if version >= 11 {
+            "r.predecessor"
+        } else {
+            "NULL"
+        },
+    )
+}
+
+fn load_terminal_record_at_schema(
+    connection: &Connection,
+    card_id: CardId,
+    version: u32,
+) -> Result<TerminalSession> {
+    let (origin, listener, predecessor) = terminal_provenance_columns(version);
     // `.optional()` rather than `?`: a terminal card whose recipe row is gone
     // is a per-card restore failure the caller can report, not a raw
     // `QueryReturnedNoRows` that used to abort the whole workspace restore.
     let recipe = connection
         .query_row(
-            "SELECT terminal_id, recipe_json, continuity_json, resume_hint, recovery_origin, owned_codex_listener, predecessor
-             FROM terminal_recipes WHERE card_id = ?1",
+            &format!("SELECT r.terminal_id, r.recipe_json, r.continuity_json, r.resume_hint, {origin}, {listener}, {predecessor}
+             FROM terminal_recipes r WHERE r.card_id = ?1"),
             [card_id.to_string()],
             |row| {
                 Ok((
@@ -7975,6 +8016,62 @@ mod tests {
             if found == CURRENT_SCHEMA_VERSION + 1 && supported == CURRENT_SCHEMA_VERSION)
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn migration_inspection_reads_schema4_without_migrating_and_open_migrates_it() {
+        let directory = tempdir().unwrap();
+        let fixture = directory.path().join("current.sqlite3");
+        let path = directory.path().join("september-window.sqlite3");
+        let store = StateStore::open(&fixture, boot("recorded-boot")).unwrap();
+        let mut workspace = workspace_with_terminal(&boot("recorded-boot"));
+        let card = workspace.cards[0].id;
+        workspace
+            .chat_drafts
+            .insert(card, "unsent retained draft".into());
+        SaveLane::default().save(&store, &workspace).unwrap();
+        drop(store);
+        let mut connection = Connection::open(&path).unwrap();
+        let transaction = connection.transaction().unwrap();
+        migrate_to_v1(&transaction).unwrap();
+        migrate_to_v2(&transaction).unwrap();
+        migrate_to_v3(&transaction).unwrap();
+        migrate_to_v4(&transaction).unwrap();
+        transaction.pragma_update(None, "user_version", 4).unwrap();
+        transaction.commit().unwrap();
+        connection
+            .execute("ATTACH DATABASE ?1 AS fixture", [fixture.to_str().unwrap()])
+            .unwrap();
+        connection.execute_batch(
+            "INSERT INTO workspaces SELECT * FROM fixture.workspaces;
+             INSERT INTO cards SELECT * FROM fixture.cards;
+             INSERT INTO terminal_recipes SELECT terminal_id,card_id,generation,recipe_json,continuity_json,resume_hint,updated_at_unix_ms FROM fixture.terminal_recipes;
+             INSERT INTO transcript_metadata SELECT * FROM fixture.transcript_metadata;
+             INSERT INTO metadata SELECT * FROM fixture.metadata;
+             DETACH DATABASE fixture;"
+        ).unwrap();
+        drop(connection);
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            read_open_migration_sessions(&path).unwrap(),
+            vec![(card, workspace.cards[0].kind.clone())]
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "preview must leave the historical store byte-for-byte intact"
+        );
+        let reopened = StateStore::open(&path, boot("recorded-boot")).unwrap();
+        assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        let loaded = reopened
+            .load_workspace(workspace.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded.chat_drafts.get(&card),
+            Some(&"unsent retained draft".to_owned())
+        );
+        assert_eq!(loaded.cards[0].id, card);
     }
 
     #[test]

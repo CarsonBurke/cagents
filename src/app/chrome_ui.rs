@@ -3146,6 +3146,7 @@ impl Cagents {
         let status = match self.cards.get(&id) {
             _ if self.pane_transfer_pending(id) => Some(("Moving to channel", true)),
             _ if self.chat_start_pending(id) => Some(("Updating conversation", true)),
+            _ if self.saved_terminal_current(id).is_some() => self.saved_terminal_status(id),
             None | Some(CardRuntime::Loading) => Some((labels.starting, true)),
             Some(CardRuntime::Failed(_)) => Some(("Unavailable", false)),
             #[cfg(feature = "integrated-browser")]
