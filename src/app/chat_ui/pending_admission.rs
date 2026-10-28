@@ -2,26 +2,49 @@
 use super::*;
 
 impl Runtime {
-    pub(super) fn awaiting_admission(&self) -> bool {
+    pub(in crate::app) fn awaiting_admission(&self) -> bool {
         matches!(self.connection, Connection::AwaitingAdmission)
     }
 
     pub(super) fn pending_admission_view(&self) -> Element<'_, Message> {
+        self.pending_admission_view_with_failure(None, false)
+    }
+
+    pub(super) fn pending_admission_view_with_failure(
+        &self,
+        failure: Option<&crate::app::shared_views::SharedChatAdmissionFailure>,
+        retry_enabled: bool,
+    ) -> Element<'_, Message> {
         let text = self.unsent_text();
-        let copy = widget::button::custom(design::body("Copy saved draft"))
-            .class(crate::ui_controls::control_style(false, None))
-            .padding([space::S as u16, space::M as u16])
-            .on_press_maybe(
-                (!text.is_empty()).then(|| Message::ChatUi(Action::CopyLiteral(text.clone()))),
-            );
-        let mut controls = vec![design::heading("Saved draft").into()];
+        let attachments = self.unsent_attachments();
+        let mut rows: Vec<Element<'_, Message>> = vec![
+            design::heading("Saved conversation").into(),
+            design::caption("Not connected")
+                .class(cosmic::theme::Text::Custom(design::muted_text))
+                .into(),
+            design::body(
+                "This conversation is not connected. Saved content remains available here.",
+            )
+            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+            .width(Length::Fill)
+            .into(),
+        ];
         if self.retained_history_candidate && self.session.is_saved_claude_history() {
-            controls.push(
+            rows.push(
+                design::body(
+                    "Open history to read the saved conversation. Resume remains a separate action.",
+                )
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                .width(Length::Fill)
+                .into(),
+            );
+            rows.push(
                 widget::button::custom(design::body(if self.history_opening {
                     "Opening history…"
                 } else {
                     "Open history"
                 }))
+                .name("Open history")
                 .class(crate::ui_controls::control_style(false, None))
                 .padding([space::S as u16, space::M as u16])
                 .on_press_maybe(
@@ -31,43 +54,92 @@ impl Runtime {
                 .into(),
             );
         }
-        controls.push(copy.into());
-        let header = widget::flex_row(controls)
-            .align_items(Alignment::Center)
-            .spacing(space::M as u16);
-        let draft = widget::container(view::body(text))
-            .width(Length::Fill)
-            .padding(space::M)
-            .class(design::surface(
-                Some(design::sunken),
-                [design::RADIUS_M; 4],
-                false,
-            ));
-        let mut children = vec![header.into(),
-            design::body(if self.retained_history_candidate && self.session.is_saved_claude_history() {
-                "Your unsent draft is kept in this pane. Open history to read the saved conversation; Resume remains a separate action."
-            } else { "Your unsent draft is kept in this pane while the workspace reconnects. You can copy its text here." }).into()];
-        if !self.unsent_attachments().is_empty() {
-            children.push(
-                design::body(format!(
-                    "{} saved {} kept with this draft",
-                    self.unsent_attachments().len(),
-                    if self.unsent_attachments().len() == 1 {
-                        "image"
-                    } else {
-                        "images"
-                    }
-                ))
-                .into(),
-            );
-        }
         if let Some(error) = &self.error {
-            children.push(design::body(error.clone()).into());
+            rows.push(design::body(error.clone()).into());
         }
-        children.push(widget::scrollable(draft).height(Length::Fill).into());
-        let content = widget::column::with_children(children)
-            .spacing(space::M)
-            .width(Length::Fill);
+        if let Some(failure) = failure {
+            // Admission owns the sanitized public message and opaque authority.
+            // Presentation never inspects a session proof or creates a retry.
+            rows.push(
+                design::body(failure.message().to_owned())
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                    .width(Length::Fill)
+                    .into(),
+            );
+            if let Some(retry) = failure.retry() {
+                rows.push(crate::ui_controls::owned(
+                    (retry.clone(), retry_enabled),
+                    widget::button::custom(design::body("Retry workspace connection"))
+                        .name("Retry workspace connection")
+                        .id(card_control_id(self.target.card, "saved.admission.retry"))
+                        .class(crate::ui_controls::control_style(false, None))
+                        .padding([space::S as u16, space::M as u16])
+                        .on_press_maybe(
+                            retry_enabled.then_some(Message::RetrySharedChatAdmission(retry)),
+                        ),
+                ));
+            }
+        }
+        if text.is_empty() && attachments.is_empty() {
+            rows.push(design::body("No unsent draft.").into());
+        } else {
+            rows.push(design::heading("Unsent draft").into());
+            if !text.is_empty() {
+                rows.push(
+                    widget::button::custom(design::body("Copy saved draft"))
+                        .name("Copy saved draft")
+                        .class(crate::ui_controls::control_style(false, None))
+                        .padding([space::S as u16, space::M as u16])
+                        .on_press(Message::ChatUi(Action::CopySavedDraft(text.clone())))
+                        .into(),
+                );
+                rows.push(
+                    widget::container(view::body(text))
+                        .width(Length::Fill)
+                        .padding(space::M)
+                        .class(design::surface(
+                            Some(design::sunken),
+                            [design::RADIUS_M; 4],
+                            false,
+                        ))
+                        .into(),
+                );
+            }
+            if !attachments.is_empty() {
+                rows.push(design::caption(format!("Attachments ({})", attachments.len())).into());
+                for attachment in attachments {
+                    // Identity and numbering come from the preserved receipt.
+                    // This is a text inventory: never open paths or decode images.
+                    let label = match &attachment.reference {
+                        Some(reference) if !reference.name.is_empty() => {
+                            format!("{} · {}", reference.label(), reference.name)
+                        }
+                        _ => attachment.label(),
+                    };
+                    rows.push(
+                        widget::row::with_children(vec![
+                            crate::ui_controls::passive_icon(
+                                Icon::Attachment,
+                                design::ROW_ICON_SIZE,
+                            ),
+                            design::body(label)
+                                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                                .width(Length::Fill)
+                                .into(),
+                        ])
+                        .align_y(Alignment::Center)
+                        .spacing(space::S)
+                        .into(),
+                    );
+                }
+            }
+        }
+        let content = widget::column::with_children(vec![
+            widget::scrollable(widget::column::with_children(rows).spacing(space::M))
+                .height(Length::Fill)
+                .into(),
+        ])
+        .width(Length::Fill);
         widget::container(widget::container(content).max_width(design::READABLE_MEASURE))
             .padding(space::L)
             .width(Length::Fill)
@@ -75,7 +147,6 @@ impl Runtime {
             .into()
     }
 }
-
 impl Cagents {
     pub(in crate::app) fn chat_awaiting_admission(&self, card: CardId) -> bool {
         matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime)) if runtime.awaiting_admission())

@@ -22,6 +22,16 @@ use std::{
 };
 
 fn isolated(name: &str) -> bool {
+    for variable in [
+        crate::agent_execution::AUTHORITY_ENV,
+        "CAGENTS_AGENT_TOKEN",
+        "CAGENTS_SESSION_TOKEN",
+    ] {
+        assert!(
+            std::env::var_os(variable).is_none(),
+            "History start qualification requires a genuine User/CI launch; inherited role variables must not be replaced"
+        );
+    }
     const CHILD: &str = "CAGENTS_HISTORY_START_TEST";
     if std::env::var(CHILD).as_deref() == Ok(name) {
         return false;
