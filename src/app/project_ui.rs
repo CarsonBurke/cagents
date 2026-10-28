@@ -604,7 +604,8 @@ impl Cagents {
             return Some("The project is no longer open.".into());
         };
         if self.project_ui.removing.contains_key(&row.repository)
-            || self.project_ui.closing.contains_key(&project)
+            || (self.project_ui.closing.contains_key(&project)
+                && !self.project_ui.close_failed.contains(&project))
         {
             return Some("Project removal is already in progress.".into());
         }
