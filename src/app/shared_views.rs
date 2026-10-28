@@ -4550,6 +4550,11 @@ mod tests {
         }
         for replacement in [false, true] {
             let saved_text = format!("submitted before peer change: {replacement}\n");
+            // The preceding case saved its later edit. Keep each new edit
+            // distinct from that baseline so both cases remain dirty in flight.
+            let later_text = format!("later edits: {replacement}\n");
+            let latest_text = format!("latest edits: {replacement}\n");
+            assert_ne!(later_text, std::fs::read_to_string(&path).unwrap());
             let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&pane.id) else {
                 unreachable!()
             };
@@ -4567,13 +4572,15 @@ mod tests {
             assert!(!runtime.can_save() && !runtime.inspector_context().can_discard);
             for action in [
                 EditorAction::SelectAll,
-                EditorAction::Edit(EditorEdit::Paste(Arc::new("later edits\n".into()))),
+                EditorAction::Edit(EditorEdit::Paste(Arc::new(later_text.clone()))),
             ] {
                 drop(runtime.update(RepositoryAction::EditorAction {
                     card: pane.id,
                     action,
                 }));
             }
+            assert_eq!(runtime.editor_text().as_deref(), Some(later_text.as_str()));
+            assert!(runtime.is_dirty() && runtime.is_saving());
             let identity = &**runtime as *const RepositoryRuntime;
             let save_root = runtime.retained_editor_root().unwrap();
             let view = &mut app.workspace_model.views[0];
@@ -4600,7 +4607,7 @@ mod tests {
                 };
                 if reason == "dirty-warning" {
                     settle(runtime, save.take().unwrap()).await;
-                    assert_eq!(runtime.editor_text().as_deref(), Some("later edits\n"));
+                    assert_eq!(runtime.editor_text().as_deref(), Some(later_text.as_str()));
                     assert!(!runtime.is_saving());
                     assert!(runtime.is_dirty() && runtime.has_durability_warning());
                 } else if reason == "saving-warning" {
@@ -4609,22 +4616,24 @@ mod tests {
                     save = Some(runtime.request_save_with_sync_warning_for_test(pane.id));
                     for action in [
                         EditorAction::SelectAll,
-                        EditorAction::Edit(EditorEdit::Paste(Arc::new("latest edits\n".into()))),
+                        EditorAction::Edit(EditorEdit::Paste(Arc::new(latest_text.clone()))),
                     ] {
                         drop(runtime.update(RepositoryAction::EditorAction {
                             card: pane.id,
                             action,
                         }));
                     }
-                    assert!(runtime.is_dirty() && runtime.has_durability_warning());
+                    assert_eq!(runtime.editor_text().as_deref(), Some(latest_text.as_str()));
+                    assert!(runtime.is_dirty() && runtime.is_saving());
+                    assert!(runtime.has_durability_warning());
                 } else if reason == "completed-warning" {
                     settle(runtime, save.take().unwrap()).await;
-                    assert_eq!(runtime.editor_text().as_deref(), Some("latest edits\n"));
+                    assert_eq!(runtime.editor_text().as_deref(), Some(latest_text.as_str()));
                     assert!(runtime.is_dirty() && runtime.has_durability_warning());
-                    assert_eq!(std::fs::read_to_string(&path).unwrap(), "later edits\n");
+                    assert_eq!(std::fs::read_to_string(&path).unwrap(), later_text);
                 } else if reason == "warning" {
                     drop(runtime.update(RepositoryAction::DiscardEdits { card: pane.id }));
-                    assert_eq!(runtime.editor_text().as_deref(), Some("later edits\n"));
+                    assert_eq!(runtime.editor_text().as_deref(), Some(later_text.as_str()));
                     assert!(!runtime.is_dirty() && runtime.has_durability_warning());
                 }
                 let saving = matches!(reason, "saving" | "saving-warning");
