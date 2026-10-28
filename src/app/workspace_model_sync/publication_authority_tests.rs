@@ -1978,3 +1978,252 @@ fn refused_title_with_failed_canonical_read_restores_only_its_still_owned_candid
         }
     }
 }
+
+/// Obtain the actual publisher's local acknowledgement from a framed successful
+/// CreateChannel response. Do not construct Ranked: its source metadata is part
+/// of the contract these reordered-reducer tests exercise.
+fn framed_channel_publication_ack(edit: ModelEdit, model: WorkspaceModel) -> ModelUpdate {
+    assert!(matches!(edit, ModelEdit::CreateChannel { .. }));
+    let expected = edit.clone();
+    let peer = Peer::new(vec![connected()], move |_, peer| {
+        let request = expect_edit(peer, &expected);
+        response(
+            peer,
+            &request,
+            ServerMessage::Response {
+                response: ServerResponse::WorkspaceModel {
+                    model: model.clone(),
+                },
+            },
+        );
+        true
+    });
+    let (tx, requests) = async_channel::unbounded();
+    tx.send_blocking(edit).unwrap();
+    drop(tx);
+    let (updates, received) = async_channel::unbounded();
+    let context = PublicationContext {
+        authority: Authority::default(),
+        remote: false,
+        no_start: true,
+    };
+    let mut pending = None;
+    let connections = Cell::new(0);
+    let error = publish_with(&updates, &requests, &mut pending, || {
+        connections.set(connections.get() + 1);
+        existing(&context, &peer.socket)
+    })
+    .unwrap_err();
+    assert_eq!(error, "the window stopped publishing");
+    assert_eq!(connections.get(), 1);
+    assert!(pending.is_none() && requests.is_empty());
+    peer.finished();
+    let update = received.try_recv().unwrap();
+    assert!(matches!(update, ModelUpdate::Ranked { .. }));
+    assert!(received.is_empty());
+    update
+}
+
+fn channel_publication_model(mut model: WorkspaceModel, edit: &ModelEdit) -> WorkspaceModel {
+    use crate::workspace_model::{ModelChannel, ModelProject};
+    let ModelEdit::CreateChannel {
+        id,
+        repository,
+        title,
+        title_source,
+    } = edit
+    else {
+        panic!("expected the local channel publication")
+    };
+    model.sequence += 1;
+    model.projects.push(ModelProject {
+        repository: repository.clone(),
+        name: "Admitted project".into(),
+        kind: ProjectKind::Folder,
+        ordinal: 1,
+    });
+    model.channels.push(ModelChannel {
+        id: *id,
+        repository: repository.clone(),
+        title: title.clone(),
+        title_source: *title_source,
+        ordinal: 21,
+    });
+    model
+}
+
+#[test]
+fn delayed_channel_ack_cannot_turn_replaced_registry_or_project_silence_into_local_deletion() {
+    use crate::app::Message;
+    use crate::model::{ProjectId, RepositoryId};
+    for changed in ["registry", "project"] {
+        let (_directory, mut app, _project, channel, repository, requests, canonical) =
+            publication_reconciliation_fixture();
+        let queued = take_creation_publications(&requests);
+        let edit = queued
+            .into_iter()
+            .find(|edit| matches!(edit, ModelEdit::CreateChannel { .. }))
+            .unwrap();
+        let admitted = channel_publication_model(canonical.clone(), &edit);
+        let delayed_ack = framed_channel_publication_ack(edit, admitted);
+        let card = app
+            .durable
+            .channels
+            .iter()
+            .find(|local| local.id == channel)
+            .unwrap()
+            .cards[0];
+        let original_kind = app.card_state(card).unwrap().kind.clone();
+        let drafts = app.durable.chat_drafts.clone();
+        let mut current = canonical;
+        if changed == "registry" {
+            current.identity = uuid::Uuid::new_v4();
+            current.sequence = 1;
+        } else {
+            let successor = ProjectId::new();
+            let successor_repository = repository.join("ack-successor");
+            std::fs::create_dir(&successor_repository).unwrap();
+            app.sidebar_model.projects.push(
+                crate::sidebar::SidebarProject::new(
+                    successor,
+                    RepositoryId::new(),
+                    "Successor project".into(),
+                    successor_repository,
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .with_kind(ProjectKind::Folder),
+            );
+            std::sync::Arc::make_mut(&mut app.durable)
+                .channels
+                .iter_mut()
+                .find(|local| local.id == channel)
+                .unwrap()
+                .project_id = successor;
+        }
+        // Observe the real replacement authority before delivering the old
+        // successful publisher result. No provider or teardown task is polled.
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+                current.clone(),
+            ))),
+        );
+        let ordinal = app
+            .durable
+            .channels
+            .iter()
+            .find(|local| local.id == channel)
+            .unwrap()
+            .ordinal;
+        drop(app.update(Message::WorkspaceModelObserved(delayed_ack)));
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+                current.clone(),
+            ))),
+        );
+        assert!(
+            !app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel),
+            "{changed}: a stale ACK must not schedule retirement under the current authority"
+        );
+        let local = app
+            .durable
+            .channels
+            .iter()
+            .find(|local| local.id == channel)
+            .expect("an absent current-registry channel is still unshared local work");
+        assert!(
+            !local.shared,
+            "{changed}: only the current publication may establish shared custody"
+        );
+        assert_eq!(
+            local.ordinal, ordinal,
+            "{changed}: an old reply must not rerank the successor"
+        );
+        assert!(local.cards.contains(&card));
+        assert!(
+            app.card_state(card).unwrap().existence.is_open(),
+            "{changed}: retain the conversation"
+        );
+        assert_eq!(app.card_state(card).unwrap().kind, original_kind);
+        assert!(app.cards.contains_key(&card));
+        assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+        assert_eq!(app.durable.active_channel, Some(channel));
+        assert_eq!(app.workspace_model, current);
+    }
+}
+
+#[test]
+fn current_channel_ack_accepts_matching_registry_and_bootstrap_before_first_connection() {
+    use crate::app::Message;
+    for bootstrap in [false, true] {
+        let (_directory, mut app, _project, channel, _repository, requests, canonical) =
+            if bootstrap {
+                let (directory, mut app, project, channel, repository, requests) =
+                    creation_fixture();
+                let card = app
+                    .durable
+                    .channels
+                    .iter()
+                    .find(|local| local.id == channel)
+                    .unwrap()
+                    .cards[0];
+                write_creation_draft(&mut app, card, "Keep the initial publication draft");
+                assert_eq!(
+                    app.workspace_model.identity,
+                    crate::workspace_model::NO_REGISTRY
+                );
+                let canonical = WorkspaceModel {
+                    identity: uuid::Uuid::new_v4(),
+                    sequence: 7,
+                    ..WorkspaceModel::default()
+                };
+                (
+                    directory, app, project, channel, repository, requests, canonical,
+                )
+            } else {
+                publication_reconciliation_fixture()
+            };
+        let queued = take_creation_publications(&requests);
+        let edit = queued
+            .into_iter()
+            .find(|edit| matches!(edit, ModelEdit::CreateChannel { .. }))
+            .unwrap();
+        let admitted = channel_publication_model(canonical, &edit);
+        let ack = framed_channel_publication_ack(edit, admitted.clone());
+        let drafts = app.durable.chat_drafts.clone();
+        drop(app.update(Message::WorkspaceModelObserved(ack)));
+        let local = app
+            .durable
+            .channels
+            .iter()
+            .find(|local| local.id == channel)
+            .unwrap();
+        assert!(
+            local.shared,
+            "bootstrap {bootstrap}: a current real ACK establishes sharing"
+        );
+        assert_eq!(local.ordinal, 21);
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+                admitted.clone(),
+            ))),
+        );
+        drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(admitted))));
+        let local = app
+            .durable
+            .channels
+            .iter()
+            .find(|local| local.id == channel)
+            .unwrap();
+        assert!(local.shared && !local.cards.is_empty());
+        assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+        assert!(
+            local
+                .cards
+                .iter()
+                .all(|card| app.card_state(*card).unwrap().existence.is_open())
+        );
+        assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+        assert_eq!(app.durable.active_channel, Some(channel));
+    }
+}
