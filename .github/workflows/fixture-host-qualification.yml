@@ -1,0 +1,62 @@
+name: Focused fixture HOST qualification
+
+# Temporary source-bound qualification. Retain evidence, then close without merge.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/fixture-host-qualification.yml
+      - scripts/ci/fixture-host-qualification.py
+      - scripts/ci/fixture-host-qualification.json
+      - scripts/ci/observe-command-owned-fixtures.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fixture-host-qualification-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: 2
+  RUSTUP_TOOLCHAIN: 1.93.0
+  FIXTURE_CI_CONTROL_HEAD: ${{ github.event.pull_request.head.sha }}
+  FIXTURE_CI_EVIDENCE: /tmp/fixture-ci-${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  fixtures:
+    name: Exact fixture products in natural User scope
+    if: github.repository == 'CarsonBurke/cagents' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'ci/fw16-plan1-fixtures1855-1797-hosted'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the exact control head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require natural User scope before creating fixture or capture paths
+        run: python3 scripts/ci/fixture-host-qualification.py --prepare
+      - name: Select pinned Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12.3'
+      - name: Set up the unchanged isolated HOST build environment
+        timeout-minutes: 20
+        uses: ./.github/actions/setup-linux-build
+      - name: Qualify the immutable products serially with one warm HOST target
+        run: |
+          set -euo pipefail
+          python3 "$FIXTURE_CI_EVIDENCE/control/scripts/ci/fixture-host-qualification.py" --run
+      - name: Retain source, raw exits, exact counts and cleanup evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fixture-host-${{ github.event.pull_request.head.sha }}
+          path: ${{ env.FIXTURE_CI_EVIDENCE }}
+          if-no-files-found: error
+          retention-days: 14

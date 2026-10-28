@@ -1,0 +1,88 @@
+{
+  "scope": "Temporary focused genuine-hosted existing fixture contracts; close control PR without merge after retaining evidence. No general/full CI, native UX or real-provider claim.",
+  "main": "4d18d788d03588621907b423a2df0e129f6e689c",
+  "observer_sha256": "bb1e8fd0d14444697198d6c495425ab18038ff2d389d7eee2e29f3f463fe3a6a",
+  "observer_provenance": {
+    "source": "/home/marvin/Documents/repositories/cagents/.worktrees/work-tracking-evidence/pr1757-c-observer-successor-20261028/observe-command-owned.py",
+    "component_review": "/tmp/updater-review-observer-bb1e8fd0-source.json",
+    "review_sha256": "64512aa89482e02c85cbde7240b349af0443821015390e7f0d73252d1e8ae9ca",
+    "historical_ea154_excluded": true
+  },
+  "products": [
+    {
+      "pr": 1855,
+      "head": "f3c0c9ea21bd4ba7c89e424a5bd635017faece94",
+      "tree": "abd3e4a0783132ddd3c9d80a4d3800e2050813af",
+      "changed_paths": [
+        "tests/automation_cli_contract.rs",
+        "tests/codex_continuity_qualification.rs",
+        "tests/agent_console_contract.rs"
+      ],
+      "compile_targets": [
+        "--test",
+        "automation_cli_contract",
+        "--test",
+        "codex_continuity_qualification"
+      ],
+      "test_artifact": "automation_cli_contract",
+      "parents": [
+        "automation_cli_runs_headless_precheck_once_and_keeps_history_after_restart_and_removal",
+        "automation_cli_lifecycle_audit_pages_durable_receipts_without_running_a_provider"
+      ],
+      "expected_parent_executions": 2,
+      "compile_only_ignored_target": "codex_continuity_qualification",
+      "source_sha256": {
+        ".github/actions/setup-linux-build/action.yml": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052",
+        "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+        "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+        "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+        "src/agent_execution.rs": "14fc4f194cbc57dabc63bba2e719170dda3e05f97a5779f95b5607317104b452",
+        "src/bin/cagentsd.rs": "252beaafc3b6226f96eb6816fa931c90e6370aac03abb75bb3529487acbe2830",
+        "src/control.rs": "b23414a7a0cb6d6e9ef755d869d695b599abe8f2cada98a2214791905eaa86fe",
+        "tests/agent_console_contract.rs": "3c4a2535b744ccf6dbfc344648f487a1b52ca15227beaa27178b07060f8a2f70",
+        "tests/automation_cli_contract.rs": "05dd3455c4381c02ab87abe1029291ce5f5106fcf1d1e96ca44fe95cb9d48e79",
+        "tests/codex_continuity_qualification.rs": "a64411b8a2e8b9728640993b3f33e53679ffe5003c33b42def1088c760387a36",
+        "tests/fixtures/automation-claude.sh": "68c4ed04ff7472c29a11968aaceaf01b5c04894d0080f99481a4c09dcadc3dc9",
+        "tests/support/hosted_agent_cleanup.rs": "62e695ff55d7d99c5487963b866d406c2f11f5a0afc4d98ba5ccbea0846d2a4b",
+        "tests/support/private_cli_capture.rs": "f76183915aa79d5fae2eaf96fde3ddf313a7bc23ffd91ed2767cfb9c7bbe61d4"
+      }
+    },
+    {
+      "pr": 1797,
+      "head": "222bea27b6958e1b814d51891e4b771994095582",
+      "tree": "3acef1b01d9f18e7cdc7c8c8d0bc30954dcc565b",
+      "changed_paths": [
+        "src/host/agent_execution/tests.rs"
+      ],
+      "compile_targets": [
+        "--lib"
+      ],
+      "test_artifact": "cagents",
+      "matrix_parent": "host::agent_execution::tests::directory_lists_live_sessions_with_relations_and_without_granting_control",
+      "parents": [
+        "host::agent_execution::tests::a_project_is_found_by_its_name",
+        "host::agent_execution::tests::authenticated_worktree_caller_places_child_in_its_exact_visible_view",
+        "host::agent_execution::tests::replaced_scheduled_directory_refuses_dispatch_before_spawning",
+        "host::agent_execution::tests::changed_target_refuses_new_work_but_keeps_interrupt_and_close_available"
+      ],
+      "expected_parent_executions": 6,
+      "source_sha256": {
+        ".github/actions/setup-linux-build/action.yml": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052",
+        "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+        "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+        "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+        "src/agent_execution.rs": "14fc4f194cbc57dabc63bba2e719170dda3e05f97a5779f95b5607317104b452",
+        "src/bin/cagentsd.rs": "252beaafc3b6226f96eb6816fa931c90e6370aac03abb75bb3529487acbe2830",
+        "src/control.rs": "b23414a7a0cb6d6e9ef755d869d695b599abe8f2cada98a2214791905eaa86fe",
+        "src/host/agent_execution.rs": "7eea3e685966b62fc9a43ef18b636c9dd2e0318624e125de24c5cde5204d8752",
+        "src/host/agent_execution/ownership.rs": "640010fb7a2289b3d7d1bac999bdacba8870c3d9f71e175818099f123a97d84f",
+        "src/host/agent_execution/tests.rs": "1bfc7f927c332591c7bb2db0d299a37b0d571570799f759adac62ea785aebcb0"
+      }
+    }
+  ],
+  "control_sha256": {
+    ".github/workflows/fixture-host-qualification.yml": "23c037d411d23f93989effeccccd79d9fe9ac38242e5bfecb8d3b86e30e23422",
+    "scripts/ci/fixture-host-qualification.py": "ad9c6c927d0e872dfd59011b43d53821d8d66e9aefe972779a7be05f1cd38daa",
+    "scripts/ci/observe-command-owned-fixtures.py": "bb1e8fd0d14444697198d6c495425ab18038ff2d389d7eee2e29f3f463fe3a6a"
+  }
+}
