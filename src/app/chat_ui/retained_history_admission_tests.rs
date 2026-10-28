@@ -489,14 +489,16 @@ fn retained_history_stale_context_and_changed_ack_connection_remain_inert() {
                         .insert("CHANGED".into(), "yes".into());
                     f.app.install_chat_session(f.card, other);
                 }
-                "window" => f
-                    .app
-                    .core
-                    .set_main_window_id(Some(iced::window::Id::unique())),
-                "deleting" => f
-                    .app
-                    .project_ui
-                    .begin_deleting(f.source.launch.recipe.working_directory.clone()),
+                "window" => {
+                    f.app
+                        .core
+                        .set_main_window_id(Some(iced::window::Id::unique()));
+                }
+                "deleting" => {
+                    f.app
+                        .project_ui
+                        .begin_deleting(f.source.launch.recipe.working_directory.clone());
+                }
                 "closed-elsewhere" => {
                     let target = chat_runtime(&f.app, f.card).target;
                     f.app.chat_runtime_mut(target).unwrap().closed_elsewhere = true;
