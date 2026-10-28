@@ -293,6 +293,74 @@ fn refused_or_unavailable_first_start_checkpoint_preserves_draft_and_never_start
 }
 
 #[test]
+fn failed_first_start_checkpoint_restores_only_the_current_unclaimed_composer() {
+    for context in [
+        "current",
+        "other-control",
+        "other-card",
+        "other-window",
+        "modal",
+        "stale",
+    ] {
+        let (mut app, _directory, card, target) = fixture();
+        app.context_inspector_open = false;
+        app.refresh_ui.focused = true;
+        app.workspace.resize_viewport(1200.0);
+        let _ = app.workspace.take_widget_focus_request();
+        let source = runtime(&app, card).session.clone();
+        let mut foreign = source.clone();
+        foreign.id = TerminalId::new();
+        app.session
+            .as_ref()
+            .unwrap()
+            .operation_store()
+            .replace_chat_identity(card, source.id, &foreign)
+            .unwrap();
+        let save = app.start_chat_draft(target);
+        let (target, attempt, result) = checkpoint(save);
+        assert!(result.is_err(), "actual writer refusal: {context}");
+        match context {
+            "other-card" => {
+                let other = app.workspace.order().find(|id| *id != card).unwrap();
+                app.workspace.focus(other).unwrap();
+                let _ = app.workspace.take_widget_focus_request();
+            }
+            "other-window" => app.refresh_ui.focused = false,
+            "modal" => app.settings_reset_confirm = true,
+            "stale" => {
+                app.chat_ui
+                    .draft_checkpoints
+                    .get_mut(&card)
+                    .unwrap()
+                    .attempt = uuid::Uuid::new_v4();
+            }
+            _ => {}
+        }
+        let recovery = app.draft_start_checkpointed(target, attempt, result);
+        let chosen = (context == "other-control").then(sidebar::search_toggle_focus_id);
+        let task = chosen.as_ref().map_or_else(Task::none, |id| {
+            iced::widget::operation::focus(id.clone()).map(cosmic::Action::App)
+        });
+        let expected = if context == "current" {
+            Some(card_control_id(card, "chat-composer"))
+        } else {
+            chosen
+        };
+        assert_eq!(
+            crate::app::tests::focused(&app, task.chain(recovery)),
+            expected,
+            "{context}: execute the actual recovery task on the rendered widget tree"
+        );
+        no_starter(&app, card);
+        assert_eq!(runtime(&app, card).session, source);
+        assert_eq!(
+            runtime(&app, card).composer.text(),
+            "First prompt remains local"
+        );
+    }
+}
+
+#[test]
 fn changed_draft_or_source_and_stale_checkpoint_cannot_authorize_first_start() {
     for change in [
         "edit",
