@@ -7413,13 +7413,19 @@ impl Cagents {
         self.snapshot_workspace_scope();
         self.publish_view_changes();
         let saved = self.persistent_workspace();
+        let resumes = self.chat_resume_snapshot_bindings();
         if let Some(session) = &self.session {
             let adoptions = std::mem::take(&mut self.shared_views.adoptions);
             let restorations = std::mem::take(&mut self.shared_views.restorations);
             if adoptions.is_empty() && restorations.is_empty() {
-                session.snapshot(saved);
+                session.snapshot_with_resumes(saved, resumes);
             } else {
-                session.snapshot_terminal_panes(saved, adoptions, restorations);
+                session.snapshot_terminal_panes_with_resumes(
+                    saved,
+                    adoptions,
+                    restorations,
+                    resumes,
+                );
             }
         }
     }

@@ -1091,7 +1091,9 @@ fn original_old_boot_visual_restores_named_account_history_then_starts_twice_ove
         client.authenticate(Default::default()).unwrap(); // Synthetic fixture User, never production authority.
         let mut requested = restored;
         for start_number in 1..=2 {
-            let ServerResponse::ChatResumePrepared { session: prepared } = client
+            let ServerResponse::ChatResumePrepared {
+                session: mut prepared,
+            } = client
                 .fixture_request(ClientRequest::ChatPrepareResume {
                     source: requested.clone(),
                 })
@@ -1105,6 +1107,70 @@ fn original_old_boot_visual_restores_named_account_history_then_starts_twice_ove
                 before + start_number,
                 "Prepare started a provider"
             );
+            if start_number == 1 && outcome == State::Succeeded {
+                // Distinct from known-B retry: the response was lost before
+                // the UI learned/persisted B. Retrying originalA must refuse
+                // without resurrecting it or starting any provider. Normal
+                // read-only Restore(A), then a NEW explicit preparation may
+                // issue another unused successor; this is not request-ID
+                // idempotency and the lostB has no process authority.
+                let lost = prepared.clone();
+                assert!(
+                    client
+                        .fixture_request(ClientRequest::ChatPrepareResume {
+                            source: requested.clone()
+                        })
+                        .is_err()
+                );
+                assert_eq!(launches(), before + start_number);
+                assert!(!fixture.host.lock().unwrap().chats.contains_key(&lost.id));
+                assert!(
+                    registry
+                        .lock()
+                        .unwrap()
+                        .retained_agent_sources(lost.id)
+                        .unwrap()
+                        .is_empty()
+                );
+                let (restore, server) = std::os::unix::net::UnixStream::pair().unwrap();
+                let host = fixture.host.clone();
+                let server = thread::spawn(move || crate::host::client::serve(server, 65, host));
+                let history =
+                    chat::client::ClientHandle::fixture_restore(restore, requested.clone())
+                        .unwrap();
+                wait(
+                    || {
+                        let snapshot = history.snapshot();
+                        !snapshot.history_loading && !snapshot.items.is_empty()
+                    },
+                    "lost preparation could not restore original history without a provider",
+                );
+                assert!(history.session().is_saved_claude_history());
+                assert_eq!(launches(), before + start_number);
+                drop(history);
+                server.join().unwrap();
+                let ServerResponse::ChatResumePrepared { session: recovered } = client
+                    .fixture_request(ClientRequest::ChatPrepareResume {
+                        source: requested.clone(),
+                    })
+                    .unwrap()
+                else {
+                    panic!("fresh explicit preparation after History restore");
+                };
+                assert_ne!(recovered.id, lost.id);
+                assert_eq!(recovered.launch, lost.launch);
+                assert_eq!(recovered.proof, lost.proof);
+                assert_eq!(launches(), before + start_number);
+                assert!(
+                    registry
+                        .lock()
+                        .unwrap()
+                        .retained_agent_sources(lost.id)
+                        .unwrap()
+                        .is_empty()
+                );
+                prepared = recovered;
+            }
             if start_number == 1 {
                 assert_ne!(
                     prepared.id, requested.id,

@@ -546,14 +546,31 @@ struct LocalReturn {
     resumes: bool,
 }
 
-#[derive(Clone)]
 struct ResumePreparation {
     target: Target,
     runtime: Target,
     source: chat::Session,
     prepared: Option<chat::Session>,
+    snapshot_binding: Option<crate::session::ResumeSnapshotBinding>,
+    snapshot_owner: Option<crate::session::ResumeSnapshotOwner>,
     writer: std::sync::Weak<()>,
     window: Option<iced::window::Id>,
+}
+
+impl Clone for ResumePreparation {
+    fn clone(&self) -> Self {
+        // Completion handlers inspect context; only the phase owns lifecycle.
+        Self {
+            target: self.target,
+            runtime: self.runtime,
+            source: self.source.clone(),
+            prepared: self.prepared.clone(),
+            snapshot_binding: self.snapshot_binding.clone(),
+            snapshot_owner: None,
+            writer: self.writer.clone(),
+            window: self.window,
+        }
+    }
 }
 
 /// One operation owns an existing card at a time. A card absent from this map
@@ -592,6 +609,9 @@ pub(super) struct State {
     receiver: async_channel::Receiver<(Target, Wake)>,
     generation: u64,
     phases: HashMap<CardId, Phase>,
+    closing_resumes: HashMap<CardId, crate::session::ResumeSnapshotBinding>,
+    // A retained product response is a candidate, never automatic start intent.
+    prepared_resumes: HashMap<CardId, ResumePreparation>,
     /// Transient user intent, never an execution proof. Automatic restoration
     /// cannot acquire this permission; an exact failed History start can retry.
     explicit_starts: HashMap<CardId, chat::Session>,
@@ -640,6 +660,8 @@ impl Default for State {
             receiver,
             generation: 0,
             phases: HashMap::new(),
+            closing_resumes: HashMap::new(),
+            prepared_resumes: HashMap::new(),
             explicit_starts: HashMap::new(),
             abandoned: HashMap::new(),
             retiring: HashSet::new(),
@@ -6618,6 +6640,7 @@ impl Cagents {
     }
 
     pub(super) fn chat_forget(&mut self, card: CardId) {
+        self.chat_ui.prepared_resumes.remove(&card);
         self.chat_ui.explicit_starts.remove(&card);
         self.chat_ui.capacity_offers.remove(&card);
         // The runtime is about to be dropped, so its unsent text is captured
@@ -6661,6 +6684,11 @@ impl Cagents {
                     .abandoned
                     .insert(attempt.target, attempt.session);
             }
+            Some(Phase::PreparingResume(resume)) => {
+                if let Some(binding) = resume.snapshot_binding {
+                    self.chat_ui.closing_resumes.insert(card, binding);
+                }
+            }
             Some(Phase::Closing { target, .. }) => {
                 if let Some(session) = self.chat_return_session(card) {
                     self.chat_ui.abandoned.insert(target, session);
@@ -6690,10 +6718,58 @@ impl Cagents {
         card: CardId,
         replacement: &chat::Session,
     ) {
+        if self
+            .chat_ui
+            .prepared_resumes
+            .get(&card)
+            .is_some_and(|resume| &resume.source != replacement)
+        {
+            self.chat_ui.prepared_resumes.remove(&card);
+        }
+        self.chat_ui.closing_resumes.remove(&card);
         if matches!(self.chat_ui.phases.get(&card), Some(Phase::PreparingResume(resume)) if &resume.source != replacement)
         {
             self.chat_ui.phases.remove(&card);
         }
+    }
+
+    /// Snapshot provenance is captured for this enqueue, never inferred later
+    /// from descriptor bytes. Closing retains its one operation until the
+    /// tombstone/missing-card snapshot is offered, then consumes it.
+    pub(super) fn chat_resume_snapshot_bindings(
+        &mut self,
+    ) -> Vec<crate::session::ResumeSnapshotBinding> {
+        let mut bindings = self
+            .chat_ui
+            .phases
+            .values()
+            .filter_map(|phase| match phase {
+                Phase::PreparingResume(resume) => resume.snapshot_binding.clone(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let closed = self
+            .chat_ui
+            .closing_resumes
+            .keys()
+            .copied()
+            .filter(|card| {
+                self.card_state(*card)
+                    .is_none_or(|card| !card.existence.is_open())
+            })
+            .collect::<Vec<_>>();
+        for card in closed {
+            if let Some(binding) = self.chat_ui.closing_resumes.remove(&card) {
+                bindings.push(binding);
+            }
+        }
+        bindings
+    }
+
+    fn history_resume_admitted(&mut self, card: CardId) -> bool {
+        !self.chat_awaiting_admission(card)
+            && !self.chat_closed_elsewhere(card)
+            && !self.refuse_for_deleting_card(card)
     }
 
     fn history_resume_current(&self, resume: &ResumePreparation) -> bool {
@@ -9389,6 +9465,9 @@ impl Cagents {
                     return Task::none();
                 }
                 let session = runtime.session.clone();
+                if self.chat_ui.prepared_resumes.contains_key(&target.card) {
+                    return self.handle_chat_action(Action::ResumeSaved(target));
+                }
                 let intent = self.chat_retry_intent(target.card, &session);
                 return self.start_chat(target.card, session, intent, None, false);
             }
@@ -9414,6 +9493,23 @@ impl Cagents {
                         None,
                         false,
                     );
+                }
+                if let Some(mut retry) = self.chat_ui.prepared_resumes.get(&target.card).cloned() {
+                    if self.history_resume_current(&retry)
+                        && self.history_resume_admitted(target.card)
+                    {
+                        let prepared = retry.prepared.take().expect("retained product preparation");
+                        retry.target = self.chat_ui.next_target(target.card);
+                        retry.snapshot_binding = None;
+                        retry.snapshot_owner = None;
+                        let operation = retry.target;
+                        self.chat_ui
+                            .phases
+                            .insert(target.card, Phase::PreparingResume(retry));
+                        return self
+                            .handle_chat_action(Action::ResumePrepared(operation, Ok(prepared)));
+                    }
+                    self.chat_ui.prepared_resumes.remove(&target.card);
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
@@ -9460,6 +9556,8 @@ impl Cagents {
                         runtime: target,
                         source: source.clone(),
                         prepared: None,
+                        snapshot_binding: None,
+                        snapshot_owner: None,
                         writer,
                         window: self.core.main_window_id(),
                     }),
@@ -9492,6 +9590,12 @@ impl Cagents {
                         .finish(target, |phase| matches!(phase, Phase::PreparingResume(_)));
                     return Task::none();
                 }
+                if !self.history_resume_admitted(target.card) {
+                    return self.history_resume_failed(
+                        resume,
+                        "Resume was cancelled because this pane's current admission changed".into(),
+                    );
+                }
                 let prepared = match result {
                     Ok(prepared) if prepared == resume.source => {
                         self.chat_ui
@@ -9515,6 +9619,9 @@ impl Cagents {
                     }
                     Err(error) => return self.history_resume_failed(resume, error),
                 };
+                let mut retry = resume.clone();
+                retry.prepared = Some(prepared.clone());
+                self.chat_ui.prepared_resumes.insert(target.card, retry);
                 // Snapshot includes the same pane's current draft and attachments.
                 // Only storage sees B until the exact atomic checkpoint succeeds.
                 let mut snapshot = self.persistent_workspace();
@@ -9532,6 +9639,15 @@ impl Cagents {
                     resume.source.clone(),
                     prepared.clone(),
                 );
+                let receipt = receipt.map(|(receipt, binding, owner)| {
+                    if let Some(Phase::PreparingResume(resume)) =
+                        self.chat_ui.phases.get_mut(&target.card)
+                    {
+                        resume.snapshot_binding = Some(binding);
+                        resume.snapshot_owner = Some(owner);
+                    }
+                    receipt
+                });
                 if let Some(Phase::PreparingResume(resume)) =
                     self.chat_ui.phases.get_mut(&target.card)
                 {
@@ -9564,6 +9680,12 @@ impl Cagents {
                     self.chat_ui
                         .finish(target, |phase| matches!(phase, Phase::PreparingResume(_)));
                     return Task::none();
+                }
+                if !self.history_resume_admitted(target.card) {
+                    return self.history_resume_failed(
+                        resume,
+                        "Resume was cancelled because this pane's current admission changed".into(),
+                    );
                 }
                 if let Err(error) = result {
                     return self.history_resume_failed(resume, error);
@@ -19865,7 +19987,14 @@ mod tests {
 
     #[test]
     fn saved_history_resume_late_receipt_cannot_start_closed_replaced_or_aba_pane() {
-        for changed in ["closed", "writer", "aba", "failed"] {
+        for changed in [
+            "closed",
+            "writer",
+            "aba",
+            "failed",
+            "shared close",
+            "deleting",
+        ] {
             let mut app = crate::app::tests::context_inspector_test_app(false);
             let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
             let mut source = chat_runtime(&app, card).session.clone();
@@ -19933,6 +20062,14 @@ mod tests {
                     other.id = TerminalId::new();
                     app.install_chat_session(card, other);
                     app.install_chat_session(card, source.clone());
+                    app.persist();
+                }
+                "shared close" => {
+                    app.shared_views.closed_chats.insert(card, source.clone());
+                }
+                "deleting" => {
+                    app.project_ui
+                        .begin_deleting(source.launch.recipe.working_directory.clone());
                 }
                 "failed" => {
                     drop(app.handle_chat_ui(Action::ResumeCommitted(
@@ -19953,6 +20090,182 @@ mod tests {
                 assert_eq!(runtime.session, source);
                 assert_eq!(runtime.composer.text(), "Keep even when resume is refused");
             }
+        }
+    }
+
+    #[test]
+    fn saved_history_resume_new_explicit_retry_adopts_committed_candidate_and_latest_draft() {
+        chat::attachment_assets::with_test_image(|image| {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+            let mut source = chat_runtime(&app, card).session.clone();
+            source.native_continuity = chat::NativeContinuity::ReconnectOnly;
+            app.install_chat_session(card, source.clone());
+            let target = chat_runtime(&app, card).target;
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.session = source.clone();
+            let snapshot = Snapshot {
+                session_id: source.launch.session_id.clone(),
+                exited: true,
+                read_only_reason: Some("Saved history".into()),
+                ..Default::default()
+            };
+            runtime.snapshot = Arc::new(snapshot.clone());
+            runtime.connection =
+                Connection::Live(Arc::new(ClientHandle::fixture(source.clone(), snapshot)));
+            runtime.replace_draft(text_editor::Content::with_text("Draft before missing ACK"));
+            let directory = tempfile::tempdir().unwrap();
+            let (writer, _) = crate::session::SessionRuntime::open(
+                directory.path().join("retry.sqlite3"),
+                crate::model::BootId::new("resume-pane"),
+            )
+            .unwrap();
+            app.session = Some(writer);
+            app.persist();
+            app.session
+                .as_ref()
+                .unwrap()
+                .flush(Duration::from_secs(10))
+                .unwrap();
+            drop(app.handle_chat_ui(Action::ResumeSaved(target)));
+            let Phase::PreparingResume(preparation) = &app.chat_ui.phases[&card] else {
+                panic!("explicit preparation");
+            };
+            let first = preparation.target;
+            let mut prepared = source.clone();
+            prepared.id = TerminalId::new();
+            let checkpoint =
+                app.handle_chat_ui(Action::ResumePrepared(first, Ok(prepared.clone())));
+            let lost_receipt = account_commit_reply(checkpoint);
+            assert!(matches!(
+                &lost_receipt,
+                Message::ChatUi(Action::ResumeCommitted(_, Ok(())))
+            ));
+            drop(app.handle_chat_ui(Action::ResumeCommitted(
+                first,
+                Err("Writer acknowledgment was unavailable".into()),
+            )));
+            assert!(app.chat_ui.attempt(card).is_none());
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            assert_eq!(runtime.session, source);
+            runtime.replace_draft(text_editor::Content::with_text(
+                "Latest draft after missing ACK",
+            ));
+            runtime.replace_attachments(vec![image.clone()]);
+            // A fresh explicit action reuses known productB, never allocatesC
+            // or gives the stale successful callback any launch permission.
+            let retry_checkpoint = app.handle_chat_ui(Action::Reconnect(target));
+            let Phase::PreparingResume(retry) = &app.chat_ui.phases[&card] else {
+                panic!("fresh retry gate");
+            };
+            assert_ne!(retry.target, first);
+            assert_eq!(retry.prepared.as_ref(), Some(&prepared));
+            drop(app.update(lost_receipt));
+            assert!(app.chat_ui.attempt(card).is_none());
+            let receipt = account_commit_reply(retry_checkpoint);
+            let stored = app
+                .session
+                .as_ref()
+                .unwrap()
+                .operation_store()
+                .load_workspace(app.durable.id, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored
+                    .cards
+                    .iter()
+                    .find(|state| state.id == card)
+                    .unwrap()
+                    .kind,
+                CardKind::Chat(prepared.clone())
+            );
+            assert_eq!(
+                stored.chat_drafts.get(&card).map(String::as_str),
+                Some("Latest draft after missing ACK")
+            );
+            assert_eq!(
+                stored.chat_draft_attachments.get(&card),
+                Some(&vec![image.clone()])
+            );
+            drop(app.update(receipt));
+            assert_eq!(app.chat_ui.attempt(card).unwrap().session, prepared);
+            assert_eq!(
+                app.chat_ui.attempt(card).unwrap().intent,
+                chat::Intent::Start
+            );
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.composer.text(), "Latest draft after missing ACK");
+            assert_eq!(runtime.attachments, [image]);
+        });
+    }
+
+    #[test]
+    fn saved_history_resume_prepared_callback_rechecks_shared_close_and_deletion() {
+        for deleting in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+            let mut source = chat_runtime(&app, card).session.clone();
+            source.native_continuity = chat::NativeContinuity::ReconnectOnly;
+            app.install_chat_session(card, source.clone());
+            let target = chat_runtime(&app, card).target;
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.session = source.clone();
+            let snapshot = Snapshot {
+                session_id: source.launch.session_id.clone(),
+                exited: true,
+                read_only_reason: Some("Saved history".into()),
+                ..Default::default()
+            };
+            runtime.snapshot = Arc::new(snapshot.clone());
+            runtime.connection =
+                Connection::Live(Arc::new(ClientHandle::fixture(source.clone(), snapshot)));
+            runtime.replace_draft(text_editor::Content::with_text(
+                "Retain my blocked resume draft",
+            ));
+            let directory = tempfile::tempdir().unwrap();
+            let (writer, _) = crate::session::SessionRuntime::open(
+                directory.path().join("state.sqlite3"),
+                crate::model::BootId::new("resume-pane"),
+            )
+            .unwrap();
+            app.session = Some(writer);
+            app.persist();
+            app.session
+                .as_ref()
+                .unwrap()
+                .flush(Duration::from_secs(10))
+                .unwrap();
+            drop(app.handle_chat_ui(Action::ResumeSaved(target)));
+            let Phase::PreparingResume(preparation) = &app.chat_ui.phases[&card] else {
+                panic!("explicit preparation");
+            };
+            let operation = preparation.target;
+            if deleting {
+                app.project_ui
+                    .begin_deleting(source.launch.recipe.working_directory.clone());
+            } else {
+                app.shared_views.closed_chats.insert(card, source.clone());
+            }
+            let mut prepared = source.clone();
+            prepared.id = TerminalId::new();
+            drop(app.handle_chat_ui(Action::ResumePrepared(operation, Ok(prepared))));
+            assert!(!app.chat_start_pending(card));
+            assert!(app.chat_ui.explicit_starts.get(&card).is_none());
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.session, source);
+            assert_eq!(runtime.composer.text(), "Retain my blocked resume draft");
+            assert_eq!(
+                app.session
+                    .as_ref()
+                    .unwrap()
+                    .operation_store()
+                    .load_card(card, None)
+                    .unwrap()
+                    .unwrap()
+                    .kind,
+                CardKind::Chat(source)
+            );
         }
     }
 

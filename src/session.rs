@@ -363,17 +363,63 @@ impl IdentityReplacement {
     }
 }
 
+/// Local provenance for snapshots offered while one explicit resume awaits its
+/// receipt. It is neither an actor capability nor a durable descriptor alias.
+#[derive(Clone, Debug)]
+pub(crate) struct ResumeSnapshotBinding {
+    card: CardId,
+    source: crate::chat::Session,
+    replacement: crate::chat::Session,
+    committed: Arc<std::sync::atomic::AtomicBool>,
+    active: Arc<std::sync::atomic::AtomicBool>,
+    writer: std::sync::Weak<()>,
+}
+
+/// Exactly one UI phase owns this guard; handler context copies do not.
+#[derive(Debug)]
+pub(crate) struct ResumeSnapshotOwner(Arc<std::sync::atomic::AtomicBool>);
+impl Drop for ResumeSnapshotOwner {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl ResumeSnapshotBinding {
+    fn project(&self, snapshot: &mut Arc<WorkspaceState>) {
+        if self.committed.load(std::sync::atomic::Ordering::Acquire)
+            && snapshot.cards.iter().any(|card| {
+                card.id == self.card
+                    && matches!(&card.kind, CardKind::Chat(source) if source == &self.source)
+            })
+        {
+            Arc::make_mut(snapshot)
+                .cards
+                .iter_mut()
+                .find(|card| card.id == self.card)
+                .unwrap()
+                .kind = CardKind::Chat(self.replacement.clone());
+        }
+    }
+}
+
 #[derive(Debug)]
 enum ConversionCheckpoint {
     Snapshot(Arc<WorkspaceState>),
+    ResumeSnapshot {
+        snapshot: Arc<WorkspaceState>,
+        bindings: Vec<ResumeSnapshotBinding>,
+    },
     PaneAdoptions {
         snapshot: Arc<WorkspaceState>,
         adoptions: Vec<crate::persistence::TerminalPaneAdoption>,
         restorations: Vec<crate::persistence::TerminalPaneRestoration>,
+        bindings: Vec<ResumeSnapshotBinding>,
     },
     IdentityReplacement(IdentityReplacement),
     ChatRecovery(ChatRecoveryWrite),
     ChatResume {
+        bindings: Vec<ResumeSnapshotBinding>,
+        committed: Arc<std::sync::atomic::AtomicBool>,
         snapshot: Arc<WorkspaceState>,
         card: CardId,
         source: crate::chat::Session,
@@ -387,6 +433,7 @@ enum ConversionCheckpoint {
         reply: Option<std::sync::mpsc::SyncSender<std::result::Result<(), String>>>,
     },
     TerminalOwnershipRecovery {
+        bindings: Vec<ResumeSnapshotBinding>,
         snapshot: Arc<WorkspaceState>,
         recovery: crate::persistence::TerminalPaneAdoption,
         reply: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
@@ -437,6 +484,8 @@ struct QueueState {
     /// change costs one `Arc` bump on this lane rather than a second deep clone
     /// of every card, title, and browser history.
     latest: Option<Arc<WorkspaceState>>,
+    latest_resumes: Vec<ResumeSnapshotBinding>,
+    resume_operations: HashMap<CardId, ResumeSnapshotBinding>,
     conversions: VecDeque<ConversionCheckpoint>,
     ordered_identities: bool,
     projects: HashMap<ProjectId, ProjectState>,
@@ -445,6 +494,42 @@ struct QueueState {
     retry_requested: bool,
     checkpoints: Vec<std::sync::mpsc::SyncSender<std::result::Result<(), String>>>,
     shutdown: bool,
+}
+
+impl QueueState {
+    fn capture_resume_bindings(
+        &mut self,
+        mut additional: Vec<ResumeSnapshotBinding>,
+    ) -> Vec<ResumeSnapshotBinding> {
+        self.resume_operations
+            .retain(|_, binding| binding.active.load(std::sync::atomic::Ordering::Acquire));
+        additional.extend(self.resume_operations.values().cloned());
+        additional
+    }
+
+    fn snapshot_checkpoint(&mut self, snapshot: Arc<WorkspaceState>) -> ConversionCheckpoint {
+        let bindings = self.capture_resume_bindings(Vec::new());
+        if bindings.is_empty() {
+            ConversionCheckpoint::Snapshot(snapshot)
+        } else {
+            ConversionCheckpoint::ResumeSnapshot { snapshot, bindings }
+        }
+    }
+
+    fn offer_snapshot(&mut self, state: Arc<WorkspaceState>, bindings: Vec<ResumeSnapshotBinding>) {
+        self.latest_resumes = self.capture_resume_bindings(bindings);
+        self.latest = Some(state);
+    }
+
+    fn take_latest(&mut self) -> Option<ConversionCheckpoint> {
+        let snapshot = self.latest.take()?;
+        let bindings = std::mem::take(&mut self.latest_resumes);
+        Some(if bindings.is_empty() {
+            ConversionCheckpoint::Snapshot(snapshot)
+        } else {
+            ConversionCheckpoint::ResumeSnapshot { snapshot, bindings }
+        })
+    }
 }
 
 pub struct SessionRuntime {
@@ -585,11 +670,25 @@ impl SessionRuntime {
     /// Navigation-only changes are complete snapshots too: card fingerprints
     /// may skip card writes, but must never skip the workspace metadata update.
     pub fn snapshot(&self, state: Arc<WorkspaceState>) {
+        self.snapshot_with_resumes(state, Vec::new());
+    }
+
+    pub(crate) fn snapshot_with_resumes(
+        &self,
+        state: Arc<WorkspaceState>,
+        bindings: Vec<ResumeSnapshotBinding>,
+    ) {
         let (lock, changed) = &*self.queue;
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
         {
-            queue.latest = Some(state);
+            queue.offer_snapshot(
+                state,
+                bindings
+                    .into_iter()
+                    .filter(|binding| self.same_writer(&binding.writer))
+                    .collect(),
+            );
             changed.notify_one();
         }
     }
@@ -608,14 +707,11 @@ impl SessionRuntime {
                     .conversions
                     .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
             }
-            if let Some(previous) = queue.latest.take() {
-                queue
-                    .conversions
-                    .push_back(ConversionCheckpoint::Snapshot(previous));
+            if let Some(previous) = queue.take_latest() {
+                queue.conversions.push_back(previous);
             }
-            queue
-                .conversions
-                .push_back(ConversionCheckpoint::Snapshot(state));
+            let checkpoint = queue.snapshot_checkpoint(state);
+            queue.conversions.push_back(checkpoint);
             changed.notify_one();
         }
     }
@@ -634,6 +730,16 @@ impl SessionRuntime {
         adoptions: Vec<crate::persistence::TerminalPaneAdoption>,
         restorations: Vec<crate::persistence::TerminalPaneRestoration>,
     ) {
+        self.snapshot_terminal_panes_with_resumes(state, adoptions, restorations, Vec::new());
+    }
+
+    pub(crate) fn snapshot_terminal_panes_with_resumes(
+        &self,
+        state: Arc<WorkspaceState>,
+        adoptions: Vec<crate::persistence::TerminalPaneAdoption>,
+        restorations: Vec<crate::persistence::TerminalPaneRestoration>,
+        bindings: Vec<ResumeSnapshotBinding>,
+    ) {
         let (lock, changed) = &*self.queue;
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
@@ -644,17 +750,22 @@ impl SessionRuntime {
                     .conversions
                     .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
             }
-            if let Some(previous) = queue.latest.take() {
-                queue
-                    .conversions
-                    .push_back(ConversionCheckpoint::Snapshot(previous));
+            if let Some(previous) = queue.take_latest() {
+                queue.conversions.push_back(previous);
             }
+            let bindings = queue.capture_resume_bindings(
+                bindings
+                    .into_iter()
+                    .filter(|binding| self.same_writer(&binding.writer))
+                    .collect(),
+            );
             queue
                 .conversions
                 .push_back(ConversionCheckpoint::PaneAdoptions {
                     snapshot: state,
                     adoptions,
                     restorations,
+                    bindings,
                 });
             changed.notify_one();
         }
@@ -681,14 +792,14 @@ impl SessionRuntime {
                 .conversions
                 .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
         }
-        if let Some(previous) = queue.latest.take() {
-            queue
-                .conversions
-                .push_back(ConversionCheckpoint::Snapshot(previous));
+        if let Some(previous) = queue.take_latest() {
+            queue.conversions.push_back(previous);
         }
+        let bindings = queue.capture_resume_bindings(Vec::new());
         queue
             .conversions
             .push_back(ConversionCheckpoint::TerminalOwnershipRecovery {
+                bindings,
                 snapshot,
                 recovery,
                 reply,
@@ -776,14 +887,20 @@ impl SessionRuntime {
     }
 
     /// Queue an atomic prepared allocation and associated-content checkpoint.
-    pub fn save_chat_resume(
+    pub(crate) fn save_chat_resume(
         &self,
         snapshot: Arc<WorkspaceState>,
         card: CardId,
         source: crate::chat::Session,
         replacement: crate::chat::Session,
-    ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String>
-    {
+    ) -> std::result::Result<
+        (
+            std::sync::mpsc::Receiver<std::result::Result<(), String>>,
+            ResumeSnapshotBinding,
+            ResumeSnapshotOwner,
+        ),
+        String,
+    > {
         let (reply, receiver) = std::sync::mpsc::sync_channel(1);
         let (lock, changed) = &*self.queue;
         let mut queue = lock.lock().map_err(|_| "Session writer is unavailable")?;
@@ -796,14 +913,24 @@ impl SessionRuntime {
                 .conversions
                 .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
         }
-        if let Some(previous) = queue.latest.take() {
-            queue
-                .conversions
-                .push_back(ConversionCheckpoint::Snapshot(previous));
+        if let Some(previous) = queue.take_latest() {
+            queue.conversions.push_back(previous);
         }
+        let binding = ResumeSnapshotBinding {
+            card,
+            source: source.clone(),
+            replacement: replacement.clone(),
+            committed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            writer: self.writer_token(),
+        };
+        let bindings = queue.capture_resume_bindings(Vec::new());
+        queue.resume_operations.insert(card, binding.clone());
         queue
             .conversions
             .push_back(ConversionCheckpoint::ChatResume {
+                bindings,
+                committed: Arc::clone(&binding.committed),
                 snapshot,
                 card,
                 source,
@@ -811,7 +938,8 @@ impl SessionRuntime {
                 reply,
             });
         changed.notify_one();
-        Ok(receiver)
+        let owner = ResumeSnapshotOwner(Arc::clone(&binding.active));
+        Ok((receiver, binding, owner))
     }
 
     /// Stable lifetime token for callbacks bound to this exact writer.
@@ -855,10 +983,8 @@ impl SessionRuntime {
                 .conversions
                 .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
         }
-        if let Some(snapshot) = queue.latest.take() {
-            queue
-                .conversions
-                .push_back(ConversionCheckpoint::Snapshot(snapshot));
+        if let Some(snapshot) = queue.take_latest() {
+            queue.conversions.push_back(snapshot);
         }
         queue
             .conversions
@@ -909,10 +1035,8 @@ impl SessionRuntime {
                 .conversions
                 .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
         }
-        if let Some(snapshot) = queue.latest.take() {
-            queue
-                .conversions
-                .push_back(ConversionCheckpoint::Snapshot(snapshot));
+        if let Some(snapshot) = queue.take_latest() {
+            queue.conversions.push_back(snapshot);
         }
         queue
             .conversions
@@ -938,10 +1062,8 @@ impl SessionRuntime {
             && !queue.shutdown
         {
             if queue.ordered_identities {
-                if let Some(previous) = queue.latest.take() {
-                    queue
-                        .conversions
-                        .push_back(ConversionCheckpoint::Snapshot(previous));
+                if let Some(previous) = queue.take_latest() {
+                    queue.conversions.push_back(previous);
                 }
                 queue
                     .conversions
@@ -950,7 +1072,7 @@ impl SessionRuntime {
                 merge_identity_replacement(&mut queue.identity_replacements, replacement);
             }
             if let Some(state) = state {
-                queue.latest = Some(state);
+                queue.offer_snapshot(state, Vec::new());
             }
             changed.notify_one();
         }
@@ -1119,6 +1241,7 @@ impl Drop for SessionRuntime {
 #[derive(Debug)]
 struct PendingWrites {
     workspace: Option<Arc<WorkspaceState>>,
+    workspace_resumes: Vec<ResumeSnapshotBinding>,
     conversions: VecDeque<ConversionCheckpoint>,
     projects: HashMap<ProjectId, ProjectState>,
     worktrees: HashMap<WorktreeId, WorktreeState>,
@@ -1134,9 +1257,6 @@ struct PendingWrites {
     /// queued while the UI awaited acknowledgment. Other card fields, including
     /// tombstones, remain exactly as submitted.
     chat_rebindings: HashMap<CardId, (crate::chat::Session, crate::chat::Session)>,
-    // Bridges only snapshots queued before the exact resume receipt returns.
-    // First observed replacement/other source retires the bridge permanently.
-    resume_rebindings: HashMap<CardId, (crate::chat::Session, crate::chat::Session)>,
     retained_chat_copies: HashMap<CardId, crate::persistence::RetainedChatCopy>,
 }
 
@@ -1831,6 +1951,7 @@ impl PendingWrites {
     ) -> Self {
         Self {
             workspace: None,
+            workspace_resumes: Vec::new(),
             conversions: VecDeque::new(),
             projects: HashMap::new(),
             worktrees: HashMap::new(),
@@ -1841,7 +1962,6 @@ impl PendingWrites {
             worktree_generations,
             quarantine: Quarantine::default(),
             chat_rebindings: HashMap::new(),
-            resume_rebindings: HashMap::new(),
             retained_chat_copies: HashMap::new(),
         }
     }
@@ -1923,7 +2043,8 @@ impl PendingWrites {
                 ConversionCheckpoint::Snapshot(snapshot)
                 | ConversionCheckpoint::PaneAdoptions { snapshot, .. }
                 | ConversionCheckpoint::TerminalOwnershipRecovery { snapshot, .. }
-                | ConversionCheckpoint::ChatResume { snapshot, .. } => Some(snapshot.id),
+                | ConversionCheckpoint::ChatResume { snapshot, .. }
+                | ConversionCheckpoint::ResumeSnapshot { snapshot, .. } => Some(snapshot.id),
                 ConversionCheckpoint::RetainedChatCopy { copy, .. } => Some(copy.workspace),
                 ConversionCheckpoint::IdentityReplacement(_)
                 | ConversionCheckpoint::ChatRecovery(_) => None,
@@ -2001,22 +2122,17 @@ impl PendingWrites {
         Ok(())
     }
 
-    fn translate_chat_rebindings(&mut self, snapshot: &mut Arc<WorkspaceState>) {
-        self.resume_rebindings.retain(|id, (source, replacement)| {
-            let Some(card) = snapshot.cards.iter().find(|card| card.id == *id) else {
-                return false;
-            };
-            if !matches!(&card.kind, CardKind::Chat(session) if session == source) {
-                return false;
-            }
-            Arc::make_mut(snapshot)
-                .cards
-                .iter_mut()
-                .find(|card| card.id == *id)
-                .unwrap()
-                .kind = CardKind::Chat(replacement.clone());
-            true
-        });
+    fn take_workspace(&mut self) -> Option<ConversionCheckpoint> {
+        let snapshot = self.workspace.take()?;
+        let bindings = std::mem::take(&mut self.workspace_resumes);
+        Some(if bindings.is_empty() {
+            ConversionCheckpoint::Snapshot(snapshot)
+        } else {
+            ConversionCheckpoint::ResumeSnapshot { snapshot, bindings }
+        })
+    }
+
+    fn translate_chat_rebindings(&self, snapshot: &mut Arc<WorkspaceState>) {
         let needs_translation = |state: &crate::model::CardState| {
             self.chat_rebindings.get(&state.id).is_some_and(
                 |(source, _)| matches!(&state.kind, CardKind::Chat(session) if session == source),
@@ -2068,29 +2184,42 @@ impl PendingWrites {
             let Some(checkpoint) = self
                 .conversions
                 .pop_front()
-                .or_else(|| self.workspace.take().map(ConversionCheckpoint::Snapshot))
+                .or_else(|| self.take_workspace())
             else {
                 return Ok(());
             };
-            let (checkpoint, adoptions, restorations) = match checkpoint {
+            let (checkpoint, adoptions, restorations, bindings) = match checkpoint {
                 ConversionCheckpoint::PaneAdoptions {
                     snapshot,
                     adoptions,
                     restorations,
+                    bindings,
                 } => (
                     ConversionCheckpoint::Snapshot(snapshot),
                     adoptions,
                     restorations,
+                    bindings,
                 ),
-                other => (other, Vec::new(), Vec::new()),
+                ConversionCheckpoint::ResumeSnapshot { snapshot, bindings } => (
+                    ConversionCheckpoint::Snapshot(snapshot),
+                    Vec::new(),
+                    Vec::new(),
+                    bindings,
+                ),
+                other => (other, Vec::new(), Vec::new(), Vec::new()),
             };
             match checkpoint {
-                ConversionCheckpoint::PaneAdoptions { .. } => unreachable!(),
+                ConversionCheckpoint::PaneAdoptions { .. }
+                | ConversionCheckpoint::ResumeSnapshot { .. } => unreachable!(),
                 ConversionCheckpoint::TerminalOwnershipRecovery {
+                    bindings,
                     mut snapshot,
                     recovery,
                     reply,
                 } => {
+                    for binding in bindings {
+                        binding.project(&mut snapshot);
+                    }
                     self.translate_chat_rebindings(&mut snapshot);
                     if let Err(error) = self.project_retained_chat_copies(&mut snapshot) {
                         let _ = reply.send(Err(error.to_string()));
@@ -2170,12 +2299,17 @@ impl PendingWrites {
                     }
                 }
                 ConversionCheckpoint::ChatResume {
-                    snapshot,
+                    bindings,
+                    committed,
+                    mut snapshot,
                     card,
                     source,
                     replacement,
                     reply,
                 } => {
+                    for binding in bindings {
+                        binding.project(&mut snapshot);
+                    }
                     let result = store.save_chat_resume(
                         &snapshot,
                         SnapshotBase {
@@ -2192,7 +2326,7 @@ impl PendingWrites {
                             self.card_generations = commit.card_generations;
                             self.quarantine.snapshot_landed(&snapshot);
                             self.acknowledge_retained_copy_closures(&snapshot);
-                            self.resume_rebindings.insert(card, (source, replacement));
+                            committed.store(true, std::sync::atomic::Ordering::Release);
                             let _ = reply.send(Ok(()));
                         }
                         Err(error) => {
@@ -2252,6 +2386,9 @@ impl PendingWrites {
                     }
                 }
                 ConversionCheckpoint::Snapshot(mut snapshot) => {
+                    for binding in &bindings {
+                        binding.project(&mut snapshot);
+                    }
                     self.translate_chat_rebindings(&mut snapshot);
                     if let Err(error) = self.project_retained_chat_copies(&mut snapshot) {
                         self.quarantine.refuse_workspace(snapshot, &error);
@@ -2287,6 +2424,7 @@ impl PendingWrites {
                                             snapshot,
                                             adoptions,
                                             restorations,
+                                            bindings: Vec::new(),
                                         }
                                     },
                                 );
@@ -2642,15 +2780,14 @@ fn persistence_loop(
             || !state.worktrees.is_empty()
             || !state.identity_replacements.is_empty();
         if !state.conversions.is_empty() {
-            if let Some(previous) = writes.workspace.take() {
-                writes
-                    .conversions
-                    .push_back(ConversionCheckpoint::Snapshot(previous));
+            if let Some(previous) = writes.take_workspace() {
+                writes.conversions.push_back(previous);
             }
             writes.conversions.append(&mut state.conversions);
         }
         if let Some(latest) = state.latest.take() {
             writes.workspace = Some(latest);
+            writes.workspace_resumes = std::mem::take(&mut state.latest_resumes);
         }
         writes.projects.extend(std::mem::take(&mut state.projects));
         writes
@@ -4789,6 +4926,8 @@ mod tests {
         writes
             .conversions
             .push_back(ConversionCheckpoint::ChatResume {
+                bindings: Vec::new(),
+                committed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 snapshot,
                 card,
                 source,
@@ -4797,7 +4936,6 @@ mod tests {
             });
         assert!(writes.flush(&store).is_empty());
         assert!(receipt.recv().unwrap().is_err());
-        assert!(writes.resume_rebindings.is_empty());
         assert_eq!(writes.workspace_generation, 0);
         assert!(writes.flush(&store).is_empty());
         assert_eq!(
@@ -4808,57 +4946,255 @@ mod tests {
     }
 
     #[test]
-    fn prepared_resume_snapshot_bridge_retires_before_a_later_source_aba() {
-        let mut snapshot = workspace();
-        let card = snapshot.cards[0].id;
+    fn prepared_resume_queue_coalescing_binds_only_its_operation_and_keeps_late_content() {
+        for scenario in ["active", "closed", "failed", "aba"] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = StateStore::open(
+                directory.path().join("resume.sqlite3"),
+                BootId::new("resume-boot"),
+            )
+            .unwrap();
+            let mut original = workspace();
+            let card = original.cards[0].id;
+            let source = crate::chat::Session {
+                id: TerminalId::new(),
+                proof: Some(crate::model::HostSessionProof {
+                    host_session_id: "fixture-host".into(),
+                    boot_id: "resume-boot".into(),
+                    host_incarnation: "fixture-incarnation".into(),
+                }),
+                terminal: None,
+                native_continuity: Default::default(),
+                owned_codex_listener: None,
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Claude,
+                    session_id: Some("77777777-1111-4111-8111-111111111111".into()),
+                    recipe: LaunchRecipe {
+                        program: "claude".into(),
+                        arguments: vec![],
+                        working_directory: "/project".into(),
+                        environment: BTreeMap::new(),
+                        unset_environment: Default::default(),
+                    },
+                },
+            };
+            original.cards[0].kind = CardKind::Chat(source.clone());
+            original.chat_drafts.insert(card, "Draft at prepare".into());
+            let mut writes = empty_writes();
+            writes.workspace = Some(Arc::new(original.clone()));
+            assert!(writes.flush(&store).is_empty());
+            let mut replacement = source.clone();
+            replacement.id = TerminalId::new();
+            let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let binding = ResumeSnapshotBinding {
+                card,
+                source: source.clone(),
+                replacement: replacement.clone(),
+                committed: Arc::clone(&committed),
+                active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                writer: std::sync::Weak::new(),
+            };
+            let mut prepared = original.clone();
+            prepared.cards[0].kind = CardKind::Chat(replacement.clone());
+            if scenario == "failed" {
+                prepared.cards.push(prepared.cards[0].clone());
+            }
+            let (reply, receipt) = std::sync::mpsc::sync_channel(1);
+            writes
+                .conversions
+                .push_back(ConversionCheckpoint::ChatResume {
+                    bindings: Vec::new(),
+                    committed,
+                    snapshot: Arc::new(prepared),
+                    card,
+                    source: source.clone(),
+                    replacement: replacement.clone(),
+                    reply,
+                });
+            let mut late = original.clone();
+            late.chat_drafts
+                .insert(card, "Latest unsent draft after preparation".into());
+            late.chat_draft_attachments.insert(
+                card,
+                vec![crate::chat::Attachment {
+                    path: "/private/fixture/latest.png".into(),
+                    reference: Some(crate::chat::ImageReference {
+                        id: uuid::Uuid::new_v4(),
+                        number: 1,
+                        device: uuid::Uuid::new_v4(),
+                        name: "Latest unsent image".into(),
+                        sha256: "a".repeat(64),
+                        extension: "png".into(),
+                    }),
+                }],
+            );
+            if scenario == "closed" {
+                late.cards[0].existence = closed();
+            }
+            let mut queue = QueueState::default();
+            queue.resume_operations.insert(card, binding.clone());
+            let mut owner = Some(ResumeSnapshotOwner(Arc::clone(&binding.active)));
+            if scenario == "closed" {
+                // Close captured the exact binding before phase drop; only its
+                // final tombstone enqueue may carry that now-inactive operation.
+                drop(owner.take());
+                queue.offer_snapshot(Arc::new(late.clone()), vec![binding]);
+            } else {
+                queue.offer_snapshot(Arc::new(late.clone()), Vec::new());
+            }
+            if scenario == "aba" {
+                drop(owner.take());
+                let mut other = late.clone();
+                let mut different = source.clone();
+                different.id = TerminalId::new();
+                other.cards[0].kind = CardKind::Chat(different);
+                queue.offer_snapshot(Arc::new(other), Vec::new());
+                // The intermediate other and any observedB can coalesce away.
+                // The final deliberateA carries no old operation provenance.
+                queue.offer_snapshot(Arc::new(late.clone()), Vec::new());
+            }
+            writes.conversions.push_back(queue.take_latest().unwrap());
+            let _ = writes.flush(&store);
+            assert_eq!(receipt.recv().unwrap().is_ok(), scenario != "failed");
+            let stored = store.load_workspace(original.id, None).unwrap().unwrap();
+            if scenario == "aba" {
+                assert_eq!(stored.cards[0].kind, CardKind::Chat(replacement));
+                let refused = &writes
+                    .quarantine
+                    .workspace
+                    .as_ref()
+                    .expect("untaggedA remains an explicit save refusal")
+                    .0;
+                assert_eq!(refused.cards[0].kind, CardKind::Chat(source));
+                assert_eq!(refused.chat_drafts, late.chat_drafts);
+                assert_eq!(refused.chat_draft_attachments, late.chat_draft_attachments);
+            } else {
+                let expected = if scenario == "failed" {
+                    source.clone()
+                } else {
+                    replacement
+                };
+                assert_eq!(stored.cards[0].kind, CardKind::Chat(expected));
+                assert_eq!(stored.cards[0].existence, late.cards[0].existence);
+                assert_eq!(stored.chat_drafts, late.chat_drafts);
+                assert_eq!(stored.chat_draft_attachments, late.chat_draft_attachments);
+                assert!(writes.quarantine.is_empty());
+                if scenario == "failed" {
+                    // A fresh explicit retry can commit against A; the failed
+                    // candidate was not silently retried or allowed to alias A.
+                    let mut retry = source.clone();
+                    retry.id = TerminalId::new();
+                    let mut snapshot = late;
+                    snapshot.cards[0].kind = CardKind::Chat(retry.clone());
+                    store
+                        .save_chat_resume(
+                            &snapshot,
+                            SnapshotBase {
+                                workspace: writes.workspace_generation,
+                                cards: &writes.card_generations,
+                            },
+                            card,
+                            &source,
+                            &retry,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        store.load_card(card, None).unwrap().unwrap().kind,
+                        CardKind::Chat(retry)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_resumes_on_two_cards_keep_both_checkpoints_before_ui_acknowledgment() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut writer, _) = SessionRuntime::open(
+            directory.path().join("two-resumes.sqlite3"),
+            BootId::new("resume-boot"),
+        )
+        .unwrap();
+        let mut state = workspace();
+        let first = state.cards[0].id;
         let source = crate::chat::Session {
             id: TerminalId::new(),
-            proof: None,
+            proof: Some(crate::model::HostSessionProof {
+                host_session_id: "fixture-host".into(),
+                boot_id: "resume-boot".into(),
+                host_incarnation: "fixture-incarnation".into(),
+            }),
             terminal: None,
             native_continuity: Default::default(),
             owned_codex_listener: None,
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Claude,
-                session_id: Some("saved".into()),
+                session_id: Some("77777777-1111-4111-8111-111111111111".into()),
                 recipe: LaunchRecipe {
                     program: "claude".into(),
-                    arguments: Vec::new(),
+                    arguments: vec![],
                     working_directory: "/project".into(),
                     environment: BTreeMap::new(),
                     unset_environment: Default::default(),
                 },
             },
         };
-        snapshot.cards[0].kind = CardKind::Chat(source.clone());
-        snapshot
+        state.cards[0].kind = CardKind::Chat(source.clone());
+        let mut other = state.cards[0].clone();
+        other.id = CardId::new();
+        let second = other.id;
+        let mut source2 = source.clone();
+        source2.id = TerminalId::new();
+        source2.launch.session_id = Some("88888888-1111-4111-8111-111111111111".into());
+        other.kind = CardKind::Chat(source2.clone());
+        state.cards.push(other);
+        state.chat_drafts.insert(first, "First draft".into());
+        state.chat_drafts.insert(second, "Second draft".into());
+        writer.snapshot(Arc::new(state.clone()));
+        writer.flush(Duration::from_secs(10)).unwrap();
+        let mut successor = source.clone();
+        successor.id = TerminalId::new();
+        let mut prepared = state.clone();
+        prepared.cards[0].kind = CardKind::Chat(successor.clone());
+        let (first_receipt, _, first_owner) = writer
+            .save_chat_resume(Arc::new(prepared), first, source, successor.clone())
+            .unwrap();
+        let mut successor2 = source2.clone();
+        successor2.id = TerminalId::new();
+        let mut prepared2 = state.clone();
+        prepared2.cards[1].kind = CardKind::Chat(successor2.clone());
+        prepared2
             .chat_drafts
-            .insert(card, "Late draft stays unsent".into());
-        let mut replacement = source.clone();
-        replacement.id = TerminalId::new();
-        for other_before_source in [false, true] {
-            let mut writes = empty_writes();
-            writes
-                .resume_rebindings
-                .insert(card, (source.clone(), replacement.clone()));
-            let mut pending = Arc::new(snapshot.clone());
-            writes.translate_chat_rebindings(&mut pending);
-            assert_eq!(pending.cards[0].kind, CardKind::Chat(replacement.clone()));
-            assert_eq!(pending.chat_drafts, snapshot.chat_drafts);
-            if other_before_source {
-                let mut other = replacement.clone();
-                other.id = TerminalId::new();
-                Arc::make_mut(&mut pending).cards[0].kind = CardKind::Chat(other);
-            }
-            writes.translate_chat_rebindings(&mut pending);
-            assert!(writes.resume_rebindings.is_empty());
-            let mut returned = Arc::new(snapshot.clone());
-            writes.translate_chat_rebindings(&mut returned);
-            assert_eq!(
-                returned.cards[0].kind,
-                CardKind::Chat(source.clone()),
-                "a later deliberate A must not become B"
-            );
-        }
+            .insert(second, "Second latest draft".into());
+        let (second_receipt, _, second_owner) = writer
+            .save_chat_resume(Arc::new(prepared2), second, source2, successor2.clone())
+            .unwrap();
+        first_receipt
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        second_receipt
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        // Both UI acknowledgments are still unconsumed. The ordinary snapshot
+        // retains A/C, but enqueue captures its exact original operation tags.
+        state.chat_drafts.insert(first, "First latest draft".into());
+        state
+            .chat_drafts
+            .insert(second, "Second latest draft".into());
+        writer.snapshot(Arc::new(state.clone()));
+        writer.flush(Duration::from_secs(10)).unwrap();
+        let stored = writer
+            .operation_store()
+            .load_workspace(state.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.cards[0].kind, CardKind::Chat(successor));
+        assert_eq!(stored.cards[1].kind, CardKind::Chat(successor2));
+        assert_eq!(stored.chat_drafts, state.chat_drafts);
+        drop((first_owner, second_owner));
+        writer.shutdown();
     }
 
     #[test]
@@ -6089,6 +6425,7 @@ mod tests {
             writes
                 .conversions
                 .push_back(ConversionCheckpoint::TerminalOwnershipRecovery {
+                    bindings: Vec::new(),
                     snapshot: Arc::new(reviewed),
                     recovery,
                     reply,
@@ -6129,6 +6466,7 @@ mod tests {
         writes
             .conversions
             .push_back(ConversionCheckpoint::TerminalOwnershipRecovery {
+                bindings: Vec::new(),
                 snapshot: Arc::clone(&snapshot),
                 recovery,
                 reply,
@@ -6144,6 +6482,7 @@ mod tests {
         writes
             .conversions
             .push_back(ConversionCheckpoint::TerminalOwnershipRecovery {
+                bindings: Vec::new(),
                 snapshot,
                 recovery,
                 reply,
@@ -6179,6 +6518,7 @@ mod tests {
         writes
             .conversions
             .push_back(ConversionCheckpoint::TerminalOwnershipRecovery {
+                bindings: Vec::new(),
                 snapshot: Arc::new(current),
                 recovery,
                 reply,
