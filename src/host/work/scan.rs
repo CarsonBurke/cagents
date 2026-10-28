@@ -102,14 +102,24 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
     let repository = input.repository;
     let cancellation = input.cancellation;
     let changed = &input.change.worktrees;
+    let retry_inventory = input
+        .previous
+        .is_some_and(|local| local.plan_error.is_some());
     scan_with_plan(input, move |records, previous| {
+        // A failed inventory cannot prove any cached worktree census current.
+        let retry_changed = retry_inventory.then(|| {
+            records
+                .iter()
+                .map(|record| record.id)
+                .collect::<BTreeSet<_>>()
+        });
         git_watch::Project::read_changed(
             id,
             repository.to_path_buf(),
             records,
             cancellation,
             previous,
-            changed,
+            retry_changed.as_ref().unwrap_or(changed),
         )
     })
 }
@@ -649,6 +659,10 @@ mod tests {
         let fixture = fixture();
         let first = run(&fixture, None, &git_watch::Change::default());
         let old_plan = first.plan.as_ref().unwrap();
+        let nested = fixture.root.join("new-watch-scope/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("tracked.rs"), "new tracked file\n").unwrap();
+        git(&fixture.root, &["add", "new-watch-scope/nested/tracked.rs"]);
         let failed = scan_with_plan(
             Input {
                 id: old_plan.id,
@@ -671,6 +685,11 @@ mod tests {
         let recovered = run(&fixture, Some(&failed), &git_watch::Change::default());
         assert!(recovered.plan_error.is_none());
         assert!(!Arc::ptr_eq(recovered.plan.as_ref().unwrap(), old_plan));
+        assert_ne!(
+            recovered.plan.as_ref().unwrap().worktrees,
+            old_plan.worktrees,
+            "retry must read the changed tracked-path census, not only allocate a new Arc"
+        );
     }
 
     #[test]
