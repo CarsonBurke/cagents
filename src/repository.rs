@@ -3913,6 +3913,51 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             })
     }
 
+    /// Looks up an exact ref path without Git's revision-name fallbacks.
+    fn resolve_exact_ref_oid(
+        &self,
+        worktree: &Path,
+        reference: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Oid, RepositoryError> {
+        let command = self.git_read(
+            worktree,
+            ["show-ref", "--verify", "--hash", "--", reference],
+        );
+        let output = self.run_checked(&command, cancellation)?;
+        Oid::parse_object(parse_utf8_line(&output.stdout, "reference_oid")?).map_err(|error| {
+            RepositoryError::InvalidOutput {
+                field: "reference_oid",
+                reason: error.to_string(),
+            }
+        })
+    }
+
+    /// Resolves an exact ref to a commit, distinguishing absence from a Git
+    /// failure. Peeling the captured object cannot select a similarly named tag
+    /// if the ref disappears between these reads.
+    fn resolve_optional_ref(
+        &self,
+        worktree: &Path,
+        reference: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Oid>, RepositoryError> {
+        let command = self.git_read(
+            worktree,
+            ["show-ref", "--verify", "--quiet", "--", reference],
+        );
+        let output = self.run(&command, cancellation)?;
+        if !output.success {
+            return if output.exit_code == Some(1) {
+                Ok(None)
+            } else {
+                Err(git_failure(&command, output).into())
+            };
+        }
+        let oid = self.resolve_exact_ref_oid(worktree, reference, cancellation)?;
+        self.resolve_optional_revision(worktree, oid.as_str(), cancellation)
+    }
+
     /// The `git log` page for one history request.
     pub fn history_command(
         &self,
@@ -11711,17 +11756,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 BaseRevision::ObjectId(_) => None,
             };
             let base_revision = if let Some(reference) = exact_ref {
-                let exact = self.git_read(
-                    &journal.request.repository,
-                    ["show-ref", "--verify", "--hash", "--", reference.as_str()],
-                );
-                let output = self.run_checked(&exact, cancellation)?;
-                let oid = Oid::parse_object(parse_utf8_line(&output.stdout, "base_ref_oid")?)
-                    .map_err(|error| RepositoryError::InvalidOutput {
-                        field: "base_ref_oid",
-                        reason: error.to_string(),
-                    })?;
-                oid.to_string()
+                self.resolve_exact_ref_oid(&journal.request.repository, &reference, cancellation)?
+                    .to_string()
             } else {
                 journal.request.base.revision_argument()
             };
@@ -11740,7 +11776,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 return Err(ValidationError::InvalidBase(oid).into());
             }
             if let Some(existing) = &journal.existing_branch_oid {
-                let current = self.resolve_optional_revision(
+                let current = self.resolve_optional_ref(
                     &journal.request.repository,
                     &journal.request.branch.full_ref(),
                     cancellation,
@@ -11967,7 +12003,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let lease_path =
             common_dir.join(format!("cagents-operation-{}.lease", request.operation_id));
         let existing_branch_oid = self
-            .resolve_optional_revision(
+            .resolve_optional_ref(
                 &request.repository,
                 &request.branch.full_ref(),
                 cancellation,
@@ -12133,7 +12169,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             };
         } else if (!residual.branch_exists
             || journal.existing_branch_oid.as_ref().is_some_and(|before| {
-                self.resolve_optional_revision(
+                self.resolve_optional_ref(
                     &journal.request.repository,
                     &journal.request.branch.full_ref(),
                     &CancellationToken::new(),
