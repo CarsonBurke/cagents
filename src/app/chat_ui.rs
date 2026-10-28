@@ -279,15 +279,15 @@ pub enum Action {
     OpenDocumentFrom(Target, Option<PathBuf>, String),
     OpenChangedFile(Target, PathBuf),
     ChangedFileResolved(Target, u64, PathBuf, Result<PathBuf, String>),
-    OpenImage(Target, String),
+    OpenImage(images::PreviewTarget),
     LoadImage(Target, String),
     ImageLoaded(Target, Arc<chat::Item>, u64, images::Loaded),
     ThumbnailLoaded(Target, Arc<PathBuf>, images::Loaded),
     RetryThumbnails(Target),
     CloseImage,
-    ImageNext(bool),
-    ImageFit,
-    ImageExternal,
+    ImageNext(images::ControlTarget, bool),
+    ImageFit(images::ControlTarget),
+    ImageExternal(images::GalleryTarget),
     CopyLiteral(String),
     CopySharedCode(Target, Arc<str>),
     CopyQueued(Target, QueueCopy),
@@ -446,9 +446,9 @@ impl Action {
                 | Self::Tick
                 | Self::AccountPicker(_, false)
                 | Self::CloseImage
-                | Self::ImageNext(_)
-                | Self::ImageFit
-                | Self::ImageExternal
+                | Self::ImageNext(..)
+                | Self::ImageFit(_)
+                | Self::ImageExternal(_)
         )
     }
 
@@ -10591,29 +10591,34 @@ impl Cagents {
                     }
                 }
             }
-            Action::OpenImage(target, id) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    let gallery = images::Gallery::new(runtime, &id);
-                    self.chat_ui.image_viewer = gallery;
+            Action::OpenImage(target) => {
+                if let Some(runtime) = self.chat_runtime_mut(target.runtime())
+                    && let Some(gallery) = images::Gallery::from_preview(runtime, &target)
+                {
+                    self.chat_ui.image_viewer = Some(gallery);
                 }
             }
             Action::CloseImage => self.chat_ui.image_viewer = None,
-            Action::ImageNext(forward) => {
-                if let Some(gallery) = &mut self.chat_ui.image_viewer {
+            Action::ImageNext(target, forward) => {
+                if let Some(gallery) = &mut self.chat_ui.image_viewer
+                    && gallery.accepts_control(target)
+                {
                     gallery.next(forward);
                 }
             }
-            Action::ImageFit => {
-                if let Some(gallery) = &mut self.chat_ui.image_viewer {
+            Action::ImageFit(target) => {
+                if let Some(gallery) = &mut self.chat_ui.image_viewer
+                    && gallery.accepts_control(target)
+                {
                     gallery.reset = gallery.reset.wrapping_add(1);
                 }
             }
-            Action::ImageExternal => {
+            Action::ImageExternal(target) => {
                 if let Some(url) = self
                     .chat_ui
                     .image_viewer
                     .as_ref()
-                    .and_then(|gallery| gallery.url())
+                    .and_then(|gallery| gallery.external_url(target))
                 {
                     return cosmic::task::future(async move {
                         Message::ExternalLinkOpened(images::open_external(url).await)
@@ -11867,33 +11872,52 @@ mod tests {
             description: "Generated image".into(),
             reference: None,
         };
-        let mut cached = CachedItem::new(&content, runtime.syntax_theme);
-        cached.image = Some(iced::widget::image::Handle::from_rgba(
-            1,
-            1,
-            vec![0, 0, 0, 255],
-        ));
-        runtime.cache.insert("image".into(), cached);
-        Arc::make_mut(&mut runtime.snapshot).items = vec![
-            chat::Item {
-                id: "image".into(),
-                role: chat::Role::Assistant,
-                content,
-                started_at: None,
-                at: None,
-            }
-            .into(),
-        ];
-        let target = runtime.target;
-        drop(app.handle_chat_ui(Action::OpenImage(target, "image".into())));
+        let item = Arc::new(chat::Item {
+            id: "image".into(),
+            role: chat::Role::Assistant,
+            content,
+            started_at: None,
+            at: None,
+        });
+        Arc::make_mut(&mut runtime.snapshot).items = vec![item.clone()];
+        Runtime::prepare_items(
+            &mut runtime.cache,
+            std::slice::from_ref(&item),
+            false,
+            &HashSet::new(),
+            runtime.syntax_theme,
+            Provider::Codex,
+        );
+        runtime.visible.store(true, Ordering::Relaxed);
+        let attempt = runtime.cache[&item.id].image_attempt;
+        images::complete(
+            runtime,
+            &item,
+            attempt,
+            images::Loaded::Ready(iced::widget::image::Handle::from_rgba(
+                1,
+                1,
+                vec![0, 0, 0, 255],
+            )),
+        );
+        let target =
+            images::PreviewTarget::capture(runtime.target, &item, &runtime.cache[&item.id])
+                .expect("a genuinely ready transcript preview");
+        drop(app.handle_chat_ui(Action::OpenImage(target.clone())));
         assert!(app.chat_ui.image_viewer.is_some());
         assert!(app.modal_is_open());
         assert!(app.dialog().is_some());
         let before = app.context_inspector_open;
         drop(app.update(Message::ToggleContextInspector));
         assert_eq!(app.context_inspector_open, before);
-        assert!(Action::ImageNext(true).allowed_while_modal());
-        assert!(!Action::OpenImage(target, "image".into()).allowed_while_modal());
+        assert!(
+            Action::ImageNext(
+                app.chat_ui.image_viewer.as_ref().unwrap().control_target(),
+                true,
+            )
+            .allowed_while_modal()
+        );
+        assert!(!Action::OpenImage(target).allowed_while_modal());
         drop(app.update(Message::ChatUi(Action::CloseImage)));
         assert!(!app.modal_is_open());
     }

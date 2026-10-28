@@ -112,8 +112,8 @@ fn click_prompt(
     let actions: Vec<_> = messages
         .iter()
         .map(|message| match message {
-            Message::ChatUi(Action::OpenImage(target, id)) => {
-                format!("OpenImage({target:?}, {id})")
+            Message::ChatUi(Action::OpenImage(target)) => {
+                format!("OpenImage({:?}, {})", target.runtime(), target.item_id())
             }
             Message::ChatUi(Action::LoadImage(target, id)) => {
                 format!("LoadImage({target:?}, {id})")
@@ -146,8 +146,8 @@ fn restored_user_image_opens_viewer_from_its_rendered_preview() {
             .any(|text| text.contains("image-internal-digest"))
     );
     assert!(matches!(messages.as_slice(),
-        [Message::ChatUi(Action::OpenImage(target, id))]
-            if *target == runtime.target && id == &item.id));
+        [Message::ChatUi(Action::OpenImage(target))]
+            if target.runtime() == runtime.target && target.item_id() == item.id));
     let Message::ChatUi(open) = messages.into_iter().next().unwrap() else {
         unreachable!()
     };
@@ -287,7 +287,7 @@ fn selected_child_user_image_uses_its_own_preview_despite_parent_id_collision() 
             .any(|text| text == "Image 47 · Click to enlarge")
     );
     assert!(matches!(messages.as_slice(),
-        [Message::ChatUi(Action::OpenImage(found, id))] if *found == target && id == &child.id));
+        [Message::ChatUi(Action::OpenImage(found))] if found.runtime() == target && found.item_id() == child.id));
     let Message::ChatUi(open) = messages.into_iter().next().unwrap() else {
         unreachable!()
     };
