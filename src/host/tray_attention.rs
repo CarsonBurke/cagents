@@ -385,6 +385,7 @@ fn navigate(
             })
         },
         || std::thread::sleep(Duration::from_millis(100)),
+        std::time::Instant::now,
     )
 }
 
@@ -395,6 +396,7 @@ fn navigate_with(
     mut activate: impl FnMut() -> Result<bool, String>,
     launch: impl FnOnce() -> Result<(), String>,
     mut wait: impl FnMut(),
+    mut now: impl FnMut() -> std::time::Instant,
 ) -> Result<String, String> {
     let current = || {
         host.lock()
@@ -405,9 +407,11 @@ fn navigate_with(
     if !current() {
         return Err("The waiting-agent request was replaced".into());
     }
-    let started = std::time::Instant::now();
     if !activate()? {
         launch()?;
+        // Startup/recovery already owns a separate bounded handshake. Give a
+        // successful slow launch its full socket-delivery budget after it ends.
+        let started = now();
         // This is the existing tray-action worker, never the UI or Host lock.
         // A cold window may not have bound its listener at launch completion.
         let mut admitted = false;
@@ -415,7 +419,7 @@ fn navigate_with(
             if !current() {
                 return Err("The waiting-agent request was replaced".into());
             }
-            if started.elapsed() >= Duration::from_secs(15) {
+            if now().saturating_duration_since(started) >= Duration::from_secs(15) {
                 break;
             }
             if activate()? {

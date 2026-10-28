@@ -409,6 +409,7 @@ fn navigation_errors_retain_queue_and_callbacks_can_acquire_host() {
             || {
                 host.lock().unwrap().register_client(12);
             },
+            std::time::Instant::now,
         );
         match case {
             0 => {
@@ -439,6 +440,93 @@ fn navigation_errors_retain_queue_and_callbacks_can_acquire_host() {
             }
         );
     }
+}
+
+#[test]
+fn slow_successful_launcher_receives_full_post_launch_delivery_budget() {
+    let host = empty_host();
+    let destination = destination("tray-owner");
+    let intent = request(TerminalId::new(), &destination.window);
+    host.lock()
+        .unwrap()
+        .queue_tray_session(destination.clone(), intent.clone())
+        .unwrap();
+    let origin = std::time::Instant::now();
+    let elapsed = Cell::new(Duration::ZERO);
+    let sends = Cell::new(0);
+    let launches = Cell::new(0);
+    let result = navigate_with(
+        &host,
+        &destination,
+        &intent,
+        || {
+            sends.set(sends.get() + 1);
+            Ok(sends.get() == 2)
+        },
+        || {
+            launches.set(launches.get() + 1);
+            // The real launcher can successfully finish its existing recovery
+            // handshake after more than the separate delivery budget.
+            elapsed.set(Duration::from_secs(20));
+            Ok(())
+        },
+        || panic!("the newly ready window must receive its immediate typed send"),
+        || origin + elapsed.get(),
+    );
+    assert!(result.is_ok());
+    assert_eq!(launches.get(), 1);
+    assert_eq!(
+        sends.get(),
+        2,
+        "successful slow launch still delivers the exact intent"
+    );
+    assert_eq!(elapsed.get(), Duration::from_secs(20));
+    assert_eq!(
+        drain(&host, &destination),
+        None,
+        "only the admitted exact request is acknowledged"
+    );
+}
+
+#[test]
+fn cold_delivery_elapsed_deadline_preserves_exact_intent_without_more_writes() {
+    let host = empty_host();
+    let destination = destination("tray-owner");
+    let intent = request(TerminalId::new(), &destination.window);
+    host.lock()
+        .unwrap()
+        .queue_tray_session(destination.clone(), intent.clone())
+        .unwrap();
+    let origin = std::time::Instant::now();
+    let elapsed = Cell::new(Duration::ZERO);
+    let sends = Cell::new(0);
+    let waits = Cell::new(0);
+    let result = navigate_with(
+        &host,
+        &destination,
+        &intent,
+        || {
+            sends.set(sends.get() + 1);
+            Ok(false)
+        },
+        || Ok(()),
+        || {
+            waits.set(waits.get() + 1);
+            elapsed.set(Duration::from_secs(15));
+        },
+        || origin + elapsed.get(),
+    );
+    assert!(result.unwrap_err().contains("did not accept"));
+    assert_eq!(
+        sends.get(),
+        2,
+        "deadline prevents the next post-launch write"
+    );
+    assert_eq!(waits.get(), 1);
+    assert_eq!(
+        host.lock().unwrap().pending_tray_session(&destination),
+        Some(&intent)
+    );
 }
 
 #[test]
@@ -473,6 +561,7 @@ fn superseded_cold_request_cannot_send_again_after_backoff() {
                 .queue_tray_session(destination.clone(), replacement.clone())
                 .unwrap();
         },
+        std::time::Instant::now,
     );
     assert!(result.unwrap_err().contains("replaced"));
     assert_eq!(
@@ -513,6 +602,7 @@ fn old_navigation_ack_cannot_remove_newer_destination_intent() {
         },
         || panic!("an acknowledged existing window must not launch a child"),
         || panic!("an admitted existing window must not back off"),
+        std::time::Instant::now,
     );
     assert!(result.is_ok());
     assert_eq!(
@@ -552,6 +642,7 @@ fn newer_tray_choice_retires_old_generic_watch_and_new_desktop_choice_retires_tr
             || panic!("superseded request cannot dispatch"),
             || panic!("superseded request cannot launch"),
             || panic!("superseded request cannot retry"),
+            std::time::Instant::now,
         )
         .unwrap_err()
         .contains("replaced")
