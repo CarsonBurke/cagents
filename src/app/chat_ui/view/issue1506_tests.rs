@@ -808,8 +808,10 @@ fn held_child_diagnostic_controls_do_not_retarget_a_replacement_incident() {
     }
 
     for copy in [false, true] {
-        for scenario in 0..3 {
-            let replace = scenario == 1;
+        for scenario in 0..4 {
+            let replace_incident = scenario == 1;
+            let replace_runtime = scenario == 3;
+            let change_details = matches!(scenario, 1 | 2);
             let (original, replacement) = if scenario == 2 {
                 // The reported reset defines this semantic incident. Its raw
                 // request details can refresh without changing that identity.
@@ -847,6 +849,7 @@ fn held_child_diagnostic_controls_do_not_retarget_a_replacement_incident() {
             if scenario != 2 {
                 assert_eq!(summary, "Request failed");
             }
+            let original_target = target;
             let original_key = live.failure_ui.incidents[0].key.clone();
             assert_eq!(
                 live.failure_details(&original_key).as_deref(),
@@ -883,24 +886,32 @@ fn held_child_diagnostic_controls_do_not_retarget_a_replacement_incident() {
             )));
             let cache = ui.into_cache();
 
-            // A real publication changes only this child's detail. Both
-            // incidents have the same heading/geometry and no transcript item
+            // Publish with the same heading/geometry and no transcript item
             // whose named anchor could otherwise discard the held press.
+            // Only the chosen detail or runtime owner changes below.
             let mut snapshot = runtime(&app, target).snapshot.as_ref().clone();
             snapshot.generation += 1;
-            if scenario != 0 {
+            if change_details {
                 snapshot.subagents[0].detail = replacement.clone();
             }
             handle.publish_snapshot_for_test(snapshot);
             app.chat_runtime_mut(target).unwrap().refresh();
+            if replace_runtime {
+                // A reopened/replaced runtime can expose identical diagnostics
+                // in the same card. Its Target generation, rather than the
+                // snapshot publication generation, owns the new interaction.
+                let live = app.chat_runtime_mut(target).unwrap();
+                live.target.generation += 1;
+                target = live.target;
+            }
             let live = runtime(&app, target);
             assert_eq!(live.failure_ui.incidents.len(), 1);
             let current_key = live.failure_ui.incidents[0].key.clone();
-            assert_eq!(original_key == current_key, !replace);
+            assert_eq!(original_key == current_key, !replace_incident);
             assert!(!live.failure_ui.expanded.contains(&current_key));
             assert_eq!(
                 live.failure_details(&current_key).as_deref(),
-                Some(if scenario != 0 {
+                Some(if change_details {
                     replacement.as_str()
                 } else {
                     original.as_str()
@@ -933,10 +944,10 @@ fn held_child_diagnostic_controls_do_not_retarget_a_replacement_incident() {
                     _ => None,
                 })
                 .collect();
-            if replace {
+            if replace_incident || replace_runtime {
                 assert!(
                     actions.is_empty(),
-                    "a held press must not invoke the replacement incident, copy={copy}"
+                    "a held press must not invoke a replacement owner, copy={copy}, scenario={scenario}"
                 );
                 assert!(
                     !runtime(&app, target)
@@ -944,6 +955,25 @@ fn held_child_diagnostic_controls_do_not_retarget_a_replacement_incident() {
                         .expanded
                         .contains(&current_key)
                 );
+                if replace_runtime {
+                    // Also reject an already-queued action from the old
+                    // runtime, even while its incident key remains current.
+                    for stale in [
+                        Action::ToggleFailure(original_target, original_key.clone()),
+                        Action::CopyFailure(original_target, original_key.clone()),
+                    ] {
+                        assert!(
+                            iced::runtime::task::into_stream(app.handle_chat_ui(stale)).is_none(),
+                            "an old runtime must not publish a clipboard effect"
+                        );
+                        assert!(
+                            !runtime(&app, target)
+                                .failure_ui
+                                .expanded
+                                .contains(&current_key)
+                        );
+                    }
+                }
             } else {
                 assert_eq!(actions.len(), 1, "same incident keeps its held press");
                 let action = actions.pop().unwrap();
