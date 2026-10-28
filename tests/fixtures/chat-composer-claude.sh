@@ -70,6 +70,14 @@ verbosity_turn() {
     emit_record "$(jq -cn --arg turn "$turn" '{type:"user",uuid:("verbosity-shell-result-"+$turn),message:{role:"user",content:[{type:"tool_result",tool_use_id:("shell-"+$turn),content:"Shell fixture complete"}]}}')"
 }
 
+# Optional provider-produced image for image preview/viewer acceptance: each
+# turn returns this PNG as a base64 block. Native launches drop CAGENTS_*
+# variables, so the provider home's fixture-image.png is the default.
+fixture_image=${CAGENTS_FIXTURE_IMAGE:-$HOME/fixture-image.png}
+image_turn() {
+    emit_record "$(base64 -w0 "$fixture_image" | jq -Rsc --arg turn "$turn" '{type:"assistant",uuid:("fixture-image-"+$turn),message:{id:("fixture-image-"+$turn),role:"assistant",content:[{type:"text",text:"Here is the chart from the failed run."},{type:"image",source:{type:"base64",media_type:"image/png",data:.}}]}}')"
+}
+
 busy=false
 fast=off
 fast_fixture=${CAGENTS_FIXTURE_FAST_MODE:-0}
@@ -121,6 +129,7 @@ while IFS= read -r frame; do
                 jq -cn --arg session "$session" --arg model "$model" \
                     '{type:"system",subtype:"init",session_id:$session,claude_code_version:"2.1.286",model:$model}'
                 if [ "${CAGENTS_FIXTURE_VERBOSITY:-0}" = 1 ]; then verbosity_turn; fi
+                if [ -f "$fixture_image" ]; then image_turn; fi
                 assistant=$(jq -cn --arg turn "$turn" \
                     '{type:"assistant",uuid:("fixture-message-"+$turn),message:{id:("fixture-message-"+$turn),role:"assistant",content:[{type:"text",text:"I’m checking the submission logs and comparing the failed run with the last successful version."}],usage:{input_tokens:4200,output_tokens:180}}}')
                 persist_record "$assistant"
