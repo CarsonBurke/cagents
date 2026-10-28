@@ -625,25 +625,27 @@ impl State {
             for item in cards_in_board {
                 *counts.entry(&item.project).or_default() += 1;
             }
-            let mut items = vec![
+            let mut items = vec![crate::ui_controls::owned(
+                (self.lifetime, None::<PathBuf>),
                 popover_item(
                     Icon::Grid.handle(),
                     "All projects",
                     cards(cards_in_board.len()),
                     Action::Scope(None),
                 )
-                .selected(self.scope.is_none())
-                .into(),
-            ];
+                .selected(self.scope.is_none()),
+            )];
             items.extend(projects.iter().map(|project| {
-                popover_item(
-                    Icon::Branch.handle(),
-                    project.name.as_str(),
-                    cards(counts.get(&project.repository).copied().unwrap_or_default()),
-                    Action::Scope(Some(project.repository.clone())),
+                crate::ui_controls::owned(
+                    (self.lifetime, Some(project.repository.clone())),
+                    popover_item(
+                        Icon::Branch.handle(),
+                        project.name.as_str(),
+                        cards(counts.get(&project.repository).copied().unwrap_or_default()),
+                        Action::Scope(Some(project.repository.clone())),
+                    )
+                    .selected(self.scope.as_ref() == Some(&project.repository)),
                 )
-                .selected(self.scope.as_ref() == Some(&project.repository))
-                .into()
             }));
             widget::scrollable(widget::column::with_children(items).width(SCOPE_MENU_WIDTH))
                 .height(Length::Shrink)
@@ -1803,6 +1805,108 @@ mod tests {
             scope_menu_text(&state).unwrap(),
             ["All projects", "0 cards"]
         );
+    }
+
+    #[test]
+    fn project_picker_press_stays_with_its_repository_and_pane() {
+        use iced::mouse::{Button, Event};
+        use iced::runtime::user_interface::Cache;
+
+        fn build<'a>(
+            state: &'a State,
+            cache: Cache,
+            renderer: &mut cosmic::Renderer,
+        ) -> iced::runtime::UserInterface<'a, Action, Theme, cosmic::Renderer> {
+            let mut ui = iced::runtime::UserInterface::build(
+                state.layout_view(1600.0),
+                iced::Size::new(1600.0, 900.0),
+                cache,
+                renderer,
+            );
+            draw_work_ui(&mut ui, renderer);
+            ui
+        }
+
+        for change in ["remove", "reorder", "metadata", "reopen"] {
+            let a = item("first", "alpha");
+            let b = item("second", "beta");
+            let mut initial = board(vec![a.clone(), b.clone()]);
+            Arc::make_mut(&mut initial)
+                .projects
+                .sort_by(|a, b| a.name.cmp(&b.name));
+            let mut state = State::default();
+            connected(&mut state, 1, initial.clone());
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let mut ui = build(&state, Cache::new(), &mut renderer);
+            let point = first_open_bounds(&ui, "Choose project").center();
+            let actions = click_work(&mut ui, &mut renderer, point);
+            let cache = ui.into_cache();
+            assert!(matches!(actions.as_slice(), [Action::ScopeMenu(true)]));
+            state.update(actions.into_iter().next().unwrap());
+            let mut ui = build(&state, cache, &mut renderer);
+            let point = popup_button_bounds(&mut ui, &renderer, "alpha").center();
+            assert!(
+                retained_work_events(
+                    &mut ui,
+                    &mut renderer,
+                    point,
+                    &[Event::ButtonPressed(Button::Left)],
+                )
+                .is_empty()
+            );
+            let cache = ui.into_cache();
+            let (next, replacement, repository) = match change {
+                "remove" => (board(vec![b.clone()]), "beta", b.project.clone()),
+                "reorder" => {
+                    Arc::make_mut(&mut initial).projects.reverse();
+                    (initial, "beta", b.project.clone())
+                }
+                "metadata" => {
+                    let data = Arc::make_mut(&mut initial);
+                    data.projects[0].name = "renamed".into();
+                    data.items.push(item("another", "alpha"));
+                    (initial, "renamed", a.project.clone())
+                }
+                "reopen" => {
+                    state.reset();
+                    state.update(Action::ScopeMenu(true));
+                    (initial, "alpha", a.project.clone())
+                }
+                _ => unreachable!(),
+            };
+            if change == "reopen" {
+                connected(&mut state, 2, next);
+            } else {
+                watched(&mut state, 2, next);
+            }
+            let mut ui = build(&state, cache, &mut renderer);
+            assert!(popup_button_bounds(&mut ui, &renderer, replacement).contains(point));
+            let released = retained_work_events(
+                &mut ui,
+                &mut renderer,
+                point,
+                &[Event::ButtonReleased(Button::Left)],
+            );
+            if change == "metadata" {
+                assert!(
+                    matches!(released.as_slice(), [Action::Scope(Some(path))] if path == &repository),
+                    "same repository must retain its press: {released:?}"
+                );
+            } else {
+                assert!(
+                    released.is_empty(),
+                    "{change} transferred press: {released:?}"
+                );
+            }
+            let fresh = click_work(&mut ui, &mut renderer, point);
+            drop(ui);
+            assert!(
+                matches!(fresh.as_slice(), [Action::Scope(Some(path))] if path == &repository),
+                "fresh replacement must work: {fresh:?}"
+            );
+            state.update(fresh.into_iter().next().unwrap());
+            assert_eq!(state.scope.as_ref(), Some(&repository));
+        }
     }
 
     #[test]
