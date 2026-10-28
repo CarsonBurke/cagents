@@ -842,6 +842,118 @@ mod tests {
         let result=read_manifest(query,move |_| {let omitted=omitted.clone();async move {Ok(omitted)}}).await.unwrap();
         assert_eq!(result.omitted_files,1);assert!(result.metadata.unavailable.is_some());
     }
+    #[tokio::test]
+    async fn explicit_copy_all_retries_failed_current_reads_without_accepting_old_attempts() {
+        let text = "@@ -1 +1 @@\n-before\n+after\n";
+        for manifest_failed in [true, false] {
+            let mut files = (*fixture(text)).clone();
+            files.metadata.total_files = 2;
+            files.metadata.total_bytes = 2 * text.len();
+            files.metadata.additions = Some(2);
+            files.metadata.deletions = Some(2);
+            let mut second = files.files[0].clone();
+            second.file_index = 1;
+            second.path = "src/second.rs".into();
+            files.files.push(second);
+            let page = Arc::new(files);
+            let raw = raw(&page, "collapsed-copy-source");
+            let expanded = HashSet::new();
+            let mut state = State::default();
+            state.project(raw, None, &expanded, false);
+            let intents = clipboard_intent::Intents::default();
+            assert!(state.request_copy_all(&page.source.source_id, intents.next()));
+            let first_manifest = state.entries[&page.source].requested[&0];
+            let failed_attempt = if manifest_failed {
+                assert!(state.complete_manifest(
+                    &page.source,
+                    0,
+                    first_manifest,
+                    Err("temporary file-list failure".into())
+                ));
+                first_manifest
+            } else {
+                assert!(state.complete_manifest(&page.source, 0, first_manifest, Ok(page.clone())));
+                state.reconcile_demand(&expanded, false);
+                let first_patch = state.entries[&page.source].patch_requests[&0];
+                assert!(state.complete_patch(
+                    &page.source,
+                    0,
+                    first_patch,
+                    Err("temporary patch failure".into())
+                ));
+                first_patch
+            };
+            state.reconcile_demand(&expanded, false);
+            assert!(!state.entries[&page.source].copy_all);
+            assert!(
+                state.entries[&page.source].opened.is_empty(),
+                "multi-file rows remained collapsed"
+            );
+            assert!(state.entries[&page.source].copy_error.is_some());
+            assert!(
+                state.take_copy_all().is_none(),
+                "a failed copy never supplies partial contents"
+            );
+            // The visible primary action starts one fresh request, even while
+            // the changed-file rows themselves have remained collapsed.
+            assert!(state.request_copy_all(&page.source.source_id, intents.next()));
+            if manifest_failed {
+                let retry = state.entries[&page.source].requested[&0];
+                assert_ne!(retry, failed_attempt);
+                assert!(!state.complete_manifest(&page.source, 0, failed_attempt, Ok(page.clone())));
+                assert!(state.complete_manifest(&page.source, 0, retry, Ok(page.clone())));
+                state.reconcile_demand(&expanded, false);
+            } else {
+                assert!(!state.complete_patch(
+                    &page.source,
+                    0,
+                    failed_attempt,
+                    Err("late first-attempt failure".into())
+                ));
+            }
+            for index in 0..2 {
+                let retry = state.entries[&page.source].patch_requests[&index];
+                if !manifest_failed && index == 0 {
+                    assert_ne!(retry, failed_attempt);
+                }
+                let file = page.files[index].clone();
+                let returned = file.clone();
+                let pending = read_patch(page.clone(), file.clone(), move |query| {
+                    std::future::ready(Ok(self::page(query, text, returned.clone())))
+                })
+                .await
+                .unwrap();
+                let record = chat::source_owners::ResidentPatch {
+                    source: page.source.clone(),
+                    epoch: page.epoch,
+                    file,
+                };
+                assert_eq!(
+                    chat::source_owners::admit_patch(&pending.text, &record, None),
+                    chat::source_owners::Admission::Ready
+                );
+                let prepared = PatchReady(Arc::new(Mutex::new(Some(pending))));
+                assert!(state.complete_patch(&page.source, index, retry, Ok(prepared)));
+            }
+            let (item, patches, intent) = state
+                .take_copy_all()
+                .expect("the explicit retry can finish");
+            assert_eq!(item, page.source.source_id);
+            assert!(intent.current());
+            assert_eq!(
+                patches
+                    .iter()
+                    .map(|patch| patch.as_ref())
+                    .collect::<Vec<_>>(),
+                vec![text, text]
+            );
+            assert!(!state.entries[&page.source].copy_all);
+            drop(patches);
+            state.reconcile_demand(&expanded, false);
+            flush_retired();
+        }
+    }
+
     #[test]
     fn newer_copy_cancels_loading_all_file_copy_but_preserves_search_demand() {
         for find in [false,true] {
