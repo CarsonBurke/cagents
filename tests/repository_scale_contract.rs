@@ -181,18 +181,19 @@ fn large_literal_pathspec_mutations_roundtrip_without_argv_limits() {
                     .len()
                     > 2_097_152
             );
-            assert!(matches!(
-                service
-                    .stage(
-                        &StageRequest {
-                            worktree: root.into(),
-                            selection: selection.clone()
-                        },
-                        &cancel
-                    )
-                    .unwrap(),
-                MutationOutcome::Applied { .. }
-            ));
+            let outcome = service
+                .stage(
+                    &StageRequest {
+                        worktree: root.into(),
+                        selection: selection.clone(),
+                    },
+                    &cancel,
+                )
+                .unwrap();
+            assert!(
+                matches!(&outcome, MutationOutcome::Applied { .. }),
+                "40k stage operation: {outcome:?}"
+            );
             assert!(matches!(
                 service
                     .unstage(
