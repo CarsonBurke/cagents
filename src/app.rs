@@ -16883,9 +16883,21 @@ impl Application for Cagents {
                 if let keyboard::Event::ModifiersChanged(modifiers) = &event {
                     self.keyboard_modifiers = *modifiers;
                 }
-                if self.chat_ui.image_viewer.is_some() {
-                    if let keyboard::Event::KeyPressed { key, .. } = &event {
+                if let Some(gallery) = &self.chat_ui.image_viewer {
+                    if let keyboard::Event::KeyPressed { key, modifiers, .. } = &event {
                         match key {
+                            keyboard::Key::Character(c)
+                                if c.eq_ignore_ascii_case("c")
+                                    && modifiers.command()
+                                    && !modifiers.shift()
+                                    && !modifiers.alt() =>
+                            {
+                                let image = gallery.selected_image();
+                                return self.handle_chat_ui(chat_ui::Action::Image(
+                                    image,
+                                    chat_ui::images::ImageCommand::Copy,
+                                ));
+                            }
                             keyboard::Key::Named(keyboard::key::Named::Escape) => {
                                 self.chat_ui.image_viewer = None
                             }
