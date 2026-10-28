@@ -471,6 +471,286 @@ fn pending_publication_serializes_a_new_recipe_without_blocking_host_reads() {
 }
 
 #[test]
+fn pending_completion_rebases_execution_retirement_without_relaunching_or_retargeting() {
+    use crate::agent_execution::{
+        Destination, HostedSession, Origin, ResultSummary, Spec, State, Submit, Surface, Target,
+        Update,
+    };
+
+    let name = thread::current().name().unwrap().to_owned();
+    let Some(root) = isolated(&name) else {
+        return;
+    };
+    // The neighboring provider is a completed registry fixture. The pending
+    // terminal is a real worker; no live provider is needed to exercise either
+    // execution retirement transaction or its independent workspace revision.
+    for case in 0..3 {
+        let directory = root.join(format!("execution-retirement-{case}"));
+        fs::create_dir(&directory).unwrap();
+        let mut registry = Registry::at(&directory.join("model.sqlite3")).unwrap();
+        registry
+            .apply(&ModelEdit::OpenProject {
+                repository: directory.clone(),
+                name: "pending-execution-retirement".into(),
+                kind: Default::default(),
+            })
+            .unwrap();
+        let scope = Scope::Worktree {
+            repository: directory.clone(),
+            path: directory.clone(),
+        };
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("pending-execution-retirement"),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: HostIncarnation::new("pending-execution-retirement"),
+        };
+        let launch = LaunchRecipe {
+            program: "/usr/bin/python3".into(),
+            arguments: vec!["-u".into(), "-c".into(), "import os,sys\nwith open('launches','a') as f: f.write(str(os.getpid())+'\\n')\nprint('ORIGINAL_READY',flush=True)\nfor line in sys.stdin: print('ORIGINAL_REPLY:'+line.strip(),flush=True)".into()],
+            working_directory: directory.clone(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let session = TerminalSession {
+            id: TerminalId::new(),
+            launch: launch.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe: launch,
+                last_exit: None,
+            },
+        };
+        let pane = Pane {
+            id: CardId::new(),
+            title: "original".into(),
+            user_title: None,
+            pending_terminal_start: true,
+            width_fraction: 0.5,
+            kind: CardKind::Terminal(session.clone()),
+            scope: None,
+        };
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: scope.clone(),
+                panes: vec![pane.clone()],
+                closed: Vec::new(),
+            })
+            .unwrap();
+        let accepted = registry
+            .submit_agent(
+                &Origin::User,
+                &Submit {
+                    name: None,
+                    destination: Destination::New(Spec {
+                        provider: crate::agent::Provider::Claude,
+                        account: None,
+                        target: Target {
+                            repository: directory.clone(),
+                            directory: directory.clone(),
+                            placement: Some(scope.clone()),
+                        },
+                        surface: Surface::Terminal,
+                        model: None,
+                        permission_mode: None,
+                        reasoning_effort: None,
+                    }),
+                    prompt: "Read the neighboring registry fixture".into(),
+                    idempotency_key: "neighbor".into(),
+                },
+                1,
+            )
+            .unwrap();
+        let mut neighbor_session = session.clone();
+        neighbor_session.id = TerminalId::new();
+        neighbor_session.continuity = TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        let neighbor_source = HostedSession::Terminal(neighbor_session.clone());
+        registry
+            .bind_agent(accepted.agent.id, None, neighbor_source.clone())
+            .unwrap();
+        let started = registry
+            .update_agent_run(
+                accepted.run.id,
+                accepted.run.revision,
+                Update::Started {
+                    provider_key: "registry-fixture-confirmed".into(),
+                },
+                2,
+            )
+            .unwrap();
+        let finished = registry
+            .update_agent_run(
+                accepted.run.id,
+                started.revision,
+                Update::Finished {
+                    state: State::Succeeded,
+                    result: ResultSummary {
+                        text: "Preserved neighboring result".into(),
+                        ..Default::default()
+                    },
+                },
+                3,
+            )
+            .unwrap();
+        let neighbor = Pane {
+            id: CardId::from_uuid(accepted.agent.id.as_uuid()),
+            title: "completed neighboring agent".into(),
+            kind: CardKind::Terminal(neighbor_session),
+            pending_terminal_start: false,
+            ..pane.clone()
+        };
+        registry
+            .apply(&ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: registry.view_revision(&scope).unwrap(),
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Insert {
+                    pane: neighbor.clone(),
+                    before: None,
+                },
+            })
+            .unwrap();
+        let reserved_revision = registry.view_revision(&scope).unwrap();
+        let mut state = HostState::new(proof);
+        state.enable_holder_recovery();
+        state.install_model(registry);
+        state.register_client(1);
+        let host = Arc::new(HostLock::new(state));
+        let _cleanup = Cleanup(host.clone());
+        let execution = host.lock().unwrap().execution_registry.clone().unwrap();
+        let mut replacement = pane.clone();
+        let CardKind::Terminal(changed) = &mut replacement.kind else {
+            unreachable!()
+        };
+        changed
+            .launch
+            .arguments
+            .push("replacement-must-not-run".into());
+        changed.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: changed.launch.clone(),
+            last_exit: None,
+        };
+        let changed_pane = replacement.clone();
+        let original_pane = pane.clone();
+        let changed_scope = scope.clone();
+        BEFORE_PENDING_PUBLICATION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                // This is the real independent execution connection, while
+                // publication still owns the workspace writer admission.
+                let mut execution = execution.lock().unwrap();
+                if case == 1 {
+                    assert!(execution.retire_agent_process(&neighbor_source, 4).unwrap());
+                } else {
+                    assert!(
+                        execution
+                            .close_agent(&Origin::User, accepted.agent.id)
+                            .unwrap()
+                            .closed
+                    );
+                }
+                assert!(execution.view_revision(&changed_scope).unwrap() > reserved_revision);
+                if case == 2 {
+                    // Adversarial source replacement through the independent
+                    // connection must never gain completion authority merely
+                    // because a neighboring execution also changed revision.
+                    execution
+                        .apply(&ModelEdit::ChangeView {
+                            scope: changed_scope.clone(),
+                            expected_revision: execution.view_revision(&changed_scope).unwrap(),
+                            operation: uuid::Uuid::new_v4(),
+                            change: Change::Update {
+                                before: original_pane,
+                                pane: changed_pane,
+                            },
+                        })
+                        .unwrap();
+                }
+            }));
+        });
+        let request = || ClientRequest::CompletePendingTerminal {
+            pane: pane.id,
+            terminal_id: session.id,
+            options: TerminalSpawnOptions::default(),
+        };
+        let answer = crate::host::client::process_request(&host, 1, request());
+        if case == 2 {
+            assert_eq!(answer.unwrap_err().code, ProtocolErrorCode::Internal);
+        } else {
+            answer.unwrap();
+        }
+        let original = host.lock().unwrap().terminals[&session.id].handle.clone();
+        assert!(!original.is_completed());
+        assert_eq!(
+            host.lock().unwrap().terminals[&session.id].session.launch,
+            session.launch
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let launches = loop {
+            if let Ok(launches) = fs::read_to_string(directory.join("launches")) {
+                if launches.ends_with('\n') && launches.trim().parse::<i32>().is_ok() {
+                    break launches;
+                }
+            }
+            assert!(Instant::now() < deadline, "original process did not start");
+            thread::sleep(Duration::from_millis(1));
+        };
+        let process =
+            crate::daemon::holder_registry::Process::read(launches.trim().parse::<i32>().unwrap())
+                .unwrap();
+        assert!(process.is_current());
+        let model = snapshot(&host, None).unwrap();
+        let view = model.views.iter().find(|view| view.scope == scope).unwrap();
+        assert!(view.retired.contains(&neighbor.id));
+        assert!(!view.panes.iter().any(|item| item.id == neighbor.id));
+        assert_eq!(view.panes.len(), 1);
+        let current = &view.panes[0];
+        if case == 2 {
+            assert_eq!(
+                current, &replacement,
+                "changed source must remain pending and untouched"
+            );
+            let refused = crate::host::client::process_request(&host, 1, request()).unwrap_err();
+            assert_eq!(refused.code, ProtocolErrorCode::TerminalNotFound);
+        } else {
+            assert_eq!(current.id, pane.id);
+            assert!(!current.pending_terminal_start);
+            assert!(
+                matches!(&current.kind, CardKind::Terminal(actual) if actual.id == session.id && actual.launch == session.launch)
+            );
+            assert!(crate::host::client::process_request(&host, 1, request()).is_ok());
+        }
+        assert!(
+            host.lock().unwrap().terminals[&session.id]
+                .handle
+                .same_worker(&original)
+        );
+        assert!(process.is_current());
+        assert_eq!(
+            fs::read_to_string(directory.join("launches")).unwrap(),
+            launches
+        );
+        let execution = host.lock().unwrap().execution_registry.clone().unwrap();
+        let execution = execution.lock().unwrap();
+        assert!(execution.agent(accepted.agent.id).unwrap().closed);
+        assert_eq!(execution.agent_run(accepted.run.id).unwrap(), finished);
+        drop(execution);
+        assert_eq!(
+            original.close_checked(true),
+            crate::terminal_ipc::TerminalCloseResult::Closed
+        );
+        assert!(original.is_completed());
+        assert!(!process.is_current());
+    }
+}
+
+#[test]
 fn failed_pending_commit_retries_the_same_original_without_relaunching_or_retargeting() {
     let name = thread::current().name().unwrap().to_owned();
     let Some(root) = isolated(&name) else {

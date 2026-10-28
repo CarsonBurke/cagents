@@ -219,41 +219,65 @@ pub(super) fn matches_pending_issued(
 pub(super) fn complete_terminal(
     host: &SharedHost,
     registry: &mut super::model::Registry,
-    reservation: PendingTerminal,
+    mut reservation: PendingTerminal,
     original: &crate::terminal::TerminalHandle,
 ) -> Result<(), String> {
-    let session = {
-        let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        super::state::pending_worker_source(
-            &state,
-            reservation.pane.id,
-            &reservation.session,
-            original,
-        )
-        .ok_or("The automatic terminal source changed before completion")?
-    };
-    if !reservation.pane.pending_terminal_start {
+    let mut conflicts = 0;
+    loop {
+        let session = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            super::state::pending_worker_source(
+                &state,
+                reservation.pane.id,
+                &reservation.session,
+                original,
+            )
+            .ok_or("The automatic terminal source changed before completion")?
+        };
+        if !reservation.pane.pending_terminal_start {
+            return Ok(());
+        }
+        let mut pane = reservation.pane.clone();
+        pane.pending_terminal_start = false;
+        pane.kind = crate::model::CardKind::Terminal(session);
+        let edit = ModelEdit::ChangeView {
+            scope: reservation.scope.clone(),
+            expected_revision: reservation.revision,
+            operation: uuid::Uuid::new_v4(),
+            change: crate::workspace_model::views::Change::Update {
+                before: reservation.pane.clone(),
+                pane,
+            },
+        };
+        let applied = match registry.apply(&edit) {
+            Ok(applied) => applied,
+            Err(error) if error == "workspace view revision conflict" && conflicts < 2 => {
+                // Execution retirement uses its own connection and can change
+                // a neighboring pane while this workspace admission is held.
+                // Rebase only the unchanged exact reservation, never a new
+                // source or a pane moved to another view. The next iteration
+                // checks the original worker again before attempting COMMIT.
+                let current =
+                    pending_terminal(registry, reservation.pane.id, reservation.session.id)
+                        .map_err(|error| error.message)?;
+                if current.scope != reservation.scope || current.pane != reservation.pane {
+                    return Err(
+                        "The automatic terminal reservation changed before completion".into(),
+                    );
+                }
+                reservation = current;
+                conflicts += 1;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if applied.changed {
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .announce_model_edit(0, applied.sequence, &edit);
+        }
         return Ok(());
     }
-    let mut pane = reservation.pane.clone();
-    pane.pending_terminal_start = false;
-    pane.kind = crate::model::CardKind::Terminal(session);
-    let edit = ModelEdit::ChangeView {
-        scope: reservation.scope,
-        expected_revision: reservation.revision,
-        operation: uuid::Uuid::new_v4(),
-        change: crate::workspace_model::views::Change::Update {
-            before: reservation.pane,
-            pane,
-        },
-    };
-    let applied = registry.apply(&edit)?;
-    if applied.changed {
-        host.lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .announce_model_edit(0, applied.sequence, &edit);
-    }
-    Ok(())
 }
 
 #[cfg(test)]
