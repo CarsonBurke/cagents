@@ -1708,11 +1708,15 @@ impl Cagents {
                         .is_some_and(|card| card.kind.is_utility())
             })
             .collect::<Vec<_>>();
+        // A retained pane may also be canonical after a coalesced transfer and
+        // channel deletion. Each ID must consume only one durable order slot.
+        let mut seen = HashSet::new();
         let visible = view
             .panes
             .iter()
             .map(|pane| pane.id)
             .chain(retained)
+            .filter(|id| seen.insert(*id))
             .collect::<Vec<_>>();
         if let Some(index) = index {
             let channel = &mut Arc::make_mut(&mut self.durable).channels[index];
@@ -4155,6 +4159,191 @@ mod tests {
             Some(first.id),
             "the saved focus follows the strip to the pane that took it"
         );
+    }
+
+    #[test]
+    fn coalesced_transfer_and_channel_delete_preserve_distinct_retained_panes() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        let (mut app, source, destination, mut moved) = fixture();
+        let project = app
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == source)
+            .unwrap()
+            .project_id;
+        let repository = PathBuf::from("/repo/.git");
+        let worktree = PathBuf::from("/repo");
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "repo".into(),
+            repository.clone(),
+            vec![],
+            vec![],
+        ));
+        app.known_worktree_roots.insert(worktree.clone());
+        app.active_workspace = Some(worktree);
+        let mut canonical = moved.clone();
+        canonical.id = CardId::new();
+        canonical.title = "Destination pane".into();
+        let mut moved_runtime = RepositoryRuntime::dirty_fixture(moved.id);
+        moved_runtime.descriptor.project = project;
+        moved.kind = CardKind::Repository(moved_runtime.descriptor.clone());
+        moved.title = "Transferred unsaved editor".into();
+        let mut retained = moved.clone();
+        retained.id = CardId::new();
+        retained.title = "Different unsaved editor".into();
+        let mut retained_runtime = RepositoryRuntime::dirty_fixture(retained.id);
+        retained_runtime.descriptor.project = project;
+        retained.kind = CardKind::Repository(retained_runtime.descriptor.clone());
+        let mut source_view = View::empty(source);
+        source_view.panes.push(moved.clone());
+        let mut destination_view = View::empty(destination);
+        destination_view.panes = vec![canonical.clone(), retained.clone()];
+        app.workspace_model.projects = vec![crate::workspace_model::ModelProject {
+            repository: repository.clone(),
+            name: "repo".into(),
+            kind: Default::default(),
+            ordinal: 1,
+        }];
+        app.workspace_model.channels = [source, destination]
+            .into_iter()
+            .map(|id| crate::workspace_model::ModelChannel {
+                id,
+                repository: repository.clone(),
+                title: "view".into(),
+                title_source: Default::default(),
+                ordinal: 1,
+            })
+            .collect();
+        app.workspace_model.views = vec![source_view, destination_view];
+        Arc::make_mut(&mut app.durable).active_channel = Some(destination);
+        drop(app.reconcile_shared_views());
+        app.cards
+            .insert(moved.id, CardRuntime::Repository(Box::new(moved_runtime)));
+        app.cards.insert(
+            retained.id,
+            CardRuntime::Repository(Box::new(retained_runtime)),
+        );
+        let inspect = |app: &Cagents, id| {
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&id) else {
+                panic!("unsaved editor remains resident")
+            };
+            (
+                std::ptr::from_ref(runtime.as_ref()),
+                runtime.descriptor.clone(),
+                runtime.editor_text(),
+                runtime.is_dirty(),
+            )
+        };
+        let moved_before = inspect(&app, moved.id);
+        let retained_before = inspect(&app, retained.id);
+        assert_eq!(moved_before.2.as_deref(), Some("unsaved\n"));
+        assert!(moved_before.3 && retained_before.3);
+        // First create genuine, distinct retained work through peer removal.
+        // The transferred pane is still canonical and is NOT manually retained.
+        let mut model = app.workspace_model.clone();
+        let destination_view = model
+            .views
+            .iter_mut()
+            .find(|view| view.scope == Scope::Channel(destination))
+            .unwrap();
+        destination_view
+            .apply(&Change::Remove { id: retained.id })
+            .unwrap();
+        destination_view.revision += 1;
+        model.sequence += 1;
+        drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
+        assert!(app.shared_views.retained.contains(&retained.id));
+        assert!(!app.shared_views.retained.contains(&moved.id));
+        assert_eq!(inspect(&app, retained.id), retained_before);
+        // A peer moves A, then deletes its now-empty source. One complete Read
+        // can contain both operations while local source membership is stale.
+        views::transfer(
+            &mut model.views,
+            &Scope::Channel(source),
+            moved.id,
+            &Scope::Channel(destination),
+            Some(canonical.id),
+        )
+        .unwrap();
+        assert!(
+            model
+                .views
+                .iter()
+                .find(|view| view.scope == Scope::Channel(source))
+                .unwrap()
+                .panes
+                .is_empty()
+        );
+        model.fold(model.sequence + 1, &ModelEdit::DeleteChannel { id: source });
+        model
+            .views
+            .retain(|view| view.scope != Scope::Channel(source));
+        model
+            .views
+            .iter_mut()
+            .find(|view| view.scope == Scope::Channel(destination))
+            .unwrap()
+            .revision += 1;
+        let expected = vec![moved.id, canonical.id, retained.id];
+        let before_ids = app
+            .durable
+            .cards
+            .iter()
+            .map(|card| card.id)
+            .collect::<HashSet<_>>();
+        let mut settled_focus_camera = None;
+        // Equal complete Reads are a real reconciliation input. Do not call a
+        // private projection helper or invalidate a cache to force the trigger.
+        for _ in 0..3 {
+            drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
+            assert!(
+                app.shared_views.retained.contains(&moved.id),
+                "actual stale-source retirement reached the producer"
+            );
+            let channel = app
+                .durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == destination)
+                .unwrap();
+            assert_eq!(channel.cards, expected);
+            assert_eq!(channel.focused, Some(canonical.id));
+            let ids = app
+                .durable
+                .cards
+                .iter()
+                .map(|card| card.id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                ids.len(),
+                before_ids.len(),
+                "no duplicate descriptor may replace a different retained card"
+            );
+            assert_eq!(ids.iter().copied().collect::<HashSet<_>>(), before_ids);
+            assert_eq!(ids.iter().filter(|id| **id == retained.id).count(), 1);
+            assert_eq!(app.card_state(retained.id).unwrap().kind, retained.kind);
+            assert_eq!(app.card_state(retained.id).unwrap().title, retained.title);
+            assert_eq!(inspect(&app, moved.id), moved_before);
+            assert_eq!(inspect(&app, retained.id), retained_before);
+            let strip = app.workspace.order().collect::<Vec<_>>();
+            assert_eq!(strip.iter().filter(|id| **id == moved.id).count(), 1);
+            assert_eq!(strip.iter().filter(|id| **id == retained.id).count(), 1);
+            assert_eq!(
+                strip.iter().copied().collect::<HashSet<_>>().len(),
+                strip.len()
+            );
+            let focus_camera = (app.workspace.focused(), app.workspace.camera().offset());
+            assert_eq!(focus_camera.0, Some(canonical.id));
+            if let Some(before) = settled_focus_camera {
+                assert_eq!(focus_camera, before);
+            }
+            settled_focus_camera = Some(focus_camera);
+            assert!(!app.chat_start_pending(moved.id));
+            assert!(!app.chat_close_owned(moved.id));
+        }
     }
 
     #[test]
