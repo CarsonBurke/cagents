@@ -238,8 +238,8 @@ impl Reservation {
     }
 
     /// Refuses while any process this user can inspect has its working
-    /// directory, root, executable or an open file inside the worktree. This
-    /// sees what the daemon does not host: shells, editors, build watchers.
+    /// directory, root, executable, open file or mapped file inside the worktree.
+    /// This sees what the daemon does not host: shells, editors, build watchers.
     pub(crate) fn ensure_no_processes(&self) -> Result<(), String> {
         let scan = || occupant(Path::new("/proc"), &self.scope.path, std::process::id());
         let mut found = scan();
@@ -375,7 +375,7 @@ pub(super) fn ensure_outside_directory(
 }
 
 /// The first process under `proc` other than `own` with its working
-/// directory, root, executable or an open file descriptor inside `scope`.
+/// directory, root, executable, open descriptor or mapped file inside `scope`.
 /// Processes that vanish, or that belong to another user, are skipped.
 fn occupant(proc: &Path, scope: &Path, own: u32) -> io::Result<Option<(u32, String)>> {
     let inside = |link: &Path| match std::fs::read_link(link) {
@@ -422,6 +422,26 @@ fn occupant(proc: &Path, scope: &Path, own: u32) -> io::Result<Option<(u32, Stri
                     Err(error) => return Err(error),
                 };
                 if inside(&descriptor.path())? {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found {
+            // Closing a descriptor does not release a file-backed mapping.
+            // A writer can still change that file after the content inspection.
+            let mappings = match std::fs::read_dir(process.join("map_files")) {
+                Ok(mappings) => mappings,
+                Err(error) if skippable(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            for mapping in mappings {
+                let mapping = match mapping {
+                    Ok(mapping) => mapping,
+                    Err(error) if skippable(&error) => break,
+                    Err(error) => return Err(error),
+                };
+                if inside(&mapping.path())? {
                     found = true;
                     break;
                 }
