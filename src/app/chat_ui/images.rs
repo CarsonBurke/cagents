@@ -117,13 +117,18 @@ enum DecodeAdmission {
 }
 struct DecoderInput<'a> {
     bytes: &'a [u8],
-    webp_orientation: Option<image::metadata::Orientation>,
+    orientation_override: Option<image::metadata::Orientation>,
+    ico_dimensions: Option<(u16, u16)>,
 }
 fn bounded_decoder_input(bytes: &[u8]) -> Option<DecoderInput<'_>> {
+    if bytes.get(..4) == Some(b"\0\0\x01\0") {
+        return bounded_ico_input(bytes);
+    }
     if bytes.get(..4) != Some(b"RIFF") || bytes.get(8..12) != Some(b"WEBP") {
         return Some(DecoderInput {
             bytes,
-            webp_orientation: None,
+            orientation_override: None,
+            ico_dimensions: None,
         });
     }
     // The pinned WebP decoder records declared metadata ranges before proving
@@ -156,11 +161,80 @@ fn bounded_decoder_input(bytes: &[u8]) -> Option<DecoderInput<'_>> {
     // Only the first actual top-level EXIF payload supplies orientation.
     Some(DecoderInput {
         bytes: container,
-        webp_orientation: Some(
+        orientation_override: Some(
             exif.and_then(image::metadata::Orientation::from_exif_chunk)
                 .unwrap_or(image::metadata::Orientation::NoTransforms),
         ),
+        ico_dimensions: None,
     })
+}
+fn bounded_ico_input(bytes: &[u8]) -> Option<DecoderInput<'_>> {
+    let count = usize::from(u16::from_le_bytes(bytes.get(4..6)?.try_into().ok()?));
+    if count == 0 {
+        return None;
+    }
+    let directory_end = 6usize.checked_add(count.checked_mul(16)?)?;
+    let directory = bytes.get(6..directory_end)?;
+    let dimension = |value: u8| if value == 0 { 256 } else { u16::from(value) };
+    let score = |entry: &[u8]| {
+        (
+            u16::from_le_bytes([entry[6], entry[7]]),
+            u32::from(dimension(entry[0])) * u32::from(dimension(entry[1])),
+        )
+    };
+    // Match image 0.25.10: seed the last entry, then replace only on a
+    // strictly greater score while visiting earlier entries in file order.
+    let mut selected = &directory[directory.len() - 16..];
+    for entry in directory.chunks_exact(16) {
+        if u16::from_le_bytes([entry[4], entry[5]]) > 256
+            || u16::from_le_bytes([entry[6], entry[7]]) > 256
+        {
+            return None;
+        }
+        if score(entry) > score(selected) {
+            selected = entry;
+        }
+    }
+    let length = usize::try_from(u32::from_le_bytes(selected[8..12].try_into().ok()?)).ok()?;
+    let start = usize::try_from(u32::from_le_bytes(selected[12..16].try_into().ok()?)).ok()?;
+    let image = bytes.get(start..start.checked_add(length)?)?;
+    let is_png = image.get(..8)? == b"\x89PNG\r\n\x1a\n";
+    Some(DecoderInput {
+        // PNG must receive limits before read_info inflates metadata. Keep
+        // DIBs on the existing ICO decoder, including its AND-mask behavior.
+        bytes: if is_png { image } else { bytes },
+        orientation_override: is_png.then_some(image::metadata::Orientation::NoTransforms),
+        ico_dimensions: is_png.then_some((dimension(selected[0]), dimension(selected[1]))),
+    })
+}
+fn decoder_with_limits<'a>(
+    input: &DecoderInput<'a>,
+    max_alloc: u64,
+) -> Option<impl image::ImageDecoder + 'a> {
+    use image::ImageDecoder;
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(input.bytes))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    // Each axis of a positive image within the existing pixel-product limit
+    // fits this ceiling, without an unadmitted dimension-only constructor.
+    limits.max_image_width = Some(MAX_PIXELS as u32);
+    limits.max_image_height = Some(MAX_PIXELS as u32);
+    limits.max_alloc = Some(max_alloc);
+    reader.limits(limits);
+    let decoder = reader.into_decoder().ok()?;
+    if let Some((width, height)) = input.ico_dimensions {
+        let (actual_width, actual_height) = decoder.dimensions();
+        // Preserve the ICO wrapper's PNG-specific checks and its treatment
+        // of a zero directory dimension as 256, including larger PNGs.
+        if u32::from(width) != actual_width.min(256)
+            || u32::from(height) != actual_height.min(256)
+            || decoder.color_type() != image::ColorType::Rgba8
+        {
+            return None;
+        }
+    }
+    Some(decoder)
 }
 fn decode_handle(bytes: &[u8], budget: &Budget, edge: Option<u32>, max_bytes: usize) -> Loaded {
     decode_handle_with_admission(bytes, budget, edge, max_bytes, DecodeAdmission::Defer)
@@ -207,19 +281,7 @@ fn decode_handle_with_admission(
     let Some(input) = bounded_decoder_input(bytes) else {
         return Loaded::Unavailable;
     };
-    let mut reader =
-        match image::ImageReader::new(std::io::Cursor::new(input.bytes)).with_guessed_format() {
-            Ok(reader) => reader,
-            Err(_) => return Loaded::Unavailable,
-        };
-    let mut limits = image::Limits::default();
-    // Each axis of a positive image within the existing pixel-product limit
-    // fits this ceiling, without an unadmitted dimension-only constructor.
-    limits.max_image_width = Some(MAX_PIXELS as u32);
-    limits.max_image_height = Some(MAX_PIXELS as u32);
-    limits.max_alloc = Some(MAX_DECODE_BYTES);
-    reader.limits(limits);
-    let Ok(mut decoder) = reader.into_decoder() else {
+    let Some(mut decoder) = decoder_with_limits(&input, MAX_DECODE_BYTES) else {
         return Loaded::Unavailable;
     };
     let (width, height) = decoder.dimensions();
@@ -248,7 +310,7 @@ fn decode_handle_with_admission(
         Ok(permit) => permit,
         Err(deferred) => return deferred,
     };
-    let orientation = input.webp_orientation.unwrap_or_else(|| {
+    let orientation = input.orientation_override.unwrap_or_else(|| {
         decoder
             .orientation()
             .unwrap_or(image::metadata::Orientation::NoTransforms)
@@ -1656,6 +1718,217 @@ mod tests {
         ));
         assert_eq!(budget.encoded.available_permits(), bytes.len());
         assert_eq!(budget.pixels.available_permits(), 3);
+    }
+    fn ico_bytes(entries: &[(u8, u8, u16, &[u8])]) -> Vec<u8> {
+        let mut bytes = b"\0\0\x01\0".to_vec();
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        let mut offset = 6 + entries.len() * 16;
+        for &(width, height, depth, image) in entries {
+            bytes.extend_from_slice(&[width, height, 0, 0]);
+            bytes.extend_from_slice(&1u16.to_le_bytes());
+            bytes.extend_from_slice(&depth.to_le_bytes());
+            bytes.extend_from_slice(&(image.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&(offset as u32).to_le_bytes());
+            offset += image.len();
+        }
+        for &(_, _, _, image) in entries {
+            bytes.extend_from_slice(image);
+        }
+        bytes
+    }
+    fn ico_png(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
+        use image::ImageEncoder;
+        let mut bytes = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut bytes)
+            .write_image(pixels, width, height, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        bytes
+    }
+    fn assert_ico_pixels(bytes: Vec<u8>, dimensions: (u32, u32), expected: &[u8]) {
+        let budget = Budget::new(bytes.len(), expected.len());
+        let encoded_length = bytes.len();
+        let Loaded::Ready(iced::widget::image::Handle::Rgba {
+            width,
+            height,
+            pixels,
+            ..
+        }) = bounded_handle(bytes, &budget)
+        else {
+            panic!("valid ICO must decode");
+        };
+        assert_eq!((width, height), dimensions);
+        assert_eq!(pixels.as_ref(), expected);
+        assert_eq!(budget.encoded.available_permits(), encoded_length);
+        assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+        assert_eq!(budget.pixels.available_permits(), 0);
+        drop(pixels);
+        assert_eq!(budget.pixels.available_permits(), expected.len());
+    }
+    #[test]
+    fn ico_preview_preserves_selection_ties_and_validates_the_whole_directory() {
+        let red = ico_png(1, 1, &[255, 0, 0, 255]);
+        let green = ico_png(1, 1, &[0, 255, 0, 255]);
+        let blue = ico_png(2, 1, &[0, 0, 255, 255, 0, 0, 255, 255]);
+        for (entries, selected) in [
+            (
+                vec![(1, 1, 32, red.as_slice()), (2, 1, 24, blue.as_slice())],
+                red.as_slice(),
+            ),
+            (
+                vec![(1, 1, 32, red.as_slice()), (2, 1, 32, blue.as_slice())],
+                blue.as_slice(),
+            ),
+            (
+                vec![(1, 1, 32, red.as_slice()), (1, 1, 32, green.as_slice())],
+                green.as_slice(),
+            ),
+            (
+                vec![
+                    (1, 1, 32, red.as_slice()),
+                    (1, 1, 32, green.as_slice()),
+                    (2, 1, 24, blue.as_slice()),
+                ],
+                red.as_slice(),
+            ),
+        ] {
+            let bytes = ico_bytes(&entries);
+            assert_eq!(bounded_decoder_input(&bytes).unwrap().bytes, selected);
+        }
+        assert_ico_pixels(ico_bytes(&[(1, 1, 32, &red)]), (1, 1), &[255, 0, 0, 255]);
+        let bytes = ico_bytes(&[(1, 1, 24, &red), (1, 1, 32, &green)]);
+        let mut unused_bad_range = bytes.clone();
+        unused_bad_range[14..22].fill(255);
+        assert_eq!(
+            bounded_decoder_input(&unused_bad_range).unwrap().bytes,
+            green
+        );
+        for field in [10, 12] {
+            let mut invalid = bytes.clone();
+            invalid[field..field + 2].copy_from_slice(&257u16.to_le_bytes());
+            assert!(bounded_decoder_input(&invalid).is_none());
+            invalid[field..field + 2].copy_from_slice(&256u16.to_le_bytes());
+            assert!(bounded_decoder_input(&invalid).is_some());
+        }
+        let single = ico_bytes(&[(1, 1, 32, &red)]);
+        let mut empty = single.clone();
+        empty[4..6].fill(0);
+        let mut short_directory = single[..21].to_vec();
+        short_directory[4..6].copy_from_slice(&2u16.to_le_bytes());
+        let mut bad_offset = single.clone();
+        bad_offset[18..22].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut bad_length = single.clone();
+        bad_length[14..18].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut short_png = single;
+        short_png[14..18].copy_from_slice(&7u32.to_le_bytes());
+        for invalid in [
+            b"\0\0\x01\0".to_vec(),
+            empty,
+            short_directory,
+            bad_offset,
+            bad_length,
+            short_png,
+        ] {
+            assert!(bounded_decoder_input(&invalid).is_none());
+            let budget = Budget::new(invalid.len(), 4);
+            let encoded_length = invalid.len();
+            assert!(matches!(
+                bounded_handle(invalid, &budget),
+                Loaded::Unavailable
+            ));
+            assert_eq!(budget.encoded.available_permits(), encoded_length);
+            assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+            assert_eq!(budget.pixels.available_permits(), 4);
+        }
+    }
+    #[test]
+    fn ico_preview_preserves_png_checks_orientation_and_dib_mask() {
+        use image::ImageEncoder;
+        let pixels = [255, 0, 0, 255, 0, 255, 0, 255];
+        let mut oriented = Vec::new();
+        let mut encoder = image::codecs::png::PngEncoder::new(&mut oriented);
+        encoder
+            .set_exif_metadata(
+                b"II\x2a\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0\0\0\0\0".to_vec(),
+            )
+            .unwrap();
+        encoder
+            .write_image(&pixels, 2, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        assert_ico_pixels(ico_bytes(&[(2, 1, 32, &oriented)]), (2, 1), &pixels);
+        let large_pixels = [1, 2, 3, 255].repeat(257);
+        let large = ico_png(257, 1, &large_pixels);
+        // Directory zero means 256; upstream compares actual.min(256).
+        assert_ico_pixels(ico_bytes(&[(0, 1, 32, &large)]), (257, 1), &large_pixels);
+        let mut rgb = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut rgb)
+            .write_image(&[1, 2, 3], 1, 1, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        for invalid in [
+            ico_bytes(&[(1, 1, 32, &oriented)]),
+            ico_bytes(&[(1, 1, 24, &rgb)]),
+        ] {
+            let budget = Budget::new(invalid.len(), 8);
+            let encoded_length = invalid.len();
+            assert!(matches!(
+                bounded_handle(invalid, &budget),
+                Loaded::Unavailable
+            ));
+            assert_eq!(budget.encoded.available_permits(), encoded_length);
+            assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+            assert_eq!(budget.pixels.available_permits(), 8);
+        }
+        let mut dib = vec![0; 48];
+        dib[..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&1u32.to_le_bytes());
+        dib[8..12].copy_from_slice(&2u32.to_le_bytes()); // Image plus AND mask.
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+        dib[20..24].copy_from_slice(&4u32.to_le_bytes());
+        dib[40..44].copy_from_slice(&[3, 2, 1, 255]);
+        dib[44] = 0x80; // Mask the sole pixel transparent.
+        let bytes = ico_bytes(&[(1, 1, 32, &dib)]);
+        let input = bounded_decoder_input(&bytes).unwrap();
+        assert_eq!(input.bytes.as_ptr(), bytes.as_ptr());
+        assert_eq!(input.bytes.len(), bytes.len());
+        assert_eq!(input.orientation_override, None);
+        assert_ico_pixels(bytes, (1, 1), &[1, 2, 3, 0]);
+    }
+    #[test]
+    fn ico_png_metadata_receives_constructor_limits_and_retains_full_input_accounting() {
+        use image::{ImageDecoder, ImageEncoder};
+        let profile = vec![0; 4096];
+        let mut png = Vec::new();
+        let mut encoder = image::codecs::png::PngEncoder::new(&mut png);
+        encoder.set_icc_profile(profile.clone()).unwrap();
+        encoder
+            .write_image(&[1, 2, 3, 255], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        assert!(png.len() < 1024);
+        let bytes = ico_bytes(&[(1, 1, 32, &png)]);
+        let input = bounded_decoder_input(&bytes).unwrap();
+        assert_eq!(input.bytes, png);
+        for max_alloc in [1024, 16384] {
+            let mut decoder = decoder_with_limits(&input, max_alloc).unwrap();
+            let metadata = decoder.icc_profile().unwrap();
+            // png suppresses an iCCP inflation-limit error and still decodes
+            // pixels. Inspect metadata, with the high-limit positive control.
+            assert_eq!(metadata, (max_alloc > 4096).then(|| profile.clone()));
+            assert_eq!(
+                image::DynamicImage::from_decoder(decoder)
+                    .unwrap()
+                    .into_rgba8()
+                    .as_raw(),
+                &[1, 2, 3, 255]
+            );
+        }
+        assert_ico_pixels(bytes.clone(), (1, 1), &[1, 2, 3, 255]);
+        let budget = Budget::new(png.len(), 4);
+        assert!(
+            matches!(bounded_handle(bytes.clone(), &budget), Loaded::Deferred(pressure) if pressure.permits as usize == bytes.len())
+        );
+        assert_eq!(budget.encoded.available_permits(), png.len());
+        assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+        assert_eq!(budget.pixels.available_permits(), 4);
     }
     fn oriented_webp(orientation: u8) -> Vec<u8> {
         use image::ImageEncoder;
