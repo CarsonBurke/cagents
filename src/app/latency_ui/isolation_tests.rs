@@ -33,6 +33,45 @@ async fn drain_app_tasks(shell: &mut Cosmic<Cagents>, task: Task<Message>) -> Ve
     .expect("local fixture tasks must settle without backend work")
 }
 
+fn transcript_is_mounted(app: &Cagents, renderer: &Renderer, card: CardId, size: Size) -> bool {
+    use cosmic::iced::advanced::widget::{Operation, operation::Scrollable};
+    struct Transcript {
+        id: String,
+        mounted: bool,
+    }
+    impl Operation for Transcript {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn scrollable(
+            &mut self,
+            id: Option<&widget::Id>,
+            bounds: Rectangle,
+            _: Rectangle,
+            _: Vector,
+            _: &mut dyn Scrollable,
+        ) {
+            self.mounted |= id.is_some_and(|id| id.to_string() == self.id)
+                && bounds.width > 0.0
+                && bounds.height > 0.0;
+        }
+    }
+    let mut element = cosmic::ApplicationExt::view_main(app);
+    let mut tree = Tree::new(&element);
+    let node =
+        element
+            .as_widget_mut()
+            .layout(&mut tree, renderer, &layout::Limits::new(Size::ZERO, size));
+    let mut transcript = Transcript {
+        id: card_control_id(card, "chat-transcript").to_string(),
+        mounted: false,
+    };
+    element
+        .as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), renderer, &mut transcript);
+    transcript.mounted
+}
+
 /// Isolate globals and paths without clearing or replacing caller authority.
 /// A real App init, its subscriptions and mounted view must not even attempt
 /// a refused service call. The socket only rejects; it supplies no identity,
@@ -162,6 +201,15 @@ fn actual_app_fixture_mounts_and_interacts_without_service_attempts() {
             executor.block_on(drain_app_tasks(&mut shell, task));
         }};
     }
+    let mut frame_time = Instant::now();
+    macro_rules! settle_frames {
+        () => {{
+            for _ in 0..40 {
+                frame_time += Duration::from_millis(16);
+                send!(Message::Frame(frame_time));
+            }
+        }};
+    }
     let expected_scale = if std::env::var(crate::latency_fixture::SCALE_ENV).unwrap() == "0.8" {
         0.8
     } else {
@@ -227,13 +275,124 @@ fn actual_app_fixture_mounts_and_interacts_without_service_attempts() {
         native_scroll,
         "native wheel input must reach the mounted workspace scroll callback"
     );
-    let first = shell.app.workspace.focused().unwrap();
+    let first = shell.app.durable.cards[0].id;
+    let neighbor = shell.app.durable.cards[1].id;
+    // The overlay hides every transcript. After it closes, moving from an
+    // initially offscreen neighbor must expose its real body, not a blank pane.
+    send!(Message::ContextInspector(InspectorAction::Close));
+    settle_frames!();
+    send!(Message::WindowResized(900.0, 600.0));
+    send!(Message::Viewport {
+        generation: shell.app.workspace_view_generation,
+        event: WorkspaceViewportEvent::Resized(590.0)
+    });
+    send!(Message::FocusCard(first));
+    send!(Message::ResizeCard {
+        card: first,
+        width: 590.0
+    });
+    send!(Message::ResizeCardFinished(first));
+    settle_frames!();
+    assert_ne!(
+        shell.app.workspace.visibility(neighbor),
+        Some(VisibilityClass::Visible),
+        "neighbor must initially be outside the visible viewport"
+    );
+    send!(Message::ToggleContextInspector);
+    assert!(shell.app.context_inspector_is_overlay());
+    send!(Message::ContextInspector(InspectorAction::Close));
+    settle_frames!();
+    assert!(!shell.app.context_inspector_is_overlay());
+    send!(Message::FocusAdjacent(FocusDirection::Right));
+    settle_frames!();
+    assert_eq!(shell.app.workspace.focused(), Some(neighbor));
+    assert!(
+        transcript_is_mounted(&shell.app, &renderer, neighbor, Size::new(900.0, 600.0)),
+        "newly exposed resident transcript must mount after closing the overlay"
+    );
+    send!(Message::WindowResized(1600.0, 1000.0));
+    send!(Message::Viewport {
+        generation: shell.app.workspace_view_generation,
+        event: WorkspaceViewportEvent::Resized(1290.0)
+    });
+    send!(Message::ResizeCard {
+        card: first,
+        width: 645.0
+    });
+    send!(Message::ResizeCardFinished(first));
+    send!(Message::FocusCard(first));
+    settle_frames!();
     send!(Message::FocusAdjacent(FocusDirection::Right));
     assert_ne!(shell.app.workspace.focused(), Some(first));
     send!(Message::Sidebar(SidebarAction::Resize { width: 310.0 }));
     assert_eq!(shell.app.settings.sidebar_width, 310.0);
     send!(Message::ContextInspector(InspectorAction::Close));
     assert!(!shell.app.context_inspector_open);
+    // Mount the real wide footer so its backend controls are present, rather
+    // than proving refusal only after an enabled-looking control is pressed.
+    send!(Message::WindowResized(2400.0, 1000.0));
+    send!(Message::Viewport {
+        generation: shell.app.workspace_view_generation,
+        event: WorkspaceViewportEvent::Resized(2090.0)
+    });
+    send!(Message::FocusCard(first));
+    send!(Message::ResizeCard {
+        card: first,
+        width: 900.0
+    });
+    send!(Message::ResizeCardFinished(first));
+    settle_frames!();
+    {
+        let mut element = cosmic::ApplicationExt::view_main(&shell.app);
+        tree.diff(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(2400.0, 1000.0)),
+        );
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let labelled = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter(|node| {
+                matches!(
+                    node.node().label(),
+                    Some("Choose a model" | "Remove attachment")
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            labelled
+                .iter()
+                .any(|node| node.node().label() == Some("Choose a model")),
+            "actual fixture model control must be mounted"
+        );
+        assert!(
+            labelled
+                .iter()
+                .any(|node| node.node().label() == Some("Remove attachment")),
+            "actual static attachment controls must be mounted"
+        );
+        assert!(
+            labelled.iter().all(|node| node.node().is_disabled()),
+            "unavailable fixture controls must report disabled to native accessibility"
+        );
+    }
+    send!(Message::WindowResized(1600.0, 1000.0));
+    send!(Message::Viewport {
+        generation: shell.app.workspace_view_generation,
+        event: WorkspaceViewportEvent::Resized(1290.0)
+    });
+    send!(Message::ResizeCard {
+        card: first,
+        width: 645.0
+    });
+    send!(Message::ResizeCardFinished(first));
+    settle_frames!();
     let target = chat_ui::Target {
         card: first,
         generation: 0,

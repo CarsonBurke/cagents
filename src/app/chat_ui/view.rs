@@ -1,6 +1,17 @@
 use super::coordination::Coordinated;
 use super::*;
 
+/// A diagnostic transcript has no account/provider configuration lane. Keep
+/// these controls present but visibly disabled instead of accepting a click
+/// which the fixture's typed dispatcher must refuse.
+fn backend_action(command: Action) -> Option<Message> {
+    #[cfg(feature = "latency-harness")]
+    if crate::latency_fixture::enabled() {
+        return None;
+    }
+    Some(action(command))
+}
+
 /// Bind a link to the surface that rendered it, before another pane, project,
 /// or child conversation can become selected.
 pub(super) fn capture_document_link(
@@ -2466,7 +2477,7 @@ impl Runtime {
                 icon(
                     Icon::Delete,
                     "Remove attachment",
-                    !transitioning,
+                    backend_available && !transitioning,
                     Action::RemoveAttachment(target, index),
                 ),
             ])
@@ -3030,7 +3041,7 @@ impl Runtime {
                     None,
                 ))
                 .padding(CONTROL_PADDING)
-                .on_press(action(Action::PermissionPicker(
+                .on_press_maybe(backend_action(Action::PermissionPicker(
                     target,
                     !self.permission_picker,
                 )))
@@ -3404,7 +3415,7 @@ impl Runtime {
                 .id(card_control_id(target.card, "chat-reasoning-picker"))
                 .class(crate::ui_controls::control_style(open, None))
                 .padding(CONTROL_PADDING)
-                .on_press(action(Action::ReasoningPicker(target, !open)));
+                .on_press_maybe(backend_action(Action::ReasoningPicker(target, !open)));
                 let choices = open.then(|| {
                     widget::column::with_children(
                         model
@@ -3475,7 +3486,7 @@ impl Runtime {
                     .name("Choose permission mode")
                     .class(crate::ui_controls::control_style(open, None))
                     .padding(CONTROL_PADDING)
-                    .on_press(action(Action::PermissionPicker(target, !open)));
+                    .on_press_maybe(backend_action(Action::PermissionPicker(target, !open)));
                 controls.push(crate::interaction::tooltip(
                     anchor,
                     crate::workspace_widget::shortcut_tooltip(
@@ -3546,7 +3557,7 @@ impl Runtime {
         .name("Choose an account")
         .class(crate::ui_controls::control_style(open, None))
         .padding(CONTROL_PADDING)
-        .on_press(action(Action::AccountPicker(target, !open)));
+        .on_press_maybe(backend_action(Action::AccountPicker(target, !open)));
         let anchor = crate::interaction::tooltip(
             anchor,
             crate::workspace_widget::shortcut_tooltip(
@@ -3680,7 +3691,7 @@ impl Runtime {
         .id(card_control_id(target.card, "chat-model-picker"))
         .class(crate::ui_controls::control_style(open, None))
         .padding(CONTROL_PADDING)
-        .on_press(action(Action::ModelPicker(target, !open)));
+        .on_press_maybe(backend_action(Action::ModelPicker(target, !open)));
         let anchor = crate::interaction::tooltip(
             anchor,
             crate::workspace_widget::shortcut_tooltip(

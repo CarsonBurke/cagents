@@ -447,6 +447,7 @@ impl Action {
                 | Self::CopyLiteral(..)
                 | Self::CopySharedCode(..)
                 | Self::ClearCopied(..)
+                | Self::FooterPicker(..)
         )
     }
 
@@ -5217,6 +5218,34 @@ const QUEUED_BLOCKER: &str = "Wait for the first message to be sent before leavi
 const MODEL_PATIENCE: Duration = Duration::from_secs(10);
 
 impl Cagents {
+    #[cfg(feature = "latency-harness")]
+    pub(super) fn sync_native_fixture_visibility(&mut self) {
+        if self.latency_fixture.is_none() {
+            return;
+        }
+        let surfaces_visible = self.workspace_surfaces_visible();
+        // Reconcile the initial seed as well as later transitions. The seed
+        // viewport was measured before resident runtimes were installed.
+        for card in &mut Arc::make_mut(&mut self.durable).cards {
+            card.exposure = self
+                .workspace
+                .visibility(card.id)
+                .unwrap_or(VisibilityClass::Offscreen)
+                .into();
+        }
+        for (card, runtime) in &mut self.cards {
+            if let CardRuntime::Chat(runtime) = runtime
+                && runtime.is_draft()
+            {
+                // Draft has no ClientHandle. This updates local presentation
+                // interest without a service, lifecycle or hydration lane.
+                let visible = surfaces_visible
+                    && self.workspace.visibility(*card) == Some(VisibilityClass::Visible);
+                let _ = runtime.set_visible(visible);
+            }
+        }
+    }
+
     #[cfg(feature = "latency-harness")]
     pub(super) fn handle_fixture_chat(&mut self, action: Action) -> Task<Message> {
         if !action.fixture_local()
