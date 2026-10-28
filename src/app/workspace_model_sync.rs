@@ -631,13 +631,23 @@ impl Cagents {
         self.apply_workspace_model_update_effect(update).0
     }
 
-    /// Only stale complete snapshots skip projection. Even an equal model can
-    /// restore optimistic local state after refusal (for example channel titles).
-    /// Newer metadata edges may still lack an older snapshot's full inventory.
+    /// Stale snapshots and replies from a replaced registry skip projection.
+    /// An equal current model can still restore optimistic state after refusal
+    /// (for example channel titles). Newer metadata edges may still lack an
+    /// older snapshot's full inventory.
     pub(super) fn apply_workspace_model_update_effect(
         &mut self,
         update: ModelUpdate,
     ) -> (Task<Message>, bool) {
+        // Publisher replies can cross the observer's Connected boundary. Only
+        // that observer may replace an already known registry; an old read or
+        // reopen must not roll back sharing or settle a successor's intent.
+        if let ModelUpdate::Read(model) | ModelUpdate::Reopened { model, .. } = &update
+            && self.workspace_model.identity != NO_REGISTRY
+            && model.identity != self.workspace_model.identity
+        {
+            return (Task::none(), false);
+        }
         if let ModelUpdate::Read(model) = &update
             && model.identity == self.workspace_model.identity
             && model.sequence < self.shared_views.snapshot_sequence
@@ -723,6 +733,12 @@ impl Cagents {
                 Task::batch([closed, self.reconcile_workspace_model()])
             }
             ModelUpdate::Read(model) => {
+                if self.workspace_model.identity == NO_REGISTRY {
+                    // A publisher can answer before the observer. Saved shared
+                    // flags belong to the saved registry, so bind this real
+                    // incoming registry before interpreting any absence.
+                    self.join_workspace_model(model.identity);
+                }
                 if !self.install_workspace_model_snapshot(model) {
                     return Task::none();
                 }
@@ -855,6 +871,12 @@ impl Cagents {
                 {
                     return Task::none();
                 }
+                if self.workspace_model.identity == NO_REGISTRY {
+                    // Bind bootstrap ACK authority too. Otherwise an ACK from
+                    // A could survive Connected(B) when B matches saved state.
+                    self.join_workspace_model(registry);
+                }
+                let local = &self.durable.channels[index];
                 if local.ordinal == ordinal && local.shared {
                     return Task::none();
                 }
@@ -911,7 +933,14 @@ impl Cagents {
         if self.durable.workspace_model_identity == Some(identity) {
             return;
         }
+        // A real default-terminal choice can precede the first model. Its
+        // existing active-path/empty-view checks still govern consumption;
+        // joining the first registry must not silently discard that choice.
+        let deferred_default = (self.workspace_model.identity == NO_REGISTRY)
+            .then(|| self.shared_views.deferred_default.take())
+            .flatten();
         self.shared_views = super::shared_views::State::for_workspace(&self.durable);
+        self.shared_views.deferred_default = deferred_default;
         self.clear_closed_chat_drafts();
         let durable = Arc::make_mut(&mut self.durable);
         durable.workspace_model_identity = Some(identity);
