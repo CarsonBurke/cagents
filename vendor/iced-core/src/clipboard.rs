@@ -248,6 +248,11 @@ impl DndDestinationRectangles {
         self.rectangles.reverse();
         self.rectangles
     }
+
+    /// Extracts the final target list for native registration.
+    pub fn into_native_rectangles(self) -> Vec<DndDestinationRectangle> {
+        self.into_rectangles()
+    }
 }
 
 impl AsRef<[DndDestinationRectangle]> for DndDestinationRectangles {

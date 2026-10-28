@@ -2082,7 +2082,7 @@ where
     {
         clipboard.register_dnd_destination(
             DndSurface(Arc::new(Box::new(raw.clone()))),
-            dnd_rectangles.into_rectangles(),
+            dnd_rectangles.into_native_rectangles(),
         );
     }
 

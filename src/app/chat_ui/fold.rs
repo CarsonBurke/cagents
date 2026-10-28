@@ -566,7 +566,7 @@ mod tests {
                 .as_widget()
                 .drag_destinations(&tree, layout, &renderer, &mut destinations);
             let actual: Vec<_> = destinations
-                .into_rectangles()
+                .into_native_rectangles()
                 .into_iter()
                 .map(|target| (target.id, target.rectangle.y, target.rectangle.height))
                 .collect();

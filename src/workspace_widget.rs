@@ -2165,7 +2165,13 @@ mod tests {
         let renderer = renderer();
         let shortcuts = KeyboardShortcuts::default();
         let offset = Vector::new(7.0, -22.0);
-        for nested in [false, true] {
+        for wrapper in [
+            "plain",
+            "surface",
+            "scroll",
+            "file drop",
+            "scroll and file drop",
+        ] {
             let (content, visits) = leaf::<()>(
                 Size::new(100.0, 60.0),
                 vec![
@@ -2183,14 +2189,23 @@ mod tests {
                     ),
                 ],
             );
-            let content: Element<'_, ()> = if nested {
-                WorkspaceSurface::new(content, &shortcuts, FocusedPane::Other, 100.0, |_| ()).into()
-            } else {
-                content
+            let content: Element<'_, ()> = match wrapper {
+                "surface" => {
+                    WorkspaceSurface::new(content, &shortcuts, FocusedPane::Other, 100.0, |_| ())
+                        .into()
+                }
+                "scroll" | "scroll and file drop" => cosmic::widget::scrollable(content)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into(),
+                _ => content,
             };
             let mut surface: Element<'_, ()> =
                 WorkspaceSurface::new(content, &shortcuts, FocusedPane::Other, 100.0, |_| ())
                     .into();
+            if matches!(wrapper, "file drop" | "scroll and file drop") {
+                surface = crate::file_drop::surface(surface, 1.0);
+            }
             let mut tree = Tree::new(&surface);
             let node = surface
                 .as_widget_mut()
@@ -2227,12 +2242,13 @@ mod tests {
                     .iter()
                     .map(|target| target.id)
                     .collect::<Vec<_>>(),
-                vec![99, 1, 2]
+                vec![99, 1, 2],
+                "each internal wrapper preserves registration order: {wrapper}"
             );
             // This is the exact extraction performed by the iced native
             // consumer, after all enclosing widgets finished registration.
             let actual: Vec<_> = destinations
-                .into_rectangles()
+                .into_native_rectangles()
                 .into_iter()
                 .map(|target| {
                     (

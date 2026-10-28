@@ -20184,7 +20184,7 @@ mod tests {
             &mut destinations,
         );
         let actual: Vec<_> = destinations
-            .into_rectangles()
+            .into_native_rectangles()
             .into_iter()
             .map(|destination| {
                 (
