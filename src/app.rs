@@ -17099,6 +17099,22 @@ impl Application for Cagents {
                 // The dialog is an overlay, so it has already seen the
                 // keystroke by the time this runs, and what it does with one
                 // is its own affair.
+                // The inspector's advertised toggle closes this foreground
+                // surface; it must not be blocked with the workspace behind it.
+                if self.context_inspector_is_overlay()
+                    && !self.modal_is_open()
+                    && workspace_widget::global_shortcut(
+                        &event,
+                        &self.settings.keyboard_shortcuts,
+                        self.focused_pane(),
+                    ) == Some(workspace_widget::GlobalShortcut::ToggleInspector)
+                    && let keyboard::Event::KeyPressed { modifiers, .. } = &event
+                {
+                    return self.run_workspace_command(
+                        workspace_widget::GlobalShortcut::ToggleInspector,
+                        *modifiers,
+                    );
+                }
                 if self.workspace_inputs_blocked() {
                     return Task::none();
                 }
