@@ -4,6 +4,10 @@
 use super::*;
 use crate::model::WorktreeId;
 mod cache;
+mod resume;
+pub(in crate::app) use resume::Completion as ResumeCompletion;
+#[cfg(test)]
+mod resume_tests;
 use notify::Watcher;
 use std::sync::{
     Mutex,
@@ -16,6 +20,7 @@ pub(in crate::app) struct State {
     active: Option<(u64, u64)>,
     ticket: u64,
     pending: Option<Request>,
+    resume: Option<Arc<resume::Intent>>,
     failed_sync: Option<(Vec<PathBuf>, Instant)>,
     cache: Option<cache::Handle>,
     cached: Option<Cached>,
@@ -28,6 +33,10 @@ pub(in crate::app) struct State {
     local_window: bool,
     #[cfg(test)]
     runtime: Option<PathBuf>,
+    #[cfg(test)]
+    before_resume_resolve: Option<Arc<dyn Fn(&Path) + Send + Sync>>,
+    #[cfg(test)]
+    before_missing_resume: Option<Arc<dyn Fn(&Path) + Send + Sync>>,
     #[cfg(test)]
     before_prepare: Option<Arc<dyn Fn(&Path) + Send + Sync>>,
     #[cfg(test)]
@@ -49,6 +58,19 @@ pub(in crate::app) struct State {
 }
 
 impl State {
+    #[cfg(test)]
+    pub(in crate::app) fn before_prepare_for_test(
+        &mut self,
+        hook: Arc<dyn Fn(&Path) + Send + Sync>,
+    ) {
+        self.before_prepare = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(in crate::app) fn before_retire_for_test(&mut self, hook: Arc<dyn Fn() + Send + Sync>) {
+        self.before_retire = Some(hook);
+    }
+
     #[cfg(test)]
     pub(super) fn record_owner_read(&self) {
         if let Some(read) = &self.owner_read {
@@ -85,6 +107,7 @@ struct Request {
     origin: Option<Origin>,
     background: bool,
     refresh_channel: Option<ChannelId>,
+    resume: Option<Arc<resume::Intent>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -298,6 +321,7 @@ impl CacheKey {
                 origin: None,
                 background: false,
                 refresh_channel: None,
+                resume: None,
             },
         );
         let mut owners = app
@@ -476,6 +500,8 @@ struct Prepared {
     epoch: u64,
     chat: Option<chat_ui::PreparedDefaultChat>,
     terminal: Option<(TerminalContext, LaunchRecipe)>,
+    resume: Option<resume::Destination>,
+    resume_paths: Vec<PathBuf>,
 }
 
 #[derive(Default)]
@@ -538,6 +564,8 @@ impl Drop for Client {
 pub(in crate::app) struct Receipt {
     client: Arc<Client>,
     phase: u64,
+    resume: Option<Arc<resume::Intent>>,
+    request_generation: u64,
 }
 
 impl std::fmt::Debug for Receipt {
@@ -569,6 +597,8 @@ impl Receipt {
                 receipt: Self {
                     client: self.client.clone(),
                     phase,
+                    resume: self.resume.clone(),
+                    request_generation: self.request_generation,
                 },
             },
             // No proof of ordinary retirement has been delivered to this task.
@@ -771,6 +801,12 @@ fn resolve(
     ),
     String,
 > {
+    #[cfg(test)]
+    if let Some(resume) = &inputs.request.resume {
+        if let Some(read) = &resume.owner_read {
+            read();
+        }
+    }
     let mut complete = true;
     let mut physical = HashMap::<PathBuf, PathBuf>::new();
     if let Some(path) = &inputs.request.path {
@@ -812,6 +848,19 @@ fn resolve(
                 }
             });
     }
+    if let Some(resume) = &inputs.request.resume {
+        for path in resume.paths() {
+            physical
+                .entry(path.clone())
+                .or_insert_with(|| match path.canonicalize() {
+                    Ok(physical) => physical,
+                    Err(_) => {
+                        complete = false;
+                        path
+                    }
+                });
+        }
+    }
     let owner = |path: &Path| {
         let canonical = physical.get(path).expect("captured physical path");
         inputs
@@ -844,6 +893,63 @@ fn prepare(
     #[cfg(test)] runtime: Option<PathBuf>,
     #[cfg(test)] after_acquire: Option<Arc<dyn Fn(&Path) + Send + Sync>>,
 ) -> Result<Prepared, String> {
+    if inputs.request.resume.is_some() {
+        return resume::prepare(
+            inputs,
+            protections,
+            state,
+            #[cfg(test)]
+            runtime,
+            #[cfg(test)]
+            after_acquire,
+        );
+    }
+    prepare_navigation(
+        inputs,
+        protections,
+        state,
+        false,
+        #[cfg(test)]
+        runtime,
+        #[cfg(test)]
+        after_acquire,
+    )
+    .map_err(PreparationError::message)
+}
+
+enum PreparationError {
+    Unavailable(String),
+    Changed(String),
+}
+
+impl From<String> for PreparationError {
+    fn from(error: String) -> Self {
+        Self::Unavailable(error)
+    }
+}
+
+impl From<&str> for PreparationError {
+    fn from(error: &str) -> Self {
+        Self::Unavailable(error.to_owned())
+    }
+}
+
+impl PreparationError {
+    fn message(self) -> String {
+        match self {
+            Self::Unavailable(error) | Self::Changed(error) => error,
+        }
+    }
+}
+
+fn prepare_navigation(
+    inputs: Inputs,
+    protections: crate::worktree_cleanup::WindowProtections,
+    state: Arc<cache::WatchState>,
+    missing_history_fallback: bool,
+    #[cfg(test)] runtime: Option<PathBuf>,
+    #[cfg(test)] after_acquire: Option<Arc<dyn Fn(&Path) + Send + Sync>>,
+) -> Result<Prepared, PreparationError> {
     let mut invalidation = Invalidation::new(state);
     invalidation.register(
         inputs
@@ -857,11 +963,46 @@ fn prepare(
                     .flat_map(|(_, _, scope, directory)| scope.iter().chain(directory).cloned()),
             )
             .chain(inputs.protected.iter().cloned())
-            .chain(inputs.request.path.iter().cloned()),
+            .chain(inputs.request.path.iter().cloned())
+            .chain(
+                inputs
+                    .request
+                    .resume
+                    .iter()
+                    .flat_map(|resume| resume.paths()),
+            ),
     )?;
     let epoch = invalidation.state.epoch.load(Ordering::Acquire);
-    let (path, owners, physical, complete) = resolve(&inputs)?;
+    let launch_available = if let Some(resume) = &inputs.request.resume {
+        let launch = resume.launch_directory();
+        let available = launch.is_dir();
+        if missing_history_fallback && available {
+            return Err(PreparationError::Changed(
+                "The conversation's project became available. Resume it again.".into(),
+            ));
+        }
+        if !available {
+            if !resume.read_only_history() {
+                return Err("This conversation's project folder is unavailable. Restore the folder before resuming.".into());
+            }
+        }
+        Some(available)
+    } else {
+        None
+    };
+    let (mut path, mut owners, mut physical, mut complete) = resolve(&inputs)?;
     invalidation.register(physical.iter().map(|(_, physical)| physical.clone()))?;
+    if inputs.request.resume.is_some() {
+        #[cfg(test)]
+        if let Some(resume) = &inputs.request.resume {
+            if let Some(before) = &resume.before_resolve {
+                before(resume.launch_directory());
+            }
+        }
+        // Physical watch discovery is not an authorization observation.
+        (path, owners, physical, complete) = resolve(&inputs).map_err(PreparationError::Changed)?;
+        invalidation.register(physical.iter().map(|(_, physical)| physical.clone()))?;
+    }
     let paths = inputs
         .protected
         .iter()
@@ -905,13 +1046,30 @@ fn prepare(
     }
     protections
         .validate_navigation()
-        .map_err(|error| error.to_string())?;
-    let final_paths = resolve(&inputs)?;
+        .map_err(|error| PreparationError::Changed(error.to_string()))?;
+    let final_paths = resolve(&inputs).map_err(PreparationError::Changed)?;
     if final_paths != (path.clone(), owners.clone(), physical, complete)
+        || inputs
+            .request
+            .resume
+            .as_ref()
+            .is_some_and(|resume| launch_available != Some(resume.launch_directory().is_dir()))
         || epoch != invalidation.state.epoch.load(Ordering::Acquire)
     {
-        return Err("worktree paths changed while preparing; select the worktree again".into());
+        return Err(PreparationError::Changed(
+            "worktree paths changed while preparing; select the worktree again".into(),
+        ));
     }
+    let resume_paths = if inputs.request.resume.is_some() {
+        inputs
+            .protected
+            .iter()
+            .cloned()
+            .chain(inputs.request.path.iter().cloned())
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(Prepared {
         inputs,
         path,
@@ -923,6 +1081,8 @@ fn prepare(
         epoch,
         chat: None,
         terminal: None,
+        resume: None,
+        resume_paths,
     })
 }
 
@@ -1055,6 +1215,7 @@ impl Cagents {
             origin,
             background: false,
             refresh_channel: None,
+            resume: None,
         });
         self.dispatch_worktree_navigation()
     }
@@ -1124,6 +1285,7 @@ impl Cagents {
             origin: None,
             background: true,
             refresh_channel: None,
+            resume: None,
         });
         self.dispatch_worktree_navigation()
     }
@@ -1195,7 +1357,12 @@ impl Cagents {
             join: Mutex::new(None),
             cache: cache.clone(),
         });
-        let receipt = Receipt { client, phase: 0 };
+        let receipt = Receipt {
+            client,
+            phase: 0,
+            resume: inputs.request.resume.clone(),
+            request_generation: inputs.request.generation,
+        };
         cosmic::task::future(async move {
             let join = tokio::task::spawn_blocking(move || {
                 if let Some(owner) = owner {
@@ -1329,6 +1496,20 @@ impl Cagents {
             return Task::none();
         }
         slot.claimed = true;
+        if matches!(
+            receipt.resume_completion(self, generation),
+            Some(ResumeCompletion::Stale | ResumeCompletion::SupersededPredecessor)
+        ) {
+            if let Some(intent) = &receipt.resume {
+                resume::stale(self, intent);
+            }
+            drop(slot);
+            return self.retire_worktree_navigation(
+                generation,
+                Retirement::default(),
+                Some(receipt),
+            );
+        }
         let Some(result) = slot.result.as_mut() else {
             return Task::none();
         };
@@ -1349,6 +1530,11 @@ impl Cagents {
                         // This is a different presentation/caller context, not
                         // a request to reinterpret an old local destination.
                         self.worktree_selection.cancel();
+                    } else if let Some(intent) = &prepared.inputs.request.resume
+                        && resume::snapshot_changed(self, intent)
+                    {
+                        self.worktree_selection.pending =
+                            Some(resume::refresh(self, &prepared.inputs.request));
                     } else if inputs != prepared.inputs {
                         // Latest desired selection, fresh snapshot, still behind
                         // this receipt's actual capability retirement.
@@ -1357,13 +1543,24 @@ impl Cagents {
                         != prepared.invalidation.state.epoch.load(Ordering::Acquire)
                     {
                         self.navigation_sync_failed();
-                        self.status = Some(TransientNotice::warning(
-                            "Worktree paths changed; select the worktree again.",
-                        ));
-                    } else if !prepared
+                        if let Some(intent) = &receipt.resume {
+                            resume::failed(
+                                self,
+                                intent,
+                                "The conversation's project changed. Resume it again.",
+                            );
+                        } else {
+                            self.status = Some(TransientNotice::warning(
+                                "Worktree paths changed; select the worktree again.",
+                            ));
+                        }
+                    } else if !(prepared
                         .path
                         .as_deref()
                         .is_some_and(|path| self.refuse_in_deleting_worktree(path))
+                        || receipt.resume.as_ref().is_some_and(|intent| {
+                            self.refuse_in_deleting_worktree(intent.launch_directory())
+                        }))
                     {
                         let needs_default = prepared.path.as_deref().is_some_and(|path| {
                             prepared.inputs.request.create
@@ -1430,6 +1627,7 @@ impl Cagents {
                             .cloned()
                             .chain(prepared.owners.values().cloned())
                             .chain(prepared.path.iter().cloned())
+                            .chain(prepared.resume_paths.iter().cloned())
                             .collect::<Vec<_>>();
                         match prepared.protections.accept_navigation(
                             &self.worktree_protections,
@@ -1438,9 +1636,17 @@ impl Cagents {
                         ) {
                             Err(error) => {
                                 self.navigation_sync_failed();
-                                self.status = Some(TransientNotice::warning(format!(
-                                    "Cannot open this worktree yet: {error}"
-                                )))
+                                if let Some(intent) = &receipt.resume {
+                                    resume::failed(
+                                        self,
+                                        intent,
+                                        &format!("Cannot resume this conversation yet: {error}"),
+                                    );
+                                } else {
+                                    self.status = Some(TransientNotice::warning(format!(
+                                        "Cannot open this worktree yet: {error}"
+                                    )));
+                                }
                             }
                             Ok(obsolete) => {
                                 retirement.obsolete = obsolete;
@@ -1452,7 +1658,16 @@ impl Cagents {
                                 self.worktree_selection.failed_sync = None;
                                 self.worktree_owners = std::mem::take(&mut prepared.owners);
                                 self.worktree_selection.owners_refreshed();
-                                let task = if let Some(path) = &prepared.path {
+                                let task = if let (Some(intent), Some(destination)) =
+                                    (&prepared.inputs.request.resume, &prepared.resume)
+                                {
+                                    resume::commit(
+                                        self,
+                                        intent,
+                                        destination,
+                                        prepared.path.as_deref(),
+                                    )
+                                } else if let Some(path) = &prepared.path {
                                     let scope = if let Some(channel) =
                                         prepared.inputs.request.refresh_channel
                                     {
@@ -1508,6 +1723,7 @@ impl Cagents {
                                     .cache
                                     .as_ref()
                                     .is_some_and(cache::Handle::alive)
+                                    && prepared.inputs.request.resume.is_none()
                                     && prepared.invalidation.state.epoch.load(Ordering::Acquire)
                                         == prepared.epoch
                                 {
@@ -1549,11 +1765,24 @@ impl Cagents {
                 paths.dedup();
                 self.worktree_selection.failed_sync =
                     Some((paths, Instant::now() + Duration::from_secs(30)));
-                self.status = Some(TransientNotice::warning(format!(
-                    "Cannot open this worktree yet: {error}"
-                )));
+                if let Some(intent) = &receipt.resume {
+                    resume::failed(self, intent, error);
+                } else {
+                    self.status = Some(TransientNotice::warning(format!(
+                        "Cannot open this worktree yet: {error}"
+                    )));
+                }
             }
             Err(_) => {}
+        }
+        if self.worktree_selection.pending.is_none() {
+            if let Some(intent) = &receipt.resume {
+                resume::failed(
+                    self,
+                    intent,
+                    "The conversation's project changed. Resume it again.",
+                );
+            }
         }
         drop(slot);
         self.retire_worktree_navigation(generation, retirement, Some(receipt))
@@ -1636,12 +1865,12 @@ mod tests {
     use crate::chat;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-    struct Fixture {
-        app: Cagents,
-        _root: tempfile::TempDir,
-        runtime: PathBuf,
-        old: PathBuf,
-        next: PathBuf,
+    pub(super) struct Fixture {
+        pub(super) app: Cagents,
+        pub(super) _root: tempfile::TempDir,
+        pub(super) runtime: PathBuf,
+        pub(super) old: PathBuf,
+        pub(super) next: PathBuf,
     }
 
     fn folder(app: &mut Cagents, path: &Path) -> ProjectId {
@@ -1659,7 +1888,7 @@ mod tests {
         id
     }
 
-    fn fixture() -> Fixture {
+    pub(super) fn fixture() -> Fixture {
         let root = tempfile::tempdir().unwrap();
         let base = root.path().canonicalize().unwrap();
         let runtime = base.join("runtime");
@@ -1719,7 +1948,7 @@ mod tests {
     // A receipt deliberately outlives the Task that delivers it. Keep the test
     // executor alive across preparation, modal deferral, and original-worker
     // retirement, just as the application's executor does.
-    fn executor() -> &'static tokio::runtime::Runtime {
+    pub(super) fn executor() -> &'static tokio::runtime::Runtime {
         static EXECUTOR: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
         EXECUTOR.get_or_init(|| {
             tokio::runtime::Builder::new_multi_thread()
@@ -2336,6 +2565,7 @@ mod tests {
                     origin: None,
                     background: false,
                     refresh_channel: None,
+                    resume: None,
                 },
             )
         }
@@ -2928,6 +3158,8 @@ mod tests {
         let receipt = Receipt {
             client: client.clone(),
             phase: 0,
+            resume: None,
+            request_generation: 0,
         };
         let mut retired = Box::pin(receipt.retired(99));
         let polled = executor().block_on(async { iced::futures::poll!(retired.as_mut()) });

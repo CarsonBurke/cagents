@@ -32,6 +32,8 @@ mod pr_checkout_ui;
 mod project_ui;
 mod pull_request_ui;
 mod refresh_ui;
+#[cfg(test)]
+mod resume_navigation_tests;
 mod resume_ui;
 mod review_request_ui;
 #[cfg(test)]
@@ -12146,10 +12148,14 @@ impl Cagents {
     /// The worktree and pull request dialogs: forms, whose focused field
     /// captures the keys the dialog itself answers.
     fn form_dialog_is_open(&self) -> bool {
+        self.form_dialog_is_open_including_resume(true)
+    }
+
+    fn form_dialog_is_open_including_resume(&self, include_resume: bool) -> bool {
         self.device_ui.open
             || self.worktree_dialog.is_some()
             || self.pull_request_dialog.is_some()
-            || self.resume_ui.open
+            || (include_resume && self.resume_ui.open)
     }
 
     /// Closes the topmost form dialog, stopping whatever it was waiting on.
@@ -12636,12 +12642,63 @@ impl Cagents {
         )
     }
 
+    fn navigation_completion_is_blocked(&self, message: &Message) -> bool {
+        use worktree_ui::selection::ResumeCompletion;
+
+        let resume = match message {
+            Message::WorktreeNavigationPrepared {
+                generation,
+                receipt,
+            } => receipt.resume_completion(self, *generation),
+            _ => None,
+        };
+        match resume {
+            // These receipts can only retire their original capabilities;
+            // they must not wait behind the picker which superseded them.
+            Some(ResumeCompletion::Stale | ResumeCompletion::SupersededPredecessor) => false,
+            Some(ResumeCompletion::CurrentPicker) => self.resume_picker_navigation_is_blocked(),
+            Some(ResumeCompletion::CurrentWithoutPicker) | None => {
+                self.focused_repository_is_saving() || self.modal_is_open()
+            }
+        }
+    }
+
+    fn resume_picker_navigation_is_blocked(&self) -> bool {
+        self.focused_repository_is_saving()
+            || self.update_ui.confirmation.is_some()
+            || self.form_dialog_is_open_including_resume(false)
+            || self.modal_over_form_dialogs()
+    }
+
     fn release_deferred_navigation_if_unblocked(&mut self) -> Task<Message> {
         let repository_blocks = self.workspace.focused().is_some_and(|card| {
             matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
         });
         if self.modal_is_open() || repository_blocks {
-            return Task::none();
+            // A current resume can have arrived behind another dialog/save.
+            // Once that blocker clears, its own picker must not strand it.
+            // Move metadata only; App::update rechecks the original receipt.
+            if repository_blocks
+                || !self.resume_ui.open
+                || self.resume_picker_navigation_is_blocked()
+                || self.deferred_navigation.is_empty()
+            {
+                return Task::none();
+            }
+            let mut ready = Vec::new();
+            let queued = std::mem::take(&mut self.deferred_navigation);
+            for message in queued {
+                let current_picker = matches!(&message,
+                    Message::WorktreeNavigationPrepared { generation, receipt }
+                        if receipt.resume_completion(self, *generation)
+                            == Some(worktree_ui::selection::ResumeCompletion::CurrentPicker));
+                if current_picker && !self.navigation_completion_is_blocked(&message) {
+                    ready.push(cosmic::task::message(message));
+                } else {
+                    self.deferred_navigation.push_back(message);
+                }
+            }
+            return Task::batch(ready);
         }
         Task::batch(
             self.deferred_navigation
@@ -14281,8 +14338,7 @@ impl Application for Cagents {
         {
             return Task::none();
         }
-        if (self.focused_repository_is_saving() || self.modal_is_open())
-            && completion_navigates(&message)
+        if completion_navigates(&message) && self.navigation_completion_is_blocked(&message)
         {
             self.deferred_navigation.push_back(message);
             return Task::none();

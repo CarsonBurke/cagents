@@ -854,6 +854,10 @@ fn history_picker_does_not_focus_retained_unadmitted_cache() {
         entry.open,
         "actual saved history marks this retained local card open"
     );
+    let navigation_runtime = tempfile::tempdir().unwrap();
+    app.configure_local_resume_without_effect_capture_for_test(
+        navigation_runtime.path().to_owned(),
+    );
     let task = app.resume_saved_conversation(entry);
     settle(&mut app, task);
     let requests = daemon.requests();

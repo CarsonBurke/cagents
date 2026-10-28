@@ -19,7 +19,7 @@ const ROW_SPACING: f32 = 8.0;
 #[derive(Default)]
 pub(super) struct State {
     pub open: bool,
-    generation: u64,
+    pub(super) generation: u64,
     pub(super) query: String,
     rows: Vec<Row>,
     /// Indices of the rows the query and scope admit, in listed order.
@@ -46,6 +46,10 @@ pub(super) struct State {
     /// Tells the indexer's thread to stop reading, which aborting its
     /// listing alone leaves to the next batch.
     cancel: Arc<AtomicBool>,
+    /// Command/continuation fixtures initialize the real picker without
+    /// dispatching its independent catalog worker. Catalog tests leave this off.
+    #[cfg(test)]
+    command_test_without_catalog: bool,
 }
 
 /// A conversation as the picker lists it.
@@ -363,7 +367,7 @@ fn resume_selection_offset(selected: usize, viewport: f32, content: f32, current
 }
 
 impl Cagents {
-    fn resume_history_is_available(&mut self) -> bool {
+    pub(in crate::app) fn resume_history_is_available(&mut self) -> bool {
         if crate::device::is_remote() {
             self.status = Some(TransientNotice::warning(
                 "Conversation history is not available on remote devices yet",
@@ -479,6 +483,13 @@ impl Cagents {
         let cache = state.cache.clone();
         state.cancel = Arc::default();
         let cancel = state.cancel.clone();
+        #[cfg(test)]
+        if state.command_test_without_catalog {
+            // Keep normal picker/query/cancel metadata and focus behavior.
+            // These explicitly opted-in tests cover command continuation,
+            // rather than the separately exercised catalog/indexer lifecycle.
+            return Some(iced::widget::operation::focus(focus_id()).map(cosmic::Action::App));
+        }
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
         let current = self.durable.cards.clone();
         let accounts = self.resume_catalog_accounts();
@@ -550,6 +561,11 @@ impl Cagents {
         ]))
     }
 
+    #[cfg(test)]
+    pub(in crate::app) fn disable_resume_catalog_for_command_test(&mut self) {
+        self.resume_ui.command_test_without_catalog = true;
+    }
+
     pub(super) fn update_resume(&mut self, action: Action) -> Task<Message> {
         match action {
             Action::Open => self.open_resume(None).unwrap_or_else(Task::none),
@@ -560,14 +576,17 @@ impl Cagents {
                 self.update_resume(Action::Close)
             }
             Action::Close => {
+                self.cancel_local_resume_navigation();
                 self.close_resume();
                 // Whatever was being prepared is abandoned with the picker.
                 self.resume_ui.loading = false;
                 self.resume_ui.generation = self.resume_ui.generation.wrapping_add(1);
-                self.workspace.focused().map_or_else(Task::none, |card| {
+                let cleanup = self.drain_stale_resume_navigation();
+                let focus = self.workspace.focused().map_or_else(Task::none, |card| {
                     iced::widget::operation::focus(self.card_keyboard_focus(card))
                         .map(cosmic::Action::App)
-                })
+                });
+                Task::batch([cleanup, focus])
             }
             Action::Query(query) => {
                 self.resume_ui.query = query;
@@ -755,7 +774,10 @@ impl Cagents {
         state.visible = resume_matches(&state.rows, &state.query, state.scope.as_ref());
     }
 
-    fn existing_conversation_card(&self, session: &chat::Session) -> Option<CardId> {
+    pub(in crate::app) fn existing_conversation_card(
+        &self,
+        session: &chat::Session,
+    ) -> Option<CardId> {
         self.durable
             .cards
             .iter()
@@ -776,27 +798,12 @@ impl Cagents {
         if self.resume_ui.loading {
             return Task::none();
         }
+        if !self.resume_history_is_available() {
+            return Task::none();
+        }
         self.resume_ui.error = None;
-        let existing = self.existing_conversation_card(&entry.session);
-        if let Some(card) = existing {
-            self.close_resume();
-            let scope = if let Some(channel) = self
-                .durable
-                .channels
-                .iter()
-                .find(|channel| channel.cards.contains(&card))
-                .map(|channel| channel.id)
-            {
-                self.select_channel(channel)
-            } else {
-                let owner = self
-                    .card_state(card)
-                    .and_then(|card| self.card_worktree(card))
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| entry.session.launch.recipe.working_directory.clone());
-                self.select_worktree(owner, false)
-            };
-            return Task::batch([scope, cosmic::task::message(Message::FocusCard(card))]);
+        if self.existing_conversation_card(&entry.session).is_some() {
+            return self.prepare_local_resume(entry);
         }
         let local_pending = self.chat_awaiting_admission(entry.card)
             && matches!(self.card_state(entry.card).map(|card| &card.kind),
@@ -831,13 +838,42 @@ impl Cagents {
     }
 
     fn insert_resumed_conversation(&mut self, entry: SavedConversation) -> Task<Message> {
-        let mut session = entry.session;
-        if !session.launch.recipe.working_directory.is_dir()
-            && !session.launch.needs_read_only_history()
-        {
-            self.resume_error("This conversation's project folder is unavailable. Restore the folder before resuming.");
-            return Task::none();
+        self.prepare_local_resume(entry)
+    }
+
+    /// Capture the exact recorded filing identity without filesystem reads.
+    /// Missing/deleted metadata remains explicit so the worker can use the
+    /// ordinary recorded-cwd fallback without recreating a channel.
+    pub(in crate::app) fn recorded_resume_channel(
+        &self,
+        session: &chat::Session,
+    ) -> Option<(ChannelId, Option<(ProjectId, PathBuf)>)> {
+        let key = channel_filing::conversation_key(session)?;
+        let id = *self.durable.conversation_channels.get(&key)?;
+        let destination = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .and_then(|channel| {
+                self.channel_directory(id)
+                    .map(|path| (channel.project_id, path))
+            });
+        Some((id, destination))
+    }
+
+    /// The selection worker has already installed the destination and its
+    /// independent launch protections. No path is inspected by this consumer.
+    pub(in crate::app) fn commit_prepared_resume(
+        &mut self,
+        entry: SavedConversation,
+        replace: Option<CardId>,
+    ) -> Task<Message> {
+        if let Some(card) = self.existing_conversation_card(&entry.session) {
+            self.close_resume();
+            return cosmic::task::message(Message::FocusCard(card));
         }
+        let mut session = entry.session;
         if !matches!(
             session.native_continuity,
             chat::NativeContinuity::Durable { .. }
@@ -847,25 +883,9 @@ impl Cagents {
             session.proof = None;
             session.terminal = None;
         }
-        let replace = self.resume_ui.replace;
-        let scope = match self.select_recorded_conversation_channel(&session) {
-            Some(scope) => scope,
-            None => {
-                let (selected, scope) = self.select_worktree_checked(
-                    session.launch.recipe.working_directory.clone(),
-                    false,
-                );
-                if !selected && !session.launch.needs_read_only_history() {
-                    return scope;
-                }
-                scope
-            }
-        };
         self.close_resume();
         self.recently_closed
             .retain(|(card, _)| card.id != entry.card);
-        // The draft `/resume` was asked from gives its place to the
-        // conversation, where both belong to the same strip.
         let replace = replace.filter(|card| {
             self.chat_is_unused(*card) && self.workspace.order().any(|id| id == *card)
         });
@@ -874,7 +894,7 @@ impl Cagents {
             self.apply_reported_title(card, entry.title);
         }
         let discard = replace.map_or_else(Task::none, |card| self.close_card_unasked(card));
-        Task::batch([scope, insert, discard])
+        Task::batch([insert, discard])
     }
 
     /// Closes the picker and stops indexing. Focus is left to whatever the
@@ -1218,6 +1238,8 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let mut app = crate::app::tests::context_inspector_test_app(false);
+        let runtime = tempfile::tempdir().unwrap();
+        app.configure_local_resume_for_test(runtime.path().to_owned());
         let mut renderer = crate::app::tests::headless_renderer();
         let older = saved(directory.path());
         let newer = catalog::Found {
@@ -1447,7 +1469,8 @@ mod tests {
             &newer.title,
         );
         let fresh = row_action(messages, reopened_generation, current_newer);
-        drop(app.update_resume(fresh));
+        let task = app.update_resume(fresh);
+        app.finish_local_resume_for_test(task);
         assert!(!app.resume_ui.open);
         assert_eq!(app.durable.cards.len(), 1);
         let card = app.card_state(app.workspace.focused().unwrap()).unwrap();
@@ -1501,6 +1524,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let entry = saved(directory.path());
         let mut app = crate::app::tests::context_inspector_test_app(false);
+        let runtime = tempfile::tempdir().unwrap();
+        app.configure_local_resume_for_test(runtime.path().to_owned());
         let mut renderer = crate::app::tests::headless_renderer();
         open_fixture(&mut app, entry.clone());
         let generation = app.resume_ui.generation;
@@ -1619,11 +1644,12 @@ mod tests {
         }
         // Stale UI callbacks must not invalidate the current preparation. Feed
         // its genuine typed completion through the real reducer and insertion.
-        drop(app.update_resume(Action::Prepared(
+        let task = app.update_resume(Action::Prepared(
             current_generation,
             entry.clone(),
             Ok(entry.session.clone()),
-        )));
+        ));
+        app.finish_local_resume_for_test(task);
         assert!(!app.resume_ui.open && !app.resume_ui.loading);
         assert_eq!(app.durable.cards.len(), 1);
         let card = app.card_state(app.workspace.focused().unwrap()).unwrap();
@@ -1671,9 +1697,12 @@ mod tests {
     fn closed_conversation_resumes_exact_identity_in_its_original_project() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = crate::app::tests::context_inspector_test_app(false);
+        let runtime = tempfile::tempdir().unwrap();
+        app.configure_local_resume_for_test(runtime.path().to_owned());
         let entry = saved(directory.path());
         let original = entry.session.clone();
-        let _ = app.resume_saved_conversation(entry);
+        let task = app.resume_saved_conversation(entry);
+        app.finish_local_resume_for_test(task);
         let card = app.card_state(app.workspace.focused().unwrap()).unwrap();
         let CardKind::Chat(session) = &card.kind else {
             panic!("native conversation")
@@ -1694,7 +1723,8 @@ mod tests {
             updated_at_unix_ms: 1,
         };
         let before = app.durable.cards.len();
-        let _ = app.resume_saved_conversation(entry);
+        let task = app.resume_saved_conversation(entry);
+        app.finish_local_resume_for_test(task);
         assert_eq!(app.durable.cards.len(), before);
     }
 
@@ -1796,6 +1826,8 @@ mod tests {
     fn cancelling_resume_ignores_late_preparation_and_allows_another_attempt() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = crate::app::tests::context_inspector_test_app(false);
+        let runtime = tempfile::tempdir().unwrap();
+        app.configure_local_resume_for_test(runtime.path().to_owned());
         let entry = saved(directory.path());
         app.resume_ui.open = true;
         app.resume_ui.loading = true;
@@ -1808,7 +1840,8 @@ mod tests {
             Ok(entry.session.clone()),
         ));
         assert!(app.durable.cards.is_empty());
-        let _ = app.resume_saved_conversation(entry);
+        let task = app.resume_saved_conversation(entry);
+        app.finish_local_resume_for_test(task);
         assert_eq!(app.durable.cards.len(), 1);
     }
 
@@ -1816,16 +1849,20 @@ mod tests {
     fn preparation_rechecks_a_conversation_opened_while_waiting() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = crate::app::tests::context_inspector_test_app(false);
+        let runtime = tempfile::tempdir().unwrap();
+        app.configure_local_resume_for_test(runtime.path().to_owned());
         let entry = saved(directory.path());
-        let _ = app.resume_saved_conversation(entry.clone());
+        let task = app.resume_saved_conversation(entry.clone());
+        app.finish_local_resume_for_test(task);
         let card = app.workspace.focused();
         app.resume_ui.loading = true;
         let generation = app.resume_ui.generation;
-        let _ = app.update_resume(Action::Prepared(
+        let task = app.update_resume(Action::Prepared(
             generation,
             entry.clone(),
             Ok(entry.session),
         ));
+        app.finish_local_resume_for_test(task);
         assert_eq!(app.durable.cards.len(), 1);
         assert_eq!(app.workspace.focused(), card);
         assert!(!app.resume_ui.loading);

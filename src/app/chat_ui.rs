@@ -21456,6 +21456,9 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let project = tempfile::tempdir().unwrap();
         let card = draft_in(&mut app, project.path());
+        // Exercise the actual command/picker metadata without starting its
+        // unrelated catalog thread or reading the user's conversation roots.
+        app.disable_resume_catalog_for_command_test();
         write(&mut app, card, "/resume flaky tests");
         submit(&mut app, card);
         assert!(app.resume_ui.open);
@@ -21473,7 +21476,10 @@ mod tests {
         assert!(runtime.is_draft() && !app.chat_start_pending(card));
         assert_eq!(app.resume_ui.replace, Some(card));
 
-        let _ = app.resume_saved_conversation(earlier(&app, card));
+        let navigation_runtime = tempfile::tempdir().unwrap();
+        app.configure_local_resume_for_test(navigation_runtime.path().to_owned());
+        let task = app.resume_saved_conversation(earlier(&app, card));
+        app.finish_local_resume_for_test(task);
         let resumed = app.workspace.focused().unwrap();
         assert_ne!(resumed, card);
         assert_eq!(app.card_state(resumed).unwrap().title, "Earlier");
@@ -21493,12 +21499,16 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let project = tempfile::tempdir().unwrap();
         let card = draft_in(&mut app, project.path());
+        app.disable_resume_catalog_for_command_test();
         write(&mut app, card, "/resume");
         submit(&mut app, card);
         assert_eq!(app.resume_ui.replace, Some(card));
         let _ = app.update_resume(super::resume_ui::Action::Close);
         assert_eq!(app.resume_ui.replace, None);
-        let _ = app.resume_saved_conversation(earlier(&app, card));
+        let navigation_runtime = tempfile::tempdir().unwrap();
+        app.configure_local_resume_for_test(navigation_runtime.path().to_owned());
+        let task = app.resume_saved_conversation(earlier(&app, card));
+        app.finish_local_resume_for_test(task);
         assert!(app.workspace.pending_close().is_none());
         assert!(app.workspace.order().any(|id| id == card));
     }
@@ -21514,7 +21524,10 @@ mod tests {
         saved.session.launch.recipe.arguments.clear();
         saved.session.launch.recipe.working_directory = project.path().join("removed");
         let provider_id = saved.session.launch.session_id.clone();
-        let _ = app.resume_saved_conversation(saved);
+        let navigation_runtime = tempfile::tempdir().unwrap();
+        app.configure_local_resume_for_test(navigation_runtime.path().to_owned());
+        let task = app.resume_saved_conversation(saved);
+        app.finish_local_resume_for_test(task);
         let reopened = app.workspace.focused().unwrap();
         assert_ne!(reopened, card);
         let CardKind::Chat(session) = &app.card_state(reopened).unwrap().kind else {

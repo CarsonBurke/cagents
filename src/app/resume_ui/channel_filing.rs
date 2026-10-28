@@ -134,6 +134,7 @@ mod tests {
 
     struct Fixture {
         directory: tempfile::TempDir,
+        runtime: PathBuf,
         app: Cagents,
         conversation: CardId,
         a: ChannelId,
@@ -148,7 +149,10 @@ mod tests {
         fn with_launch_directory(launch_directory: Option<PathBuf>) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path().to_path_buf();
+            let runtime = root.join("lease-runtime");
+            std::fs::create_dir(&runtime).unwrap();
             let mut app = crate::app::tests::context_inspector_test_app(true);
+            app.configure_local_resume_for_test(runtime.clone());
             let mut conversation = app
                 .card_state(app.workspace.focused().unwrap())
                 .unwrap()
@@ -249,6 +253,7 @@ mod tests {
                 .unwrap();
             Self {
                 directory,
+                runtime,
                 app,
                 conversation: conversation.id,
                 a,
@@ -295,6 +300,7 @@ mod tests {
                 .expect("actual closed SQL row");
             assert!(!entry.open);
             let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.configure_local_resume_for_test(self.runtime.clone());
             app.sidebar_model = self.app.sidebar_model.clone();
             app.durable = Arc::new(restored.unwrap());
             app.workspace = Cagents::rebuild_workspace(&app.durable);
@@ -307,7 +313,8 @@ mod tests {
 
         fn resumed(&mut self, entry: SavedConversation) -> CardId {
             let launch = entry.session.launch.clone();
-            drop(self.app.resume_saved_conversation(entry));
+            let task = self.app.resume_saved_conversation(entry);
+            self.app.finish_local_resume_for_test(task);
             let id = self.app.workspace.focused().unwrap();
             let CardKind::Chat(session) = &self.app.card_state(id).unwrap().kind else {
                 panic!("resumed chat")
@@ -390,7 +397,8 @@ mod tests {
         // insert another card.
         let count = fixture.app.durable.cards.len();
         let live = fixture.app.workspace.focused().unwrap();
-        drop(fixture.app.resume_saved_conversation(entry.clone()));
+        let task = fixture.app.resume_saved_conversation(entry.clone());
+        fixture.app.finish_local_resume_for_test(task);
         assert_eq!(fixture.app.durable.cards.len(), count);
         assert_eq!(fixture.app.workspace.focused(), Some(live));
         // A live instance moved again after preparation began takes priority
@@ -409,11 +417,12 @@ mod tests {
         drop(fixture.app.select_channel(fixture.a));
         let generation = fixture.app.resume_ui.generation;
         fixture.app.resume_ui.loading = true;
-        drop(fixture.app.update_resume(Action::Prepared(
+        let task = fixture.app.update_resume(Action::Prepared(
             generation,
             entry.clone(),
             Ok(entry.session.clone()),
-        )));
+        ));
+        fixture.app.finish_local_resume_for_test(task);
         assert_eq!(fixture.app.durable.cards.len(), count);
         assert_eq!(fixture.app.durable.active_channel, Some(fixture.a));
         assert_eq!(
@@ -475,13 +484,8 @@ mod tests {
         drop(fixture.app.select_channel(fixture.b));
         let original = fixture.directory.path().to_path_buf();
         let blocked = original.join("removing");
-        let runtime = original.join("lease-runtime");
+        let runtime = fixture.runtime.clone();
         std::fs::create_dir(&blocked).unwrap();
-        std::fs::create_dir(&runtime).unwrap();
-        fixture
-            .app
-            .worktree_protections
-            .use_fixture_runtime(runtime.clone());
         fixture
             .app
             .worktree_protections
@@ -561,9 +565,8 @@ mod tests {
             .unwrap();
         let original = fixture.directory.path().to_path_buf();
         let browsing = original.join("browsing");
-        let runtime = original.join("lease-runtime");
+        let runtime = fixture.runtime.clone();
         std::fs::create_dir(&browsing).unwrap();
-        std::fs::create_dir(&runtime).unwrap();
         let project = ProjectId::new();
         fixture.app.sidebar_model.projects.push(SidebarProject::new(
             project,
@@ -592,10 +595,6 @@ mod tests {
         fixture
             .app
             .worktree_protections
-            .use_fixture_runtime(runtime.clone());
-        fixture
-            .app
-            .worktree_protections
             .protect_next(&browsing)
             .unwrap();
         let busy = crate::worktree_cleanup::fixture_protection(&runtime, &original, true).unwrap();
@@ -605,7 +604,8 @@ mod tests {
         let before = fixture.app.durable.cards.len();
         let transition_pending = fixture.app.chat_ui.transition_pending();
         assert!(!transition_pending);
-        drop(fixture.app.resume_saved_conversation(entry.clone()));
+        let task = fixture.app.resume_saved_conversation(entry.clone());
+        fixture.app.finish_local_resume_for_test(task);
         assert_eq!(fixture.app.durable.cards.len(), before);
         assert_eq!(
             fixture.app.chat_ui.transition_pending(),
@@ -693,12 +693,7 @@ mod tests {
                 std::io::ErrorKind::NotFound
             );
             assert!(entry.session.launch.needs_read_only_history());
-            let runtime = fixture.directory.path().join("history-lease-runtime");
-            std::fs::create_dir(&runtime).unwrap();
-            fixture
-                .app
-                .worktree_protections
-                .use_fixture_runtime(runtime.clone());
+            let runtime = fixture.runtime.clone();
             if !remembered_available {
                 fixture.app.sidebar_model.projects.clear();
             }
@@ -865,7 +860,9 @@ mod adoption_tests {
     #[test]
     fn home_only_live_adoption_requires_the_same_recorded_account_context() {
         let directory = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
         let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.configure_local_resume_for_test(runtime.path().to_owned());
         let mut session = chat::fresh_session(
             Provider::Claude,
             TerminalId::new(),
@@ -899,7 +896,8 @@ mod adoption_tests {
             open: false,
             updated_at_unix_ms: 1,
         };
-        drop(app.resume_saved_conversation(selected.clone()));
+        let task = app.resume_saved_conversation(selected.clone());
+        app.finish_local_resume_for_test(task);
         let selected_id = app.workspace.focused().unwrap();
         let count = app.durable.cards.len();
         explicit
@@ -913,10 +911,11 @@ mod adoption_tests {
             .environment
             .insert("XDG_CONFIG_HOME".into(), "/unrelated/xdg".into());
         assert_eq!(app.existing_conversation_card(&explicit), Some(selected_id));
-        drop(app.resume_saved_conversation(SavedConversation {
+        let task = app.resume_saved_conversation(SavedConversation {
             session: explicit,
             ..selected
-        }));
+        });
+        app.finish_local_resume_for_test(task);
         assert_eq!(app.durable.cards.len(), count);
 
         let entry = SavedConversation {
@@ -926,7 +925,8 @@ mod adoption_tests {
             open: false,
             updated_at_unix_ms: 1,
         };
-        drop(app.resume_saved_conversation(entry.clone()));
+        let task = app.resume_saved_conversation(entry.clone());
+        app.finish_local_resume_for_test(task);
         let a = app.workspace.focused().unwrap();
         let mut other = entry.clone();
         other
@@ -936,13 +936,15 @@ mod adoption_tests {
             .environment
             .insert("HOME".into(), "/recorded/home-b".into());
         assert!(app.existing_conversation_card(&other.session).is_none());
-        drop(app.resume_saved_conversation(other.clone()));
+        let task = app.resume_saved_conversation(other.clone());
+        app.finish_local_resume_for_test(task);
         let b = app.workspace.focused().unwrap();
         assert_ne!(a, b);
         let count = app.durable.cards.len();
         assert_eq!(app.existing_conversation_card(&entry.session), Some(a));
         assert_eq!(app.existing_conversation_card(&other.session), Some(b));
-        drop(app.resume_saved_conversation(entry));
+        let task = app.resume_saved_conversation(entry);
+        app.finish_local_resume_for_test(task);
         assert_eq!(app.durable.cards.len(), count);
         // Unknown context supplies no remembered placement, but retains the
         // original live predicate in either direction. Never create a second
@@ -952,11 +954,15 @@ mod adoption_tests {
         assert!(same_conversation(&other.session, &other.session));
         assert_eq!(app.existing_conversation_card(&other.session), Some(a));
         other.open = true;
-        drop(app.resume_saved_conversation(other.clone()));
+        let task = app.resume_saved_conversation(other.clone());
+        app.finish_local_resume_for_test(task);
         assert_eq!(app.durable.cards.len(), count);
+        let legacy_runtime = tempfile::tempdir().unwrap();
         let mut legacy = crate::app::tests::context_inspector_test_app(false);
+        legacy.configure_local_resume_for_test(legacy_runtime.path().to_owned());
         other.open = false;
-        drop(legacy.resume_saved_conversation(other.clone()));
+        let task = legacy.resume_saved_conversation(other.clone());
+        legacy.finish_local_resume_for_test(task);
         let legacy_id = legacy.workspace.focused().unwrap();
         let mut known = other.clone();
         known
@@ -969,7 +975,8 @@ mod adoption_tests {
             legacy.existing_conversation_card(&known.session),
             Some(legacy_id)
         );
-        drop(legacy.resume_saved_conversation(known));
+        let task = legacy.resume_saved_conversation(known);
+        legacy.finish_local_resume_for_test(task);
         assert_eq!(legacy.durable.cards.len(), 1);
         // A distinct externally open conversation still cannot insert.
         other.open = true;
