@@ -1106,9 +1106,24 @@ pub fn physical_key(
     match physical_key {
         winit::keyboard::PhysicalKey::Code(code) => key_code(code)
             .map(keyboard::key::Physical::Code)
-            .unwrap_or(keyboard::key::Physical::Unidentified(
-                keyboard::key::NativeCode::Unidentified,
-            )),
+            .unwrap_or_else(|| {
+                // A newer winit Code may have no iced equivalent yet. Keep
+                // its native identity shared by Winit and SCTK producers.
+                #[cfg(all(free_unix, not(redox)))]
+                {
+                    use winit::platform::scancode::PhysicalKeyExtScancode;
+                    if let Some(raw) =
+                        winit::keyboard::PhysicalKey::Code(code).to_scancode()
+                    {
+                        return keyboard::key::Physical::Unidentified(
+                            keyboard::key::NativeCode::Xkb(raw),
+                        );
+                    }
+                }
+                keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                )
+            }),
         winit::keyboard::PhysicalKey::Unidentified(code) => {
             keyboard::key::Physical::Unidentified(native_key_code(code))
         }

@@ -98,6 +98,82 @@ mod tests {
         })
     }
 
+    #[cfg(wayland_platform)]
+    #[test]
+    fn unmapped_native_codes_keep_distinct_held_cycles_across_surfaces() {
+        use crate::platform_specific::wayland::sctk_event::KeyboardEventVariant;
+        use cctk::sctk::seat::keyboard::{KeyEvent, Modifiers as SctkModifiers};
+        use winit::platform::scancode::PhysicalKeyExtScancode;
+        use xkeysym::{Keysym, key as sym};
+
+        let event = |raw| KeyEvent {
+            time: 7,
+            raw_code: raw,
+            keysym: Keysym::new(if raw == 224 {
+                sym::XF86_MonBrightnessDown
+            } else {
+                sym::XF86_MonBrightnessUp
+            }),
+            utf8: None,
+        };
+        let convert = |variant: KeyboardEventVariant| {
+            variant.into_key_event(SctkModifiers::default()).unwrap()
+        };
+        let physical = |event: &keyboard::Event| match event {
+            keyboard::Event::KeyPressed { physical_key, .. }
+            | keyboard::Event::KeyReleased { physical_key, .. } => *physical_key,
+            _ => unreachable!(),
+        };
+        let first_press = convert(KeyboardEventVariant::Press(event(224)));
+        let second_press = convert(KeyboardEventVariant::Press(event(225)));
+        for (raw, press) in [(224, &first_press), (225, &second_press)] {
+            let normal =
+                crate::conversion::physical_key(winit::keyboard::PhysicalKey::from_scancode(raw));
+            assert_eq!(
+                normal,
+                key::Physical::Unidentified(key::NativeCode::Xkb(raw))
+            );
+            assert_eq!(physical(press), normal, "SCTK and Winit agree");
+        }
+        assert_ne!(physical(&first_press), physical(&second_press));
+
+        let main = window::Id::unique();
+        let popup = window::Id::unique();
+        let mut queue = NativeEvents::default();
+        queue.push((Some(popup), Event::Keyboard(first_press)));
+        queue.push((Some(main), Event::Keyboard(second_press)));
+        let first = queue.pending[0].2.cycle().unwrap().clone();
+        let second = queue.pending[1].2.cycle().unwrap().clone();
+        assert!(!Arc::ptr_eq(&first, &second));
+        queue.push((
+            Some(popup),
+            Event::Keyboard(convert(KeyboardEventVariant::Release(event(224)))),
+        ));
+        assert!(!first.is_down());
+        assert!(
+            second.is_down(),
+            "another physical release cannot end this hold"
+        );
+        queue.push((
+            Some(popup),
+            Event::Keyboard(convert(KeyboardEventVariant::Repeat(event(225)))),
+        ));
+        assert!(Arc::ptr_eq(&second, queue.pending[3].2.cycle().unwrap()));
+        queue.push((
+            Some(main),
+            Event::Keyboard(convert(KeyboardEventVariant::Release(event(225)))),
+        ));
+        assert!(!second.is_down());
+        let (_, main_sources) = queue.take_window(main);
+        let (_, popup_sources) = queue.take_window(popup);
+        assert!(Arc::ptr_eq(&second, main_sources[0].cycle().unwrap()));
+        assert!(Arc::ptr_eq(&second, main_sources[1].cycle().unwrap()));
+        assert!(Arc::ptr_eq(&first, popup_sources[0].cycle().unwrap()));
+        assert!(Arc::ptr_eq(&first, popup_sources[1].cycle().unwrap()));
+        assert!(Arc::ptr_eq(&second, popup_sources[2].cycle().unwrap()));
+        assert!(queue.is_empty());
+    }
+
     #[test]
     fn queued_old_release_keeps_old_cycle_after_new_press() {
         let id = window::Id::unique();
