@@ -38,6 +38,14 @@ pub(crate) struct PreparedRemoval {
 }
 
 #[cfg(any(feature = "host", feature = "ui"))]
+pub(crate) fn automatic_retention_reason(path: &Path) -> String {
+    format!(
+        "Kept {}: automatic cleanup cannot exclude new files written by other programs. Review the worktree, then choose Delete worktree and confirm if you want to discard its files. The directory and branch have been retained.",
+        path.display()
+    )
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
 fn exact_merged_head(request: &RemovalRequest, pr: &crate::github::PullRequest) -> bool {
     pr.state.0 == "MERGED"
         && pr.number == request.pull_request.number
@@ -179,10 +187,7 @@ impl PreparedRemoval {
         self,
         _check_quiescence: impl FnOnce(&[crate::instance::VerifiedWindow]) -> Result<(), String>,
     ) -> Result<crate::repository::RemovedWorktree, String> {
-        Err(format!(
-            "Kept {}: automatic cleanup cannot exclude new files written by other programs. Review the worktree, then choose Delete worktree and confirm if you want to discard its files. The directory and branch have been retained.",
-            self.request.path.display()
-        ))
+        Err(automatic_retention_reason(&self.request.path))
     }
 }
 

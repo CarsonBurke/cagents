@@ -9,6 +9,7 @@ use crate::{
 #[derive(Debug, Clone)]
 struct AutomaticAttempt {
     project: ProjectId,
+    generation: u64,
     at: Instant,
     request: crate::worktree_cleanup::RemovalRequest,
     retained: bool,
@@ -38,6 +39,7 @@ pub struct State {
     /// failed one stays so its row can say why and offer to run it again.
     deletions: HashMap<WorktreeId, Deletion>,
     automatic_attempts: HashMap<WorktreeId, AutomaticAttempt>,
+    next_automatic_attempt: u64,
     editors: Vec<crate::external_editor::Editor>,
 }
 
@@ -201,6 +203,7 @@ pub enum Action {
     AwaitSessions(Target),
     AutomaticallyDeleted {
         target: Target,
+        generation: u64,
         request: crate::worktree_cleanup::RemovalRequest,
         result: Result<Option<RemovedWorktree>, String>,
     },
@@ -259,8 +262,9 @@ impl Cagents {
         }
     }
 
-    /// Sidebar discovery only proposes a candidate. The daemon fetches its PR
-    /// again and independently authorizes the exact checkout under its fences.
+    /// Sidebar discovery proposes a review notification from its latest PR
+    /// snapshot. It never authorizes deletion or dispatches the old destructive
+    /// operation to a possibly older, same-protocol daemon.
     pub(super) fn cleanup_merged_worktree_task(
         &mut self,
         project_id: ProjectId,
@@ -348,12 +352,18 @@ impl Cagents {
         let Some((target, request)) = candidate else {
             return Task::none();
         };
+        let Some(generation) = self.project_ui.next_automatic_attempt.checked_add(1) else {
+            return Task::none();
+        };
+        self.project_ui.next_automatic_attempt = generation;
+        let started_at = Instant::now();
         let id = target.worktree.unwrap();
         self.project_ui.automatic_attempts.insert(
             id,
             AutomaticAttempt {
                 project: project_id,
-                at: Instant::now(),
+                generation,
+                at: started_at,
                 request: request.clone(),
                 retained: false,
             },
@@ -362,32 +372,18 @@ impl Cagents {
             id,
             Deletion {
                 target: target.clone(),
-                started_at: Instant::now(),
+                started_at,
                 failure: None,
             },
         );
         self.sync_worktree_operation_rows();
-        let store = self.session.as_ref().map(SessionRuntime::operation_store);
-        cosmic::task::future(async move {
-            let binding = request.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                let reply = crate::device_service::request(crate::device_service::Operation::RemoveMergedWorktree { request })?;
-                let crate::device_service::Reply::MergedWorktreeRemoved(removed) = reply else {
-                    return Err("The daemon did not confirm merged worktree cleanup; the worktree has been kept.".to_owned());
-                };
-                let Some(removed) = removed else { return Ok(None); };
-                if let Some(store) = store
-                    && let Err(errors) = crate::repository::release_deleted_worktree_creations(&store, &removed) {
-                    for error in errors { tracing::warn!(%error, "could not release removed worktree creation receipt"); }
-                }
-                Ok(Some(removed))
-            }).await.map_err(|error| error.to_string()).and_then(|result| result);
-            Message::ProjectUi(Action::AutomaticallyDeleted {
-                target,
-                request: binding,
-                result,
-            })
-        })
+        let reason = crate::worktree_cleanup::automatic_retention_reason(&request.path);
+        cosmic::task::message(Message::ProjectUi(Action::AutomaticallyDeleted {
+            target,
+            generation,
+            request,
+            result: Err(reason),
+        }))
     }
 
     pub(super) fn selected_project_removal_blocker(&self, project: ProjectId) -> Option<String> {
@@ -1320,9 +1316,34 @@ impl Cagents {
             }
             Action::AutomaticallyDeleted {
                 target,
+                generation,
                 request,
                 result,
             } => {
+                let Some(id) = target.worktree else {
+                    return Task::none();
+                };
+                let Some(attempt) = self.project_ui.automatic_attempts.get(&id) else {
+                    return Task::none();
+                };
+                let Some(pending) = self.project_ui.deletions.get(&id) else {
+                    return Task::none();
+                };
+                if attempt.generation != generation
+                    || attempt.project != target.project
+                    || attempt.request != request
+                    || attempt.retained
+                    || pending.started_at != attempt.at
+                    || pending.failure.is_some()
+                    || pending.target.project != target.project
+                    || pending.target.worktree != Some(id)
+                    || pending.target.path != request.path
+                    || target.path != request.path
+                    || pending.target.repository != request.repository
+                    || target.repository != request.repository
+                {
+                    return Task::none();
+                }
                 if result.as_ref().is_ok_and(|removed| {
                     removed
                         .as_ref()
@@ -1496,6 +1517,8 @@ impl Cagents {
         let Some(id) = target.worktree else {
             return Task::none();
         };
+        // Explicit confirmation supersedes any queued automatic notification.
+        self.project_ui.automatic_attempts.remove(&id);
         self.project_ui.deletions.insert(
             id,
             Deletion {
@@ -2427,10 +2450,12 @@ mod tests {
         let request = app.project_ui.automatic_attempts[&linked.id]
             .request
             .clone();
+        let generation = app.project_ui.automatic_attempts[&linked.id].generation;
         let reason = "Kept: external writes cannot be excluded; choose Delete worktree and confirm";
         drop(app.handle_project_action(Action::AutomaticallyDeleted {
-            target,
-            request,
+            target: target.clone(),
+            generation,
+            request: request.clone(),
             result: Err(reason.into()),
         }));
         assert_eq!(row(&app, linked.id).unwrap().path, linked.path);
@@ -2493,8 +2518,10 @@ mod tests {
         assert!(!app.project_ui.deletions.contains_key(&linked.id));
         let other_target = app.project_ui.deletions[&other.id].target.clone();
         let other_request = app.project_ui.automatic_attempts[&other.id].request.clone();
+        let other_generation = app.project_ui.automatic_attempts[&other.id].generation;
         drop(app.handle_project_action(Action::AutomaticallyDeleted {
             target: other_target,
+            generation: other_generation,
             request: other_request,
             result: Err(reason.into()),
         }));
@@ -2525,11 +2552,76 @@ mod tests {
             .at = Instant::now();
         record.head_oid = Some("b".repeat(40));
         pr.head_ref_oid = "b".repeat(40);
-        drop(app.cleanup_merged_worktree_task(project, &[(record, None)], &[pr]));
+        drop(app.cleanup_merged_worktree_task(project, &[(record.clone(), None)], &[pr.clone()]));
         assert!(app.project_ui.deletions.contains_key(&linked.id));
         let fresh = &app.project_ui.automatic_attempts[&linked.id];
         assert!(!fresh.retained);
         assert_eq!(fresh.request.head_oid, "b".repeat(40));
+        let fresh_generation = fresh.generation;
+        let fresh_request = fresh.request.clone();
+        let pending_at = app.project_ui.deletions[&linked.id].started_at;
+        let notice = app.status.as_ref().unwrap().message.clone();
+        // Both a late retained result and a stale removal receipt from the
+        // previous binding must leave the newer operation and row untouched.
+        for result in [
+            Err("stale refusal".into()),
+            Ok(Some(RemovedWorktree {
+                common_dir: repository.join(".git"),
+                admin_dir: repository.join(".git/worktrees/feature"),
+                path: linked.path.clone(),
+                branch: Some("refs/heads/feature".into()),
+            })),
+        ] {
+            drop(app.handle_project_action(Action::AutomaticallyDeleted {
+                target: target.clone(),
+                generation,
+                request: request.clone(),
+                result,
+            }));
+            assert_eq!(app.project_ui.deletions[&linked.id].started_at, pending_at);
+            assert_eq!(
+                app.project_ui.automatic_attempts[&linked.id].generation,
+                fresh_generation
+            );
+            assert_eq!(app.status.as_ref().unwrap().message, notice);
+            assert!(row(&app, linked.id).is_some());
+        }
+        drop(app.handle_project_action(Action::AutomaticallyDeleted {
+            target: target.clone(),
+            generation: fresh_generation,
+            request: fresh_request,
+            result: Err(reason.into()),
+        }));
+        assert!(app.project_ui.deletions.is_empty());
+
+        // Open the manual confirmation first, then let a new automatic
+        // notification queue before the user confirms. Explicit confirmation
+        // invalidates that queued operation before starting manual deletion.
+        drop(app.handle_project_action(Action::Command {
+            project_id: project,
+            worktree_id: Some(linked.id),
+            command: ProjectCommand::Delete,
+        }));
+        record.head_oid = Some("c".repeat(40));
+        pr.head_ref_oid = "c".repeat(40);
+        drop(app.cleanup_merged_worktree_task(project, &[(record, None)], &[pr]));
+        let queued = app.project_ui.automatic_attempts[&linked.id].clone();
+        drop(app.handle_project_action(Action::ConfirmDelete));
+        assert!(!app.project_ui.automatic_attempts.contains_key(&linked.id));
+        assert!(app.project_ui.dialog.is_none());
+        let manual_at = app.project_ui.deletions[&linked.id].started_at;
+        let notice = app.status.as_ref().unwrap().message.clone();
+        drop(app.handle_project_action(Action::AutomaticallyDeleted {
+            target,
+            generation: queued.generation,
+            request: queued.request,
+            result: Err("late retained result".into()),
+        }));
+        assert_eq!(app.project_ui.deletions[&linked.id].started_at, manual_at);
+        assert!(app.project_ui.deletions[&linked.id].failure.is_none());
+        assert!(app.project_ui.is_deleting(linked.id));
+        assert_eq!(app.status.as_ref().unwrap().message, notice);
+        assert!(row(&app, linked.id).is_some());
     }
 
     #[test]
