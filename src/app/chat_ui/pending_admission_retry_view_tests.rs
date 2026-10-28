@@ -299,6 +299,7 @@ fn saved_empty_text_and_image_only_views_remain_honest_and_preserve_receipts_at_
                 .filter(|node| node.node().role() == iced_accessibility::accesskit::Role::Button)
                 .collect::<Vec<_>>();
             assert_eq!(buttons.len(), 1 + usize::from(!expected_text.is_empty()));
+            let mut copy_action = None;
             if !expected_text.is_empty() {
                 use iced_accessibility::accesskit::{Action, ActionRequest, NodeId, TreeId};
                 let copy = buttons
@@ -320,9 +321,12 @@ fn saved_empty_text_and_image_only_views_remain_honest_and_preserve_receipts_at_
                     ),
                     mouse::Cursor::Unavailable,
                 );
-                assert!(
-                    matches!(messages.as_slice(), [Message::ChatUi(chat_ui::Action::CopyLiteral(actual))] if actual == &expected_text)
+                assert_eq!(
+                    messages.len(),
+                    1,
+                    "the actual accessible Copy control emits one action"
                 );
+                copy_action = messages.into_iter().next();
             }
             for image in &images {
                 let reference = image.reference.as_ref().unwrap();
@@ -338,6 +342,37 @@ fn saved_empty_text_and_image_only_views_remain_honest_and_preserve_receipts_at_
                     .any(|label| label.contains("never-open-saved-attachment"))
             );
             drop(ui);
+            if let Some(message) = copy_action {
+                use iced::futures::StreamExt;
+                // Dispatch the actual native AX action only after its borrowed
+                // UI has been dropped, then inspect the real clipboard effect.
+                let task = app.update(message);
+                let notice = &app.notices.recent().next().unwrap().notice;
+                assert_eq!(notice.message, "Copied saved draft");
+                assert!(matches!(notice.severity, NoticeSeverity::Success));
+                let copied = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let mut effects = iced::runtime::task::into_stream(task)
+                            .expect("saved draft Copy produces clipboard work");
+                        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                            while let Some(effect) = effects.next().await {
+                                if let iced::runtime::Action::Clipboard(
+                                    iced::runtime::clipboard::Action::Write { contents, .. },
+                                ) = effect
+                                {
+                                    return contents;
+                                }
+                            }
+                            panic!("saved draft Copy must emit its clipboard write");
+                        })
+                        .await
+                        .expect("saved draft clipboard deadline")
+                    });
+                assert_eq!(copied, expected_text, "preserve exact saved bytes");
+            }
             preserved(&mut app, card, &original, &queue);
         }
         assert_eq!(

@@ -62,7 +62,7 @@ impl Runtime {
                         .name("Copy saved draft")
                         .class(crate::ui_controls::control_style(false, None))
                         .padding([space::S as u16, space::M as u16])
-                        .on_press(Message::ChatUi(Action::CopyLiteral(text.clone())))
+                        .on_press(Message::ChatUi(Action::CopySavedDraft(text.clone())))
                         .into(),
                 );
                 rows.push(
