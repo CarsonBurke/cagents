@@ -1328,16 +1328,18 @@ impl EditBuffer for ProtocolTracked<'_> {
         let range = exact_caret_position(self.content, start)
             .zip(exact_caret_position(self.content, end))
             .map(|(start, end)| LspRange::new(start, end));
+        let incremental = incremental_replacement_is_safe(
+            char_before(self.content, start),
+            expected,
+            replacement,
+            char_after(self.content, end),
+        );
         let trailing_cr = trailing_carriage_return(self.content).is_some();
         self.content
             .replace_range_with_breaks(start, end, replacement, replacement_breaks);
         // Preserve the existing final-CR full-sync fallback during replay.
         self.edits.push(
-            if expected.contains('\r')
-                || replacement.contains('\r')
-                || trailing_cr
-                || trailing_carriage_return(self.content).is_some()
-            {
+            if !incremental || trailing_cr || trailing_carriage_return(self.content).is_some() {
                 None
             } else {
                 range.map(|range| LspTextEdit {
@@ -1661,6 +1663,51 @@ fn char_after(
         .flatten()
 }
 
+/// The preceding source character, without flattening the editor buffer.
+fn char_before(
+    content: &text_editor::Content<cosmic::Renderer>,
+    caret: text_editor::Position,
+) -> Option<char> {
+    if let Some(character) = content.with_line(caret.line, |text, _| {
+        text[..char_boundary(text, caret.column)]
+            .chars()
+            .next_back()
+    })? {
+        return Some(character);
+    }
+    for line in (0..caret.line).rev() {
+        if let Some(character) = content.with_line(line, |text, ending| {
+            terminator_str(ending, false)
+                .chars()
+                .next_back()
+                .or_else(|| text.chars().next_back())
+        })? {
+            return Some(character);
+        }
+    }
+    None
+}
+
+/// Whether an edit can shift standing diagnostic ranges from its payload
+/// alone. Forming or splitting a CRLF across either edge changes the number
+/// of protocol lines independently of the payload's own line breaks.
+fn incremental_replacement_is_safe(
+    before: Option<char>,
+    removed: &str,
+    inserted: &str,
+    after: Option<char>,
+) -> bool {
+    if removed.contains('\r') || inserted.contains('\r') {
+        return false;
+    }
+    let old_first = removed.chars().next().or(after);
+    let new_first = inserted.chars().next().or(after);
+    let old_last = removed.chars().next_back().or(before);
+    let new_last = inserted.chars().next_back().or(before);
+    !(before == Some('\r') && (old_first == Some('\n')) != (new_first == Some('\n'))
+        || after == Some('\n') && (old_last == Some('\r')) != (new_last == Some('\r')))
+}
+
 /// Protocol position of the editor's caret, without serializing the buffer.
 ///
 /// Ordinary LF/CRLF buffers use their persistent native line index. Other
@@ -1834,7 +1881,12 @@ fn protocol_edit(
     // A CR can pair with a neighboring LF across a replacement boundary.
     // Full synchronization also clears standing diagnostic ranges whose
     // offsets cannot be shifted from this edit payload alone.
-    if change.removed.contains('\r') || change.inserted.contains('\r') {
+    if !incremental_replacement_is_safe(
+        char_before(content, change.start),
+        &change.removed,
+        &change.inserted,
+        char_after(content, change.inserted_end()),
+    ) {
         return None;
     }
     let (start, end) = if content.text_snapshot().protocol_compatible_lines() {
@@ -3508,15 +3560,7 @@ impl RepositoryRuntime {
     /// what materialises the change these edits describe.
     #[must_use]
     pub fn take_lsp_edits(&mut self) -> Vec<LspTextEdit> {
-        // Completion edits also reach this boundary without protocol_edit.
-        // An inserted CR may pair with an adjacent LF, so its payload alone
-        // cannot safely shift standing diagnostics. Send the native source.
-        if !std::mem::replace(&mut self.lsp_edits_exact, true)
-            || self
-                .lsp_edits
-                .iter()
-                .any(|edit| edit.new_text.contains('\r'))
-        {
+        if !std::mem::replace(&mut self.lsp_edits_exact, true) {
             self.lsp_edits.clear();
             return Vec::new();
         }
@@ -4596,7 +4640,14 @@ impl RepositoryRuntime {
         }
 
         let mut updated = text.clone();
+        let mut incremental = true;
         for (span, new_text, _) in edits.iter().rev() {
+            incremental &= incremental_replacement_is_safe(
+                updated[..span.start].chars().next_back(),
+                &updated[span.clone()],
+                new_text,
+                updated[span.end..].chars().next(),
+            );
             updated.replace_range(span.clone(), new_text);
         }
         // The caret belongs after the text the user chose. Edits that sit
@@ -4646,6 +4697,7 @@ impl RepositoryRuntime {
             document.text_changed();
         }
         if let Some(version) = version {
+            self.lsp_edits_exact &= incremental;
             // Recorded highest-range-first, the order they were applied in:
             // each range then still addresses the document the one before it
             // produced.

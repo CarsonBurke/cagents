@@ -26288,6 +26288,99 @@ mod tests {
     }
 
     #[test]
+    fn crlf_boundary_edits_and_replay_clear_standing_diagnostics_through_the_real_drain() {
+        // Enter but never drive this executor: the real manager owns immutable
+        // snapshots and versions, while discovery cannot spawn a server.
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        for completion in [false, true] {
+            for (original, removed, inserted, original_b_line) in
+                [("é🌲\rX\nb", "X", "", 2), ("é🌲\rb", "", "\n", 1)]
+            {
+                let (mut app, card, doc) = completion_intent_fixture_text(original, false);
+                let publish = |version, line| {
+                    let mut item = diagnostic("standing error on b");
+                    item.range = crate::lsp::LspRange::new(
+                        LspPosition::new(line, 0),
+                        LspPosition::new(line, 1),
+                    );
+                    Message::Lsp(LspEvent::Diagnostics {
+                        doc,
+                        version,
+                        items: vec![item],
+                    })
+                };
+                drop(app.update(publish(1, original_b_line)));
+                let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else {
+                    unreachable!()
+                };
+                assert!(runtime.diagnostic_navigation_available());
+                assert!(runtime.move_cursor_to(LspPosition::new(1, 0)));
+                if completion {
+                    let mut item = completion_item(inserted);
+                    item.edit.range = crate::lsp::LspRange::new(
+                        LspPosition::new(1, 0),
+                        LspPosition::new(1, u32::try_from(removed.len()).unwrap()),
+                    );
+                    assert!(runtime.apply_completion(&item));
+                } else {
+                    let edit = if removed.is_empty() {
+                        widget::text_editor::Edit::Paste(Arc::new(inserted.into()))
+                    } else {
+                        widget::text_editor::Edit::Delete
+                    };
+                    drop(runtime.update(RepositoryAction::EditorAction {
+                        card,
+                        action: widget::text_editor::Action::Edit(edit),
+                    }));
+                }
+                for (version, expected, b_line, replay) in [
+                    (2, "é🌲\r\nb", 1, None),
+                    (3, original, original_b_line, Some(false)),
+                    (4, "é🌲\r\nb", 1, Some(true)),
+                ] {
+                    if let Some(redo) = replay {
+                        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card)
+                        else {
+                            unreachable!()
+                        };
+                        drop(runtime.update(if redo {
+                            RepositoryAction::Redo { card }
+                        } else {
+                            RepositoryAction::Undo { card }
+                        }));
+                    }
+                    drop(app.drain_lsp_intents(card));
+                    assert_eq!(app.lsp.document_version(doc), Some(version));
+                    assert!(app.lsp_contexts[&card].context.diagnostics.is_empty());
+                    assert_eq!(app.lsp_contexts[&card].diagnostics_version, None);
+                    assert_eq!(
+                        app.lsp.scalar_position(doc, LspPosition::new(b_line, 1)),
+                        Ok(LspPosition::new(b_line, 1)),
+                    );
+                    let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else {
+                        unreachable!()
+                    };
+                    assert_eq!(runtime.editor_text().as_deref(), Some(expected));
+                    assert!(!runtime.diagnostic_navigation_available());
+                    assert!(runtime.move_cursor_to(LspPosition::new(b_line, 1)));
+                    assert_eq!(runtime.cursor_position(), Some(LspPosition::new(b_line, 1)));
+                    // Fresh diagnostics still work, then the next edit must
+                    // clear those marks rather than shift b onto a false line.
+                    drop(app.update(publish(version, b_line)));
+                    let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+                        unreachable!()
+                    };
+                    assert!(runtime.diagnostic_navigation_available());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn resource_events_refresh_every_document_even_when_the_routing_document_closed() {
         for close_routing_document in [false, true] {
             let mut app = lsp_test_app();
