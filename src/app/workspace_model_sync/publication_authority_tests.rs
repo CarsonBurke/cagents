@@ -4148,3 +4148,102 @@ fn a_current_inventory_replacing_the_project_repository_fences_old_close_launch_
     assert!(!app.project_ui.closing.contains_key(&project));
     assert!(!app.project_ui.close_generation.contains_key(&project));
 }
+
+#[test]
+fn retiring_an_unrelated_shared_channel_during_read_keeps_the_real_project_close_authority() {
+    use crate::{
+        app::{
+            Message, channel_ui,
+            project_ui::{Action, ProjectSessionClosure},
+        },
+        model::{ProjectId, RepositoryId},
+        sidebar::SidebarProject,
+    };
+    let (directory, mut app, project, repository, closed, generation) =
+        queued_observer_close_fixture();
+    let cancellation = app.project_ui.close_cancellation_for(project).unwrap();
+    let unrelated_repository = directory.path().join("unrelated-project");
+    std::fs::create_dir(&unrelated_repository).unwrap();
+    let unrelated_project = ProjectId::new();
+    app.sidebar_model.projects.push(
+        SidebarProject::new(
+            unrelated_project,
+            RepositoryId::new(),
+            "Unrelated shared channel".into(),
+            unrelated_repository.clone(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .with_kind(ProjectKind::Folder),
+    );
+    let (tx, requests) = async_channel::unbounded();
+    app.workspace_model_tx = tx;
+    drop(app.handle_channel_ui(channel_ui::Action::Create(unrelated_project)));
+    let unrelated_channel = app.durable.active_channel.unwrap();
+    let create = take_creation_publications(&requests)
+        .into_iter()
+        .find(
+            |edit| matches!(edit, ModelEdit::CreateChannel { id, .. } if *id == unrelated_channel),
+        )
+        .unwrap();
+    let shared = channel_publication_model(closed, &create);
+    drop(app.update(Message::WorkspaceModelObserved(
+        framed_channel_publication_ack(create, shared.clone()),
+    )));
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+            shared.clone(),
+        ))),
+    );
+    assert!(
+        app.durable
+            .channels
+            .iter()
+            .any(|channel| channel.id == unrelated_channel && channel.shared)
+    );
+    assert_eq!(
+        app.project_ui.close_generation.get(&project),
+        Some(&generation)
+    );
+    assert!(!cancellation.is_cancelled());
+    // An ordinary current-registry read deletes S while R remains canonically
+    // closed. Retiring S calls project completion during reconciliation's
+    // temporary model extraction; that placeholder cannot revoke R's proof.
+    let mut absent = shared;
+    absent.sequence += 1;
+    absent
+        .channels
+        .retain(|channel| channel.id != unrelated_channel);
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+            absent.clone(),
+        ))),
+    );
+    assert_eq!(app.workspace_model, absent);
+    assert!(app.channel_ui.was_deleted(unrelated_channel));
+    assert!(
+        !app.durable
+            .channels
+            .iter()
+            .any(|channel| channel.id == unrelated_channel)
+    );
+    assert_eq!(
+        app.project_ui.close_generation.get(&project),
+        Some(&generation)
+    );
+    assert_eq!(app.project_ui.closing.get(&project), Some(&repository));
+    assert!(app.project_ui.closed.contains(&repository));
+    assert!(app.project_ui.close_in_flight_for(project));
+    assert!(!cancellation.is_cancelled());
+    drop(app.handle_project_action(Action::ProjectSessionsClosed(
+        project,
+        generation,
+        Ok(ProjectSessionClosure::for_roots(vec![repository.clone()])),
+    )));
+    assert!(
+        app.sidebar_model.project(project).is_none(),
+        "the original legitimate close must still finish"
+    );
+    assert!(app.sidebar_model.project(unrelated_project).is_some());
+    assert!(app.project_ui.closed.contains(&repository));
+}

@@ -1458,6 +1458,9 @@ impl Cagents {
             tasks.push(self.sync_chrome());
         }
         self.refresh_channel_title_suggestions();
+        // Channel retirement may have drained a project while the model was
+        // taken. Admit its close only after restoring canonical authority.
+        tasks.push(self.complete_closed_projects());
         Task::batch(tasks)
     }
 

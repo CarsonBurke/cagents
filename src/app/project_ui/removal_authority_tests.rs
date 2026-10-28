@@ -267,7 +267,9 @@ fn fixture() -> (
         "The folder is never removed",
     )
     .unwrap();
+    let registry = uuid::Uuid::new_v4();
     let removal = ProjectRemoval {
+        registry,
         project: ProjectId::new(),
         repository: repository.clone(),
         kind: ProjectKind::Folder,
@@ -277,7 +279,7 @@ fn fixture() -> (
         project_sessions: ProjectSessionOwnership::default(),
     };
     let model = WorkspaceModel {
-        identity: uuid::Uuid::new_v4(),
+        identity: registry,
         sequence: 7,
         projects: vec![ModelProject {
             repository: repository.clone(),

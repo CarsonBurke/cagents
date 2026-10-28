@@ -790,6 +790,9 @@ impl Cagents {
     }
 
     pub(super) fn retire_stale_shared_project_closes(&mut self) {
+        if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
+            return;
+        }
         let projects = self.project_ui.closing.keys().copied().collect::<Vec<_>>();
         for project in projects {
             self.retire_stale_shared_project_close(project);
@@ -803,6 +806,11 @@ impl Cagents {
     }
 
     pub(super) fn complete_closed_projects(&mut self) -> Task<Message> {
+        // Reconciliation temporarily takes the model while retiring channels.
+        // Its empty placeholder grants neither close nor reopen authority.
+        if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
+            return Task::none();
+        }
         self.retire_stale_shared_project_closes();
         let ready = self
             .project_ui
