@@ -115,6 +115,29 @@ exit 83
                 self.assertIn(expected, result.stderr)
                 self.assertEqual(calls, [], "Cargo started before Zig was ready")
 
+    def test_custom_mise_data_directory_with_and_without_explicit_selection(self):
+        custom = self.root / "custom data"
+        self.data.rename(custom)
+        self.real = custom / "installs/zig/0.15.2/zig"
+        self.env["PATH"] = self.env["PATH"].replace(str(self.data / "shims"), str(custom / "shims"))
+        for changes, selection in (({}, "unset"), ({"MISE_DATA_DIR": str(custom)}, str(custom))):
+            with self.subTest(changes=changes):
+                result, calls = self.run_runner(**changes)
+                self.assertEqual(result.returncode, 83, result.stderr)
+                self.assertEqual(len(calls), 1)
+                self.assertIn(f"zig={self.real}", calls[0])
+                self.assertIn(f"home={self.home}|xdg={self.xdg}|mise={selection}", calls[0])
+                self.cargo_calls.unlink()
+
+    def test_renamed_zig_override_fails_before_cargo_can_find_the_old_shim(self):
+        renamed = self.root / "renamed tool with spaces" / "zig-0.15.2"
+        renamed.parent.mkdir()
+        self.real.rename(renamed)
+        result, calls = self.run_runner(CAGENTS_ZIG=str(renamed))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("executable named zig", result.stderr)
+        self.assertEqual(calls, [], "Cargo could resolve the original unverified shim")
+
 
 if __name__ == "__main__":
     unittest.main()
