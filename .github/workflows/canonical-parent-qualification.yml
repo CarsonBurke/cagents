@@ -1,0 +1,370 @@
+name: Canonical-parent HOST fixture qualification
+
+# Temporary supplementary evidence only. Retain run/artifact links and close
+# its Draft without merging. Baseline outcomes below are source predictions.
+on:
+  pull_request:
+    branches: [main]
+    paths: [.github/workflows/canonical-parent-qualification.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: canonical-parent-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: 2
+  RUSTUP_TOOLCHAIN: 1.93.0
+  CARGO_TARGET_DIR: /tmp/canonical-parent-target-${{ github.run_id }}-${{ github.run_attempt }}
+  CANONICAL_EVIDENCE_DIR: /tmp/canonical-parent-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+  CANONICAL_CONTROL_HEAD: ${{ github.event.pull_request.head.sha }}
+
+jobs:
+  causal-host-parents:
+    name: Exact channel and schema parents under one aliased TMPDIR per pair
+    if: github.repository == 'CarsonBurke/cagents' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'ci/canonical-parent-qualification-20261028'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 210
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Require natural hosted scope before fixture isolation
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib
+          evidence = pathlib.Path(os.environ['CANONICAL_EVIDENCE_DIR'])
+          evidence.mkdir(mode=0o700)
+          names = sorted(n for n in os.environ if n.startswith('CAGENTS'))
+          assert not names, f'Unexpected inherited context names: {names}'
+          assert os.environ.get('GITHUB_ACTIONS') == 'true'
+          assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+          (evidence / 'natural-context.json').write_text(json.dumps({
+              'github_hosted': True, 'inherited_cagents_names': names,
+              'empty_present_values_also_refused': True,
+              'credentials_or_authority_removed_or_replaced': False,
+          }, indent=2) + '\n')
+          PY
+
+      - name: Check out the immutable same-repository control
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Archive control and trusted setup before product fetch or detach
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          evidence = pathlib.Path(os.environ['CANONICAL_EVIDENCE_DIR'])
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          base = '4d18d788d03588621907b423a2df0e129f6e689c'
+          workflow = '.github/workflows/canonical-parent-qualification.yml'
+          setup = '.github/actions/setup-linux-build/action.yml'
+          head = git('rev-parse', 'HEAD')
+          assert head == os.environ['CANONICAL_CONTROL_HEAD']
+          assert not git('status', '--porcelain')
+          subprocess.run(['git', 'merge-base', '--is-ancestor', base, head], check=True)
+          assert git('diff', '--name-only', base, head).splitlines() == [workflow]
+          setup_blob = 'f24f0b0a90c31306518ff7253463a52b63a3c0e3'
+          assert git('rev-parse', head + ':' + setup) == setup_blob
+          assert git('rev-parse', base + ':' + setup) == setup_blob
+          for source, name in [(workflow, 'workflow-control.yml'), (setup, 'setup-action.yml')]:
+              (evidence / name).write_bytes(pathlib.Path(source).read_bytes())
+          (evidence / 'control.json').write_text(json.dumps({
+              'head': head, 'tree': git('rev-parse', 'HEAD^{tree}'),
+              'main_base': base, 'main_base_tree': git('rev-parse', base + '^{tree}'),
+              'workflow_ref': os.environ.get('GITHUB_WORKFLOW_REF'),
+              'workflow_sha': os.environ.get('GITHUB_WORKFLOW_SHA'),
+              'workflow_sha256': hashlib.sha256(pathlib.Path(workflow).read_bytes()).hexdigest(),
+              'setup_blob': setup_blob,
+              'setup_sha256': hashlib.sha256(pathlib.Path(setup).read_bytes()).hexdigest(),
+          }, indent=2) + '\n')
+          PY
+
+      - name: Prepare the trusted control's pinned Linux environment
+        timeout-minutes: 20
+        uses: ./.github/actions/setup-linux-build
+
+      - name: Run four immutable HOST variants serially and stop on any unexpected result
+        timeout-minutes: 185
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, stat, subprocess, tempfile, time
+          evidence = pathlib.Path(os.environ['CANONICAL_EVIDENCE_DIR'])
+          control = json.loads((evidence / 'control.json').read_text())
+          CHANNEL = ['host::model::channel_work_integration_tests::canonical_empty_retirement_preserves_work_history_and_rejects_reused_channel_identity', 'host::model::channel_work_integration_tests::canonical_project_close_preserves_work_and_original_receipt_without_restoring_current_claims', 'host::model::channel_work_integration_tests::canonical_empty_retirement_accepts_only_the_captured_empty_view_and_no_work']
+          SCHEMA = ['host::model::schema::tests::published_twelve_missing_table_refuses_before_writable_admission', 'host::model::schema::tests::published_twelve_missing_index_refuses_before_writable_admission', 'host::model::schema::tests::published_twelve_missing_metadata_table_cannot_mint_a_new_identity', 'host::model::schema::tests::published_twelve_wal_damage_preserves_primary_wal_and_permissions', 'host::model::schema::tests::published_twelve_migrates_to_current_without_historical_terminal_proof', 'host::model::schema::tests::published_thirteen_missing_provenance_is_not_recreated', 'host::model::schema::tests::published_native_actor_layout_damage_refuses_before_writable_admission', 'host::model::schema::tests::native_actor_schema_generations_preserve_existing_receipts_on_upgrade_and_reopen', 'host::model::schema::tests::every_published_version_preserves_nonempty_model_identity_and_ordinals', 'host::model::schema::tests::published_eighteen_adds_only_empty_attention_outbox_and_preserves_audit', 'host::model::schema::tests::failed_eighteen_to_nineteen_rolls_back_outbox_and_published_header', 'host::model::schema::tests::published_sixteen_channel_work_upgrade_preserves_home_without_inferring_prs', 'host::model::schema::tests::legacy_view_conversion_preserves_consumed_rows_and_rejects_unknown_shapes', 'host::model::schema::tests::unknown_legacy_view_columns_indexes_and_triggers_are_not_dropped', 'host::model::schema::tests::each_actual_migration_failure_rolls_back_all_prior_steps_and_header', 'host::model::schema::tests::future_delete_and_wal_refusal_preserves_database_and_wal_bytes', 'host::model::schema::tests::unjournaled_wal_refusal_preserves_absent_sidecars_and_literal_filename', 'host::model::schema::tests::immutable_precheck_cannot_admit_a_later_writer_or_new_wal', 'host::model::schema::tests::authoritative_writer_rejects_concurrent_header_and_layout_changes', 'host::model::schema::tests::current_delete_writer_lock_spans_commit_and_persistent_wal_conversion', 'host::model::schema::tests::wal_opener_has_no_persistent_configuration_after_migration_commit', 'host::model::schema::tests::retained_outer_edits_refuse_future_or_unknown_layout_before_dml', 'host::model::schema::tests::current_edits_keep_cascade_sequence_and_reopen_semantics', 'host::model::schema::tests::current_header_preserves_the_unversioned_legacy_project_kind_upgrade', 'host::model::schema::tests::failed_opener_cannot_release_another_connections_actual_writer_lock', 'host::model::schema::tests::schema_tokens_do_not_erase_identifiers_or_change_literal_meaning', 'host::model::schema::tests::hot_rollback_journal_refusal_does_not_recover_or_change_bytes']
+          assert len(CHANNEL) == len(set(CHANNEL)) == 3
+          assert len(SCHEMA) == len(set(SCHEMA)) == 27
+          assert not any(n.endswith(('::writer_lock_child', '::hot_journal_child')) for n in SCHEMA)
+          variants = [
+              ('channel-baseline', 'channel', 'fd537aaf299e73314f07ae57fe7bab777c5d2bd9',
+               '36cacf5ece6c0743037e8718aab7026165c11b35', CHANNEL[:1], 11),
+              ('channel-fixed', 'channel', 'fbc8af341b5eac5b3fff4905f84df98ab59b7515',
+               '867024bf92d672c35f5fa2756a1d6d541cf82ab1', CHANNEL, None),
+              ('schema-baseline', 'schema', '191b8559dacdbb2c4965a99284fe3412f024413d',
+               'aa6d68da62c3f9fa9b197c9e0cd9e8873ccce004',
+               ['host::model::schema::tests::published_twelve_wal_damage_preserves_primary_wal_and_permissions'], 617),
+              ('schema-fixed', 'schema', '892989a86988ef44f25a606b58b15e60c0e3508d',
+               'ad745503253e8e79b47db8db61406069c2e91351', SCHEMA, None),
+          ]
+          paths = [
+              'Cargo.toml', 'Cargo.lock', 'build.rs', '.cargo/config.toml',
+              '.github/actions/setup-linux-build/action.yml',
+              'src/host/model.rs', 'src/host/model/schema.rs',
+              'src/host/model/channel_work_integration_tests.rs',
+              'vendor/libsqlite3-sys/Cargo.toml', 'vendor/libsqlite3-sys/build.rs',
+              'vendor/libsqlite3-sys/sqlite3/sqlite3.c',
+          ]
+          results = []
+          def write(path, value):
+              path.write_text(json.dumps(value, indent=2) + '\n')
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          def digest(path):
+              result = hashlib.sha256()
+              with path.open('rb') as stream:
+                  for block in iter(lambda: stream.read(1024 * 1024), b''):
+                      result.update(block)
+              return result.hexdigest()
+          def natural():
+              names = sorted(n for n in os.environ if n.startswith('CAGENTS'))
+              overrides = sorted(n for n in os.environ if n.startswith(('SQLITE3_', 'LIBSQLITE3_')))
+              assert not names and not overrides, {'context_names': names, 'sqlite_override_names': overrides}
+          def source(head, tree):
+              value = {'head': git('rev-parse', 'HEAD'), 'tree': git('rev-parse', 'HEAD^{tree}'),
+                       'status': git('status', '--porcelain'),
+                       'sha256': {p: digest(pathlib.Path(p)) for p in paths}}
+              assert value['head'] == head and value['tree'] == tree and not value['status']
+              return value
+          def run(directory, label, argv, seconds, env):
+              started = time.monotonic()
+              command = ['timeout', '--signal=TERM', '--kill-after=15s', f'{seconds}s', *argv]
+              with (directory / (label + '.stdout')).open('wb') as out, (directory / (label + '.stderr')).open('wb') as err:
+                  status = subprocess.run(command, stdout=out, stderr=err, env=env).returncode
+              record = {'argv': command, 'exit': status, 'seconds': time.monotonic() - started,
+                        'timeout_seconds': seconds, 'timeout_or_signal': status in (124, 137) or status < 0}
+              write(directory / (label + '.result.json'), record)
+              return record
+          def graph(directory, label):
+              rows = [json.loads(line) for line in (directory / (label + '.stdout')).read_text().splitlines()]
+              finished = [row for row in rows if row.get('reason') == 'build-finished']
+              assert len(finished) == 1 and finished[0]['success']
+              artifacts = [row for row in rows if row.get('reason') == 'compiler-artifact']
+              forbidden = ('libcosmic', 'servo', 'webrender', 'spidermonkey', 'mozjs', '#iced@')
+              assert not [r['package_id'] for r in artifacts
+                          if any(n in r['package_id'].lower() for n in forbidden)], 'Unexpected UI/browser HOST graph'
+              sqlite = [r for r in artifacts if 'libsqlite3-sys' in r['package_id']]
+              assert sqlite and all('bundled' in r['features'] for r in sqlite)
+              assert all(pathlib.Path(r['manifest_path']).resolve() ==
+                         pathlib.Path('vendor/libsqlite3-sys/Cargo.toml').resolve() for r in sqlite)
+              write(directory / (label + '.graph.json'), {
+                  'packages': sorted({r['package_id'] for r in artifacts}),
+                  'bundled_sqlite_artifacts': sqlite, 'forbidden_ui_browser_packages': [],
+              })
+              return artifacts
+          def pair_identity(root):
+              physical, alias = root / 'physical', root / 'alias'
+              value = {}
+              for item in (root, physical, alias):
+                  info = item.lstat()
+                  assert info.st_uid == os.getuid()
+                  if item != alias:
+                      assert stat.S_ISDIR(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o700
+                  else:
+                      assert stat.S_ISLNK(info.st_mode) and os.readlink(item) == str(physical)
+                      assert item.resolve(strict=True) == physical
+                  value[item.name] = [info.st_dev, info.st_ino, info.st_mode, info.st_uid]
+              return value
+          def census(identity, root):
+              # Candidate evidence only. Do not infer ownership or signal a PID.
+              found, errors = [], []
+              for entry in pathlib.Path('/proc').iterdir():
+                  if not entry.name.isdigit():
+                      continue
+                  try:
+                      if entry.stat().st_uid != os.getuid():
+                          continue
+                      before = (entry / 'stat').read_text()
+                      fields = before[before.rindex(')') + 2:].split()
+                      started = fields[19]
+                      reasons = []
+                      try:
+                          info = (entry / 'exe').stat()
+                          if [info.st_dev, info.st_ino] == identity['file_id']:
+                              reasons.append('exact_test_executable_file')
+                      except FileNotFoundError:
+                          pass
+                      try:
+                          cwd = (entry / 'cwd').resolve(strict=True)
+                          if cwd == root or root in cwd.parents:
+                              reasons.append('private_pair_cwd')
+                      except FileNotFoundError:
+                          pass
+                      args = (entry / 'cmdline').read_bytes().split(b'\0')
+                      if any(a == str(root).encode() or a.startswith(str(root).encode() + b'/') for a in args):
+                          reasons.append('private_pair_argument')
+                      after = (entry / 'stat').read_text()
+                      if after[after.rindex(')') + 2:].split()[19] != started:
+                          errors.append({'pid': int(entry.name), 'reason': 'identity_changed'})
+                      elif reasons:
+                          found.append({'pid': int(entry.name), 'start_ticks': started,
+                                        'state': fields[0], 'candidate_reasons': reasons})
+                  except (FileNotFoundError, ProcessLookupError):
+                      continue
+                  except (PermissionError, OSError, ValueError) as error:
+                      errors.append({'pid': int(entry.name), 'reason': type(error).__name__})
+              return {'candidates': found, 'observation_errors': errors,
+                      'scope': 'Read-only candidates, not process custody or permission to signal'}
+          natural()
+          assert git('rev-parse', 'HEAD') == control['head']
+          for tool in ('rustc', 'cargo'):
+              version = subprocess.check_output([tool, '--version'], text=True).strip()
+              assert version.startswith(tool + ' 1.93.0 ')
+              (evidence / (tool + '-version.txt')).write_text(version + '\n')
+          pairs = {}
+          for name in ('channel', 'schema'):
+              root = pathlib.Path(tempfile.mkdtemp(prefix='canonical-' + name + '-', dir='/tmp'))
+              (root / 'physical').mkdir(mode=0o700)
+              (root / 'alias').symlink_to(root / 'physical', target_is_directory=True)
+              pairs[name] = (root, pair_identity(root))
+          write(evidence / 'pairs.json', {name: {'root': str(root), 'identity': identity}
+                                         for name, (root, identity) in pairs.items()})
+          for label, pair, head, tree, selectors, failure_line in variants:
+              directory = evidence / label
+              directory.mkdir(mode=0o700)
+              natural()
+              assert not git('status', '--porcelain')
+              fetched = run(directory, 'fetch', ['git', 'fetch', '--no-tags', 'origin', head], 300, os.environ)
+              assert fetched['exit'] == 0
+              assert git('rev-parse', head + '^{tree}') == tree
+              checkout = run(directory, 'checkout', ['git', 'checkout', '--detach', head], 60, os.environ)
+              assert checkout['exit'] == 0
+              assert git('rev-parse', 'HEAD:.github/actions/setup-linux-build/action.yml') == control['setup_blob']
+              pinned = source(head, tree)
+              write(directory / 'product-source.json', pinned)
+              root, pair_pin = pairs[pair]
+              assert pair_identity(root) == pair_pin
+              env = os.environ.copy()
+              env['TMPDIR'] = str(root / 'alias')
+              # Keep HOME, credentials and authority untouched. Only the
+              # qualification operand TMPDIR changes, once per pair.
+              write(directory / 'context.json', {'TMPDIR': env['TMPDIR'], 'pair_identity': pair_pin,
+                                                'authority_or_credentials_replaced': False})
+              schema_text = pathlib.Path('src/host/model/schema.rs').read_text()
+              sqlite_text = pathlib.Path('vendor/libsqlite3-sys/sqlite3/sqlite3.c').read_text()
+              assert 'SQLITE_OPEN_NOFOLLOW' in schema_text
+              assert 'rc = SQLITE_CANTOPEN_SYMLINK;' in sqlite_text and 'path.nSymlink' in sqlite_text
+              assert 'features = ["bundled"]' in pathlib.Path('Cargo.toml').read_text()
+              for selector in selectors:
+                  leaf = 'src/host/model/channel_work_integration_tests.rs' if pair == 'channel' else 'src/host/model/schema.rs'
+                  assert len(re.findall(r'\bfn ' + re.escape(selector.rsplit('::', 1)[1]) + r'\s*\(',
+                                        pathlib.Path(leaf).read_text())) == 1
+              if failure_line:
+                  marker = 'Registry::at' if pair == 'channel' else 'let writer = connect'
+                  assert marker in pathlib.Path(leaf).read_text().splitlines()[failure_line - 1]
+              for stage, argv, seconds in [
+                  ('host-check', ['cargo', 'check', '--locked', '--no-default-features', '--features', 'host',
+                                  '--bin', 'cagentsd', '--message-format=json'], 1800),
+                  ('test-build', ['cargo', 'test', '--locked', '--no-default-features', '--features', 'host',
+                                  '--lib', '--no-run', '--message-format=json'], 2400),
+              ]:
+                  outcome = run(directory, stage, argv, seconds, env)
+                  assert outcome['exit'] == 0, f'{label} {stage}: blocked, not a baseline result'
+                  natural()
+                  assert source(head, tree) == pinned and pair_identity(root) == pair_pin
+                  artifacts = graph(directory, stage)
+                  if stage == 'host-check':
+                      bins = [r for r in artifacts if r['target']['name'] == 'cagentsd'
+                              and 'bin' in r['target']['kind']]
+                      assert len(bins) == 1 and 'host' in bins[0]['features']
+                      assert 'ui' not in bins[0]['features'] and 'integrated-browser' not in bins[0]['features']
+              candidates = [r for r in artifacts if r['target']['name'] == 'cagents'
+                            and 'lib' in r['target']['kind'] and r['profile']['test'] and r.get('executable')]
+              assert len(candidates) == 1
+              artifact = candidates[0]
+              assert pathlib.Path(artifact['manifest_path']).resolve() == pathlib.Path('Cargo.toml').resolve()
+              assert 'host' in artifact['features'] and 'ui' not in artifact['features']
+              assert 'integrated-browser' not in artifact['features']
+              executable = pathlib.Path(artifact['executable']).resolve(strict=True)
+              info = executable.stat()
+              identity = {'path': str(executable), 'file_id': [info.st_dev, info.st_ino],
+                          'size': info.st_size, 'sha256': digest(executable),
+                          'product_head': head, 'product_tree': tree, 'compiler_artifact': artifact}
+              write(directory / 'test-artifact.json', identity)
+              for index, selector in enumerate(selectors, 1):
+                  phase = directory / f'root-{index:02d}'
+                  phase.mkdir(mode=0o700)
+                  pre = census(identity, root)
+                  write(phase / 'before.json', {'source': source(head, tree), 'pair': pair_identity(root), 'census': pre})
+                  assert not pre['candidates'] and not pre['observation_errors']
+                  assert digest(executable) == identity['sha256']
+                  outcome = run(phase, 'test', [str(executable), selector, '--exact', '--nocapture', '--test-threads=1'], 180, env)
+                  stdout = (phase / 'test.stdout').read_text(errors='replace')
+                  stderr = (phase / 'test.stderr').read_text(errors='replace')
+                  post = census(identity, root)
+                  integrity = (source(head, tree) == pinned and pair_identity(root) == pair_pin
+                               and digest(executable) == identity['sha256']
+                               and not post['candidates'] and not post['observation_errors'])
+                  natural()
+                  selected = len(re.findall(r'^test ' + re.escape(selector) + r' \.\.\. (?:ok|FAILED)$', stdout, re.M))
+                  summaries = re.findall(r'^test result: (?:ok|FAILED)\..*$', stdout, re.M)
+                  common = selected == 1 and len(summaries) == 1 and stdout.count('running 1 test\n') == 1 and integrity
+                  if failure_line:
+                      location = re.search(r"thread '" + re.escape(selector) +
+                                           r"'(?: \(\d+\))? panicked at (?:[^\n]*?/)?" +
+                                           re.escape(leaf) + ':' + str(failure_line) + r':\d+:', stderr)
+                      sqlite_refusal = re.search(r'called .*unwrap.* on an .*Err.*value: "unable to open database file[^"\n]*"', stderr)
+                      expected = (outcome['exit'] == 101 and common and location and sqlite_refusal
+                                  and re.search(r'^test result: FAILED\. 0 passed; 1 failed; 0 ignored;', stdout, re.M))
+                      classification = 'matched_source_predicted_setup_refusal' if expected else 'BLOCKED_UNKNOWN_source_prediction_not_established'
+                  else:
+                      expected = (outcome['exit'] == 0 and common
+                                  and re.search(r'^test result: ok\. 1 passed; 0 failed; 0 ignored;', stdout, re.M))
+                      classification = 'exact_parent_pass' if expected else 'BLOCKED_UNKNOWN_unexpected_test_result'
+                  record = {'variant': label, 'selector': selector, 'classification': classification,
+                            'exit': outcome['exit'], 'selected_root_count': selected,
+                            'summaries': summaries, 'integrity': integrity, 'post_census': post,
+                            'source_head': head, 'source_tree': tree, 'test_artifact': identity,
+                            'same_alias_pair_unchanged': pair_identity(root) == pair_pin,
+                            'source_prediction_disproved': bool(failure_line and outcome['exit'] == 0),
+                            'expected_panic_location': f'{leaf}:{failure_line}' if failure_line else None,
+                            'stderr_sha256': digest(phase / 'test.stderr'), 'stdout_sha256': digest(phase / 'test.stdout'),
+                            'baseline_cause': ('NOFOLLOW symlink cause inferred from pinned bundled SQLite/source, exact panic and unchanged pair; extended SQLite code erased by existing String mapping, not measured'
+                                               if failure_line else None),
+                            'nested_children': 'Existing original parent guards/assertions only; nonadditive, no standalone child pass claimed'}
+                  write(phase / 'classification.json', record)
+                  results.append(record)
+                  write(evidence / 'results.json', results)
+                  assert expected, f'{label} {selector}: {classification}; stop before another root'
+              if failure_line is None:
+                  formatted = run(directory, 'official-format', ['bash', 'scripts/check-format'], 600, env)
+                  assert formatted['exit'] == 0
+                  assert source(head, tree) == pinned and pair_identity(root) == pair_pin
+          assert len(results) == 32
+          assert sum(r['classification'] == 'matched_source_predicted_setup_refusal' for r in results) == 2
+          assert sum(r['classification'] == 'exact_parent_pass' for r in results) == 30
+          write(evidence / 'qualification.json', {
+              'control': control, 'variants': [dict(label=v[0], product_head=v[2], product_tree=v[3]) for v in variants],
+              'matched_expected_baselines': 2, 'fixed_channel_parents': 3, 'fixed_schema_parents': 27,
+              'nested_children_additive': False,
+              'scope': 'Supplementary aliased-TMPDIR HOST fixture qualification only; not full CI, native, provider or whole-product acceptance',
+          })
+          PY
+
+      - name: Retain all logs and partial or complete results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: canonical-parent-${{ github.event.pull_request.head.sha }}
+          path: ${{ env.CANONICAL_EVIDENCE_DIR }}
+          if-no-files-found: error
+          retention-days: 14
