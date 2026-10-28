@@ -23,7 +23,7 @@ pub enum AutomationCommand {
         #[arg(help = "Maximum seconds to wait (1 through 3600).")]
         wait_seconds: u64,
     },
-    /// Read only this conversation's immutable approval request.
+    /// Read a saved request; hosted conversations can read only their own.
     Proposal {
         #[arg(help = "The stable resource ID.")]
         id: Uuid,
@@ -33,6 +33,22 @@ pub enum AutomationCommand {
         #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))]
         #[arg(help = "Maximum seconds to wait (1 through 3600).")]
         wait_seconds: u64,
+    },
+    /// Approve and enable the exact saved proposal revision (user authority required).
+    Approve {
+        /// ID returned by automation propose or automation proposal.
+        id: Uuid,
+        /// Exact revision from the complete saved proposal you reviewed.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        revision: u64,
+    },
+    /// Decline the exact saved proposal revision without creating a schedule.
+    Decline {
+        /// ID returned by automation propose or automation proposal.
+        id: Uuid,
+        /// Exact revision from the complete saved proposal you reviewed.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        revision: u64,
     },
     /// Create a disabled automation from a JSON definition (use - for stdin).
     Create {
@@ -198,6 +214,11 @@ pub(super) fn execute_with_context(
 ) -> Result<CommandOutput, AppError> {
     context.admit_remote()?;
     let authority = &context.authority;
+    let decision = match &command {
+        AutomationCommand::Approve { id, revision } => Some((*id, *revision, true)),
+        AutomationCommand::Decline { id, revision } => Some((*id, *revision, false)),
+        _ => None,
+    };
     let wait = match &command {
         AutomationCommand::Propose {
             wait: true,
@@ -243,11 +264,26 @@ pub(super) fn execute_with_context(
             }
         }
     }
-    let outcome = match (&reply, wait) {
-        (Response::Proposal(proposal), Some(_)) => Some(proposal_outcome(&proposal.state)),
-        _ => None,
+    let outcome = if let Some(expected) = decision {
+        let Response::Proposal(proposal) = &reply else {
+            return Err(AppError::new(
+                "automation_receipt",
+                "The decision response did not contain its proposal receipt; inspect the saved proposal before retrying",
+            ));
+        };
+        Some(decision_outcome(
+            expected,
+            proposal.id,
+            proposal.revision,
+            &proposal.state,
+        )?)
+    } else {
+        match (&reply, wait) {
+            (Response::Proposal(proposal), Some(_)) => Some(proposal_outcome(&proposal.state)),
+            _ => None,
+        }
     };
-    let (mut data, human) = match reply {
+    let (mut data, mut human) = match reply {
         Response::Proposal(proposal) => {
             let human = match &proposal.state {
                 crate::automations::ProposalState::Pending => format!(
@@ -324,6 +360,9 @@ pub(super) fn execute_with_context(
             "Cancellation requested; inspect the run for its confirmed outcome.".into(),
         ),
     };
+    if decision.is_some() && matches!(outcome, Some(WaitOutcome::Failed)) {
+        human = format!("The recorded decision differs from this request. {human}");
+    }
     if let Some(outcome) = outcome {
         data["outcome"] = json!(outcome);
     }
@@ -493,6 +532,28 @@ fn proposal_outcome(state: &crate::automations::ProposalState) -> WaitOutcome {
     }
 }
 
+fn decision_outcome(
+    expected: (Uuid, u64, bool),
+    received_id: Uuid,
+    received_revision: u64,
+    state: &crate::automations::ProposalState,
+) -> Result<WaitOutcome, AppError> {
+    if received_id != expected.0 || received_revision != expected.1 {
+        return Err(AppError::new(
+            "automation_receipt",
+            "The decision response does not match the reviewed proposal; inspect the saved proposal before retrying",
+        ));
+    }
+    Ok(match state {
+        crate::automations::ProposalState::Pending => WaitOutcome::Pending,
+        crate::automations::ProposalState::Approved { .. } if expected.2 => WaitOutcome::Succeeded,
+        crate::automations::ProposalState::Declined if !expected.2 => WaitOutcome::Succeeded,
+        // Another user may have committed the opposite terminal decision.
+        // Report its receipt without claiming this requested decision won.
+        _ => WaitOutcome::Failed,
+    })
+}
+
 fn request(command: AutomationCommand) -> Result<(&'static str, Request), AppError> {
     Ok(match command {
         AutomationCommand::Propose {
@@ -507,6 +568,22 @@ fn request(command: AutomationCommand) -> Result<(&'static str, Request), AppErr
             },
         ),
         AutomationCommand::Proposal { id, .. } => ("automation.proposal", Request::Proposal { id }),
+        AutomationCommand::Approve { id, revision } => (
+            "automation.approve",
+            Request::ResolveProposal {
+                id,
+                revision,
+                approved: true,
+            },
+        ),
+        AutomationCommand::Decline { id, revision } => (
+            "automation.decline",
+            Request::ResolveProposal {
+                id,
+                revision,
+                approved: false,
+            },
+        ),
         AutomationCommand::Create { definition } => (
             "automation.create",
             Request::Create {
@@ -621,6 +698,83 @@ fn read_definition(path: &Path) -> Result<Definition, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proposal_decisions_require_the_reviewed_revision_and_refuse_scoped_callers() {
+        let id = Uuid::new_v4();
+        let id_text = id.to_string();
+        for (verb, approved) in [("approve", true), ("decline", false)] {
+            assert!(parse(&["cagents", "automation", verb, &id_text]).is_err());
+            assert!(parse(&["cagents", "automation", verb, &id_text, "--revision", "0"]).is_err());
+            let arguments = ["cagents", "automation", verb, &id_text, "--revision", "7"];
+            let (name, operation) = request(parse(&arguments).unwrap()).unwrap();
+            assert_eq!(name, format!("automation.{verb}"));
+            assert_eq!(
+                operation,
+                Request::ResolveProposal {
+                    id,
+                    revision: 7,
+                    approved,
+                }
+            );
+            assert!(!operation.allowed_from_hosted_conversation());
+            // A synthetic input to the ordinary context proves local admission;
+            // it does not establish any deployed caller's authority.
+            let context = ServiceRequestContext {
+                authority: Authority::session("proposal-decision-test-scope".into()),
+                remote: false,
+            };
+            let Err(refused) = execute_with_context(parse(&arguments).unwrap(), &context) else {
+                panic!("scoped decision must refuse before connecting");
+            };
+            assert_eq!(refused.kind, "automation_authority");
+            assert!(
+                refused
+                    .message
+                    .contains("cannot alter unattended schedules")
+            );
+        }
+    }
+
+    #[test]
+    fn proposal_decision_receipts_match_identity_revision_and_the_requested_outcome() {
+        use crate::automations::ProposalState;
+        let id = Uuid::new_v4();
+        let approved = ProposalState::Approved {
+            automation: Uuid::new_v4(),
+            execution_revision: 2,
+        };
+        for (requested, received, expected) in [
+            (true, &approved, WaitOutcome::Succeeded),
+            (false, &ProposalState::Declined, WaitOutcome::Succeeded),
+            (true, &ProposalState::Declined, WaitOutcome::Failed),
+            (false, &approved, WaitOutcome::Failed),
+            (true, &ProposalState::Pending, WaitOutcome::Pending),
+            (false, &ProposalState::Pending, WaitOutcome::Pending),
+        ] {
+            let outcome = decision_outcome((id, 7, requested), id, 7, received).unwrap();
+            assert_eq!(outcome, expected);
+            assert_eq!(
+                outcome.exit_code(),
+                match expected {
+                    WaitOutcome::Succeeded => 0,
+                    WaitOutcome::Failed => 4,
+                    WaitOutcome::Pending => 3,
+                    _ => unreachable!(),
+                }
+            );
+        }
+        for (received_id, revision) in [(Uuid::new_v4(), 7), (id, 8)] {
+            let error =
+                decision_outcome((id, 7, true), received_id, revision, &approved).unwrap_err();
+            assert_eq!(error.kind, "automation_receipt");
+            assert!(
+                error
+                    .message
+                    .contains("does not match the reviewed proposal")
+            );
+        }
+    }
 
     #[test]
     fn readable_automation_lists_have_headers_empty_states_and_plain_values() {

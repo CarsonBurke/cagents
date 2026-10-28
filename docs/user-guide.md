@@ -722,6 +722,15 @@ changed settings. After a wait ends, `cagents automation proposal UUID --wait`
 can resume reading that conversation's request. Neither approval nor inspection
 gives a delegated agent permission to change an active schedule.
 
+From your own terminal, `cagents --json automation proposal UUID` reads the full
+saved definition and its revision. After reviewing it, use
+`cagents automation approve UUID --revision REVISION` to approve and enable it,
+or `cagents automation decline UUID --revision REVISION` to decline it. Hosted
+conversations cannot send either decision. Both commands return the exact saved
+receipt. If another user already committed the opposite decision, that receipt
+is reported with exit code 4; an unconfirmed pending receipt returns 3. A lost
+reply remains unknown: inspect the same proposal before explicitly retrying.
+
 ## Settings
 
 Open **Settings** from the gear in the lower-left corner. Valid changes save
