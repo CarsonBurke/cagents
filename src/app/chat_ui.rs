@@ -5688,6 +5688,16 @@ impl Cagents {
         }) {
             return Task::none();
         }
+        if local_io
+            .is_some_and(|runtime| runtime.pending.is_some() || !runtime.followups.is_empty())
+        {
+            // Accepted local work can still be waiting for its send task. An
+            // idle actor does not prove that work has reached the source.
+            self.status = Some(TransientNotice::warning(
+                "Finish pending commands and send or take back queued follow-ups, then select the account again.",
+            ));
+            return Task::none();
+        }
         let Some(CardKind::Chat(source)) = self.card_state(card).map(|state| &state.kind) else {
             return Task::none();
         };
@@ -27121,6 +27131,119 @@ mod tests {
                 assert!(!runtime.account_switch_checking);
             }
         }
+    }
+
+    #[test]
+    fn explicit_switch_waits_for_accepted_commands_and_local_followups() {
+        for pending_command in [true, false] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let alternate = app.account_ui.add_managed_fixture(Provider::Codex, 462);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let target = chat_runtime(&app, card).target;
+            let source = chat_runtime(&app, card).session.clone();
+            let handle = chat_runtime(&app, card).handle().unwrap().clone();
+            write(&mut app, card, "Keep the unsent request");
+            let command = if pending_command {
+                // Accept the real command, but keep its send task unpolled:
+                // the actor can still be idle while the UI owns this work.
+                Some(app.chat_send(
+                    target,
+                    Command::SetModel {
+                        model: "fixture-model".into(),
+                        reasoning: None,
+                    },
+                    false,
+                ))
+            } else {
+                app.chat_runtime_mut(target)
+                    .unwrap()
+                    .followups
+                    .push(followup(462, "accepted follow-up", &[]));
+                None
+            };
+            let pending = chat_runtime(&app, card)
+                .pending
+                .as_ref()
+                .map(|pending| pending.id);
+            assert_eq!(pending.is_some(), pending_command);
+            drop(app.update(Message::ChatUi(Action::ChooseAccount(
+                target,
+                alternate.clone(),
+            ))));
+            assert!(!app.chat_start_pending(card));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.target, target);
+            assert_eq!(runtime.session, source);
+            assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
+            assert_eq!(runtime.pending.as_ref().map(|pending| pending.id), pending);
+            assert_eq!(runtime.followups.len(), usize::from(!pending_command));
+            assert_eq!(runtime.composer.text(), "Keep the unsent request");
+            assert!(
+                runtime.pending_account_switch.is_none(),
+                "local work is not actor-proved Busy"
+            );
+            assert!(!runtime.disconnected);
+            assert!(app.status.is_some());
+            drop(command);
+            if let Some(id) = pending {
+                drop(app.update(Message::ChatUi(Action::CommandFinished(target, id, Ok(())))));
+            } else {
+                drop(app.update(Message::ChatUi(Action::TakeBackQueued(
+                    target,
+                    Some(QueueEntry::Local(462)),
+                ))));
+            }
+            assert!(
+                !app.chat_start_pending(card),
+                "settlement does not silently retry the switch"
+            );
+            assert!(chat_runtime(&app, card).pending.is_none());
+            assert!(chat_runtime(&app, card).followups.is_empty());
+            drop(app.update(Message::ChatUi(Action::ChooseAccount(target, alternate))));
+            assert!(
+                app.chat_start_pending(card),
+                "a fresh explicit choice can now ask the actor"
+            );
+            assert_eq!(
+                app.chat_ui
+                    .attempt(card)
+                    .unwrap()
+                    .recovery
+                    .as_ref()
+                    .unwrap()
+                    .source,
+                source
+            );
+        }
+    }
+
+    #[test]
+    fn preclose_capacity_refusal_keeps_the_original_attachment_and_guidance() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let alternate = app.account_ui.add_managed_fixture(Provider::Codex, 463);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let source = chat_runtime(&app, card).session.clone();
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        write(&mut app, card, "Keep this draft at capacity");
+        drop(app.choose_chat_account(target, alternate));
+        let attempt = chat_runtime_attempt(&app, card);
+        answer_start(&mut app, attempt, Err(chat::StartFailure {
+            message: "Daemon native chat capacity reached: release completed chats or change capacity".into(),
+            recovery: chat::Recovery::AccountSwitchUnavailable,
+        }));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.target, target);
+        assert_eq!(runtime.session, source);
+        assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
+        assert_eq!(runtime.composer.text(), "Keep this draft at capacity");
+        assert!(runtime.error.as_ref().unwrap().contains("change capacity"));
+        assert!(!runtime.disconnected);
+        assert!(runtime.pending_account_switch.is_none());
+        assert!(runtime.account_switch_fallback.is_some());
+        assert!(!app.chat_ui.removed_accounts.contains(&card));
+        assert!(app.chat_ui.retiring.is_empty());
+        assert!(!app.chat_start_pending(card));
     }
 
     #[test]

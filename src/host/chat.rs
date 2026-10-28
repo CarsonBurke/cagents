@@ -2211,7 +2211,8 @@ fn recover_account(
         }
         // A different card is a distinct resident slot, even after its source
         // completes. Refuse capacity before ending the healthy source.
-        capacity::require_available(&state)?;
+        capacity::require_available(&state)
+            .map_err(|failure| account_switch_unavailable(failure.message))?;
         state.chat_spawning.insert(source.id, source.clone());
         (
             handle,
@@ -5952,6 +5953,37 @@ while time.monotonic() < end:
             return;
         }
         let generation = handle.snapshot(None).unwrap().generation;
+        let original_process = handle.provider_process().unwrap();
+        let capacity = {
+            let mut state = host.lock().unwrap();
+            let capacity = state.native_chat_capacity;
+            state.native_chat_capacity = capacity::usage(&state);
+            capacity
+        };
+        let failure = recover_account(
+            &host,
+            1,
+            source.clone(),
+            replacement.clone(),
+            Some(generation),
+            Default::default(),
+            explicit,
+        )
+        .unwrap_err();
+        assert_eq!(failure.code, ProtocolErrorCode::AccountSwitchUnavailable);
+        assert!(failure.message.contains("capacity reached"));
+        assert!(!failure.retryable);
+        assert!(original_process.is_current());
+        assert!(!handle.is_completed());
+        assert_eq!(std::fs::read(&transcript).unwrap(), b"{}\n");
+        assert!(!alternate_home.join("projects").exists());
+        {
+            let mut state = host.lock().unwrap();
+            assert!(state.chat_spawning.is_empty());
+            assert_eq!(state.chats.len(), 1);
+            assert!(state.chats[&source.id].handle.same_actor(&handle));
+            state.native_chat_capacity = capacity;
+        }
         let mut foreign = source.clone();
         foreign.proof.as_mut().unwrap().host_incarnation = "foreign".into();
         assert!(account_switch_source(&host.lock().unwrap(), &foreign).is_err());
