@@ -34,7 +34,9 @@ impl Cagents {
                             !session.is_unstarted()
                                 && !self.retained_startup_draft(card.id, session)
                         }
-                        CardKind::Terminal(session) => !terminal_ended(session),
+                        CardKind::Terminal(session) => {
+                            !terminal_ended(session) && !self.saved_terminal_ready(card.id)
+                        }
                         _ => false,
                     }
             })
@@ -63,7 +65,7 @@ impl Cagents {
             .filter(|card| card.existence.is_open())
         {
             if let CardKind::Terminal(session) = &card.kind {
-                if terminal_ended(session) {
+                if terminal_ended(session) || self.saved_terminal_ready(card.id) {
                     continue;
                 }
                 match self.cards.get(&card.id) {
@@ -126,6 +128,7 @@ impl Cagents {
             if card.existence.is_open()
                 && matches!(&card.kind, CardKind::Terminal(session) if !terminal_ended(session))
                 && matches!(self.cards.get(&card.id), Some(CardRuntime::Loading))
+                && self.saved_terminal_current(card.id).is_none()
                 && !self.restored_agent_attaches.contains(&card.id)
             {
                 self.restored_agent_attaches.push_back(card.id);

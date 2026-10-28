@@ -56,7 +56,16 @@ cargo check --locked --no-default-features --features ui --bin cagents-ui
 
 # Integrated UI client: libcosmic and Servo, no Ghostty graph.
 cargo check --locked --features integrated-browser --bin cagents-ui
+
+# Standalone editor: separate package using the browserless UI graph.
+cargo check --locked --package ceditor --bin ceditor
 ```
+
+Changes to ceditor or shared UI, editor, or notification public contracts also
+require the standalone editor check above. The workspace's
+`default-members = ["."]` selects only cagents: root UI checks and root
+`--all-targets` tests do not compile the downstream ceditor binary. Run the
+ceditor check separately from the CLI, host, and UI checks.
 
 The default `full` feature selects production identity only; `ui`, `host`, and
 `integrated-browser` select implementation graphs. Cargo features are
