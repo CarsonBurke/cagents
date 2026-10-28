@@ -1001,10 +1001,7 @@ impl Cagents {
                     self.chat_start_pending(card),
                     self.settings.chat_enter_sends,
                     &self.settings.keyboard_shortcuts,
-                    self.workspace
-                        .presentation_geometry()
-                        .card(card)
-                        .map_or(self.workspace.viewport_width(), |card| card.width())
+                    self.card_content_width(card)
                         .min(super::layout::READING_COLUMN),
                     place,
                     !self.workspace_inputs_blocked(),
@@ -2073,12 +2070,16 @@ impl Runtime {
         }
         // The scroll viewport spans the pane, so its scrollbar follows the
         // pane edge, while the rows keep the reading column the composer
-        // shares. The symmetric inset already exceeds the scrollbar rail.
+        // shares. The symmetric inset reserves the whole scrollbar rail.
         // Reserving the rail a second time would make transcript rows
         // narrower than the composer in a pane no wider than the column.
         let transcript = widget::container(
             widget::container(virtualized::column(transcript.children, Default::default()))
-                .padding(iced::Padding::new(step::GAP_M))
+                .padding(iced::Padding {
+                    left: super::layout::HORIZONTAL_INSET,
+                    right: super::layout::HORIZONTAL_INSET,
+                    ..iced::Padding::new(step::GAP_M)
+                })
                 .width(Length::Fill)
                 .max_width(super::layout::READING_COLUMN),
         )
@@ -2508,11 +2509,10 @@ impl Runtime {
                     child
                 } else {
                     widget::container(child)
-                        .padding(iced::Padding::from([0.0, step::GAP_M]).top(if index == 0 {
-                            step::GAP_M
-                        } else {
-                            0.0
-                        }))
+                        .padding(
+                            iced::Padding::from([0.0, super::layout::HORIZONTAL_INSET])
+                                .top(if index == 0 { step::GAP_M } else { 0.0 }),
+                        )
                         .width(Length::Fill)
                         .max_width(super::layout::READING_COLUMN)
                         .into()
@@ -3105,7 +3105,7 @@ impl Runtime {
                     child
                 } else {
                     widget::container(child)
-                        .padding([0.0, step::GAP_M])
+                        .padding([0.0, super::layout::HORIZONTAL_INSET])
                         .width(Length::Fill)
                         .max_width(super::layout::READING_COLUMN)
                         .into()
@@ -3119,7 +3119,8 @@ impl Runtime {
             widget::container(footer)
                 .id(card_control_id(target.card, "chat-footer"))
                 .padding(
-                    iced::Padding::from([0.0, step::GAP_M + COMPOSER_PADDING]).bottom(step::GAP_M),
+                    iced::Padding::from([0.0, super::layout::HORIZONTAL_INSET + COMPOSER_PADDING])
+                        .bottom(step::GAP_M),
                 )
                 .into(),
         ))
@@ -10270,11 +10271,12 @@ mod tests {
             let field = probe.field.expect("find field");
             assert_eq!(
                 field.x,
-                (width - column) / 2.0 + step::GAP_M,
+                (width - column) / 2.0 + super::super::layout::HORIZONTAL_INSET,
                 "width {width}"
             );
             assert!(
-                field.x + field.width <= (width + column) / 2.0 - step::GAP_M,
+                field.x + field.width
+                    <= (width + column) / 2.0 - super::super::layout::HORIZONTAL_INSET,
                 "width {width}"
             );
         }
@@ -10558,8 +10560,11 @@ mod tests {
                     &mut probe,
                 );
                 let bounds = probe.bounds.expect("composer editor");
-                assert_eq!(bounds.x, step::GAP_M);
-                assert_eq!(bounds.width, width - 2.0 * step::GAP_M);
+                assert_eq!(bounds.x, super::super::layout::HORIZONTAL_INSET);
+                assert_eq!(
+                    bounds.width,
+                    width - 2.0 * super::super::layout::HORIZONTAL_INSET
+                );
             }
         }
     }
@@ -10698,12 +10703,12 @@ mod tests {
                 assert_eq!((viewport.x, viewport.width), (0.0, width), "state {state}");
                 assert_eq!(
                     editor.x,
-                    (width - column_width) / 2.0 + step::GAP_M,
+                    (width - column_width) / 2.0 + super::super::layout::HORIZONTAL_INSET,
                     "state {state}"
                 );
                 assert_eq!(
                     editor.width,
-                    column_width - 2.0 * step::GAP_M,
+                    column_width - 2.0 * super::super::layout::HORIZONTAL_INSET,
                     "state {state}"
                 );
                 assert_eq!(*baseline.get_or_insert(geometry), geometry, "state {state}");

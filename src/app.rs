@@ -6945,11 +6945,7 @@ impl Cagents {
     ) -> Element<'a, Message> {
         // The strip already tracks the rendered width, including animations.
         // Responsive would hide the review and its controls from AccessKit.
-        let width = self
-            .workspace
-            .presentation_geometry()
-            .card(id)
-            .map_or(self.workspace.viewport_width(), |card| card.width());
+        let width = self.card_content_width(id);
         self.pull_request_card_layout(id, pane, width)
     }
 
@@ -9568,6 +9564,24 @@ impl Cagents {
         Task::batch(tasks)
     }
 
+    fn card_resize_clearance(&self) -> f32 {
+        // Winit's border scales with the display, while content additionally
+        // scales with COSMIC's interface factor. A smaller interface needs
+        // more layout space to clear the same native resize band.
+        (design::PANE_RESIZE_CLEARANCE / self.core.scale_factor())
+            .max(design::PANE_RESIZE_CLEARANCE)
+    }
+
+    fn card_content_width(&self, id: CardId) -> f32 {
+        (self
+            .workspace
+            .presentation_geometry()
+            .card(id)
+            .map_or(self.workspace.viewport_width(), |card| card.width())
+            - 2.0 * self.card_resize_clearance())
+        .max(0.0)
+    }
+
     fn workspace_card_view(
         &self,
         id: CardId,
@@ -10139,6 +10153,9 @@ impl Cagents {
         }
         let surface: Element<'a, Message> =
             widget::container(widget::column::with_children(rows).height(Length::Fill))
+                // Resize targets keep the outer edge; content, including a
+                // scrollbar, must finish before their hit regions begin.
+                .padding([0.0, self.card_resize_clearance()])
                 .class(cosmic::theme::Container::custom(move |theme| {
                     iced::widget::container::Style {
                         background: Some(iced::Background::Color(theme.cosmic().bg_color().into())),

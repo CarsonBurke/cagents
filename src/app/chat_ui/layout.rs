@@ -1,8 +1,11 @@
 //! One reading column, determined by available space rather than its contents.
 use super::*;
 
-/// The conversation's readable width, including its symmetric inset.
-pub(in crate::app) const READING_COLUMN: f32 = design::READABLE_MEASURE + 2.0 * step::GAP_M;
+// Pane content already sits inside the shared resize clearance. Reserve the
+// full scrollbar rail within that content, including in a narrow pane.
+pub(super) const HORIZONTAL_INSET: f32 = design::SCROLLBAR_GUTTER;
+/// The conversation's readable width, including its symmetric rail inset.
+pub(in crate::app) const READING_COLUMN: f32 = design::READABLE_MEASURE + 2.0 * HORIZONTAL_INSET;
 
 use iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer,

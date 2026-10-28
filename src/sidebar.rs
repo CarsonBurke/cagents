@@ -4865,6 +4865,16 @@ fn view_inner<'a>(
                 body(model, state, compact, modal_open)
             },
         )
+        // The expanded sidebar's splitter keeps the outer edge. Its hit
+        // region must not cover the project list's scrollbar.
+        .padding(Padding {
+            right: if compact {
+                0.0
+            } else {
+                design::PANE_RESIZE_CLEARANCE
+            },
+            ..Padding::ZERO
+        })
         .width(Length::Fill)
         .height(Length::Fill),
     );
