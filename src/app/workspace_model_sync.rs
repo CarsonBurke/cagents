@@ -109,6 +109,13 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
     // model to mirror, and the window starts one itself as soon as it publishes.
     let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
     let mut client = ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+    observe_with_client(sender, &mut client)
+}
+
+fn observe_with_client(
+    sender: &async_channel::Sender<ModelUpdate>,
+    client: &mut ControlClient,
+) -> Result<(), String> {
     // One request subscribes and reads, so an edit applied between the two
     // cannot fall into a gap - the hazard `watch_terminals` then `list` has to
     // order around with two requests.
@@ -133,6 +140,7 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
                 | ModelEdit::ReorderNavigation { .. }
                 | ModelEdit::ResetNavigation { .. }
                 | ModelEdit::RetireEmptyChannel { .. }
+                | ModelEdit::AgentsChanged
         ) {
             let model = client
                 .read_workspace_model()
@@ -142,13 +150,7 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
                 .map_err(|error| error.to_string())?;
             continue;
         }
-        let ranked = matches!(
-            edit,
-            ModelEdit::CreateChannel { .. }
-                | ModelEdit::AgentsChanged
-                | ModelEdit::SeedView { .. }
-                | ModelEdit::ChangeView { .. }
-        );
+        let ranked = matches!(edit, ModelEdit::CreateChannel { .. });
         sender
             .send_blocking(ModelUpdate::Edited { sequence, edit })
             .map_err(|error| error.to_string())?;
@@ -421,6 +423,24 @@ enum Adoption {
     /// Nothing this window can show yet; the row is retained in the model and
     /// reconsidered on the next reconciliation.
     Retained,
+}
+
+/// Absence candidates only; the caller retains deletion/republish policy.
+/// Shared IDs include rows skipped during adoption. Local order and duplicate
+/// entries remain authoritative for the later action loop.
+fn channels_absent_from_model(
+    local: &[ProjectChannel],
+    shared: &[ModelChannel],
+) -> Vec<(ChannelId, bool)> {
+    let shared_ids = shared
+        .iter()
+        .map(|channel| channel.id)
+        .collect::<HashSet<_>>();
+    local
+        .iter()
+        .filter(|channel| !shared_ids.contains(&channel.id))
+        .map(|channel| (channel.id, channel.shared))
+        .collect()
 }
 
 impl Cagents {
@@ -863,13 +883,7 @@ impl Cagents {
             }
         }
         let mut republished = Vec::new();
-        let retired = self
-            .durable
-            .channels
-            .iter()
-            .filter(|local| !model.channels.iter().any(|shared| shared.id == local.id))
-            .map(|local| (local.id, local.shared))
-            .collect::<Vec<_>>();
+        let retired = channels_absent_from_model(&self.durable.channels, &model.channels);
         for (id, shared) in retired {
             if self.channel_ui.is_deleting(id) {
                 continue;
@@ -1549,6 +1563,250 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absent_channel_candidates_preserve_local_order_duplicates_and_shared_flags() {
+        let project = ProjectId::new();
+        let repository = PathBuf::from("/repo/.git");
+        let mut locals = (0..2_046)
+            .map(|index| {
+                let mut channel = local(ChannelId::new(), project, "local", index);
+                channel.shared = index % 2 == 0;
+                let card = CardId::new();
+                channel.cards.push(card);
+                channel.focused = Some(card);
+                channel
+            })
+            .collect::<Vec<_>>();
+        let missing = locals[0].id;
+        let present = locals[1].id;
+        let skipped_adoption = locals[3].id;
+        let mut incoming = locals
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| index % 3 != 0)
+            .rev()
+            .map(|(_, channel)| shared(channel.id, &repository, "shared", channel.ordinal))
+            .collect::<Vec<_>>();
+        // Even a model row the caller skips while adopting is still present for
+        // absence authority. The selector must consume the complete model list.
+        incoming.push(shared(skipped_adoption, &repository, "skipped adoption", 0));
+        incoming.push(incoming[0].clone());
+        incoming.push(shared(ChannelId::new(), &repository, "not local", 1));
+        let mut duplicate_missing = locals[0].clone();
+        duplicate_missing.shared = false;
+        duplicate_missing.title = "unshared duplicate".into();
+        locals.insert(9, duplicate_missing);
+        let mut duplicate_present = locals[2].clone();
+        // After the insertion, original row1 is still at index1.
+        duplicate_present.id = present;
+        duplicate_present.shared = true;
+        locals.push(duplicate_present);
+        assert_eq!(locals.len(), 2_048);
+        let before = locals.clone();
+
+        // Independent old nested membership is the semantic oracle, not an
+        // assertion about HashSet iteration or measured runtime.
+        let expected = locals
+            .iter()
+            .filter(|local| !incoming.iter().any(|shared| shared.id == local.id))
+            .map(|local| (local.id, local.shared))
+            .collect::<Vec<_>>();
+        let absent = channels_absent_from_model(&locals, &incoming);
+        assert_eq!(absent, expected);
+        assert_eq!(absent.len(), 682);
+        assert_eq!(
+            absent
+                .iter()
+                .copied()
+                .filter(|(id, _)| *id == missing)
+                .collect::<Vec<_>>(),
+            [(missing, true), (missing, false)],
+            "local duplicates retain order and their distinct retirement authority"
+        );
+        assert!(
+            !absent
+                .iter()
+                .any(|(id, _)| *id == present || *id == skipped_adoption)
+        );
+        assert_eq!(
+            locals, before,
+            "titles, conversations and focus are untouched"
+        );
+
+        assert_eq!(
+            channels_absent_from_model(&locals, &[]),
+            locals
+                .iter()
+                .map(|local| (local.id, local.shared))
+                .collect::<Vec<_>>()
+        );
+        let all_present = locals
+            .iter()
+            .rev()
+            .map(|channel| shared(channel.id, &repository, "shared", channel.ordinal))
+            .collect::<Vec<_>>();
+        assert!(channels_absent_from_model(&locals, &all_present).is_empty());
+    }
+
+    #[test]
+    fn agent_invalidation_reads_once_without_reconciling_a_stale_inventory_edge() {
+        use crate::terminal::ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+            ServerResponse, read_frame, write_frame,
+        };
+        // Exercise both a real inventory arrival and removal while preserving
+        // the exact five-update ordering contract in each scenario.
+        for removed in [false, true] {
+            let (_, mut agent, _, _) = managed_display_fixture();
+            agent.name = Some("Refreshed managed agent".into());
+            let initial = if removed {
+                vec![agent.clone()]
+            } else {
+                Vec::new()
+            };
+            let refreshed = if removed { Vec::new() } else { vec![agent] };
+            let server_initial = initial.clone();
+            let server_refreshed = refreshed.clone();
+            let channel = ChannelId::new();
+            let title = ModelEdit::RetitleChannel {
+                id: channel,
+                title: "Manual title".into(),
+            };
+            let create = ModelEdit::CreateChannel {
+                id: ChannelId::new(),
+                repository: "/repo/.git".into(),
+                title: "Other channel".into(),
+                title_source: Default::default(),
+            };
+            let expected_title = title.clone();
+            let expected_create = create.clone();
+            let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let server = std::thread::spawn(move || {
+                let proof = crate::model::HostSessionProof {
+                    host_session_id: "observer".into(),
+                    boot_id: "boot".into(),
+                    host_incarnation: "owner".into(),
+                };
+                let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(hello.request_id),
+                        proof: proof.clone(),
+                        message: ServerMessage::Response {
+                            response: ServerResponse::Connected {
+                                proof: proof.clone(),
+                                resumed: vec![],
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+                let watch: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                assert_eq!(watch.request, ClientRequest::WatchWorkspaceModel);
+                let mut model = WorkspaceModel {
+                    identity: uuid::Uuid::new_v4(),
+                    agents: server_initial,
+                    ..Default::default()
+                };
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(watch.request_id),
+                        proof: proof.clone(),
+                        message: ServerMessage::Response {
+                            response: ServerResponse::WorkspaceModel {
+                                model: model.clone(),
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+                for (sequence, edit) in [(1, title), (2, ModelEdit::AgentsChanged), (3, create)] {
+                    write_frame(
+                        &mut peer,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: None,
+                            proof: proof.clone(),
+                            message: ServerMessage::WorkspaceModelEdited {
+                                sequence,
+                                edit: edit.clone(),
+                            },
+                        },
+                    )
+                    .unwrap();
+                    model.fold(sequence, &edit);
+                    if sequence == 2 {
+                        model.agents = server_refreshed.clone();
+                    }
+                    if sequence != 1 {
+                        let read: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                        assert_eq!(read.request, ClientRequest::ReadWorkspaceModel);
+                        write_frame(
+                            &mut peer,
+                            &ServerEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id: Some(read.request_id),
+                                proof: proof.clone(),
+                                message: ServerMessage::Response {
+                                    response: ServerResponse::WorkspaceModel {
+                                        model: model.clone(),
+                                    },
+                                },
+                            },
+                        )
+                        .unwrap();
+                    }
+                }
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: None,
+                        proof,
+                        message: ServerMessage::HostShuttingDown,
+                    },
+                )
+                .unwrap();
+            });
+            let mut client = ControlClient::from_stream(stream).unwrap();
+            let (tx, rx) = async_channel::unbounded();
+            assert!(observe_with_client(&tx, &mut client).is_err());
+            server.join().unwrap();
+            let updates = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+            assert_eq!(
+                updates.len(),
+                5,
+                "one full Read for AgentsChanged, never a stale Edited first"
+            );
+            assert!(matches!(&updates[0], ModelUpdate::Connected(model) if model.sequence == 0));
+            assert!(
+                matches!(&updates[0], ModelUpdate::Connected(model) if model.agents == initial),
+                "the watch response keeps the original inventory"
+            );
+            assert!(
+                matches!(&updates[1], ModelUpdate::Edited { sequence: 1, edit } if edit == &expected_title)
+            );
+            assert!(matches!(&updates[2], ModelUpdate::Read(model) if model.sequence == 2));
+            assert!(
+                matches!(&updates[2], ModelUpdate::Read(model) if model.agents == refreshed),
+                "AgentsChanged must carry the exact fresh inventory, including removal"
+            );
+            assert!(
+                matches!(&updates[3], ModelUpdate::Edited { sequence: 3, edit } if edit == &expected_create)
+            );
+            assert!(matches!(&updates[4], ModelUpdate::Read(model) if model.sequence == 3));
+            assert!(
+                matches!(&updates[4], ModelUpdate::Read(model) if model.agents == refreshed),
+                "later full reads must not restore stale agent inventory"
+            );
+        }
+    }
 
     #[test]
     fn busy_title_publication_yields_after_three_original_attempts_to_the_next_edit() {
