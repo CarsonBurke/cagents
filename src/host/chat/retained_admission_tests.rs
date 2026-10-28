@@ -246,17 +246,29 @@ fn named_resume_case(name: &str, fail_retirement: bool, finish_with_close: bool)
     let initial_id = initial.id;
     start(&host, initial).unwrap();
     let handle = host.lock().unwrap().chats[&initial_id].handle.clone();
-    let wait = |condition: &mut dyn FnMut() -> bool| {
+    let wait = |stage: &str, condition: &mut dyn FnMut() -> bool| {
         let deadline = Instant::now() + Duration::from_secs(15);
         while !condition() {
-            assert!(
-                Instant::now() < deadline,
-                "named-resume fixture did not settle"
-            );
+            if Instant::now() >= deadline {
+                let resident = handle.attachment_snapshot();
+                let snapshot_error = handle.snapshot(None).and_then(|snapshot| snapshot.error);
+                panic!(
+                    "named-resume fixture did not settle at {stage}: ready={} exited={} busy={} history_loading={} failure={:?} snapshot_error={snapshot_error:?} provider_done={} trace={}",
+                    resident.ready,
+                    resident.exited,
+                    resident.busy,
+                    resident.history_loading,
+                    handle.failure(),
+                    root.join("provider-done").exists(),
+                    fs::read_to_string(root.join("provider-trace.jsonl")).unwrap_or_default(),
+                );
+            }
             thread::sleep(Duration::from_millis(10));
         }
     };
-    wait(&mut || handle.attachment_snapshot().ready);
+    wait("initial SDK initialization", &mut || {
+        handle.attachment_snapshot().ready
+    });
     handle
         .command(chat::Command::Prompt {
             text: "LIVE_WORK_1513".into(),
@@ -264,7 +276,9 @@ fn named_resume_case(name: &str, fail_retirement: bool, finish_with_close: bool)
             mode: chat::PromptMode::Send,
         })
         .unwrap();
-    wait(&mut || root.join("provider-done").exists() && handle.is_idle());
+    wait("initial prompt result and idle", &mut || {
+        root.join("provider-done").exists() && handle.is_idle()
+    });
     let ServerResponse::ChatListed { sessions } =
         process(&host, 0, ClientRequest::ChatList).unwrap()
     else {
@@ -519,14 +533,14 @@ fn named_resume_case(name: &str, fail_retirement: bool, finish_with_close: bool)
     // The adapter does not broadcast daemon change notifications. Wait for
     // normal history loading, then exercise the real Client visibility/read
     // path rather than asserting a potentially still-loading initial body.
-    wait(&mut || {
+    wait("resumed HOST history", &mut || {
         !host.lock().unwrap().chats[&requested.id]
             .handle
             .attachment_snapshot()
             .history_loading
     });
     client.set_visible(true).unwrap();
-    wait(&mut || {
+    wait("resumed Client transcript", &mut || {
         client
             .snapshot()
             .items
