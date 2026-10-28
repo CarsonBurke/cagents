@@ -1,10 +1,10 @@
 {
   "schema": 1,
-  "prepared_state": "private source only; no workflow/harness import or execution; independent and Root publication review required",
+  "prepared_state": "Reviewed-source successor after actual2819 UI lib compile failure; new matching compiler/tests/controls remain UNRUN until one authorized remote qualification.",
   "sources": {
     "after": {
-      "head": "ad664eaf63dc9ba27144637a11f03ed5100fdf29",
-      "tree": "91864515367304362f3cf19480938b4434806614"
+      "head": "b816e5419fe3610c7bb67f87f16533d10443e345",
+      "tree": "93e583ae8b04555a6654081ea3624a0c1d653258"
     },
     "before": {
       "head": "87d17f5767c39c7304f87b6fbf20e2f51930fc53",
@@ -57,8 +57,11 @@
     "sha256": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052"
   },
   "product_source_reviews": {
-    "after_whole_sha256": "f9284e29f46edb2f9881ea4903409717f69fe94f7d406235ec4f6467e984486b",
-    "before_whole_sha256": "d66597e9a3d9fa6d264302cd95b2115a33919739502cfc1e92953f825ef83c51"
+    "before_whole_sha256": "d66597e9a3d9fa6d264302cd95b2115a33919739502cfc1e92953f825ef83c51",
+    "after_original_whole_sha256": "f9284e29f46edb2f9881ea4903409717f69fe94f7d406235ec4f6467e984486b",
+    "after_original_whole_head": "ad664eaf63dc9ba27144637a11f03ed5100fdf29",
+    "after_two_import_refresh_sha256": "af06c87af72276584dfa028b445651d96b9b23c0443e9ddd01686efb10cc76e8",
+    "after_two_import_refresh_head": "b816e5419fe3610c7bb67f87f16533d10443e345"
   },
   "limits": [
     "Compiler and headless owning-test evidence only, no actual native window/provider/auth/lease/P0 or screenshot qualification",
@@ -67,5 +70,12 @@
     "Caller authority/HOME/no-start/account scope inherited unchanged; no User marker constructed or authority removed",
     "No local B mutex/admission logic and no stale EA154 observer reused"
   ],
-  "budget": "50 minutes absolute from the earliest workflow step before checkout/setup; all phases consume remaining time; nominal10 minutes of the60-minute job reserved for cleanup/upload. No new phase on exhaustion; owned cleanup remains mandatory."
+  "budget": "50 minutes absolute from the earliest workflow step before checkout/setup; all phases consume remaining time; nominal10 minutes of the60-minute job reserved for cleanup/upload. No new phase on exhaustion; owned cleanup remains mandatory.",
+  "prior_actual_run": {
+    "research_head": "2819e7a6bb0723db8bd8abade3cd1eaeb5e8bb91",
+    "run_id": 40782884760,
+    "tested_after": "ad664eaf63dc9ba27144637a11f03ed5100fdf29",
+    "result": "UIbincheck0, UIlibcompile101 on two missing Uuid imports; no selectors/latency/before/controls executed. Both owned families closed. Historical result only, not new-source qualification.",
+    "artifact_sha256": "7dcf1357deae2d6fd7a0947a03b9a37bd103d97334d5b00ab210cde3c52ce357"
+  }
 }

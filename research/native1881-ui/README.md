@@ -1,5 +1,5 @@
 This temporary research branch adds compiler and owning headless test evidence
-for frozen before `87d17f576` and assembled after `ad664eaf6`. It changes no
+for frozen before `87d17f576` and assembled after `b816e5419` (`ad664eaf6` plus two reviewed test imports). It changes no
 product source. Its extra parents retain the two exact source controls for a
 single fetch and one serial hosted job; they are not adopted product changes.
 
@@ -43,3 +43,11 @@ CLI/daemon/browserless UI+latency-harness artifact set through the reviewed
 diagnostic runner remain separate gates, as does independent native UX review.
 Integrated-browser coverage is a separate affected-consumer/production delivery
 gate. These logs cannot establish any of those claims.
+
+The original research head `2819e7a6b` and failed run `40782884760` remain
+reachable. That run passed the ad664 UI binary check, then failed UI library
+compilation on two missing Uuid imports; no tests or controls ran. The new
+after source fixes only those two test imports, independently source-reviewed
+with all other product entries conserved. Its actual compiler, test and control
+results remain unrun until the next authorized qualification. The earlier
+binary check is historical evidence, not a matching artifact for this source.
