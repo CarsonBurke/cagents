@@ -356,6 +356,103 @@ fn owning_delete(role: &str) {
             ));
         }
     }
+    if role == "user" {
+        owning_retained_claude_delete();
+    }
+}
+
+fn retained_claude_session() -> crate::chat::Session {
+    let mut session = tests::chat_session();
+    session.launch.provider = crate::agent::Provider::Claude;
+    session.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+    session.proof = Some(proof());
+    session.native_continuity = crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+    assert!(session.has_valid_native_continuity());
+    session
+}
+
+// Empty actor inventory is not a retained provider teardown receipt. Exercise
+// actual channel deletion in the already isolated User child, with both a
+// definite refusal and a synthetic Accepted control; no provider is launched.
+fn owning_retained_claude_delete() {
+    for accepted in [false, true] {
+        let (mut app, channel, survivor, card) = tests::channel_with_a_conversation();
+        assert!(app.session.is_none());
+        Arc::make_mut(&mut app.durable).active_channel = Some(survivor);
+        let registry = uuid::Uuid::new_v4();
+        app.workspace_model.identity = registry;
+        Arc::make_mut(&mut app.durable).workspace_model_identity = Some(registry);
+        let session = retained_claude_session();
+        app.card_state_mut(card).unwrap().kind = CardKind::Chat(session.clone());
+        let drafts = HashMap::from([(card, "Keep this retained Claude draft".into())]);
+        app.chat_ui = crate::app::chat_ui::State::with_drafts(drafts.clone());
+        Arc::make_mut(&mut app.durable).chat_drafts = drafts.clone();
+        let saved = app.card_state(card).unwrap().clone();
+        let channels = app.durable.channels.clone();
+        let focused = app.workspace.focused();
+        let (tx, publications) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        let (receipt_tx, receipt_rx) = std::sync::mpsc::channel();
+        let peer = Peer::new(move |server| {
+            let mut connection = server
+                .connect(&Authority::default(), Some(registry), false)
+                .unwrap();
+            connection.terminals(vec![]);
+            connection.chats(vec![]);
+            // Permit only legacy EOF here so BEFORE completes its valid census
+            // before failing the explicit missing-receipt oracle below.
+            let Some(request) = read_frame::<ClientEnvelope>(&mut connection.0).unwrap() else {
+                receipt_tx.send(false).unwrap();
+                return;
+            };
+            assert_eq!(request.proof.as_ref(), Some(&proof()));
+            assert!(matches!(&request.request,
+                ClientRequest::ChatCloseRetained { session: actual } if actual == &session));
+            receipt_tx.send(true).unwrap();
+            if accepted {
+                connection.response(&request, ServerResponse::Accepted);
+            } else {
+                connection.refuse(&request);
+            }
+            connection.eof();
+        });
+        let task = app.delete_channel(channel);
+        assert!(app.channel_ui.is_deleting(channel));
+        assert!(!app.channel_ui.was_deleted(channel));
+        assert_eq!(app.card_state(card), Some(&saved));
+        let completion = close_message(task);
+        peer.finished();
+        assert!(
+            receipt_rx.try_recv().unwrap(),
+            "empty actor inventory must demand the exact retained Claude close receipt"
+        );
+        assert!(matches!(&completion,
+            Message::ChannelUi(Action::SessionsClosed(id, _, result))
+                if *id == channel && result.is_ok() == accepted));
+        drop(app.update(completion));
+        assert!(!app.channel_ui.is_deleting(channel));
+        assert!(!app.channel_ui.closing.contains_key(&channel));
+        let edits = std::iter::from_fn(|| publications.try_recv().ok()).collect::<Vec<_>>();
+        if accepted {
+            assert!(app.channel_ui.was_deleted(channel));
+            assert!(!app.durable.channels.iter().any(|row| row.id == channel));
+            assert!(!app.card_state(card).unwrap().existence.is_open());
+            assert!(edits.iter().any(
+                |edit| matches!(&edit.edit, ModelEdit::DeleteChannel { id } if *id == channel)
+            ));
+        } else {
+            assert!(!app.channel_ui.was_deleted(channel));
+            assert!(app.channel_ui.failed.contains_key(&channel));
+            assert_eq!(app.durable.channels, channels);
+            assert_eq!(app.card_state(card), Some(&saved));
+            assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+            assert_eq!(app.workspace.focused(), focused);
+            assert_eq!(app.durable.active_channel, Some(survivor));
+            assert!(!edits.iter().any(
+                |edit| matches!(&edit.edit, ModelEdit::DeleteChannel { id } if *id == channel)
+            ));
+        }
+    }
 }
 #[test]
 fn owning_channel_delete_task_preserves_scoped_conversations_and_actorless_channels() {
@@ -597,6 +694,7 @@ fn absence_or_remote(role: &str) {
             provider_version: "fixture".into(),
         };
         assert!(close_sessions(vec![CardKind::Chat(retained)], &context).is_err());
+        assert!(close_sessions(vec![CardKind::Chat(retained_claude_session())], &context).is_err());
         assert_eq!(socket.exists(), stale);
         assert_eq!(
             UnixStream::connect(&socket).unwrap_err().kind(),
