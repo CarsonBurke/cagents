@@ -24,6 +24,9 @@ struct SeedAdmission {
     retry_available: bool,
     // Preserve every failed source even if a later projection prunes its UI row.
     failed_chats: Vec<SharedChatAdmissionRetry>,
+    // An explicit retry keeps its original authority until the new seed ACK.
+    // A watcher read or the ACK itself may contain a newer canonical source.
+    retry_sources: Vec<SharedChatAdmissionRetry>,
 }
 
 /// A retry authorizes only another shared-view admission request, never a
@@ -485,7 +488,14 @@ impl Cagents {
         self.shared_views
             .admission_failures
             .retain(|_, failure| failure.retry.0.scope != source.scope);
-        self.shared_views.seed_admissions.remove(&source.scope);
+        let seed = self
+            .shared_views
+            .seed_admissions
+            .get_mut(&source.scope)
+            .unwrap();
+        if seed.retry_sources.is_empty() {
+            seed.retry_sources = seed.failed_chats.clone();
+        }
         self.shared_views.seeding.remove(&source.scope);
         self.publish_view_changes();
         Task::none()
@@ -1272,6 +1282,11 @@ impl Cagents {
                         .into_iter()
                         .filter(|pane| !self.durable.pending_terminal_creations.contains(&pane.id))
                         .collect::<Vec<_>>();
+                    let retry_sources = self
+                        .shared_views
+                        .seed_admissions
+                        .remove(&scope)
+                        .map_or_else(Vec::new, |seed| seed.retry_sources);
                     self.shared_views.seed_admissions.insert(
                         scope.clone(),
                         SeedAdmission {
@@ -1289,6 +1304,7 @@ impl Cagents {
                             failed: false,
                             retry_available: true,
                             failed_chats: Vec::new(),
+                            retry_sources,
                         },
                     );
                     self.shared_views
@@ -1371,6 +1387,34 @@ impl Cagents {
                 .pending
                 .retain(|(id, _, _)| *id != operation);
         } else {
+            if let Some(seed) = self.shared_views.seed_admissions.get(&scope)
+                && !seed.retry_sources.is_empty()
+            {
+                // The callback authorizes only the saved sources the user
+                // retried. Keep this fence through the installed ACK snapshot,
+                // including newer watcher reads that preceded that snapshot.
+                if seed.failed || seed.registry != self.workspace_model.identity {
+                    return;
+                }
+                let Some(attempt) = seed.attempt else {
+                    return;
+                };
+                if !seed
+                    .retry_sources
+                    .iter()
+                    .all(|retry| self.shared_chat_retry_source_current(&retry.0))
+                {
+                    let registry = seed.registry;
+                    self.refuse_shared_view_seed(
+                        scope,
+                        attempt,
+                        Some(registry),
+                        "This saved workspace changed. Close and reopen this window to reconnect. Saved drafts and sessions are retained".into(),
+                        false,
+                    );
+                    return;
+                }
+            }
             self.shared_views.seed_admissions.remove(&scope);
             self.shared_views
                 .admission_failures
