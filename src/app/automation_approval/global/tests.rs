@@ -1386,3 +1386,170 @@ fn rekeyed_notice_open_still_refuses_foreign_revision_focus_and_transport_result
         assert!(app.automation_approval.global.wanted.is_none(), "{refusal}");
     }
 }
+
+#[test]
+fn full_final_approval_page_disables_next_without_losing_first_or_refresh() {
+    fn click(app: &Cagents, label: &str) -> (bool, Vec<Message>) {
+        use cosmic::iced::{
+            Event, Point, Rectangle, Size,
+            advanced::{Layout, Shell, clipboard, layout, widget::Tree},
+            mouse,
+        };
+        use iced_accessibility::accesskit::Role;
+        let renderer = crate::app::tests::headless_renderer();
+        let mut element = app.global_proposal_banner().expect("expanded requests");
+        let mut tree = Tree::new(element.as_widget());
+        let size = Size::new(1000.0, 900.0);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, size),
+        );
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let buttons: Vec<_> = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter(|node| node.node().role() == Role::Button && node.node().label() == Some(label))
+            .collect();
+        assert_eq!(buttons.len(), 1, "unique {label} button");
+        let enabled = !buttons[0].node().is_disabled();
+        let rect = buttons[0].node().bounds().expect("mounted page control");
+        let point = Point::new(
+            ((rect.x0 + rect.x1) / 2.0) as f32,
+            ((rect.y0 + rect.y1) / 2.0) as f32,
+        );
+        let mut messages = Vec::new();
+        for event in [
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(event),
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &Rectangle::with_size(size),
+            );
+        }
+        (enabled, messages)
+    }
+    for total in [PROPOSAL_PAGE_SIZE * 2, PROPOSAL_PAGE_SIZE * 2 + 1] {
+        let mut app = app();
+        let rows: Vec<_> = (1..=total).map(|number| proposal(number as u128)).collect();
+        let identity = app.workspace_model.identity;
+        let held = flight(&app);
+        drop(complete(
+            &mut app,
+            held,
+            Ok(delivery(
+                identity,
+                9,
+                total as u64,
+                &rows[..PROPOSAL_PAGE_SIZE],
+            )),
+        ));
+        drop(global(&mut app, Action::Toggle));
+        let (enabled, messages) = click(&app, "Next requests");
+        assert!(enabled);
+        assert_eq!(messages.len(), 1);
+        for message in messages {
+            drop(app.update(message));
+        }
+        let held = flight(&app);
+        let Read::Page { key, after, .. } = held.2.clone() else {
+            panic!("actual Next read")
+        };
+        let last_full = &rows[PROPOSAL_PAGE_SIZE..PROPOSAL_PAGE_SIZE * 2];
+        drop(complete(
+            &mut app,
+            held,
+            Ok(Response::ProposalPage(ProposalPage {
+                identity,
+                automation_proposal_sequence: key.sequence,
+                after,
+                proposals: last_full.iter().map(ProposalSummary::from).collect(),
+            })),
+        ));
+        let (enabled, messages) = click(&app, "Next requests");
+        if total == PROPOSAL_PAGE_SIZE * 2 {
+            assert!(!enabled, "the final full page has no next request");
+            assert!(
+                messages.is_empty(),
+                "disabled Next cannot open an empty page"
+            );
+        } else {
+            assert!(enabled, "the final partial page remains reachable");
+            assert_eq!(messages.len(), 1);
+            for message in messages {
+                drop(app.update(message));
+            }
+            let held = flight(&app);
+            let Read::Page { key, after, .. } = held.2.clone() else {
+                panic!()
+            };
+            drop(complete(
+                &mut app,
+                held,
+                Ok(Response::ProposalPage(ProposalPage {
+                    identity,
+                    automation_proposal_sequence: key.sequence,
+                    after,
+                    proposals: vec![ProposalSummary::from(rows.last().unwrap())],
+                })),
+            ));
+            let (enabled, messages) = click(&app, "Next requests");
+            assert!(!enabled);
+            assert!(messages.is_empty());
+        }
+        drop(global(&mut app, Action::Refresh));
+        let held = flight(&app);
+        drop(complete(
+            &mut app,
+            held,
+            Ok(delivery(
+                identity,
+                9,
+                total as u64,
+                &rows[..PROPOSAL_PAGE_SIZE],
+            )),
+        ));
+        let (enabled, messages) = click(&app, "Next requests");
+        assert!(!enabled, "same snapshot preserves the final page");
+        assert!(messages.is_empty());
+        let (enabled, messages) = click(&app, "First requests");
+        assert!(enabled);
+        assert_eq!(messages.len(), 1);
+        for message in messages {
+            drop(app.update(message));
+        }
+        let held = flight(&app);
+        let Read::Page { key, after, .. } = held.2.clone() else {
+            panic!()
+        };
+        assert_eq!(after, None);
+        drop(complete(
+            &mut app,
+            held,
+            Ok(Response::ProposalPage(ProposalPage {
+                identity,
+                automation_proposal_sequence: key.sequence,
+                after,
+                proposals: rows[..PROPOSAL_PAGE_SIZE]
+                    .iter()
+                    .map(ProposalSummary::from)
+                    .collect(),
+            })),
+        ));
+        assert!(
+            click(&app, "Next requests").0,
+            "First restores forward navigation"
+        );
+    }
+}
