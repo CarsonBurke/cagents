@@ -102,12 +102,14 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
     let repository = input.repository;
     let cancellation = input.cancellation;
     let changed = &input.change.worktrees;
-    let retry_inventory = input
-        .previous
-        .is_some_and(|local| local.plan_error.is_some());
+    let revalidate_inventory = input.change.topology
+        || input
+            .previous
+            .is_some_and(|local| local.plan_error.is_some());
     scan_with_plan(input, move |records, previous| {
-        // A failed inventory cannot prove any cached worktree census current.
-        let retry_changed = retry_inventory.then(|| {
+        // A replaced metadata directory or failed inventory cannot prove any
+        // cached worktree census current, even when its ID and root survive.
+        let all_changed = revalidate_inventory.then(|| {
             records
                 .iter()
                 .map(|record| record.id)
@@ -119,7 +121,7 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
             records,
             cancellation,
             previous,
-            retry_changed.as_ref().unwrap_or(changed),
+            all_changed.as_ref().unwrap_or(changed),
         )
     })
 }
@@ -652,6 +654,105 @@ mod tests {
             cancellation: &CancellationToken::new(),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn topology_revalidates_linked_inventory_after_shared_metadata_replacement() {
+        let fixture = fixture();
+        let first = run(&fixture, None, &git_watch::Change::default());
+        assert!(first.plan_error.is_none());
+        let old_plan = first.plan.as_ref().unwrap();
+        let primary = first.worktrees.iter().find(|row| row.primary).unwrap().id;
+        let linked = first
+            .worktrees
+            .iter()
+            .find(|row| row.path == fixture.linked)
+            .unwrap();
+        let linked_id = linked.id;
+        assert_eq!(linked.dirty.as_ref().unwrap().paths, 0);
+        let old_linked = old_plan
+            .worktrees
+            .iter()
+            .find(|row| row.id == linked_id)
+            .unwrap();
+        // The metadata/index mutations below deliberately occur without native
+        // coverage. Recovery receives only the producer's shared-owner edge.
+        drop(git_watch::test_support::covered_monitor(old_plan.clone()));
+        let change = git_watch::test_support::replace_linked_metadata(old_plan);
+        assert!(change.topology && change.membership);
+        assert_eq!(change.worktrees, BTreeSet::from([primary]));
+        let nested = fixture.linked.join("new-watch-scope/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("tracked.rs");
+        std::fs::write(&file, "new tracked file while coverage is absent\n").unwrap();
+        git(
+            &fixture.linked,
+            &["add", "new-watch-scope/nested/tracked.rs"],
+        );
+        let read = |change: &git_watch::Change| {
+            scan(Input {
+                id: old_plan.id,
+                repository: &fixture.root.join(".git"),
+                previous: Some(&first),
+                change,
+                hints: &ForgeHints::default(),
+                now_unix_ms: crate::chat::now_ms().unwrap(),
+                cancellation: &CancellationToken::new(),
+            })
+            .unwrap()
+        };
+        let selective = read(&git_watch::Change {
+            worktrees: BTreeSet::from([primary]),
+            membership: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            selective
+                .plan
+                .as_ref()
+                .unwrap()
+                .worktrees
+                .iter()
+                .find(|row| row.id == linked_id)
+                .unwrap(),
+            old_linked,
+            "ordinary primary-only membership keeps the linked cache"
+        );
+        // Each read starts from the same error-free old Local. HOST full_change
+        // also requests topology without IDs, independently of native routing.
+        for empty_ids in [false, true] {
+            let mut topology = change.clone();
+            if empty_ids {
+                topology.worktrees.clear();
+            }
+            let fresh = read(&topology);
+            assert!(fresh.plan_error.is_none());
+            let linked = fresh
+                .worktrees
+                .iter()
+                .find(|row| row.id == linked_id)
+                .unwrap();
+            assert_eq!(linked.path, fixture.linked);
+            assert!(linked.error.is_none());
+            assert!(linked.dirty.as_ref().unwrap().paths > 0);
+            let recovered = fresh.plan.unwrap();
+            let current = recovered
+                .worktrees
+                .iter()
+                .find(|row| row.id == linked_id)
+                .unwrap();
+            assert_eq!(current.root, old_linked.root);
+            assert_ne!(
+                current, old_linked,
+                "topology must read the linked census, not just fresh status"
+            );
+            git_watch::test_support::reconfigure_then_observe(
+                old_plan.clone(),
+                recovered,
+                linked_id,
+                &file,
+            );
+        }
     }
 
     #[test]
