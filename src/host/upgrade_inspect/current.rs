@@ -1,4 +1,4 @@
-//! Read-only inspection of the stable 99/100/101/current inventory subset.
+//! Read-only inspection of the qualified inventory and saved-history subsets.
 //! The frozen protocol-77 reader remains separate from this matched connection.
 use crate::{
     chat::Session,
@@ -143,8 +143,13 @@ impl Client {
         for _ in 0..256 {
             let envelope = if bootstrap_chat.is_some() {
                 let payload = read_payload_with_limit(&mut stream, ipc::MAX_FRAME_BYTES)?;
-                postcard::from_bytes::<ServerEnvelope>(&payload)
-                    .map_err(|_| "Unsupported legacy retained-owner response")?
+                let (envelope, remaining) =
+                    postcard::take_from_bytes::<ServerEnvelope>(&payload)
+                        .map_err(|_| "Unsupported legacy retained-owner response")?;
+                if !remaining.is_empty() {
+                    return Err("Source retained-owner response has an unknown layout".into());
+                }
+                envelope
             } else {
                 read_response(&mut stream)?
             };
@@ -287,7 +292,7 @@ impl Client {
     /// descriptor or presented as evidence of an old provider's execution.
     /// The host's normal owner/managed-work fences remain. No resident data is evicted.
     pub(super) fn inspect_saved_history(&mut self, source: &Session) -> Result<(), String> {
-        if ![119, ipc::PROTOCOL_VERSION].contains(&self.protocol)
+        if ![119, 127, ipc::PROTOCOL_VERSION].contains(&self.protocol)
             || !source.is_saved_claude_history()
         {
             return Err("Saved history has no qualified read-only inspection API".into());
@@ -380,12 +385,15 @@ impl Client {
 // and inventory DTOs. Version 100 appends capacity operations; 101 requires
 // atomic managed-pane adoption without changing these DTOs. This restricted
 // Inventory uses the frozen restricted decoder. The separate retained/history
-// methods admit full snapshots only for the explicitly qualified119/current pair.
+// methods admit full snapshots only for the explicitly qualified 119/127/current
+// layouts. Protocol 139 appends ProtocolError details, so an old error remains a
+// refusal rather than being treated as a successful history response. The
+// frozen-127 contract tests pin the unchanged success DTOs independently.
 // Versions 102 (Copy sidecars), 103 (retained Claude continuity) and 104 (the
 // appended Work board request) preserve this subset, including the existing
 // continuity enum discriminants.
 pub(super) fn supports_protocol(protocol: u16) -> bool {
-    [99, 100, 101, 102, 103, 119, ipc::PROTOCOL_VERSION].contains(&protocol)
+    [99, 100, 101, 102, 103, 119, 127, ipc::PROTOCOL_VERSION].contains(&protocol)
 }
 
 fn read_payload_with_limit(reader: &mut impl Read, limit: usize) -> Result<Vec<u8>, String> {
@@ -552,11 +560,15 @@ impl Write for DeadlineStream<'_> {
 }
 
 #[cfg(test)]
+#[path = "current/protocol127_tests.rs"]
+mod protocol127_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     fn source_protocols() -> std::collections::BTreeSet<u16> {
-        [99, 100, 101, 102, 103, 119, ipc::PROTOCOL_VERSION].into()
+        [99, 100, 101, 102, 103, 119, 127, ipc::PROTOCOL_VERSION].into()
     }
 
     fn source_frame_version(frame: &[u8], protocol: u16) -> Vec<u8> {
