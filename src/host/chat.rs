@@ -1760,7 +1760,7 @@ fn start_with_execution(
                             .chats
                             .get(&id)
                             .ok_or("The resumed conversation disappeared")?;
-                        if !record.handle.same_actor(&installed_handle) {
+                        if !record.handle.same_attachment(&installed_handle) {
                             return Err("The resumed conversation changed its owner".into());
                         }
                         record.session.clone()
@@ -1798,7 +1798,7 @@ fn start_with_execution(
                             let record = state.chats.get(&id).ok_or_else(|| {
                                 unavailable("The unconfirmed conversation lost its cleanup owner")
                             })?;
-                            if !record.handle.same_actor(&installed_handle) {
+                            if !record.handle.same_attachment(&installed_handle) {
                                 return Err(unavailable(
                                     "The unconfirmed conversation changed its owner",
                                 ));
