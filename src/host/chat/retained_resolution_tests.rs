@@ -103,11 +103,26 @@ pub(super) fn isolated() -> Option<PathBuf> {
         thread::sleep(Duration::from_millis(10));
     };
     cleanup_discoveries(&root.path().join("run"));
+    let stdout = fs::read_to_string(stdout).unwrap();
+    let stderr = fs::read_to_string(stderr).unwrap();
     assert!(
         status.is_some_and(|s| s.success()),
-        "resolution fixture failed/deadline:\n{}\n{}",
-        fs::read_to_string(stdout).unwrap(),
-        fs::read_to_string(stderr).unwrap()
+        "resolution fixture failed/deadline:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line == format!("test {test} ... ok"))
+            && stdout.lines().any(|line| {
+                line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")
+            }),
+        "resolution child did not run its exact owning test {test}:\n{stdout}\n{stderr}"
+    );
+    println!(
+        "\n--- BEGIN retained child stdout [parent {test}] ---\n{stdout}\n--- END retained child stdout [parent {test}] ---"
+    );
+    eprintln!(
+        "\n--- BEGIN retained child stderr [parent {test}] ---\n{stderr}\n--- END retained child stderr [parent {test}] ---"
     );
     None
 }
