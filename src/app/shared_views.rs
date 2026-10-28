@@ -1750,10 +1750,7 @@ impl Cagents {
             .iter()
             .filter(|card| members.contains(&card.id))
             .map(|card| card.id)
-            .eq(visible
-                .iter()
-                .copied()
-                .filter(|id| existing.contains(id)));
+            .eq(visible.iter().copied().filter(|id| existing.contains(id)));
         if !ordered {
             let states = self
                 .durable
