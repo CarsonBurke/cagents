@@ -120,7 +120,7 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
         if let Some(foreground) = layout.children().nth(1) {
             self.foreground.as_widget_mut().operate(
                 &mut tree.children[1],
-                foreground,
+                foreground.with_virtual_offset(layout.virtual_offset()),
                 renderer,
                 operation,
             );
@@ -142,7 +142,7 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
             self.foreground.as_widget_mut().update(
                 &mut tree.children[1],
                 event,
-                foreground,
+                foreground.with_virtual_offset(layout.virtual_offset()),
                 cursor,
                 renderer,
                 clipboard,
@@ -166,7 +166,7 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
             .map_or_else(mouse::Interaction::default, |foreground| {
                 self.foreground.as_widget().mouse_interaction(
                     &tree.children[1],
-                    foreground,
+                    foreground.with_virtual_offset(layout.virtual_offset()),
                     cursor,
                     viewport,
                     renderer,
@@ -193,7 +193,7 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
             renderer,
             theme,
             style,
-            background,
+            background.with_virtual_offset(layout.virtual_offset()),
             mouse::Cursor::Unavailable,
             viewport,
         );
@@ -203,7 +203,7 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
                 renderer,
                 theme,
                 style,
-                foreground,
+                foreground.with_virtual_offset(layout.virtual_offset()),
                 cursor,
                 viewport,
             );
@@ -232,7 +232,7 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
             .as_widget_mut()
             .overlay(
                 &mut background_tree[0],
-                background_layout,
+                background_layout.with_virtual_offset(layout.virtual_offset()),
                 renderer,
                 viewport,
                 translation,
@@ -240,7 +240,7 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
             .map(|overlay| overlay::Element::new(Box::new(Inert { overlay })));
         let foreground = self.foreground.as_widget_mut().overlay(
             &mut foreground_tree[0],
-            foreground_layout,
+            foreground_layout.with_virtual_offset(layout.virtual_offset()),
             renderer,
             viewport,
             translation,
@@ -263,9 +263,11 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
             .children()
             .nth(1)
             .map_or_else(iced_accessibility::A11yTree::default, |foreground| {
-                self.foreground
-                    .as_widget()
-                    .a11y_nodes(foreground, &state.children[1], cursor)
+                self.foreground.as_widget().a11y_nodes(
+                    foreground.with_virtual_offset(layout.virtual_offset()),
+                    &state.children[1],
+                    cursor,
+                )
             })
     }
 }

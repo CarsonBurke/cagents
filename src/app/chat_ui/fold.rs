@@ -204,6 +204,8 @@ impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
         let (Some(content), Some(toggle)) = (children.next(), children.next()) else {
             return;
         };
+        let content = content.with_virtual_offset(layout.virtual_offset());
+        let toggle = toggle.with_virtual_offset(layout.virtual_offset());
         let state = tree.state.downcast_mut::<State>();
         if let Event::Mouse(mouse::Event::ButtonPressed(_)) = event {
             state.pressed = cursor.is_over(Self::shown(state, layout));
@@ -249,6 +251,8 @@ impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
         let (Some(content), Some(toggle)) = (children.next(), children.next()) else {
             return mouse::Interaction::None;
         };
+        let content = content.with_virtual_offset(layout.virtual_offset());
+        let toggle = toggle.with_virtual_offset(layout.virtual_offset());
         let state = tree.state.downcast_ref::<State>();
         let shown = self.content.as_widget().mouse_interaction(
             &tree.children[0],
@@ -284,6 +288,8 @@ impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
         let (Some(content), Some(toggle)) = (children.next(), children.next()) else {
             return;
         };
+        let content = content.with_virtual_offset(layout.virtual_offset());
+        let toggle = toggle.with_virtual_offset(layout.virtual_offset());
         let state = tree.state.downcast_ref::<State>();
         let shown = Self::shown(state, layout);
         let cut = shown.height < content.bounds().height;
@@ -357,6 +363,8 @@ impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
         let (Some(content), Some(toggle)) = (children.next(), children.next()) else {
             return iced_accessibility::A11yTree::default();
         };
+        let content = content.with_virtual_offset(layout.virtual_offset());
+        let toggle = toggle.with_virtual_offset(layout.virtual_offset());
         let content = self
             .content
             .as_widget()
