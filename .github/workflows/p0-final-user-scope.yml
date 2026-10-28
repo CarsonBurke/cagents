@@ -1,0 +1,311 @@
+name: P0 final439 User-scope qualification
+
+# Temporary supplementary qualification. Retain immutable run/artifact links,
+# then close this control PR without merging; artifacts expire after 14 days.
+on:
+  pull_request:
+    branches: [main]
+    paths: [.github/workflows/p0-final-user-scope.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: p0-final-user-scope-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: 2
+  RUSTUP_TOOLCHAIN: 1.93.0
+  P0_CONTROL_HEAD: ${{ github.event.pull_request.head.sha }}
+  P0_CONTROL_BASE: 4d18d788d03588621907b423a2df0e129f6e689c
+  P0_PRODUCT_HEAD: 439444b44611a1c05997f1b34f88b9d993411926
+  P0_PRODUCT_TREE: 0208332031f8a8499cabf1e5d5b652ab4ab43057
+
+jobs:
+  host-final439:
+    name: Final439 exact HOST parents in natural User scope
+    if: github.repository == 'CarsonBurke/cagents' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'ci/p0-final-user-scope-qualification'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    env:
+      P0_EVIDENCE_DIR: /tmp/p0-final-user-scope-host-${{ github.run_id }}-${{ github.run_attempt }}
+      CARGO_TARGET_DIR: /tmp/p0-final-user-scope-host-target-${{ github.run_id }}-${{ github.run_attempt }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the immutable main-based control head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Archive the control and require naturally absent cagents context
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          evidence = pathlib.Path(os.environ['P0_EVIDENCE_DIR'])
+          evidence.mkdir(mode=0o700)
+          assert os.environ.get('GITHUB_ACTIONS') == 'true'
+          assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+          names = sorted(name for name in os.environ if name.startswith('CAGENTS_'))
+          (evidence / 'natural-context.json').write_text(json.dumps({'cagents_names': names,
+              'environment_removed_or_masked': False}, indent=2) + '\n')
+          assert not names, f'Unexpected inherited cagents context names: {names}'
+          for marker in ['CAGENTS_AGENT_AUTHORITY', 'CAGENTS_AGENT_TOKEN', 'CAGENTS_SESSION_TOKEN']:
+              assert marker not in os.environ, f'Inherited role marker present, including empty: {marker}'
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          workflow = '.github/workflows/p0-final-user-scope.yml'
+          setup = '.github/actions/setup-linux-build/action.yml'
+          assert git('rev-parse', 'HEAD') == os.environ['P0_CONTROL_HEAD']
+          assert not git('status', '--porcelain')
+          assert git('diff', '--name-only', os.environ['P0_CONTROL_BASE'], 'HEAD').splitlines() == [workflow]
+          assert git('rev-parse', 'HEAD:' + setup) == 'f24f0b0a90c31306518ff7253463a52b63a3c0e3'
+          (evidence / 'workflow-control.yml').write_bytes(pathlib.Path(workflow).read_bytes())
+          for name, revision in [('control-base', os.environ['P0_CONTROL_BASE']), ('control-head', 'HEAD')]:
+              (evidence / (name + '.commit')).write_text(git('show', '--no-patch', '--format=raw', revision) + '\n')
+          (evidence / 'control.json').write_text(json.dumps({
+              'control_base': os.environ['P0_CONTROL_BASE'],
+              'control_base_tree': git('rev-parse', os.environ['P0_CONTROL_BASE'] + '^{tree}'),
+              'control_head': git('rev-parse', 'HEAD'), 'control_tree': git('rev-parse', 'HEAD^{tree}'),
+              'workflow_sha256': hashlib.sha256(pathlib.Path(workflow).read_bytes()).hexdigest(),
+              'workflow_ref': os.environ.get('GITHUB_WORKFLOW_REF'),
+              'workflow_sha': os.environ.get('GITHUB_WORKFLOW_SHA'),
+              'product_head': os.environ['P0_PRODUCT_HEAD'], 'product_tree': os.environ['P0_PRODUCT_TREE'],
+              'setup_blob': git('rev-parse', 'HEAD:' + setup),
+              'scope': 'Only two Ready parents and source-discovered retained execution-exit parents; no local B5 donation, other HOST parents, native UX or actual-eight acceptance',
+          }, indent=2) + '\n')
+          PY
+
+      - name: Set up the pinned Linux build environment from the control
+        timeout-minutes: 20
+        uses: ./.github/actions/setup-linux-build
+
+      - name: Fetch and detach the exact product before any product Cargo command
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$P0_PRODUCT_HEAD" > "$P0_EVIDENCE_DIR/product-fetch.stdout" 2> "$P0_EVIDENCE_DIR/product-fetch.stderr"
+          git checkout --detach "$P0_PRODUCT_HEAD" > "$P0_EVIDENCE_DIR/product-checkout.stdout" 2> "$P0_EVIDENCE_DIR/product-checkout.stderr"
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, subprocess
+          evidence = pathlib.Path(os.environ['P0_EVIDENCE_DIR'])
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          assert git('rev-parse', 'HEAD') == os.environ['P0_PRODUCT_HEAD']
+          assert git('rev-parse', 'HEAD^{tree}') == os.environ['P0_PRODUCT_TREE']
+          assert not git('status', '--porcelain')
+          assert not [name for name in os.environ if name.startswith('CAGENTS_')]
+          setup = '.github/actions/setup-linux-build/action.yml'
+          assert git('rev-parse', 'HEAD:' + setup) == 'f24f0b0a90c31306518ff7253463a52b63a3c0e3'
+          ready_path = pathlib.Path('src/host/chat/retained_admission_tests.rs')
+          exit_path = pathlib.Path('src/host/chat/retained_execution_exit_tests.rs')
+          def parents(path):
+              names = re.findall(r'(?m)^#\[test\]\s*\n(?:#\[[^\n]*\]\s*\n)*fn\s+([A-Za-z_]\w*)\s*\(', path.read_text())
+              assert names and len(names) == len(set(names)), f'No unique test declarations: {path}'
+              module = '::'.join((*path.relative_to('src').parts[:-1], path.stem))
+              return [module + '::' + name for name in names]
+          ready = [
+              'host::chat::retained_admission_tests::named_claude_resume_waits_for_ready_after_identity_without_replacing_actor',
+              'host::chat::retained_admission_tests::named_claude_resume_exit_after_identity_before_ready_retires_exact_actor',
+          ]
+          assert set(ready).issubset(parents(ready_path))
+          chat_source = pathlib.Path('src/host/chat.rs').read_text()
+          for leaf in [ready_path, exit_path]:
+              assert re.search(r'(?m)^mod\s+' + re.escape(leaf.stem) + r';$', chat_source)
+          exits = parents(exit_path)
+          roots = ready + exits
+          assert len(roots) == len(set(roots))
+          sources = ['Cargo.toml', 'Cargo.lock', 'build.rs', setup, 'src/bin/cagentsd.rs',
+              'src/host/chat.rs', 'src/chat/runtime.rs', 'src/host/chat/retained_actor.rs',
+              'src/host/chat/retained_actor_tests.rs', str(ready_path), str(exit_path)]
+          (evidence / 'product-source.json').write_text(json.dumps({
+              'head': git('rev-parse', 'HEAD'), 'tree': git('rev-parse', 'HEAD^{tree}'), 'status': git('status', '--porcelain'),
+              'sources': {p: {'git_blob': git('rev-parse', 'HEAD:' + p),
+                  'sha256': hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()} for p in sources},
+              'selector_sources': {'ready': str(ready_path), 'execution_exit': str(exit_path)},
+              'ready_parents': ready, 'all_execution_exit_parents': exits, 'exact_parents': roots,
+              'nested_output_scope': 'Exact outer parent stdout/stderr are retained. Product assertions include failing child output; successful nested child raw output is not exported by the product. Nested child counts are nonadditive.',
+          }, indent=2) + '\n')
+          PY
+
+      - name: Prepare short private fixture paths without changing authority
+        run: |
+          set -euo pipefail
+          fixture_root=$(mktemp -d /tmp/p0XXXXXX)
+          install -d -m 700 "$fixture_root/tmp" "$fixture_root/runtime"
+          printf '%s\n' "TMPDIR=$fixture_root/tmp" "XDG_RUNTIME_DIR=$fixture_root/runtime" >> "$GITHUB_ENV"
+          stat --printf='%n %a %u %d %i\n' "$fixture_root" "$fixture_root/tmp" "$fixture_root/runtime" > "$P0_EVIDENCE_DIR/private-paths.txt"
+
+      - name: Check, build and run only the exact HOST parents, stopping at first failure
+        timeout-minutes: 115
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, subprocess, time
+          evidence = pathlib.Path(os.environ['P0_EVIDENCE_DIR'])
+          source_identity = json.loads((evidence / 'product-source.json').read_text())
+          roles = ['CAGENTS_AGENT_AUTHORITY', 'CAGENTS_AGENT_TOKEN', 'CAGENTS_SESSION_TOKEN']
+          helper = test_executable = None
+          helper_identity = test_identity = None
+          results = []
+          def source():
+              def git(*args):
+                  return subprocess.check_output(['git', *args], text=True).strip()
+              return {'head': git('rev-parse', 'HEAD'), 'tree': git('rev-parse', 'HEAD^{tree}'), 'status': git('status', '--porcelain')}
+          def exact(value):
+              return value['head'] == os.environ['P0_PRODUCT_HEAD'] and value['tree'] == os.environ['P0_PRODUCT_TREE'] and not value['status']
+          def context(allowed=()):
+              names = sorted(name for name in os.environ if name.startswith('CAGENTS_'))
+              assert not set(names) - set(allowed), f'Unexpected cagents context names: {names}'
+              for marker in roles:
+                  assert marker not in os.environ, f'Inherited role marker present, including empty: {marker}'
+              return names
+          def census():
+              found = []
+              for entry in pathlib.Path('/proc').iterdir():
+                  if not entry.name.isdigit():
+                      continue
+                  try:
+                      if entry.stat().st_uid != os.getuid():
+                          continue
+                      args = (entry / 'cmdline').read_bytes().split(b'\0')
+                      comm = (entry / 'comm').read_text().strip()
+                      family = any(arg.startswith(b'/tmp/updater1513-') or
+                          (arg.startswith(b'/var/tmp/') and b'/bin/claude' in arg) for arg in args)
+                      family = family or comm == 'cagentsd' or any(
+                          path is not None and str(path).encode() in args for path in [helper, test_executable])
+                      if family:
+                          found.append({'pid': int(entry.name), 'comm': comm, 'stat': (entry / 'stat').read_text()})
+                  except (FileNotFoundError, ProcessLookupError):
+                      continue
+              return found
+          def identities():
+              return {name: {'recorded': identity, 'current_sha256':
+                  hashlib.sha256(path.read_bytes()).hexdigest() if path is not None and path.is_file() else None}
+                  for name, path, identity in [('helper', helper, helper_identity), ('test', test_executable, test_identity)]}
+          def phase(label, argv, seconds, allowed=(), parent=False):
+              directory = evidence / label
+              directory.mkdir(mode=0o700)
+              before = {'source': source(), 'cagents_names': context(allowed), 'family_census': census(), 'identities': identities()}
+              (directory / 'before.json').write_text(json.dumps(before, indent=2) + '\n')
+              assert exact(before['source']) and not before['family_census'], f'Unexpected pre-phase source/family: {label}'
+              started = time.monotonic()
+              bounded = ['timeout', '--signal=TERM', '--kill-after=15s', f'{seconds}s', *argv]
+              with (directory / 'stdout').open('wb') as stdout, (directory / 'stderr').open('wb') as stderr:
+                  status = subprocess.run(bounded, stdout=stdout, stderr=stderr).returncode
+              after = {'source': source(), 'cagents_names': context(allowed), 'family_census': census(), 'identities': identities()}
+              result = {'label': label, 'argv': bounded, 'exit': status, 'seconds': time.monotonic() - started,
+                  'before': before, 'after': after, 'outer_timeout_or_kill': status in [124, 137],
+                  'integrity_qualified': exact(after['source']) and not after['family_census'],
+                  'cleanup': 'Observational census only; no workflow PID-based cleanup. Test guards and hosted runner isolation remain separate.'}
+              (directory / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
+              if not parent:
+                  assert status == 0 and result['integrity_qualified'], f'Phase failed: {label}; no later phase runs'
+              return directory
+          def artifact(directory, target, test):
+              rows = [json.loads(line) for line in (directory / 'stdout').read_text().splitlines()]
+              roots = [row for row in rows if row.get('reason') == 'compiler-artifact'
+                  and row['target']['name'] == target and row.get('executable') and row['profile']['test'] == test]
+              assert len(roots) == 1, 'Exactly one owning Cargo artifact required'
+              owner = roots[0]
+              assert 'host' in owner['features'] and not {'ui', 'integrated-browser'} & set(owner['features'])
+              assert not [row for row in rows if row.get('reason') == 'compiler-artifact' and
+                  row['target']['name'] in ['cosmic', 'libcosmic', 'servo', 'webrender', 'mozjs', 'mozjs_sys']]
+              path = pathlib.Path(owner['executable']).resolve(strict=True)
+              return path, {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                  'source_head': os.environ['P0_PRODUCT_HEAD'], 'source_tree': os.environ['P0_PRODUCT_TREE'],
+                  'compiler_artifact': owner}
+          cargo = ['cargo']
+          common = ['--locked', '--no-default-features', '--features', 'host']
+          phase('host-check', cargo + ['check', *common, '--bin', 'cagentsd', '--message-format=json-render-diagnostics'], 1800)
+          built = phase('helper-build', cargo + ['build', *common, '--bin', 'cagentsd', '--message-format=json-render-diagnostics'], 1800)
+          helper, helper_identity = artifact(built, 'cagentsd', False)
+          (evidence / 'helper.json').write_text(json.dumps(helper_identity, indent=2) + '\n')
+          version = subprocess.run([str(helper), '--version'], capture_output=True, text=True, timeout=15)
+          helper_identity.update(version_stdout=version.stdout, version_stderr=version.stderr,
+              version_exit=version.returncode,
+              rustc_version=subprocess.check_output(['rustc', '--version'], text=True),
+              cargo_version=subprocess.check_output(['cargo', '--version'], text=True))
+          (evidence / 'helper.json').write_text(json.dumps(helper_identity, indent=2) + '\n')
+          assert version.returncode == 0 and helper_identity['rustc_version'].startswith('rustc 1.93.0 ')
+          compiled = phase('test-build', cargo + ['test', *common, '--lib', '--no-run', '--message-format=json-render-diagnostics'], 1800)
+          test_executable, test_identity = artifact(compiled, 'cagents', True)
+          assert 'lib' in test_identity['compiler_artifact']['target']['kind']
+          (evidence / 'test-artifact.json').write_text(json.dumps(test_identity, indent=2) + '\n')
+          context()
+          # Introduce only the verified test helper after naturally absent
+          # context has been checked; no inherited name is removed or masked.
+          os.environ['CAGENTS_TEST_RETAINED_ACTOR_HELPER'] = str(helper)
+          allowed = ['CAGENTS_TEST_RETAINED_ACTOR_HELPER']
+          for index, root in enumerate(source_identity['exact_parents'], 1):
+              assert hashlib.sha256(helper.read_bytes()).hexdigest() == helper_identity['sha256']
+              assert hashlib.sha256(test_executable.read_bytes()).hexdigest() == test_identity['sha256']
+              directory = phase(f'parent-{index}', [str(test_executable), '--exact', root, '--test-threads=1', '--nocapture'], 150, allowed, parent=True)
+              phase_result = json.loads((directory / 'result.json').read_text())
+              stdout = (directory / 'stdout').read_text(errors='replace')
+              counts = {'named_passes': len(re.findall(r'^test ' + re.escape(root) + r' \.\.\. ok$', stdout, re.M)),
+                  'one_test_headers': len(re.findall(r'^running 1 test$', stdout, re.M)),
+                  'one_pass_summaries': len(re.findall(r'^test result: ok\. 1 passed; 0 failed; 0 ignored;', stdout, re.M))}
+              after = {'helper_sha256': hashlib.sha256(helper.read_bytes()).hexdigest(),
+                  'test_sha256': hashlib.sha256(test_executable.read_bytes()).hexdigest()}
+              passed = phase_result['exit'] == 0 and phase_result['integrity_qualified'] and all(value == 1 for value in counts.values()) and after['helper_sha256'] == helper_identity['sha256'] and after['test_sha256'] == test_identity['sha256']
+              result = {'root': root, 'passed': passed, 'expected_selected_count': 1, 'counts': counts,
+                  'source': source_identity, 'helper': helper_identity, 'test_executable': test_identity, 'after': after,
+                  'phase': phase_result,
+                  'child_results': 'Internal subprocess results are nonadditive; only this exact outer parent is selected.'}
+              (directory / 'qualification.json').write_text(json.dumps(result, indent=2) + '\n')
+              results.append(result)
+              (evidence / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
+              assert passed, f'Exact parent failed qualification: {root}; no later parent runs'
+          PY
+
+      - name: Retain final source and observational family state
+        if: always()
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          evidence = pathlib.Path(os.environ['P0_EVIDENCE_DIR'])
+          evidence.mkdir(mode=0o700, exist_ok=True)
+          def git(*args):
+              result = subprocess.run(['git', *args], capture_output=True, text=True)
+              return {'exit': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr}
+          executables = []
+          for name in ['helper.json', 'test-artifact.json']:
+              path = evidence / name
+              if path.is_file():
+                  executables.append(json.loads(path.read_text())['path'].encode())
+          family = []
+          for entry in pathlib.Path('/proc').iterdir():
+              if not entry.name.isdigit():
+                  continue
+              try:
+                  if entry.stat().st_uid == os.getuid():
+                      args = (entry / 'cmdline').read_bytes().split(b'\0')
+                      comm = (entry / 'comm').read_text().strip()
+                      if comm == 'cagentsd' or any(executable in args for executable in executables) or any(arg.startswith(b'/tmp/updater1513-') or (arg.startswith(b'/var/tmp/') and b'/bin/claude' in arg) for arg in args):
+                          family.append({'pid': int(entry.name), 'comm': comm, 'stat': (entry / 'stat').read_text()})
+              except (FileNotFoundError, ProcessLookupError):
+                  continue
+          (evidence / 'job-final.json').write_text(json.dumps({'head': git('rev-parse', 'HEAD'),
+              'tree': git('rev-parse', 'HEAD^{tree}'), 'source_status': git('status', '--porcelain'),
+              'cagents_names': sorted(name for name in os.environ if name.startswith('CAGENTS_')),
+              'observational_family_census': family, 'pid_based_cleanup': False,
+              'identity_files': {name: (evidence / name).exists() for name in ['control.json', 'product-source.json', 'helper.json', 'test-artifact.json']},
+              'files': sorted(str(path.relative_to(evidence)) for path in evidence.rglob('*') if path.is_file())}, indent=2) + '\n')
+          PY
+
+      - name: Preserve focused HOST qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: p0-final-user-scope-host-${{ github.event.pull_request.head.sha }}
+          path: ${{ env.P0_EVIDENCE_DIR }}
+          if-no-files-found: error
+          retention-days: 14
