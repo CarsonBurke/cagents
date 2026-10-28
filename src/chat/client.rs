@@ -3119,7 +3119,7 @@ mod tests {
                         },
                         ServerMessage::ChatActivity {
                             chat_id: expected.id,
-                            state: ActivityState::Idle,
+                            state: ActivityState::Working,
                             generation: 5,
                         },
                         ServerMessage::ChatAccountUsage {
@@ -3225,7 +3225,7 @@ mod tests {
                 assert_eq!(handle.session(), session);
                 assert!(handle.snapshot().ready);
                 assert!(handle.take_observed());
-                assert_eq!(handle.take_activity(), ActivityState::Idle);
+                assert_eq!(handle.take_activity(), ActivityState::Working);
                 let usage = handle.take_account_usage();
                 assert_eq!(usage.len(), 1);
                 assert_eq!(usage[0].1, 42);
