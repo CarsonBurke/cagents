@@ -1871,9 +1871,12 @@ mod tests {
             crate::session::SessionRuntime::open(&database, boot).unwrap();
         let workspace = workspace.expect("device adoption saved its sidebar rank");
         assert_eq!(workspace.project_order, vec![id]);
-        // Restore resets runtime placement, while preserving the existing work.
+        // The first save advances the new card's generation; restore resets
+        // runtime placement, while preserving the existing work.
         let mut restored_cards = cards;
         for card in &mut restored_cards {
+            assert_eq!(card.generation, 0, "the fixture starts unsaved");
+            card.generation = 1;
             card.exposure = Exposure::Offscreen;
             card.residency = Residency::Cold;
         }
