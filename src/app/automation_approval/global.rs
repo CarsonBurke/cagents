@@ -213,6 +213,18 @@ fn message(action: Action) -> Message {
     Message::AutomationApproval(super::Action::Global(action))
 }
 
+fn resolved_proposal_notice(state: &ProposalState) -> Option<TransientNotice> {
+    match state {
+        ProposalState::Pending => None,
+        ProposalState::Approved { .. } => Some(TransientNotice::success(
+            "This request was already approved. No new decision was sent.",
+        )),
+        ProposalState::Declined => Some(TransientNotice::warning(
+            "This request was already declined. No new decision was sent.",
+        )),
+    }
+}
+
 impl Cagents {
     /// Called only by the real model observer's disconnect/Connected path.
     pub(in crate::app) fn retire_global_proposals(&mut self) {
@@ -502,14 +514,7 @@ impl Cagents {
                         && self.chrome_ui.workspace_preview_since.is_none() =>
                     {
                         if review.proposal.state != ProposalState::Pending {
-                            self.status = Some(match review.proposal.state {
-                                ProposalState::Approved { .. } => TransientNotice::success(
-                                    "This request was already approved. No new decision was sent.",
-                                ),
-                                _ => TransientNotice::warning(
-                                    "This request was already declined. No new decision was sent.",
-                                ),
-                            });
+                            self.status = resolved_proposal_notice(&review.proposal.state);
                             self.automation_approval.global.latest_open = None;
                             self.automation_approval.global.authorized = None;
                             self.automation_approval.global.resolved(id);
@@ -547,6 +552,7 @@ impl Cagents {
                             resolved.state = review.proposal.state.clone();
                             if &resolved == review.proposal.as_ref() {
                                 if review.proposal.state != ProposalState::Pending {
+                                    self.status = resolved_proposal_notice(&review.proposal.state);
                                     self.automation_approval.global.resolved(id);
                                     let closed = self.close_automation_approval();
                                     return Task::batch([

@@ -837,6 +837,99 @@ fn an_exact_already_resolved_notice_reports_its_terminal_state_without_a_modal_o
         assert!(matches!(flight(&app).2, Read::Delivery));
         assert!(app.status.is_some());
     }
+
+    // A request resolved elsewhere, or an uncertain earlier decision, must
+    // report the confirmed outcome when its still-open review is refreshed.
+    // All returned futures remain unpolled; only real App reducers run here.
+    for approved in [false, true] {
+        for lost_receipt in [false, true] {
+            let mut app = app();
+            let proposal = proposal(1);
+            let key = install(&mut app, &[proposal.clone()]);
+            open(&mut app, &proposal);
+            if lost_receipt {
+                let generation = app.automation_approval.generation;
+                let decision = app.update(Message::AutomationApproval(ApprovalAction::Decide {
+                    id: proposal.id,
+                    revision: proposal.revision,
+                    generation,
+                    approved,
+                }));
+                assert!(decision.units() > 0);
+                drop(decision);
+                assert!(app.automation_approval.deciding);
+                drop(app.update(Message::WorkspaceModelObserved(
+                    ModelUpdate::ProposalWatchLost,
+                )));
+                assert!(!app.automation_approval.deciding);
+                assert!(app.automation_approval.global.review_stale);
+                model(&mut app, key.identity, 2, true);
+            } else {
+                // Match the observer's AgentsChanged edge plus full read;
+                // neither first-page absence nor a watch edge is consent.
+                drop(
+                    app.update(Message::WorkspaceModelObserved(ModelUpdate::Edited {
+                        sequence: 2,
+                        edit: crate::workspace_model::ModelEdit::AgentsChanged,
+                    })),
+                );
+                model(&mut app, key.identity, 2, false);
+            }
+            let delivery_read = flight(&app);
+            assert!(matches!(delivery_read.2, Read::Delivery));
+            drop(complete(
+                &mut app,
+                delivery_read,
+                Ok(delivery(key.identity, 2, 0, &[])),
+            ));
+            let exact_review = flight(&app);
+            assert!(matches!(exact_review.2, Read::Review { id, revision, .. }
+                if id == proposal.id && revision == proposal.revision));
+            assert_eq!(app.automation_approval.proposal.as_ref(), Some(&proposal));
+            assert!(!app.automation_approval.deciding);
+            let generation = app.automation_approval.generation;
+            app.status = None;
+            let mut terminal = proposal;
+            terminal.state = if approved {
+                ProposalState::Approved {
+                    automation: uuid::Uuid::from_u128(900),
+                    execution_revision: 1,
+                }
+            } else {
+                ProposalState::Declined
+            };
+            drop(complete(
+                &mut app,
+                exact_review,
+                Ok(review(key.identity, &terminal)),
+            ));
+            assert!(!app.modal_is_open());
+            assert!(!app.automation_approval.deciding);
+            assert!(app.automation_approval.proposal.is_none());
+            assert!(app.automation_approval.global.authorized.is_none());
+            assert!(app.automation_approval.global.pending.is_empty());
+            assert!(app.automation_approval.generation > generation);
+            assert!(matches!(flight(&app).2, Read::Delivery));
+            assert!(app.core.keyboard_nav());
+            let notice = app.status.as_ref().expect("confirmed decision outcome");
+            assert_eq!(
+                notice.message,
+                if approved {
+                    "This request was already approved. No new decision was sent."
+                } else {
+                    "This request was already declined. No new decision was sent."
+                }
+            );
+            assert_eq!(
+                notice.severity,
+                if approved {
+                    NoticeSeverity::Success
+                } else {
+                    NoticeSeverity::Warning
+                }
+            );
+        }
+    }
 }
 
 #[test]
