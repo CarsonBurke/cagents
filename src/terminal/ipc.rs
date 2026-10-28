@@ -195,7 +195,13 @@ use crate::{
 /// compatibility: replace the matched daemon before sending the new budgets.
 /// Version 127 combines both contracts in the matched set. Version 126 is
 /// reserved for the separate native Goal integration and is not adopted here.
-pub const PROTOCOL_VERSION: u16 = 127;
+/// Version 139 preserves accepted version 127 and adds structured delegated-agent
+/// capacity errors and origin-aware interrupted cleanup. ProtocolError now has
+/// appended details and the agent operation/reply enums append capacity/cleanup
+/// variants; all three executables require the matched positional wire layout.
+/// Root allocated 139 specifically to this cumulative #1258/Main-a68 contract;
+/// unrelated private account/global experiments are not adopted here.
+pub const PROTOCOL_VERSION: u16 = 139;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -993,6 +999,13 @@ pub struct ProtocolError {
     pub code: ProtocolErrorCode,
     pub message: String,
     pub retryable: bool,
+    #[serde(default)]
+    pub details: Option<ProtocolErrorDetails>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProtocolErrorDetails {
+    AgentLimitReached(crate::agent_execution::LimitReached),
 }
 
 impl ProtocolError {
@@ -1001,6 +1014,16 @@ impl ProtocolError {
             code,
             message: message.into(),
             retryable,
+            details: None,
+        }
+    }
+
+    pub fn agent_limit_reached(details: crate::agent_execution::LimitReached) -> Self {
+        Self {
+            code: ProtocolErrorCode::LimitReached,
+            message: details.to_string(),
+            retryable: details.retryable,
+            details: Some(ProtocolErrorDetails::AgentLimitReached(details)),
         }
     }
 }
@@ -1022,6 +1045,7 @@ pub enum ProtocolErrorCode {
     Internal,
     ViewConflict,
     ChatCapacity,
+    LimitReached,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2085,6 +2109,127 @@ pub fn validate_proof(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn maximum_agent_capacity_error_keeps_every_holder_in_a_real_server_frame() {
+        use crate::agent_execution::{
+            Capacity, CapacityHolder, CapacityScope, LimitReached, State,
+        };
+        let holders: Vec<_> = (0..4096)
+            .map(|_| CapacityHolder {
+                id: crate::model::AgentId::new(),
+                run: crate::model::RunId::new(),
+                state: State::Interrupted,
+            })
+            .collect();
+        let expected = holders.last().unwrap().clone();
+        let error = ProtocolError::agent_limit_reached(LimitReached {
+            capacity: Capacity {
+                running: holders.len(),
+                limit: 4096,
+                scope: CapacityScope::Global,
+                holders,
+            },
+            retryable: true,
+        });
+        assert!(error.message.len() < 2048);
+        let envelope = ServerEnvelope {
+            version: PROTOCOL_VERSION,
+            request_id: Some(7),
+            proof: proof("session", "boot", "incarnation"),
+            message: ServerMessage::Error(error),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &envelope).unwrap();
+        assert!(bytes.len() < MAX_FRAME_BYTES);
+        let actual: ServerEnvelope = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
+        let ServerMessage::Error(actual) = actual.message else {
+            panic!("missing structured error")
+        };
+        assert!(actual.retryable);
+        let Some(ProtocolErrorDetails::AgentLimitReached(details)) = actual.details else {
+            panic!("missing full capacity")
+        };
+        assert_eq!(details.capacity.holders.len(), 4096);
+        assert_eq!(details.capacity.holders.last(), Some(&expected));
+    }
+
+    #[test]
+    fn agent_capacity_retryability_and_legacy_json_error_omission_are_preserved() {
+        use crate::agent_execution::{Capacity, CapacityScope, LimitReached};
+        let legacy: ProtocolError = serde_json::from_value(
+            serde_json::json!({"code":"invalid_request", "message":"legacy", "retryable":false}),
+        )
+        .unwrap();
+        assert!(legacy.details.is_none());
+        let error = ProtocolError::agent_limit_reached(LimitReached {
+            capacity: Capacity {
+                running: 0,
+                limit: 1,
+                scope: CapacityScope::Caller,
+                holders: vec![],
+            },
+            retryable: false,
+        });
+        assert!(!error.retryable);
+        let bytes = postcard::to_allocvec(&error).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<ProtocolError>(&bytes).unwrap(),
+            error
+        );
+    }
+
+    #[test]
+    fn maximum_interrupted_cleanup_failure_report_fits_a_frame() {
+        use crate::agent_execution::{CloseFailure, CloseInterrupted, Reply};
+        let reply = Reply::InterruptedClosed(CloseInterrupted {
+            closed: vec![],
+            next: None,
+            failed: (0..4096)
+                .map(|_| CloseFailure::new(crate::model::AgentId::new(), "é".repeat(2000)))
+                .collect(),
+        });
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &reply).unwrap();
+        assert!(bytes.len() < MAX_FRAME_BYTES);
+        let actual: Reply = read_frame(&mut std::io::Cursor::new(bytes))
+            .unwrap()
+            .unwrap();
+        let Reply::InterruptedClosed(result) = actual else {
+            unreachable!()
+        };
+        assert_eq!(result.failed.len(), 4096);
+        assert!(
+            result
+                .failed
+                .iter()
+                .all(|failure| failure.message.ends_with('…'))
+        );
+    }
+
+    #[test]
+    fn structured_agent_limit_details_round_trip_in_postcard() {
+        use crate::agent_execution::{
+            Capacity, CapacityHolder, CapacityScope, LimitReached, State,
+        };
+        let expected = ProtocolError::agent_limit_reached(LimitReached {
+            capacity: Capacity {
+                running: 1,
+                limit: 1,
+                scope: CapacityScope::Caller,
+                holders: vec![CapacityHolder {
+                    id: crate::model::AgentId::new(),
+                    run: crate::model::RunId::new(),
+                    state: State::Interrupted,
+                }],
+            },
+            retryable: true,
+        });
+        let bytes = postcard::to_allocvec(&expected).unwrap();
+        let actual: ProtocolError = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(actual, expected);
+        assert!(actual.retryable);
+        assert_eq!(actual.code, ProtocolErrorCode::LimitReached);
+    }
     use std::io::{Cursor, Read};
 
     use crate::model::{BootId, HostIncarnation, HostSessionId};

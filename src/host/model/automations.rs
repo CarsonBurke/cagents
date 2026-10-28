@@ -1264,6 +1264,9 @@ impl Registry {
         now_ms: u64,
     ) -> Result<Claimed, String> {
         use crate::automations::{SkipReason, Trigger};
+        // Read outside the write transaction, but require policy only for new
+        // acceptance: retries and proven precheck cleanup need no new slot.
+        let limits = crate::host::agent_execution::concurrency_limits();
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1372,7 +1375,15 @@ impl Registry {
         insert_firing(&tx, &firing, &key)?;
         let accepted = if firing.state == FiringState::Prechecking && definition.precheck.is_none()
         {
-            accept_firing(&tx, &mut automation, &mut firing, &definition, &key, now_ms)?
+            accept_firing(
+                &tx,
+                &mut automation,
+                &mut firing,
+                &definition,
+                &key,
+                limits?,
+                now_ms,
+            )?
         } else {
             None
         };
@@ -1410,6 +1421,9 @@ impl Registry {
         now_ms: u64,
     ) -> Result<Option<crate::agent_execution::Accepted>, String> {
         use crate::{automations::SkipReason, host::automations::precheck::Outcome};
+        // Read outside the write transaction, but require policy only for new
+        // acceptance: retries and proven precheck cleanup need no new slot.
+        let limits = crate::host::agent_execution::concurrency_limits();
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1472,7 +1486,15 @@ impl Registry {
         } else {
             let definition = read_definition(&tx, firing.automation, firing.revision)?;
             let key = occurrence_key(firing.revision, &firing.trigger);
-            accept_firing(&tx, &mut automation, &mut firing, &definition, &key, now_ms)?
+            accept_firing(
+                &tx,
+                &mut automation,
+                &mut firing,
+                &definition,
+                &key,
+                limits?,
+                now_ms,
+            )?
         };
         if !firing.state.is_active() {
             firing.finished_ms = Some(now_ms);
@@ -1510,6 +1532,7 @@ fn accept_firing(
     firing: &mut Firing,
     definition: &Definition,
     key: &str,
+    limits: crate::agent_execution::ConcurrencyLimits,
     now_ms: u64,
 ) -> Result<Option<crate::agent_execution::Accepted>, String> {
     use crate::{
@@ -1539,10 +1562,11 @@ fn accept_firing(
     // a savepoint keeps that same guarantee inside the firing transaction.
     tx.execute_batch("SAVEPOINT automation_accept")
         .map_err(|error| error.to_string())?;
-    let accepted = Registry::submit_agent_in(
+    let accepted = Registry::submit_agent_in_with_limits(
         tx,
         &Origin::Automation { id: automation.id },
         &request,
+        limits,
         now_ms,
     );
     match accepted {
@@ -1581,9 +1605,17 @@ fn accept_firing(
         Err(error) => {
             tx.execute_batch("ROLLBACK TO automation_accept; RELEASE automation_accept")
                 .map_err(|error| error.to_string())?;
-            firing.state = FiringState::Failed;
+            firing.state = if matches!(
+                &error,
+                crate::agent_execution::AcceptanceError::LimitReached(_)
+            ) {
+                firing.skip = Some(crate::automations::SkipReason::Capacity);
+                FiringState::Skipped
+            } else {
+                FiringState::Failed
+            };
             firing.finished_ms = Some(now_ms);
-            let mut diagnostic = error;
+            let mut diagnostic = error.to_string();
             crate::agent_execution::truncate(
                 &mut diagnostic,
                 crate::agent_execution::MAX_DIAGNOSTIC_BYTES,
@@ -1723,6 +1755,309 @@ mod tests {
             precheck: None,
         };
         (registry, directory, definition)
+    }
+
+    fn isolated_capacity_settings() -> (std::path::PathBuf, Vec<u8>) {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("CAGENTS_EXECUTION_FIXTURE")
+                .expect("capacity settings tests must run in the isolated host fixture"),
+        );
+        let path = crate::settings::default_path().unwrap();
+        assert!(path.starts_with(root), "settings must remain fixture-owned");
+        crate::settings::save(
+            &path,
+            &crate::settings::AppSettings {
+                agent_concurrency: crate::agent_execution::ConcurrencyLimits {
+                    caller: 50,
+                    global: 50,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let valid = std::fs::read(&path).unwrap();
+        (path, valid)
+    }
+
+    fn corrupt_capacity_settings(path: &std::path::Path) {
+        // Corrupt only the already-created private fixture file, after claim.
+        std::fs::write(path, "schema_version = [\n").unwrap();
+        assert!(crate::host::agent_execution::concurrency_limits().is_err());
+    }
+
+    #[test]
+    fn stopped_precheck_releases_slot_despite_invalid_concurrency_settings() {
+        if crate::host::agent_execution::tests::isolated(
+            "host::model::automations::tests::stopped_precheck_releases_slot_despite_invalid_concurrency_settings",
+        )
+        .is_some()
+        {
+            return;
+        }
+        use crate::host::automations::precheck::Outcome;
+        let (path, valid) = isolated_capacity_settings();
+        for state in [FiringState::Cancelled, FiringState::Failed] {
+            std::fs::write(&path, &valid).unwrap();
+            let (mut registry, _directory, mut definition) = fixture();
+            definition.precheck = Some(crate::automations::Precheck {
+                command: "true".into(),
+                timeout_seconds: 1,
+            });
+            let automation = registry
+                .create_automation(definition, 100, test_identity())
+                .unwrap();
+            let claim = registry
+                .claim_automation(
+                    automation.id,
+                    1,
+                    None,
+                    crate::automations::Trigger::Manual {
+                        request: Uuid::new_v4(),
+                    },
+                    None,
+                    true,
+                    200,
+                )
+                .unwrap();
+            assert!(claim.accepted.is_none());
+            corrupt_capacity_settings(&path);
+            assert!(
+                registry
+                    .finish_automation_precheck(
+                        claim.firing.id,
+                        Outcome::Stopped {
+                            state,
+                            skip: None,
+                            diagnostic: "proved precheck exit".into()
+                        },
+                        300,
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+            let firing = registry.automation_firing(claim.firing.id).unwrap();
+            assert_eq!(firing.state, state);
+            assert_eq!(firing.finished_ms, Some(300));
+            assert!(firing.agent.is_none() && firing.run.is_none());
+            assert!(
+                registry
+                    .automation(automation.id)
+                    .unwrap()
+                    .active_firing
+                    .is_none()
+            );
+            assert_eq!(
+                registry
+                    .db
+                    .query_row("SELECT count(*) FROM agent_runs", [], |row| row
+                        .get::<_, usize>(0))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_precheck_receipt_retires_despite_invalid_concurrency_settings() {
+        if crate::host::agent_execution::tests::isolated(
+            "host::model::automations::tests::interrupted_precheck_receipt_retires_despite_invalid_concurrency_settings",
+        )
+        .is_some()
+        {
+            return;
+        }
+        use crate::host::automations::precheck::Outcome;
+        let (path, _) = isolated_capacity_settings();
+        let (mut registry, _directory, mut definition) = fixture();
+        definition.precheck = Some(crate::automations::Precheck {
+            command: "true".into(),
+            timeout_seconds: 1,
+        });
+        let automation = registry
+            .create_automation(definition, 100, test_identity())
+            .unwrap();
+        let claim = registry
+            .claim_automation(
+                automation.id,
+                1,
+                None,
+                crate::automations::Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                200,
+            )
+            .unwrap();
+        registry
+            .interrupt_automation_precheck(claim.firing.id, "cleanup was uncertain".into(), 300)
+            .unwrap();
+        let blocked = registry.automation(automation.id).unwrap();
+        assert_eq!(blocked.active_firing, Some(claim.firing.id));
+        assert!(blocked.blocked.is_some());
+        assert_eq!(
+            registry
+                .pending_automation_notifications(100)
+                .unwrap()
+                .len(),
+            1
+        );
+        corrupt_capacity_settings(&path);
+        assert!(
+            registry
+                .finish_automation_precheck(claim.firing.id, Outcome::Passed, 400)
+                .unwrap()
+                .is_none()
+        );
+        let recovered = registry.automation(automation.id).unwrap();
+        assert!(recovered.active_firing.is_none() && recovered.blocked.is_none());
+        assert!(
+            !recovered.enabled,
+            "the receipt cannot authorize a new scheduled run"
+        );
+        let firing = registry.automation_firing(claim.firing.id).unwrap();
+        assert_eq!(firing.state, FiringState::Interrupted);
+        assert!(firing.agent.is_none() && firing.run.is_none());
+        assert!(
+            registry
+                .pending_automation_notifications(100)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            registry
+                .automation_audit(automation.id, None, 1)
+                .unwrap()
+                .events[0]
+                .cause,
+            LifecycleCause::PrecheckRecovered
+        );
+        assert_eq!(
+            registry
+                .db
+                .query_row("SELECT count(*) FROM agent_runs", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn automation_retry_ignores_invalid_settings_but_new_acceptance_refuses_them() {
+        if crate::host::agent_execution::tests::isolated(
+            "host::model::automations::tests::automation_retry_ignores_invalid_settings_but_new_acceptance_refuses_them",
+        )
+        .is_some()
+        {
+            return;
+        }
+        use crate::host::automations::precheck::Outcome;
+        let (path, _) = isolated_capacity_settings();
+        let (mut registry, _directory, mut definition) = fixture();
+        let automation = registry
+            .create_automation(definition.clone(), 100, test_identity())
+            .unwrap();
+        let request = Uuid::new_v4();
+        let claim = registry
+            .claim_automation(
+                automation.id,
+                1,
+                None,
+                crate::automations::Trigger::Manual { request },
+                None,
+                true,
+                200,
+            )
+            .unwrap();
+        let accepted = claim
+            .accepted
+            .as_ref()
+            .expect("initial valid policy accepts a run");
+        definition.name = "Fresh acceptance".into();
+        let fresh = registry
+            .create_automation(definition.clone(), 100, test_identity())
+            .unwrap();
+        definition.name = "Passing precheck".into();
+        definition.precheck = Some(crate::automations::Precheck {
+            command: "true".into(),
+            timeout_seconds: 1,
+        });
+        let checked = registry
+            .create_automation(definition, 100, test_identity())
+            .unwrap();
+        let precheck = registry
+            .claim_automation(
+                checked.id,
+                1,
+                None,
+                crate::automations::Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                200,
+            )
+            .unwrap();
+        let before = registry.model().unwrap();
+        corrupt_capacity_settings(&path);
+        let retry = registry
+            .claim_automation(
+                automation.id,
+                1,
+                None,
+                crate::automations::Trigger::Manual { request },
+                None,
+                true,
+                300,
+            )
+            .unwrap();
+        assert!(!retry.created && retry.accepted.is_none());
+        assert_eq!(retry.firing, claim.firing);
+        assert_eq!(retry.firing.run, Some(accepted.run.id));
+        assert_eq!(retry.firing.agent, Some(accepted.agent.id));
+        let error = registry
+            .claim_automation(
+                fresh.id,
+                1,
+                None,
+                crate::automations::Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                300,
+            )
+            .err()
+            .expect("new acceptance still requires readable concurrency policy");
+        assert!(error.contains("Cannot read agent concurrency settings"));
+        assert_eq!(registry.automation(fresh.id).unwrap(), fresh);
+        let error = registry
+            .finish_automation_precheck(precheck.firing.id, Outcome::Passed, 300)
+            .err()
+            .expect("passing precheck cannot bypass unreadable concurrency policy");
+        assert!(error.contains("Cannot read agent concurrency settings"));
+        assert_eq!(
+            registry.automation_firing(precheck.firing.id).unwrap(),
+            precheck.firing
+        );
+        assert_eq!(registry.model().unwrap(), before);
+        assert_eq!(
+            registry
+                .db
+                .query_row("SELECT count(*) FROM agent_runs", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            registry
+                .db
+                .query_row("SELECT count(*) FROM automation_firings", [], |row| {
+                    row.get::<_, usize>(0)
+                })
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
@@ -2134,6 +2469,88 @@ mod tests {
             .query_row("SELECT count(*) FROM agent_runs", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn configured_agent_capacity_skips_automation_without_partial_acceptance() {
+        use crate::agent_execution::{ConcurrencyLimits, Destination, Origin, Submit};
+        let (mut registry, _directory, definition) = fixture();
+        let mut automation = registry
+            .create_automation(definition.clone(), 100, test_identity())
+            .unwrap();
+        let limits = ConcurrencyLimits {
+            caller: 1,
+            global: 1,
+        };
+        let occupied = registry
+            .submit_agent_with_limits(
+                &Origin::User,
+                &Submit {
+                    name: None,
+                    destination: Destination::New(definition.agent.clone()),
+                    prompt: "Occupy one global slot".into(),
+                    idempotency_key: "occupied-capacity".into(),
+                },
+                None,
+                limits,
+                101,
+            )
+            .unwrap();
+        let mut firing = Firing {
+            id: Uuid::new_v4(),
+            automation: automation.id,
+            name: definition.name.clone(),
+            revision: automation.execution_revision,
+            trigger: crate::automations::Trigger::Manual {
+                request: Uuid::new_v4(),
+            },
+            state: FiringState::Prechecking,
+            release_pending: false,
+            cancel_requested: false,
+            created_ms: 102,
+            started_ms: None,
+            finished_ms: None,
+            agent: None,
+            run: None,
+            skip: None,
+            diagnostic: None,
+        };
+        automation.active_firing = Some(firing.id);
+        let tx = registry
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(
+            accept_firing(
+                &tx,
+                &mut automation,
+                &mut firing,
+                &definition,
+                "limited-firing",
+                limits,
+                103
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(firing.state, FiringState::Skipped);
+        assert_eq!(firing.skip, Some(crate::automations::SkipReason::Capacity));
+        assert!(
+            firing
+                .diagnostic
+                .as_ref()
+                .unwrap()
+                .contains(&occupied.agent.id.to_string())
+        );
+        assert!(automation.active_firing.is_none());
+        assert!(firing.agent.is_none() && firing.run.is_none());
+        assert_eq!(
+            tx.query_row("SELECT count(*) FROM agent_runs", [], |row| row
+                .get::<_, usize>(0))
+                .unwrap(),
+            1
+        );
+        tx.commit().unwrap();
     }
 
     #[test]

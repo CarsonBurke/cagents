@@ -116,9 +116,12 @@ pub(crate) fn coordination(argv: &[String], stdin: Text) -> Option<Kind> {
                 action,
             }),
             AgentCommand::Interrupt { agent, .. } => Kind::Act(Act::Interrupt { agent }),
-            AgentCommand::Close { agent } => Kind::Act(Act::Close {
+            AgentCommand::Close {
+                agent: Some(agent), ..
+            } => Kind::Act(Act::Close {
                 agents: vec![agent],
             }),
+            AgentCommand::Close { agent: None, .. } => Kind::Act(Act::Cli(subcommand_path(argv))),
             AgentCommand::Console { .. } => return None,
         },
         // The rest manage the application rather than other agents, and are
@@ -363,6 +366,26 @@ mod tests {
         let argv: Vec<String> = line.split(' ').map(str::to_owned).collect();
         let stdin = stdin.map_or(Text::Unseen, |stdin| Text::Inline(stdin.into()));
         super::coordination(&argv, stdin)
+    }
+
+    #[test]
+    fn interrupted_cleanup_invocations_do_not_invent_individual_agent_targets() {
+        for command in [
+            "cagents agent close --interrupted",
+            "cagents agent close --interrupted --all",
+        ] {
+            assert_eq!(
+                parse(command, None),
+                Some(Kind::Act(Act::Cli("agent close".into())))
+            );
+        }
+        assert_eq!(
+            parse("cagents agent close existing-agent", None),
+            Some(Kind::Act(Act::Close {
+                agents: vec!["existing-agent".into()]
+            }))
+        );
+        assert_eq!(parse("cagents agent close --all", None), None);
     }
 
     #[test]
