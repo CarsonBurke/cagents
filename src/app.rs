@@ -5522,6 +5522,14 @@ impl Cagents {
             return self.device_project_read_task(path, project_id, generation, kind);
         }
         let project_id = project_id.unwrap_or_default();
+        let reopen_closed_before = open_cards.then(|| {
+            self.project_ui
+                .closed
+                .iter()
+                .chain(self.workspace_model.closed_projects.iter())
+                .cloned()
+                .collect::<HashSet<_>>()
+        });
         if open_cards && let Ok(repository) = crate::workspace_model::canonical_repository(&path) {
             if self.project_ui.is_reopening(&repository)
                 && !self.workspace_model_reopens.can_retry(&repository)
@@ -5567,6 +5575,7 @@ impl Cagents {
                 self.workspace_model.identity,
                 self.workspace_model_source.clone(),
                 Some(generation),
+                reopen_closed_before.unwrap_or_default(),
             );
         }
         if let Some(previous) = self
@@ -14548,6 +14557,9 @@ impl Application for Cagents {
                 let mut task = Task::none();
                 match result {
                     Ok(loaded) => {
+                        if !self.promote_loaded_reopen(project_id, generation, &loaded.project.repository) {
+                            return Task::none();
+                        }
                         if self.project_ui.closed.contains(&loaded.project.repository) {
                             self.repository_generations.remove(&project_id);
                             return Task::none();

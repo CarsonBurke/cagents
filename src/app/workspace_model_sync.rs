@@ -57,11 +57,18 @@ struct ReopenAcknowledgement {
 }
 
 #[derive(Default)]
+struct ReopenDiscovery {
+    closed_before: HashSet<PathBuf>,
+    closed_after: HashSet<PathBuf>,
+}
+
+#[derive(Default)]
 pub(super) struct ReopenTracking {
     active: HashMap<ProjectId, ReopenOrigin>,
     deferred: HashMap<ProjectId, ReopenAcknowledgement>,
     queued: HashSet<ProjectId>,
     retryable: HashSet<ProjectId>,
+    discovery: HashMap<ProjectId, ReopenDiscovery>,
 }
 
 impl ReopenTracking {
@@ -70,6 +77,7 @@ impl ReopenTracking {
         self.deferred.remove(&project);
         self.queued.remove(&project);
         self.retryable.remove(&project);
+        self.discovery.remove(&project);
     }
 
     pub(super) fn begin(
@@ -79,8 +87,16 @@ impl ReopenTracking {
         registry: uuid::Uuid,
         host: Option<crate::model::HostSessionProof>,
         inventory_generation: Option<u64>,
+        closed_before: HashSet<PathBuf>,
     ) {
         self.invalidate(project);
+        self.discovery.insert(
+            project,
+            ReopenDiscovery {
+                closed_before,
+                closed_after: HashSet::new(),
+            },
+        );
         self.active.insert(
             project,
             ReopenOrigin {
@@ -96,11 +112,23 @@ impl ReopenTracking {
 
     pub(super) fn remap(&mut self, previous: ProjectId, project: ProjectId) {
         let origin = self.active.get(&previous).cloned();
+        let discovery = self.discovery.remove(&previous);
         self.invalidate(previous);
         self.invalidate(project);
         if let Some(mut origin) = origin {
             origin.project = project;
             self.active.insert(project, origin);
+            if let Some(discovery) = discovery {
+                self.discovery.insert(project, discovery);
+            }
+        }
+    }
+
+    fn observe_close(&mut self, repository: &Path) {
+        for (project, discovery) in &mut self.discovery {
+            if !self.queued.contains(project) {
+                discovery.closed_after.insert(repository.to_path_buf());
+            }
         }
     }
 
@@ -607,6 +635,105 @@ impl Cagents {
                 },
                 |project| project.repository == origin.repository,
             )
+    }
+
+    pub(super) fn promote_loaded_reopen(
+        &mut self,
+        project: ProjectId,
+        generation: u64,
+        repository: &Path,
+    ) -> bool {
+        let Some(origin) = self.workspace_model_reopens.active.get(&project).cloned() else {
+            return true;
+        };
+        if origin.inventory_generation != Some(generation)
+            || self.workspace_model_reopens.queued.contains(&project)
+        {
+            return true;
+        }
+        if self.project_ui.reopening.get(&project) != Some(&origin.repository)
+            || self.workspace_model_reopens.retryable.contains(&project)
+            || (origin.registry != NO_REGISTRY && origin.registry != self.workspace_model.identity)
+            || origin
+                .host
+                .as_ref()
+                .is_some_and(|host| self.workspace_model_source.as_ref() != Some(host))
+        {
+            self.workspace_model_reopens.retryable.insert(project);
+            self.invalidate_reopen_inventory(project);
+            return false;
+        }
+        // The worker established this identity. Resolve picker aliases here,
+        // without performing Git discovery or filesystem work on the UI path.
+        let aliases = self
+            .workspace_model_reopens
+            .active
+            .values()
+            .filter(|other| other.project != project && other.repository == repository)
+            .cloned()
+            .collect::<Vec<_>>();
+        if aliases.iter().any(|other| {
+            other
+                .inventory_generation
+                .is_some_and(|newer| newer > generation)
+        }) {
+            self.invalidate_reopen_inventory(project);
+            self.workspace_model_reopens.invalidate(project);
+            self.project_ui.reopening.remove(&project);
+            return false;
+        }
+        for older in aliases {
+            self.invalidate_reopen_inventory(older.project);
+            self.workspace_model_reopens.invalidate(older.project);
+            if self.project_ui.reopening.get(&older.project) == Some(&older.repository) {
+                self.project_ui.reopening.remove(&older.project);
+            }
+        }
+        self.workspace_model_reopens
+            .active
+            .get_mut(&project)
+            .unwrap()
+            .repository = repository.to_path_buf();
+        self.project_ui
+            .reopening
+            .insert(project, repository.to_path_buf());
+        if self
+            .project_ui
+            .closing
+            .values()
+            .any(|closing| closing == repository)
+        {
+            self.workspace_model_reopens.retryable.insert(project);
+            self.invalidate_reopen_inventory(project);
+            self.status = Some(TransientNotice::warning(
+                "Wait for this project to finish closing, then open it again to retry.",
+            ));
+            return false;
+        }
+        let closed_since_begin = self
+            .workspace_model_reopens
+            .discovery
+            .get(&project)
+            .is_none_or(|discovery| {
+                discovery.closed_after.contains(repository)
+                    || ((self.project_ui.closed.contains(repository)
+                        || self
+                            .workspace_model
+                            .closed_projects
+                            .iter()
+                            .any(|closed| closed == repository))
+                        && !discovery.closed_before.contains(repository))
+            });
+        if closed_since_begin {
+            self.workspace_model_reopens.retryable.insert(project);
+            self.invalidate_reopen_inventory(project);
+            self.status = Some(TransientNotice::warning(
+                "This project closed while it was opening. Open it again to retry.",
+            ));
+            return false;
+        }
+        self.project_ui.closed.remove(repository);
+        true
     }
 
     pub(super) fn invalidate_reopen_inventory(&mut self, project: ProjectId) {
@@ -1155,7 +1282,10 @@ impl Cagents {
                     _ => None,
                 };
                 let closing = match &edit {
-                    ModelEdit::CloseProject { repository } => Some(repository.clone()),
+                    ModelEdit::CloseProject { repository } => {
+                        self.workspace_model_reopens.observe_close(repository);
+                        Some(repository.clone())
+                    }
                     ModelEdit::ReopenProject { repository, .. } => {
                         self.cancel_shared_project_close(repository);
                         self.project_ui.closed.remove(repository);
@@ -2781,6 +2911,315 @@ mod tests {
             drain(&published).is_empty(),
             "obsolete successful load must not fall back to OpenProject"
         );
+    }
+
+    #[test]
+    fn real_git_picker_promotes_only_its_current_load_and_publishes_one_stamped_reopen() {
+        let Some(checkout) = git_checkout() else {
+            return;
+        };
+        let repository = checkout.path().join(".git").canonicalize().unwrap();
+        let subdirectory = checkout.path().join("nested");
+        std::fs::create_dir(&subdirectory).unwrap();
+        for state in ["initial", "bootstrap", "known_closed", "existing_closed"] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            let mut model = registry(Vec::new());
+            if state != "bootstrap" {
+                drop(app.update(Message::WorkspaceModelObserved(
+                    ModelUpdate::connected_fixture(model.clone()),
+                )));
+            }
+            let existing = (state == "existing_closed").then(ProjectId::new);
+            if let Some(project) = existing {
+                app.sidebar_model.projects.push(SidebarProject::new(
+                    project,
+                    RepositoryId::new(),
+                    "Existing checkout".into(),
+                    repository.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                ));
+            }
+            let edited = existing.map(|_| {
+                drop(app.new_native_chat(
+                    crate::agent::Provider::Claude,
+                    Some(checkout.path().to_path_buf()),
+                ));
+                let card = app
+                    .workspace
+                    .focused()
+                    .expect("the existing worktree draft opens");
+                let target = match app.cards.get(&card) {
+                    Some(CardRuntime::Chat(runtime)) => runtime.target,
+                    _ => panic!("an inert native composer is expected"),
+                };
+                let draft = "Keep the existing checkout draft  \nUnicode 🦀  ";
+                drop(
+                    app.update(Message::ChatUi(super::super::chat_ui::Action::Composer(
+                        target,
+                        cosmic::widget::text_editor::Action::Edit(
+                            cosmic::widget::text_editor::Edit::Paste(Arc::new(draft.into())),
+                        ),
+                    ))),
+                );
+                assert_eq!(app.persistent_workspace().chat_drafts[&card], draft);
+                (
+                    card,
+                    draft.to_owned(),
+                    app.card_state(card).unwrap().kind.clone(),
+                )
+            });
+            if state.contains("closed") {
+                // A cached completed close, not a close still in progress.
+                app.project_ui.closed.insert(repository.clone());
+                app.workspace_model.closed_projects.push(repository.clone());
+                model.closed_projects.push(repository.clone());
+            }
+            let selected = if existing.is_some() {
+                subdirectory.clone()
+            } else {
+                checkout.path().to_path_buf()
+            };
+            let task = app.update(Message::RepositorySelected(Ok(selected.clone())));
+            let captured = app
+                .workspace_model_reopens
+                .active
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+            assert_eq!(captured.repository, selected.canonicalize().unwrap());
+            assert_ne!(captured.repository, repository);
+            let loaded = first_message(task).expect("actual Git discovery completes");
+            assert!(
+                matches!(&loaded, Message::RepositoryLoaded { project_id, generation, result: Ok(loaded), .. }
+                if *project_id == captured.project
+                    && Some(*generation) == captured.inventory_generation
+                    && loaded.project.repository == repository)
+            );
+            let published = intercept_publishes(&mut app);
+            drop(app.update(loaded));
+            let requests = std::iter::from_fn(|| published.try_recv().ok()).collect::<Vec<_>>();
+            let reopens = requests
+                .iter()
+                .filter(|request| {
+                    matches!(&request.edit,
+                ModelEdit::ReopenProject { repository: path, .. } if path == &repository)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                reopens.len(),
+                1,
+                "{state}: the picker must publish one reopen"
+            );
+            assert!(
+                !requests.iter().any(|request| matches!(&request.edit,
+                ModelEdit::OpenProject { repository: path, .. } if path == &repository)),
+                "{state}: a picker alias must not fall back to ordinary OpenProject"
+            );
+            let request = reopens[0];
+            let origin = request.reopen.as_ref().unwrap();
+            assert_eq!(origin.nonce, captured.nonce);
+            assert_eq!(origin.registry, captured.registry);
+            assert_eq!(origin.host, captured.host);
+            assert_eq!(origin.inventory_generation, captured.inventory_generation);
+            assert_eq!(origin.repository, repository);
+            assert_eq!(origin.project, existing.unwrap_or(captured.project));
+            assert_eq!(
+                app.project_ui.reopening.get(&origin.project),
+                Some(&repository)
+            );
+            assert!(!app.project_ui.closed.contains(&repository));
+            assert_eq!(app.sidebar_model.projects.len(), 1);
+            assert!(
+                !app.sidebar_model
+                    .project(origin.project)
+                    .unwrap()
+                    .worktrees
+                    .is_empty()
+            );
+            assert_eq!(
+                app.active_workspace,
+                Some(checkout.path().canonicalize().unwrap())
+            );
+            if let Some((card, draft, kind)) = &edited {
+                assert_eq!(&app.card_state(*card).unwrap().kind, kind);
+                assert_eq!(&app.persistent_workspace().chat_drafts[card], draft);
+                assert!(app.workspace.order().any(|id| id == *card));
+                assert_eq!(app.workspace.focused(), Some(*card));
+                assert_eq!(app.durable.active_channel, None);
+            }
+            let ModelEdit::ReopenProject { name, kind, .. } = &request.edit else {
+                unreachable!()
+            };
+            model.sequence += 1;
+            model.closed_projects.clear();
+            model.projects.push(ModelProject {
+                repository: repository.clone(),
+                name: name.clone(),
+                kind: *kind,
+                ordinal: 1,
+            });
+            let ModelUpdate::Connected { proof, .. } =
+                ModelUpdate::connected_fixture(model.clone())
+            else {
+                unreachable!()
+            };
+            drop(
+                app.update(Message::WorkspaceModelObserved(ModelUpdate::Reopened {
+                    repository: repository.clone(),
+                    model: model.clone(),
+                    origin: request.reopen.clone(),
+                    destination: Some(proof.clone()),
+                })),
+            );
+            if state == "bootstrap" {
+                assert_eq!(app.workspace_model.identity, NO_REGISTRY);
+                assert!(app.project_ui.is_reopening(&repository));
+                drop(
+                    app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected {
+                        model,
+                        proof,
+                    })),
+                );
+            }
+            assert!(
+                !app.project_ui.is_reopening(&repository),
+                "{state}: matching acknowledgement settles"
+            );
+            assert!(app.workspace_model_reopens.active.is_empty());
+            if let Some((card, draft, kind)) = &edited {
+                assert_eq!(&app.card_state(*card).unwrap().kind, kind);
+                assert_eq!(&app.persistent_workspace().chat_drafts[card], draft);
+                assert!(app.workspace.order().any(|id| id == *card));
+                assert_eq!(app.workspace.focused(), Some(*card));
+                assert_eq!(app.durable.active_channel, None);
+            }
+            assert!(
+                !drain(&published)
+                    .iter()
+                    .any(|edit| matches!(edit, ModelEdit::ReopenProject { .. })),
+                "confirmation never replays the picker"
+            );
+        }
+    }
+
+    #[test]
+    fn discovered_git_close_requires_exact_explicit_retry_without_vetoing_other_projects() {
+        let Some(checkout) = git_checkout() else {
+            return;
+        };
+        let repository = checkout.path().join(".git").canonicalize().unwrap();
+        for state in [
+            "new_close_no_row",
+            "completed_close",
+            "active_close",
+            "unknown_bootstrap_close",
+            "unrelated_close",
+        ] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            let mut model = registry(Vec::new());
+            if state != "unknown_bootstrap_close" {
+                drop(app.update(Message::WorkspaceModelObserved(
+                    ModelUpdate::connected_fixture(model.clone()),
+                )));
+            }
+            let loaded = first_message(app.update(Message::RepositorySelected(Ok(
+                checkout.path().to_path_buf(),
+            ))))
+            .unwrap();
+            let origin = app
+                .workspace_model_reopens
+                .active
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+            if state == "unknown_bootstrap_close" {
+                model.closed_projects.push(repository.clone());
+                drop(app.update(Message::WorkspaceModelObserved(
+                    ModelUpdate::connected_fixture(model.clone()),
+                )));
+            } else if state == "active_close" {
+                app.project_ui
+                    .closing
+                    .insert(ProjectId::new(), repository.clone());
+            } else {
+                let closed = if state == "unrelated_close" {
+                    PathBuf::from("/unrelated/.git")
+                } else {
+                    repository.clone()
+                };
+                // Accepted edges retain their meaning even after the close's
+                // local row/generation has finished and its tombstone cleared.
+                drop(
+                    app.update(Message::WorkspaceModelObserved(ModelUpdate::Edited {
+                        sequence: model.sequence + 1,
+                        edit: ModelEdit::CloseProject { repository: closed },
+                    })),
+                );
+                assert!(app.project_ui.close_generation.is_empty());
+                if state == "completed_close" {
+                    app.project_ui.closed.remove(&repository);
+                    app.workspace_model.closed_projects.clear();
+                }
+            }
+            let canonical = app.workspace_model.clone();
+            let durable = Arc::clone(&app.durable);
+            let published = intercept_publishes(&mut app);
+            drop(app.update(loaded));
+            if state == "unrelated_close" {
+                assert_eq!(app.sidebar_model.projects.len(), 1);
+                assert_eq!(drain(&published).iter().filter(|edit| matches!(edit, ModelEdit::ReopenProject { repository: path, .. } if path == &repository)).count(), 1);
+                continue;
+            }
+            assert!(
+                app.sidebar_model.projects.is_empty(),
+                "{state}: refused discovery must not project a row"
+            );
+            assert_eq!(app.workspace_model, canonical);
+            assert_eq!(app.durable, durable);
+            assert!(app.workspace_model_reopens.can_retry(&repository));
+            let retained = &app.workspace_model_reopens.active[&origin.project];
+            assert_eq!(retained.nonce, origin.nonce);
+            assert_eq!(retained.registry, origin.registry);
+            assert_eq!(retained.host, origin.host);
+            assert_eq!(retained.inventory_generation, origin.inventory_generation);
+            assert_eq!(retained.repository, repository);
+            assert_eq!(
+                app.project_ui.reopening.get(&origin.project),
+                Some(&repository)
+            );
+            assert!(!app.repository_generations.contains_key(&origin.project));
+            assert!(app.status.is_some());
+            assert!(
+                drain(&published).is_empty(),
+                "{state}: neither OpenProject nor Reopen may escape"
+            );
+            if state == "unknown_bootstrap_close" {
+                // A new explicit choice, after Connected, can now date the
+                // cached close and gets its own admitted origin and nonce.
+                let loaded = first_message(app.update(Message::RepositorySelected(Ok(
+                    checkout.path().to_path_buf(),
+                ))))
+                .unwrap();
+                drop(app.update(loaded));
+                let requests = std::iter::from_fn(|| published.try_recv().ok()).collect::<Vec<_>>();
+                let retry = requests
+                    .iter()
+                    .find(|request| matches!(request.edit, ModelEdit::ReopenProject { .. }))
+                    .unwrap();
+                let newer = retry.reopen.as_ref().unwrap();
+                assert_ne!(newer.nonce, origin.nonce);
+                assert_eq!(newer.registry, model.identity);
+                assert_eq!(newer.repository, repository);
+                assert!(
+                    !app.workspace_model_reopens
+                        .active
+                        .contains_key(&origin.project)
+                );
+            }
+        }
     }
 
     #[test]
