@@ -4445,8 +4445,12 @@ impl Worker {
             self.refresh_resume_hint(true);
             self.stop_reading()?;
             self.input_drained_for_handoff()?;
-            carry::screen(&mut self.terminal, holder::MAX_SCREEN)
-                .and_then(|screen| self.holder.detach(socket, &screen))?;
+            let screen = carry::screen(&mut self.terminal, holder::MAX_SCREEN);
+            // Formatting can restore cold history without changing its activity
+            // token. A refused detach keeps this worker and must reclaim it again.
+            self.scrollback_compression
+                .history_read(std::time::Instant::now());
+            screen.and_then(|screen| self.holder.detach(socket, &screen))?;
             self.carried = true;
             self.complete_input_handoff();
             Ok(Carried {
@@ -6944,6 +6948,82 @@ mod tests {
         handle.input(b"still here\n".to_vec()).unwrap();
         wait_for_text(&handle, "after:still here");
         handle.shutdown().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refused_carry_reclaims_formatted_history_without_new_output() {
+        if isolated_input_case("refused_carry_reclaims_formatted_history_without_new_output") {
+            return;
+        }
+        let (mut worker, handle, mut root) = input_handoff_worker(
+            r#"
+import os, time, tty
+tty.setraw(0)
+for row in range(2000):
+    os.write(1, f'\x1b[38;5;{row % 216 + 16}mfile-{row:04}.rs: reading café ✓\x1b[0m\r\n'.encode())
+os.write(1, b'CARRY_HISTORY_READY')
+while True: time.sleep(1)
+"#,
+        );
+        observe_worker_marker(&mut worker, b"CARRY_HISTORY_READY");
+        let formatted = |terminal: &Terminal<'_, '_>| {
+            use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
+            Formatter::new(
+                terminal,
+                FormatterOptions::new()
+                    .with_format(Format::Vt)
+                    .with_style(true),
+            )
+            .unwrap()
+            .format_alloc(None)
+            .unwrap()
+            .to_vec()
+        };
+        let before = formatted(&worker.terminal);
+        let rows = worker.terminal.scrollbar().unwrap().total;
+        assert!(rows >= 2_000);
+        worker.compress_scrollback(CompressionMode::Full);
+        assert!(worker.scrollback_compression.enabled());
+        assert_eq!(worker.scrollback_compression.after(Instant::now()), None);
+        let token = worker.terminal.compression_activity().unwrap();
+        let old_reader = worker.reader.as_ref().unwrap().thread().id();
+
+        // Reach the real carry formatter, then the holder's bind refusal. The
+        // child stays silent, so neither reader restart nor activity can rearm it.
+        let socket = std::env::current_dir()
+            .unwrap()
+            .join("missing")
+            .join("holder.sock");
+        let error = worker.carry(&socket).unwrap_err();
+        assert!(error.starts_with("listen on "), "{error}");
+        assert!(!worker.carried);
+        assert_ne!(worker.reader.as_ref().unwrap().thread().id(), old_reader);
+        assert!(!input_root_exited(&root.pidfd).unwrap());
+        assert_eq!(worker.terminal.compression_activity().unwrap(), token);
+        let delay = worker
+            .scrollback_compression
+            .after(Instant::now())
+            .expect("refused carry must rearm the completed compression pass");
+        assert!(delay <= Duration::from_secs(1));
+
+        // Use the worker's real idle path, without history reads between carry
+        // and recompression: those reads would hide the missing carry rearm.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut steps = 0;
+        while let Some(delay) = worker.scrollback_compression.after(Instant::now()) {
+            assert!(Instant::now() + delay < deadline, "recompression stalled");
+            thread::sleep(delay);
+            worker.compress_idle_scrollback();
+            steps += 1;
+        }
+        assert!(steps > 0);
+        assert!(worker.scrollback_compression.enabled());
+        assert_eq!(worker.terminal.compression_activity().unwrap(), token);
+        assert_eq!(formatted(&worker.terminal), before);
+        assert_eq!(worker.terminal.scrollbar().unwrap().total, rows);
+        worker.published.request_shutdown();
+        finish_captured_input_worker(worker, &handle, &mut root);
     }
 
     #[test]
