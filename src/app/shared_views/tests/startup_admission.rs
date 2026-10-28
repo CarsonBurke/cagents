@@ -2254,6 +2254,7 @@ fn failed_scope_retry_preserves_a_changed_deleted_or_closed_sibling_and_both_dra
                 .push(sibling.id);
         }
         app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.shared_views = State::for_workspace(&app.durable);
         let (tx, rx) = async_channel::unbounded();
         app.workspace_model_tx = tx;
         let drafts = HashMap::from([
@@ -2637,6 +2638,7 @@ fn retried_seed_ack_preserves_every_failed_source_across_reordered_snapshots() {
                             .push(sibling.id);
                     }
                     app.workspace = Cagents::rebuild_workspace(&app.durable);
+                    app.shared_views = State::for_workspace(&app.durable);
                     let mut destination_pane = pane.clone();
                     destination_pane.id = CardId::new();
                     destination_pane.title = "Destination browser".into();
