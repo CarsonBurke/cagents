@@ -4267,6 +4267,22 @@ impl Cagents {
         if cleanup.key != key {
             return Task::none();
         }
+        if !self.sign_in_cleanup_matches(&cleanup) {
+            if let Some(login) = self
+                .account_ui
+                .logins
+                .iter_mut()
+                .find(|login| login.key == key)
+                && login.phase == LoginPhase::Verifying
+            {
+                // Retry replaced the terminal while this observation was in
+                // flight. Check its current source later without applying the
+                // old result to registration, abandonment, or exhaustion.
+                login.phase = LoginPhase::Waiting;
+                login.next_check = now_ms() + LOGIN_RETRY;
+            }
+            return Task::none();
+        }
         let authority = cleanup.authority.clone();
         let outcome = match outcome {
             Outcome::Answered {

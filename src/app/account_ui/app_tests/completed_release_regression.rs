@@ -351,6 +351,18 @@ async fn original_verification_and_registration_cannot_close_a_newer_same_home_r
     let verification = app.update(Message::AccountUi(Action::LoginTick));
     assert_eq!(app.account_ui.logins[0].phase, LoginPhase::Verifying);
     drop(verification); // Provider work is deliberately never polled.
+    // Admit and complete registration while T1 still matches, but hold its
+    // actual completion until after Retry. No provider future is polled.
+    let registration = app.update(Message::AccountUi(Action::LoginVerified {
+        key,
+        cleanup: captured,
+        outcome: successful_outcome(),
+    }));
+    let settled = lifecycle_message(registration).await;
+    let Message::AccountUi(Action::LoginSettled { cleanup, .. }) = &settled else {
+        panic!("actual registration completion")
+    };
+    assert_eq!(cleanup.target.as_ref().unwrap().1, source);
     drop(app.update(Message::RetryCard(card)));
     let state = app.card_state_mut(card).unwrap();
     let CardKind::Terminal(next) = &mut state.kind else {
@@ -373,16 +385,6 @@ async fn original_verification_and_registration_cannot_close_a_newer_same_home_r
         replacement.residency,
         Residency::Hydrating { .. }
     ));
-    let registration = app.update(Message::AccountUi(Action::LoginVerified {
-        key,
-        cleanup: captured,
-        outcome: successful_outcome(),
-    }));
-    let settled = lifecycle_message(registration).await;
-    let Message::AccountUi(Action::LoginSettled { cleanup, .. }) = &settled else {
-        panic!("actual registration completion")
-    };
-    assert_eq!(cleanup.target.as_ref().unwrap().1, source);
     let close = app.update(settled);
     assert_eq!(
         close.units(),
@@ -390,6 +392,8 @@ async fn original_verification_and_registration_cannot_close_a_newer_same_home_r
         "late original settlement must not send a close for the retry"
     );
     drop(close);
+    assert!(app.account_ui.registry.find(key).is_some());
+    assert!(app.account_ui.logins.iter().all(|login| login.key != key));
     assert_eq!(app.card_state(card), Some(&replacement));
     assert!(!app.pane_close_owned(card));
     assert!(app.terminal_close.is_none());
@@ -527,4 +531,178 @@ fn an_old_callback_blockage_releases_verification_without_blocking_the_retry() {
     );
     assert!(app.account_ui.logins[0].next_check >= before_completion + LOGIN_RETRY);
     assert!(!app.pane_close_owned(card));
+}
+
+fn ready_login_retry(
+    app: &mut Cagents,
+    card: CardId,
+    original: &TerminalSession,
+) -> TerminalSession {
+    drop(app.update(Message::RetryCard(card)));
+    let state = app.card_state_mut(card).unwrap();
+    let CardKind::Terminal(next) = &mut state.kind else {
+        panic!("replacement sign-in terminal")
+    };
+    assert_ne!(next.id, original.id);
+    // Same fixture custody as the existing replacement positive control;
+    // this is not an observed daemon start or attachment.
+    next.continuity = TerminalContinuity::DetachedSameBoot {
+        host_session_id: crate::model::HostSessionId::new("replacement-host"),
+        boot_id: crate::model::BootId::new("replacement-boot"),
+        host_incarnation: crate::model::HostIncarnation::new("replacement-incarnation"),
+    };
+    state.residency = Residency::Hot;
+    let next = next.clone();
+    drop(app.finish_terminal_start(card));
+    assert!(!app.terminal_start_in_flight(card));
+    assert!(!app.pending_terminal_spawn(card));
+    assert!(!matches!(
+        app.card_state(card).unwrap().residency,
+        Residency::Hydrating { .. }
+    ));
+    next
+}
+
+#[test]
+fn stale_verification_cannot_register_abandon_or_exhaust_a_newer_ready_retry() {
+    for (case, outcome, recovered) in [
+        ("signed out", answered(None, UsageStatus::NeedsLogin), false),
+        (
+            "expired cached identity",
+            answered(Some("expired@fixture.invalid"), UsageStatus::NeedsLogin),
+            false,
+        ),
+        (
+            "failed at limit",
+            Outcome::Failed("fixture verification failed".into()),
+            false,
+        ),
+        ("busy at limit", Outcome::Busy, false),
+        ("signed in", successful_outcome(), false),
+        (
+            "recovered signed out",
+            answered(None, UsageStatus::NeedsLogin),
+            true,
+        ),
+    ] {
+        let (mut app, card, source) = ended_fixture(false);
+        drop(app.select_worktree("/repo".into(), false));
+        let key = app.account_ui.logins[0].key;
+        let captured = app.sign_in_cleanup(key);
+        assert_eq!(captured.target, Some((card, source.clone())));
+        assert_eq!(captured.authority, app.account_ui.authority);
+        let verification = app.update(Message::AccountUi(Action::LoginTick));
+        assert_eq!(app.account_ui.logins[0].phase, LoginPhase::Verifying);
+        drop(verification); // Provider verification is deliberately unpolled.
+        app.account_ui.logins[0].attempts = LOGIN_ATTEMPTS;
+        app.account_ui.logins[0].recovered = recovered;
+        let original_login = app.account_ui.logins[0].clone();
+        app.account_ui
+            .registry
+            .begin(Provider::Claude, key, now_ms());
+        let registry = app.account_ui.registry.clone();
+        let next = ready_login_retry(&mut app, card, &source);
+        let replacement = app.card_state(card).unwrap().clone();
+        let retry_not_before = now_ms() + LOGIN_RETRY;
+        let task = app.update(Message::AccountUi(Action::LoginVerified {
+            key,
+            cleanup: captured,
+            outcome,
+        }));
+        assert_eq!(
+            task.units(),
+            0,
+            "stale verification must not schedule registration or abandonment: {case}"
+        );
+        drop(task);
+        assert_eq!(
+            app.account_ui.logins.len(),
+            1,
+            "stale verification must not exhaust or remove the retry watcher: {case}"
+        );
+        let login = &app.account_ui.logins[0];
+        assert_eq!(login.key, original_login.key);
+        assert_eq!(login.provider, original_login.provider);
+        assert_eq!(login.home, original_login.home);
+        assert_eq!(login.attempts, original_login.attempts);
+        assert_eq!(login.recovered, original_login.recovered);
+        assert_eq!(login.started_at, original_login.started_at);
+        assert_eq!(login.phase, LoginPhase::Waiting);
+        assert!(login.next_check >= retry_not_before);
+        assert_eq!(app.account_ui.registry, registry);
+        assert_eq!(app.card_state(card), Some(&replacement));
+        assert!(!app.pane_close_owned(card));
+        assert!(app.terminal_close.is_none());
+
+        // Exercise the existing public retry-clock/host-result route to a
+        // fresh observation of T2. Tasks and the accepted host-result message
+        // are headless contracts, not actual daemon/provider observations.
+        drop(app.select_worktree("/elsewhere".into(), false));
+        app.account_ui.logins[0].next_check = 0;
+        app.account_ui.next_host_check = 0;
+        let query = app.update(Message::AccountUi(Action::LoginTick));
+        assert!(query.units() > 0);
+        assert!(app.account_ui.asking_host);
+        drop(query);
+        let verification = app.update(Message::AccountUi(Action::LoginsEnded(Ok(vec![(
+            key, next.id,
+        )]))));
+        assert!(verification.units() > 0);
+        assert_eq!(app.account_ui.logins[0].phase, LoginPhase::Verifying);
+        drop(verification);
+        let current = app.sign_in_cleanup(key);
+        assert_eq!(current.target, Some((card, next)));
+        assert_eq!(current.authority, app.account_ui.authority);
+        // A matching fresh signed-out observation must still be actionable;
+        // neither a blanket refusal nor disabling verification can pass.
+        app.account_ui.logins[0].recovered = false;
+        let abandonment = app.update(Message::AccountUi(Action::LoginVerified {
+            key,
+            cleanup: current,
+            outcome: answered(None, UsageStatus::NeedsLogin),
+        }));
+        assert!(abandonment.units() > 0);
+        assert_eq!(app.account_ui.logins[0].phase, LoginPhase::Settling);
+        drop(abandonment); // No abandonment RPC or filesystem work is polled.
+    }
+}
+
+#[tokio::test]
+async fn recovered_verification_without_a_card_can_still_register_its_pending_home() {
+    let mut app = context_inspector_test_app(false);
+    let key = pending_login(&mut app, 152352);
+    app.account_ui.logins[0].recovered = true;
+    app.account_ui
+        .registry
+        .begin(Provider::Claude, key, now_ms());
+    let captured = app.sign_in_cleanup(key);
+    assert!(captured.target.is_none());
+    assert_eq!(captured.authority, app.account_ui.authority);
+    let verification = app.update(Message::AccountUi(Action::LoginTick));
+    assert_eq!(app.account_ui.logins[0].phase, LoginPhase::Verifying);
+    drop(verification); // No provider verification is executed.
+    let registration = app.update(Message::AccountUi(Action::LoginVerified {
+        key,
+        cleanup: captured,
+        outcome: successful_outcome(),
+    }));
+    assert!(registration.units() > 0);
+    // This fixture has no Store/Homes: polling completes in-memory registry
+    // registration only, and provides the actual reducer completion payload.
+    assert!(app.account_ui.store.is_none());
+    assert!(app.account_ui.homes.is_none());
+    let settled = lifecycle_message(registration).await;
+    let Message::AccountUi(Action::LoginSettled {
+        cleanup, result, ..
+    }) = &settled
+    else {
+        panic!("actual registration completion")
+    };
+    assert!(cleanup.target.is_none());
+    assert!(matches!(result, Ok(Settled::Registered { .. })));
+    let task = app.update(settled);
+    assert_eq!(task.units(), 0);
+    drop(task);
+    assert!(app.account_ui.registry.find(key).is_some());
+    assert!(app.account_ui.logins.is_empty());
 }
