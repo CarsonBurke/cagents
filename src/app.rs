@@ -31146,7 +31146,7 @@ mod tests {
                     if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action
                         && matches!(
                             message,
-                            Message::Repository(RepositoryAction::FileLoadedAt { .. })
+                            Message::Repository(RepositoryAction::FileLoaded { .. })
                                 | Message::SourceControlMutated { .. }
                         )
                     {
