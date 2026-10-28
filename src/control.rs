@@ -1244,7 +1244,17 @@ impl ControlClient {
         &mut self,
         policy: crate::update::impact::Policy,
     ) -> Result<crate::update::impact::DaemonImpact, ControlError> {
-        match self.request_strict(ClientRequest::UpgradeImpact { policy })? {
+        self.upgrade_impact_with_deadline(policy, Instant::now() + Duration::from_secs(30))
+    }
+
+    /// Preview may scan a large owned inventory. Its complete operation has a
+    /// separate budget; individual reads and unsolicited traffic cannot renew it.
+    pub(crate) fn upgrade_impact_with_deadline(
+        &mut self,
+        policy: crate::update::impact::Policy,
+        deadline: Instant,
+    ) -> Result<crate::update::impact::DaemonImpact, ControlError> {
+        match self.request_with_deadline(ClientRequest::UpgradeImpact { policy }, deadline)? {
             ServerResponse::UpgradeImpact(impact) => Ok(impact),
             response => Err(unexpected_response("update impact", &response)),
         }
@@ -6307,6 +6317,166 @@ mod tests {
         assert_eq!(client.stream.write_timeout().unwrap(), Some(IO_TIMEOUT));
         drop(client);
         server.join().unwrap();
+    }
+
+    fn preview_impact(pinned: HostSessionProof) -> crate::update::impact::DaemonImpact {
+        crate::update::impact::DaemonImpact {
+            capability: crate::terminal_ipc::ShutdownCapability {
+                proof: pinned,
+                token: "preview-only".into(),
+                inventory_generation: 1,
+                live_terminals: 0,
+                background_subagents: 0,
+                background_identity: String::new(),
+                expires_at_unix_ms: 1,
+            },
+            policy: crate::update::impact::Policy::WhenIdle,
+            sessions: Vec::new(),
+            blockers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn upgrade_impact_accepts_slow_preview_without_changing_normal_rpc_timeout() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let pinned = proof("session", "boot", "incarnation");
+        let expected = preview_impact(pinned.clone());
+        let response = expected.clone();
+        let server = thread::spawn(move || {
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, pinned.clone(), pinned.clone()),
+            )
+            .unwrap();
+            let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(
+                request.request,
+                ClientRequest::UpgradeImpact {
+                    policy: crate::update::impact::Policy::WhenIdle
+                }
+            );
+            assert_eq!(request.proof, Some(pinned.clone()));
+            // This is deliberately beyond the generic RPC's five-second budget.
+            thread::sleep(IO_TIMEOUT + Duration::from_millis(100));
+            write_frame(
+                &mut server_stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request.request_id),
+                    proof: pinned,
+                    message: ServerMessage::Response {
+                        response: ServerResponse::UpgradeImpact(response),
+                    },
+                },
+            )
+            .unwrap();
+            // A preview never causes a checkpoint, replay or other operation.
+            assert!(
+                read_frame::<ClientEnvelope>(&mut server_stream)
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        assert_eq!(
+            client
+                .upgrade_impact(crate::update::impact::Policy::WhenIdle)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
+        assert_eq!(client.stream.write_timeout().unwrap(), Some(IO_TIMEOUT));
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn upgrade_preview_total_deadline_and_exact_reply_fences_are_preserved() {
+        for case in 0..5 {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let pinned = proof("session", "boot", "incarnation");
+            let server = thread::spawn(move || {
+                let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                write_frame(
+                    &mut server_stream,
+                    &connected_envelope(1, pinned.clone(), pinned.clone()),
+                )
+                .unwrap();
+                let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                let mut envelope = ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request.request_id),
+                    proof: pinned.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::UpgradeImpact(preview_impact(pinned)),
+                    },
+                };
+                match case {
+                    0 => {
+                        // Repeated valid unsolicited traffic cannot renew the operation.
+                        envelope.request_id = None;
+                        envelope.message = ServerMessage::NotificationsChanged;
+                        for _ in 0..50 {
+                            if write_frame(&mut server_stream, &envelope).is_err() {
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                    1 => {
+                        let bytes = postcard::to_stdvec(&envelope).unwrap();
+                        server_stream
+                            .write_all(&(bytes.len() as u32).to_be_bytes())
+                            .unwrap();
+                        for byte in bytes {
+                            if server_stream.write_all(&[byte]).is_err() {
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                    2 => {
+                        envelope.request_id = Some(request.request_id + 1);
+                        let _ = write_frame(&mut server_stream, &envelope);
+                    }
+                    3 => {
+                        envelope.proof.host_incarnation = HostIncarnation::new("replacement");
+                        let _ = write_frame(&mut server_stream, &envelope);
+                    }
+                    _ => return,
+                }
+                // Timing out with unread response bytes can reset a Unix
+                // socket when the client closes it. Inspect the first byte
+                // directly: even an incomplete replay must fail this guard,
+                // rather than being hidden by a frame reader's later reset.
+                let mut replay = [0];
+                match server_stream.read(&mut replay) {
+                    Ok(0) => {}
+                    Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+                    result => panic!("no automatic request replay (case {case}): {result:?}"),
+                }
+            });
+            let mut client = ControlClient::from_stream(client_stream).unwrap();
+            let started = Instant::now();
+            let error = client
+                .upgrade_impact_with_deadline(
+                    crate::update::impact::Policy::WhenIdle,
+                    started + Duration::from_millis(80),
+                )
+                .unwrap_err();
+            match case {
+                0 | 1 => assert!(matches!(error, ControlError::ReplyTimeout { .. })),
+                2 => assert!(matches!(error, ControlError::RequestIdMismatch { .. })),
+                3 => assert!(matches!(error, ControlError::ProofMismatch)),
+                _ => assert!(matches!(error, ControlError::ConnectionClosed)),
+            }
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
+            assert_eq!(client.stream.write_timeout().unwrap(), Some(IO_TIMEOUT));
+            drop(client);
+            server.join().unwrap();
+        }
     }
 
     #[test]
