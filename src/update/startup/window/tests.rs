@@ -51,6 +51,48 @@ fn rendered(
         &mut clipboard::Null,
         &mut messages,
     );
+    if click == Some("Check diagnostics") {
+        use iced::advanced::widget::{Operation, operation};
+        #[derive(Default)]
+        struct BodyViewport(Vec<iced::Rectangle>);
+        impl Operation for BodyViewport {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&iced::advanced::widget::Id>,
+                bounds: iced::Rectangle,
+                _: iced::Rectangle,
+                _: iced::Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                self.0.push(bounds);
+            }
+        }
+        let mut body = BodyViewport::default();
+        ui.operate(&renderer, &mut body);
+        assert_eq!(body.0.len(), 1, "one actual startup body viewport");
+        let point = body.0[0].center();
+        // Diagnostics follows the details in the scrolling body. Reveal it
+        // through ordinary input before querying its current accessible bounds.
+        ui.update(
+            &[
+                iced::Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                iced::Event::Mouse(mouse::Event::WheelScrolled {
+                    delta: mouse::ScrollDelta::Pixels {
+                        x: 0.0,
+                        y: -100_000.0,
+                    },
+                }),
+            ],
+            mouse::Cursor::Available(point),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert!(messages.is_empty(), "scrolling must not invoke an action");
+    }
     ui.draw(
         &mut renderer,
         &cosmic::theme::active(),
