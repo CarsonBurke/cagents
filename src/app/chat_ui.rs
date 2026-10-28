@@ -3201,27 +3201,16 @@ impl Runtime {
                 None
             } else {
                 tokio::task::spawn_blocking(move || {
-                    worker
-                        .lock()
-                        .ok()?
-                        .search_composed(
-                            &inputs,
-                            provider,
-                            &query,
-                            generation,
-                            &current,
-                            &external,
-                            &supplemental,
-                        )
-                        .map(|matches| {
-                            find::Results::with_composed_revisions(
-                                matches,
-                                &inputs,
-                                scope,
-                                &external,
-                                &supplemental,
-                            )
-                        })
+                    find::Worker::search_results(
+                        &worker,
+                        &inputs,
+                        provider,
+                        &query,
+                        scope,
+                        &external,
+                        &supplemental,
+                        || current.load(Ordering::Relaxed) == generation,
+                    )
                 })
                 .await
                 .ok()

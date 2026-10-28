@@ -7,10 +7,36 @@ use std::{
     collections::{HashMap, HashSet},
     ops::Range,
     sync::{
-        Arc, Weak,
+        Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
 };
+
+// Poll every bounded batch of entries, including cache hits and result maps.
+// A finished phase also checks before publishing or moving to an allocation.
+const CANCEL_BATCH: usize = 256;
+struct Cancellation<F> {
+    current: F,
+    visited: usize,
+}
+impl<F: FnMut(usize) -> bool> Cancellation<F> {
+    fn new(current: F) -> Self {
+        Self {
+            current,
+            visited: 0,
+        }
+    }
+    fn check(&mut self) -> Option<()> {
+        (self.current)(self.visited).then_some(())
+    }
+    fn entry(&mut self) -> Option<()> {
+        self.visited = self.visited.wrapping_add(1);
+        if self.visited % CANCEL_BATCH == 0 {
+            self.check()?;
+        }
+        Some(())
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(in crate::app::chat_ui) struct Block {
@@ -55,27 +81,56 @@ impl Index {
         generation: u64,
         current: &AtomicU64,
     ) -> Option<Vec<Match>> {
-        if current.load(Ordering::Relaxed) != generation {
-            return None;
-        }
+        self.search_checked(
+            documents,
+            query,
+            &mut Cancellation::new(|_| current.load(Ordering::Relaxed) == generation),
+        )
+    }
+    fn search_checked(
+        &mut self,
+        documents: &[Document],
+        query: &str,
+        cancel: &mut Cancellation<impl FnMut(usize) -> bool>,
+    ) -> Option<Vec<Match>> {
+        let mut result = Vec::new();
+        self.fill_checked(documents, query, &mut result, cancel)?;
+        Some(result)
+    }
+    fn fill_checked(
+        &mut self,
+        documents: &[Document],
+        query: &str,
+        result: &mut Vec<Match>,
+        cancel: &mut Cancellation<impl FnMut(usize) -> bool>,
+    ) -> Option<()> {
+        cancel.check()?;
         if self.query != query {
             self.query = query.to_owned();
             self.items.clear();
         }
         if query.is_empty() {
             self.items.clear();
-            return Some(Vec::new());
+            return Some(());
         }
-        let present: HashSet<_> = documents
-            .iter()
-            .map(|document| document.item.as_str())
-            .collect();
-        self.items.retain(|item, _| present.contains(item.as_str()));
-        let mut result = Vec::new();
+        let mut present = HashSet::new();
         for document in documents {
-            if current.load(Ordering::Relaxed) != generation {
-                return None;
+            cancel.entry()?;
+            present.insert(document.item.as_str());
+        }
+        let mut removed = Vec::new();
+        for item in self.items.keys() {
+            cancel.entry()?;
+            if !present.contains(item.as_str()) {
+                removed.push(item.clone());
             }
+        }
+        for item in removed {
+            cancel.entry()?;
+            self.items.remove(&item);
+        }
+        for document in documents {
+            cancel.check()?;
             if self
                 .items
                 .get(&document.item)
@@ -85,15 +140,14 @@ impl Index {
                 for block in document.blocks.iter() {
                     let found =
                         super::matched_ranges_cancellable(&block.text, query, usize::MAX, || {
-                            current.load(Ordering::Relaxed) == generation
+                            cancel.check().is_some()
                         })?;
-                    ranges.extend(
-                        found
-                            .ranges
-                            .into_iter()
-                            .map(|range| (block.identity, range)),
-                    );
+                    for range in found.ranges {
+                        cancel.entry()?;
+                        ranges.push((block.identity, range));
+                    }
                 }
+                cancel.check()?;
                 self.items.insert(
                     document.item.clone(),
                     Cached {
@@ -105,6 +159,7 @@ impl Index {
             let turn: Arc<str> = Arc::from(document.turn.as_str());
             let item: Arc<str> = Arc::from(document.item.as_str());
             for (identity, range) in self.items[&document.item].ranges.iter() {
+                cancel.entry()?;
                 result.push(Match {
                     turn: turn.clone(),
                     item: item.clone(),
@@ -113,7 +168,8 @@ impl Index {
                 });
             }
         }
-        (current.load(Ordering::Relaxed) == generation).then_some(result)
+        cancel.check()?;
+        Some(())
     }
 }
 
@@ -256,25 +312,45 @@ pub(in crate::app::chat_ui) struct Paint {
 }
 impl Paint {
     pub fn new(generation: u64, matches: &[Match], current: Option<Match>) -> Self {
+        Self::build(
+            generation,
+            matches,
+            current,
+            &mut Cancellation::new(|_| true),
+        )
+        .expect("uncancelled paint construction")
+    }
+    fn build(
+        generation: u64,
+        matches: &[Match],
+        current: Option<Match>,
+        cancel: &mut Cancellation<impl FnMut(usize) -> bool>,
+    ) -> Option<Self> {
+        cancel.check()?;
         let mut blocks: HashMap<u64, Vec<Range<usize>>> = HashMap::new();
         for found in matches {
+            cancel.entry()?;
             blocks
                 .entry(found.identity)
                 .or_default()
                 .push(found.range.clone());
         }
-        Self {
+        let mut shared: HashMap<u64, Arc<[Range<usize>]>> = HashMap::new();
+        for (identity, ranges) in blocks {
+            cancel.entry()?;
+            // Arc conversion is one allocation; check on both sides without
+            // truncating the exact complete range slice shared by fragments.
+            cancel.check()?;
+            shared.insert(identity, Arc::from(ranges));
+        }
+        cancel.check()?;
+        Some(Self {
             generation,
-            blocks: Arc::new(
-                blocks
-                    .into_iter()
-                    .map(|(key, ranges)| (key, ranges.into()))
-                    .collect(),
-            ),
+            blocks: Arc::new(shared),
             current,
             sources: Default::default(),
             signatures: Default::default(),
-        }
+        })
     }
     /// Byte ranges belong to the exact immutable source parsed by the worker.
     /// A stable item/leaf ID alone is not a rendered-source revision proof.
@@ -346,47 +422,56 @@ pub(in crate::app::chat_ui) struct Results {
 }
 impl Results {
     pub fn new(matches: Vec<Match>) -> Self {
+        Self::build(matches, &mut Cancellation::new(|_| true))
+            .expect("uncancelled result construction")
+    }
+    fn build(
+        matches: Vec<Match>,
+        cancel: &mut Cancellation<impl FnMut(usize) -> bool>,
+    ) -> Option<Self> {
         use std::hash::{Hash, Hasher};
+        cancel.check()?;
         let mut item_signatures: HashMap<Arc<str>, std::hash::DefaultHasher> = HashMap::new();
         for found in &matches {
+            cancel.entry()?;
             (found.identity, found.range.start, found.range.end)
                 .hash(item_signatures.entry(found.item.clone()).or_default());
         }
-        let signatures = Arc::new(
-            item_signatures
-                .into_iter()
-                .map(|(item, hash)| (item, hash.finish()))
-                .collect(),
-        );
-        let blocks = Paint::new(0, &matches, None).blocks;
-        let positions = matches
-            .iter()
-            .enumerate()
-            .map(|(index, found)| {
+        let mut signatures = HashMap::new();
+        for (item, hash) in item_signatures {
+            cancel.entry()?;
+            signatures.insert(item, hash.finish());
+        }
+        let blocks = Paint::build(0, &matches, None, cancel)?.blocks;
+        let mut positions = HashMap::new();
+        let mut turns = HashSet::new();
+        let mut items = HashSet::new();
+        for (index, found) in matches.iter().enumerate() {
+            cancel.entry()?;
+            positions.insert(
                 (
-                    (
-                        found.item.clone(),
-                        found.identity,
-                        found.range.start,
-                        found.range.end,
-                    ),
-                    index,
-                )
-            })
-            .collect();
-        let turns = matches.iter().map(|found| found.turn.clone()).collect();
-        let items = matches.iter().map(|found| found.item.clone()).collect();
-        Self {
+                    found.item.clone(),
+                    found.identity,
+                    found.range.start,
+                    found.range.end,
+                ),
+                index,
+            );
+            turns.insert(found.turn.clone());
+            items.insert(found.item.clone());
+        }
+        cancel.check()?;
+        Some(Self {
             matches: Arc::new(matches),
             blocks,
             positions,
             revisions: HashMap::new(),
             sources: Default::default(),
-            signatures,
+            signatures: Arc::new(signatures),
             turns: Arc::new(turns),
             items: Arc::new(items),
             scope: 0,
-        }
+        })
     }
     pub fn with_revisions(matches: Vec<Match>, inputs: &[Input], scope: u64) -> Self {
         Self::with_external_revisions(matches, inputs, scope, &HashMap::new())
@@ -406,37 +491,49 @@ impl Results {
         external: &HashMap<String, Arc<External>>,
         supplemental: &HashMap<String, Arc<External>>,
     ) -> Self {
-        let mut result = Self::new(matches);
-        let matched: HashSet<_> = result
-            .matches
-            .iter()
-            .map(|found| found.item.as_ref())
-            .collect();
-        result.revisions = inputs
-            .iter()
-            .filter(|input| matched.contains(input.item.id.as_str()))
-            .map(|input| (input.item.id.clone(), input.revision))
-            .collect();
+        Self::build_composed(
+            matches,
+            inputs,
+            scope,
+            external,
+            supplemental,
+            &mut Cancellation::new(|_| true),
+        )
+        .expect("uncancelled source proof construction")
+    }
+    fn build_composed(
+        matches: Vec<Match>,
+        inputs: &[Input],
+        scope: u64,
+        external: &HashMap<String, Arc<External>>,
+        supplemental: &HashMap<String, Arc<External>>,
+        cancel: &mut Cancellation<impl FnMut(usize) -> bool>,
+    ) -> Option<Self> {
+        let mut result = Self::build(matches, cancel)?;
+        let mut sources = HashMap::new();
         // Negative results need source proofs too: a previously unmatched
         // item may have changed while the worker was running.
-        result.sources = Arc::new(
-            inputs
-                .iter()
-                .map(|input| {
-                    (
-                        input.item.id.clone(),
-                        SourceProof {
-                            item: Arc::downgrade(&input.item),
-                            growing: input.growing,
-                            external: external.get(&input.item.id).map(Arc::downgrade),
-                            supplemental: supplemental.get(&input.item.id).map(Arc::downgrade),
-                        },
-                    )
-                })
-                .collect(),
-        );
+        for input in inputs {
+            cancel.entry()?;
+            if result.items.contains(input.item.id.as_str()) {
+                result
+                    .revisions
+                    .insert(input.item.id.clone(), input.revision);
+            }
+            sources.insert(
+                input.item.id.clone(),
+                SourceProof {
+                    item: Arc::downgrade(&input.item),
+                    growing: input.growing,
+                    external: external.get(&input.item.id).map(Arc::downgrade),
+                    supplemental: supplemental.get(&input.item.id).map(Arc::downgrade),
+                },
+            );
+        }
+        cancel.check()?;
+        result.sources = Arc::new(sources);
         result.scope = scope;
-        result
+        Some(result)
     }
     pub fn position(&self, found: &Match) -> Option<usize> {
         self.positions
@@ -533,13 +630,118 @@ impl Worker {
         external: &HashMap<String, Arc<External>>,
         supplemental: &HashMap<String, Arc<External>>,
     ) -> Option<Vec<Match>> {
-        let present: HashSet<_> = inputs.iter().map(|input| input.item.id.as_str()).collect();
-        self.documents.retain(|id, _| present.contains(id.as_str()));
+        self.search_composed_checked(
+            inputs,
+            provider,
+            query,
+            external,
+            supplemental,
+            &mut Cancellation::new(|_| current.load(Ordering::Relaxed) == generation),
+        )
+    }
+    /// The mutex owns mutable caches only. Result materialization can be large
+    /// and must neither hold it nor finish after its generation was cancelled.
+    pub fn search_results(
+        worker: &Mutex<Self>,
+        inputs: &[Input],
+        provider: crate::agent::Provider,
+        query: &str,
+        scope: u64,
+        external: &HashMap<String, Arc<External>>,
+        supplemental: &HashMap<String, Arc<External>>,
+        mut current: impl FnMut() -> bool,
+    ) -> Option<Results> {
+        let mut cancel = Cancellation::new(|_| current());
+        cancel.check()?;
+        // Keep even a cancelled partial output outside the cache lock: dropping
+        // its per-match Arc references can be as costly as constructing them.
+        let mut matches = Vec::new();
+        Self::fill_matches(
+            worker,
+            inputs,
+            provider,
+            query,
+            external,
+            supplemental,
+            &mut matches,
+            &mut cancel,
+        )?;
+        Results::build_composed(matches, inputs, scope, external, supplemental, &mut cancel)
+    }
+    /// Only the status crosses the lock boundary. The caller owns the partial
+    /// output until after this returns, including when filling is cancelled.
+    fn fill_matches(
+        worker: &Mutex<Self>,
+        inputs: &[Input],
+        provider: crate::agent::Provider,
+        query: &str,
+        external: &HashMap<String, Arc<External>>,
+        supplemental: &HashMap<String, Arc<External>>,
+        matches: &mut Vec<Match>,
+        cancel: &mut Cancellation<impl FnMut(usize) -> bool>,
+    ) -> Option<()> {
+        let mut worker = worker.lock().ok()?;
+        worker.fill_composed_checked(
+            inputs,
+            provider,
+            query,
+            external,
+            supplemental,
+            matches,
+            cancel,
+        )
+    }
+    fn search_composed_checked(
+        &mut self,
+        inputs: &[Input],
+        provider: crate::agent::Provider,
+        query: &str,
+        external: &HashMap<String, Arc<External>>,
+        supplemental: &HashMap<String, Arc<External>>,
+        cancel: &mut Cancellation<impl FnMut(usize) -> bool>,
+    ) -> Option<Vec<Match>> {
+        let mut matches = Vec::new();
+        self.fill_composed_checked(
+            inputs,
+            provider,
+            query,
+            external,
+            supplemental,
+            &mut matches,
+            cancel,
+        )?;
+        Some(matches)
+    }
+    fn fill_composed_checked(
+        &mut self,
+        inputs: &[Input],
+        provider: crate::agent::Provider,
+        query: &str,
+        external: &HashMap<String, Arc<External>>,
+        supplemental: &HashMap<String, Arc<External>>,
+        matches: &mut Vec<Match>,
+        cancel: &mut Cancellation<impl FnMut(usize) -> bool>,
+    ) -> Option<()> {
+        cancel.check()?;
+        let mut present = HashSet::new();
+        for input in inputs {
+            cancel.entry()?;
+            present.insert(input.item.id.as_str());
+        }
+        let mut removed = Vec::new();
+        for id in self.documents.keys() {
+            cancel.entry()?;
+            if !present.contains(id.as_str()) {
+                removed.push(id.clone());
+            }
+        }
+        for id in removed {
+            cancel.entry()?;
+            self.documents.remove(&id);
+        }
         let mut documents = Vec::with_capacity(inputs.len());
         for input in inputs {
-            if current.load(Ordering::Relaxed) != generation {
-                return None;
-            }
+            cancel.check()?;
             let extra = external.get(&input.item.id);
             let prefix = supplemental.get(&input.item.id);
             if extra
@@ -580,12 +782,13 @@ impl Worker {
                     },
                 );
                 if let Some(prefix) = prefix {
-                    parsed.blocks = prefix
-                        .blocks
-                        .iter()
-                        .chain(parsed.blocks.iter())
-                        .cloned()
-                        .collect();
+                    let mut blocks = Vec::new();
+                    for block in prefix.blocks.iter().chain(parsed.blocks.iter()) {
+                        cancel.entry()?;
+                        blocks.push(block.clone());
+                    }
+                    cancel.check()?;
+                    parsed.blocks = blocks.into();
                 }
                 parsed.revision = self.document_revision;
                 self.documents.insert(
@@ -604,7 +807,7 @@ impl Worker {
             document.turn.clone_from(&input.turn);
             documents.push(document);
         }
-        self.index.search(&documents, query, generation, current)
+        self.index.fill_checked(&documents, query, matches, cancel)
     }
 }
 fn document(input: &Input, provider: crate::agent::Provider) -> Document {
@@ -1358,5 +1561,377 @@ mod external_tests {
                 .upgrade()
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use crate::{
+        agent::Provider,
+        chat::{CommandAction, Item, ItemContent, Role, ToolStatus},
+    };
+    use std::{cell::Cell, sync::mpsc, thread, time::Duration};
+
+    const UNIT: &str = "é Straße İ ﬃ ";
+    const OCCURRENCES: usize = super::super::HIGHLIGHT_LIMIT + 4;
+
+    fn input(id: &str, output: String) -> Input {
+        Input {
+            item: Arc::new(Item {
+                id: id.into(),
+                role: Role::Assistant,
+                content: ItemContent::Command {
+                    command: "true".into(),
+                    label: "true".into(),
+                    working_directory: String::new(),
+                    output,
+                    action: CommandAction::Run,
+                    status: ToolStatus::Running,
+                    exit_code: None,
+                    duration_ms: None,
+                },
+                started_at: None,
+                at: None,
+            }),
+            revision: 7,
+            turn: "turn".into(),
+            growing: true,
+        }
+    }
+    fn inputs() -> Vec<Input> {
+        vec![
+            input("hits", UNIT.repeat(OCCURRENCES)),
+            input("negative", "no matching output".into()),
+        ]
+    }
+    fn owner(item: &str, identity: u64, text: &str) -> Arc<External> {
+        Arc::new(External {
+            item: item.into(),
+            revision: 8,
+            blocks: vec![Block {
+                identity,
+                text: Arc::from(text),
+            }]
+            .into(),
+        })
+    }
+
+    #[test]
+    fn warm_cached_occurrences_cancel_within_two_batches_without_losing_valid_ranges() {
+        let inputs = inputs();
+        let worker = Mutex::new(Worker::default());
+        let external = HashMap::from([(
+            "negative".into(),
+            owner("negative", 90, "authoritative empty result"),
+        )]);
+        let supplemental = HashMap::from([(
+            "negative".into(),
+            owner("negative", 91, "original empty result"),
+        )]);
+        let warm = Worker::search_results(
+            &worker,
+            &inputs,
+            Provider::Claude,
+            "STRASSE",
+            13,
+            &external,
+            &supplemental,
+            || true,
+        )
+        .unwrap();
+        assert_eq!(
+            warm.matches.len(),
+            OCCURRENCES,
+            "discovery is never truncated to the paint budget"
+        );
+        let cached = {
+            let mut worker = worker.lock().unwrap();
+            let cached = worker.index.items["hits"].ranges.clone();
+            let documents = [worker.documents["hits"].document.clone()];
+            let mut cancel = Cancellation::new(|visited| visited < CANCEL_BATCH * 2);
+            assert!(
+                worker
+                    .index
+                    .search_checked(&documents, "STRASSE", &mut cancel)
+                    .is_none()
+            );
+            assert_eq!(
+                cancel.visited,
+                CANCEL_BATCH * 2,
+                "stop in cached expansion, not only after all hits were cloned"
+            );
+            assert!(Arc::ptr_eq(&cached, &worker.index.items["hits"].ranges));
+            cached
+        };
+        let complete = Worker::search_results(
+            &worker,
+            &inputs,
+            Provider::Claude,
+            "STRASSE",
+            13,
+            &external,
+            &supplemental,
+            || true,
+        )
+        .unwrap();
+        assert_eq!(complete.matches.as_ref(), warm.matches.as_ref());
+        assert!(Arc::ptr_eq(
+            &cached,
+            &worker.lock().unwrap().index.items["hits"].ranges
+        ));
+        for (index, found) in complete.matches.iter().enumerate() {
+            assert_eq!(found.range, index * UNIT.len() + 3..index * UNIT.len() + 10);
+            assert_eq!(complete.position(found), Some(index));
+            assert_eq!(complete.blocks[&found.identity][index], found.range);
+        }
+        assert_eq!(complete.scope, 13);
+        assert_eq!(
+            complete.sources.len(),
+            2,
+            "negative documents retain their exact source proofs"
+        );
+        assert!(complete.sources["negative"].matches_external(external.get("negative")));
+        assert!(complete.sources["negative"].matches_supplemental(supplemental.get("negative")));
+        assert!(Arc::ptr_eq(
+            &complete.sources["hits"].item.upgrade().unwrap(),
+            &inputs[0].item
+        ));
+        assert!(complete.sources["hits"].growing);
+        assert!(!complete.revisions.contains_key("negative"));
+        // U+0130 is two source bytes and folds to three UTF-8 bytes. The
+        // second query still uses original source offsets, not folded offsets.
+        let dotted = Worker::search_results(
+            &worker,
+            &inputs,
+            Provider::Claude,
+            "i\u{307}",
+            13,
+            &external,
+            &supplemental,
+            || true,
+        )
+        .unwrap();
+        assert_eq!(dotted.matches.len(), OCCURRENCES);
+        let start = UNIT.find('İ').unwrap();
+        for (index, found) in dotted.matches.iter().enumerate() {
+            assert_eq!(
+                found.range,
+                index * UNIT.len() + start..index * UNIT.len() + start + 'İ'.len_utf8()
+            );
+        }
+    }
+
+    #[test]
+    fn late_cancelled_partial_output_keeps_its_owners_until_after_worker_unlock() {
+        let inputs = inputs();
+        let worker = Mutex::new(Worker::default());
+        let empty = HashMap::new();
+        let warm = Worker::search_results(
+            &worker,
+            &inputs,
+            Provider::Claude,
+            "STRASSE",
+            1,
+            &empty,
+            &empty,
+            || true,
+        )
+        .unwrap();
+        assert_eq!(warm.matches.len(), OCCURRENCES);
+        drop(warm);
+
+        // Use the same locked filling boundary as search_results. Cancel late
+        // in warm expansion, with most of the per-hit Arc owners accumulated.
+        let cutoff = CANCEL_BATCH * 14;
+        let cancelled_under_lock = Cell::new(false);
+        let mut cancel = Cancellation::new(|visited| {
+            if visited >= cutoff {
+                cancelled_under_lock.set(worker.try_lock().is_err());
+                false
+            } else {
+                true
+            }
+        });
+        let mut partial = Vec::new();
+        assert!(
+            Worker::fill_matches(
+                &worker,
+                &inputs,
+                Provider::Claude,
+                "STRASSE",
+                &empty,
+                &empty,
+                &mut partial,
+                &mut cancel,
+            )
+            .is_none()
+        );
+        assert_eq!(cancel.visited, cutoff);
+        assert!(cancelled_under_lock.get());
+        assert!(partial.len() >= CANCEL_BATCH * 13 && partial.len() < OCCURRENCES);
+        let item = Arc::downgrade(&partial[0].item);
+        let turn = Arc::downgrade(&partial[0].turn);
+        assert_eq!(item.strong_count(), partial.len());
+        assert_eq!(turn.strong_count(), partial.len());
+        assert!(
+            worker.try_lock().is_ok(),
+            "the cache lock must already be free while every partial-output owner is still alive"
+        );
+        let fresh = Worker::search_results(
+            &worker,
+            &inputs,
+            Provider::Claude,
+            "absent",
+            2,
+            &empty,
+            &empty,
+            || true,
+        )
+        .unwrap();
+        assert!(fresh.matches.is_empty());
+        assert_eq!(fresh.sources.len(), inputs.len());
+        assert_eq!(item.strong_count(), partial.len());
+        assert_eq!(turn.strong_count(), partial.len());
+        drop(partial);
+        assert!(item.upgrade().is_none() && turn.upgrade().is_none());
+    }
+
+    #[test]
+    fn result_and_paint_materialization_cancel_in_each_bounded_map_phase() {
+        let inputs = inputs();
+        let worker = Mutex::new(Worker::default());
+        let empty = HashMap::new();
+        let warm = Worker::search_results(
+            &worker,
+            &inputs,
+            Provider::Claude,
+            "STRASSE",
+            1,
+            &empty,
+            &empty,
+            || true,
+        )
+        .unwrap();
+        let mut complete = Cancellation::new(|_| true);
+        let accepted = Results::build_composed(
+            warm.matches.as_ref().clone(),
+            &inputs,
+            1,
+            &empty,
+            &empty,
+            &mut complete,
+        )
+        .unwrap();
+        assert_eq!(accepted.matches.len(), OCCURRENCES);
+        // Exercise the actual constructor with cancellation at every batch,
+        // including later phases after hashing and grouping have completed.
+        for cutoff in (CANCEL_BATCH..=complete.visited).step_by(CANCEL_BATCH) {
+            let mut cancel = Cancellation::new(|visited| visited < cutoff);
+            assert!(
+                Results::build_composed(
+                    warm.matches.as_ref().clone(),
+                    &inputs,
+                    1,
+                    &empty,
+                    &empty,
+                    &mut cancel
+                )
+                .is_none()
+            );
+            assert_eq!(cancel.visited, cutoff);
+        }
+        let mut cancel = Cancellation::new(|visited| visited < CANCEL_BATCH * 2);
+        assert!(Paint::build(1, &warm.matches, None, &mut cancel).is_none());
+        assert_eq!(cancel.visited, CANCEL_BATCH * 2);
+        // A query with no hits must still poll while constructing proofs for
+        // many negative documents; the hit loops cannot provide these checks.
+        let negative = (0..CANCEL_BATCH * 3)
+            .map(|index| input(&format!("negative-{index}"), String::new()))
+            .collect::<Vec<_>>();
+        let mut cancel = Cancellation::new(|visited| visited < CANCEL_BATCH * 2);
+        assert!(
+            Results::build_composed(Vec::new(), &negative, 2, &empty, &empty, &mut cancel)
+                .is_none()
+        );
+        assert_eq!(cancel.visited, CANCEL_BATCH * 2);
+    }
+
+    #[test]
+    fn production_result_builder_releases_worker_before_it_waits_or_is_cancelled() {
+        let inputs = Arc::new(inputs());
+        let worker = Arc::new(Mutex::new(Worker::default()));
+        let current = Arc::new(AtomicU64::new(1));
+        let empty = HashMap::new();
+        Worker::search_results(
+            &worker,
+            &inputs,
+            Provider::Claude,
+            "STRASSE",
+            1,
+            &empty,
+            &empty,
+            || true,
+        )
+        .unwrap();
+        let (entered, waiting) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let search_worker = worker.clone();
+        let probe = worker.clone();
+        let search_inputs = inputs.clone();
+        let search_generation = current.clone();
+        let job = thread::spawn(move || {
+            let saw_locked_worker = Cell::new(false);
+            let mut paused = false;
+            Worker::search_results(
+                &search_worker,
+                &search_inputs,
+                Provider::Claude,
+                "STRASSE",
+                1,
+                &HashMap::new(),
+                &HashMap::new(),
+                || {
+                    let worker_locked = probe.try_lock().is_err();
+                    if worker_locked {
+                        saw_locked_worker.set(true);
+                    } else if saw_locked_worker.get() && !paused {
+                        paused = true;
+                        let _ = entered.send(());
+                        if released.recv_timeout(Duration::from_secs(2)).is_err() {
+                            return false;
+                        }
+                    }
+                    search_generation.load(Ordering::Relaxed) == 1
+                },
+            )
+        });
+        let entered = waiting.recv_timeout(Duration::from_secs(2)).is_ok();
+        let unlocked = entered && worker.try_lock().is_ok();
+        current.store(2, Ordering::Relaxed);
+        let fresh = unlocked.then(|| {
+            Worker::search_results(
+                &worker,
+                &inputs,
+                Provider::Claude,
+                "absent",
+                2,
+                &empty,
+                &empty,
+                || current.load(Ordering::Relaxed) == 2,
+            )
+        });
+        // Always release/join before assertions, including a failed lock proof.
+        let _ = release.send(());
+        let obsolete = job.join().unwrap();
+        assert!(
+            entered && unlocked,
+            "a real result-construction checkpoint must run outside the worker mutex"
+        );
+        assert!(obsolete.is_none(), "superseded results cannot reach the UI");
+        let fresh = fresh.unwrap().unwrap();
+        assert!(fresh.matches.is_empty());
+        assert_eq!(fresh.sources.len(), 2);
+        assert_eq!(fresh.scope, 2);
     }
 }
