@@ -21,6 +21,98 @@ use crate::workspace_model::{
 /// cannot miss anything by being late.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
+/// Local correlation travels with the queued edit, never over the daemon wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReopenOrigin {
+    nonce: uuid::Uuid,
+    registry: uuid::Uuid,
+    host: Option<crate::model::HostSessionProof>,
+    project: ProjectId,
+    repository: PathBuf,
+    inventory_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct QueuedEdit {
+    pub(super) edit: ModelEdit,
+    pub(super) reopen: Option<ReopenOrigin>,
+    destination: Option<crate::model::HostSessionProof>,
+}
+
+impl From<ModelEdit> for QueuedEdit {
+    fn from(edit: ModelEdit) -> Self {
+        Self {
+            edit,
+            reopen: None,
+            destination: None,
+        }
+    }
+}
+
+struct ReopenAcknowledgement {
+    origin: ReopenOrigin,
+    registry: uuid::Uuid,
+    host: crate::model::HostSessionProof,
+    sequence: u64,
+}
+
+#[derive(Default)]
+pub(super) struct ReopenTracking {
+    active: HashMap<ProjectId, ReopenOrigin>,
+    deferred: HashMap<ProjectId, ReopenAcknowledgement>,
+    queued: HashSet<ProjectId>,
+    retryable: HashSet<ProjectId>,
+}
+
+impl ReopenTracking {
+    pub(super) fn invalidate(&mut self, project: ProjectId) {
+        self.active.remove(&project);
+        self.deferred.remove(&project);
+        self.queued.remove(&project);
+        self.retryable.remove(&project);
+    }
+
+    pub(super) fn begin(
+        &mut self,
+        project: ProjectId,
+        repository: PathBuf,
+        registry: uuid::Uuid,
+        host: Option<crate::model::HostSessionProof>,
+        inventory_generation: Option<u64>,
+    ) {
+        self.invalidate(project);
+        self.active.insert(
+            project,
+            ReopenOrigin {
+                nonce: uuid::Uuid::new_v4(),
+                registry,
+                host,
+                project,
+                repository,
+                inventory_generation,
+            },
+        );
+    }
+
+    pub(super) fn remap(&mut self, previous: ProjectId, project: ProjectId) {
+        let origin = self.active.get(&previous).cloned();
+        self.invalidate(previous);
+        self.invalidate(project);
+        if let Some(mut origin) = origin {
+            origin.project = project;
+            self.active.insert(project, origin);
+        }
+    }
+
+    pub(super) fn can_retry(&self, repository: &Path) -> bool {
+        self.active.values().any(|origin| {
+            origin.repository == repository
+                && (self.retryable.contains(&origin.project)
+                    || self.deferred.contains_key(&origin.project))
+        })
+    }
+}
+
 /// What the daemon threads hand the window.
 #[derive(Debug, Clone)]
 pub enum ModelUpdate {
@@ -30,16 +122,23 @@ pub enum ModelUpdate {
     /// why it is distinct from [`ModelUpdate::Read`]: it is where the window
     /// compares the registry's identity against the one it recorded and decides
     /// whether anything it holds has ever been shared with this registry.
-    Connected(WorkspaceModel),
+    Connected {
+        model: WorkspaceModel,
+        proof: crate::model::HostSessionProof,
+    },
     /// A fresh read, taken because an edge does not carry the ranks it changed.
     Read(WorkspaceModel),
     Reopened {
         repository: PathBuf,
         model: WorkspaceModel,
+        origin: Option<ReopenOrigin>,
+        destination: Option<crate::model::HostSessionProof>,
     },
     ReopenFailed {
         repository: PathBuf,
         error: String,
+        origin: Option<ReopenOrigin>,
+        destination: Option<crate::model::HostSessionProof>,
     },
     Edited {
         sequence: u64,
@@ -83,6 +182,20 @@ pub enum ModelUpdate {
     },
 }
 
+#[cfg(test)]
+impl ModelUpdate {
+    pub(super) fn connected_fixture(model: WorkspaceModel) -> Self {
+        Self::Connected {
+            proof: crate::model::HostSessionProof {
+                host_session_id: "workspace-model-test".into(),
+                boot_id: "workspace-model-test-boot".into(),
+                host_incarnation: model.identity.to_string().into(),
+            },
+            model,
+        }
+    }
+}
+
 /// Watches the daemon for shared-model edges.
 pub(super) fn observe_workspace_model(sender: async_channel::Sender<ModelUpdate>) {
     let observer = std::thread::Builder::new()
@@ -116,7 +229,10 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
         .watch_workspace_model()
         .map_err(|error| error.to_string())?;
     sender
-        .send_blocking(ModelUpdate::Connected(model))
+        .send_blocking(ModelUpdate::Connected {
+            model,
+            proof: client.proof().clone(),
+        })
         .map_err(|error| error.to_string())?;
     loop {
         let (sequence, edit) = client
@@ -166,7 +282,7 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
 /// Publishes this window's shared-model mutations.
 pub(super) fn publish_workspace_model(
     updates: async_channel::Sender<ModelUpdate>,
-    requests: async_channel::Receiver<ModelEdit>,
+    requests: async_channel::Receiver<QueuedEdit>,
 ) {
     let publisher = std::thread::Builder::new()
         .name("cagents-workspace-model-publisher".into())
@@ -190,8 +306,8 @@ pub(super) fn publish_workspace_model(
 
 fn publish(
     updates: &async_channel::Sender<ModelUpdate>,
-    requests: &async_channel::Receiver<ModelEdit>,
-    pending: &mut Option<ModelEdit>,
+    requests: &async_channel::Receiver<QueuedEdit>,
+    pending: &mut Option<QueuedEdit>,
 ) -> Result<(), String> {
     // Unlike the observer, the publisher starts a daemon: a channel the user
     // just created has to reach the registry, and there is no registry without
@@ -199,7 +315,7 @@ fn publish(
     let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
     let mut client = ControlClient::connect(&socket).map_err(|error| error.to_string())?;
     loop {
-        let request = match pending.take() {
+        let mut request = match pending.take() {
             Some(request) => request,
             None => requests
                 .recv_blocking()
@@ -208,9 +324,10 @@ fn publish(
         // Retained until it is sent, so a daemon replaced mid-publish costs a
         // reconnection rather than the edit.
         *pending = Some(request.clone());
-        match send(&mut client, request.clone(), updates) {
+        match send_queued(&mut client, &mut request, updates) {
             Ok(()) => *pending = None,
             Err(error) => {
+                *pending = Some(request.clone());
                 // A refusal is final: the registry rejected the edit itself, so
                 // resending it to a fresh connection would be refused
                 // identically and retrying would never stop.
@@ -223,13 +340,13 @@ fn publish(
                 ) {
                     *pending = None;
                     if matches!(
-                        &request,
+                        &request.edit,
                         ModelEdit::ReorderNavigation { .. } | ModelEdit::ResetNavigation { .. }
                     ) {
                         let _ =
                             updates.send_blocking(ModelUpdate::NavigationFailed(error.to_string()));
                     }
-                    if matches!(&request, ModelEdit::SuggestConversationTitle { .. })
+                    if matches!(&request.edit, ModelEdit::SuggestConversationTitle { .. })
                         && let Ok(model) = client.read_workspace_model()
                     {
                         // A refused suggestion is not replayed against a newer
@@ -238,7 +355,7 @@ fn publish(
                     }
                     if let ModelEdit::ChangeView {
                         scope, operation, ..
-                    } = &request
+                    } = &request.edit
                     {
                         let _ = updates.send_blocking(ModelUpdate::ViewRefused {
                             scope: scope.clone(),
@@ -246,11 +363,8 @@ fn publish(
                             error: error.to_string(),
                         });
                     }
-                    if let ModelEdit::ReopenProject { repository, .. } = request {
-                        let _ = updates.send_blocking(ModelUpdate::ReopenFailed {
-                            repository,
-                            error: error.to_string(),
-                        });
+                    if let Some(update) = reopen_refusal(&request, &error) {
+                        let _ = updates.send_blocking(update);
                     }
                 }
                 return Err(error.to_string());
@@ -259,11 +373,61 @@ fn publish(
     }
 }
 
-fn send(
+fn reopen_refusal(request: &QueuedEdit, error: &ControlError) -> Option<ModelUpdate> {
+    let ModelEdit::ReopenProject { repository, .. } = &request.edit else {
+        return None;
+    };
+    Some(ModelUpdate::ReopenFailed {
+        repository: repository.clone(),
+        error: error.to_string(),
+        origin: request.reopen.clone(),
+        destination: request.destination.clone(),
+    })
+}
+
+fn send_queued(
     client: &mut ControlClient,
-    edit: ModelEdit,
+    request: &mut QueuedEdit,
     updates: &async_channel::Sender<ModelUpdate>,
 ) -> Result<(), ControlError> {
+    if matches!(request.edit, ModelEdit::ReopenProject { .. }) {
+        let refused = || {
+            ControlError::Remote {
+            code: crate::terminal::ipc::ProtocolErrorCode::InvalidRequest,
+            message: "The workspace connection changed before reopening. Open the project again to retry.".into(),
+            retryable: false,
+        }
+        };
+        let origin = request.reopen.as_ref().ok_or_else(refused)?;
+        if !client.proof().is_complete()
+            || (origin.registry != NO_REGISTRY && origin.host.is_none())
+            || origin
+                .host
+                .as_ref()
+                .is_some_and(|host| host != client.proof())
+        {
+            return Err(refused());
+        }
+        if request.destination.is_none() {
+            request.destination = origin.host.clone().or_else(|| Some(client.proof().clone()));
+        }
+        if request.destination.as_ref() != Some(client.proof()) {
+            return Err(refused());
+        }
+    }
+    send(client, request.clone(), updates)
+}
+
+fn send(
+    client: &mut ControlClient,
+    queued: impl Into<QueuedEdit>,
+    updates: &async_channel::Sender<ModelUpdate>,
+) -> Result<(), ControlError> {
+    let QueuedEdit {
+        edit,
+        reopen,
+        destination,
+    } = queued.into();
     let reordered = matches!(
         &edit,
         ModelEdit::ReorderNavigation { .. } | ModelEdit::ResetNavigation { .. }
@@ -382,7 +546,12 @@ fn send(
         let _ = updates.send_blocking(ModelUpdate::Read(model.clone()));
     }
     if let Some(repository) = reopened {
-        let _ = updates.send_blocking(ModelUpdate::Reopened { repository, model });
+        let _ = updates.send_blocking(ModelUpdate::Reopened {
+            repository,
+            model,
+            origin: reopen,
+            destination,
+        });
     }
     Ok(())
 }
@@ -424,6 +593,227 @@ enum Adoption {
 }
 
 impl Cagents {
+    fn live_reopen_intent(&self, origin: &ReopenOrigin) -> bool {
+        self.workspace_model_reopens.active.get(&origin.project) == Some(origin)
+            && self.project_ui.reopening.get(&origin.project) == Some(&origin.repository)
+            && !self.project_ui.closed.contains(&origin.repository)
+            && self.sidebar_model.project(origin.project).map_or_else(
+                // A new picker has no row until its inventory read completes.
+                || {
+                    !self
+                        .workspace_model_reopens
+                        .queued
+                        .contains(&origin.project)
+                },
+                |project| project.repository == origin.repository,
+            )
+    }
+
+    pub(super) fn invalidate_reopen_inventory(&mut self, project: ProjectId) {
+        let Some(generation) = self
+            .workspace_model_reopens
+            .active
+            .get(&project)
+            .and_then(|origin| origin.inventory_generation)
+        else {
+            return;
+        };
+        if self.repository_generations.get(&project) == Some(&generation) {
+            self.repository_generations.remove(&project);
+            if let Some(cancel) = self.refresh_ui.projects.remove(&project) {
+                cancel.cancel();
+            }
+            if let Some(row) = self
+                .sidebar_model
+                .projects
+                .iter_mut()
+                .find(|row| row.id == project)
+            {
+                row.reloading = false;
+            }
+            if let Some(cancel) = self.repository_pr_cancellations.remove(&project) {
+                cancel.cancel();
+            }
+        }
+    }
+
+    pub(super) fn inventory_failed_reopen(&mut self, project: ProjectId) {
+        let Some(origin) = self.workspace_model_reopens.active.get(&project) else {
+            return;
+        };
+        if self.project_ui.reopening.get(&project) == Some(&origin.repository)
+            && !self.workspace_model_reopens.queued.contains(&project)
+        {
+            // An inventory failure is not acknowledgement of a close. Keep
+            // local work protected, but let a fresh explicit picker retry an
+            // attempt that has not admitted any physical publication.
+            self.workspace_model_reopens.retryable.insert(project);
+            self.invalidate_reopen_inventory(project);
+        }
+    }
+
+    fn current_reopen(&self, origin: &ReopenOrigin) -> bool {
+        self.live_reopen_intent(origin)
+            && self
+                .sidebar_model
+                .project(origin.project)
+                .is_some_and(|project| project.repository == origin.repository)
+    }
+
+    fn capture_reopen_origin(
+        &mut self,
+        edit: &ModelEdit,
+        registry: uuid::Uuid,
+    ) -> Option<ReopenOrigin> {
+        let ModelEdit::ReopenProject { repository, .. } = edit else {
+            return None;
+        };
+        let project = self.project_ui.reopening.iter().find_map(|(id, path)| {
+            (path == repository
+                && self
+                    .sidebar_model
+                    .project(*id)
+                    .is_some_and(|project| project.repository == *repository))
+            .then_some(*id)
+        })?;
+        // Passive repository refreshes publish through this same path. They
+        // retain the explicit picker's nonce rather than minting a new intent.
+        let origin = self.workspace_model_reopens.active.get(&project)?;
+        if origin.repository != *repository
+            || (origin.registry != NO_REGISTRY && origin.registry != registry)
+        {
+            return None;
+        }
+        Some(origin.clone())
+    }
+
+    fn defer_reopen_acknowledgement(
+        &mut self,
+        repository: &Path,
+        model: &WorkspaceModel,
+        origin: Option<&ReopenOrigin>,
+        destination: Option<&crate::model::HostSessionProof>,
+    ) {
+        if let Some(origin) = origin
+            && origin.repository == repository
+            && self.current_reopen(origin)
+            && !self
+                .workspace_model_reopens
+                .retryable
+                .contains(&origin.project)
+            && model.identity != NO_REGISTRY
+            && model.project(repository).is_some()
+            && let Some(destination) = destination
+            && destination.is_complete()
+            && origin.host.as_ref().is_none_or(|host| host == destination)
+        {
+            self.workspace_model_reopens.deferred.insert(
+                origin.project,
+                ReopenAcknowledgement {
+                    origin: origin.clone(),
+                    registry: model.identity,
+                    host: destination.clone(),
+                    sequence: model.sequence,
+                },
+            );
+        }
+    }
+
+    fn settle_reopen_acknowledgements(&mut self, connected: Option<uuid::Uuid>) -> bool {
+        let obsolete: Vec<_> = self
+            .workspace_model_reopens
+            .active
+            .values()
+            .filter(|origin| !self.live_reopen_intent(origin))
+            .map(|origin| origin.project)
+            .collect();
+        for project in obsolete {
+            if self
+                .workspace_model_reopens
+                .active
+                .get(&project)
+                .is_some_and(|origin| {
+                    self.project_ui.reopening.get(&project) == Some(&origin.repository)
+                })
+            {
+                self.workspace_model_reopens.deferred.remove(&project);
+                self.workspace_model_reopens.retryable.insert(project);
+                self.invalidate_reopen_inventory(project);
+            } else {
+                self.workspace_model_reopens.invalidate(project);
+            }
+        }
+        if let Some(registry) = connected {
+            let stale =
+                self.workspace_model_reopens
+                    .active
+                    .values()
+                    .filter(|origin| {
+                        (origin.registry != NO_REGISTRY && origin.registry != registry)
+                            || origin.host.as_ref().is_some_and(|host| {
+                                self.workspace_model_source.as_ref() != Some(host)
+                            })
+                    })
+                    .filter(|origin| self.live_reopen_intent(origin))
+                    .map(|origin| origin.project)
+                    .collect::<Vec<_>>();
+            for project in stale {
+                self.workspace_model_reopens.deferred.remove(&project);
+                self.workspace_model_reopens.retryable.insert(project);
+                self.invalidate_reopen_inventory(project);
+                self.status = Some(TransientNotice::warning(
+                    "Project reopening was interrupted by a connection change. Open the project again to retry.",
+                ));
+            }
+        }
+        let completed: Vec<_> = self
+            .workspace_model_reopens
+            .deferred
+            .iter()
+            .filter(|(_, ack)| self.current_reopen(&ack.origin))
+            .filter_map(|(project, ack)| {
+                let confirmed = self.workspace_model.identity == ack.registry
+                    && self.workspace_model_source.as_ref() == Some(&ack.host)
+                    && self.workspace_model.sequence >= ack.sequence;
+                let replaced = connected.is_some_and(|registry| {
+                    registry != ack.registry
+                        || self.workspace_model_source.as_ref() != Some(&ack.host)
+                });
+                (confirmed || replaced).then_some((
+                    *project,
+                    ack.origin.repository.clone(),
+                    confirmed,
+                ))
+            })
+            .collect();
+        let mut changed = false;
+        for (project, repository, confirmed) in completed {
+            if confirmed {
+                self.workspace_model_reopens.invalidate(project);
+                self.project_ui.reopening.remove(&project);
+                if self.workspace_model.project(&repository).is_some() {
+                    self.cancel_shared_project_close(&repository);
+                    self.project_ui.closed.remove(&repository);
+                }
+                // This exact attempt completed even when a later current
+                // close outran its reply. Release only its shield, then apply
+                // the current tombstone rather than resurrecting old state.
+                changed = true;
+            } else {
+                // Keep the local-work shield until an explicit new picker
+                // attempt replaces it. A different connection's tombstone is
+                // not permission to retire this unfinished local reopen.
+                self.workspace_model_reopens.deferred.remove(&project);
+                self.workspace_model_reopens.retryable.insert(project);
+                self.invalidate_reopen_inventory(project);
+                self.status = Some(TransientNotice::warning(
+                    "Project reopening could not be confirmed on the current workspace connection. Open the project again to retry.",
+                ));
+            }
+        }
+        changed
+    }
+
     pub(super) fn reorder_sidebar_member(
         &mut self,
         project: crate::model::ProjectId,
@@ -525,20 +915,87 @@ impl Cagents {
         self.apply_workspace_model_update_effect(update).0
     }
 
-    /// Only stale complete snapshots skip projection. Even an equal model can
-    /// restore optimistic local state after refusal (for example channel titles).
-    /// Newer metadata edges may still lack an older snapshot's full inventory.
+    /// Only complete snapshots from the admitted registry may project. The
+    /// observer's Connected event admits that registry; a delayed publisher
+    /// response cannot bootstrap one or roll a replacement back. Equal models
+    /// can still repair optimistic state, and newer metadata edges may still
+    /// lack an older snapshot's full inventory.
     pub(super) fn apply_workspace_model_update_effect(
         &mut self,
         update: ModelUpdate,
     ) -> (Task<Message>, bool) {
+        if matches!(&update, ModelUpdate::Connected { model, proof }
+            if model.identity == NO_REGISTRY || !proof.is_complete())
+        {
+            return (Task::none(), false);
+        }
+        if let ModelUpdate::Reopened {
+            repository,
+            model,
+            origin,
+            destination,
+        } = &update
+        {
+            let (Some(origin), Some(destination)) = (origin, destination) else {
+                return (Task::none(), false);
+            };
+            if origin.repository != *repository
+                || !self.current_reopen(origin)
+                || self
+                    .workspace_model_reopens
+                    .retryable
+                    .contains(&origin.project)
+                || !destination.is_complete()
+                || (origin.registry != NO_REGISTRY && origin.host.is_none())
+                || origin.host.as_ref().is_some_and(|host| host != destination)
+            {
+                return (Task::none(), false);
+            }
+            self.defer_reopen_acknowledgement(repository, model, Some(origin), Some(destination));
+            if self.workspace_model.identity == NO_REGISTRY
+                || model.identity != self.workspace_model.identity
+                || self.workspace_model_source.as_ref() != Some(destination)
+            {
+                if self.workspace_model.identity != NO_REGISTRY {
+                    self.settle_reopen_acknowledgements(Some(self.workspace_model.identity));
+                }
+                return (Task::none(), false);
+            }
+        }
+        let ordinary = match &update {
+            ModelUpdate::Read(model)
+            | ModelUpdate::ViewApplied { model, .. }
+            | ModelUpdate::ViewConflicted { model, .. } => Some(model),
+            _ => None,
+        };
+        if ordinary.is_some_and(|model| {
+            self.workspace_model.identity == NO_REGISTRY
+                || model.identity != self.workspace_model.identity
+        }) {
+            return (Task::none(), false);
+        }
         if let ModelUpdate::Read(model) = &update
-            && model.identity == self.workspace_model.identity
             && model.sequence < self.shared_views.snapshot_sequence
         {
             return (Task::none(), false);
         }
-        (self.apply_workspace_model_update_inner(update), true)
+        let connected = match &update {
+            ModelUpdate::Connected { model, .. } if model.identity != NO_REGISTRY => {
+                Some(model.identity)
+            }
+            _ => None,
+        };
+        let task = self.apply_workspace_model_update_inner(update);
+        let task = if self.settle_reopen_acknowledgements(connected) {
+            Task::batch([
+                task,
+                self.apply_closed_project_tombstones(),
+                self.reconcile_workspace_model(),
+            ])
+        } else {
+            task
+        };
+        (task, true)
     }
 
     fn apply_workspace_model_update_inner(&mut self, update: ModelUpdate) -> Task<Message> {
@@ -598,14 +1055,22 @@ impl Cagents {
                 self.retarget_transferred_pane_updates(transferred);
                 self.reconcile_workspace_model()
             }
-            ModelUpdate::Connected(model) => {
+            ModelUpdate::Connected { model, proof } => {
+                if model.identity == NO_REGISTRY {
+                    return Task::none();
+                }
                 if model.identity == self.workspace_model.identity
                     && model.sequence < self.shared_views.snapshot_sequence
                 {
+                    // Connection ownership is new even when its snapshot was
+                    // overtaken by a publisher receipt. Keep newer model data
+                    // while fencing reopen attempts owned by the old host.
+                    self.workspace_model_source = Some(proof);
                     return Task::none();
                 }
                 self.join_workspace_model(model.identity);
                 self.install_workspace_model_snapshot(model);
+                self.workspace_model_source = Some(proof);
                 let closed = self.apply_closed_project_tombstones();
                 Task::batch([closed, self.reconcile_workspace_model()])
             }
@@ -616,35 +1081,46 @@ impl Cagents {
                 let closed = self.apply_closed_project_tombstones();
                 Task::batch([closed, self.reconcile_workspace_model()])
             }
-            ModelUpdate::Reopened { repository, model } => {
-                if model.identity == self.workspace_model.identity
-                    && model.sequence < self.workspace_model.sequence
-                {
-                    self.project_ui
-                        .reopening
-                        .retain(|_, path| path != &repository);
-                    return self.apply_closed_project_tombstones();
-                }
-                self.join_workspace_model(model.identity);
-                if model.project(&repository).is_some() {
-                    self.cancel_shared_project_close(&repository);
-                    self.project_ui.closed.remove(&repository);
-                    self.project_ui
-                        .reopening
-                        .retain(|_, path| path != &repository);
+            ModelUpdate::Reopened { model, .. } => {
+                // Only Connected admits a registry. The outer gate retained
+                // this exact acknowledgement until that admission, if needed.
+                if model.sequence < self.workspace_model.sequence {
+                    return Task::none();
                 }
                 self.install_workspace_model_snapshot(model);
                 let closed = self.apply_closed_project_tombstones();
                 Task::batch([closed, self.reconcile_workspace_model()])
             }
-            ModelUpdate::ReopenFailed { repository, error } => {
-                self.project_ui
-                    .reopening
-                    .retain(|_, path| path != &repository);
-                self.status = Some(crate::app::TransientNotice::error(format!(
-                    "Could not reopen project: {error}"
+            ModelUpdate::ReopenFailed {
+                repository,
+                error,
+                origin,
+                destination,
+            } => {
+                let Some(origin) = origin else {
+                    return Task::none();
+                };
+                if origin.repository != repository
+                    || !self.current_reopen(&origin)
+                    || self
+                        .workspace_model_reopens
+                        .retryable
+                        .contains(&origin.project)
+                    || (origin.host.is_some() && destination != origin.host)
+                {
+                    return Task::none();
+                }
+                self.workspace_model_reopens
+                    .deferred
+                    .remove(&origin.project);
+                self.workspace_model_reopens
+                    .retryable
+                    .insert(origin.project);
+                self.invalidate_reopen_inventory(origin.project);
+                self.status = Some(TransientNotice::error(format!(
+                    "Could not reopen project: {error}. Open the project again to retry."
                 )));
-                self.apply_closed_project_tombstones()
+                Task::none()
             }
             ModelUpdate::Edited { sequence, edit } => {
                 // Work commits and metadata announcements can cross between
@@ -1628,13 +2104,43 @@ impl Cagents {
             &edit,
             ModelEdit::ReorderNavigation { .. } | ModelEdit::ResetNavigation { .. }
         );
-        if let Err(error) = self.workspace_model_tx.try_send(edit) {
+        let reopen = self.capture_reopen_origin(&edit, self.workspace_model.identity);
+        if matches!(edit, ModelEdit::ReopenProject { .. }) && reopen.is_none() {
+            return;
+        }
+        if reopen.as_ref().is_some_and(|origin| {
+            self.workspace_model_reopens
+                .queued
+                .contains(&origin.project)
+                || self
+                    .workspace_model_reopens
+                    .retryable
+                    .contains(&origin.project)
+        }) {
+            return;
+        }
+        if let Err(error) = self.workspace_model_tx.try_send(QueuedEdit {
+            edit,
+            reopen: reopen.clone(),
+            destination: reopen.as_ref().and_then(|origin| origin.host.clone()),
+        }) {
+            if let Some(origin) = reopen {
+                self.workspace_model_reopens
+                    .retryable
+                    .insert(origin.project);
+                self.invalidate_reopen_inventory(origin.project);
+                self.status = Some(TransientNotice::warning(
+                    "Could not queue reopening this project. Open the project again to retry.",
+                ));
+            }
             tracing::debug!(%error, "a shared workspace model edit was not queued");
             if navigation {
                 self.status = Some(TransientNotice::warning(
                     "Could not save the sidebar order; try again once the selected device is connected",
                 ));
             }
+        } else if let Some(origin) = reopen {
+            self.workspace_model_reopens.queued.insert(origin.project);
         }
     }
 }
@@ -1658,11 +2164,9 @@ mod tests {
             )];
         let mut old = registry(Vec::new());
         old.sequence = 900;
-        drop(
-            app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
-                old.clone(),
-            ))),
-        );
+        drop(app.update(Message::WorkspaceModelObserved(
+            ModelUpdate::connected_fixture(old.clone()),
+        )));
         // Obtain the actual publisher-produced Read from a framed reorder
         // response. Hold delivery while the independent observer reconnects;
         // this models a pause before the publisher sends its already-read model.
@@ -1732,11 +2236,9 @@ mod tests {
         let mut current = registry(vec![shared(selected, &repository, "Current work", 7)]);
         current.sequence = 1;
         assert_ne!(current.identity, old.identity);
-        drop(
-            app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
-                current.clone(),
-            ))),
-        );
+        drop(app.update(Message::WorkspaceModelObserved(
+            ModelUpdate::connected_fixture(current.clone()),
+        )));
         drop(
             app.update(Message::ChannelUi(super::super::channel_ui::Action::Open(
                 selected,
@@ -1818,23 +2320,522 @@ mod tests {
 
     #[test]
     fn ordinary_reads_wait_for_connected_registry_admission() {
-        for unknown_model in [false, true] {
-            let (mut app, _, repository) = app_with_project();
-            assert_eq!(app.workspace_model.identity, NO_REGISTRY);
-            let mut model = registry(vec![shared(ChannelId::new(), &repository, "Unadmitted", 1)]);
-            if unknown_model {
-                model.identity = NO_REGISTRY;
+        for kind in ["read", "applied", "conflicted", "reopened"] {
+            for unknown_model in [false, true] {
+                let (mut app, _, repository) = app_with_project();
+                assert_eq!(app.workspace_model.identity, NO_REGISTRY);
+                let channel = ChannelId::new();
+                let mut model = registry(vec![shared(channel, &repository, "Unadmitted", 1)]);
+                if unknown_model {
+                    model.identity = NO_REGISTRY;
+                }
+                let scope = crate::workspace_model::views::Scope::Channel(channel);
+                let before =
+                    crate::workspace_model::views::Pane::from_card(&app.durable.cards[0], None)
+                        .unwrap();
+                let operation = uuid::Uuid::new_v4();
+                let update = match kind {
+                    "read" => ModelUpdate::Read(model),
+                    "applied" => ModelUpdate::ViewApplied {
+                        scope,
+                        operation: Some(operation),
+                        model,
+                    },
+                    "conflicted" => ModelUpdate::ViewConflicted {
+                        scope,
+                        operation,
+                        change: crate::workspace_model::views::Change::Remove { id: before.id },
+                        model,
+                        error: "unadmitted".into(),
+                    },
+                    "reopened" => ModelUpdate::Reopened {
+                        repository,
+                        model,
+                        origin: None,
+                        destination: None,
+                    },
+                    _ => unreachable!(),
+                };
+                let durable = Arc::clone(&app.durable);
+                let before = app.workspace_model.clone();
+                let published = intercept_publishes(&mut app);
+                let (task, project) = app.apply_workspace_model_update_effect(update);
+                drop(task);
+                assert!(
+                    !project,
+                    "{kind}: ordinary response cannot bootstrap a registry"
+                );
+                assert_eq!(app.workspace_model, before);
+                assert_eq!(app.durable, durable);
+                assert!(drain(&published).is_empty());
             }
-            let durable = Arc::clone(&app.durable);
-            let before = app.workspace_model.clone();
-            let published = intercept_publishes(&mut app);
-            let (task, project) = app.apply_workspace_model_update_effect(ModelUpdate::Read(model));
-            drop(task);
-            assert!(!project, "an ordinary read cannot bootstrap a registry");
-            assert_eq!(app.workspace_model, before);
-            assert_eq!(app.durable, durable);
-            assert!(drain(&published).is_empty());
         }
+    }
+
+    #[test]
+    fn stale_reopen_callbacks_and_inventory_cannot_settle_or_replay_a_replacement_attempt() {
+        for failure in [false, true] {
+            let (mut app, project, repository) = app_with_project();
+            let mut old = registry(Vec::new());
+            old.projects.push(ModelProject {
+                repository: repository.clone(),
+                name: "repo".into(),
+                kind: ProjectKind::Git,
+                ordinal: 1,
+            });
+            drop(app.update(Message::WorkspaceModelObserved(
+                ModelUpdate::connected_fixture(old.clone()),
+            )));
+            let previous = queue_reopen_fixture(&mut app, project, &repository);
+            let origin = previous.reopen.clone().unwrap();
+            let generation = origin.inventory_generation.unwrap();
+            let mut current = old.clone();
+            current.identity = uuid::Uuid::new_v4();
+            current.sequence += 1;
+            drop(app.update(Message::WorkspaceModelObserved(
+                ModelUpdate::connected_fixture(current.clone()),
+            )));
+            assert!(app.workspace_model_reopens.can_retry(&repository));
+            assert!(
+                app.project_ui.is_reopening(&repository),
+                "failed intent retains local-work protection"
+            );
+            assert!(
+                !app.repository_generations.contains_key(&project),
+                "only the captured old load is invalidated"
+            );
+            let published = intercept_publishes(&mut app);
+            app.publish_project_opened(project);
+            assert!(
+                published.try_recv().is_err(),
+                "passive refresh cannot replay R0 into R1"
+            );
+            let replacement = queue_reopen_fixture(&mut app, project, &repository);
+            let newer = replacement.reopen.clone().unwrap();
+            assert_ne!(newer.nonce, origin.nonce);
+            assert_eq!(newer.registry, current.identity);
+            assert!(!app.workspace_model_reopens.can_retry(&repository));
+            let durable = Arc::clone(&app.durable);
+            let canonical = app.workspace_model.clone();
+            let request_generation = app.repository_generations[&project];
+            let published = intercept_publishes(&mut app);
+            let stale = if failure {
+                ModelUpdate::ReopenFailed {
+                    repository: repository.clone(),
+                    error: "old refusal".into(),
+                    origin: Some(origin.clone()),
+                    destination: previous.destination,
+                }
+            } else {
+                ModelUpdate::Reopened {
+                    repository: repository.clone(),
+                    model: old,
+                    origin: Some(origin.clone()),
+                    destination: previous.destination,
+                }
+            };
+            drop(app.update(Message::WorkspaceModelObserved(stale)));
+            assert_eq!(app.workspace_model, canonical);
+            assert_eq!(app.durable, durable);
+            assert_eq!(
+                app.workspace_model_reopens.active.get(&project),
+                Some(&newer)
+            );
+            assert!(!app.workspace_model_reopens.can_retry(&repository));
+            // This is the real App load callback with an obsolete generation;
+            // even an error must not clear a newer request or publish a fallback.
+            drop(app.update(Message::RepositoryLoaded {
+                project_id: project,
+                generation,
+                open_cards: true,
+                result: Err("obsolete inventory".into()),
+            }));
+            assert_eq!(app.repository_generations[&project], request_generation);
+            assert_eq!(
+                app.workspace_model_reopens.active.get(&project),
+                Some(&newer)
+            );
+            assert!(
+                drain(&published).is_empty(),
+                "old load cannot publish OpenProject or ReopenProject"
+            );
+            drop(
+                app.update(Message::WorkspaceModelObserved(ModelUpdate::Reopened {
+                    repository: repository.clone(),
+                    model: current,
+                    origin: replacement.reopen,
+                    destination: replacement.destination,
+                })),
+            );
+            assert!(!app.project_ui.is_reopening(&repository));
+            assert!(!app.workspace_model_reopens.active.contains_key(&project));
+        }
+    }
+
+    #[test]
+    fn bootstrap_reopen_confirmation_waits_for_matching_connected_without_replay() {
+        for matching in [false, true] {
+            let (mut app, project, repository) = app_with_project();
+            let mut request = queue_reopen_fixture(&mut app, project, &repository);
+            let origin = request.reopen.clone().unwrap();
+            assert_eq!(origin.registry, NO_REGISTRY);
+            assert_eq!(origin.host, None);
+            let mut model = registry(Vec::new());
+            model.sequence = 7;
+            model.projects.push(ModelProject {
+                repository: repository.clone(),
+                name: "repo".into(),
+                kind: ProjectKind::Git,
+                ordinal: 1,
+            });
+            let ModelUpdate::Connected { proof, .. } =
+                ModelUpdate::connected_fixture(model.clone())
+            else {
+                unreachable!()
+            };
+            request.destination = Some(proof.clone());
+            let published = intercept_publishes(&mut app);
+            drop(
+                app.update(Message::WorkspaceModelObserved(ModelUpdate::Reopened {
+                    repository: repository.clone(),
+                    model: model.clone(),
+                    origin: request.reopen,
+                    destination: request.destination,
+                })),
+            );
+            assert_eq!(app.workspace_model.identity, NO_REGISTRY);
+            assert_eq!(app.durable.workspace_model_identity, None);
+            assert!(app.project_ui.is_reopening(&repository));
+            assert!(app.workspace_model_reopens.deferred.contains_key(&project));
+            if !matching {
+                model.identity = uuid::Uuid::new_v4();
+            }
+            drop(app.update(Message::WorkspaceModelObserved(
+                ModelUpdate::connected_fixture(model),
+            )));
+            assert_eq!(app.project_ui.is_reopening(&repository), !matching);
+            assert_eq!(
+                app.workspace_model_reopens.can_retry(&repository),
+                !matching
+            );
+            assert!(
+                !drain(&published)
+                    .iter()
+                    .any(|edit| matches!(edit, ModelEdit::ReopenProject { .. })),
+                "Connected never replays the old explicit intent"
+            );
+            if !matching {
+                assert!(
+                    app.status
+                        .as_ref()
+                        .is_some_and(|notice| notice.message.contains("again"))
+                );
+                let replacement = queue_reopen_fixture(&mut app, project, &repository);
+                assert_ne!(replacement.reopen.unwrap().nonce, origin.nonce);
+            }
+        }
+    }
+
+    #[test]
+    fn reopen_retry_keeps_its_first_physical_host_and_sends_no_edit_after_reconnect() {
+        use crate::terminal::ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+            ServerResponse, read_frame, write_frame,
+        };
+        fn connection(
+            proof: crate::model::HostSessionProof,
+            expect_edit: bool,
+        ) -> (ControlClient, std::thread::JoinHandle<()>) {
+            let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let server = std::thread::spawn(move || {
+                let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(hello.request_id),
+                        proof: proof.clone(),
+                        message: ServerMessage::Response {
+                            response: ServerResponse::Connected {
+                                proof,
+                                resumed: Vec::new(),
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+                if expect_edit {
+                    let request: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                    assert!(matches!(
+                        request.request,
+                        ClientRequest::EditWorkspaceModel {
+                            edit: ModelEdit::ReopenProject { .. }
+                        }
+                    ));
+                    // The effect may have happened; close before returning its
+                    // response so retry custody must survive an uncertain result.
+                } else {
+                    assert!(
+                        read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none(),
+                        "changed physical host must receive no request"
+                    );
+                }
+            });
+            (ControlClient::from_stream(stream).unwrap(), server)
+        }
+        let (mut app, project, repository) = app_with_project();
+        let mut request = queue_reopen_fixture(&mut app, project, &repository);
+        let origin = request.reopen.clone().unwrap();
+        let first = crate::model::HostSessionProof {
+            host_session_id: "physical-one".into(),
+            boot_id: "boot-one".into(),
+            host_incarnation: "host-one".into(),
+        };
+        let second = crate::model::HostSessionProof {
+            host_session_id: "physical-two".into(),
+            boot_id: "boot-two".into(),
+            host_incarnation: "host-two".into(),
+        };
+        let (sender, updates) = async_channel::unbounded();
+        let (mut client, server) = connection(first.clone(), true);
+        assert!(send_queued(&mut client, &mut request, &sender).is_err());
+        drop(client);
+        server.join().unwrap();
+        assert_eq!(request.destination, Some(first.clone()));
+        assert_eq!(request.reopen, Some(origin.clone()));
+        let (mut client, server) = connection(second, false);
+        let error = send_queued(&mut client, &mut request, &sender).unwrap_err();
+        assert!(matches!(
+            &error,
+            ControlError::Remote {
+                retryable: false,
+                ..
+            }
+        ));
+        assert_eq!(request.destination, Some(first));
+        assert_eq!(request.reopen, Some(origin));
+        assert!(updates.try_recv().is_err());
+        drop(client);
+        server.join().unwrap();
+        let refused = reopen_refusal(&request, &error).unwrap();
+        drop(app.update(Message::WorkspaceModelObserved(refused)));
+        assert!(app.project_ui.is_reopening(&repository));
+        assert!(app.workspace_model_reopens.can_retry(&repository));
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|notice| notice.message.contains("again"))
+        );
+        assert_eq!(app.workspace_model.identity, NO_REGISTRY);
+    }
+
+    #[test]
+    fn framed_reopen_success_preserves_origin_and_waits_for_observer_admission() {
+        use crate::terminal::ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+            ServerResponse, read_frame, write_frame,
+        };
+        let (mut app, project, repository) = app_with_project();
+        let mut request = queue_reopen_fixture(&mut app, project, &repository);
+        let origin = request.reopen.clone();
+        let proof = crate::model::HostSessionProof {
+            host_session_id: "reopen-server".into(),
+            boot_id: "reopen-boot".into(),
+            host_incarnation: "reopen-incarnation".into(),
+        };
+        let mut model = registry(Vec::new());
+        model.sequence = 8;
+        model.projects.push(ModelProject {
+            repository: repository.clone(),
+            name: "repo".into(),
+            kind: ProjectKind::Git,
+            ordinal: 1,
+        });
+        let expected = model.clone();
+        let server_proof = proof.clone();
+        let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let server = std::thread::spawn(move || {
+            let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            write_frame(
+                &mut peer,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(hello.request_id),
+                    proof: server_proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof: server_proof.clone(),
+                            resumed: Vec::new(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+            let edit: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            assert!(matches!(
+                edit.request,
+                ClientRequest::EditWorkspaceModel {
+                    edit: ModelEdit::ReopenProject { .. }
+                }
+            ));
+            write_frame(
+                &mut peer,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(edit.request_id),
+                    proof: server_proof,
+                    message: ServerMessage::Response {
+                        response: ServerResponse::WorkspaceModel { model },
+                    },
+                },
+            )
+            .unwrap();
+            assert!(
+                read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none(),
+                "no destination preflight or polling RPC is added"
+            );
+        });
+        let mut client = ControlClient::from_stream(stream).unwrap();
+        let (sender, updates) = async_channel::unbounded();
+        send_queued(&mut client, &mut request, &sender).unwrap();
+        let reply = updates.try_recv().unwrap();
+        assert!(
+            matches!(&reply, ModelUpdate::Reopened { model, origin: actual, destination, .. }
+            if model == &expected && actual == &origin && destination.as_ref() == Some(&proof))
+        );
+        assert!(updates.try_recv().is_err());
+        drop(client);
+        server.join().unwrap();
+        drop(app.update(Message::WorkspaceModelObserved(reply)));
+        assert_eq!(app.workspace_model.identity, NO_REGISTRY);
+        assert!(app.project_ui.is_reopening(&repository));
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected {
+                model: expected,
+                proof,
+            })),
+        );
+        assert!(!app.project_ui.is_reopening(&repository));
+        assert!(!app.workspace_model_reopens.active.contains_key(&project));
+    }
+
+    #[test]
+    fn old_provisional_reopen_inventory_cannot_publish_after_explicit_retry() {
+        let Some(checkout) = git_checkout() else {
+            return;
+        };
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let old_model = registry(Vec::new());
+        drop(app.update(Message::WorkspaceModelObserved(
+            ModelUpdate::connected_fixture(old_model.clone()),
+        )));
+        let old_task = app.repository_load_task(checkout.path().to_path_buf(), None, true);
+        let old = app
+            .workspace_model_reopens
+            .active
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        let loaded = first_message(old_task).expect("real inventory yields its completion");
+        assert!(matches!(
+            &loaded,
+            Message::RepositoryLoaded { result: Ok(_), .. }
+        ));
+        let mut replacement_model = old_model;
+        replacement_model.identity = uuid::Uuid::new_v4();
+        drop(app.update(Message::WorkspaceModelObserved(
+            ModelUpdate::connected_fixture(replacement_model),
+        )));
+        assert!(app.workspace_model_reopens.can_retry(&old.repository));
+        drop(app.repository_load_task(checkout.path().to_path_buf(), None, true));
+        let newer = app
+            .workspace_model_reopens
+            .active
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        assert_ne!(newer.project, old.project);
+        assert_ne!(newer.nonce, old.nonce);
+        let durable = Arc::clone(&app.durable);
+        let projects = app.sidebar_model.projects.len();
+        let canonical = app.workspace_model.clone();
+        let published = intercept_publishes(&mut app);
+        drop(app.update(loaded));
+        assert_eq!(app.durable, durable);
+        assert_eq!(app.sidebar_model.projects.len(), projects);
+        assert_eq!(app.workspace_model, canonical);
+        assert_eq!(
+            app.workspace_model_reopens.active.get(&newer.project),
+            Some(&newer)
+        );
+        assert_eq!(
+            app.project_ui.reopening.get(&newer.project),
+            Some(&newer.repository)
+        );
+        assert!(!app.repository_generations.contains_key(&old.project));
+        assert!(
+            drain(&published).is_empty(),
+            "obsolete successful load must not fall back to OpenProject"
+        );
+    }
+
+    #[test]
+    fn same_registry_host_replacement_requires_fresh_explicit_reopen() {
+        let (mut app, project, repository) = app_with_project();
+        let mut model = registry(Vec::new());
+        model.projects.push(ModelProject {
+            repository: repository.clone(),
+            name: "repo".into(),
+            kind: ProjectKind::Git,
+            ordinal: 1,
+        });
+        drop(app.update(Message::WorkspaceModelObserved(
+            ModelUpdate::connected_fixture(model.clone()),
+        )));
+        let previous = queue_reopen_fixture(&mut app, project, &repository);
+        let newer_proof = crate::model::HostSessionProof {
+            host_session_id: "new-server".into(),
+            boot_id: "new-boot".into(),
+            host_incarnation: "new-incarnation".into(),
+        };
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected {
+                model: model.clone(),
+                proof: newer_proof.clone(),
+            })),
+        );
+        assert!(app.workspace_model_reopens.can_retry(&repository));
+        let durable = Arc::clone(&app.durable);
+        let canonical = app.workspace_model.clone();
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Reopened {
+                repository: repository.clone(),
+                model: model.clone(),
+                origin: previous.reopen,
+                destination: previous.destination,
+            })),
+        );
+        assert_eq!(app.durable, durable);
+        assert_eq!(app.workspace_model, canonical);
+        assert!(app.workspace_model_reopens.can_retry(&repository));
+        let published = intercept_publishes(&mut app);
+        app.publish_project_opened(project);
+        assert!(published.try_recv().is_err());
+        let retry = queue_reopen_fixture(&mut app, project, &repository);
+        assert_eq!(retry.destination, Some(newer_proof));
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Reopened {
+                repository: repository.clone(),
+                model,
+                origin: retry.reopen,
+                destination: retry.destination,
+            })),
+        );
+        assert!(!app.project_ui.is_reopening(&repository));
     }
 
     #[test]
@@ -2759,7 +3760,7 @@ mod tests {
                     "a truly blocked scope must not create a fresh card or Starting Task"
                 );
                 assert!(!app.chat_start_pending(card));
-                assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|edit|
+                assert!(!std::iter::from_fn(|| rx.try_recv().ok().map(|queued| queued.edit)).any(|edit|
                     matches!(edit, ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. } if pane.id == card)));
                 // The next authoritative read removes the conflict while the
                 // previous projection's blocked flag is still set locally.
@@ -2771,7 +3772,8 @@ mod tests {
             model.sequence += 1;
             let focus = app.workspace.focused();
             drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
-            let edits = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+            let edits = std::iter::from_fn(|| rx.try_recv().ok().map(|queued| queued.edit))
+                .collect::<Vec<_>>();
             let inserts = edits
                 .iter()
                 .filter_map(|edit| match edit {
@@ -2833,7 +3835,7 @@ mod tests {
             // rather than re-issuing it or treating the old empty view as close.
             drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
             assert!(app.card_state(card).unwrap().existence.is_open());
-            assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|edit|
+            assert!(!std::iter::from_fn(|| rx.try_recv().ok().map(|queued| queued.edit)).any(|edit|
                 matches!(edit, ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. } if pane.id == card)));
             let change = Change::Insert {
                 pane: pane.clone(),
@@ -3274,7 +4276,7 @@ mod tests {
                 };
             }
             let incoming = std::mem::take(&mut app.workspace_model);
-            drop(app.apply_workspace_model_update(ModelUpdate::Connected(incoming)));
+            drop(app.apply_workspace_model_update(ModelUpdate::connected_fixture(incoming)));
             let target = app
                 .card_state(pane.id)
                 .expect("first incoming snapshot adopted its exact managed pane");
@@ -3382,7 +4384,9 @@ mod tests {
                 "an ended terminal grants no live adoption authority"
             );
             let incoming = std::mem::take(&mut app.workspace_model);
-            drop(app.apply_workspace_model_update(ModelUpdate::Connected(incoming.clone())));
+            drop(
+                app.apply_workspace_model_update(ModelUpdate::connected_fixture(incoming.clone())),
+            );
             // An ended pane cannot use the eager live-agent adoption path.
             // Its passive shared projection waits for the publisher's seed
             // acknowledgements, just as an ordinary saved terminal does.
@@ -3439,7 +4443,7 @@ mod tests {
                 }),
             };
             let incoming = std::mem::take(&mut app.workspace_model);
-            drop(app.apply_workspace_model_update(ModelUpdate::Connected(incoming)));
+            drop(app.apply_workspace_model_update(ModelUpdate::connected_fixture(incoming)));
             assert!(!app.shared_views.blocked.is_empty());
             assert!(
                 app.durable
@@ -3472,7 +4476,7 @@ mod tests {
                 }
             }
             let incoming = std::mem::take(&mut app.workspace_model);
-            drop(app.apply_workspace_model_update(ModelUpdate::Connected(incoming)));
+            drop(app.apply_workspace_model_update(ModelUpdate::connected_fixture(incoming)));
             assert!(
                 app.card_state(pane.id).is_none(),
                 "{state} canonical evidence cannot fall back to the original placement"
@@ -3550,6 +4554,23 @@ mod tests {
         }
     }
 
+    fn queue_reopen_fixture(
+        app: &mut Cagents,
+        project: ProjectId,
+        repository: &Path,
+    ) -> QueuedEdit {
+        drop(app.repository_load_task(repository.to_path_buf(), Some(project), true));
+        let published = intercept_publishes(app);
+        app.publish_project_opened(project);
+        let request = published
+            .try_recv()
+            .expect("the exact explicit attempt queues once");
+        assert!(matches!(request.edit, ModelEdit::ReopenProject { .. }));
+        assert!(request.reopen.is_some());
+        assert!(published.try_recv().is_err());
+        request
+    }
+
     fn rank_receipt(app: &Cagents, id: ChannelId, ordinal: u32, sequence: u64) -> ModelUpdate {
         let local = app
             .durable
@@ -3585,7 +4606,7 @@ mod tests {
         let (mut app, project, repository) = app_with_project();
         let mut model = registry(Vec::new());
         model.closed_projects.push(repository.clone());
-        drop(app.apply_workspace_model_update(ModelUpdate::Connected(model)));
+        drop(app.apply_workspace_model_update(ModelUpdate::connected_fixture(model)));
         assert!(app.project_ui.closing.contains_key(&project));
         let generation = app.project_ui.close_generation[&project];
         drop(
@@ -3607,7 +4628,7 @@ mod tests {
         let mut model = registry(Vec::new());
         model.sequence = 1;
         model.closed_projects.push(repository.clone());
-        drop(app.apply_workspace_model_update(ModelUpdate::Connected(model)));
+        drop(app.apply_workspace_model_update(ModelUpdate::connected_fixture(model)));
         assert!(app.project_ui.closing.contains_key(&project));
         let generation = app.project_ui.close_generation[&project];
 
@@ -3641,7 +4662,6 @@ mod tests {
     #[test]
     fn an_unchanged_explicit_open_acknowledges_the_pending_reopen() {
         let (mut app, project, repository) = app_with_project();
-        app.project_ui.reopening.insert(project, repository.clone());
         let mut model = registry(Vec::new());
         model.projects.push(ModelProject {
             kind: Default::default(),
@@ -3649,9 +4669,13 @@ mod tests {
             name: "repo".into(),
             ordinal: 1,
         });
+        drop(app.apply_workspace_model_update(ModelUpdate::connected_fixture(model.clone())));
+        let request = queue_reopen_fixture(&mut app, project, &repository);
         drop(app.apply_workspace_model_update(ModelUpdate::Reopened {
             repository: repository.clone(),
             model,
+            origin: request.reopen,
+            destination: request.destination,
         }));
         assert!(!app.project_ui.is_reopening(&repository));
         assert!(app.sidebar_model.project(project).is_some());
@@ -3659,14 +4683,14 @@ mod tests {
 
     /// Replaces the publish queue with one the test can read, which is how the
     /// window's side of a publish is observed without a daemon.
-    fn intercept_publishes(app: &mut Cagents) -> async_channel::Receiver<ModelEdit> {
+    fn intercept_publishes(app: &mut Cagents) -> async_channel::Receiver<QueuedEdit> {
         let (tx, rx) = async_channel::unbounded();
         app.workspace_model_tx = tx;
         rx
     }
 
-    fn drain(rx: &async_channel::Receiver<ModelEdit>) -> Vec<ModelEdit> {
-        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    fn drain(rx: &async_channel::Receiver<QueuedEdit>) -> Vec<ModelEdit> {
+        std::iter::from_fn(|| rx.try_recv().ok().map(|queued| queued.edit)).collect()
     }
 
     /// A real checkout, because adopting a project runs the repository loader
@@ -3831,11 +4855,9 @@ mod tests {
             let focused = app.workspace.focused();
             let strip = app.workspace.order().collect::<Vec<_>>();
             let published = intercept_publishes(&mut app);
-            drop(
-                app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
-                    registry(Vec::new()),
-                ))),
-            );
+            drop(app.update(Message::WorkspaceModelObserved(
+                ModelUpdate::connected_fixture(registry(Vec::new())),
+            )));
             reopen(&mut app, &parent, 1);
             assert!(app.known_worktree_roots.contains(&parent));
             assert_eq!(app.worktree_scope_for(&nested), Some(parent.clone()));
@@ -4282,7 +5304,8 @@ mod tests {
         Arc::make_mut(&mut app.durable).channels.push(channel);
         let published = intercept_publishes(&mut app);
 
-        let _ = app.apply_workspace_model_update(ModelUpdate::Connected(registry(Vec::new())));
+        let _ =
+            app.apply_workspace_model_update(ModelUpdate::connected_fixture(registry(Vec::new())));
 
         let kept = app
             .durable
@@ -4347,7 +5370,7 @@ mod tests {
         durable.workspace_model_identity = Some(identity);
         let published = intercept_publishes(&mut app);
 
-        let _ = app.apply_workspace_model_update(ModelUpdate::Connected(WorkspaceModel {
+        let _ = app.apply_workspace_model_update(ModelUpdate::connected_fixture(WorkspaceModel {
             identity,
             ..registry(Vec::new())
         }));
@@ -4401,7 +5424,7 @@ mod tests {
 
         let replacement = registry(Vec::new());
         let identity = replacement.identity;
-        let _ = app.apply_workspace_model_update(ModelUpdate::Connected(replacement));
+        let _ = app.apply_workspace_model_update(ModelUpdate::connected_fixture(replacement));
 
         let kept = app
             .durable
@@ -4447,7 +5470,7 @@ mod tests {
         assert_eq!(app.workspace_model.identity, NO_REGISTRY);
         let published = intercept_publishes(&mut app);
         let replacement = registry(Vec::new());
-        drop(app.apply_workspace_model_update(ModelUpdate::Connected(replacement)));
+        drop(app.apply_workspace_model_update(ModelUpdate::connected_fixture(replacement)));
         let edits = drain(&published);
         let creates = edits
             .iter()

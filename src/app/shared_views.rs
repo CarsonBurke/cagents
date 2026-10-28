@@ -184,8 +184,8 @@ impl Cagents {
         model: crate::workspace_model::WorkspaceModel,
         error: String,
     ) -> Task<Message> {
-        if self.workspace_model.identity != crate::workspace_model::NO_REGISTRY
-            && model.identity != self.workspace_model.identity
+        if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
+            || model.identity != self.workspace_model.identity
         {
             return Task::none();
         }
@@ -769,12 +769,15 @@ impl Cagents {
         self.shared_views
             .requested_transfers
             .insert(operation, card);
-        if let Err(error) = self.workspace_model_tx.try_send(ModelEdit::ChangeView {
-            scope,
-            expected_revision,
-            operation,
-            change,
-        }) {
+        if let Err(error) = self.workspace_model_tx.try_send(
+            ModelEdit::ChangeView {
+                scope,
+                expected_revision,
+                operation,
+                change,
+            }
+            .into(),
+        ) {
             self.reject_pane_transfer(operation, format!("Could not queue the move: {error}"));
         }
         // Runtime and local placement remain authoritative until the daemon
@@ -2192,13 +2195,13 @@ mod tests {
             let ModelEdit::ChangeView {
                 operation: transfer,
                 ..
-            } = rx.try_recv().unwrap()
+            } = rx.try_recv().unwrap().edit
             else {
                 panic!("transfer");
             };
             let expected = edit_moving_terminal(&mut app, pane.id, source);
             let mut old = Vec::new();
-            while let Ok(edit) = rx.try_recv() {
+            while let Ok(edit) = rx.try_recv().map(|queued| queued.edit) {
                 if let ModelEdit::ChangeView {
                     scope,
                     operation,
@@ -2262,7 +2265,7 @@ mod tests {
                     .contains(&pane.id)
             );
             let mut retried = Vec::new();
-            while let Ok(edit) = rx.try_recv() {
+            while let Ok(edit) = rx.try_recv().map(|queued| queued.edit) {
                 if let ModelEdit::ChangeView {
                     scope,
                     expected_revision,
@@ -2338,6 +2341,61 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_view_receipts_do_not_settle_foreign_or_unadmitted_operations() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        for unknown in [false, true] {
+            for conflict in [false, true] {
+                let (mut app, source, destination, pane) = channel_move_fixture();
+                let (tx, rx) = async_channel::unbounded();
+                app.workspace_model_tx = tx;
+                drop(app.move_pane_to_channel(pane.id, destination));
+                let ModelEdit::ChangeView {
+                    operation, change, ..
+                } = rx.try_recv().unwrap().edit
+                else {
+                    panic!("transfer")
+                };
+                let mut model = app.workspace_model.clone();
+                if unknown {
+                    app.workspace_model.identity = crate::workspace_model::NO_REGISTRY;
+                } else {
+                    model.identity = uuid::Uuid::new_v4();
+                }
+                let pending = app.shared_views.pending.clone();
+                let transfers = app.shared_views.requested_transfers.clone();
+                let bases = app.shared_views.source_bases.clone();
+                let durable = Arc::clone(&app.durable);
+                let canonical = app.workspace_model.clone();
+                let scope = Scope::Channel(source);
+                let update = if conflict {
+                    ModelUpdate::ViewConflicted {
+                        scope,
+                        operation,
+                        change,
+                        model,
+                        error: "unadmitted response".into(),
+                    }
+                } else {
+                    ModelUpdate::ViewApplied {
+                        scope,
+                        operation: Some(operation),
+                        model,
+                    }
+                };
+                let (task, project) = app.apply_workspace_model_update_effect(update);
+                drop(task);
+                assert!(!project);
+                assert_eq!(app.shared_views.pending, pending);
+                assert_eq!(app.shared_views.requested_transfers, transfers);
+                assert_eq!(app.shared_views.source_bases, bases);
+                assert_eq!(app.durable, durable);
+                assert_eq!(app.workspace_model, canonical);
+                assert!(rx.try_recv().is_err());
+            }
+        }
+    }
+
+    #[test]
     fn refused_channel_move_keeps_metadata_edits_in_the_original_scope() {
         use super::super::workspace_model_sync::ModelUpdate;
         let kind = moving_terminal_kind();
@@ -2348,7 +2406,7 @@ mod tests {
         let ModelEdit::ChangeView {
             operation: transfer,
             ..
-        } = rx.try_recv().unwrap()
+        } = rx.try_recv().unwrap().edit
         else {
             panic!("transfer");
         };
@@ -2413,7 +2471,7 @@ mod tests {
             let ModelEdit::ChangeView {
                 operation: transfer,
                 ..
-            } = rx.try_recv().unwrap()
+            } = rx.try_recv().unwrap().edit
             else {
                 panic!("transfer");
             };
@@ -2480,7 +2538,7 @@ mod tests {
                 "{replacement}"
             );
             let mut retried = Vec::new();
-            while let Ok(edit) = rx.try_recv() {
+            while let Ok(edit) = rx.try_recv().map(|queued| queued.edit) {
                 if let ModelEdit::ChangeView {
                     scope,
                     operation,
@@ -2541,7 +2599,7 @@ mod tests {
         let ModelEdit::ChangeView {
             operation: transfer,
             ..
-        } = rx.try_recv().unwrap()
+        } = rx.try_recv().unwrap().edit
         else {
             panic!("transfer");
         };
@@ -2605,7 +2663,7 @@ mod tests {
             operation: Some(transfer),
             model: model.clone(),
         }));
-        let ModelEdit::ChangeView { scope, change, .. } = rx.try_recv().unwrap() else {
+        let ModelEdit::ChangeView { scope, change, .. } = rx.try_recv().unwrap().edit else {
             panic!("presentation retry");
         };
         assert_eq!(scope, Scope::Channel(destination));
@@ -2665,7 +2723,7 @@ mod tests {
             let ModelEdit::ChangeView {
                 operation: transfer,
                 ..
-            } = rx.try_recv().unwrap()
+            } = rx.try_recv().unwrap().edit
             else {
                 panic!("transfer");
             };
@@ -2767,8 +2825,10 @@ mod tests {
                     operation,
                     change: change.clone(),
                 });
-                assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
-                    operation: queued, .. } if queued == operation));
+                assert!(
+                    matches!(rx.try_recv().unwrap().edit, ModelEdit::ChangeView {
+                    operation: queued, .. } if queued == operation)
+                );
             }
             let later_operation = uuid::Uuid::new_v4();
             if control == "later-title" {
@@ -2843,7 +2903,7 @@ mod tests {
                 operation: retry,
                 change,
                 ..
-            } = rx.try_recv().unwrap()
+            } = rx.try_recv().unwrap().edit
             else {
                 panic!("presentation retry");
             };
@@ -2926,7 +2986,7 @@ mod tests {
         let ModelEdit::ChangeView {
             operation: transfer,
             ..
-        } = rx.try_recv().unwrap()
+        } = rx.try_recv().unwrap().edit
         else {
             panic!("transfer");
         };
@@ -3059,9 +3119,11 @@ mod tests {
         drop(app.cancel_terminal_close());
         assert!(app.can_move_pane_to_channel(pane.id, destination));
         drop(app.move_pane_to_channel(pane.id, destination));
-        assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
+        assert!(
+            matches!(rx.try_recv().unwrap().edit, ModelEdit::ChangeView {
             scope: Scope::Channel(from), change: Change::Transfer { id, destination: Scope::Channel(to), .. }, ..
-        } if from == source && id == pane.id && to == destination));
+        } if from == source && id == pane.id && to == destination)
+        );
     }
 
     #[test]
@@ -3091,7 +3153,7 @@ mod tests {
             expected_revision,
             operation,
             change,
-        } = rx.try_recv().unwrap()
+        } = rx.try_recv().unwrap().edit
         else {
             panic!("a transfer request");
         };
@@ -3188,7 +3250,7 @@ mod tests {
             .unwrap()
             .repository = PathBuf::from("/repo/.git");
         drop(app.move_pane_to_channel(pane.id, destination));
-        let ModelEdit::ChangeView { operation, .. } = rx.try_recv().unwrap() else {
+        let ModelEdit::ChangeView { operation, .. } = rx.try_recv().unwrap().edit else {
             panic!("transfer");
         };
         drop(app.apply_workspace_model_update(
@@ -3312,9 +3374,11 @@ mod tests {
         let (tx, rx) = async_channel::unbounded();
         app.workspace_model_tx = tx;
         drop(app.move_pane_to_channel(pane.id, destination));
-        assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
+        assert!(
+            matches!(rx.try_recv().unwrap().edit, ModelEdit::ChangeView {
             scope, expected_revision: 17, change: Change::Transfer { id, destination: Scope::Channel(to), .. }, ..
-        } if scope == worktree && id == pane.id && to == destination));
+        } if scope == worktree && id == pane.id && to == destination)
+        );
         assert!(app.card_state(pane.id).unwrap().existence.is_open());
     }
 
@@ -3337,9 +3401,11 @@ mod tests {
             !app.palette.is_open(),
             "dismiss before dispatch so the move passes the modal guard"
         );
-        assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
+        assert!(
+            matches!(rx.try_recv().unwrap().edit, ModelEdit::ChangeView {
             scope: Scope::Channel(from), change: Change::Transfer { id, destination: Scope::Channel(to), .. }, ..
-        } if from == source && id == pane.id && to == destination));
+        } if from == source && id == pane.id && to == destination)
+        );
         assert!(
             app.durable
                 .channels
@@ -3375,9 +3441,11 @@ mod tests {
             stronger.ordinal += 1;
             app.workspace_model.channels.push(stronger);
             drop(app.update_palette(super::super::palette_ui::Action::Submit));
-            assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
+            assert!(
+                matches!(rx.try_recv().unwrap().edit, ModelEdit::ChangeView {
                 scope: Scope::Channel(from), change: Change::Transfer { id, destination: Scope::Channel(to), .. }, ..
-            } if from == source && id == pane.id && to == destination));
+            } if from == source && id == pane.id && to == destination)
+            );
             assert!(app.pane_transfer_pending(pane.id));
         }
     }
@@ -4781,7 +4849,7 @@ mod tests {
         let id = app.workspace.focused().unwrap();
         assert!(app.durable.pending_terminal_creations.contains(&id));
         assert!(app.terminal_starts.lock().unwrap().is_empty());
-        assert!(std::iter::from_fn(||rx.try_recv().ok()).any(|edit| matches!(edit,
+        assert!(std::iter::from_fn(||rx.try_recv().ok().map(|queued| queued.edit)).any(|edit| matches!(edit,
             ModelEdit::ChangeView { operation, change: Change::Insert { pane, before }, .. }
                 if operation == id.as_uuid() && pane.id == id && pane.pending_terminal_start && before == Some(first.id))));
         let saved = app.persistent_workspace();
@@ -4829,7 +4897,7 @@ mod tests {
         let id = app.workspace.focused().unwrap();
         assert!(app.shared_views.defaults.contains_key(&id));
         assert!(app.terminal_starts.lock().unwrap().is_empty());
-        assert!(std::iter::from_fn(||rx.try_recv().ok()).any(|edit|matches!(edit,ModelEdit::ChangeView {change:Change::InsertIfEmpty {pane},..} if pane.id==id)));
+        assert!(std::iter::from_fn(||rx.try_recv().ok().map(|queued| queued.edit)).any(|edit|matches!(edit,ModelEdit::ChangeView {change:Change::InsertIfEmpty {pane},..} if pane.id==id)));
         let mut view = View::empty(a);
         view.panes
             .push(Pane::from_card(app.card_state(id).unwrap(), None).unwrap());
@@ -4856,7 +4924,7 @@ mod tests {
             &HashSet::from([pane.id]),
         ));
         app.acknowledge_view_edit(Scope::Channel(a), None);
-        assert!(std::iter::from_fn(||rx.try_recv().ok()).any(|edit|matches!(edit, ModelEdit::ChangeView {change:Change::Insert {pane: inserted,..},..} if inserted.id==pane.id)));
+        assert!(std::iter::from_fn(||rx.try_recv().ok().map(|queued| queued.edit)).any(|edit|matches!(edit, ModelEdit::ChangeView {change:Change::Insert {pane: inserted,..},..} if inserted.id==pane.id)));
     }
 
     #[test]
@@ -4890,14 +4958,16 @@ mod tests {
         assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
         assert!(app.can_move_pane_to_channel(pane.id, destination));
         drop(app.move_pane_to_channel(pane.id, destination));
-        assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
+        assert!(
+            matches!(rx.try_recv().unwrap().edit, ModelEdit::ChangeView {
             change: Change::Transfer { id, .. }, ..
-        } if id == pane.id));
+        } if id == pane.id)
+        );
     }
 
     fn assert_lifecycle_refuses_moves(
         app: &mut Cagents,
-        rx: &async_channel::Receiver<ModelEdit>,
+        rx: &async_channel::Receiver<super::super::workspace_model_sync::QueuedEdit>,
         source: ChannelId,
         destination: ChannelId,
         card: CardId,
@@ -4943,9 +5013,11 @@ mod tests {
         app.workspace.cancel_close(pane.id).unwrap();
         assert!(app.can_move_pane_to_channel(pane.id, destination));
         drop(app.move_pane_to_channel(pane.id, destination));
-        assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
+        assert!(
+            matches!(rx.try_recv().unwrap().edit, ModelEdit::ChangeView {
             change: Change::Transfer { id, .. }, ..
-        } if id == pane.id));
+        } if id == pane.id)
+        );
     }
 
     #[test]
@@ -4973,9 +5045,11 @@ mod tests {
         drop(app.cancel_terminal_close());
         assert!(app.can_move_pane_to_channel(pane.id, destination));
         drop(app.move_pane_to_channel(pane.id, destination));
-        assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
+        assert!(
+            matches!(rx.try_recv().unwrap().edit, ModelEdit::ChangeView {
             change: Change::Transfer { id, .. }, ..
-        } if id == pane.id));
+        } if id == pane.id)
+        );
     }
 
     #[test]
@@ -5000,9 +5074,11 @@ mod tests {
         assert!(!app.can_move_pane_to_channel(other.id, destination));
         assert!(app.can_move_pane_to_channel(pane.id, destination));
         drop(app.move_pane_to_channel(pane.id, destination));
-        assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
+        assert!(
+            matches!(rx.try_recv().unwrap().edit, ModelEdit::ChangeView {
             change: Change::Transfer { id, .. }, ..
-        } if id == pane.id));
+        } if id == pane.id)
+        );
         assert!(rx.try_recv().is_err());
         assert_eq!(app.terminal_close.as_ref().unwrap().card, other.id);
         assert!(app.card_state(other.id).unwrap().existence.is_open());
@@ -5072,7 +5148,7 @@ mod tests {
             operation,
             change: Change::Transfer { .. },
             ..
-        } = rx.try_recv().unwrap()
+        } = rx.try_recv().unwrap().edit
         else {
             panic!("transfer request")
         };
@@ -5107,7 +5183,7 @@ mod tests {
             operation,
             change: Change::Transfer { .. },
             ..
-        } = rx.try_recv().unwrap()
+        } = rx.try_recv().unwrap().edit
         else {
             panic!("transfer request");
         };
@@ -5153,13 +5229,15 @@ mod tests {
         }));
         assert!(!app.pane_transfer_pending(pane.id));
         assert!(
-            !std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| matches!(
-                edit,
-                ModelEdit::ChangeView {
-                    change: Change::Transfer { .. },
-                    ..
-                }
-            ))
+            !std::iter::from_fn(|| rx.try_recv().ok().map(|queued| queued.edit)).any(
+                |edit| matches!(
+                    edit,
+                    ModelEdit::ChangeView {
+                        change: Change::Transfer { .. },
+                        ..
+                    }
+                )
+            )
         );
         let operation = app.channel_ui.close_operation(source);
         drop(
@@ -5253,7 +5331,9 @@ mod tests {
                     replacement.identity = uuid::Uuid::new_v4();
                     let identity = replacement.identity;
                     drop(app.apply_workspace_model_update(
-                        super::super::workspace_model_sync::ModelUpdate::Connected(replacement),
+                        super::super::workspace_model_sync::ModelUpdate::connected_fixture(
+                            replacement,
+                        ),
                     ));
                     assert_eq!(app.workspace_model.identity, identity);
                     assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
@@ -5300,7 +5380,7 @@ mod tests {
             );
             assert!(!app.channel_ui.is_deleting(source));
             assert!(
-                !std::iter::from_fn(|| rx.try_recv().ok())
+                !std::iter::from_fn(|| rx.try_recv().ok().map(|queued| queued.edit))
                     .any(|edit| matches!(edit, ModelEdit::DeleteChannel { .. })),
                 "{changed}"
             );
