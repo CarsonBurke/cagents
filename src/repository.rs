@@ -7594,11 +7594,17 @@ mod tests {
             );
             for name in ["team", "team/nested"] {
                 let unavailable = root.join(format!("missing-{}.git", name.replace('/', "-")));
-                git(root, &["remote", "add", name, unavailable.to_str().unwrap()]);
+                git(
+                    root,
+                    &["remote", "add", name, unavailable.to_str().unwrap()],
+                );
             }
             // No fetch or symbolic remote HEAD: the configured remote names
             // must disambiguate this shared remote-tracking namespace.
-            git(root, &["update-ref", "refs/remotes/team/nested/topic", "HEAD"]);
+            git(
+                root,
+                &["update-ref", "refs/remotes/team/nested/topic", "HEAD"],
+            );
             let service = service();
             let cancellation = CancellationToken::new();
             let input = |base: &str| WorktreeInput {
