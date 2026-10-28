@@ -1,0 +1,48 @@
+#!/bin/sh
+# Rebuild the complete upstream SQLite 3.50.7 amalgamation offline.
+# Usage: scripts/generate-bundled-sqlite /absolute/source.tar.gz /absolute/new-output
+# Run compiler work through the project's ordinary build admission when shared.
+set -eu
+if [ "$#" -ne 2 ]; then
+    echo "usage: $0 /absolute/sqlite-3.50.7.tar.gz /absolute/new-output" >&2
+    exit 2
+fi
+archive=$1
+output=$2
+case "$archive" in /*) ;; *) echo "archive path must be absolute" >&2; exit 2 ;; esac
+case "$output" in /*) ;; *) echo "output path must be absolute" >&2; exit 2 ;; esac
+expected_archive=5aaadc14483389983751300f3f1072bb630e846c71cd6aaaa1bb3aed4f8fb65c
+expected_source=c7facf7ac58d2cdac619a2da838c5fd5c5270f52b3458c7881b5a4fca1ca4791
+actual_archive=$(sha256sum "$archive")
+actual_archive=${actual_archive%% *}
+if [ "$actual_archive" != "$expected_archive" ]; then
+    echo "SQLite source archive checksum differs from the pinned upstream snapshot" >&2
+    exit 1
+fi
+# The fixed, checked archive has no symlinks or entries outside this source root.
+# A fresh private output keeps generated tools and files out of the source repo.
+umask 077
+mkdir "$output"
+tar -xzf "$archive" -C "$output"
+source_dir=$output/sqlite-3.50.7
+if [ "$(cat "$source_dir/manifest.uuid")" != "$expected_source" ] ||
+   [ "$(cat "$source_dir/VERSION")" != "3.50.7" ]; then
+    echo "SQLite source version or Fossil identity differs" >&2
+    exit 1
+fi
+mkdir "$output/build"
+cd "$output/build"
+# Keep caller compiler/configuration flags out of generated parser choices.
+clean_env() {
+    /usr/bin/env -i PATH=/usr/bin:/bin HOME="$output" LC_ALL=C TZ=UTC \
+        CC=cc BUILD_CC=cc TCLSH_CMD=tclsh "$@"
+}
+clean_env /bin/sh "$source_dir/configure" --disable-shared --disable-tcl
+clean_env make -j2 B.tclsh=tclsh sqlite3.c sqlite3.h
+grep -Eq '^#define SQLITE_VERSION +"3\.50\.7"$' sqlite3.h
+grep -Eq "^#define SQLITE_SOURCE_ID +\"2026-03-05 01:44:06 $expected_source\"$" sqlite3.h
+cp sqlite3.c sqlite3.h sqlite3ext.h "$output/"
+cd "$output"
+sha256sum sqlite3.c sqlite3.h sqlite3ext.h > generated.sha256
+cat generated.sha256
+# No make install, database access, package installation or artifact deletion.

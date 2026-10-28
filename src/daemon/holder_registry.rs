@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{BootId, TerminalId};
 
+mod connection;
+pub(crate) use connection::connect_until;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Kind {
     #[default]
@@ -37,9 +40,37 @@ impl Process {
     }
 }
 
+/// Behavioural identity is separate from the wire protocol: additive fields
+/// keep existing durable helpers adoptable while exposing upgrades to users.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BuildIdentity {
+    pub version: String,
+    pub commit: Option<String>,
+    pub capabilities: Vec<String>,
+}
+
+impl BuildIdentity {
+    pub(crate) fn current(kind: Kind) -> Self {
+        Self {
+            version: crate::VERSION.into(),
+            commit: crate::VERSION
+                .split("+local.")
+                .nth(1)
+                .and_then(|metadata| metadata.split('.').next())
+                .map(str::to_owned),
+            capabilities: match kind {
+                Kind::Native => vec!["event-driven-orphan-reaping".into()],
+                Kind::Terminal => Vec::new(),
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Record {
     pub version: u32,
+    #[serde(default)]
+    pub build: Option<BuildIdentity>,
     /// Older terminal records predate native holders. Their existing private
     /// directory and absent kind continue to identify them as terminals.
     #[serde(default)]
@@ -49,6 +80,103 @@ pub(crate) struct Record {
     pub terminal: TerminalId,
     pub holder: Process,
     pub root: Process,
+}
+
+pub(crate) const RETAINED_CLAUDE_CAPABILITY: &str = "claude-actor-v2";
+
+/// Retained Claude discovery visibility only. Attachment still requires the
+/// original record, authenticated peer, daemon lease and actor epoch. Ordinary
+/// terminal discovery and native Codex matching remain application-exact.
+pub(crate) fn record_application_matches(record: &Record) -> bool {
+    record_application_matches_for(
+        record,
+        crate::instance::APPLICATION_ID,
+        crate::instance::IS_DEVELOPMENT,
+    )
+}
+
+fn record_application_matches_for(record: &Record, current: &str, development: bool) -> bool {
+    record.application == current
+        || (!development
+            && record.kind == Kind::Native
+            && production_role_pair(&record.application, current)
+            && record.build.as_ref().is_some_and(|build| {
+                build
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == RETAINED_CLAUDE_CAPABILITY)
+            }))
+}
+
+/// Read-only recovery intake may inspect the other production package's original
+/// holder. This is not adoption or cleanup authority: those paths must retain
+/// an authenticated exact-record transition after checking live issued lineage.
+fn recovery_role(application: &str) -> bool {
+    production_role_pair(application, crate::instance::APPLICATION_ID)
+}
+
+pub(crate) fn production_role_pair(original: &str, successor: &str) -> bool {
+    matches!(
+        (original, successor),
+        ("dev.cagents.Cagents", "dev.cagents.Cagents.Browserless")
+            | ("dev.cagents.Cagents.Browserless", "dev.cagents.Cagents")
+    )
+}
+
+/// Private, process-local custody established only after authenticated Inspect
+/// or an exact durable cleanup receipt, and exact issued-source matching. It never changes the original Record.
+#[derive(Clone)]
+pub(crate) struct OriginalRole {
+    record: Record,
+    original: crate::model::HostSessionProof,
+    successor: crate::model::HostSessionProof,
+    application: &'static str,
+}
+
+impl OriginalRole {
+    pub(crate) fn authenticated(
+        record: &Record,
+        original: &crate::model::HostSessionProof,
+        successor: &crate::model::HostSessionProof,
+    ) -> Result<Option<Self>, String> {
+        if record.application == crate::instance::APPLICATION_ID {
+            return Ok(None);
+        }
+        if !recovery_role(&record.application)
+            || !original.is_complete()
+            || !successor.is_complete()
+            || original.boot_id != record.boot
+            || successor.boot_id != record.boot
+        {
+            return Err("Holder role transition lacks exact same-boot issued ownership".into());
+        }
+        let paths = crate::daemon::RuntimePaths::discover().map_err(|e| e.to_string())?;
+        if crate::daemon::lease_owner(&paths.lock, successor).map_err(|e| e.to_string())?
+            != std::process::id()
+        {
+            return Err("Holder role transition caller no longer owns the daemon lease".into());
+        }
+        Ok(Some(Self {
+            record: record.clone(),
+            original: original.clone(),
+            successor: successor.clone(),
+            application: crate::instance::APPLICATION_ID,
+        }))
+    }
+
+    pub(crate) fn matches(&self, record: &Record, proof: &crate::model::HostSessionProof) -> bool {
+        self.application == crate::instance::APPLICATION_ID && self.matches_original(record, proof)
+    }
+
+    fn matches_original(&self, record: &Record, proof: &crate::model::HostSessionProof) -> bool {
+        self.record == *record
+            && self.successor == *proof
+            && self.original.is_complete()
+            && self.original.boot_id == record.boot
+            && proof.is_complete()
+            && proof.boot_id == record.boot
+            && production_role_pair(&record.application, self.application)
+    }
 }
 
 pub(crate) fn directory(kind: Kind) -> Result<PathBuf, String> {
@@ -135,10 +263,64 @@ pub(crate) fn connect(path: &Path) -> io::Result<std::os::unix::net::UnixStream>
 }
 
 impl Record {
+    pub(crate) fn is_outdated(&self) -> bool {
+        self.build.as_ref().is_none_or(|build| {
+            build.version != crate::VERSION
+                || (self.kind == Kind::Native
+                    && !build
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == "event-driven-orphan-reaping"))
+        })
+    }
+
+    /// A diagnostic snapshot, never process-control authority. Verify the
+    /// holder's start identity both before and after scanning its direct children.
+    pub(crate) fn zombie_children(&self) -> io::Result<usize> {
+        if !self.holder.is_current() {
+            return Err(io::Error::other("holder process identity changed"));
+        }
+        // Linux records children on the thread that created them, even though
+        // their stat parent is the process leader. Inspect every live thread.
+        let mut children = std::collections::BTreeSet::new();
+        for task in fs::read_dir(format!("/proc/{}/task", self.holder.pid))? {
+            let task = task?;
+            let raw = match fs::read_to_string(task.path().join("children")) {
+                Ok(raw) => raw,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            children.extend(
+                raw.split_whitespace()
+                    .filter_map(|pid| pid.parse::<i32>().ok()),
+            );
+        }
+        let zombies = children
+            .into_iter()
+            .filter(|pid| {
+                fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|stat| {
+                        stat.rsplit_once(')').map(|(_, fields)| {
+                            let mut fields = fields.split_whitespace();
+                            fields.next() == Some("Z")
+                                && fields.next().and_then(|parent| parent.parse::<i32>().ok())
+                                    == Some(self.holder.pid)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .count();
+        if !self.holder.is_current() {
+            return Err(io::Error::other("holder process identity changed"));
+        }
+        Ok(zombies)
+    }
+
     fn supported_version(&self) -> bool {
         match self.kind {
-            Kind::Terminal => matches!(self.version, 3 | 4),
-            Kind::Native => self.version == 3,
+            Kind::Terminal => matches!(self.version, 3 | 4 | 5),
+            Kind::Native => matches!(self.version, 2 | 3 | 4),
         }
     }
 
@@ -239,6 +421,16 @@ pub(crate) fn retirement_pending(expected: &Record) -> io::Result<bool> {
 }
 
 pub(crate) fn evidence(socket: &Path, kind: Kind) -> Result<Option<Record>, String> {
+    evidence_inner(socket, kind, false)
+}
+
+/// Untrusted routing evidence for the recovery Inspect handshake only. Ordinary
+/// discovery stays application-exact; no caller may infer adoption from this.
+pub(crate) fn recovery_candidate(socket: &Path, kind: Kind) -> Result<Option<Record>, String> {
+    evidence_inner(socket, kind, true)
+}
+
+fn evidence_inner(socket: &Path, kind: Kind, recovery: bool) -> Result<Option<Record>, String> {
     let path = socket.with_extension("json");
     let record = match read(&path) {
         Ok(record) => record,
@@ -248,7 +440,8 @@ pub(crate) fn evidence(socket: &Path, kind: Kind) -> Result<Option<Record>, Stri
     let boot = crate::daemon::read_boot_id().map_err(|error| error.to_string())?;
     if !record.supported_version()
         || record.kind != kind
-        || record.application != crate::instance::APPLICATION_ID
+        || (record.application != crate::instance::APPLICATION_ID
+            && !(recovery && recovery_role(&record.application)))
         || record.boot != boot
         || socket.file_name() != Some(std::ffi::OsStr::new(&record.terminal.to_string()))
     {
@@ -257,7 +450,67 @@ pub(crate) fn evidence(socket: &Path, kind: Kind) -> Result<Option<Record>, Stri
     Ok(Some(record))
 }
 
+/// Read-only runtime evidence for diagnostics. Unlike recovery discovery this
+/// never creates directories, removes stale files, or contacts a helper.
+pub(crate) fn observed(kind: Kind) -> io::Result<Vec<Record>> {
+    let directory = directory(kind).map_err(io::Error::other)?;
+    crate::secure_file::reject_symlink_components(&directory)?;
+    let metadata = match fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_dir()
+        || metadata.uid() != crate::daemon::current_uid()
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe holder directory",
+        ));
+    }
+    let boot = crate::daemon::read_boot_id()?;
+    let mut records = Vec::new();
+    for (index, entry) in fs::read_dir(&directory)?.enumerate() {
+        if index >= 8192 {
+            return Err(io::Error::other("holder discovery limit exceeded"));
+        }
+        let path = entry?.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let record = read(&path)?;
+        if record.kind == kind
+            && record.supported_version()
+            && record.application == crate::instance::APPLICATION_ID
+            && record.boot == boot
+            && record.path(&directory) == path
+            && record.holder.is_current()
+        {
+            records.push(record);
+        }
+    }
+    Ok(records)
+}
+
 pub(crate) fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Vec<Record>, String> {
+    discover_inner(directory, boot, kind, false)
+}
+
+pub(crate) fn recovery_candidates(
+    directory: &Path,
+    boot: &BootId,
+    kind: Kind,
+) -> Result<Vec<Record>, String> {
+    discover_inner(directory, boot, kind, true)
+}
+
+fn discover_inner(
+    directory: &Path,
+    boot: &BootId,
+    kind: Kind,
+    recovery: bool,
+) -> Result<Vec<Record>, String> {
     crate::secure_file::prepare_private_directory(directory).map_err(|error| error.to_string())?;
     let mut records = Vec::new();
     for (index, entry) in fs::read_dir(directory)
@@ -280,7 +533,8 @@ pub(crate) fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Ve
         };
         if !record.supported_version()
             || record.kind != kind
-            || record.application != crate::instance::APPLICATION_ID
+            || (record.application != crate::instance::APPLICATION_ID
+                && !(recovery && recovery_role(&record.application)))
             || record.path(directory) != path
             || &record.boot != boot
         {
@@ -288,7 +542,11 @@ pub(crate) fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Ve
             continue;
         }
         if !record.holder.is_current() {
-            record.remove(directory);
+            // Candidate intake grants no mutation authority over the other
+            // package's evidence, including an unresolved orphan root.
+            if record.application == crate::instance::APPLICATION_ID {
+                record.remove(directory);
+            }
             continue;
         }
         records.push(record);
@@ -304,10 +562,205 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    #[test]
+    fn retained_claude_family_visibility_keeps_original_record_and_codex_isolation() {
+        const FULL: &str = "dev.cagents.Cagents";
+        const BROWSERLESS: &str = "dev.cagents.Cagents.Browserless";
+        for (current, prior) in [(FULL, BROWSERLESS), (BROWSERLESS, FULL)] {
+            let mut actor = record();
+            actor.version = 4;
+            actor.kind = Kind::Native;
+            actor.application = prior.into();
+            actor.build = Some(BuildIdentity::current(Kind::Native));
+            let original = serde_json::to_vec(&actor).unwrap();
+            assert!(
+                !record_application_matches_for(&actor, current, false),
+                "native Codex stays exact"
+            );
+            actor
+                .build
+                .as_mut()
+                .unwrap()
+                .capabilities
+                .push("claude-actor-v2".into());
+            let original_actor = serde_json::to_vec(&actor).unwrap();
+            assert!(record_application_matches_for(&actor, current, false));
+            assert!(
+                !record_application_matches_for(&actor, current, true),
+                "development cannot acquire production actors"
+            );
+            assert!(!record_application_matches_for(
+                &actor,
+                "another.installation",
+                false
+            ));
+            assert_eq!(
+                serde_json::to_vec(&actor).unwrap(),
+                original_actor,
+                "visibility never retags application/process provenance"
+            );
+            actor.build.as_mut().unwrap().capabilities.pop();
+            assert_eq!(serde_json::to_vec(&actor).unwrap(), original);
+            assert!(!record_application_matches_for(&actor, current, false));
+            actor.build = None;
+            assert!(
+                !record_application_matches_for(&actor, current, false),
+                "legacy records cannot infer the actor protocol"
+            );
+        }
+        let mut terminal = record();
+        terminal.application = BROWSERLESS.into();
+        terminal.kind = Kind::Terminal;
+        terminal
+            .build
+            .as_mut()
+            .unwrap()
+            .capabilities
+            .push(RETAINED_CLAUDE_CAPABILITY.into());
+        assert!(
+            !record_application_matches_for(&terminal, FULL, false),
+            "Claude capability cannot widen terminal discovery"
+        );
+        terminal.application = FULL.into();
+        assert!(record_application_matches_for(&terminal, FULL, false));
+        let mut foreign = record();
+        foreign.kind = Kind::Native;
+        foreign.application = "dev.cagents.Cagents.Development".into();
+        foreign
+            .build
+            .as_mut()
+            .unwrap()
+            .capabilities
+            .push("claude-actor-v2".into());
+        assert!(!record_application_matches_for(&foreign, FULL, false));
+        foreign.application = "another.installation".into();
+        assert!(!record_application_matches_for(
+            &foreign,
+            BROWSERLESS,
+            false
+        ));
+    }
+
+    #[test]
+    fn recovery_roles_are_only_the_two_distinct_production_packages() {
+        let full = "dev.cagents.Cagents";
+        let browserless = "dev.cagents.Cagents.Browserless";
+        assert!(production_role_pair(full, browserless));
+        assert!(production_role_pair(browserless, full));
+        for unrelated in [
+            "dev.cagents.Cagents.Development",
+            "another-installation",
+            "",
+            full,
+        ] {
+            assert!(!production_role_pair(full, unrelated));
+            assert!(!production_role_pair(unrelated, full));
+        }
+    }
+
+    #[test]
+    fn retained_role_capability_cannot_move_to_another_record_or_daemon() {
+        // Pure capability/data oracle. This does not impersonate a production
+        // executable or claim the real cross-package/native qualification.
+        let mut original = record();
+        original.application = "dev.cagents.Cagents.Browserless".into();
+        let proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("original-role-test"),
+            host_incarnation: crate::model::HostIncarnation::new("successor"),
+            boot_id: original.boot.clone(),
+        };
+        let role = OriginalRole {
+            record: original.clone(),
+            original: proof.clone(),
+            successor: proof.clone(),
+            application: "dev.cagents.Cagents",
+        };
+        assert!(role.matches_original(&original, &proof));
+        let mut changed = original.clone();
+        changed.root.start += 1;
+        assert!(!role.matches_original(&changed, &proof));
+        changed = original.clone();
+        changed.holder.start += 1;
+        assert!(!role.matches_original(&changed, &proof));
+        changed = original.clone();
+        changed.terminal = TerminalId::new();
+        assert!(!role.matches_original(&changed, &proof));
+        changed = original.clone();
+        changed.application = "dev.cagents.Cagents".into();
+        assert!(!role.matches_original(&changed, &proof));
+        let mut other = proof.clone();
+        other.host_incarnation = crate::model::HostIncarnation::new("different-daemon");
+        assert!(!role.matches_original(&original, &other));
+        if crate::instance::IS_DEVELOPMENT {
+            assert!(
+                !role.matches(&original, &proof),
+                "production capability entered development"
+            );
+            assert!(OriginalRole::authenticated(&original, &proof, &proof).is_err());
+        }
+    }
+
+    #[test]
+    fn ordinary_discovery_refuses_other_production_role_without_mutating_it() {
+        // This is on-disk untrusted evidence, never a spawned/renamed helper.
+        // Actual cross-role adoption requires separately built real products.
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let mut foreign = record();
+        foreign.application =
+            if crate::instance::APPLICATION_ID == "dev.cagents.Cagents.Browserless" {
+                "dev.cagents.Cagents"
+            } else {
+                "dev.cagents.Cagents.Browserless"
+            }
+            .into();
+        assert_ne!(foreign.application, crate::instance::APPLICATION_ID);
+        foreign.create(directory.path()).unwrap();
+        let endpoint = socket(directory.path(), foreign.terminal);
+        let path = foreign.path(directory.path());
+        let before = fs::read(&path).unwrap();
+        assert!(evidence(&endpoint, Kind::Terminal).is_err());
+        assert!(
+            discover(directory.path(), &foreign.boot, Kind::Terminal)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        if crate::instance::IS_DEVELOPMENT {
+            assert!(recovery_candidate(&endpoint, Kind::Terminal).is_err());
+            assert!(
+                recovery_candidates(directory.path(), &foreign.boot, Kind::Terminal)
+                    .unwrap()
+                    .is_empty()
+            );
+        } else {
+            assert_eq!(
+                recovery_candidate(&endpoint, Kind::Terminal).unwrap(),
+                Some(foreign.clone())
+            );
+            assert_eq!(
+                recovery_candidates(directory.path(), &foreign.boot, Kind::Terminal).unwrap(),
+                vec![foreign.clone()]
+            );
+            let missing = crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new(""),
+                host_incarnation: crate::model::HostIncarnation::new(""),
+                boot_id: foreign.boot.clone(),
+            };
+            assert!(
+                OriginalRole::authenticated(&foreign, &missing, &missing).is_err(),
+                "candidate became authority without issued proof"
+            );
+        }
+        assert_eq!(read(&path).unwrap(), foreign);
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
     fn record() -> Record {
         let process = Process::read(std::process::id() as i32).unwrap();
         Record {
             version: 3,
+            build: Some(BuildIdentity::current(Kind::Terminal)),
             kind: Kind::Terminal,
             application: crate::instance::APPLICATION_ID.into(),
             boot: crate::daemon::read_boot_id().unwrap(),
@@ -445,7 +898,8 @@ mod tests {
     }
 
     #[test]
-    fn terminal_receipt_protocol_is_discovered_without_widening_native_versions() {
+    fn terminal_receipt_protocol_and_known_native_build_are_discovered_but_unknown_native_is_refused()
+     {
         let directory = tempfile::tempdir().unwrap();
         let mut terminal = record();
         terminal.version = 4;
@@ -462,12 +916,54 @@ mod tests {
         native.kind = Kind::Native;
         native.version = 4;
         native.create(directory.path()).unwrap();
+        assert_eq!(
+            evidence(&socket(directory.path(), native.terminal), Kind::Native).unwrap(),
+            Some(native.clone())
+        );
+        assert_eq!(
+            discover(directory.path(), &native.boot, Kind::Native).unwrap(),
+            vec![native.clone()]
+        );
+        native.remove(directory.path());
+        native.version = 5;
+        native.create(directory.path()).unwrap();
         assert!(evidence(&socket(directory.path(), native.terminal), Kind::Native).is_err());
         assert!(
             discover(directory.path(), &native.boot, Kind::Native)
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn terminal_directory_pin_protocol_is_discovered_but_future_evidence_is_preserved() {
+        let directory = tempfile::tempdir().unwrap();
+        for version in [3, 4, 5] {
+            let mut terminal = record();
+            terminal.version = version;
+            terminal.create(directory.path()).unwrap();
+            assert_eq!(
+                evidence(&socket(directory.path(), terminal.terminal), Kind::Terminal).unwrap(),
+                Some(terminal.clone())
+            );
+            assert_eq!(
+                discover(directory.path(), &terminal.boot, Kind::Terminal).unwrap(),
+                vec![terminal.clone()]
+            );
+            terminal.remove(directory.path());
+        }
+
+        let mut future = record();
+        future.version = 6;
+        future.create(directory.path()).unwrap();
+        let before = fs::read(future.path(directory.path())).unwrap();
+        assert!(evidence(&socket(directory.path(), future.terminal), Kind::Terminal).is_err());
+        assert!(
+            discover(directory.path(), &future.boot, Kind::Terminal)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read(future.path(directory.path())).unwrap(), before);
     }
 
     #[test]
@@ -531,5 +1027,51 @@ mod tests {
         assert!(evidence(&socket(directory.path(), native.terminal), Kind::Terminal).is_err());
         assert!(native.path(directory.path()).exists());
         assert!(terminal.path(directory.path()).exists());
+    }
+    #[test]
+    fn legacy_native_record_remains_adoptable_and_is_outdated() {
+        let mut value = serde_json::to_value(record()).unwrap();
+        value["version"] = serde_json::json!(2);
+        value["kind"] = serde_json::json!("Native");
+        value.as_object_mut().unwrap().remove("build");
+        let legacy: Record = serde_json::from_value(value).unwrap();
+        assert!(legacy.supported_version());
+        assert!(legacy.is_outdated());
+        let mut current = legacy;
+        current.version = 4;
+        current.build = Some(BuildIdentity::current(Kind::Native));
+        assert!(!current.is_outdated());
+        current.build.as_mut().unwrap().capabilities.clear();
+        assert!(current.is_outdated());
+    }
+
+    #[test]
+    fn zombie_count_observes_children_without_consuming_status() {
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        child.id(),
+                        &mut status,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                },
+                0
+            );
+            if unsafe { status.si_pid() } != 0 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(record().zombie_children().unwrap() >= 1);
+        assert!(
+            child.wait().unwrap().success(),
+            "diagnostics consumed the exit status"
+        );
     }
 }

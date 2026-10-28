@@ -4,11 +4,9 @@
 
 use super::Registry;
 use crate::agent_execution::Lineage;
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, params};
 
-pub(super) fn migrate(db: &Connection) -> Result<(), String> {
-    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)
-        .map_err(|error| error.to_string())?;
+pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     let current: u32 = tx
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
@@ -17,12 +15,11 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
             "CREATE TABLE IF NOT EXISTS terminal_owners(
                  lineage TEXT PRIMARY KEY,
                  owner TEXT NOT NULL
-             ) STRICT;
-             PRAGMA user_version = 6;",
+             ) STRICT;",
         )
         .map_err(|error| error.to_string())?;
     }
-    tx.commit().map_err(|error| error.to_string())
+    Ok(())
 }
 
 impl Registry {

@@ -121,56 +121,131 @@ impl Drop for Acl {
     }
 }
 
-pub(super) fn copy_access_acl(source: &File, destination: &File) -> io::Result<()> {
-    let original = FileSecurity::new()?;
-    let replacement = FileSecurity::new()?;
-    let mut metadata = MaybeUninit::<libc::stat>::uninit();
-    // Read failure must not be confused with a successfully observed absent
-    // ACL. fstatx fills only caller-owned storage through the retained source fd.
-    // SAFETY: all output allocations and the source descriptor remain live.
-    if unsafe { fstatx_np(source.as_raw_fd(), metadata.as_mut_ptr(), original.0) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let mut acl = Acl(ptr::null_mut());
-    // SAFETY: the output points to an opaque pointer-sized ACL slot.
-    let status = unsafe {
-        filesec_get_property(
-            original.0,
-            FILESEC_ACL,
-            (&mut acl.0 as *mut *mut libc::c_void).cast(),
-        )
-    };
-    let property = if status == 0 {
-        if acl.0.is_null() {
-            return Err(io::Error::other(
-                "the filesystem returned an invalid access ACL",
-            ));
+/// A native access ACL captured from one retained source observation.
+/// The allocation is independent of both the source file and filesec object.
+pub(super) struct AccessAcl(Acl);
+
+impl AccessAcl {
+    pub(super) fn capture(source: &File) -> io::Result<Self> {
+        let original = FileSecurity::new()?;
+        let mut metadata = MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: caller-owned stat/filesec storage and source fd remain live.
+        if unsafe { fstatx_np(source.as_raw_fd(), metadata.as_mut_ptr(), original.0) } != 0 {
+            return Err(io::Error::last_os_error());
         }
-        if acl.0 as usize == 1 {
+        let mut acl = Acl(ptr::null_mut());
+        // SAFETY: the output is a pointer-sized slot for an independent ACL.
+        let status = unsafe {
+            filesec_get_property(
+                original.0,
+                FILESEC_ACL,
+                (&mut acl.0 as *mut *mut libc::c_void).cast(),
+            )
+        };
+        if status == 0 {
+            if acl.0.is_null() {
+                return Err(io::Error::other(
+                    "the filesystem returned an invalid access ACL",
+                ));
+            }
+        } else {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ENOENT) {
+                return Err(error);
+            }
+            // Only after successful stat can ENOENT mean observed absence.
+            // The null slot records absence without manufacturing an allocation.
+            acl = Acl(ptr::null_mut());
+        }
+        Ok(Self(acl))
+    }
+
+    pub(super) fn apply(&self, destination: &File) -> io::Result<()> {
+        let replacement = FileSecurity::new()?;
+        let property = if self.0.0.is_null() || self.0.0 as usize == 1 {
             ptr::without_provenance(1)
         } else {
-            (&acl.0 as *const *mut libc::c_void).cast()
+            (&self.0.0 as *const *mut libc::c_void).cast()
+        };
+        // A fresh object contains only the ACL: no captured mode or ownership
+        // can restore set-ID bits or overwrite the caller's current checks.
+        // SAFETY: property is the retained ACL pointer slot or remove marker.
+        if unsafe { filesec_set_property(replacement.0, FILESEC_ACL, property) } != 0 {
+            return Err(io::Error::last_os_error());
         }
-    } else {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ENOENT) {
-            return Err(error);
+        // SAFETY: both retained destination and security object remain live.
+        if unsafe { fchmodx_np(destination.as_raw_fd(), replacement.0) } != 0 {
+            return Err(io::Error::last_os_error());
         }
-        // After successful source stat, ENOENT means this property is absent.
-        // Explicit removal prevents inheriting the temporary parent's ACL.
-        ptr::without_provenance(1)
+        Ok(())
+    }
+}
+
+/// Enumerate only the retained directory, never its mutable original name.
+pub(super) fn directory_entries(
+    descriptor: libc::c_int,
+    limit: usize,
+) -> io::Result<Vec<std::ffi::OsString>> {
+    use std::os::{
+        fd::{FromRawFd, IntoRawFd, OwnedFd},
+        unix::ffi::OsStringExt,
     };
-    // A fresh security object contains only the ACL, so applying it cannot
-    // restore set-ID mode bits or overwrite ownership already checked by caller.
-    // SAFETY: property is an ACL pointer slot or the documented remove marker.
-    if unsafe { filesec_set_property(replacement.0, FILESEC_ACL, property) } != 0 {
+    // Open a readable stream relative to the retained event-only directory.
+    // SAFETY: this static component cannot escape or follow a repository link.
+    let readable = unsafe {
+        libc::openat(
+            descriptor,
+            c".".as_ptr(),
+            libc::O_RDONLY
+                | libc::O_DIRECTORY
+                | libc::O_NOFOLLOW
+                | libc::O_NONBLOCK
+                | libc::O_CLOEXEC,
+        )
+    };
+    if readable < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: destination is retained; replacement owns its independent ACL.
-    if unsafe { fchmodx_np(destination.as_raw_fd(), replacement.0) } != 0 {
+    // SAFETY: openat returned a fresh descriptor exclusively owned here.
+    let readable = unsafe { OwnedFd::from_raw_fd(readable) };
+    // SAFETY: fdopendir takes ownership only on success.
+    let stream = unsafe { libc::fdopendir(readable.as_raw_fd()) };
+    if stream.is_null() {
         return Err(io::Error::last_os_error());
     }
-    Ok(())
+    let _ = readable.into_raw_fd();
+    struct Stream(*mut libc::DIR);
+    impl Drop for Stream {
+        fn drop(&mut self) {
+            // SAFETY: this wrapper uniquely owns the successful fdopendir stream.
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+    let stream = Stream(stream);
+    let mut names = Vec::new();
+    loop {
+        // Darwin readdir reports EOF with unchanged errno and errors with errno.
+        // SAFETY: __error points to this thread's errno; stream remains live.
+        unsafe { *libc::__error() = 0 };
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(0) {
+                Ok(names)
+            } else {
+                Err(error)
+            };
+        }
+        // SAFETY: readdir's NUL-terminated name remains live until the next call.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        if names.len() == limit {
+            return Err(io::Error::other("directory entry limit exceeded"));
+        }
+        names.push(std::ffi::OsString::from_vec(name.to_vec()));
+    }
 }
 
 #[cfg(test)]
@@ -245,12 +320,14 @@ mod tests {
         );
         let expected = acl_text(&source);
         assert!(expected.is_some(), "fixture must install an explicit ACL");
+        let captured =
+            super::super::AccessAcl::capture(&source).expect("capture native ACL snapshot");
         assert_ne!(
             expected,
             acl_text(&destination),
             "fixture must establish distinct native access control"
         );
-        copy_access_acl(&source, &destination).expect("preserve explicit native ACL");
+        super::super::copy_access_acl(&source, &destination).expect("preserve explicit native ACL");
         assert_eq!(acl_text(&destination), expected);
 
         assert!(
@@ -268,8 +345,28 @@ mod tests {
             acl_text(&destination),
             "replacement still carries the previously installed ACL"
         );
-        copy_access_acl(&source, &destination).expect("remove inherited or previous native ACL");
+        super::super::copy_access_acl(&source, &destination)
+            .expect("remove inherited or previous native ACL");
         assert_eq!(acl_text(&destination), absent);
+        // Applying the captured snapshot must not reread the now-absent source ACL.
+        captured
+            .apply(&destination)
+            .expect("apply retained native ACL snapshot");
+        assert_eq!(acl_text(&destination), expected);
+        let absent_snapshot = super::super::AccessAcl::capture(&source).unwrap();
+        assert!(
+            Command::new("/bin/chmod")
+                .args(["+a", &entry])
+                .arg(&source_path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(acl_text(&source).is_some());
+        absent_snapshot
+            .apply(&destination)
+            .expect("apply captured absence despite current source ACL");
+        assert!(acl_text(&destination).is_none());
         assert_eq!(
             fs::read(&destination_path).unwrap(),
             b"replacement contents"

@@ -11,7 +11,7 @@
 
 use std::{
     fs, io,
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -24,17 +24,30 @@ use crate::{
     workspace_model::{ModelChannel, ModelEdit, ModelProject, WorkspaceModel},
 };
 
+mod archived_history;
+mod automation_audit;
+pub(super) use archived_history::ArchivedHistory;
+pub(super) mod automation_notifications;
 mod automation_proposals;
 mod automations;
+pub(super) mod channel_work;
+#[cfg(test)]
+mod channel_work_integration_tests;
 pub(super) use automations::Claimed;
 mod execution;
+pub(super) use execution::ResidentRelease;
 mod lineage;
 mod mailbox;
+mod native_actor;
+mod native_actor_retirement;
+pub(super) use native_actor::NativeActorEvent;
+pub(super) use native_actor_retirement::{NativeActorOwnership, NativeActorRetirement};
 mod navigation;
+mod schema;
 mod terminal_owners;
 mod views;
 
-const SCHEMA_VERSION: u32 = 12;
+const SCHEMA_VERSION: u32 = 19;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -70,15 +83,7 @@ impl Registry {
 
     /// Opens or creates the registry at `path`.
     pub(crate) fn at(path: &Path) -> Result<Self, String> {
-        if let Some(parent) = path.parent() {
-            create_private_directory(parent)
-                .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
-        }
-        prepare_private_file(path)
-            .map_err(|error| format!("cannot prepare {}: {error}", path.display()))?;
-        let db = Connection::open(path).map_err(|error| error.to_string())?;
-        configure(&db)?;
-        migrate(&db)?;
+        let db = schema::open(path)?;
         Ok(Self {
             db,
             path: path.to_owned(),
@@ -208,11 +213,15 @@ impl Registry {
     /// The caller has already resolved the edit's repository key; this never
     /// touches the filesystem, so an edit is decided entirely from the store.
     pub(crate) fn apply(&mut self, edit: &ModelEdit) -> Result<Applied, String> {
-        let transaction = self.db.transaction().map_err(|error| error.to_string())?;
+        let transaction = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        schema::require_current(&transaction)?;
         let changed = match edit {
             ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply(&transaction, edit)?,
             ModelEdit::ResetNavigation { .. } | ModelEdit::ReorderNavigation { .. } => navigation::apply(&transaction, edit)?,
-            ModelEdit::AgentsChanged => {
+            ModelEdit::AgentsChanged | ModelEdit::ChannelWorkChanged { .. } => {
                 return Err("Agent model changes are committed by the execution service".into());
             }
             ModelEdit::OpenProject {
@@ -294,6 +303,15 @@ impl Registry {
             // nobody has open is reachable from no window's sidebar.
             ModelEdit::CloseProject { repository } => {
                 let key = repository_key(repository)?;
+                let channels = {
+                    let mut statement = transaction.prepare("SELECT id FROM channels WHERE repository=?1").map_err(|e| e.to_string())?;
+                    statement.query_map(params![key], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?
+                        .collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
+                };
+                views::retire_project_placements(&transaction, repository)?;
+                for channel in channels {
+                    channel_work::deleted_in(&transaction, channel.parse().map_err(|_| "The channel identity is unreadable")?)?;
+                }
                 let removed = transaction
                     .execute("DELETE FROM projects WHERE repository = ?1", params![key])
                     .map_err(|error| error.to_string())?
@@ -352,6 +370,7 @@ impl Registry {
                             params![id.to_string(), key, title, ordinal, *title_source as i64],
                         )
                         .map_err(|error| error.to_string())?;
+                    channel_work::created_in(&transaction, *id)?;
                     true
                 }
             }
@@ -377,7 +396,29 @@ impl Registry {
                     params![id.to_string(), title, *source as i64],
                 ).map_err(|error| error.to_string())? > 0
             }
+            ModelEdit::SuggestConversationTitle { id, card, expected_revision, title, source } => {
+                if *source == ChannelTitleSource::Manual || title.is_empty() {
+                    return Err("channel title suggestions require a nonempty inferred title".into());
+                }
+                let view = views::read(&transaction, &crate::workspace_model::views::Scope::Channel(*id))?;
+                if view.revision != *expected_revision || view.primary_chat() != Some(*card) {
+                    return Err("The channel's primary conversation changed; title suggestion refused".into());
+                }
+                transaction.execute(
+                    "UPDATE channels SET title = ?2, title_source = ?3 WHERE id = ?1 AND (title = '' OR title_source <= ?3) AND (title <> ?2 OR title_source <> ?3)",
+                    params![id.to_string(), title, *source as i64],
+                ).map_err(|error| error.to_string())? > 0
+            }
+            ModelEdit::RetireEmptyChannel { home, expected_view_revision } => {
+                if channel_work::may_auto_retire_in(&transaction, home, *expected_view_revision)? {
+                    views::retire_channel_placements(&transaction, home.channel)?;
+                    channel_work::deleted_in(&transaction, home.channel)?;
+                    transaction.execute("DELETE FROM channels WHERE id=?1", params![home.channel.to_string()]).map_err(|e| e.to_string())? > 0
+                } else { false }
+            }
             ModelEdit::DeleteChannel { id } => {
+                views::retire_channel_placements(&transaction, *id)?;
+                channel_work::deleted_in(&transaction, *id)?;
                 transaction
                     .execute(
                         "DELETE FROM channels WHERE id = ?1",
@@ -388,6 +429,14 @@ impl Registry {
             }
         };
         if changed {
+            match edit {
+                ModelEdit::RetitleChannel { id, .. }
+                | ModelEdit::SuggestChannelTitle { id, .. }
+                | ModelEdit::SuggestConversationTitle { id, .. } => {
+                    channel_work::renamed_in(&transaction, *id)?
+                }
+                _ => {}
+            }
             transaction
                 .execute(
                     "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
@@ -458,78 +507,14 @@ fn create_private_directory(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Creates the store file with a private mode, or re-asserts the mode of one
-/// that already exists.
-///
-/// The model names every repository the user has open, which is nobody else's
-/// business on a shared machine.
-fn prepare_private_file(path: &Path) -> io::Result<()> {
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(FILE_MODE)
-        .open(path)
-    {
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            fs::set_permissions(path, fs::Permissions::from_mode(FILE_MODE))
-        }
-        Err(error) => Err(error),
-    }
-}
-
-/// Applies the pragmas this store depends on, and verifies each one.
-///
-/// `foreign_keys` is load-bearing rather than hygienic: closing a project
-/// removes its channels through the cascade, so an unenforced foreign key would
-/// silently leave channels behind that no sidebar can reach. `FULL` makes
-/// execution acceptance durable before launching a child or submitting its
-/// prompt, including a power failure after the external side effect begins.
-fn configure(db: &Connection) -> Result<(), String> {
-    db.busy_timeout(BUSY_TIMEOUT)
-        .map_err(|error| error.to_string())?;
-    db.execute_batch(
-        "PRAGMA foreign_keys = ON;
-         PRAGMA journal_mode = WAL;
-         PRAGMA synchronous = FULL;",
-    )
-    .map_err(|error| error.to_string())?;
-    let foreign_keys: i64 = db
-        .pragma_query_value(None, "foreign_keys", |row| row.get(0))
-        .map_err(|error| error.to_string())?;
-    if foreign_keys != 1 {
-        return Err("SQLite foreign key enforcement could not be enabled".into());
-    }
-    let journal_mode: String = db
-        .pragma_query_value(None, "journal_mode", |row| row.get(0))
-        .map_err(|error| error.to_string())?;
-    if !journal_mode.eq_ignore_ascii_case("wal") {
-        return Err(format!(
-            "SQLite journal mode is `{journal_mode}`, but write-ahead logging is required"
-        ));
-    }
-    // 0 = OFF, 1 = NORMAL, 2 = FULL, 3 = EXTRA.
-    let synchronous: i64 = db
-        .pragma_query_value(None, "synchronous", |row| row.get(0))
-        .map_err(|error| error.to_string())?;
-    if synchronous != 2 {
-        return Err(format!(
-            "SQLite synchronous mode is {synchronous}, but FULL (2) is required"
-        ));
-    }
-    Ok(())
-}
-
-fn migrate(db: &Connection) -> Result<(), String> {
-    let version: u32 = db
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(|error| error.to_string())?;
-    if version > SCHEMA_VERSION {
-        return Err(format!(
-            "workspace registry schema {version} is newer than supported schema {SCHEMA_VERSION}"
-        ));
-    }
-    db.execute_batch(
+/// Runs the published migration bodies inside the caller's writer transaction.
+/// The header is published only after every body and the final layout validate.
+fn migrate_through(
+    tx: &rusqlite::Transaction<'_>,
+    version: u32,
+    target: u32,
+) -> Result<(), String> {
+    tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS projects(
              repository TEXT PRIMARY KEY,
              name TEXT NOT NULL,
@@ -558,7 +543,7 @@ fn migrate(db: &Connection) -> Result<(), String> {
          ) STRICT;",
     )
     .map_err(|error| error.to_string())?;
-    let has_kind: bool = db
+    let has_kind: bool = tx
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('projects') WHERE name = 'kind')",
             [],
@@ -566,62 +551,92 @@ fn migrate(db: &Connection) -> Result<(), String> {
         )
         .map_err(|error| error.to_string())?;
     if !has_kind {
-        db.execute_batch("ALTER TABLE projects ADD COLUMN kind TEXT NOT NULL DEFAULT 'git' CHECK(kind IN ('git', 'folder'));")
+        tx.execute_batch("ALTER TABLE projects ADD COLUMN kind TEXT NOT NULL DEFAULT 'git' CHECK(kind IN ('git', 'folder'));")
             .map_err(|error| error.to_string())?;
     }
     // The identity is minted here rather than in `at`, because this is the only
     // place that can tell a store being created from one being reopened: the
     // ignored insert is what makes minting happen exactly once, and a reopened
     // registry has to keep the identity every window recorded against it.
-    db.execute(
+    tx.execute(
         "INSERT OR IGNORE INTO metadata(
              key, identity, sequence, next_project_ordinal, next_channel_ordinal
          ) VALUES (0, ?1, 0, 1, 1)",
         [Uuid::new_v4().to_string()],
     )
     .map_err(|error| error.to_string())?;
-    if version < 1 {
-        execution::migrate(db)?;
+    if version < 1 && target >= 1 {
+        execution::migrate(tx)?;
+        schema::migration_checkpoint(1)?;
     }
-    if version < 2 {
-        automations::migrate(db)?;
+    if version < 2 && target >= 2 {
+        automations::migrate(tx)?;
+        schema::migration_checkpoint(2)?;
     }
-    if version < 3 {
-        let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)
+    if version < 3 && target >= 3 {
+        tx.execute_batch("ALTER TABLE channels ADD COLUMN title_source INTEGER NOT NULL DEFAULT 2 CHECK(title_source BETWEEN 0 AND 2);")
             .map_err(|error| error.to_string())?;
-        let current: u32 = tx
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .map_err(|error| error.to_string())?;
-        if current < 3 {
-            tx.execute_batch("ALTER TABLE channels ADD COLUMN title_source INTEGER NOT NULL DEFAULT 2 CHECK(title_source BETWEEN 0 AND 2); PRAGMA user_version = 3;")
-                .map_err(|error| error.to_string())?;
-        }
-        tx.commit().map_err(|error| error.to_string())?;
+        schema::migration_checkpoint(3)?;
     }
-    if version < 4 {
-        lineage::migrate(db)?;
+    if version < 4 && target >= 4 {
+        lineage::migrate(tx)?;
+        schema::migration_checkpoint(4)?;
     }
-    if version < 5 {
-        mailbox::migrate(db)?;
+    if version < 5 && target >= 5 {
+        mailbox::migrate(tx)?;
+        schema::migration_checkpoint(5)?;
     }
-    if version < 6 {
-        terminal_owners::migrate(db)?;
+    if version < 6 && target >= 6 {
+        terminal_owners::migrate(tx)?;
+        schema::migration_checkpoint(6)?;
     }
-    if version < 8 {
-        views::migrate(db)?;
+    if version < 8 && target >= 8 {
+        views::migrate(tx)?;
+        schema::migration_checkpoint(8)?;
     }
-    if version < 9 {
-        db.pragma_update(None, "user_version", 9)
-            .map_err(|error| error.to_string())?;
+    // Version nine changed the wire contract without changing the layout.
+    if version < 9 && target >= 9 {
+        schema::migration_checkpoint(9)?;
     }
-    if version < 10 {
-        execution::migrate_names(db)?;
+    if version < 10 && target >= 10 {
+        execution::migrate_names(tx)?;
+        schema::migration_checkpoint(10)?;
     }
-    if version < 11 {
-        automation_proposals::migrate(db)?;
+    if version < 11 && target >= 11 {
+        automation_proposals::migrate(tx)?;
+        schema::migration_checkpoint(11)?;
     }
-    if version < 12 {
-        mailbox::migrate_attention(db)?;
+    if version < 12 && target >= 12 {
+        mailbox::migrate_attention(tx)?;
+        schema::migration_checkpoint(12)?;
+    }
+    if version < 13 && target >= 13 {
+        views::migrate_terminal_sources(tx)?;
+        schema::migration_checkpoint(13)?;
+    }
+    if version < 14 && target >= 14 {
+        native_actor::migrate(tx)?;
+        schema::migration_checkpoint(14)?;
+    }
+    if version < 15 && target >= 15 {
+        native_actor_retirement::migrate(tx)?;
+        schema::migration_checkpoint(15)?;
+    }
+    if version < 16 && target >= 16 {
+        automation_audit::migrate(tx)?;
+        schema::migration_checkpoint(16)?;
+    }
+    if version < 17 && target >= 17 {
+        channel_work::migrate(tx)?;
+        schema::migration_checkpoint(17)?;
+    }
+    if version < 18 && target >= 18 {
+        channel_work::placement::migrate(tx)?;
+        schema::migration_checkpoint(18)?;
+    }
+    if version < 19 && target >= 19 {
+        automation_notifications::migrate(tx)?;
+        schema::migration_checkpoint(19)?;
     }
     Ok(())
 }
@@ -629,6 +644,98 @@ fn migrate(db: &Connection) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Functional coverage for the two independently retained production WAL
+    /// connections. This is not a reproduction of SQLite's rare reset race.
+    /// Use published model rows so strict schema admission stays in force.
+    #[test]
+    fn model_and_execution_connections_preserve_commits_during_checkpoints() {
+        fn write(
+            mut registry: Registry,
+            lane: i64,
+            start: std::sync::Arc<std::sync::Barrier>,
+        ) -> (Registry, Vec<(ChannelId, String)>) {
+            let mut committed = Vec::new();
+            start.wait();
+            for turn in 0..32_i64 {
+                let channel = ChannelId::new();
+                let payload = format!("lane={lane} turn={turn} {}", "x".repeat(8192));
+                let applied = registry
+                    .apply(&create(channel, "/sqlite-contract", &payload))
+                    .unwrap();
+                assert!(applied.changed);
+                committed.push((channel, payload));
+                let (busy, _, _): (i64, i64, i64) = registry
+                    .db
+                    .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .unwrap();
+                assert!(matches!(busy, 0 | 1));
+            }
+            (registry, committed)
+        }
+        fn payloads(registry: &Registry) -> std::collections::BTreeMap<String, String> {
+            registry
+                .model()
+                .unwrap()
+                .channels
+                .into_iter()
+                .map(|channel| (channel.id.to_string(), channel.title))
+                .collect()
+        }
+        let (mut registry, directory) = registry();
+        let path = registry.path.clone();
+        registry.apply(&open("/sqlite-contract")).unwrap();
+        let execution = registry.execution_connection().unwrap();
+        for connection in [&registry.db, &execution.db] {
+            connection
+                .pragma_update(None, "wal_autocheckpoint", 1)
+                .unwrap();
+            let journal: String = connection
+                .pragma_query_value(None, "journal_mode", |row| row.get(0))
+                .unwrap();
+            assert_eq!(journal, "wal");
+        }
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let other_start = start.clone();
+        let writer = std::thread::spawn(move || write(execution, 1, other_start));
+        let (mut registry, mut committed) = write(registry, 0, start);
+        let (execution, other_committed) = writer.join().unwrap();
+        committed.extend(other_committed);
+        let mut expected: std::collections::BTreeMap<_, _> = committed
+            .into_iter()
+            .map(|(channel, payload)| (channel.to_string(), payload))
+            .collect();
+        assert_eq!(expected.len(), 64);
+        assert_eq!(payloads(&registry), expected);
+        assert_eq!(payloads(&execution), expected);
+        let channel = ChannelId::new();
+        registry
+            .apply(&create(channel, "/sqlite-contract", "retained"))
+            .unwrap();
+        expected.insert(channel.to_string(), "retained".into());
+        assert_eq!(payloads(&execution), expected);
+        let integrity: String = execution
+            .db
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        drop(execution);
+        drop(registry);
+        let reopened = Registry::at(&path).unwrap();
+        assert_eq!(payloads(&reopened), expected);
+        let version: u32 = reopened
+            .db
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        println!(
+            "SQLITE_REGISTRY_WAL_CONNECTIONS_VERIFIED schema={version} rows={} {}",
+            expected.len(),
+            directory.path().display()
+        );
+    }
 
     #[test]
     fn navigation_rejects_cross_project_channels_and_relative_paths_without_writing() {
@@ -801,6 +908,170 @@ mod tests {
     }
 
     #[test]
+    fn conversation_title_refresh_is_bound_to_current_primary_view_and_manual_names() {
+        use crate::model::{CardId, CardKind, TerminalId};
+        use crate::workspace_model::views::{Change, Pane, Scope};
+        let (mut registry, directory) = registry();
+        registry.apply(&open("/project")).unwrap();
+        let id = ChannelId::new();
+        registry
+            .apply(&ModelEdit::CreateChannel {
+                id,
+                repository: "/project".into(),
+                title: String::new(),
+                title_source: Default::default(),
+            })
+            .unwrap();
+        let chat = || Pane {
+            id: CardId::new(),
+            title: "Chat".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            scope: Some("/project".into()),
+            kind: CardKind::Chat(crate::chat::Session {
+                id: TerminalId::new(),
+                native_continuity: Default::default(),
+                owned_codex_listener: None,
+                proof: None,
+                terminal: None,
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Claude,
+                    session_id: None,
+                    recipe: crate::model::LaunchRecipe {
+                        program: "claude".into(),
+                        arguments: Vec::new(),
+                        environment: Default::default(),
+                        unset_environment: Default::default(),
+                        working_directory: "/project".into(),
+                    },
+                },
+            }),
+        };
+        let a = chat();
+        let b = chat();
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: Scope::Channel(id),
+                panes: vec![a.clone(), b.clone()],
+                closed: Vec::new(),
+            })
+            .unwrap();
+        let revision = registry.model().unwrap().views[0].revision;
+        let suggest = |card, expected_revision, title: &str| ModelEdit::SuggestConversationTitle {
+            id,
+            card,
+            expected_revision,
+            title: title.into(),
+            source: ChannelTitleSource::Provider,
+        };
+        assert!(
+            registry
+                .apply(&suggest(a.id, revision, "Bundle encryption"))
+                .unwrap()
+                .changed
+        );
+        assert!(
+            registry
+                .apply(&suggest(a.id, revision, "Encryption and performance audit"))
+                .unwrap()
+                .changed
+        );
+        let before = registry.model().unwrap().sequence;
+        assert!(
+            !registry
+                .apply(&suggest(a.id, revision, "Encryption and performance audit"))
+                .unwrap()
+                .changed
+        );
+        assert_eq!(registry.model().unwrap().sequence, before);
+        assert!(
+            registry
+                .apply(&suggest(b.id, revision, "Sibling must not rename"))
+                .is_err()
+        );
+        registry
+            .apply(&ModelEdit::ChangeView {
+                scope: Scope::Channel(id),
+                expected_revision: revision,
+                operation: Uuid::new_v4(),
+                change: Change::Move {
+                    id: b.id,
+                    before: Some(a.id),
+                },
+            })
+            .unwrap();
+        let current = registry.model().unwrap().views[0].revision;
+        assert!(
+            registry
+                .apply(&suggest(a.id, revision, "Delayed old primary"))
+                .is_err()
+        );
+        assert!(
+            registry
+                .apply(&suggest(b.id, revision, "Old view revision"))
+                .is_err()
+        );
+        assert_eq!(registry.model().unwrap().channels[0].title, "");
+        assert!(
+            registry
+                .apply(&ModelEdit::SuggestConversationTitle {
+                    id,
+                    card: b.id,
+                    expected_revision: current,
+                    title: "Review another task".into(),
+                    source: ChannelTitleSource::Prompt
+                })
+                .unwrap()
+                .changed
+        );
+        assert!(
+            registry
+                .apply(&suggest(b.id, current, "New primary conversation"))
+                .unwrap()
+                .changed
+        );
+        registry
+            .apply(&ModelEdit::RetitleChannel {
+                id,
+                title: "My encrypted bundle project".into(),
+            })
+            .unwrap();
+        assert!(
+            !registry
+                .apply(&suggest(b.id, current, "Late provider name"))
+                .unwrap()
+                .changed
+        );
+        registry
+            .apply(&ModelEdit::ChangeView {
+                scope: Scope::Channel(id),
+                expected_revision: current,
+                operation: Uuid::new_v4(),
+                change: Change::Move {
+                    id: a.id,
+                    before: Some(b.id),
+                },
+            })
+            .unwrap();
+        assert_eq!(
+            registry.model().unwrap().channels[0].title,
+            "My encrypted bundle project"
+        );
+
+        drop(registry);
+        let restored = Registry::at(&directory.path().join("model.sqlite3"))
+            .unwrap()
+            .model()
+            .unwrap();
+        assert_eq!(restored.channels[0].title, "My encrypted bundle project");
+        assert_eq!(
+            restored.channels[0].title_source,
+            ChannelTitleSource::Manual
+        );
+    }
+
+    #[test]
     fn legacy_channel_names_migrate_as_authoritative() {
         let (mut registry, directory) = registry();
         registry.apply(&open("/project")).unwrap();
@@ -816,7 +1087,14 @@ mod tests {
         registry
             .db
             .execute_batch(
-                "ALTER TABLE channels DROP COLUMN title_source; PRAGMA user_version = 2;",
+                "DROP TABLE automation_notifications;
+                 DROP TABLE channel_work_placement_epochs;
+                 DROP TABLE channel_work_placement_clock;
+                 DROP TABLE channel_work_operations;
+                 DROP TABLE channel_work_entries;
+                 DROP TABLE channel_work_homes;
+                 DROP TABLE automation_lifecycle;
+                 ALTER TABLE channels DROP COLUMN title_source; PRAGMA user_version = 2;",
             )
             .unwrap();
         drop(registry);
