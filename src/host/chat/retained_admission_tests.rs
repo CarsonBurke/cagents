@@ -25,6 +25,9 @@ fn isolated(name: &str) -> Option<PathBuf> {
         tempfile::tempdir_in("/var/tmp").unwrap()
     };
     let root = directory.path();
+    // SDK fixtures and private helper authority require a private root;
+    // tempfile's directory mode can inherit a broader caller policy.
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
     for child in [
         "home/.claude",
         "run",
@@ -246,19 +249,20 @@ fn named_resume_case(name: &str, fail_retirement: bool, finish_with_close: bool)
     let initial_id = initial.id;
     start(&host, initial).unwrap();
     let handle = host.lock().unwrap().chats[&initial_id].handle.clone();
-    let wait = |stage: &str, condition: &mut dyn FnMut() -> bool| {
+    let wait = |stage: &str, observed: &Handle, condition: &mut dyn FnMut() -> bool| {
         let deadline = Instant::now() + Duration::from_secs(15);
         while !condition() {
             if Instant::now() >= deadline {
-                let resident = handle.attachment_snapshot();
-                let snapshot_error = handle.snapshot(None).and_then(|snapshot| snapshot.error);
+                let resident = observed.attachment_snapshot();
+                let snapshot = observed.snapshot(None);
+                let history_loading = snapshot.as_ref().map(|snapshot| snapshot.history_loading);
+                let snapshot_error = snapshot.and_then(|snapshot| snapshot.error);
                 panic!(
-                    "named-resume fixture did not settle at {stage}: ready={} exited={} busy={} history_loading={} failure={:?} snapshot_error={snapshot_error:?} provider_done={} trace={}",
+                    "named-resume fixture did not settle at {stage}: ready={} exited={} busy={} history_loading={history_loading:?} failure={:?} snapshot_error={snapshot_error:?} provider_done={} trace={}",
                     resident.ready,
                     resident.exited,
                     resident.busy,
-                    resident.history_loading,
-                    handle.failure(),
+                    observed.failure(),
                     root.join("provider-done").exists(),
                     fs::read_to_string(root.join("provider-trace.jsonl")).unwrap_or_default(),
                 );
@@ -266,7 +270,7 @@ fn named_resume_case(name: &str, fail_retirement: bool, finish_with_close: bool)
             thread::sleep(Duration::from_millis(10));
         }
     };
-    wait("initial SDK initialization", &mut || {
+    wait("initial SDK initialization", &handle, &mut || {
         handle.attachment_snapshot().ready
     });
     handle
@@ -276,7 +280,7 @@ fn named_resume_case(name: &str, fail_retirement: bool, finish_with_close: bool)
             mode: chat::PromptMode::Send,
         })
         .unwrap();
-    wait("initial prompt result and idle", &mut || {
+    wait("initial prompt result and idle", &handle, &mut || {
         root.join("provider-done").exists() && handle.is_idle()
     });
     let ServerResponse::ChatListed { sessions } =
@@ -533,14 +537,14 @@ fn named_resume_case(name: &str, fail_retirement: bool, finish_with_close: bool)
     // The adapter does not broadcast daemon change notifications. Wait for
     // normal history loading, then exercise the real Client visibility/read
     // path rather than asserting a potentially still-loading initial body.
-    wait("resumed HOST history", &mut || {
-        !host.lock().unwrap().chats[&requested.id]
-            .handle
-            .attachment_snapshot()
-            .history_loading
+    let resumed_handle = host.lock().unwrap().chats[&requested.id].handle.clone();
+    wait("resumed HOST history", &resumed_handle, &mut || {
+        resumed_handle
+            .snapshot(None)
+            .is_some_and(|snapshot| !snapshot.history_loading)
     });
     client.set_visible(true).unwrap();
-    wait("resumed Client transcript", &mut || {
+    wait("resumed Client transcript", &resumed_handle, &mut || {
         client
             .snapshot()
             .items
