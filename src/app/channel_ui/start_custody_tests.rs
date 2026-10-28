@@ -426,112 +426,140 @@ fn close_survives_pending_ready_and_save_ack_and_failed_save_keeps_retryable_cus
 
 fn mounted_identity_learning_has_a_finite_pane_owner(_role: &str) {
     use crate::app::chat_ui;
-    for change in [
-        "learned",
-        "descriptor-only",
-        "connection",
-        "same-descriptor-connection",
-        "target",
-    ] {
-        let mut app = custody_app(change);
-        let registry = app.workspace_model.identity;
-        let (card, target, _, _) = chat_ui::tests::attempted_claude_start_fixture(&mut app);
-        let (handle, backend, updates) =
-            checkpointed_start_ready_update_fixture(&mut app, target, None);
-        let original = handle.session();
-        assert!(original.launch.session_id.is_none());
-        let task =
-            chat_ui::tests::deliver_attempted_start_fixture(&mut app, target, Ok(handle.clone()));
-        let ready_ack = custody_message(task).unwrap();
-        drop(app.begin_chat_close(card));
-        let peer = accepted_custody_peer(registry, original.clone());
-        let task = app.update(ready_ack);
-        let resolved = custody_message(task).unwrap();
-        let task = app.update(resolved);
-        let observed_ack = custody_message(task).unwrap();
-        let task = app.update(observed_ack); // captures the actual pane owner before Close
-        let closed = custody_message(task).unwrap();
-        assert!(matches!(
-            &closed,
-            Message::ChatUi(chat_ui::Action::StartCleanupFinished(_, true, Ok(())))
-        ));
-        peer.finished();
-        let mut learned = original.clone();
-        learned.launch.session_id = Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into());
-        if change == "same-descriptor-connection" {
-            learned = original.clone();
-            chat_ui::tests::replace_custody_pane_lifetime_fixture(&mut app, card, true);
-        } else if change == "descriptor-only" {
-            // An accepted descriptor install alone must not erase a different
-            // mounted source, even when only the provider ID differs.
-            app.install_chat_session(card, learned.clone());
-        } else {
-            // Real framed metadata publication on the exact original client,
-            // followed by the ordinary Wake projection into durable state.
-            write_frame(
-                &mut *updates.lock().unwrap(),
-                &ServerEnvelope {
-                    version: PROTOCOL_VERSION,
-                    request_id: None,
-                    proof: proof(),
-                    message: ServerMessage::Response {
-                        response: ServerResponse::ChatSnapshot {
-                            chat_id: original.id,
-                            snapshot: Some(crate::chat::Snapshot {
-                                ready: true,
-                                generation: 1,
-                                session_id: learned.launch.session_id.clone(),
-                                ..Default::default()
-                            }),
+    for close_pane in [false, true] {
+        for change in [
+            "learned",
+            "descriptor-only",
+            "connection",
+            "same-descriptor-connection",
+            "target",
+        ] {
+            let mut app = custody_app(&format!("{change}-{close_pane}"));
+            let registry = app.workspace_model.identity;
+            let (card, target, _, _) = chat_ui::tests::attempted_claude_start_fixture(&mut app);
+            let (handle, backend, updates) =
+                checkpointed_start_ready_update_fixture(&mut app, target, None);
+            let original = handle.session();
+            assert!(original.launch.session_id.is_none());
+            let task = chat_ui::tests::deliver_attempted_start_fixture(
+                &mut app,
+                target,
+                Ok(handle.clone()),
+            );
+            let ready_ack = custody_message(task).unwrap();
+            chat_ui::tests::edit_attempted_start_fixture(
+                &mut app,
+                card,
+                "Retain this edited λ draft  ",
+            );
+            let draft = chat_ui::tests::attempted_start_draft_fixture(&app, card);
+            if close_pane {
+                drop(app.begin_chat_close(card));
+            } else {
+                drop(app.retry_start_custody(card, false));
+            }
+            let peer = accepted_custody_peer(registry, original.clone());
+            let task = app.update(ready_ack);
+            let resolved = custody_message(task).unwrap();
+            let task = app.update(resolved);
+            let observed_ack = custody_message(task).unwrap();
+            let task = app.update(observed_ack); // captures the actual pane owner before Close
+            let closed = custody_message(task).unwrap();
+            assert!(matches!(
+                &closed,
+                Message::ChatUi(chat_ui::Action::StartCleanupFinished(_, requested, Ok(()))) if *requested == close_pane
+            ));
+            peer.finished();
+            let mut learned = original.clone();
+            learned.launch.session_id = Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into());
+            if change == "same-descriptor-connection" {
+                learned = original.clone();
+                chat_ui::tests::replace_custody_pane_lifetime_fixture(&mut app, card, true);
+            } else if change == "descriptor-only" {
+                // An accepted descriptor install alone must not erase a different
+                // mounted source, even when only the provider ID differs.
+                app.install_chat_session(card, learned.clone());
+            } else {
+                // Real framed metadata publication on the exact original client,
+                // followed by the ordinary Wake projection into durable state.
+                write_frame(
+                    &mut *updates.lock().unwrap(),
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: None,
+                        proof: proof(),
+                        message: ServerMessage::Response {
+                            response: ServerResponse::ChatSnapshot {
+                                chat_id: original.id,
+                                snapshot: Some(crate::chat::Snapshot {
+                                    ready: true,
+                                    generation: 1,
+                                    session_id: learned.launch.session_id.clone(),
+                                    ..Default::default()
+                                }),
+                            },
                         },
                     },
-                },
-            )
-            .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while handle.session().launch.session_id != learned.launch.session_id {
+                )
+                .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while handle.session().launch.session_id != learned.launch.session_id {
+                    assert!(
+                        Instant::now() < deadline,
+                        "framed UUID publication did not arrive"
+                    );
+                    thread::sleep(Duration::from_millis(2));
+                }
+                drop(app.update(Message::ChatUi(chat_ui::Action::Wake(
+                    target,
+                    crate::chat::client::Wake::Changed,
+                ))));
                 assert!(
-                    Instant::now() < deadline,
-                    "framed UUID publication did not arrive"
+                    matches!(&app.card_state(card).unwrap().kind, CardKind::Chat(current) if current == &learned)
                 );
-                thread::sleep(Duration::from_millis(2));
+                if change == "connection" || change == "target" {
+                    chat_ui::tests::replace_custody_pane_lifetime_fixture(
+                        &mut app,
+                        card,
+                        change == "connection",
+                    );
+                }
             }
-            drop(app.update(Message::ChatUi(chat_ui::Action::Wake(
-                target,
-                crate::chat::client::Wake::Changed,
-            ))));
-            assert!(
-                matches!(&app.card_state(card).unwrap().kind, CardKind::Chat(current) if current == &learned)
+            let task = app.update(closed);
+            drain_custody(&mut app, task);
+            assert!(!app.chat_has_unresolved_start_custody(card));
+            assert_eq!(
+                app.card_state(card).unwrap().existence.is_open(),
+                !close_pane || change != "learned",
+                "only the captured actor's mounted pane can be retired after UUID learning"
             );
-            if change == "connection" || change == "target" {
-                chat_ui::tests::replace_custody_pane_lifetime_fixture(
-                    &mut app,
-                    card,
-                    change == "connection",
+            if !close_pane && change == "learned" {
+                assert!(
+                    matches!(&app.card_state(card).unwrap().kind, CardKind::Chat(current) if current.id != original.id && current.is_unstarted())
+                );
+                assert_eq!(
+                    chat_ui::tests::attempted_start_draft_fixture(&app, card),
+                    draft
+                );
+                assert!(
+                    !app.chat_start_pending(card),
+                    "explicit cleanup opens an inert fresh draft, never a Start replay"
                 );
             }
+            if change != "learned" {
+                assert!(
+                    app.notices.entries.iter().any(|entry| entry.notice.message == "The previous conversation stopped. This pane changed while cleanup was pending, so its current conversation was kept."),
+                    "a preserved replacement needs an explanation"
+                );
+                assert!(
+                    matches!(&app.card_state(card).unwrap().kind, CardKind::Chat(current) if current == &learned)
+                );
+            }
+            drop(app);
+            drop(handle);
+            drop(updates);
+            assert!(backend.join().unwrap() <= 1);
         }
-        let task = app.update(closed);
-        drain_custody(&mut app, task);
-        assert!(!app.chat_has_unresolved_start_custody(card));
-        assert_eq!(
-            app.card_state(card).unwrap().existence.is_open(),
-            change != "learned",
-            "only the captured actor's mounted pane can be retired after UUID learning"
-        );
-        if change != "learned" {
-            assert!(
-                app.status.is_some(),
-                "a preserved replacement needs an explanation"
-            );
-            assert!(
-                matches!(&app.card_state(card).unwrap().kind, CardKind::Chat(current) if current == &learned)
-            );
-        }
-        drop(app);
-        drop(handle);
-        drop(updates);
-        assert!(backend.join().unwrap() <= 1);
     }
 }
 

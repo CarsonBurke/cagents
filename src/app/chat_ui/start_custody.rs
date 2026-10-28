@@ -891,7 +891,7 @@ impl Cagents {
                         .remove_chat_card(entry.card, None)
                         .unwrap_or_else(Task::none);
                 }
-                if close_pane {
+                if close_pane || (ended && !pane_matches) {
                     self.status = Some(TransientNotice::warning(
                         "The previous conversation stopped. This pane changed while cleanup was pending, so its current conversation was kept.",
                     ));
