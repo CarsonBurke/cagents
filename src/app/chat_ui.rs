@@ -6885,6 +6885,12 @@ impl Cagents {
     /// behind its source terminal closes before that terminal's own close, so
     /// the terminal's close never races the actor that owns it.
     pub(super) fn begin_chat_close(&mut self, card: CardId) -> Task<Message> {
+        if self.pane_transfer_pending(card) {
+            self.status = Some(TransientNotice::warning(
+                "This pane is moving to a channel. Wait for the move to finish before closing it.",
+            ));
+            return Task::none();
+        }
         if self.chat_awaiting_admission(card) {
             let Some(remove) = self.remove_chat_card(card, None) else {
                 return Task::none();
@@ -6893,12 +6899,6 @@ impl Cagents {
                 .pending_chat_admissions
                 .remove(&card);
             return remove;
-        }
-        if self.pane_transfer_pending(card) {
-            self.status = Some(TransientNotice::warning(
-                "This pane is moving to a channel. Wait for the move to finish before closing it.",
-            ));
-            return Task::none();
         }
         if matches!(
             self.chat_ui.phases.get(&card),
@@ -19883,6 +19883,27 @@ mod tests {
             }
             let (tx, rx) = async_channel::unbounded();
             app.workspace_model_tx = tx;
+            // The public Move requires an admitted source view. Establish it
+            // with real seed publications/receipts rather than a private flag.
+            app.persist();
+            let seeds = std::iter::from_fn(|| rx.try_recv().ok())
+                .map(|edit| match edit {
+                    ModelEdit::SeedView { scope, .. } => scope,
+                    other => panic!("expected initial seed, got {other:?}"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(seeds.len(), 2);
+            for scope in seeds {
+                let model = app.workspace_model.clone();
+                drop(app.update(Message::WorkspaceModelObserved(
+                    super::super::workspace_model_sync::ModelUpdate::ViewApplied {
+                        scope,
+                        operation: None,
+                        model,
+                    },
+                )));
+            }
+            assert!(rx.try_recv().is_err());
             assert!(app.can_move_pane_to_channel(card, destination));
             if close_first {
                 drop(app.begin_chat_close(card));

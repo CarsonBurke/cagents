@@ -606,6 +606,11 @@ impl Cagents {
         self.pane_close_owned(card)
             || self.terminal_start_in_flight(card)
             || self.chat_start_pending(card)
+            || self.chat_awaiting_admission(card)
+    }
+
+    fn pane_move_scope_pending(&self, scope: &Scope) -> bool {
+        !self.shared_views.initialized.contains(scope) || self.shared_views.seeding.contains(scope)
     }
 
     fn pane_transfer_source(&self, card: CardId) -> Option<(&View, &Path)> {
@@ -636,7 +641,8 @@ impl Cagents {
             .views
             .iter()
             .find(|view| view.panes.iter().any(|pane| pane.id == card))?;
-        if self.shared_views.blocked.contains(&source.scope)
+        if self.pane_move_scope_pending(&source.scope)
+            || self.shared_views.blocked.contains(&source.scope)
             || matches!(&source.scope, Scope::Channel(id) if self.channel_ui.is_deleting(*id) || self.channel_ui.was_deleted(*id))
         {
             return None;
@@ -748,9 +754,30 @@ impl Cagents {
         if self.workspace_inputs_blocked() {
             return Task::none();
         }
+        if self.chat_awaiting_admission(card) {
+            let message = if self
+                .chat_return_session(card)
+                .is_some_and(|session| session.launch.session_id.is_some())
+            {
+                "This saved pane has not been reopened. Open the conversation from history before moving it to a channel."
+            } else {
+                "This saved pane has not been reopened. Copy its saved draft into a new conversation, then move the new pane to a channel."
+            };
+            self.status = Some(TransientNotice::warning(message));
+            return Task::none();
+        }
         if self.pane_move_lifecycle_pending(card) {
             self.status = Some(TransientNotice::warning(
                 "Wait for this pane to finish opening, closing or changing views before moving it.",
+            ));
+            return Task::none();
+        }
+        if self.workspace_model.views.iter().any(|view| {
+            view.panes.iter().any(|pane| pane.id == card)
+                && self.pane_move_scope_pending(&view.scope)
+        }) {
+            self.status = Some(TransientNotice::warning(
+                "Wait for this pane to finish joining the shared workspace before moving it to a channel.",
             ));
             return Task::none();
         }
@@ -2009,6 +2036,7 @@ fn same_attention_update_source(left: &CardKind, right: &CardKind) -> bool {
 #[cfg(test)]
 mod tests {
     mod history_start;
+    mod move_admission;
     mod startup_admission;
 
     use super::*;

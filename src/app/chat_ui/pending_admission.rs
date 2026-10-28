@@ -25,9 +25,14 @@ impl Runtime {
                 [design::RADIUS_M; 4],
                 false,
             ));
+        let recovery = if self.session.launch.session_id.is_some() {
+            "This saved pane has not been reopened. Your unsent text is kept here; you can copy it while the workspace reconnects, or open the conversation from history."
+        } else {
+            "This saved pane has not been reopened. Your unsent text is kept here; you can copy it into a new conversation while the workspace reconnects."
+        };
         let content = widget::column::with_children(vec![
             header.into(),
-            design::body("This saved pane has not been reopened. Your unsent text is kept here; you can copy it while the workspace reconnects, or open the conversation from history.").into(),
+            design::body(recovery).into(),
             widget::scrollable(draft).height(Length::Fill).into(),
         ])
         .spacing(space::M)
