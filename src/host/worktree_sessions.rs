@@ -1033,6 +1033,80 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_holder_refuses_the_roster_before_any_session_stop_is_published() {
+        for unsupported_first in [false, true] {
+            for capability in [None, Some(false)] {
+                let root = repository_fixture();
+                let host = host();
+                let supported =
+                    crate::terminal::RenderStreamFixture::for_session_stop(root.path(), Some(true));
+                let unsupported =
+                    crate::terminal::RenderStreamFixture::for_session_stop(root.path(), capability);
+                let id = |value| TerminalId::from_uuid(uuid::Uuid::from_u128(value));
+                let supported_id = id(if unsupported_first { 2 } else { 1 });
+                let unsupported_id = id(if unsupported_first { 1 } else { 2 });
+                {
+                    let mut state = host.lock().unwrap();
+                    state.register_client(1);
+                    let proof = state.proof().clone();
+                    for (id, fixture) in
+                        [(supported_id, &supported), (unsupported_id, &unsupported)]
+                    {
+                        let session = TerminalSession {
+                            id,
+                            launch: starting_session(root.path().into()).launch.recipe,
+                            owned_codex_listener: None,
+                            recovery_origin: None,
+                            predecessor: None,
+                            transcript_path: None,
+                            resume_hint: None,
+                            continuity: crate::model::TerminalContinuity::Live {
+                                host_session_id: proof.host_session_id.clone(),
+                                boot_id: proof.boot_id.clone(),
+                                host_incarnation: proof.host_incarnation.clone(),
+                            },
+                        };
+                        state
+                            .finish_spawn(1, session, fixture.handle.clone(), false)
+                            .unwrap();
+                    }
+                }
+                let actors = census(&host, root.path()).unwrap();
+                assert_eq!(actors.len(), 2, "both resident actors must enter consent");
+                assert_eq!(actors[0].token.session, id(1));
+                let consent = SessionStopConsent {
+                    sessions: session_identities(&actors),
+                };
+                let refusal = prepare_stop(&host, root.path(), root.path(), &consent)
+                    .err()
+                    .expect("unsupported cleanup must refuse the complete roster");
+                assert!(refusal.contains("cannot confirm whole-session cleanup"));
+                for fixture in [&supported, &unsupported] {
+                    assert_eq!(
+                        fixture.session_stop_state(),
+                        (false, false),
+                        "predictable unsupported cleanup must precede all input fences and priority stops"
+                    );
+                    assert!(!fixture.handle.is_completed());
+                    fixture.handle.input(b"still admitted").unwrap();
+                }
+                let state = host.lock().unwrap();
+                assert_eq!(state.terminals.len(), 2);
+                assert!(
+                    state.terminals[&supported_id]
+                        .handle
+                        .same_worker(&supported.handle)
+                );
+                assert!(
+                    state.terminals[&unsupported_id]
+                        .handle
+                        .same_worker(&unsupported.handle)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn stopped_actor_cannot_retire_a_same_id_replacement_after_gate_release() {
         let root = repository_fixture();
         let host = host();

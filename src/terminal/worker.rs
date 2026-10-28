@@ -911,6 +911,38 @@ impl RenderStreamFixture {
     pub(crate) fn queued_commands(&self) -> usize {
         self.commands.len()
     }
+
+    /// Admission metadata only: no holder, PTY or process is created. A true
+    /// capability allows stop publication, never proves actual family cleanup.
+    pub(crate) fn for_session_stop(directory: &std::path::Path, capability: Option<bool>) -> Self {
+        let fixture = Self::new(|_| {});
+        let directory = Arc::new(File::open(directory).unwrap());
+        let identity = crate::agent_execution::DirectoryIdentity::from_metadata(
+            &directory.metadata().unwrap(),
+        );
+        let published = &fixture.handle.inner.published;
+        assert!(
+            published
+                .admitted_directory
+                .set(AdmittedDirectory {
+                    directory,
+                    identity
+                })
+                .is_ok()
+        );
+        if let Some(capability) = capability {
+            assert!(published.family_cleanup_capable.set(capability).is_ok());
+        }
+        fixture
+    }
+
+    pub(crate) fn session_stop_state(&self) -> (bool, bool) {
+        let published = &self.handle.inner.published;
+        (
+            published.input_order.lock().unwrap().closing,
+            published.priority_close.lock().unwrap().is_some(),
+        )
+    }
 }
 
 impl WeakTerminalHandle {
