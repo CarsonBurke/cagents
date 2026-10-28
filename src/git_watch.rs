@@ -572,10 +572,10 @@ impl Registrations {
         for (&id, project) in projects {
             for root in std::iter::once(&project.common_dir)
                 .filter(|common| {
-                    !project
-                        .worktrees
-                        .iter()
-                        .any(|worktree| common.starts_with(&worktree.root))
+                    !project.worktrees.iter().any(|worktree| {
+                        **common == worktree.root
+                            || common.parent() == Some(worktree.root.as_path())
+                    })
                 })
                 .chain(project.worktrees.iter().map(|worktree| &worktree.root))
             {
@@ -1679,6 +1679,26 @@ mod tests {
             recoverable.failures.is_empty(),
             "watching the parent can observe root recreation"
         );
+        let root = parent.join("first");
+        std::fs::create_dir(&root).unwrap();
+        let mut separated = projects[&id].as_ref().clone();
+        separated.common_dir = root.join("untracked-admin/nested/git");
+        separated.worktrees[0].git_dir = separated.common_dir.clone();
+        let projects = BTreeMap::from([(id, Arc::new(separated.clone()))]);
+        let unavailable = Registrations::within(&projects, MAX_DIRECTORIES);
+        assert!(unavailable.desired.contains_key(&root));
+        assert!(
+            unavailable.failures.contains_key(&id),
+            "a root watch cannot observe recreation below an untracked intermediate directory"
+        );
+        std::fs::create_dir_all(separated.common_dir.parent().unwrap()).unwrap();
+        let anchored = Registrations::within(&projects, MAX_DIRECTORIES);
+        assert!(
+            anchored
+                .desired
+                .contains_key(separated.common_dir.parent().unwrap())
+        );
+        assert!(anchored.failures.is_empty());
     }
 
     #[test]
