@@ -110,7 +110,21 @@ fn bounded_handle_size(bytes: Vec<u8>, budget: &Budget, edge: Option<u32>) -> Lo
     decode_handle(&bytes, budget, edge, chat::MAX_INLINE_IMAGE_BYTES)
 }
 
+#[derive(Clone, Copy)]
+enum DecodeAdmission {
+    Defer,
+    Wait,
+}
 fn decode_handle(bytes: &[u8], budget: &Budget, edge: Option<u32>, max_bytes: usize) -> Loaded {
+    decode_handle_with_admission(bytes, budget, edge, max_bytes, DecodeAdmission::Defer)
+}
+fn decode_handle_with_admission(
+    bytes: &[u8],
+    budget: &Budget,
+    edge: Option<u32>,
+    max_bytes: usize,
+    admission: DecodeAdmission,
+) -> Loaded {
     if bytes.len() > max_bytes {
         return Loaded::Unavailable;
     }
@@ -120,11 +134,27 @@ fn decode_handle(bytes: &[u8], budget: &Budget, edge: Option<u32>, max_bytes: us
     };
     // Constructing a decoder can inflate metadata before exposing dimensions.
     // Admit that work too, and keep one decoder through conversion. Holding the
-    // existing whole budget serializes decoding, not the two worker/IO slots;
-    // it avoids partial-reservation upgrades while metadata remains live.
-    let _decode = match reserve(&budget.decode, DECODE_BUDGET as u32, false) {
-        Ok(permit) => permit,
-        Err(deferred) => return deferred,
+    // existing whole budget serializes decoding without partial-reservation
+    // upgrades while metadata remains live. Subscription work defers instead
+    // of occupying a worker; one-shot user actions wait on their worker.
+    let _decode = match admission {
+        DecodeAdmission::Defer => match reserve(&budget.decode, DECODE_BUDGET as u32, false) {
+            Ok(permit) => permit,
+            Err(deferred) => return deferred,
+        },
+        // One-shot user actions have no subscription to retry Deferred. Wait
+        // only for transient decoder ownership on their existing blocking
+        // worker, retaining these exact input bytes. Never wait for retained
+        // pixels: closing a gallery must not be needed to finish a decode.
+        DecodeAdmission::Wait => match iced::futures::executor::block_on(
+            budget
+                .decode
+                .clone()
+                .acquire_many_owned(DECODE_BUDGET as u32),
+        ) {
+            Ok(permit) => permit,
+            Err(_) => return Loaded::Unavailable,
+        },
     };
     use image::ImageDecoder;
     let mut reader =
@@ -298,11 +328,12 @@ fn load_with_request(
             });
         return bytes.map_or(Loaded::Unavailable, |bytes| bounded_handle(bytes, budget()));
     }
-    load_file_with_request(Path::new(path), origin, request)
+    load_file_with_request(Path::new(path), origin, DecodeAdmission::Defer, request)
 }
 fn load_file_with_request(
     path: &Path,
     origin: &Origin,
+    admission: DecodeAdmission,
     request: impl FnOnce(
         crate::device_service::Operation,
     ) -> Result<crate::device_service::Reply, String>,
@@ -344,7 +375,13 @@ fn load_file_with_request(
         crate::device_service::read_image_file(&origin.root, path, chat::MAX_INLINE_IMAGE_BYTES)
     };
     match bytes {
-        Ok(bytes) => match bounded_handle(bytes, budget()) {
+        Ok(bytes) => match decode_handle_with_admission(
+            &bytes,
+            budget(),
+            None,
+            chat::MAX_INLINE_IMAGE_BYTES,
+            admission,
+        ) {
             Loaded::Unavailable => Loaded::Failed(format!(
                 "Cannot preview {path:?} on {}: unsupported, damaged or oversized image.",
                 origin.device.as_deref().unwrap_or("this device")
@@ -390,8 +427,15 @@ pub(in crate::app) async fn file_preview(
             "Cannot preview {description}: an absolute device path is required."
         ));
     }
-    match worker(move || load_file_with_request(&path, &origin, crate::device_service::request))
-        .await
+    match worker(move || {
+        load_file_with_request(
+            &path,
+            &origin,
+            DecodeAdmission::Wait,
+            crate::device_service::request,
+        )
+    })
+    .await
     {
         Loaded::Ready(handle) => Ok(handle),
         Loaded::Failed(error) => Err(error),
@@ -547,11 +591,12 @@ pub(super) fn validate_attachment(
     ) {
         return Err("The file is not a supported attachment image.".into());
     }
-    match decode_handle(
+    match decode_handle_with_admission(
         bytes,
         budget(),
         Some(1),
         chat::attachment_assets::MAX_IMAGE_BYTES as usize,
+        DecodeAdmission::Wait,
     ) {
         Loaded::Ready(_) => Ok(format),
         Loaded::Deferred(_) => Err("Image memory is busy. Try attaching the image again.".into()),
@@ -1232,13 +1277,18 @@ mod tests {
             child: false,
             device: Some("FW16 fixture".into()),
         };
-        let Loaded::Ready(handle) = load_file_with_request(&path, &origin, |operation| {
-            assert!(
-                matches!(operation, crate::device_service::Operation::ReadImage { root, path: sent }
+        let Loaded::Ready(handle) = load_file_with_request(
+            &path,
+            &origin,
+            DecodeAdmission::Defer,
+            |operation| {
+                assert!(
+                    matches!(operation, crate::device_service::Operation::ReadImage { root, path: sent }
                 if root == Path::new("/") && sent == path)
-            );
-            Ok(crate::device_service::Reply::Image(remote))
-        }) else {
+                );
+                Ok(crate::device_service::Reply::Image(remote))
+            },
+        ) else {
             panic!("real remote PNG should decode")
         };
         let iced::widget::image::Handle::Rgba { pixels, .. } = &handle else {
@@ -1615,6 +1665,156 @@ mod tests {
             assert_eq!(pixels.as_ref(), expected.as_raw().as_ref());
         }
     }
+    #[test]
+    fn one_shot_image_actions_wait_for_decoder_admission_without_changing_their_input() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        const CHILD: &str = "CAGENTS_IMAGE_ONESHOT_ADMISSION_CHILD";
+        const TEST: &str = "app::chat_ui::images::tests::one_shot_image_actions_wait_for_decoder_admission_without_changing_their_input";
+        let Some(marker) = std::env::var_os(CHILD) else {
+            // This test intentionally blocks the process-global decode budget.
+            // Isolate it from other image tests, including parallel test runs.
+            let directory = tempfile::tempdir().unwrap();
+            let marker = directory.path().join("verified");
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, &marker)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if child.try_wait().unwrap().is_some() {
+                    let output = child.wait_with_output().unwrap();
+                    assert!(
+                        output.status.success(),
+                        "{}\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    assert_eq!(
+                        std::fs::read(&marker).unwrap(),
+                        b"one-shot image actions verified"
+                    );
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("one-shot image action failed to finish after transient decode release");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        fn wait_for_encoded_input(bytes: usize) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while budget().encoded.available_permits() != ENCODED_BUDGET - bytes {
+                assert!(
+                    Instant::now() < deadline,
+                    "the real action must retain its encoded input while waiting for the decoder"
+                );
+                std::thread::yield_now();
+            }
+        }
+        fn assert_released() {
+            assert_eq!(budget().encoded.available_permits(), ENCODED_BUDGET);
+            assert_eq!(budget().decode.available_permits(), DECODE_BUDGET);
+            assert_eq!(budget().pixels.available_permits(), PIXEL_BUDGET);
+        }
+        assert_released();
+        for mode in ["attach", "paste", "cancel-paste"] {
+            let (ticket, lease) = attachment_draft::admit().unwrap();
+            let mut lease = Some(lease);
+            let busy = budget().block_decoder();
+            let (started, input) = mpsc::channel();
+            let (finished, result) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let outcome = chat::attachment_assets::with_test_image(|existing| {
+                    let bytes = std::fs::read(&existing.path).unwrap();
+                    started.send(bytes.len()).unwrap();
+                    let result = if mode == "attach" {
+                        clipboard_image::stage_file_active(existing.path, u64::MAX, &ticket)
+                    } else {
+                        let image =
+                            clipboard_image::Image::try_from((bytes, "image/png".into())).unwrap();
+                        clipboard_image::save_active(image, u64::MAX, &ticket)
+                    };
+                    if mode == "cancel-paste" {
+                        assert_eq!(
+                            chat::attachment_assets::list().unwrap().images.len(),
+                            1,
+                            "a canceled paste must not publish a durable asset"
+                        );
+                    }
+                    result.map(|_| ())
+                });
+                finished.send(outcome).unwrap();
+            });
+            let bytes = input.recv_timeout(Duration::from_secs(2)).unwrap();
+            wait_for_encoded_input(bytes);
+            assert!(
+                matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "{mode} waits instead of reporting a false capacity error"
+            );
+            if mode == "cancel-paste" {
+                drop(lease.take());
+            }
+            drop(busy);
+            let outcome = result.recv_timeout(Duration::from_secs(2)).unwrap();
+            if mode == "cancel-paste" {
+                assert!(outcome.unwrap_err().contains("cancelled"));
+            } else {
+                outcome.unwrap();
+            }
+            worker.join().unwrap();
+            drop(lease);
+            assert_released();
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("selected.png");
+        let bytes = png();
+        std::fs::write(&path, &bytes).unwrap();
+        let busy = budget().block_decoder();
+        let selected = path.clone();
+        let (finished, result) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            finished
+                .send(runtime.block_on(file_preview(selected, None)))
+                .unwrap();
+        });
+        wait_for_encoded_input(bytes.len());
+        assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        // The action already read its immutable input. A retry must not read
+        // this changed path and silently show a different image.
+        std::fs::write(&path, b"replacement is not an image").unwrap();
+        drop(busy);
+        let handle = result
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        let iced::widget::image::Handle::Rgba {
+            pixels,
+            width,
+            height,
+            ..
+        } = &handle
+        else {
+            panic!("decoded selected image");
+        };
+        assert_eq!((*width, *height), (1, 1));
+        assert_eq!(pixels.as_ref(), &[1, 2, 3, 255]);
+        worker.join().unwrap();
+        drop(handle);
+        assert_released();
+        std::fs::write(marker, b"one-shot image actions verified").unwrap();
+    }
+
     #[test]
     fn decoder_metadata_is_admitted_before_construction_and_releases_its_leases() {
         use image::ImageEncoder;
