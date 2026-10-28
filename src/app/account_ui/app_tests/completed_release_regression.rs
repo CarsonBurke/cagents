@@ -254,6 +254,7 @@ async fn completed_offstrip_task_waits_for_exact_release_and_keeps_refusals() {
             assert_eq!(app.account_ui.logins[0].phase, LoginPhase::Waiting);
             resume.send(()).unwrap();
             let message = completion.await;
+            let notice_id_before = app.notices.next_id;
             drop(app.update(message));
             server.join().unwrap();
             if matches!(answer, Answer::Closed) {
@@ -265,12 +266,22 @@ async fn completed_offstrip_task_waits_for_exact_release_and_keeps_refusals() {
             } else {
                 assert_eq!(app.card_state(card), Some(&original), "{answer:?}");
                 assert_eq!(app.durable.card_scopes, scopes);
+                // Public update records the transient write channel in the
+                // visible notice history before returning.
+                let entry = app
+                    .notices
+                    .recent()
+                    .next()
+                    .expect("a refused release must remain visible in notice history");
+                assert_ne!(entry.id, notice_id_before, "a fresh refusal: {answer:?}");
+                let notice = &entry.notice;
+                assert_eq!(notice.severity, NoticeSeverity::Error, "{answer:?}");
                 assert!(
-                    app.status
-                        .as_ref()
-                        .unwrap()
-                        .message
-                        .contains("card was kept")
+                    notice.message.starts_with(
+                        "The original sign-in card was kept because terminal release was not confirmed:"
+                    ),
+                    "{answer:?}: {}",
+                    notice.message
                 );
             }
         }
