@@ -88,20 +88,39 @@ fn encode(handle: &Handle) -> Result<Png, String> {
     Ok(Png(png))
 }
 
+/// Encoder scratch and output are admitted against the decode budget at the
+/// size of the raw pixels (fast PNG output rarely exceeds it), so concurrent
+/// copies of large images wait for memory rather than adding to it.
+fn encode_admission(handle: &Handle) -> u32 {
+    match handle {
+        Handle::Rgba { pixels, .. } => {
+            u32::try_from(pixels.len()).map_or(DECODE_BUDGET as u32, |bytes| {
+                bytes.min(DECODE_BUDGET as u32)
+            })
+        }
+        _ => 0,
+    }
+}
+
 /// Start copying `handle`. A newer copy anywhere in the app supersedes this
-/// one, including while it waits for or runs on an image worker.
+/// one, including while it waits for memory or an image worker.
 pub(in crate::app) fn copy(handle: Handle) -> Task<Message> {
     let intent = text_copy::Intent::begin();
     let current = intent.clone();
     cosmic::task::future(async move {
-        let result = run_worker(move || {
-            current
-                .is_current()
-                .then(|| encode(&handle))
-                .transpose()
-        })
-        .await
-        .and_then(|result| result);
+        let permits = encode_admission(&handle);
+        let result = match budget().decode.clone().acquire_many_owned(permits).await {
+            Ok(memory) => run_worker(move || {
+                let _memory = memory;
+                current
+                    .is_current()
+                    .then(|| encode(&handle))
+                    .transpose()
+            })
+            .await
+            .and_then(|result| result),
+            Err(_) => Err("Image memory admission is closed.".into()),
+        };
         action(Action::ImageCopied(intent, result))
     })
 }
@@ -117,38 +136,44 @@ impl widget::menu::Action for MenuCommand {
     }
 }
 
-/// The image context menu. `path` and `external` say whether those actions
-/// apply to this image; Ctrl+C is shown where it works, in the viewer.
+/// One context menu entry: its label, command, and whether it is enabled.
+type MenuEntry = (&'static str, ImageCommand, bool);
+
+/// The image context menu's entries. `path` and `external` say whether those
+/// actions apply to this image; `copy` whether the clipboard can hold images.
+fn entries(image: ImageRef, path: bool, external: bool, copy: bool) -> Vec<MenuEntry> {
+    let mut entries = Vec::with_capacity(4);
+    if matches!(image, ImageRef::Transcript(..)) {
+        entries.push(("Open image", ImageCommand::Open, true));
+    }
+    entries.push(("Copy image", ImageCommand::Copy, copy));
+    if path {
+        entries.push(("Copy image path", ImageCommand::CopyPath, true));
+    }
+    if external {
+        entries.push(("Open externally", ImageCommand::OpenExternally, true));
+    }
+    entries
+}
+
+/// The image context menu. Ctrl+C is shown where it works: in the viewer.
 pub(in crate::app) fn menu(
     image: ImageRef,
     path: bool,
     external: bool,
 ) -> Vec<widget::menu::Tree<Message>> {
     use widget::menu::{Item, KeyBind, key_bind::Modifier};
-    let command = |command| MenuCommand(image, command);
-    let mut items = Vec::with_capacity(4);
-    if matches!(image, ImageRef::Transcript(..)) {
-        items.push(Item::Button("Open image", None, command(ImageCommand::Open)));
-    }
-    items.push(if supported() {
-        Item::Button("Copy image", None, command(ImageCommand::Copy))
-    } else {
-        Item::ButtonDisabled("Copy image", None, command(ImageCommand::Copy))
-    });
-    if path {
-        items.push(Item::Button(
-            "Copy image path",
-            None,
-            command(ImageCommand::CopyPath),
-        ));
-    }
-    if external {
-        items.push(Item::Button(
-            "Open externally",
-            None,
-            command(ImageCommand::OpenExternally),
-        ));
-    }
+    let items = entries(image, path, external, supported())
+        .into_iter()
+        .map(|(label, command, enabled)| {
+            let command = MenuCommand(image, command);
+            if enabled {
+                Item::Button(label, None, command)
+            } else {
+                Item::ButtonDisabled(label, None, command)
+            }
+        })
+        .collect();
     let mut key_binds = HashMap::new();
     if matches!(image, ImageRef::Viewer(_)) {
         key_binds.insert(
@@ -156,16 +181,17 @@ pub(in crate::app) fn menu(
                 modifiers: vec![Modifier::Ctrl],
                 key: iced::keyboard::Key::Character("c".into()),
             },
-            command(ImageCommand::Copy),
+            MenuCommand(image, ImageCommand::Copy),
         );
     }
     widget::menu::items(&key_binds, items)
 }
 
-/// A literal image path the reader can copy. Managed assets are excluded
-/// (their snapshot path is a non-authority hint), as are inline data and a
-/// child's relative path, whose working directory is unknown here.
-pub(in crate::app) fn copyable_path(runtime: &Runtime, content: &ItemContent) -> Option<String> {
+/// An image's literal path, and whether it is relative to the conversation's
+/// working directory. Managed assets are excluded (their snapshot path is a
+/// non-authority hint), as are inline data, URLs, and a child's relative
+/// path, whose working directory is unknown here.
+fn literal_path<'a>(runtime: &Runtime, content: &'a ItemContent) -> Option<(&'a str, bool)> {
     let ItemContent::Image {
         path, reference, ..
     } = content
@@ -176,14 +202,22 @@ pub(in crate::app) fn copyable_path(runtime: &Runtime, content: &ItemContent) ->
         return None;
     }
     if Path::new(path).is_absolute() {
-        return Some(path.clone());
+        return Some((path, false));
     }
-    if runtime.selected_subagent.is_some()
-        || Url::parse(path).is_ok_and(|url| !url.scheme().is_empty())
-    {
-        return None;
-    }
-    Some(
+    (runtime.selected_subagent.is_none()
+        && !Url::parse(path).is_ok_and(|url| !url.scheme().is_empty()))
+    .then_some((path, true))
+}
+
+/// Whether a preview offers Copy image path; checked on every view.
+pub(in crate::app) fn has_copyable_path(runtime: &Runtime, content: &ItemContent) -> bool {
+    literal_path(runtime, content).is_some()
+}
+
+/// The image path Copy image path writes.
+pub(in crate::app) fn copyable_path(runtime: &Runtime, content: &ItemContent) -> Option<String> {
+    let (path, relative) = literal_path(runtime, content)?;
+    Some(if relative {
         runtime
             .session
             .launch
@@ -191,8 +225,10 @@ pub(in crate::app) fn copyable_path(runtime: &Runtime, content: &ItemContent) ->
             .working_directory
             .join(path)
             .to_string_lossy()
-            .into_owned(),
-    )
+            .into_owned()
+    } else {
+        path.to_owned()
+    })
 }
 
 /// The transcript preview currently drawn with `image`, if it still is.
@@ -366,15 +402,62 @@ mod tests {
     }
 
     #[test]
-    fn the_viewer_menu_shows_its_copy_shortcut_and_previews_offer_open() {
+    fn previews_and_the_viewer_offer_the_actions_that_apply() {
+        use ImageCommand::*;
+        use widget::menu::Action as _;
         let target = Target {
             card: CardId::new(),
             generation: 1,
         };
         let id = Handle::from_rgba(1, 1, vec![0; 4]).id();
-        assert_eq!(menu(ImageRef::Transcript(target, id), false, false).len(), 2);
-        assert_eq!(menu(ImageRef::Transcript(target, id), true, false).len(), 3);
-        assert_eq!(menu(ImageRef::Viewer(id), true, true).len(), 3);
-        assert_eq!(menu(ImageRef::Viewer(id), false, false).len(), 1);
+        let preview = ImageRef::Transcript(target, id);
+        let viewer = ImageRef::Viewer(id);
+        assert_eq!(
+            entries(preview, true, false, true),
+            [
+                ("Open image", Open, true),
+                ("Copy image", Copy, true),
+                ("Copy image path", CopyPath, true),
+            ]
+        );
+        assert_eq!(
+            entries(viewer, false, true, true),
+            [("Copy image", Copy, true), ("Open externally", OpenExternally, true)]
+        );
+        // Where the clipboard cannot hold image data, Copy stays visible but disabled.
+        assert_eq!(
+            entries(preview, false, false, false),
+            [("Open image", Open, true), ("Copy image", Copy, false)]
+        );
+        // Each menu item sends its own command for the same exact image.
+        for (_, command, _) in entries(viewer, true, true, true) {
+            assert!(matches!(
+                MenuCommand(viewer, command).message(),
+                Message::ChatUi(Action::Image(image, sent)) if image == viewer && sent == command
+            ));
+        }
+        assert_eq!(menu(viewer, true, true).len(), 3);
+    }
+
+    #[test]
+    fn encoding_memory_is_admitted_at_the_raw_pixel_size() {
+        assert_eq!(encode_admission(&Handle::from_rgba(3, 2, vec![0; 24])), 24);
+        assert_eq!(encode_admission(&Handle::from_path("/no/pixels.png")), 0);
+    }
+
+    #[test]
+    fn a_copy_superseded_after_encoding_never_reaches_the_clipboard() {
+        let _context = text_copy::isolated_context();
+        let intent = text_copy::Intent::begin();
+        let task = intent.write_data(Png(vec![1, 2, 3]));
+        text_copy::invalidate();
+        let effects = iced::futures::executor::block_on(async {
+            use iced::futures::StreamExt;
+            iced::runtime::task::into_stream(task)
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await
+        });
+        assert!(effects.is_empty(), "the gate runs when the write is polled");
     }
 }

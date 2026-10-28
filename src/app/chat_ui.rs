@@ -10778,24 +10778,24 @@ impl Cagents {
                 }
             }
             Action::ImageExternal => {
-                if let Some(url) = self
+                if let Some(image) = self
                     .chat_ui
                     .image_viewer
                     .as_ref()
-                    .and_then(|gallery| gallery.url())
+                    .map(images::Gallery::selected_image)
                 {
-                    return cosmic::task::future(async move {
-                        Message::ExternalLinkOpened(images::open_external(url).await)
-                    });
+                    return self.image_command(image, images::ImageCommand::OpenExternally);
                 }
             }
             Action::Image(image, command) => return self.image_command(image, command),
+            // A superseded copy reports nothing, not even its failure.
+            Action::ImageCopied(intent, _) if !intent.is_current() => {}
             Action::ImageCopied(intent, result) => match result {
-                Ok(Some(png)) if intent.is_current() => {
+                Ok(Some(png)) => {
                     self.status = Some(TransientNotice::success("Copied image"));
                     return intent.write_data(png);
                 }
-                Ok(_) => {}
+                Ok(None) => {}
                 Err(error) => {
                     self.status =
                         Some(TransientNotice::error("Could not copy the image").with_details(error));
@@ -12197,20 +12197,28 @@ mod tests {
         assert!(Action::ImageCopied(text_copy::Intent::begin(), Ok(None)).allowed_while_modal());
         assert!(!Action::Image(preview, images::ImageCommand::Copy).allowed_while_modal());
 
-        // Ctrl+C in the viewer copies the image it shows.
+        // Ctrl+C in the viewer copies the image it shows, by physical key on
+        // any layout (here Cyrillic), once per press rather than per repeat.
         app.status = None;
         app.notices.entries.clear();
-        let control_c = keyboard::Event::KeyPressed {
-            key: keyboard::Key::Character("c".into()),
-            modified_key: keyboard::Key::Character("c".into()),
+        let control_c = |repeat| keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character("с".into()),
+            modified_key: keyboard::Key::Character("с".into()),
             physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyC),
             location: keyboard::Location::Standard,
             modifiers: keyboard::Modifiers::CTRL,
             text: None,
-            repeat: false,
+            repeat,
         };
+        assert!(
+            run(app.update(Message::KeyEvent {
+                event: control_c(true),
+                captured: false,
+            }))
+            .is_empty()
+        );
         let effects = run(app.update(Message::KeyEvent {
-            event: control_c,
+            event: control_c(false),
             captured: false,
         }));
         assert_eq!(copied(&mut app, effects), ["image/png"]);

@@ -12454,6 +12454,7 @@ impl Cagents {
             }
             InspectorAction::ResizeFinished => self.save_settings_task(false),
             InspectorAction::CopyLspDiagnostic(diagnostic) => {
+                chat_ui::invalidate_copy_intent();
                 iced::clipboard::write(diagnostic.copy_text()).map(cosmic::Action::App)
             }
             // A request's answer is rendered by this very panel, so dismissing
@@ -16884,14 +16885,29 @@ impl Application for Cagents {
                     self.keyboard_modifiers = *modifiers;
                 }
                 if let Some(gallery) = &self.chat_ui.image_viewer {
-                    if let keyboard::Event::KeyPressed { key, modifiers, .. } = &event {
+                    if let keyboard::Event::KeyPressed {
+                        key,
+                        physical_key,
+                        modifiers,
+                        repeat,
+                        ..
+                    } = &event
+                    {
                         match key {
-                            keyboard::Key::Character(c)
-                                if c.eq_ignore_ascii_case("c")
-                                    && modifiers.command()
+                            // Layout-independent, like the other Ctrl chords.
+                            keyboard::Key::Character(_)
+                                if modifiers.command()
                                     && !modifiers.shift()
-                                    && !modifiers.alt() =>
+                                    && !modifiers.alt()
+                                    && !modifiers.logo()
+                                    && key
+                                        .to_latin(*physical_key)
+                                        .is_some_and(|key| key.eq_ignore_ascii_case(&'c')) =>
                             {
+                                // A held chord copies once.
+                                if *repeat {
+                                    return Task::none();
+                                }
                                 let image = gallery.selected_image();
                                 return self.handle_chat_ui(chat_ui::Action::Image(
                                     image,

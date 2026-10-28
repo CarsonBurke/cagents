@@ -953,15 +953,13 @@ impl Gallery {
     pub(in crate::app) fn selected_image(&self) -> ImageRef {
         ImageRef::Viewer(self.entries[self.selected].handle.id())
     }
-    /// The viewer entry still drawn with `image`, if any.
+    /// The viewer entry drawn with `image`, if it is still the one shown. A
+    /// menu left open across navigation must not act on another image.
     pub(in crate::app) fn resolve(
         &self,
         image: iced::advanced::image::Id,
     ) -> Option<clipboard::Resolved> {
-        let entry = self
-            .entries
-            .iter()
-            .find(|entry| entry.handle.id() == image)?;
+        let entry = Some(&self.entries[self.selected]).filter(|entry| entry.handle.id() == image)?;
         Some(clipboard::Resolved {
             item: None,
             handle: entry.handle.clone(),
@@ -1029,9 +1027,11 @@ impl Gallery {
                     toolbar.into(),
                     design::caption(entry.label.as_str()).into(),
                     canvas.into(),
-                    design::caption(
-                        "Scroll to zoom · Drag to pan · Left / Right to browse · Ctrl+C to copy",
-                    )
+                    design::caption(if clipboard::supported() {
+                        "Scroll to zoom · Drag to pan · Left / Right to browse · Ctrl+C to copy"
+                    } else {
+                        "Scroll to zoom · Drag to pan · Left / Right to browse"
+                    })
                     .into(),
                 ])
                 .spacing(step::GAP_S)
@@ -1088,7 +1088,7 @@ impl Runtime {
             .height(280)
             .content_fit(iced::ContentFit::Contain);
         let image = ImageRef::Transcript(self.target, handle.id());
-        let path = clipboard::copyable_path(self, &item.content).is_some();
+        let path = clipboard::has_copyable_path(self, &item.content);
         widget::column::with_children(vec![
             crate::interaction::context_menu_lazy(
                 widget::button::custom(preview)
