@@ -216,6 +216,10 @@ impl Daemon {
                                     session,
                                 }
                             }
+                            ClientRequest::ChatPrepareResume { source } => {
+                                assert!(admitted.lock().unwrap().contains(&source));
+                                ServerResponse::ChatResumePrepared { session: source }
+                            }
                             ClientRequest::ChatStart { mut session, .. } => {
                                 let count = {
                                     let mut starts = recorded.lock().unwrap();

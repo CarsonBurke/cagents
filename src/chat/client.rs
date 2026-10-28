@@ -1115,14 +1115,15 @@ fn restore(
     upgrade_recovery: &mut Option<(Session, Session)>,
     retry_explicit_start: bool,
 ) -> Result<ClientRequest, StartFailure> {
-    if session.proof.as_ref() == Some(proof) {
+    if session.proof.as_ref() == Some(proof) && !retry_explicit_start {
         return Ok(ClientRequest::ChatAttach { session });
     }
     let mut refusal = None;
-    if !session
-        .proof
-        .as_ref()
-        .is_some_and(HostSessionProof::is_complete)
+    if retry_explicit_start
+        || !session
+            .proof
+            .as_ref()
+            .is_some_and(HostSessionProof::is_complete)
     {
         // Shared panes can be published before their first attachment records
         // ownership. Recover the daemon's exact descriptor before considering
@@ -1152,6 +1153,48 @@ fn restore(
                     && session.launch.session_id != hosted.launch.session_id)
             {
                 return Err("The hosted chat does not match the exact saved conversation".into());
+            }
+            if retry_explicit_start && session.launch.provider == crate::agent::Provider::Claude {
+                // A lost successful reply attaches the existing owner. A
+                // genuinely failed named initialization may instead retain an
+                // exact unfinished Close; only normal authenticated resume
+                // preparation can finish it and return the original request.
+                let request_id = *attach_request;
+                *attach_request += 1;
+                codec
+                    .write(
+                        stream,
+                        &ClientEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: Some(proof.clone()),
+                            request: ClientRequest::ChatPrepareResume {
+                                source: hosted.clone(),
+                            },
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                let prepared = match receive(stream, codec, request_id, Some(proof))? {
+                    ServerResponse::ChatResumePrepared { session } => session,
+                    _ => {
+                        return Err(
+                            "The failed start did not receive exact resume preparation".into()
+                        );
+                    }
+                };
+                if prepared == hosted {
+                    return Ok(ClientRequest::ChatAttach { session: hosted });
+                }
+                if prepared == session {
+                    let execution_environment = native_environment(&prepared, true);
+                    return Ok(ClientRequest::ChatStart {
+                        session: prepared,
+                        source: None,
+                        terminate_source: false,
+                        execution_environment,
+                    });
+                }
+                return Err("Resume preparation changed the exact failed-start request".into());
             }
             return Ok(ClientRequest::ChatAttach { session: hosted });
         }

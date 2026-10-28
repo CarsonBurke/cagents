@@ -29,6 +29,78 @@ fn same_scope(left: &LaunchAccountScope, right: &LaunchAccountScope) -> bool {
 
 // Evidence is projected only from a VerifiedRetirement on the production path.
 // A holder awaiting its parent's wait is not executing provider work.
+fn validate_retired_identity(
+    ownership: &NativeActorOwnership,
+    retirement: &NativeActorRetirement,
+    evidence: &Evidence<'_>,
+) -> Result<(), String> {
+    let owns_alias =
+        |candidate: &Session| candidate == evidence.source || evidence.aliases.contains(candidate);
+    if evidence.actor != ownership.actor()
+        || evidence.actor != retirement.actor()
+        || evidence.owner != ownership.owner()
+        || evidence.owner != retirement.owner()
+        || evidence.source.id != evidence.owner.terminal
+        || evidence.source.proof.as_ref() != Some(evidence.proof)
+        || evidence.owner.boot != evidence.proof.boot_id
+        || !owns_alias(ownership.source())
+        || !owns_alias(retirement.source())
+        || retirement.confirmed_session() != evidence.confirmed
+        || evidence.owner.root.is_current()
+    {
+        return Err("The saved Claude actor has no matching completed retirement".into());
+    }
+    let captured = evidence.scope.map_err(|_| {
+        "The retired Claude actor has no captured physical account identity".to_owned()
+    })?;
+    let registered = ownership.scope().map_err(str::to_owned)?;
+    let retired = retirement.scope().map_err(str::to_owned)?;
+    if captured.provider != Provider::Claude
+        || !same_scope(captured, registered)
+        || !same_scope(captured, retired)
+    {
+        return Err("The Claude retirement changed its captured physical account identity".into());
+    }
+    Ok(())
+}
+
+fn retirement_evidence(verified: &crate::chat::runtime::VerifiedRetirement) -> Evidence<'_> {
+    let receipt = verified.receipt();
+    Evidence {
+        actor: receipt.identity.instance,
+        owner: &receipt.identity.record,
+        proof: &receipt.proof,
+        source: &receipt.source,
+        aliases: &receipt.previous_sources,
+        scope: receipt
+            .launch_account_scope
+            .as_ref()
+            .map_err(String::as_str),
+        confirmed: receipt.confirmed_session.as_deref(),
+        paired_holder: receipt.paired_holder.as_ref(),
+    }
+}
+
+fn unconfirmed_retired_startup(
+    ownership: &NativeActorOwnership,
+    retirement: &NativeActorRetirement,
+    verified: &crate::chat::runtime::VerifiedRetirement,
+) -> Result<bool, String> {
+    // This actor is not resume evidence. A normal Close has already consumed
+    // its semantic journal and authenticated both process and helper teardown.
+    // Keep its census/retirement intact, but do not let a failed initialization
+    // compete with a later provider-confirmed actor using the same allocation.
+    // Pending cleanup intent remains subject to its separate strict witness.
+    if ownership.is_pending()
+        || retirement.is_pending()
+        || verified.receipt().confirmed_session.is_some()
+    {
+        return Ok(false);
+    }
+    validate_retired_identity(ownership, retirement, &retirement_evidence(verified))?;
+    Ok(true)
+}
+
 fn validate_evidence(
     source: &Session,
     ownership: &NativeActorOwnership,
@@ -43,35 +115,15 @@ fn validate_evidence(
     {
         return Err("Pending cleanup intent never grants disk resume authority".into());
     }
-    let owns_alias =
-        |candidate: &Session| candidate == evidence.source || evidence.aliases.contains(candidate);
-    if evidence.actor != ownership.actor()
-        || evidence.actor != retirement.actor()
-        || evidence.owner != ownership.owner()
-        || evidence.owner != retirement.owner()
-        || source.id != evidence.owner.terminal
-        || !owns_alias(source)
-        || !owns_alias(ownership.source())
-        || !owns_alias(retirement.source())
-        || retirement.confirmed_session() != evidence.confirmed
+    validate_retired_identity(ownership, retirement, evidence)?;
+    if source.id != evidence.owner.terminal
+        || (source != evidence.source && !evidence.aliases.contains(source))
         || evidence.confirmed != source.launch.session_id.as_deref()
         || evidence.confirmed.is_none()
-        || evidence.owner.root.is_current()
     {
         return Err(
             "The exact saved Claude pane has no matching completed actor retirement".into(),
         );
-    }
-    let captured = evidence.scope.map_err(|_| {
-        "The retired Claude actor has no captured physical account identity".to_owned()
-    })?;
-    let registered = ownership.scope().map_err(str::to_owned)?;
-    let retired = retirement.scope().map_err(str::to_owned)?;
-    if captured.provider != Provider::Claude
-        || !same_scope(captured, registered)
-        || !same_scope(captured, retired)
-    {
-        return Err("The Claude retirement changed its captured physical account identity".into());
     }
     Ok(())
 }
@@ -171,6 +223,14 @@ pub(super) fn inspect_resume_retirement(
                     return Err("The saved Claude actor exited without verified retirement".into());
                 }
                 crate::chat::runtime::RetirementInspection::Verified(receipt) => {
+                    let retirement = registry
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .native_actor_retirement(ownership.actor())?
+                        .ok_or("The saved Claude actor has no committed retirement")?;
+                    if unconfirmed_retired_startup(&ownership, &retirement, &receipt)? {
+                        continue;
+                    }
                     if receipt.receipt().identity.instance != ownership.actor()
                         || verified.replace(receipt).is_some()
                     {
@@ -304,23 +364,14 @@ pub(super) fn prepare_resume_verified(
                     );
                 }
             };
+            if unconfirmed_retired_startup(&ownership, &retirement, &verified)? {
+                continue;
+            }
             let receipt = verified.receipt();
             if archived.is_some() && !receipt.installed {
                 return Err("Archived history requires actual installed actor retirement".into());
             }
-            let evidence = Evidence {
-                actor: receipt.identity.instance,
-                owner: &receipt.identity.record,
-                proof: &receipt.proof,
-                source: &receipt.source,
-                aliases: &receipt.previous_sources,
-                scope: receipt
-                    .launch_account_scope
-                    .as_ref()
-                    .map_err(String::as_str),
-                confirmed: receipt.confirmed_session.as_deref(),
-                paired_holder: receipt.paired_holder.as_ref(),
-            };
+            let evidence = retirement_evidence(&verified);
             validate_evidence(
                 source,
                 &ownership,

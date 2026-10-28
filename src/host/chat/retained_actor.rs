@@ -14,6 +14,9 @@ pub(in crate::host) struct Startup {
     pub(super) source: Session,
     pub(super) requested: Session,
     pub(super) context: Arc<chat::protocol::ExecutionContext>,
+    /// An initial named resume failed after installation. Only this exact
+    /// attachment may finish its normal semantic close before a retry starts.
+    pub(super) failed_close: Option<super::CloseTarget>,
 }
 
 /// Unit-only HostState fixtures intentionally exercise local transports without
@@ -556,6 +559,9 @@ pub(super) fn forget_startup(
 }
 
 pub(super) fn reconcile_startup(host: &SharedHost, source: &Session) -> Result<bool, String> {
+    if prepare_failed_start(host, source)?.is_some() {
+        return Ok(true);
+    }
     let pending = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let Some(pending) = state.native_actor_startups.get(&source.id) else {
@@ -580,6 +586,34 @@ pub(super) fn reconcile_startup(host: &SharedHost, source: &Session) -> Result<b
                 .into(),
         ),
     }
+}
+
+/// Explicit retry may discover the still-owned failed attachment in ChatList.
+/// Preparation finishes that exact normal Close and returns only its original
+/// requested launch. An unrelated or successful retained actor never gains a
+/// restart grant through this path.
+pub(super) fn prepare_failed_start(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<Option<Session>, String> {
+    let failed = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .native_actor_startups
+            .get(&source.id)
+            .and_then(|pending| {
+                pending.failed_close.as_ref().and_then(|target| {
+                    (source == &pending.requested || source == &target.source)
+                        .then(|| (pending.clone(), target.clone()))
+                })
+            })
+    };
+    if let Some((pending, target)) = failed {
+        super::close_captured(host, target).map_err(|error| error.message)?;
+        forget_startup(host, &pending.source, &pending.context);
+        return Ok(Some(pending.requested));
+    }
+    Ok(None)
 }
 
 /// Persist cleanup authority while the inspected source and captured scope are

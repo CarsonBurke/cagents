@@ -3159,7 +3159,17 @@ impl Runtime {
             return Err("Conversation connection closed during recovery".into());
         }
         let snapshot = handle.snapshot();
-        if self.session.is_saved_claude_history()
+        if self.is_saved_history_snapshot(&snapshot) {
+            return Ok(!snapshot.history_loading);
+        }
+        if snapshot.exited || snapshot.read_only_reason.is_some() {
+            return Err("Conversation cannot accept a message after recovery".into());
+        }
+        Ok(snapshot.ready && !snapshot.history_loading)
+    }
+
+    fn is_saved_history_snapshot(&self, snapshot: &Snapshot) -> bool {
+        self.session.is_saved_claude_history()
             && snapshot.exited
             && snapshot.read_only_reason.is_some()
             && snapshot.session_id == self.session.launch.session_id
@@ -3171,13 +3181,6 @@ impl Runtime {
             && !snapshot.busy
             && !snapshot.waiting
             && snapshot.requests.is_empty()
-        {
-            return Ok(!snapshot.history_loading);
-        }
-        if snapshot.exited || snapshot.read_only_reason.is_some() {
-            return Err("Conversation cannot accept a message after recovery".into());
-        }
-        Ok(snapshot.ready && !snapshot.history_loading)
     }
 
     pub(super) fn parent_transcript_selected(&self) -> bool {
@@ -4508,6 +4511,23 @@ impl Runtime {
     /// Whether this runtime still has a daemon connection to its own actor.
     fn connected(&self) -> bool {
         self.handle().is_some() && !self.disconnected
+    }
+    pub(super) fn inspector_runtime_status(&self) -> InspectorRuntimeStatus {
+        if self.disconnected {
+            InspectorRuntimeStatus::Attention
+        } else if self.is_saved_history_snapshot(&self.snapshot) {
+            if self.snapshot.history_loading {
+                InspectorRuntimeStatus::Loading
+            } else {
+                InspectorRuntimeStatus::Ready
+            }
+        } else if self.snapshot.exited {
+            InspectorRuntimeStatus::Attention
+        } else if self.is_draft() || self.snapshot.ready {
+            InspectorRuntimeStatus::Ready
+        } else {
+            InspectorRuntimeStatus::Starting
+        }
     }
     /// Ownership can become durable after the initial attachment, including
     /// while the pane is hidden. Preserve that confirmed capability before
@@ -14747,6 +14767,50 @@ mod tests {
             Some(CardRuntime::Chat(runtime)) => runtime,
             _ => panic!("the card holds a chat"),
         }
+    }
+
+    #[test]
+    fn inspector_does_not_report_an_exited_attached_provider_as_ready() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let draft = draft_chat_for_provider(&mut app, Provider::Claude);
+        assert_eq!(
+            app.inspector_runtime_status(draft),
+            InspectorRuntimeStatus::Ready
+        );
+        let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+        for (ready, exited, expected) in [
+            (false, false, InspectorRuntimeStatus::Starting),
+            (true, false, InspectorRuntimeStatus::Ready),
+            (false, true, InspectorRuntimeStatus::Attention),
+            (true, true, InspectorRuntimeStatus::Attention),
+        ] {
+            show_chat_snapshot_for_test(
+                &mut app,
+                card,
+                Snapshot {
+                    session_id: Some(KNOWN_THREAD.into()),
+                    ready,
+                    exited,
+                    ..Snapshot::default()
+                },
+            );
+            assert_eq!(app.inspector_runtime_status(card), expected);
+        }
+        show_chat_snapshot_for_test(
+            &mut app,
+            card,
+            Snapshot {
+                session_id: Some(KNOWN_THREAD.into()),
+                exited: true,
+                read_only_reason: Some("Saved history has no executing provider".into()),
+                native_continuity: chat::NativeContinuity::ReconnectOnly,
+                ..Snapshot::default()
+            },
+        );
+        assert_eq!(
+            app.inspector_runtime_status(card),
+            InspectorRuntimeStatus::Ready
+        );
     }
 
     fn presentation_child(id: &str, item: Arc<chat::Item>) -> chat::Subagent {

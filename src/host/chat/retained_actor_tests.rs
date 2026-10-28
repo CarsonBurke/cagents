@@ -3182,6 +3182,7 @@ fn pending_startup_keeps_exact_cleanup_owner_until_retry_proves_teardown() {
             source: source.clone(),
             requested: source.clone(),
             context: original.clone(),
+            failed_close: None,
         },
     );
     for _ in 0..2 {

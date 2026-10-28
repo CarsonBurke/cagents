@@ -15,7 +15,15 @@ fn isolated(name: &str) -> Option<PathBuf> {
             std::env::var_os("CAGENTS_HOLDER_ROOT").unwrap(),
         ));
     }
-    let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+    let named_resume = name.starts_with("named_claude_resume_");
+    let directory = if named_resume {
+        tempfile::Builder::new()
+            .prefix("updater1513-")
+            .tempdir_in("/tmp")
+            .unwrap()
+    } else {
+        tempfile::tempdir_in("/var/tmp").unwrap()
+    };
     let root = directory.path();
     for child in [
         "home/.claude",
@@ -28,6 +36,16 @@ fn isolated(name: &str) -> Option<PathBuf> {
     ] {
         fs::create_dir_all(root.join(child)).unwrap();
     }
+    let claude_home = if named_resume {
+        for child in ["account-alpha", "account-beta", "project"] {
+            let path = root.join("fixture-inputs/workload").join(child);
+            fs::create_dir_all(&path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        root.join("fixture-inputs/workload/account-alpha")
+    } else {
+        root.join("home/.claude")
+    };
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
         .args([
@@ -40,7 +58,7 @@ fn isolated(name: &str) -> Option<PathBuf> {
         .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
         .env("CAGENTS_HOLDER_ROOT", root)
         .env("HOME", root.join("home"))
-        .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
+        .env("CLAUDE_CONFIG_DIR", claude_home)
         .env("XDG_RUNTIME_DIR", root.join("run"))
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_CONFIG_HOME", root.join("config"))
@@ -144,6 +162,398 @@ fn start(host: &SharedHost, session: Session) -> Result<ServerResponse, Protocol
         Some(context),
         None,
     )
+}
+
+#[test]
+fn named_claude_resume_failure_retires_before_exact_retry() {
+    named_resume_case(
+        "named_claude_resume_failure_retires_before_exact_retry",
+        false,
+    );
+}
+
+#[test]
+fn named_claude_resume_retry_finishes_failed_retirement_write() {
+    named_resume_case(
+        "named_claude_resume_retry_finishes_failed_retirement_write",
+        true,
+    );
+}
+
+fn named_resume_case(name: &str, fail_retirement: bool) {
+    let Some(root) = isolated(name) else { return };
+    let provider = root.join("bin/claude");
+    fs::write(
+        &provider,
+        include_str!("../../../tests/fixtures/claude-upgrade-continuity.py"),
+    )
+    .unwrap();
+    fs::set_permissions(provider, fs::Permissions::from_mode(0o700)).unwrap();
+    let project = root.join("fixture-inputs/workload/project");
+    let (host, proof) = setup(&root, name);
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let notifications = super::super::notifications::Broker::start(
+        &host,
+        crate::notifications::Application::Cagents,
+    )
+    .unwrap();
+    host.lock().unwrap().notifications = Some(notifications.handle());
+    let _wire = HostClientWire::start(&host, &proof);
+    let initial = chat::fresh_session(
+        Provider::Claude,
+        TerminalId::new(),
+        project.clone(),
+        &crate::account::Account::system(Provider::Claude),
+    )
+    .unwrap();
+    let initial_id = initial.id;
+    start(&host, initial).unwrap();
+    let handle = host.lock().unwrap().chats[&initial_id].handle.clone();
+    let wait = |condition: &mut dyn FnMut() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !condition() {
+            assert!(
+                Instant::now() < deadline,
+                "named-resume fixture did not settle"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    wait(&mut || handle.attachment_snapshot().ready);
+    handle
+        .command(chat::Command::Prompt {
+            text: "LIVE_WORK_1513".into(),
+            attachments: vec![],
+            mode: chat::PromptMode::Send,
+        })
+        .unwrap();
+    wait(&mut || root.join("provider-done").exists() && handle.is_idle());
+    let ServerResponse::ChatListed { sessions } =
+        process(&host, 0, ClientRequest::ChatList).unwrap()
+    else {
+        panic!("expected the actual hosted conversation");
+    };
+    let original = sessions
+        .into_iter()
+        .find(|session| session.id == initial_id)
+        .unwrap();
+    let thread = original.launch.session_id.as_ref().unwrap();
+    let project_key = project
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>();
+    let history = root
+        .join("fixture-inputs/workload/account-alpha/projects")
+        .join(project_key)
+        .join(format!("{thread}.jsonl"));
+    let history_before = fs::read(&history).unwrap();
+    process(
+        &host,
+        0,
+        ClientRequest::ChatClose {
+            chat_id: initial_id,
+        },
+    )
+    .unwrap();
+    let ServerResponse::ChatResumePrepared { session: requested } = process(
+        &host,
+        0,
+        ClientRequest::ChatPrepareResume {
+            source: original.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected authenticated resume preparation")
+    };
+    assert_eq!(requested.launch, original.launch);
+    assert_ne!(requested.id, original.id);
+    assert_eq!(requested.proof, None);
+
+    let fault = rusqlite::Connection::open(root.join("registry.sqlite3")).unwrap();
+    if fail_retirement {
+        fault.execute_batch("CREATE TRIGGER fail_resume_retirement BEFORE DELETE ON agent_authorities BEGIN SELECT RAISE(ABORT, 'fixture resume retirement refusal'); END;").unwrap();
+    }
+    let connect = |intent| {
+        crate::chat::client::ClientHandle::connect(
+            requested.clone(),
+            intent,
+            None,
+            false,
+            None,
+            |_| {},
+        )
+    };
+    let failure = match connect(chat::Intent::Start) {
+        Err(failure) => failure,
+        Ok(handle) => {
+            let _ = handle.close();
+            panic!("unconfirmed initialization must not become a successful attachment");
+        }
+    };
+    assert!(failure.message.contains("75"), "{}", failure.message);
+    let registry = super::super::agent_execution::registry(&host).unwrap();
+    if fail_retirement {
+        assert!(
+            failure
+                .message
+                .contains("fixture resume retirement refusal"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            host.lock().unwrap().native_actor_startups[&requested.id]
+                .failed_close
+                .is_some()
+        );
+        assert!(host.lock().unwrap().chats.contains_key(&requested.id));
+        fault
+            .execute_batch("DROP TRIGGER fail_resume_retirement")
+            .unwrap();
+    } else {
+        assert!(!host.lock().unwrap().chats.contains_key(&requested.id));
+        assert!(host.lock().unwrap().native_actor_startups.is_empty());
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .retained_agent_authority_source(requested.id)
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert!(host.lock().unwrap().chat_spawning.is_empty());
+    assert_eq!(fs::read(&history).unwrap(), history_before);
+
+    // The exact original request is retried only after the real failed owner
+    // finishes normal Close, including a previously failed retirement write.
+    let client = connect(chat::Intent::RetryStart).unwrap();
+    let resumed = client.session();
+    // The adapter does not broadcast daemon change notifications. Wait for
+    // normal history loading, then exercise the real Client visibility/read
+    // path rather than asserting a potentially still-loading initial body.
+    wait(&mut || {
+        !host.lock().unwrap().chats[&requested.id]
+            .handle
+            .attachment_snapshot()
+            .history_loading
+    });
+    client.set_visible(true).unwrap();
+    wait(&mut || {
+        client
+            .snapshot()
+            .items
+            .iter()
+            .filter(|item| item.role == chat::Role::User)
+            .count()
+            == 1
+            && !client.snapshot().history_loading
+    });
+    let snapshot = client.snapshot();
+    assert_eq!(
+        resumed.id, requested.id,
+        "keep the daemon-issued allocation"
+    );
+    assert_eq!(resumed.launch, requested.launch);
+    assert!(snapshot.ready && !snapshot.exited);
+    assert_eq!(snapshot.session_id, requested.launch.session_id);
+    assert_eq!(
+        snapshot
+            .items
+            .iter()
+            .filter(|item| item.role == chat::Role::User)
+            .count(),
+        1
+    );
+    for index in 0..40 {
+        assert_eq!(snapshot.items.iter().filter(|item| {
+            matches!(&item.content, chat::ItemContent::Text { text, .. } if text == &format!("FRAME_{index:03}|"))
+        }).count(), 1);
+    }
+    assert_eq!(
+        fs::read_to_string(root.join("prompts")).unwrap(),
+        "prompt\n"
+    );
+    assert_eq!(fs::read(&history).unwrap(), history_before);
+    assert!(host.lock().unwrap().native_actor_startups.is_empty());
+    let failed = registry
+        .lock()
+        .unwrap()
+        .native_actor_ownerships(None, 128)
+        .unwrap()
+        .into_iter()
+        .filter(|owner| owner.source().id == requested.id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        failed.len(),
+        2,
+        "retain failed and successful actor metadata"
+    );
+    for owner in &failed {
+        if registry
+            .lock()
+            .unwrap()
+            .native_actor_retirement(owner.actor())
+            .unwrap()
+            .is_some()
+        {
+            assert!(!owner.owner().root.is_current() && !owner.owner().holder.is_current());
+        }
+    }
+    client.close().unwrap();
+    assert!(
+        registry
+            .lock()
+            .unwrap()
+            .retained_agent_authority_source(resumed.id)
+            .unwrap()
+            .is_none()
+    );
+    // The obsolete unconfirmed actor is not history authority and does not
+    // veto the genuinely confirmed, normally retired successor's next resume.
+    let ServerResponse::ChatResumePrepared { session: next } = process(
+        &host,
+        0,
+        ClientRequest::ChatPrepareResume {
+            source: resumed.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected exact resume after the completed retry")
+    };
+    assert_ne!(next.id, resumed.id);
+    assert_eq!(next.launch, resumed.launch);
+    assert_eq!(next.proof, None);
+    assert_eq!(fs::read(&history).unwrap(), history_before);
+    assert!(host.lock().unwrap().chats.is_empty());
+}
+
+/// Framed native Client calls use the actual HOST handlers, lease and private
+/// execed helper. This test adapter supplies only the Connect envelope; it does
+/// not fabricate start/attach, provider exit, semantic ACK or retirement data.
+struct HostClientWire {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    streams: Arc<std::sync::Mutex<Vec<std::os::unix::net::UnixStream>>>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl HostClientWire {
+    fn start(host: &SharedHost, proof: &HostSessionProof) -> Self {
+        use crate::terminal_ipc::{
+            ClientEnvelope, ServerEnvelope, ServerMessage, read_frame, write_frame,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let socket = crate::terminal::ipc::daemon_socket_path().unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let streams = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stopped = stop.clone();
+        let connections = streams.clone();
+        let host = host.clone();
+        let proof = proof.clone();
+        let worker = thread::spawn(move || {
+            let mut workers = Vec::new();
+            while !stopped.load(Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("native client fixture accept: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                connections
+                    .lock()
+                    .unwrap()
+                    .push(stream.try_clone().unwrap());
+                let stopped = stopped.clone();
+                let host = host.clone();
+                let proof = proof.clone();
+                workers.push(thread::spawn(move || {
+                    while !stopped.load(Ordering::Acquire) {
+                        let envelope: ClientEnvelope = match read_frame(&mut stream) {
+                            Ok(Some(envelope)) => envelope,
+                            Ok(None) => break,
+                            Err(_) if stopped.load(Ordering::Acquire) => break,
+                            Err(crate::terminal_ipc::FrameError::Io(error))
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ) =>
+                            {
+                                continue;
+                            }
+                            Err(error) => panic!("native client fixture request: {error}"),
+                        };
+                        assert_eq!(envelope.version, PROTOCOL_VERSION);
+                        let result = match envelope.request {
+                            ClientRequest::Connect {
+                                expected_host,
+                                resume,
+                            } => {
+                                assert!(
+                                    expected_host.is_none()
+                                        || expected_host.as_ref() == Some(&proof)
+                                );
+                                assert!(resume.is_empty());
+                                Ok(ServerResponse::Connected {
+                                    proof: proof.clone(),
+                                    resumed: vec![],
+                                })
+                            }
+                            request => {
+                                assert_eq!(envelope.proof.as_ref(), Some(&proof));
+                                process(&host, 0, request)
+                            }
+                        };
+                        let message = match result {
+                            Ok(response) => ServerMessage::Response { response },
+                            Err(error) => ServerMessage::Error(error),
+                        };
+                        if write_frame(
+                            &mut stream,
+                            &ServerEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id: Some(envelope.request_id),
+                                proof: proof.clone(),
+                                message,
+                            },
+                        )
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }));
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+        Self {
+            stop,
+            streams,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for HostClientWire {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        for stream in self.streams.lock().unwrap().iter() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        self.worker.take().unwrap().join().unwrap();
+    }
 }
 
 #[test]

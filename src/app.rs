@@ -12421,7 +12421,7 @@ impl Cagents {
                     InspectorRuntimeStatus::Ready
                 }
             },
-            Some(CardRuntime::Chat(_)) => InspectorRuntimeStatus::Ready,
+            Some(CardRuntime::Chat(runtime)) => runtime.inspector_runtime_status(),
             Some(CardRuntime::Completed)
             | Some(CardRuntime::Terminal(_))
             | Some(CardRuntime::PullRequests(_))
