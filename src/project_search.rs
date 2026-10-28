@@ -133,6 +133,8 @@ fn search_with_limits(
     };
     let mut overrides = GitignoreBuilder::new(root);
     overrides.allow_unclosed_class(false);
+    let mut directory_includes = GitignoreBuilder::new(root);
+    directory_includes.allow_unclosed_class(false);
     for (patterns, excluded) in [(&options.include, false), (&options.exclude, true)] {
         for glob in patterns
             .split(',')
@@ -148,6 +150,14 @@ fn search_with_limits(
                 publish(Progress::Error(format!("Invalid file glob: {error}")));
                 return;
             }
+            if !excluded && glob.ends_with('/') && !glob.starts_with('!') {
+                // Only an explicit directory include inherits to children;
+                // a file glob such as *.rs must still filter by file name.
+                if let Err(error) = directory_includes.add_line(None, glob) {
+                    publish(Progress::Error(format!("Invalid file glob: {error}")));
+                    return;
+                }
+            }
         }
     }
     let overrides = match overrides.build() {
@@ -157,9 +167,14 @@ fn search_with_limits(
             return;
         }
     };
-    // Like OverrideBuilder, positive globs include and negated globs
-    // exclude. Keep the underlying matcher so directory matches can also
-    // apply to descendant files without rewriting gitignore syntax.
+    let directory_includes = match directory_includes.build() {
+        Ok(includes) => includes,
+        Err(error) => {
+            publish(Progress::Error(error.to_string()));
+            return;
+        }
+    };
+    // Like OverrideBuilder, positive globs include and negated globs exclude.
     let has_includes = overrides.num_ignores() > 0;
     let guarded_root = match crate::fs_safety::Root::open(root) {
         Ok(root) => root,
@@ -271,8 +286,14 @@ fn search_with_limits(
         // Apply include/exclude patterns after the ignore-aware walk. A file
         // include must not silently re-include an ignored file or prune a
         // directory that may contain a matching descendant.
-        let matched = overrides.matched_path_or_any_parents(&path, false).invert();
-        if matched.is_ignore() || (matched.is_none() && has_includes) {
+        let matched = overrides.matched(&path, false).invert();
+        if matched.is_ignore()
+            || (matched.is_none()
+                && has_includes
+                && !directory_includes
+                    .matched_path_or_any_parents(&path, false)
+                    .is_ignore())
+        {
             continue;
         }
         let Ok(path) = path.strip_prefix(root) else {
@@ -727,6 +748,23 @@ mod tests {
             [PathBuf::from("src/child/deep.rs")]
         );
         assert_eq!(paths("**/", "generated/", false).len(), 4);
+        assert_eq!(paths("src/,src/child", "", false), paths("src/", "", false));
+        for path in [
+            "looks_like.rs/notes.txt",
+            "looks_like.rs/child.rs",
+            "src/looks_like.rs/notes.txt",
+        ] {
+            let path = fixture.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "needle").unwrap();
+        }
+        assert!(
+            paths("*.rs", "", false)
+                .iter()
+                .all(|path| path.extension().is_some_and(|extension| extension == "rs"))
+        );
+        assert_eq!(paths("src/*.rs", "", false), [PathBuf::from("src/main.rs")]);
+        assert!(paths("*.rs", "", false).contains(&PathBuf::from("looks_like.rs/child.rs")));
     }
 
     #[test]
