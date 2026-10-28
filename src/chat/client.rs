@@ -271,6 +271,58 @@ impl UpgradeRecovery {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod saved_history_fixture;
+
+/// Authenticated, settled History attachment for one unchanged saved allocation.
+/// This witness cannot be serialized or minted from descriptor data.
+#[derive(Clone, Debug)]
+pub(crate) struct SavedHistoryAdmission {
+    source: Session,
+    reader: Session,
+}
+
+impl SavedHistoryAdmission {
+    pub(crate) fn exact(source: &Session, reader: &Session) -> bool {
+        let mut expected = source.clone();
+        expected.proof = reader.proof.clone();
+        source.is_saved_claude_history() && reader.is_saved_claude_history() && expected == *reader
+    }
+
+    pub(crate) fn snapshot_matches(reader: &Session, snapshot: &Snapshot, settled: bool) -> bool {
+        snapshot.session_id == reader.launch.session_id
+            && snapshot.exited
+            && snapshot.read_only_reason.is_some()
+            && (!settled || !snapshot.history_loading)
+            && !snapshot.busy
+            && !snapshot.waiting
+            && snapshot.requests.is_empty()
+            && snapshot.error.is_none()
+            && snapshot.native_continuity == super::NativeContinuity::ReconnectOnly
+    }
+
+    fn confirmed(
+        source: Session,
+        reader: Session,
+        snapshot: &Snapshot,
+    ) -> Result<Self, StartFailure> {
+        if !Self::exact(&source, &reader) || !Self::snapshot_matches(&reader, snapshot, true) {
+            return Err("The saved conversation did not return settled read-only history; the draft is retained".into());
+        }
+        Ok(Self { source, reader })
+    }
+
+    pub(crate) fn source(&self) -> &Session {
+        &self.source
+    }
+    pub(crate) fn reader(&self) -> &Session {
+        &self.reader
+    }
+    pub(crate) fn validate(&self) -> bool {
+        Self::exact(&self.source, &self.reader)
+    }
+}
+
 /// One immutable, coherent presentation. Append evidence owns only bounded
 /// Weak item edges; neither hidden state nor lineage keeps transcript bodies.
 struct Publication {
@@ -1706,6 +1758,69 @@ impl ClientHandle {
         )
     }
 
+    /// Open the original saved allocation strictly as History. Neither a live
+    /// actor nor a fallback provider start can escape this handshake.
+    pub(crate) fn connect_saved_history(
+        source: Session,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<(Self, SavedHistoryAdmission), StartFailure> {
+        let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+        let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
+        Self::connect_saved_history_on(stream, source, wake)
+    }
+
+    pub(crate) fn connect_saved_history_on(
+        stream: UnixStream,
+        source: Session,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<(Self, SavedHistoryAdmission), StartFailure> {
+        let handle = Self::connect_on_policy(
+            stream,
+            source.clone(),
+            Intent::Restore,
+            None,
+            false,
+            None,
+            None,
+            None,
+            true,
+            wake,
+        )?;
+        // Hydrate on the background connector while this operation's wakes
+        // still have no UI owner. Showing an already-loading initial snapshot
+        // must not depend on a ChatChanged edge which may have raced Connect.
+        handle.set_interest(true, true)?;
+        if handle.snapshot().history_loading {
+            transmit(
+                &handle.inner.wire,
+                &handle.inner.proof,
+                handle.inner.next.fetch_add(1, Ordering::Relaxed),
+                ClientRequest::ChatRead {
+                    chat_id: handle.inner.id,
+                    after_generation: None,
+                },
+            )?;
+        }
+        let deadline = std::time::Instant::now() + CHAT_ATTACH_TIMEOUT;
+        loop {
+            let snapshot = handle.snapshot();
+            if !handle.is_connected()
+                || !SavedHistoryAdmission::snapshot_matches(&handle.session(), &snapshot, false)
+            {
+                return Err("The saved history connection changed before admission".into());
+            }
+            if !snapshot.history_loading {
+                let witness =
+                    SavedHistoryAdmission::confirmed(source, handle.session(), &snapshot)?;
+                return Ok((handle, witness));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("Saved history is still loading; retry Open history".into());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     pub fn recover_account(
         source: Session,
         replacement: Session,
@@ -1794,7 +1909,7 @@ impl ClientHandle {
     }
 
     fn connect_on(
-        mut stream: UnixStream,
+        stream: UnixStream,
         session: Session,
         intent: Intent,
         source: Option<HostSessionProof>,
@@ -1804,6 +1919,44 @@ impl ClientHandle {
         upgrade_expected: Option<Session>,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
+        Self::connect_on_policy(
+            stream,
+            session,
+            intent,
+            source,
+            terminate_source,
+            selection,
+            account_recovery,
+            upgrade_expected,
+            false,
+            wake,
+        )
+    }
+
+    fn connect_on_policy(
+        mut stream: UnixStream,
+        session: Session,
+        intent: Intent,
+        source: Option<HostSessionProof>,
+        terminate_source: bool,
+        selection: Option<String>,
+        account_recovery: Option<(Session, Option<u64>)>,
+        upgrade_expected: Option<Session>,
+        history_only: bool,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
+        let history_source = history_only.then(|| session.clone());
+        if history_only
+            && (!session.is_saved_claude_history()
+                || intent != Intent::Restore
+                || source.is_some()
+                || terminate_source
+                || selection.is_some()
+                || account_recovery.is_some()
+                || upgrade_expected.is_some())
+        {
+            return Err("Only exact saved history can be opened from a retained draft".into());
+        }
         let retirement = ClientRetirement::for_client(session.id)?;
         if intent == Intent::RetryStart
             && (source.is_some()
@@ -1873,7 +2026,36 @@ impl ClientHandle {
         let id = session.id;
         let mut attach_request = 2;
         let mut upgrade_recovery = None;
-        let request = if let Some(expected) = upgrade_expected {
+        let request = if history_only {
+            let request_id = attach_request;
+            attach_request += 1;
+            codec
+                .write(
+                    &mut stream,
+                    &ClientEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id,
+                        proof: Some(proof.clone()),
+                        request: ClientRequest::ResolveUpgradeChat {
+                            source: session.clone(),
+                        },
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            let resolved = match receive(&mut stream, &mut codec, request_id, Some(&proof))? {
+                ServerResponse::UpgradeChatResolved { session } => session,
+                _ => return Err("The daemon did not resolve this saved history".into()),
+            };
+            if resolved.proof.as_ref() != Some(&proof)
+                || !SavedHistoryAdmission::exact(&session, &resolved)
+            {
+                return Err("The saved conversation resolved to an active or different conversation; the draft is retained".into());
+            }
+            if session != resolved {
+                upgrade_recovery = Some((session, resolved.clone()));
+            }
+            ClientRequest::ChatAttach { session: resolved }
+        } else if let Some(expected) = upgrade_expected {
             if expected.proof.as_ref() != Some(&proof) {
                 return Err("The canonical chat belongs to a different daemon".into());
             }
@@ -2013,6 +2195,22 @@ impl ClientHandle {
                 _ => return Err("Daemon did not attach the exact native chat".into()),
             }
         };
+        if history_only
+            && early_activity.is_some_and(|(_, state)| {
+                matches!(state, ActivityState::Working | ActivityState::Waiting)
+            })
+        {
+            return Err("The saved history became active during attachment".into());
+        }
+        if let Some(source) = history_source {
+            // A racing actor attachment is detached by dropping the stream;
+            // no client/Close/retirement path has been installed yet.
+            if !SavedHistoryAdmission::exact(&source, &session)
+                || !SavedHistoryAdmission::snapshot_matches(&session, &initial, false)
+            {
+                return Err("The saved conversation did not attach as read-only history".into());
+            }
+        }
         let upgrade_recovery = upgrade_recovery
             .map(|(source, resolved)| {
                 UpgradeRecovery::confirmed(source, resolved, &session, &initial)
@@ -2037,7 +2235,11 @@ impl ClientHandle {
         }
         let activity = Arc::new(Mutex::new(activity));
         let observed = Arc::new(Mutex::new(early_observed));
-        let account_usage = Arc::new(Mutex::new(early_usage));
+        let account_usage = Arc::new(Mutex::new(if history_only {
+            AccountUsage::default()
+        } else {
+            early_usage
+        }));
         // Attachment also serves non-UI callers that inspect the initial
         // publication directly. The UI immediately sets its actual visibility;
         // an unvisited hidden pane releases this body without preparing it.
@@ -2056,6 +2258,7 @@ impl ClientHandle {
         let file_pending: FilePending = Arc::new(Mutex::new(BTreeMap::new()));
         let text_copy_pending: TextCopyPending = Arc::new(Mutex::new(BTreeMap::new()));
         let (visibility_tx, visibility_rx) = crossbeam_channel::bounded(1);
+        let history_reader = history_only.then(|| session.clone());
         let inner = Arc::new(Inner::new(
             InnerPayload {
                 id,
@@ -2149,6 +2352,10 @@ impl ClientHandle {
                         _ => unreachable!(),
                     };
                     if chat_id!=id { break "Daemon closed a different chat".into(); }
+                    if history_reader.as_ref().is_some_and(|reader| terminal.is_some()
+                        || !SavedHistoryAdmission::snapshot_matches(reader, &final_snapshot, false)) {
+                        break "The read-only history attachment changed; detached without closing a provider".into();
+                    }
                     if terminal.is_some() && !final_snapshot.exited {
                         // A shared-server CLI is another view, not a closed
                         // native actor. Keep this connection and pending work.
@@ -2223,11 +2430,15 @@ impl ClientHandle {
                         }
                     },
                     ServerMessage::ChatActivity { chat_id, state, generation } if chat_id == id => {
+                        if history_only && matches!(state, ActivityState::Working | ActivityState::Waiting) {
+                            break "The read-only history attachment became active; detached without closing a provider".into();
+                        }
                         let changed = activity.lock().unwrap_or_else(|p| p.into_inner())
                             .observe(generation, state);
                         if changed { wake(Wake::Activity); }
                     },
                     ServerMessage::ChatAccountUsage { chat_id, report, observed_at } if chat_id == id => {
+                        if history_only { continue; }
                         let first = account_usage.lock().unwrap_or_else(|p| p.into_inner())
                             .push(report, observed_at);
                         if first { wake(Wake::AccountUsage); }
@@ -2235,6 +2446,9 @@ impl ClientHandle {
                     ServerMessage::Response { response: ServerResponse::ChatSnapshot { chat_id, snapshot: update } } if chat_id == id => {
                         read_pending = false;
                         if let Some(update) = update {
+                            if history_reader.as_ref().is_some_and(|reader| !SavedHistoryAdmission::snapshot_matches(reader, &update, false)) {
+                                break "The read-only history snapshot changed; detached without closing a provider".into();
+                            }
                             resync = false;
                             user_item_seen.fetch_or(update.items.iter().any(|item| item.role == super::Role::User), Ordering::AcqRel);
                             let resident = publication.replace(update, &body_requested, true, false);
@@ -2264,18 +2478,27 @@ impl ClientHandle {
                         // fallback. A failed full patch never publishes just its clock.
                         let derived = if retain_body {
                             let candidates = append::Lineage::candidates(&update, &base.snapshot);
-                            update.apply(&base.snapshot).map(|next| {
+                            update.apply(&base.snapshot).and_then(|next| {
+                                if history_reader.as_ref().is_some_and(|reader| !SavedHistoryAdmission::snapshot_matches(reader, &next, false)) {
+                                    return Err("Read-only history changed in a presentation update");
+                                }
                                 let mut lineage = base.lineage.clone(); lineage.record(candidates, &next);
                                 let full = Publication::next(&base, next, true, lineage);
                                 let metadata = full.hidden.as_ref().unwrap().clone();
-                                (Some(full), metadata)
+                                Ok((Some(full), metadata))
                             })
                         } else {
-                            update.metadata_for(&base.snapshot).map(|mut metadata| {
+                            update.metadata_for(&base.snapshot).and_then(|mut metadata| {
+                                if history_reader.as_ref().is_some_and(|reader| !SavedHistoryAdmission::snapshot_matches(reader, &metadata, false)) {
+                                    return Err("Read-only history changed in a metadata update");
+                                }
                                 metadata.evict_transcript();
-                                (None, Publication::next(&base, metadata, false, append::Lineage::default()))
+                                Ok((None, Publication::next(&base, metadata, false, append::Lineage::default())))
                             })
                         };
+                        if history_only && derived.is_err() {
+                            break "The read-only history update could not be verified; detached without closing a provider".into();
+                        }
                         let committed = derived.map(|(full, metadata)| {
                             #[cfg(test)]
                             if full.is_some() { tests::pause_before_publication(id); }
@@ -2292,6 +2515,7 @@ impl ClientHandle {
                             resident_bytes = state.snapshot.transcript_bytes());
                     },
                     ServerMessage::Error(error) => {
+                        if history_only { break format!("Read-only history became unavailable: {}", error.message); }
                         read_pending = false;
                         loop {
                             let (base, revision) = publication.capture();
@@ -2329,6 +2553,7 @@ impl ClientHandle {
                 }
             };
             alive.store(false, Ordering::Release);
+            if history_only { let _ = reader_stream.shutdown(Shutdown::Both); }
             {
                 let mut activity = activity.lock().unwrap_or_else(|p| p.into_inner());
                 activity.state = ActivityState::Unknown;

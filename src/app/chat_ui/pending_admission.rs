@@ -14,7 +14,25 @@ impl Runtime {
             .on_press_maybe(
                 (!text.is_empty()).then(|| Message::ChatUi(Action::CopyLiteral(text.clone()))),
             );
-        let header = widget::flex_row(vec![design::heading("Saved draft").into(), copy.into()])
+        let mut controls = vec![design::heading("Saved draft").into()];
+        if self.retained_history_candidate && self.session.is_saved_claude_history() {
+            controls.push(
+                widget::button::custom(design::body(if self.history_opening {
+                    "Opening history…"
+                } else {
+                    "Open history"
+                }))
+                .class(crate::ui_controls::control_style(false, None))
+                .padding([space::S as u16, space::M as u16])
+                .on_press_maybe(
+                    (!self.history_opening)
+                        .then_some(Message::ChatUi(Action::OpenSavedHistory(self.target))),
+                )
+                .into(),
+            );
+        }
+        controls.push(copy.into());
+        let header = widget::flex_row(controls)
             .align_items(Alignment::Center)
             .spacing(space::M as u16);
         let draft = widget::container(view::body(text))
@@ -25,13 +43,31 @@ impl Runtime {
                 [design::RADIUS_M; 4],
                 false,
             ));
-        let content = widget::column::with_children(vec![
-            header.into(),
-            design::body("This saved pane has not been reopened. Your unsent text is kept here; you can copy it while the workspace reconnects, or open the conversation from history.").into(),
-            widget::scrollable(draft).height(Length::Fill).into(),
-        ])
-        .spacing(space::M)
-        .width(Length::Fill);
+        let mut children = vec![header.into(),
+            design::body(if self.retained_history_candidate && self.session.is_saved_claude_history() {
+                "Your unsent draft is kept in this pane. Open history to read the saved conversation; Resume remains a separate action."
+            } else { "Your unsent draft is kept in this pane while the workspace reconnects. You can copy its text here." }).into()];
+        if !self.unsent_attachments().is_empty() {
+            children.push(
+                design::body(format!(
+                    "{} saved {} kept with this draft",
+                    self.unsent_attachments().len(),
+                    if self.unsent_attachments().len() == 1 {
+                        "image"
+                    } else {
+                        "images"
+                    }
+                ))
+                .into(),
+            );
+        }
+        if let Some(error) = &self.error {
+            children.push(design::body(error.clone()).into());
+        }
+        children.push(widget::scrollable(draft).height(Length::Fill).into());
+        let content = widget::column::with_children(children)
+            .spacing(space::M)
+            .width(Length::Fill);
         widget::container(widget::container(content).max_width(design::READABLE_MEASURE))
             .padding(space::L)
             .width(Length::Fill)
@@ -53,6 +89,18 @@ impl Cagents {
         Arc::make_mut(&mut self.durable)
             .pending_chat_admissions
             .insert(card, session.clone());
+        self.await_inert_chat(card, session);
+    }
+
+    pub(in crate::app) fn await_retained_history_reader(
+        &mut self,
+        card: CardId,
+        session: chat::Session,
+    ) {
+        self.await_inert_chat(card, session);
+    }
+
+    fn await_inert_chat(&mut self, card: CardId, session: chat::Session) {
         let target = self.chat_ui.next_target(card);
         let visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible);
         let mut runtime = Runtime::new(
@@ -73,6 +121,11 @@ impl Cagents {
                     .collect(),
             );
         }
+        runtime.retained_history_candidate = self
+            .session
+            .as_ref()
+            .is_some_and(|writer| writer.has_retained_history_candidate(card))
+            || self.is_retained_history_reader(card, &runtime.session);
         // Deliberately no provider connection, draft skill discovery, retirement,
         // or lifecycle job: this is only a local view of saved bytes.
         self.cards
@@ -280,6 +333,7 @@ impl Cagents {
             state.residency = Residency::Hot;
             let local_card = state.clone();
             runtime.retarget(self.chat_ui.next_target(retained));
+            runtime.retained_history_candidate = true;
             let durable = Arc::make_mut(&mut self.durable);
             if let Some(scope) = durable.card_scopes.get(&pane.id).cloned() {
                 durable.card_scopes.insert(retained, scope);
@@ -414,5 +468,280 @@ mod tests {
                 "review-only admission must not start the replacement provider"
             );
         });
+    }
+}
+
+impl Cagents {
+    pub(super) fn is_retained_history_reader(&self, card: CardId, source: &chat::Session) -> bool {
+        self.durable.local_only_cards.contains(&card)
+            && self.chat_ui.explicit_starts.get(&card) != Some(source)
+            && (self.chat_ui.strict_history_readers.get(&card) == Some(source)
+                || self
+                    .session
+                    .as_ref()
+                    .is_some_and(|writer| writer.is_retained_history_reader(card, source)))
+    }
+
+    fn retained_history_current(&self, context: &ResumePreparation, pending: bool) -> bool {
+        self.history_resume_current(context)
+            && self.durable.local_only_cards.contains(&context.target.card)
+            && if pending {
+                self.durable
+                    .pending_chat_admissions
+                    .get(&context.target.card)
+                    == Some(&context.source)
+                    && matches!(self.cards.get(&context.target.card), Some(CardRuntime::Chat(runtime))
+                        if runtime.awaiting_admission() && runtime.retained_history_candidate)
+            } else {
+                !self
+                    .durable
+                    .pending_chat_admissions
+                    .contains_key(&context.target.card)
+                    && self.is_retained_history_reader(context.target.card, &context.source)
+            }
+    }
+
+    fn retained_history_admitted(&mut self, card: CardId) -> bool {
+        !self.chat_closed_elsewhere(card)
+            && !self.refuse_for_deleting_card(card)
+            && !crate::device::is_remote()
+    }
+
+    fn retained_history_failed(
+        &mut self,
+        context: &ResumePreparation,
+        error: String,
+    ) -> Task<Message> {
+        self.chat_ui.finish(context.target, |phase| {
+            matches!(phase, Phase::OpeningHistory(_))
+        });
+        if let Some(runtime) = self.chat_runtime_mut(context.runtime) {
+            runtime.history_opening = false;
+            runtime.error = Some(format!(
+                "History could not be opened: {error}. Your draft and images are kept. Retry Open history."
+            ));
+        }
+        Task::none()
+    }
+
+    pub(super) fn open_retained_chat_history(&mut self, target: Target) -> Task<Message> {
+        if self.chat_start_pending(target.card) || !self.retained_history_admitted(target.card) {
+            return Task::none();
+        }
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) else {
+            return Task::none();
+        };
+        if runtime.target != target
+            || !(runtime.awaiting_admission() && runtime.retained_history_candidate
+                || self.is_retained_history_reader(target.card, &runtime.session))
+            || !runtime.session.is_saved_claude_history()
+        {
+            return Task::none();
+        }
+        let source = runtime.session.clone();
+        let pending = self.durable.pending_chat_admissions.get(&target.card) == Some(&source);
+        let Some(writer) = &self.session else {
+            if let Some(runtime) = self.chat_runtime_mut(target) {
+                runtime.error = Some(
+                    "Session storage is unavailable. Keep this window open and retry Open history."
+                        .into(),
+                );
+            }
+            return Task::none();
+        };
+        let writer = writer.writer_token();
+        let operation = self.chat_ui.next_target(target.card);
+        let context = ResumePreparation {
+            target: operation,
+            runtime: target,
+            source: source.clone(),
+            prepared: None,
+            snapshot_binding: None,
+            snapshot_owner: None,
+            writer,
+            window: self.core.main_window_id(),
+        };
+        if !self.retained_history_current(&context, pending) {
+            return Task::none();
+        }
+        self.chat_runtime_mut(target).unwrap().history_opening = true;
+        self.chat_runtime_mut(target).unwrap().error = None;
+        self.chat_ui.phases.insert(
+            target.card,
+            Phase::OpeningHistory(HistoryPreparation {
+                context,
+                pending,
+                reader: None,
+            }),
+        );
+        let sender = self.chat_ui.sender.clone();
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                ClientHandle::connect_saved_history(source, move |wake| {
+                    // No Runtime owns this target until the exact durable ACK.
+                    let _ = sender.try_send((operation, wake));
+                })
+                .map(|(handle, witness)| (Arc::new(handle), witness))
+                .map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap_or_else(|error| Err(error.to_string()));
+            Message::ChatUi(Action::SavedHistoryOpened(
+                operation,
+                HistoryReady(Arc::new(Mutex::new(Some(result)))),
+            ))
+        })
+    }
+
+    fn retained_chat_history_opened(
+        &mut self,
+        target: Target,
+        ready: HistoryReady,
+    ) -> Task<Message> {
+        let Some(Phase::OpeningHistory(history)) = self.chat_ui.phases.get(&target.card) else {
+            return Task::none();
+        };
+        let context = history.context.clone();
+        let pending = history.pending;
+        if context.target != target || history.reader.is_some() {
+            return Task::none();
+        }
+        if !self.retained_history_current(&context, pending) {
+            return self.retained_history_failed(
+                &context,
+                "This pane or its storage owner changed".into(),
+            );
+        }
+        if !self.retained_history_admitted(target.card) {
+            return self.retained_history_failed(
+                &context,
+                "This pane is no longer available for history".into(),
+            );
+        }
+        let result = ready.0.lock().ok().and_then(|mut ready| ready.take());
+        let (handle, witness) = match result {
+            Some(Ok(reader)) => reader,
+            Some(Err(error)) => return self.retained_history_failed(&context, error),
+            None => return Task::none(),
+        };
+        let snapshot = handle.snapshot();
+        if witness.source() != &context.source
+            || !witness.validate()
+            || handle.session() != *witness.reader()
+            || !handle.is_connected()
+            || !chat::client::SavedHistoryAdmission::snapshot_matches(
+                witness.reader(),
+                &snapshot,
+                true,
+            )
+        {
+            return self.retained_history_failed(
+                &context,
+                "The attachment is not the exact settled read-only conversation".into(),
+            );
+        }
+        let mut snapshot = self.persistent_workspace();
+        let state = Arc::make_mut(&mut snapshot);
+        state
+            .cards
+            .iter_mut()
+            .find(|card| card.id == target.card)
+            .unwrap()
+            .kind = CardKind::Chat(witness.reader().clone());
+        state.pending_chat_admissions.remove(&target.card);
+        let receipt = self.session.as_ref().unwrap().save_retained_chat_history(
+            snapshot,
+            target.card,
+            witness.clone(),
+        );
+        let receipt = receipt.map(|(receipt, binding, owner)| {
+            if let Some(Phase::OpeningHistory(history)) = self.chat_ui.phases.get_mut(&target.card)
+            {
+                history.context.snapshot_binding = Some(binding);
+                history.context.snapshot_owner = Some(owner);
+                history.reader = Some((handle, witness));
+            }
+            receipt
+        });
+        cosmic::task::future(async move {
+            let result = match receipt {
+                Ok(receipt) => tokio::task::spawn_blocking(move || {
+                    receipt.recv().unwrap_or_else(|_| {
+                        Err("Session writer did not acknowledge history admission".into())
+                    })
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string())),
+                Err(error) => Err(error),
+            };
+            Message::ChatUi(Action::SavedHistoryCommitted(target, result))
+        })
+    }
+
+    fn retained_chat_history_committed(
+        &mut self,
+        target: Target,
+        result: Result<(), String>,
+    ) -> Task<Message> {
+        let Some(Phase::OpeningHistory(history)) = self.chat_ui.phases.get(&target.card) else {
+            return Task::none();
+        };
+        let context = history.context.clone();
+        let reader = history.reader.clone();
+        let pending = history.pending;
+        if context.target != target || reader.is_none() {
+            return Task::none();
+        }
+        if !self.retained_history_current(&context, pending)
+            || !self.retained_history_admitted(target.card)
+        {
+            return self.retained_history_failed(
+                &context,
+                "This pane or its storage owner changed".into(),
+            );
+        }
+        if let Err(error) = result {
+            return self.retained_history_failed(&context, error);
+        }
+        let (handle, witness) = reader.unwrap();
+        if !handle.is_connected()
+            || handle.session() != *witness.reader()
+            || !chat::client::SavedHistoryAdmission::snapshot_matches(
+                witness.reader(),
+                &handle.snapshot(),
+                true,
+            )
+        {
+            return self.retained_history_failed(
+                &context,
+                "The history connection changed while saving; retry to reopen it".into(),
+            );
+        }
+        let Some(Phase::OpeningHistory(history)) = self.chat_ui.phases.remove(&target.card) else {
+            return Task::none();
+        };
+        let (handle, witness) = history.reader.unwrap();
+        // Keep the same Runtime and Content objects. Only now does this target
+        // own wakes, and refresh observes any hydration that arrived before ACK.
+        let runtime = self.chat_runtime_mut(context.runtime).unwrap();
+        runtime.retarget(target);
+        runtime.session = witness.reader().clone();
+        runtime.connection = Connection::Live(handle);
+        runtime.history_opening = false;
+        runtime.error = None;
+        runtime.disconnected = false;
+        if let Err(error) = runtime.present() {
+            runtime.error = Some(error);
+        }
+        runtime.refresh();
+        Arc::make_mut(&mut self.durable)
+            .pending_chat_admissions
+            .remove(&target.card);
+        self.install_chat_session(target.card, witness.reader().clone());
+        self.chat_ui
+            .strict_history_readers
+            .insert(target.card, witness.reader().clone());
+        self.persist();
+        Task::none()
     }
 }
