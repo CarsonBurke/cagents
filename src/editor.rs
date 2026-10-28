@@ -73,6 +73,8 @@ pub enum ReadOnlyReason {
         refusal: LinkRefusal,
     },
     Binary,
+    /// Bounded, paged binary details loaded from the same safe descriptor.
+    BinaryPreview(BinaryPreview),
     InvalidUtf8,
     Image(String),
     Document(String),
@@ -85,6 +87,113 @@ pub enum ReadOnlyReason {
         kind: OversizeKind,
     },
     NotRegularFile,
+}
+
+/// One page of a binary file. Paging replaces the page rather than retaining
+/// the whole file, including for multi-gigabyte artifacts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryPreview {
+    pub bytes: u64,
+    pub modified: Option<std::time::SystemTime>,
+    pub mime: &'static str,
+    pub error: Option<String>,
+    pub offset: u64,
+    pub data: std::sync::Arc<[u8]>,
+    pub hex: std::sync::Arc<str>,
+}
+
+pub const BINARY_PREVIEW_BYTES: u64 = 64 * 1024;
+
+fn binary_mime(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(b"\x7fELF") {
+        "application/x-elf"
+    } else if bytes.starts_with(b"PK\x03\x04") {
+        "application/zip"
+    } else if bytes.starts_with(b"\x1f\x8b") {
+        "application/gzip"
+    } else if bytes.starts_with(b"SQLite format 3\0") {
+        "application/vnd.sqlite3"
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if bytes.starts_with(b"BM") {
+        "image/bmp"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+fn binary_preview(mut file: File, offset: u64) -> Result<BinaryPreview, FileIoError> {
+    let metadata = file.metadata().map_err(io_error)?;
+    if !metadata.is_file() {
+        return Err(FileIoError::Io("Not a regular file".into()));
+    }
+    file.seek(io::SeekFrom::Start(0)).map_err(io_error)?;
+    let mut header = [0; 32];
+    let read = file.read(&mut header).map_err(io_error)?;
+    file.seek(io::SeekFrom::Start(offset)).map_err(io_error)?;
+    let mut data = Vec::new();
+    file.take(BINARY_PREVIEW_BYTES)
+        .read_to_end(&mut data)
+        .map_err(io_error)?;
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(data.len() * 5);
+    for (row, bytes) in data.chunks(16).enumerate() {
+        let _ = write!(hex, "{:08x}  ", offset + (row * 16) as u64);
+        for index in 0..16 {
+            match bytes.get(index) {
+                Some(byte) => {
+                    let _ = write!(hex, "{byte:02x} ");
+                }
+                None => hex.push_str("   "),
+            }
+        }
+        hex.push_str(" | ");
+        for byte in bytes {
+            hex.push(if byte.is_ascii_graphic() || *byte == b' ' {
+                *byte as char
+            } else {
+                '.'
+            });
+        }
+        hex.push('\n');
+    }
+    Ok(BinaryPreview {
+        bytes: metadata.len(),
+        modified: metadata.modified().ok(),
+        mime: binary_mime(&header[..read]),
+        error: (metadata.len() > MAX_EDITABLE_FILE_BYTES).then(|| format!(
+            "This file exceeds the {MAX_EDITABLE_FILE_BYTES} byte editing limit. Showing a bounded byte preview.",
+        )),
+        offset,
+        data: data.into(),
+        hex: hex.into(),
+    })
+}
+
+pub fn load_binary_page(
+    worktree: &Path,
+    path: &Path,
+    offset: u64,
+) -> Result<BinaryPreview, FileIoError> {
+    load_binary_page_at(worktree, path, offset, None)
+}
+
+pub(crate) fn load_binary_page_at(
+    worktree: &Path,
+    path: &Path,
+    offset: u64,
+    original: Option<std::sync::Arc<Root>>,
+) -> Result<BinaryPreview, FileIoError> {
+    validate_repo_path(path)?;
+    let root = match original {
+        Some(root) => root,
+        None => std::sync::Arc::new(open_read_root(worktree)?),
+    };
+    validate_read_root_for_worktree(&root, worktree)?;
+    let file = fs_safety::open_beneath(&root, path).map_err(resolve_error)?;
+    let preview = binary_preview(file, offset)?;
+    validate_read_root_for_worktree(&root, worktree)?;
+    Ok(preview)
 }
 
 /// Why a symbolic link was presented instead of followed.
@@ -298,6 +407,7 @@ fn validate_read_root_for_worktree(root: &Root, worktree: &Path) -> Result<(), F
 #[derive(Debug, Clone)]
 pub struct FileRead {
     pub(crate) watch_revision: Option<u64>,
+    pub(crate) indentation: crate::editor_indent::Overrides,
     worktree: PathBuf,
     root: std::sync::Arc<Root>,
     result: Result<LoadedFile, FileIoError>,
@@ -326,14 +436,17 @@ pub(crate) fn read_file_at(
         Some(root) => root,
         None => std::sync::Arc::new(open_read_root(worktree)?),
     };
+    let mut indentation = crate::editor_indent::Overrides::default();
     let result = validate_read_root_for_worktree(&root, worktree)
         .and_then(|()| load_file_at_original(&root, relative, tone))
         .and_then(|loaded| {
+            indentation = crate::editor_indent::read_at(&root, relative);
             validate_read_root_for_worktree(&root, worktree)?;
             Ok(loaded)
         });
     Ok(FileRead {
         watch_revision: None,
+        indentation,
         worktree: worktree.to_owned(),
         root,
         result,
@@ -511,6 +624,15 @@ fn load_regular_file(
         OversizeKind::Document => MAX_DOCUMENT_BYTES,
         OversizeKind::Editable => MAX_EDITABLE_FILE_BYTES,
     };
+    if metadata.len() > limit && !document && image::ImageFormat::from_path(relative_path).is_err()
+    {
+        // An ASCII prefix cannot prove an oversized file is text. Keep the
+        // same editing limit while exposing bounded bytes and file actions
+        // for both unknown binary files and oversized UTF-8 text.
+        return Ok(FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(
+            binary_preview(file, 0)?,
+        )));
+    }
     if metadata.len() > limit {
         return Ok(FileContent::ReadOnly(ReadOnlyReason::Oversize {
             bytes: metadata.len(),
@@ -542,7 +664,8 @@ fn load_regular_file(
     // A file can grow after metadata was read. Bound the read itself, not only
     // its result, so a concurrently growing file cannot exhaust memory.
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(limit + 1)
+    (&file)
+        .take(limit + 1)
         .read_to_end(&mut bytes)
         .map_err(io_error)?;
     if bytes.len() as u64 > limit {
@@ -573,12 +696,12 @@ fn load_regular_file(
     // first bytes claim: a Git LFS pointer named `logo.png`, an error page
     // saved as `.jpg`, or prose that begins with one of the printable
     // signatures ("BM", "P1" to "P7", "DDS ", "qoif", "GIF89a").
-    let (bytes, reason) = if bytes.contains(&0) {
-        (bytes, ReadOnlyReason::Binary)
+    let bytes = if bytes.contains(&0) {
+        bytes
     } else {
         match String::from_utf8(bytes) {
             Ok(text) => return Ok(editable_text(relative_path, text)),
-            Err(error) => (error.into_bytes(), ReadOnlyReason::InvalidUtf8),
+            Err(error) => error.into_bytes(),
         }
     };
     // Bytes that are not text but that a name or a signature says are an
@@ -597,7 +720,9 @@ fn load_regular_file(
             Err(reason) => return Ok(FileContent::ReadOnly(ReadOnlyReason::Image(reason))),
         }
     }
-    Ok(FileContent::ReadOnly(reason))
+    Ok(FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(
+        binary_preview(file, 0)?,
+    )))
 }
 
 /// Whether `format`'s signature, as `image::guess_format` matches it, is too
@@ -1269,11 +1394,132 @@ mod tests {
             rgba,
         } = content(root.path(), "opaque.dat")
         else {
-            panic!("image magic must win over the filename extension");
+            panic!("valid image bytes must render regardless of extension");
         };
         assert_eq!((width, height), (2, 1));
         assert_eq!(&*rgba, &[31, 127, 220, 128, 31, 127, 220, 128]);
         assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn prose_with_weak_image_magic_and_failed_decodes_remains_text() {
+        let root = tempdir().unwrap();
+        for (name, text) in [
+            ("rank.md", "BM25 ranking..."),
+            ("notes.txt", "P3: notes"),
+            ("broken.bmp", "BMbroken"),
+            ("broken.png", "plain text"),
+        ] {
+            fs::write(root.path().join(name), text).unwrap();
+            assert!(
+                matches!(content(root.path(), name), FileContent::Editable { .. }),
+                "{name}"
+            );
+        }
+        let path = root.path().join("pixel.bmp");
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]))
+            .save_with_format(&path, image::ImageFormat::Bmp)
+            .unwrap();
+        assert!(matches!(
+            content(root.path(), "pixel.bmp"),
+            FileContent::Image {
+                width: 1,
+                height: 1,
+                ..
+            }
+        ));
+        fs::write(root.path().join("invalid.bmp"), b"BM\0\xff").unwrap();
+        assert!(matches!(
+            content(root.path(), "invalid.bmp"),
+            FileContent::ReadOnly(ReadOnlyReason::Image(_))
+        ));
+    }
+
+    #[test]
+    fn binary_pages_remain_bounded_for_large_files_and_report_content_type() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("artifact.bin");
+        let mut file = File::create(path).unwrap();
+        file.write_all(b"\x7fELF\0").unwrap();
+        file.set_len(1024 * 1024 * 1024).unwrap();
+        let FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(preview)) =
+            content(root.path(), "artifact.bin")
+        else {
+            panic!("binary");
+        };
+        assert_eq!(preview.bytes, 1024 * 1024 * 1024);
+        assert_eq!(preview.mime, "application/x-elf");
+        assert_eq!(preview.data.len(), BINARY_PREVIEW_BYTES as usize);
+        let next =
+            load_binary_page(root.path(), Path::new("artifact.bin"), BINARY_PREVIEW_BYTES).unwrap();
+        assert_eq!(next.offset, BINARY_PREVIEW_BYTES);
+        assert_eq!(next.data.len(), BINARY_PREVIEW_BYTES as usize);
+        symlink("/etc/passwd", root.path().join("escape.bin")).unwrap();
+        assert!(load_binary_page(root.path(), Path::new("escape.bin"), 0).is_err());
+    }
+
+    #[test]
+    fn binary_pages_refuse_a_replaced_original_worktree() {
+        let directory = tempdir().unwrap();
+        let worktree = directory.path().join("worktree");
+        fs::create_dir(&worktree).unwrap();
+        fs::write(worktree.join("data.bin"), b"original\0bytes").unwrap();
+        let original = std::sync::Arc::new(open_read_root(&worktree).unwrap());
+        let page = load_binary_page_at(&worktree, Path::new("data.bin"), 0, Some(original.clone()))
+            .unwrap();
+        assert_eq!(page.data.as_ref(), b"original\0bytes");
+        fs::rename(&worktree, directory.path().join("departed")).unwrap();
+        fs::create_dir(&worktree).unwrap();
+        fs::write(worktree.join("data.bin"), b"another\0root").unwrap();
+        assert!(load_binary_page_at(&worktree, Path::new("data.bin"), 0, Some(original)).is_err());
+        // A deliberate fresh open may read the new root; the old pane cannot.
+        assert_eq!(
+            load_binary_page(&worktree, Path::new("data.bin"), 0)
+                .unwrap()
+                .data
+                .as_ref(),
+            b"another\0root"
+        );
+    }
+
+    #[test]
+    fn oversized_files_keep_byte_preview_after_an_ascii_header() {
+        let root = tempdir().unwrap();
+        let mut binary = File::create(root.path().join("late-binary.bin")).unwrap();
+        binary.write_all(&vec![b'a'; 5000]).unwrap();
+        binary.set_len(MAX_EDITABLE_FILE_BYTES + 1).unwrap();
+        let FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(preview)) =
+            content(root.path(), "late-binary.bin")
+        else {
+            panic!("bounded binary preview");
+        };
+        assert_eq!(preview.bytes, MAX_EDITABLE_FILE_BYTES + 1);
+        assert_eq!(preview.data.len(), BINARY_PREVIEW_BYTES as usize);
+        assert!(preview.data[..5000].iter().all(|byte| *byte == b'a'));
+        assert_eq!(preview.data[5000], 0);
+        assert!(preview.error.as_deref().unwrap().contains("editing limit"));
+        let next = load_binary_page(
+            root.path(),
+            Path::new("late-binary.bin"),
+            BINARY_PREVIEW_BYTES,
+        )
+        .unwrap();
+        assert_eq!(next.data.len(), BINARY_PREVIEW_BYTES as usize);
+        assert!(next.error.as_deref().unwrap().contains("editing limit"));
+
+        fs::write(
+            root.path().join("large-text.txt"),
+            vec![b'x'; MAX_EDITABLE_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+        let FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(text)) =
+            content(root.path(), "large-text.txt")
+        else {
+            panic!("oversized text remains read-only");
+        };
+        assert_eq!(text.data.len(), BINARY_PREVIEW_BYTES as usize);
+        assert!(text.data.iter().all(|byte| *byte == b'x'));
+        assert!(text.error.as_deref().unwrap().contains("editing limit"));
     }
 
     #[test]
@@ -1427,30 +1673,20 @@ mod tests {
     #[test]
     fn a_weak_signature_without_an_image_name_is_not_evidence() {
         let root = tempdir().unwrap();
-        for (name, bytes, reason) in [
-            (
-                "notes.txt",
-                &b"BM25 r\xe9sum\xe9\n"[..],
-                ReadOnlyReason::InvalidUtf8,
-            ),
-            (
-                "plan",
-                b"P3 caf\xe9 opens at nine\n",
-                ReadOnlyReason::InvalidUtf8,
-            ),
-            (
-                "blob",
-                b"BM\0\0\x01\x02 not a bitmap",
-                ReadOnlyReason::Binary,
-            ),
-            ("frames", b"P6\0\x01 not a pixmap", ReadOnlyReason::Binary),
+        for (name, bytes) in [
+            ("notes.txt", &b"BM25 r\xe9sum\xe9\n"[..]),
+            ("plan", b"P3 caf\xe9 opens at nine\n"),
+            ("blob", b"BM\0\0\x01\x02 not a bitmap"),
+            ("frames", b"P6\0\x01 not a pixmap"),
         ] {
             fs::write(root.path().join(name), bytes).unwrap();
-            assert_eq!(
-                content(root.path(), name),
-                FileContent::ReadOnly(reason),
-                "{name}"
-            );
+            let FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(preview)) =
+                content(root.path(), name)
+            else {
+                panic!("{name} must open as bytes, not an image");
+            };
+            assert_eq!(preview.data.as_ref(), bytes, "{name}");
+            assert_eq!(preview.bytes, bytes.len() as u64, "{name}");
         }
         // Named as an image, the same bytes get the decoder's reason.
         fs::write(root.path().join("notes.bmp"), b"BM25 r\xe9sum\xe9\n").unwrap();
@@ -1557,14 +1793,13 @@ mod tests {
             "x".repeat(MAX_EDITABLE_FILE_BYTES as usize + 1),
         )
         .unwrap();
-        assert!(matches!(
-            content(root.path(), "big.txt"),
-            FileContent::ReadOnly(ReadOnlyReason::Oversize {
-                limit: MAX_EDITABLE_FILE_BYTES,
-                kind: OversizeKind::Editable,
-                ..
-            })
-        ));
+        let FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(preview)) =
+            content(root.path(), "big.txt")
+        else {
+            panic!("oversized text is not editable");
+        };
+        assert_eq!(preview.bytes, MAX_EDITABLE_FILE_BYTES + 1);
+        assert_eq!(preview.data.len(), BINARY_PREVIEW_BYTES as usize);
     }
 
     #[test]
@@ -1590,22 +1825,21 @@ mod tests {
         fs::write(root.path().join("invalid.txt"), [0xff, 0xfe]).unwrap();
         symlink("binary.bin", root.path().join("link.txt")).unwrap();
 
-        assert_eq!(
-            load_file(root.path(), Path::new("binary.bin"), PdfTone::Original).unwrap(),
-            loaded("binary.bin", FileContent::ReadOnly(ReadOnlyReason::Binary))
-        );
-        assert_eq!(
-            load_file(root.path(), Path::new("invalid.txt"), PdfTone::Original).unwrap(),
-            loaded(
-                "invalid.txt",
-                FileContent::ReadOnly(ReadOnlyReason::InvalidUtf8)
-            )
-        );
-        // A link is classified by what it leads to, and the source names that.
-        assert_eq!(
-            load_file(root.path(), Path::new("link.txt"), PdfTone::Original).unwrap(),
-            loaded("binary.bin", FileContent::ReadOnly(ReadOnlyReason::Binary))
-        );
+        for (name, source, bytes) in [
+            ("binary.bin", "binary.bin", 11),
+            ("invalid.txt", "invalid.txt", 2),
+            ("link.txt", "binary.bin", 11),
+        ] {
+            let loaded = load_file(root.path(), Path::new(name), PdfTone::Original).unwrap();
+            assert_eq!(loaded.source, Path::new(source));
+            let FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(preview)) = loaded.content
+            else {
+                panic!("binary preview expected");
+            };
+            assert_eq!(preview.bytes, bytes);
+            assert_eq!(preview.offset, 0);
+            assert!(preview.modified.is_some());
+        }
     }
 
     /// What the file at `path` presents as, for the tests that are about the
@@ -1641,12 +1875,12 @@ mod tests {
             );
         }
         std::fs::write(root.path().join("binary"), b"a\0b").unwrap();
-        assert_eq!(
+        assert!(matches!(
             load_file(root.path(), Path::new("binary"), PdfTone::Original)
                 .unwrap()
                 .content,
-            FileContent::ReadOnly(ReadOnlyReason::Binary)
-        );
+            FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(_))
+        ));
     }
 
     fn editable(text: &str, markdown: bool) -> FileContent {

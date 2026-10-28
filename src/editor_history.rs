@@ -157,6 +157,10 @@ impl Default for History {
 }
 
 impl History {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.bytes
+    }
+
     fn with_limits(max_transactions: usize, max_bytes: usize) -> Self {
         Self {
             revision: 0,
