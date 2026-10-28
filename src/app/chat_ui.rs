@@ -294,6 +294,7 @@ pub enum Action {
     ImageFit,
     ImageExternal,
     CopyLiteral(String),
+    CopySavedDraft(String),
     CopySharedCode(Target, Arc<str>),
     CopyQueued(Target, QueueCopy),
     Latest(Target),
@@ -11142,6 +11143,11 @@ impl Cagents {
             Action::CopyLiteral(text) => {
                 text_copy::invalidate();
                 self.status = Some(TransientNotice::success("Copied code block"));
+                return iced::clipboard::write(text).map(cosmic::Action::App);
+            }
+            Action::CopySavedDraft(text) => {
+                text_copy::invalidate();
+                self.status = Some(TransientNotice::success("Copied saved draft"));
                 return iced::clipboard::write(text).map(cosmic::Action::App);
             }
             Action::Tick => {}
