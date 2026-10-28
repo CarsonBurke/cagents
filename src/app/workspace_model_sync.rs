@@ -3730,6 +3730,200 @@ mod tests {
         assert_eq!(app.workspace.focused(), None);
     }
 
+    fn overlapping_passive_load_after_project_close(failed: bool) {
+        let checkout = git_checkout().expect("the overlapping-load fixture requires Git");
+        let repository = canonical_repository(&checkout.path().join(".git")).unwrap();
+        let sibling = git_checkout().expect("the independent-load fixture requires Git");
+        let sibling_repository = canonical_repository(&sibling.path().join(".git")).unwrap();
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let published = intercept_publishes(&mut app);
+        let cards = app.durable.cards.clone();
+        let focused = app.workspace.focused();
+        app.workspace_model = WorkspaceModel {
+            projects: vec![
+                ModelProject {
+                    repository: repository.clone(),
+                    name: "shared checkout".into(),
+                    kind: ProjectKind::Git,
+                    ordinal: 1,
+                },
+                ModelProject {
+                    repository: sibling_repository.clone(),
+                    name: "independent checkout".into(),
+                    kind: ProjectKind::Git,
+                    ordinal: 2,
+                },
+            ],
+            ..registry(Vec::new())
+        };
+        let Adoption::Opening(passive_task) =
+            app.open_shared_repository(&repository, Some(ProjectKind::Git))
+        else {
+            panic!("the target repository must admit a passive read");
+        };
+        let Message::RepositoryLoaded {
+            project_id: passive,
+            generation: passive_generation,
+            result: Ok(old_listing),
+            ..
+        } = first_message(passive_task).unwrap()
+        else {
+            panic!("the passive read must produce a real Git listing");
+        };
+        let passive_cancel = app.refresh_ui.projects[&passive].clone();
+        let Adoption::Opening(sibling_task) =
+            app.open_shared_repository(&sibling_repository, Some(ProjectKind::Git))
+        else {
+            panic!("the independent repository must admit its own read");
+        };
+        let sibling_listing = first_message(sibling_task).unwrap();
+        let Message::RepositoryLoaded {
+            project_id: sibling_id,
+            generation: sibling_generation,
+            ..
+        } = &sibling_listing
+        else {
+            panic!("the independent passive read must produce a real listing");
+        };
+        let (sibling_id, sibling_generation) = (*sibling_id, *sibling_generation);
+        let sibling_cancel = app.refresh_ui.projects[&sibling_id].clone();
+
+        // Exercise the independent directory-load boundary without opening
+        // cards. It has its own request ID and can land before the passive
+        // callback, just as the picker's read can; no pending map is edited.
+        let explicit =
+            first_message(app.repository_load_task(repository.clone(), None, false)).unwrap();
+        let Message::RepositoryLoaded {
+            project_id: explicit_id,
+            ..
+        } = &explicit
+        else {
+            panic!("the independent read must finish through RepositoryLoaded");
+        };
+        let explicit_id = *explicit_id;
+        assert_ne!(explicit_id, passive);
+        drop(app.update(explicit));
+        assert_eq!(app.project_for_repository(&repository), Some(explicit_id));
+
+        let sequence = app.workspace_model.sequence + 1;
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Edited {
+                sequence,
+                edit: ModelEdit::CloseProject {
+                    repository: repository.clone(),
+                },
+            })),
+        );
+        let close_generation = app.project_ui.close_generation[&explicit_id];
+        // The session-close operation is outside this loader regression.
+        // Use its typed, generation-bound completion, without running a
+        // daemon or starting/closing any real terminal.
+        drop(app.update(Message::ProjectUi(
+            super::super::project_ui::Action::ProjectSessionsClosed(
+                explicit_id,
+                close_generation,
+                Ok(super::super::project_ui::ProjectSessionClosure::for_roots(
+                    vec![repository.clone()],
+                )),
+            ),
+        )));
+        assert!(app.sidebar_model.projects.is_empty());
+
+        let new_listing = first_message(app.update(Message::WorkspaceModelObserved(
+            ModelUpdate::Edited {
+                sequence: sequence + 1,
+                edit: ModelEdit::ReopenProject {
+                    repository: repository.clone(),
+                    name: "shared checkout".into(),
+                    kind: ProjectKind::Git,
+                },
+            },
+        )))
+        .expect("the reopened project admits a new real Git load");
+        let Message::RepositoryLoaded {
+            project_id: current,
+            generation,
+            ..
+        } = &new_listing
+        else {
+            panic!("the reopened read must finish through RepositoryLoaded");
+        };
+        let (current, generation) = (*current, *generation);
+        assert_ne!(current, passive);
+        let current_cancel = app.refresh_ui.projects[&current].clone();
+        drain(&published);
+
+        drop(app.update(Message::RepositoryLoaded {
+            open_cards: false,
+            project_id: passive,
+            generation: passive_generation,
+            result: if failed {
+                Err("late pre-close failure".into())
+            } else {
+                Ok(old_listing)
+            },
+        }));
+        assert!(
+            app.workspace_model_opens.contains(&repository),
+            "a pre-close failure must not release the reopened load's admission"
+        );
+        assert!(
+            app.sidebar_model.projects.is_empty(),
+            "a pre-close success must not adopt its old listing"
+        );
+        assert_eq!(
+            app.workspace_model_loads[&current],
+            (repository.clone(), generation)
+        );
+        assert!(passive_cancel.is_cancelled());
+        assert!(!current_cancel.is_cancelled());
+        assert!(!sibling_cancel.is_cancelled());
+        assert!(app.workspace_model_opens.contains(&sibling_repository));
+        assert_eq!(
+            app.workspace_model_loads[&sibling_id],
+            (sibling_repository.clone(), sibling_generation)
+        );
+        assert_eq!(app.repository_generations[&sibling_id], sibling_generation);
+        assert!(
+            drain(&published).is_empty(),
+            "stale callbacks cannot publish"
+        );
+
+        let model = app.workspace_model.clone();
+        assert!(
+            first_message(app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(model))))
+                .is_none()
+        );
+        assert_eq!(
+            app.workspace_model_loads.len(),
+            2,
+            "no duplicate load admitted"
+        );
+        drop(app.update(new_listing));
+        assert_eq!(app.project_for_repository(&repository), Some(current));
+        assert_eq!(app.sidebar_model.projects.len(), 1);
+        drop(app.update(sibling_listing));
+        assert_eq!(
+            app.project_for_repository(&sibling_repository),
+            Some(sibling_id)
+        );
+        assert_eq!(app.sidebar_model.projects.len(), 2);
+        assert!(app.workspace_model_loads.is_empty());
+        assert_eq!(app.durable.cards, cards);
+        assert_eq!(app.workspace.focused(), focused);
+        assert_eq!(app.active_workspace, None);
+    }
+
+    #[test]
+    fn a_closed_explicit_project_rejects_an_overlapping_passive_success_after_reopen() {
+        overlapping_passive_load_after_project_close(false);
+    }
+
+    #[test]
+    fn a_closed_explicit_project_preserves_reopened_admission_after_a_passive_failure() {
+        overlapping_passive_load_after_project_close(true);
+    }
+
     /// A channel another window created arrives as a scope, not as a
     /// conversation: N windows adopting one channel must not start N chats in
     /// it, and the cards inside a channel are each window's own business.
