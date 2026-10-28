@@ -721,6 +721,35 @@ impl Monitor {
     /// [`drain`](Self::drain). It may run for every event, so it must only
     /// signal (a bounded `try_send`, a condvar notify) and never block.
     pub fn start(wake: impl Fn() + Send + Sync + 'static) -> std::io::Result<Self> {
+        Self::with_watcher(wake, |handler| notify::recommended_watcher(handler))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_for_test<W: Watcher + Send + 'static>(
+        wake: impl Fn() + Send + Sync + 'static,
+        create: impl FnMut(Box<dyn FnMut(notify::Result<Event>) + Send>) -> notify::Result<W>
+        + Send
+        + 'static,
+    ) -> std::io::Result<Self> {
+        Self::with_watcher(wake, create)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_coverage_for_test(&self, id: ProjectId) -> Option<bool> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .changes
+            .get(&id)
+            .and_then(|change| change.coverage)
+    }
+
+    fn with_watcher<W: Watcher + Send + 'static>(
+        wake: impl Fn() + Send + Sync + 'static,
+        mut create: impl FnMut(Box<dyn FnMut(notify::Result<Event>) + Send>) -> notify::Result<W>
+        + Send
+        + 'static,
+    ) -> std::io::Result<Self> {
         let (commands, requests) = mpsc::sync_channel(1);
         let configuration = Arc::new(Mutex::new(Configuration::default()));
         let desired_configuration = configuration.clone();
@@ -730,10 +759,10 @@ impl Monitor {
         let thread = thread::Builder::new()
             .name("git-watch".into())
             .spawn(move || {
-                let create_watcher = || {
+                let mut create_watcher = || {
                     let events = state.clone();
                     let signal = wake.clone();
-                    notify::recommended_watcher(move |event: notify::Result<Event>| {
+                    create(Box::new(move |event: notify::Result<Event>| {
                         // Git status itself produces Access traffic. A requested
                         // rescan still reaches the normal recovery path.
                         if event.as_ref().is_ok_and(access_only) {
@@ -743,7 +772,7 @@ impl Monitor {
                         if pending.event(event) {
                             signal();
                         }
-                    })
+                    }))
                 };
                 let mut watcher = create_watcher();
                 let mut registered: BTreeMap<PathBuf, (RecursiveMode, u64, u64)> = BTreeMap::new();
