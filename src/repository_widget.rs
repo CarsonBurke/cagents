@@ -2892,7 +2892,7 @@ impl RepositoryRuntime {
     /// Poll only visible panes. Keep the mounted list, viewport, and document
     /// intact while discovering external changes, and never overlap a read.
     pub fn refresh_visible(&mut self, card: CardId) -> Task<RepositoryAction> {
-        let diff = self.refresh_diff_visibility(card, true);
+        let diff = self.refresh_diff_visibility(card, self.diff_surface_visible);
         if self.descriptor.selected_file.is_some() || self.file_list_read_outstanding() {
             return diff;
         }

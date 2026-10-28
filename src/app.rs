@@ -24818,6 +24818,37 @@ mod tests {
     }
 
     #[test]
+    fn refresh_tick_preserves_diff_visibility_under_context_overlay() {
+        let (mut app, card) = editing_repository_app();
+        app.workspace.resize_viewport(1200.0);
+        app.refresh_ui.focused = true;
+
+        drop(app.update(Message::WindowResized(900.0, 900.0)));
+        assert!(app.context_inspector_is_overlay());
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible),
+            "the overlay covers a card still visible in the workspace strip"
+        );
+        let diff_visible = |app: &Cagents| {
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+                panic!("repository fixture")
+            };
+            runtime.diff_surface_is_visible()
+        };
+        assert!(!diff_visible(&app));
+
+        // Inspect synchronous scheduling state without polling any task: a
+        // catalog refresh must not reveal the surface hidden by the overlay.
+        drop(app.update_refresh(refresh_ui::Action::Tick));
+        assert!(!diff_visible(&app));
+
+        drop(app.update(Message::WindowResized(1600.0, 900.0)));
+        assert!(!app.context_inspector_is_overlay());
+        assert!(diff_visible(&app));
+    }
+
+    #[test]
     fn restored_editor_startup_focus_follows_the_loaded_surface() {
         let (mut app, pane) = editing_repository_app();
         let update = app.workspace.resize_viewport(1200.0);
