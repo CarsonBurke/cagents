@@ -2460,11 +2460,11 @@ fn wait_saved_conversation_ready(
                     .into(),
             );
         }
-        if snapshot.ready && snapshot.session_id.as_deref() == Some(expected) {
-            return Ok(());
-        }
         if Instant::now() >= deadline {
             return Err("The provider confirmed the saved conversation but did not become ready in time; it remains unchanged".into());
+        }
+        if snapshot.ready && snapshot.session_id.as_deref() == Some(expected) {
+            return Ok(());
         }
         thread::sleep(Duration::from_millis(20));
     }
