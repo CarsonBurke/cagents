@@ -320,7 +320,7 @@ jobs:
                           reasons.append('matching_test_comm_candidate')
                       stage = 'cmdline_nomination'
                       args = (entry / 'cmdline').read_bytes().split(b'\0')
-                      if args and args[0] == str(executable).encode():
+                      if any(arg == str(executable).encode() for arg in args):
                           reasons.append('exact_test_executable_argument')
                       prefix = str(fixture_root).encode() + b'/'
                       if any(arg == str(fixture_root).encode() or arg.startswith(prefix) for arg in args):
