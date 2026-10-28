@@ -178,9 +178,7 @@ mod service {
     }
 
     fn path_scope(parts: &[String]) -> Vec<String> {
-        if parts.len() > 2 {
-            vec![parts[0].clone(), "…".into(), parts.last().unwrap().clone()]
-        } else if parts.is_empty() {
+        if parts.is_empty() {
             vec!["/".into()]
         } else {
             parts.to_vec()
@@ -398,7 +396,24 @@ mod service {
 
     fn clean_label(text: &str) -> String {
         let mut label = String::new();
-        for ch in text.chars().take(LABEL_SCAN_CHARS) {
+        let head = text.chars().take(LABEL_SCAN_CHARS).collect::<Vec<_>>();
+        let chars = if text.chars().nth(LABEL_SCAN_CHARS).is_some() {
+            head.into_iter()
+                .take(LABEL_SCAN_CHARS / 2 - 1)
+                .chain(std::iter::once('…'))
+                .chain(
+                    text.chars()
+                        .rev()
+                        .take(LABEL_SCAN_CHARS / 2)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev(),
+                )
+                .collect::<Vec<_>>()
+        } else {
+            head
+        };
+        for ch in chars {
             if matches!(ch, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')
             {
                 continue;
@@ -1162,12 +1177,59 @@ mod service {
             assert!(menu[0].1.contains("ONE"));
             assert!(menu[1].1.contains("TWO"));
             for (_, label) in menu {
-                assert!(label.ends_with("/…/project"));
+                assert!(label.ends_with("/project"));
                 assert!(
                     !label.contains(" · Chat"),
                     "distinct worktrees need meaningful scope, not arbitrary ordinal"
                 );
                 assert!(label.chars().count() <= LABEL_CHARS);
+            }
+        }
+
+        #[test]
+        fn waiting_full_menu_preserves_all_distinguishing_path_components_with_named_scope_fallback()
+         {
+            for named in [false, true] {
+                let paths = [
+                    "/root/a/b/project",
+                    "/root/a/c/project",
+                    "/root/x/b/project",
+                    "/root/x/c/project",
+                ];
+                let rows = paths
+                    .iter()
+                    .enumerate()
+                    .map(|(index, path)| {
+                        let mut row = scoped_row(
+                            index as u128 + 1,
+                            Some("Review"),
+                            if named { "/accepted/directory" } else { path },
+                            WaitingSurface::Chat,
+                        );
+                        if named {
+                            row.set_named_scope(
+                                None,
+                                &["Workspace".into(), "Review".into()],
+                                std::path::Path::new(path),
+                            );
+                        }
+                        row
+                    })
+                    .collect();
+                let menu = waiting_menu_for_test(snapshot_rows(rows));
+                for ((_, label), distinct) in
+                    menu.iter()
+                        .zip(["a/b/project", "a/c/project", "x/b/project", "x/c/project"])
+                {
+                    assert!(label.contains(distinct), "{label} must preserve {distinct}");
+                    assert!(
+                        !label.contains(" · Chat"),
+                        "human path distinctions must precede arbitrary ordinals"
+                    );
+                    if named {
+                        assert!(label.contains("Workspace/Review/"));
+                    }
+                }
             }
         }
 
@@ -1243,15 +1305,17 @@ mod service {
                     "/private/project",
                     WaitingSurface::Chat,
                 ),
-                scoped_row(3, Some(&title), "/private/project", WaitingSurface::Console),
+                scoped_row(3, Some(&title), "/private/project", WaitingSurface::Chat),
+                scoped_row(4, Some(&title), "/private/project", WaitingSurface::Chat),
+                scoped_row(5, Some(&title), "/private/project", WaitingSurface::Console),
                 scoped_row(
-                    4,
+                    6,
                     Some("Inspect"),
                     &format!("/private/{}left", "路径".repeat(80)),
                     WaitingSurface::Console,
                 ),
                 scoped_row(
-                    5,
+                    7,
                     Some("Inspect"),
                     &format!("/private/{}right", "路径".repeat(80)),
                     WaitingSurface::Console,
@@ -1273,11 +1337,15 @@ mod service {
                 assert!(!human.contains(&session.to_string()));
                 assert!(human.contains('…'));
             }
-            assert!(menu[0].1.ends_with(" — project · Chat 1"));
-            assert!(menu[1].1.ends_with(" — project · Chat 2"));
-            assert!(menu[2].1.ends_with(" — project · Console"));
-            assert!(menu[3].1.ends_with("left"));
-            assert!(menu[4].1.ends_with("right"));
+            assert!(menu[0].1.contains("alpha"));
+            assert!(menu[1].1.contains("beta"));
+            assert!(menu[0].1.ends_with(" — project"));
+            assert!(menu[1].1.ends_with(" — project"));
+            assert!(menu[2].1.ends_with(" — project · Chat 3"));
+            assert!(menu[3].1.ends_with(" — project · Chat 4"));
+            assert!(menu[4].1.ends_with(" — project · Console"));
+            assert!(menu[5].1.ends_with("left"));
+            assert!(menu[6].1.ends_with("right"));
         }
 
         #[test]

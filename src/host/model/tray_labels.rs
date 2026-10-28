@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     agent_execution::HostedSession,
-    model::{CardId, CardKind, TerminalId},
+    model::{CardId, TerminalId},
     workspace_model::views::{ManagedDisplayIndex, Scope},
 };
 use std::collections::BTreeMap;
@@ -20,11 +20,21 @@ impl Registry {
         &self,
         sources: &[(TerminalId, Vec<HostedSession>)],
     ) -> Result<BTreeMap<TerminalId, TrayLabel>, String> {
+        self.tray_labels_with(sources, || {})
+    }
+
+    fn tray_labels_with(
+        &self,
+        sources: &[(TerminalId, Vec<HostedSession>)],
+        mut decoded_view: impl FnMut(),
+    ) -> Result<BTreeMap<TerminalId, TrayLabel>, String> {
         let transaction = self
             .db
             .unchecked_transaction()
             .map_err(|error| error.to_string())?;
         let mut labels = BTreeMap::new();
+        let mut pending = Vec::new();
+        let mut views = BTreeMap::new();
         for (session, sources) in sources.iter().take(crate::tray::MAX_WAITING_AGENTS) {
             let Some(agent) = self.agent_for_session(*session)? else {
                 continue;
@@ -39,30 +49,48 @@ impl Registry {
                 )
                 .optional()
                 .map_err(|error| error.to_string())?;
-            let views = owner
-                .map(|owner| {
+            let expected_owner = if let Some(owner) = owner {
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    views.entry(owner.clone())
+                {
                     let scope: Scope =
                         serde_json::from_str(&owner).map_err(|error| error.to_string())?;
-                    super::views::read(&self.db, &scope)
-                })
-                .transpose()?;
-            if views
-                .as_ref()
-                .is_some_and(|view| !view.panes.iter().any(|pane| pane.id == canonical))
+                    decoded_view();
+                    entry.insert(super::views::read(&self.db, &scope)?);
+                }
+                Some(views[&owner].scope.clone())
+            } else {
+                None
+            };
+            pending.push((*session, sources, agent, expected_owner));
+        }
+        // Decode each selected canonical view once and build this index once,
+        // even when all20 rows share one large channel.
+        let model = WorkspaceModel {
+            views: views.into_values().collect(),
+            ..Default::default()
+        };
+        let canonical_panes = model
+            .views
+            .iter()
+            .flat_map(|view| view.panes.iter().map(|pane| pane.id))
+            .collect::<std::collections::HashSet<_>>();
+        let index = ManagedDisplayIndex::new(&model);
+        for (session, sources, agent, expected_owner) in pending {
+            if expected_owner.is_some()
+                && !canonical_panes.contains(&CardId::from_uuid(agent.id.as_uuid()))
             {
                 continue;
             }
-            let views = views.into_iter().collect();
-            // Reuse the actual canonical-pane/saved-surface resolver. A moved
-            // legacy pane's current scope outranks accepted execution placement.
-            let model = WorkspaceModel {
-                views,
-                ..Default::default()
-            };
-            let index = ManagedDisplayIndex::new(&model);
-            let Some(display) = index.activation_display(&agent, *session) else {
+            let Some(display) = index.activation_display(&agent, session) else {
                 continue;
             };
+            if expected_owner
+                .as_ref()
+                .is_some_and(|scope| scope != &display.display.scope)
+            {
+                continue;
+            }
             if !sources
                 .iter()
                 .any(|source| source.same_process(&display.session))
@@ -117,7 +145,7 @@ impl Registry {
                 scope.push(section);
             }
             labels.insert(
-                *session,
+                session,
                 TrayLabel {
                     name,
                     scope,
@@ -141,7 +169,10 @@ mod tests {
             chat::Record,
             state::{HostLock, HostState, SharedHost},
         },
-        model::{AgentId, BootId, HostIncarnation, HostSessionId, HostSessionProof, LaunchRecipe},
+        model::{
+            AgentId, BootId, CardKind, HostIncarnation, HostSessionId, HostSessionProof,
+            LaunchRecipe,
+        },
     };
     use std::sync::Arc;
 
@@ -366,6 +397,76 @@ mod tests {
             "Claude Code · Review — Project/Review/right/project"
         );
         assert!(rows.values().all(|label| !label.contains(" · Chat ")));
+    }
+
+    #[test]
+    fn twenty_selected_rows_decode_one_shared_hundred_pane_view_once() {
+        let (_directory, host, agents, backend, _) = fixture();
+        let registry = host.lock().unwrap().execution_registry.clone().unwrap();
+        let registry = registry.lock().unwrap();
+        let mut selected = Vec::new();
+        let mut panes = Vec::new();
+        for index in 0..100 {
+            let mut agent = agents[0].clone();
+            agent.id = AgentId::new();
+            let Some(HostedSession::Chat(chat)) = &mut agent.session else {
+                unreachable!()
+            };
+            chat.id = TerminalId::new();
+            let source = HostedSession::Chat(chat.clone());
+            let pane = crate::workspace_model::views::Pane {
+                id: CardId::from_uuid(agent.id.as_uuid()),
+                title: format!("Task {index}"),
+                user_title: None,
+                pending_terminal_start: false,
+                width_fraction: 1.0,
+                kind: CardKind::Chat(chat.clone()),
+                scope: None,
+            };
+            if index < 20 {
+                registry.db.execute("INSERT INTO agents(id,origin,record,session_id,closed) VALUES(?1,?2,?3,?4,0)",params![agent.id.to_string(),serde_json::to_string(&agent.origin).unwrap(),serde_json::to_string(&agent).unwrap(),source.id().to_string()]).unwrap();
+                selected.push((source.id(), vec![source]));
+            }
+            panes.push(pane);
+        }
+        let scope = serde_json::to_string(&Scope::Channel(backend)).unwrap();
+        registry
+            .db
+            .execute(
+                "INSERT INTO shared_view_scopes(scope,channel) VALUES(?1,?2)",
+                params![scope, backend.to_string()],
+            )
+            .unwrap();
+        registry
+            .db
+            .execute(
+                "INSERT INTO shared_views(scope,revision,panes,retired) VALUES(?1,1,?2,'[]')",
+                params![scope, serde_json::to_string(&panes).unwrap()],
+            )
+            .unwrap();
+        for pane in panes {
+            registry
+                .db
+                .execute(
+                    "INSERT INTO shared_view_panes(id,scope) VALUES(?1,?2)",
+                    params![pane.id.to_string(), scope],
+                )
+                .unwrap();
+        }
+        let mut decodes = 0;
+        let labels = registry
+            .tray_labels_with(&selected, || decodes += 1)
+            .unwrap();
+        assert_eq!(labels.len(), 20);
+        assert_eq!(
+            decodes, 1,
+            "twenty selected rows cannot each decode the same hundred-pane view"
+        );
+        assert!(
+            labels
+                .values()
+                .all(|label| label.scope == ["Workspace", "Backend"])
+        );
     }
 
     #[test]
