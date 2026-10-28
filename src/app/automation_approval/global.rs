@@ -16,6 +16,7 @@ pub enum Read {
     Page {
         key: Key,
         after: Option<uuid::Uuid>,
+        start: Option<u64>,
     },
     Open {
         key: Key,
@@ -65,6 +66,9 @@ pub(super) struct State {
     total: Option<u64>,
     pending: Vec<ProposalSummary>,
     after: Option<uuid::Uuid>,
+    // Presentation position within the exact delivery snapshot. Arbitrary
+    // cursors remain usable without inventing a position for them.
+    page_end: Option<u64>,
     expanded: bool,
     error: Option<String>,
     dirty: bool,
@@ -290,7 +294,7 @@ impl Cagents {
         cosmic::task::future(async move {
             let request = match &read {
                 Read::Delivery => Request::ProposalDelivery,
-                Read::Page { key, after } => Request::AllPendingProposals {
+                Read::Page { key, after, .. } => Request::AllPendingProposals {
                     identity: Some(key.identity),
                     sequence: Some(key.sequence),
                     after: *after,
@@ -408,7 +412,14 @@ impl Cagents {
                 if state.key != Some(key) || key.identity != self.workspace_model.identity {
                     return Task::none();
                 }
-                state.wanted = Some(Read::Page { key, after });
+                let start = if after.is_none() {
+                    Some(0)
+                } else if after == state.pending.last().map(|row| row.id) {
+                    state.page_end
+                } else {
+                    None
+                };
+                state.wanted = Some(Read::Page { key, after, start });
             }
             Action::Open { key, id, revision } => {
                 if self.automation_approval.global.key != Some(key)
@@ -458,7 +469,7 @@ impl Cagents {
                     (Read::Delivery, Ok(Response::ProposalDelivery(delivery))) => {
                         self.install_proposal_delivery(delivery)
                     }
-                    (Read::Page { key, after }, Ok(Response::ProposalPage(page)))
+                    (Read::Page { key, after, start }, Ok(Response::ProposalPage(page)))
                         if self.automation_approval.global.key == Some(key)
                             && page.identity == key.identity
                             && page.automation_proposal_sequence == key.sequence
@@ -467,6 +478,8 @@ impl Cagents {
                     {
                         self.automation_approval.global.pending = page.proposals.clone();
                         self.automation_approval.global.after = after;
+                        self.automation_approval.global.page_end =
+                            start.and_then(|start| start.checked_add(page.proposals.len() as u64));
                     }
                     (
                         Read::Open {
@@ -658,6 +671,7 @@ impl Cagents {
         state.total = Some(delivery.pending_automation_proposal_count);
         state.pending = delivery.pending_automation_proposals.clone();
         state.after = None;
+        state.page_end = Some(state.pending.len() as u64);
         state.authorized = None;
         state.error = None;
         let initial_open = state.initial_open.take();
@@ -797,7 +811,7 @@ impl Cagents {
             );
             let next = state.pending.last().map(|row| row.id);
             let can_next = state.pending.len() == PROPOSAL_PAGE_SIZE
-                && (state.after.is_some() || total > state.pending.len() as u64);
+                && state.page_end.is_none_or(|end| end < total);
             let controls: Element<'_, Message> = widget::row::with_children(vec![
                 crate::ui_controls::button::secondary("First requests")
                     .on_press_maybe(
