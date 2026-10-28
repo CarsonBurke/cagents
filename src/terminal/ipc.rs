@@ -175,7 +175,27 @@ use crate::{
 /// Version 105 adds immutable image-reference metadata to Attachment and
 /// ItemContent::Image. These are positional postcard fields, so all three
 /// executables must be replaced together; JSON omission alone is compatible.
-pub const PROTOCOL_VERSION: u16 = 105;
+/// Version 110 bounds channel-work projections with independent current/history
+/// cursors and adds exact-target and metadata-only home reads for safe recovery.
+/// Version 115 appends an explicit recoverable input notice. Older clients
+/// cannot decode this unsolicited event, so all three executables must match.
+/// Version 116 combines channel-work requests/responses with recoverable input
+/// notices. Neither predecessor identifies this combined matched executable set.
+/// Version 119 replaces a channel-work caller's incidental whole-view revision
+/// with an explicit durable placement_epoch. Matched executables are required;
+/// old saved actor requests are refused without rebasing their captured intent.
+/// Known private account experiments use 117 and 118 and are not adopted here.
+/// Version 122 appends no-run automation notification target identity and fixed
+/// pause/block kinds while preserving channel-work placement and input notices.
+/// The matched set includes the accepted attention predecessor; schema 19 adds
+/// the current-actionable automation outbox without backfilling past audit rows.
+/// Version 125 raises terminal history to an explicit byte budget (16 MiB by
+/// default, up to 1 GiB). Published protocol-119 hosts reject values above
+/// 1,000,000, so their unchanged positional field encoding is not sufficient
+/// compatibility: replace the matched daemon before sending the new budgets.
+/// Version 127 combines both contracts in the matched set. Version 126 is
+/// reserved for the separate native Goal integration and is not adopted here.
+pub const PROTOCOL_VERSION: u16 = 127;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -525,6 +545,10 @@ pub enum ClientRequest {
     /// the same response, as [`crate::work::Response::Watching`]. Each later
     /// change arrives as [`ServerMessage::WorkBoard`].
     WatchWork,
+    ChannelWork {
+        authority: crate::agent_execution::Authority,
+        request: crate::channel_work_api::Request,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -540,7 +564,9 @@ pub struct TerminalSpawnOptions {
     pub rows: u16,
     pub cell_width_px: u32,
     pub cell_height_px: u32,
-    pub max_scrollback: usize,
+    /// Ghostty history page budget in bytes. The legacy JSON name also meant bytes.
+    #[serde(alias = "max_scrollback")]
+    pub max_scrollback_bytes: usize,
     pub initially_visible: bool,
     pub theme: TerminalTheme,
 }
@@ -552,7 +578,7 @@ impl Default for TerminalSpawnOptions {
             rows: 24,
             cell_width_px: 9,
             cell_height_px: 18,
-            max_scrollback: 10_000,
+            max_scrollback_bytes: TerminalConfig::DEFAULT_SCROLLBACK_BYTES,
             initially_visible: true,
             theme: TerminalTheme::default(),
         }
@@ -566,7 +592,7 @@ impl From<TerminalConfig> for TerminalSpawnOptions {
             rows: value.rows,
             cell_width_px: value.cell_width_px,
             cell_height_px: value.cell_height_px,
-            max_scrollback: value.max_scrollback,
+            max_scrollback_bytes: value.max_scrollback_bytes,
             initially_visible: value.initially_visible,
             theme: value.theme,
         }
@@ -856,6 +882,7 @@ pub enum ServerResponse {
         page: crate::chat::TextCopyPage,
     },
     Work(crate::work::Response),
+    ChannelWork(crate::channel_work_api::Response),
 }
 
 /// Maximum compact inventory rows in one capacity response.
@@ -1547,6 +1574,10 @@ pub enum WireTerminalEvent {
         matches: Vec<crate::terminal::SearchMatch>,
         truncated: bool,
     },
+    InputNotice {
+        operation: String,
+        message: String,
+    },
 }
 
 impl From<TerminalEvent> for WireTerminalEvent {
@@ -1584,6 +1615,10 @@ impl From<TerminalEvent> for WireTerminalEvent {
                 Self::AgentActivityChanged { activity }
             }
             TerminalEvent::Bell => Self::Bell,
+            TerminalEvent::InputNotice { operation, message } => Self::InputNotice {
+                operation: operation.to_owned(),
+                message,
+            },
             TerminalEvent::Exited {
                 exit_code,
                 signal,
@@ -1593,7 +1628,11 @@ impl From<TerminalEvent> for WireTerminalEvent {
                 signal,
                 intentional,
             },
-            TerminalEvent::Error { operation, message } => Self::Error {
+            // InputRejected is client-local. If serialized by a future caller,
+            // preserve the conservative existing wire Error semantics; a bare
+            // wire event must never issue trusted nonfatal admission evidence.
+            TerminalEvent::Error { operation, message }
+            | TerminalEvent::InputRejected { operation, message } => Self::Error {
                 operation: operation.to_owned(),
                 message,
             },
@@ -1640,6 +1679,19 @@ impl From<WireTerminalEvent> for TerminalEvent {
                 Self::AgentActivityChanged(activity)
             }
             WireTerminalEvent::Bell => Self::Bell,
+            WireTerminalEvent::InputNotice { operation, message } => Self::InputNotice {
+                operation: match operation.as_str() {
+                    "cancel terminal input" => "cancel terminal input",
+                    "write terminal input" => "write terminal input",
+                    "write encoded key" => "write encoded key",
+                    "write terminal paste" => "write terminal paste",
+                    "write encoded mouse event" => "write encoded mouse event",
+                    "write terminal response" => "write terminal response",
+                    "interrupt terminal" => "interrupt terminal",
+                    _ => "terminal input",
+                },
+                message,
+            },
             WireTerminalEvent::Exited {
                 exit_code,
                 signal,
@@ -1695,6 +1747,36 @@ pub struct FrameCodec {
     payload_length: Option<usize>,
     payload_read: usize,
     maximum: usize,
+    memory_id: u64,
+    small_reads: u8,
+    small_writes: u8,
+}
+
+// A codec moves from handshake into a reader thread. Pointer identity would
+// leave a phantom owner at its former stack address in memory census traces.
+fn next_memory_codec_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+// Normal interactive frames keep a reusable quarter-mebibyte allocation. A
+// one-off transcript/image transfer must not permanently multiply its peak
+// capacity across every attached chat. Eight consecutive frames at least four
+// times smaller retire an outlier; interleaved snapshots/acknowledgements keep
+// hot capacity. Hidden chat transports explicitly release their spare buffers.
+const FRAME_REUSE_FLOOR: usize = 256 * 1024;
+
+fn recycle_frame_buffer(buffer: &mut Vec<u8>, completed_bytes: usize, small_frames: &mut u8) {
+    buffer.clear();
+    if buffer.capacity() > FRAME_REUSE_FLOOR.max(completed_bytes.saturating_mul(4)) {
+        *small_frames = small_frames.saturating_add(1);
+        if *small_frames >= 8 {
+            buffer.shrink_to(FRAME_REUSE_FLOOR);
+            *small_frames = 0;
+        }
+    } else {
+        *small_frames = 0;
+    }
 }
 
 impl FrameCodec {
@@ -1707,7 +1789,30 @@ impl FrameCodec {
             payload_length: None,
             payload_read: 0,
             maximum,
+            memory_id: next_memory_codec_id(),
+            small_reads: 0,
+            small_writes: 0,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn buffer_capacities_for_test(&self) -> (usize, usize) {
+        (self.read_buffer.capacity(), self.write_buffer.capacity())
+    }
+
+    /// Release outlier scratch when a connection becomes hidden or idle.
+    /// A timed-out partial frame remains intact until it is decoded.
+    pub fn release_spare(&mut self) {
+        if self.payload_length.is_none() && self.prefix_read == 0 {
+            self.read_buffer.clear();
+            self.read_buffer.shrink_to(FRAME_REUSE_FLOOR);
+            self.small_reads = 0;
+        }
+        self.write_buffer.clear();
+        self.write_buffer.shrink_to(FRAME_REUSE_FLOOR);
+        self.small_writes = 0;
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "ipc", codec = self.memory_id,
+            read_capacity = self.read_buffer.capacity(), write_capacity = self.write_buffer.capacity());
     }
 
     pub fn read<T: DeserializeOwned>(
@@ -1767,6 +1872,8 @@ impl FrameCodec {
         if let Some(started) = started {
             tracing::trace!(target: "cagents::terminal_pipeline", stage = "ipc_decode", elapsed_ns = started.elapsed().as_nanos() as u64, bytes = length);
         }
+        recycle_frame_buffer(&mut self.read_buffer, length, &mut self.small_reads);
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "ipc", codec = self.memory_id, read_capacity = self.read_buffer.capacity(), write_capacity = self.write_buffer.capacity());
         Ok(Some(value?))
     }
 
@@ -1786,7 +1893,20 @@ impl FrameCodec {
         }
         writer.write_all(&self.write_buffer)?;
         writer.flush()?;
+        recycle_frame_buffer(
+            &mut self.write_buffer,
+            payload_length,
+            &mut self.small_writes,
+        );
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "ipc", codec = self.memory_id, read_capacity = self.read_buffer.capacity(), write_capacity = self.write_buffer.capacity());
         Ok(())
+    }
+}
+
+impl Drop for FrameCodec {
+    fn drop(&mut self) {
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "ipc", codec = self.memory_id,
+            released = true, read_capacity = 0usize, write_capacity = 0usize);
     }
 }
 
@@ -1972,6 +2092,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scrollback_options_keep_legacy_json_and_positional_wire_bytes() {
+        #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+        struct LegacyOptions {
+            columns: u16,
+            rows: u16,
+            cell_width_px: u32,
+            cell_height_px: u32,
+            max_scrollback: usize,
+            initially_visible: bool,
+            theme: TerminalTheme,
+        }
+        for budget in [
+            0,
+            10_000,
+            TerminalConfig::DEFAULT_SCROLLBACK_BYTES,
+            TerminalConfig::MAX_SCROLLBACK_BYTES,
+        ] {
+            let legacy = LegacyOptions {
+                columns: 80,
+                rows: 24,
+                cell_width_px: 9,
+                cell_height_px: 18,
+                max_scrollback: budget,
+                initially_visible: true,
+                theme: TerminalTheme::default(),
+            };
+            let decoded: TerminalSpawnOptions =
+                serde_json::from_value(serde_json::to_value(&legacy).unwrap()).unwrap();
+            assert_eq!(decoded.max_scrollback_bytes, budget);
+            let mut old_frame = Vec::new();
+            write_frame(&mut old_frame, &legacy).unwrap();
+            let mut new_frame = Vec::new();
+            write_frame(&mut new_frame, &decoded).unwrap();
+            assert_eq!(old_frame, new_frame);
+            assert_eq!(
+                read_frame::<TerminalSpawnOptions>(&mut Cursor::new(&old_frame)).unwrap(),
+                Some(decoded)
+            );
+            assert_eq!(
+                read_frame::<LegacyOptions>(&mut Cursor::new(&new_frame)).unwrap(),
+                Some(legacy)
+            );
+        }
+        let options = TerminalSpawnOptions::from(TerminalConfig::default());
+        assert_eq!(options.max_scrollback_bytes, 16 * 1024 * 1024);
+        let mut duplicate = serde_json::to_value(options).unwrap();
+        duplicate["max_scrollback"] = serde_json::json!(10_000);
+        assert!(serde_json::from_value::<TerminalSpawnOptions>(duplicate).is_err());
+    }
+
+    #[test]
     fn retained_claude_snapshot_continuity_uses_the_matched_public_wire() {
         let response = ServerResponse::ChatSnapshot {
             chat_id: TerminalId::new(),
@@ -1995,6 +2166,79 @@ mod tests {
             legacy.native_continuity,
             crate::chat::NativeContinuity::ReconnectOnly
         );
+    }
+
+    #[test]
+    fn frame_codec_sheds_oversized_capacity_after_small_frame_without_losing_reuse() {
+        let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+        let large = "x".repeat(3 * 1024 * 1024);
+        let mut frames = Vec::new();
+        codec.write(&mut frames, &large).unwrap();
+        assert!(codec.write_buffer.capacity() >= large.len());
+        for _ in 0..8 {
+            codec.write(&mut frames, &"small").unwrap();
+        }
+        assert!(codec.write_buffer.capacity() <= FRAME_REUSE_FLOOR);
+        let reused = codec.write_buffer.capacity();
+        codec.write(&mut Vec::new(), &"small").unwrap();
+        assert_eq!(codec.write_buffer.capacity(), reused);
+        let mut reader = Cursor::new(frames);
+        assert_eq!(codec.read::<String>(&mut reader).unwrap(), Some(large));
+        assert!(codec.read_buffer.capacity() >= 3 * 1024 * 1024);
+        for _ in 0..8 {
+            assert_eq!(
+                codec.read::<String>(&mut reader).unwrap().as_deref(),
+                Some("small")
+            );
+        }
+        assert!(codec.read_buffer.capacity() <= FRAME_REUSE_FLOOR);
+    }
+
+    #[test]
+    fn recoverable_input_notice_does_not_reclassify_error_or_admission_evidence() {
+        let message = "Previously delivered input was preserved; unsent input was canceled.";
+        let notice = TerminalEvent::InputNotice {
+            operation: "cancel terminal input",
+            message: message.into(),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &WireTerminalEvent::from(notice.clone())).unwrap();
+        let received = read_frame::<WireTerminalEvent>(&mut Cursor::new(bytes))
+            .unwrap()
+            .unwrap();
+        assert_eq!(TerminalEvent::from(received), notice);
+
+        // An old or genuine failure with identical text is still a failure.
+        // Only the explicit event variant carries recoverable semantics.
+        let error = TerminalEvent::from(WireTerminalEvent::Error {
+            operation: "cancel terminal input".into(),
+            message: message.into(),
+        });
+        assert!(matches!(error, TerminalEvent::Error { .. }));
+        assert!(matches!(
+            WireTerminalEvent::from(TerminalEvent::InputRejected {
+                operation: "write terminal input",
+                message: "local correlated refusal".into(),
+            }),
+            WireTerminalEvent::Error { .. }
+        ));
+        assert!(PROTOCOL_VERSION > 105);
+    }
+
+    #[test]
+    fn alternating_large_frames_and_acknowledgements_keep_hot_capacity_until_hidden() {
+        let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+        let large = "x".repeat(3 * 1024 * 1024);
+        codec.write(&mut Vec::new(), &large).unwrap();
+        let hot = codec.write_buffer.capacity();
+        for _ in 0..8 {
+            codec.write(&mut Vec::new(), &"ack").unwrap();
+            assert_eq!(codec.write_buffer.capacity(), hot);
+            codec.write(&mut Vec::new(), &large).unwrap();
+            assert_eq!(codec.write_buffer.capacity(), hot);
+        }
+        codec.release_spare();
+        assert!(codec.write_buffer.capacity() <= FRAME_REUSE_FLOOR);
     }
 
     #[test]
@@ -2038,12 +2282,14 @@ mod tests {
             codec.read::<String>(&mut reader),
             Err(FrameError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
         ));
+        codec.release_spare();
         // A writer on the same connection must not overwrite a partial read.
         codec.write(&mut Vec::new(), &"outbound").unwrap();
         assert!(matches!(
             codec.read::<String>(&mut reader),
             Err(FrameError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
         ));
+        codec.release_spare();
         assert_eq!(
             codec.read::<String>(&mut reader).unwrap(),
             Some("a split payload".into())

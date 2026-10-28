@@ -9,6 +9,7 @@ use crate::{
         ServerMessage, ServerResponse,
     },
 };
+use arc_swap::ArcSwap;
 use std::{
     collections::{BTreeMap, VecDeque},
     io,
@@ -25,6 +26,8 @@ use std::{
 // Native holder startup can spend 30 seconds sending its control request and
 // another 30 seconds receiving the reply. Leave room for the daemon response
 // and a busy desktop scheduler.
+mod append;
+
 const CHAT_ATTACH_TIMEOUT: Duration = Duration::from_secs(70);
 
 fn start_failure(error: ipc::ProtocolError) -> StartFailure {
@@ -36,6 +39,37 @@ fn start_failure(error: ipc::ProtocolError) -> StartFailure {
             _ => super::Recovery::Retry,
         },
     }
+}
+
+/// Stack ranges are virtual reservations, not committed memory. A profiler
+/// can intersect these ranges with smaps RSS/PSS rather than multiplying an
+/// assumed stack size by the number of chat workers.
+fn trace_worker_stack(role: &'static str) {
+    #[cfg(target_os = "linux")]
+    if tracing::enabled!(target: "cagents::memory", tracing::Level::TRACE) {
+        // SAFETY: pthread initializes attr on success; all output pointers are
+        // live local storage and the initialized attribute is destroyed once.
+        unsafe {
+            let mut attr = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
+            if libc::pthread_getattr_np(libc::pthread_self(), attr.as_mut_ptr()) != 0 {
+                return;
+            }
+            let mut attr = attr.assume_init();
+            let mut base = std::ptr::null_mut();
+            let mut bytes = 0;
+            let mut guard_bytes = 0;
+            let valid = libc::pthread_attr_getstack(&attr, &mut base, &mut bytes) == 0;
+            let _ = libc::pthread_attr_getguardsize(&attr, &mut guard_bytes);
+            let _ = libc::pthread_attr_destroy(&mut attr);
+            if valid {
+                tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "thread_stack", role,
+                    thread_id = libc::syscall(libc::SYS_gettid) as u64,
+                    stack_base = base as usize, reserved_stack_bytes = bytes, guard_bytes);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = role;
 }
 
 fn connect_daemon(path: &std::path::Path) -> io::Result<UnixStream> {
@@ -86,6 +120,7 @@ pub struct ClientHandle {
 struct Wire {
     stream: UnixStream,
     codec: FrameCodec,
+    body_requested: Arc<AtomicBool>,
 }
 type Pending = Arc<
     Mutex<
@@ -236,15 +271,288 @@ impl UpgradeRecovery {
     }
 }
 
+/// One immutable, coherent presentation. Append evidence owns only bounded
+/// Weak item edges; neither hidden state nor lineage keeps transcript bodies.
+struct Publication {
+    owned: Option<Box<RetiredPublication>>,
+    retirement: Arc<ClientRetirement>,
+    // One exact connection reader, registered inside its owned thread. This
+    // preserves producer-side destruction backpressure without labeling callers
+    // or trusting the thread which happened to construct the attach snapshot.
+    source_thread: Arc<std::sync::OnceLock<std::thread::ThreadId>>,
+}
+
+struct PublicationPayload {
+    snapshot: Arc<Snapshot>,
+    clock: Option<SourceClock>,
+    resident: bool,
+    lineage: append::Lineage,
+    // Ready before installation: hide performs no body/metadata derivation.
+    // Metadata nodes have no pair and own no body or append authority.
+    hidden: Option<Arc<Publication>>,
+    #[cfg(test)]
+    retirement_complete: Mutex<Option<std::sync::mpsc::Sender<std::thread::ThreadId>>>,
+}
+
+impl std::ops::Deref for Publication {
+    type Target = PublicationPayload;
+
+    fn deref(&self) -> &Self::Target {
+        &self
+            .owned
+            .as_ref()
+            .expect("held until Publication::drop")
+            .payload
+    }
+}
+
+impl Drop for Publication {
+    fn drop(&mut self) {
+        if let Some(retired) = self.owned.take() {
+            // ArcSwap guards can become last owners on a presentation reader.
+            // Retire on EVERY final Publication path, not only hide/swap paths.
+            if self
+                .source_thread
+                .get()
+                .is_some_and(|id| *id == thread::current().id())
+            {
+                // Ordinary producer swaps keep their existing disposal cost;
+                // only a different final owner hands this work to the reaper.
+                retired.finish();
+            } else {
+                self.retirement.enqueue(RetirementJob::Publication(retired));
+            }
+        }
+    }
+}
+
+struct RetiredPublication {
+    payload: PublicationPayload,
+    next: Option<RetirementJob>,
+}
+
+impl RetiredPublication {
+    fn finish(self: Box<Self>) {
+        debug_assert!(self.next.is_none());
+        #[cfg(test)]
+        let complete = self
+            .payload
+            .retirement_complete
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        // Snapshot/control vectors, weak lineage and ready metadata ownership
+        // all belong to this same node, regardless of the last Arc's thread.
+        drop(self);
+        #[cfg(test)]
+        if let Some(complete) = complete {
+            let _ = complete.send(thread::current().id());
+        }
+    }
+}
+
+impl Publication {
+    fn owned(
+        snapshot: Snapshot,
+        clock: Option<SourceClock>,
+        resident: bool,
+        lineage: append::Lineage,
+        hidden: Option<Arc<Publication>>,
+        source_thread: Arc<std::sync::OnceLock<std::thread::ThreadId>>,
+    ) -> Arc<Self> {
+        // The connection starts this owner before any handshake/body admission.
+        // Direct test constructors use the same fallible process initialization.
+        let retirement = ClientRetirement::shared()
+            .expect("client retirement must prestart before body admission");
+        Arc::new(Self {
+            owned: Some(Box::new(RetiredPublication {
+                payload: PublicationPayload {
+                    snapshot: Arc::new(snapshot),
+                    clock,
+                    resident,
+                    lineage,
+                    hidden,
+                    #[cfg(test)]
+                    retirement_complete: Mutex::new(None),
+                },
+                next: None,
+            })),
+            retirement,
+            source_thread,
+        })
+    }
+
+    fn initial(snapshot: Snapshot) -> Arc<Self> {
+        let clock = SourceClock::from_sample(snapshot.sampled_at, Instant::now());
+        Self::resident(
+            snapshot,
+            clock,
+            append::Lineage::default(),
+            Arc::new(std::sync::OnceLock::new()),
+        )
+    }
+
+    fn resident(
+        snapshot: Snapshot,
+        clock: Option<SourceClock>,
+        lineage: append::Lineage,
+        source_thread: Arc<std::sync::OnceLock<std::thread::ThreadId>>,
+    ) -> Arc<Self> {
+        let mut metadata = snapshot.clone();
+        metadata.evict_transcript();
+        let hidden = Self::owned(
+            metadata,
+            clock,
+            false,
+            append::Lineage::default(),
+            None,
+            source_thread.clone(),
+        );
+        Self::owned(snapshot, clock, true, lineage, Some(hidden), source_thread)
+    }
+
+    fn next(
+        base: &Self,
+        snapshot: Snapshot,
+        resident: bool,
+        lineage: append::Lineage,
+    ) -> Arc<Self> {
+        let mut clock = base.clock;
+        SourceClock::observe(&mut clock, snapshot.sampled_at, Instant::now());
+        if resident {
+            Self::resident(snapshot, clock, lineage, base.source_thread.clone())
+        } else {
+            Self::owned(
+                snapshot,
+                clock,
+                false,
+                append::Lineage::default(),
+                None,
+                base.source_thread.clone(),
+            )
+        }
+    }
+}
+
+struct Publications {
+    current: ArcSwap<Publication>,
+    // Only writers use this gate. All body derivation and destruction happens
+    // outside it; UI presentation readers never acquire a producer lock.
+    commit: Mutex<u64>,
+}
+
+impl Publications {
+    fn new(snapshot: Snapshot) -> Self {
+        Self {
+            current: ArcSwap::from(Publication::initial(snapshot)),
+            commit: Mutex::new(0),
+        }
+    }
+
+    fn bind_source_thread(&self) {
+        self.current
+            .load()
+            .source_thread
+            .set(thread::current().id())
+            .expect("one owned reader per publication lineage");
+    }
+
+    /// Pair the installed identity with body-policy revision before deriving
+    /// any proposal. Metadata can be the base of a full response, so identity
+    /// alone cannot fence a hide/show cycle while that response is built.
+    fn capture(&self) -> (Arc<Publication>, u64) {
+        let revision = self.commit.lock().unwrap_or_else(|p| p.into_inner());
+        (self.current.load_full(), *revision)
+    }
+
+    fn replace(
+        &self,
+        snapshot: Snapshot,
+        body: &AtomicBool,
+        sample_clock: bool,
+        final_body: bool,
+    ) -> Option<bool> {
+        let (base, revision) = self.capture();
+        let mut clock = base.clock;
+        if sample_clock {
+            SourceClock::observe(&mut clock, snapshot.sampled_at, Instant::now());
+        }
+        let full = Publication::resident(
+            snapshot,
+            clock,
+            append::Lineage::default(),
+            base.source_thread.clone(),
+        );
+        let metadata = full
+            .hidden
+            .as_ref()
+            .expect("resident publication has ready metadata")
+            .clone();
+        #[cfg(test)]
+        tests::pause_before_replacement(self as *const Self as usize);
+        self.publish(&base, revision, body, Some(full), metadata, final_body)
+    }
+
+    /// The connection reader is the only source writer; visibility is a second
+    /// writer. A hide (even followed by show) invalidates any derived body.
+    /// Visibility preserves generation/clock, so a validated metadata fallback
+    /// can still advance controls. A different source base requires resync.
+    fn publish(
+        &self,
+        base: &Arc<Publication>,
+        revision: u64,
+        body: &AtomicBool,
+        mut full: Option<Arc<Publication>>,
+        metadata: Arc<Publication>,
+        final_body: bool,
+    ) -> Option<bool> {
+        let (old, current, result) = {
+            let current_revision = self.commit.lock().unwrap_or_else(|p| p.into_inner());
+            let current = self.current.load_full();
+            if !final_body && current.snapshot.generation != base.snapshot.generation {
+                (None, current, None)
+            } else {
+                let resident = full.is_some()
+                    && (final_body
+                        || (*current_revision == revision
+                            && Arc::ptr_eq(base, &current)
+                            && body.load(Ordering::Acquire)));
+                let next = if resident {
+                    full.take().unwrap()
+                } else {
+                    metadata
+                };
+                let old = self.current.swap(next);
+                (Some(old), current, Some(resident))
+            }
+        };
+        // ArcSwap can retire the last owner of a large old transcript. Do not
+        // let that destruction, or an unused proposal's, run under the gate.
+        drop(old);
+        drop(current);
+        result
+    }
+}
+
+// Keep the public ClientHandle/Arc API unchanged. The private payload can move
+// as one owner, including its installed body, even after both threads settled.
 struct Inner {
+    owned: Option<Box<RetiredClient>>,
+    retirement: Arc<ClientRetirement>,
+}
+
+struct InnerPayload {
     id: TerminalId,
     session: Session,
     upgrade_recovery: Option<UpgradeRecovery>,
     proof: HostSessionProof,
     wire: Arc<Mutex<Wire>>,
     cancel: UnixStream,
-    snapshot: Arc<Mutex<Arc<Snapshot>>>,
-    source_clock: Arc<Mutex<Option<SourceClock>>>,
+    publication: Arc<Publications>,
+    body_requested: Arc<AtomicBool>,
+    // First-prompt receipt evidence survives body eviction, without retaining
+    // user text. This is scoped to this exact authenticated connection.
+    user_item_seen: Arc<AtomicBool>,
     activity: Arc<Mutex<ActivityObservation>>,
     observed: Arc<Mutex<OutputObservation>>,
     account_usage: Arc<Mutex<AccountUsage>>,
@@ -259,6 +567,262 @@ struct Inner {
     text_copies: AtomicUsize,
     visibility_tx: crossbeam_channel::Sender<()>,
     visibility_worker: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(test)]
+    retirement_complete: Option<std::sync::mpsc::Sender<std::thread::ThreadId>>,
+}
+
+impl Inner {
+    fn new(payload: InnerPayload, retirement: Arc<ClientRetirement>) -> Self {
+        Self {
+            owned: Some(Box::new(RetiredClient {
+                payload,
+                next: None,
+            })),
+            retirement,
+        }
+    }
+}
+
+impl std::ops::Deref for Inner {
+    type Target = InnerPayload;
+
+    fn deref(&self) -> &Self::Target {
+        &self.owned.as_ref().expect("held until Inner::drop").payload
+    }
+}
+
+impl std::ops::DerefMut for Inner {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.owned.as_mut().expect("held until Inner::drop").payload
+    }
+}
+
+struct RetiredClient {
+    payload: InnerPayload,
+    next: Option<RetirementJob>,
+}
+
+impl RetiredClient {
+    fn ready(&mut self) -> bool {
+        self.payload
+            .reader
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_none_or(JoinHandle::is_finished)
+            && self
+                .payload
+                .visibility_worker
+                .get_mut()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+                .is_none_or(JoinHandle::is_finished)
+    }
+
+    fn finish(mut self: Box<Self>) {
+        debug_assert!(self.next.is_none());
+        debug_assert!(self.ready());
+        if let Some(reader) = self
+            .payload
+            .reader
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            let _ = reader.join();
+        }
+        if let Some(worker) = self
+            .payload
+            .visibility_worker
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            let _ = worker.join();
+        }
+        let id = self.payload.id;
+        #[cfg(test)]
+        let completed = self.payload.retirement_complete.take();
+        // Actual publication, codec scratch, pending replies, session metadata
+        // and callback ownership all leave the event thread together.
+        drop(self);
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_client", chat_id = %id,
+            released = true, resident_bytes = 0usize);
+        #[cfg(test)]
+        if let Some(completed) = completed {
+            let _ = completed.send(std::thread::current().id());
+        }
+    }
+}
+
+enum RetirementJob {
+    Client(Box<RetiredClient>),
+    Publication(Box<RetiredPublication>),
+}
+
+impl RetirementJob {
+    fn next_mut(&mut self) -> &mut Option<Self> {
+        match self {
+            Self::Client(client) => &mut client.next,
+            Self::Publication(publication) => &mut publication.next,
+        }
+    }
+
+    fn ready(&mut self) -> bool {
+        match self {
+            Self::Client(client) => client.ready(),
+            Self::Publication(_) => true,
+        }
+    }
+
+    fn finish(self) {
+        match self {
+            Self::Client(client) => client.finish(),
+            Self::Publication(publication) => publication.finish(),
+        }
+    }
+}
+
+/// One process-owned worker, separate from the parser/presentation FIFO. Each
+/// admitted client and constructed publication already owns its intrusive node;
+/// Drop allocates no queue node and never starts a thread. Outstanding client
+/// and publication retirements have no fixed global byte cap. Never join an
+/// unfinished client here.
+struct ClientRetirement {
+    incoming: Mutex<Option<RetirementJob>>,
+    wake: std::sync::Condvar,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// Only a successful process owner is cached. An OS thread-spawn error must
+/// refuse this admission without permanently poisoning later chat attempts.
+struct ClientRetirementInitializer {
+    owner: std::sync::OnceLock<Arc<ClientRetirement>>,
+    initialize: Mutex<()>,
+}
+
+impl ClientRetirementInitializer {
+    const fn new() -> Self {
+        Self {
+            owner: std::sync::OnceLock::new(),
+            initialize: Mutex::new(()),
+        }
+    }
+
+    fn get_or_start(
+        &self,
+        start: impl FnOnce() -> Result<Arc<ClientRetirement>, String>,
+    ) -> Result<Arc<ClientRetirement>, String> {
+        if let Some(owner) = self.owner.get() {
+            return Ok(owner.clone());
+        }
+        let _initializing = self.initialize.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(owner) = self.owner.get() {
+            return Ok(owner.clone());
+        }
+        let owner = start()?;
+        // This is the sole setter, serialized by initialize. Failure leaves
+        // OnceLock empty; concurrent admissions can never start duplicate owners.
+        assert!(
+            self.owner.set(owner.clone()).is_ok(),
+            "serialized retirement initialization"
+        );
+        Ok(owner)
+    }
+}
+
+impl ClientRetirement {
+    fn shared() -> Result<Arc<Self>, String> {
+        static OWNER: ClientRetirementInitializer = ClientRetirementInitializer::new();
+        OWNER.get_or_start(|| {
+            Self::start_with(|worker| {
+                thread::Builder::new()
+                    .name("chat-client-retire".into())
+                    .spawn(worker)
+            })
+        })
+    }
+
+    fn for_client(id: TerminalId) -> Result<Arc<Self>, String> {
+        #[cfg(test)]
+        if tests::fail_retirement_start(id) {
+            return Self::start_with(|_| {
+                Err(io::Error::other("fixture retirement worker startup failed"))
+            });
+        }
+        #[cfg(not(test))]
+        let _ = id;
+        Self::shared()
+    }
+
+    fn start_with(
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> io::Result<JoinHandle<()>>,
+    ) -> Result<Arc<Self>, String> {
+        let owner = Arc::new(Self {
+            incoming: Mutex::new(None),
+            wake: std::sync::Condvar::new(),
+            worker: Mutex::new(None),
+        });
+        let running = owner.clone();
+        // No client payload or connection thread has been admitted yet. A spawn
+        // failure drops only this empty startup state and returns a real error.
+        let worker = spawn(Box::new(move || running.run())).map_err(|error| error.to_string())?;
+        *owner.worker.lock().unwrap_or_else(|p| p.into_inner()) = Some(worker);
+        Ok(owner)
+    }
+
+    fn enqueue(&self, mut retired: RetirementJob) {
+        let mut incoming = self.incoming.lock().unwrap_or_else(|p| p.into_inner());
+        *retired.next_mut() = incoming.take();
+        *incoming = Some(retired);
+        drop(incoming);
+        self.wake.notify_one();
+    }
+
+    fn run(&self) {
+        let mut waiting = None;
+        loop {
+            let incoming = {
+                let mut incoming = self.incoming.lock().unwrap_or_else(|p| p.into_inner());
+                while incoming.is_none() && waiting.is_none() {
+                    incoming = self.wake.wait(incoming).unwrap_or_else(|p| p.into_inner());
+                }
+                incoming.take()
+            };
+            // Both lists are owned only by this worker. No scan, join, trace or
+            // payload destruction holds the short UI handoff mutex.
+            for mut list in [incoming, waiting.take()] {
+                while let Some(mut retired) = list {
+                    list = retired.next_mut().take();
+                    if retired.ready() {
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            retired.finish()
+                        }))
+                        .is_err()
+                        {
+                            // Each node is unlinked first: an ordinary payload
+                            // destructor panic cannot drop or strand later jobs.
+                            // Rust abort/double-panic behavior is unchanged.
+                            tracing::error!("chat client retirement payload panicked");
+                        }
+                    } else {
+                        *retired.next_mut() = waiting.take();
+                        waiting = Some(retired);
+                    }
+                }
+            }
+            if waiting.is_some() {
+                let incoming = self.incoming.lock().unwrap_or_else(|p| p.into_inner());
+                if incoming.is_none() {
+                    drop(
+                        self.wake
+                            .wait_timeout(incoming, Duration::from_millis(10))
+                            .unwrap_or_else(|p| p.into_inner()),
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -343,8 +907,16 @@ fn transmit(
     id: u64,
     request: ClientRequest,
 ) -> Result<(), String> {
+    let hidden = matches!(
+        &request,
+        ClientRequest::ChatVisibility { visible: false, .. }
+    );
     let mut wire = wire.lock().unwrap_or_else(|p| p.into_inner());
-    let Wire { stream, codec } = &mut *wire;
+    let Wire {
+        stream,
+        codec,
+        body_requested,
+    } = &mut *wire;
     codec
         .write(
             stream,
@@ -355,7 +927,11 @@ fn transmit(
                 request,
             },
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if hidden || !body_requested.load(Ordering::Acquire) {
+        codec.release_spare();
+    }
+    Ok(())
 }
 fn text_copy_remaining(deadline: Instant) -> Result<Duration, String> {
     deadline
@@ -398,7 +974,7 @@ fn transmit_text_copy(
             io::Write::flush(self.stream)
         }
     }
-    let Wire { stream, codec } = &mut *wire;
+    let Wire { stream, codec, .. } = &mut *wire;
     let previous_timeout = stream.write_timeout().map_err(|error| error.to_string())?;
     let result = codec
         .write(
@@ -537,15 +1113,17 @@ fn restore(
     proof: &HostSessionProof,
     mut session: Session,
     upgrade_recovery: &mut Option<(Session, Session)>,
+    retry_explicit_start: bool,
 ) -> Result<ClientRequest, StartFailure> {
-    if session.proof.as_ref() == Some(proof) {
+    if session.proof.as_ref() == Some(proof) && !retry_explicit_start {
         return Ok(ClientRequest::ChatAttach { session });
     }
     let mut refusal = None;
-    if !session
-        .proof
-        .as_ref()
-        .is_some_and(HostSessionProof::is_complete)
+    if retry_explicit_start
+        || !session
+            .proof
+            .as_ref()
+            .is_some_and(HostSessionProof::is_complete)
     {
         // Shared panes can be published before their first attachment records
         // ownership. Recover the daemon's exact descriptor before considering
@@ -576,6 +1154,63 @@ fn restore(
             {
                 return Err("The hosted chat does not match the exact saved conversation".into());
             }
+            if retry_explicit_start && session.launch.provider == crate::agent::Provider::Claude {
+                // A lost successful reply attaches the existing owner. A
+                // genuinely failed named initialization may instead retain an
+                // exact unfinished Close; only normal authenticated resume
+                // preparation can finish it and return the original request.
+                let request_id = *attach_request;
+                *attach_request += 1;
+                codec
+                    .write(
+                        stream,
+                        &ClientEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: Some(proof.clone()),
+                            request: ClientRequest::ChatPrepareResume {
+                                source: hosted.clone(),
+                            },
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                let prepared = match receive(stream, codec, request_id, Some(proof))? {
+                    ServerResponse::ChatResumePrepared { session } => session,
+                    _ => {
+                        return Err(
+                            "The failed start did not receive exact resume preparation".into()
+                        );
+                    }
+                };
+                if prepared == hosted {
+                    if hosted.is_saved_claude_history() {
+                        if hosted != session {
+                            return Err(
+                                "The saved-history reader changed the explicit retry request"
+                                    .into(),
+                            );
+                        }
+                        let execution_environment = native_environment(&hosted, true);
+                        return Ok(ClientRequest::ChatStart {
+                            session: hosted,
+                            source: None,
+                            terminate_source: false,
+                            execution_environment,
+                        });
+                    }
+                    return Ok(ClientRequest::ChatAttach { session: hosted });
+                }
+                if prepared == session {
+                    let execution_environment = native_environment(&prepared, true);
+                    return Ok(ClientRequest::ChatStart {
+                        session: prepared,
+                        source: None,
+                        terminate_source: false,
+                        execution_environment,
+                    });
+                }
+                return Err("Resume preparation changed the exact failed-start request".into());
+            }
             return Ok(ClientRequest::ChatAttach { session: hosted });
         }
     }
@@ -605,6 +1240,20 @@ fn restore(
                     && restored.proof.as_ref() == Some(proof)
                     && restored.launch.provider == session.launch.provider =>
             {
+                if retry_explicit_start && restored.is_saved_claude_history() {
+                    if restored != session {
+                        return Err(
+                            "The saved-history reader changed the explicit retry request".into(),
+                        );
+                    }
+                    let execution_environment = native_environment(&restored, true);
+                    return Ok(ClientRequest::ChatStart {
+                        session: restored,
+                        source: None,
+                        terminate_source: false,
+                        execution_environment,
+                    });
+                }
                 if session != restored {
                     if UpgradeRecovery::candidate(&session, &restored).is_none() {
                         return Err("The daemon's upgrade replacement changed the saved conversation configuration".into());
@@ -629,6 +1278,12 @@ fn restore(
         return Err(StartFailure::from(format!(
             "The saved native conversation could not be reattached. Its uncertain work was not restarted or resubmitted. {}",
             refusal.unwrap_or_else(|| "No authenticated native holder was available.".into())
+        )));
+    }
+    if session.launch.provider == crate::agent::Provider::Claude && !retry_explicit_start {
+        return Err(StartFailure::from(format!(
+            "Saved Claude history could not be opened without starting a provider. Its exact conversation and draft are retained. {}",
+            refusal.unwrap_or_else(|| "No authenticated history attachment was available.".into())
         )));
     }
     if session.launch.session_id.is_none() {
@@ -657,6 +1312,12 @@ impl ClientHandle {
     /// handle does not look like a protocol failure to a test that only draws.
     #[cfg(test)]
     pub(crate) fn fixture(session: Session, snapshot: Snapshot) -> Self {
+        let retirement = ClientRetirement::shared().expect("start fixture client retirement");
+        let body_requested = Arc::new(AtomicBool::new(true));
+        let user_item_seen = snapshot
+            .items
+            .iter()
+            .any(|item| item.role == super::Role::User);
         let (stream, peer) = UnixStream::pair().expect("socket pair");
         let (cancel, cancel_peer) = UnixStream::pair().expect("socket pair");
         let (visibility_tx, visibility_rx) = crossbeam_channel::bounded(1);
@@ -669,40 +1330,43 @@ impl ClientHandle {
             host_incarnation: crate::model::HostIncarnation::new("fixture-incarnation"),
         };
         Self {
-            inner: Arc::new(Inner {
-                id: session.id,
-                session,
-                upgrade_recovery: None,
-                proof,
-                wire: Arc::new(Mutex::new(Wire {
-                    stream,
-                    codec: FrameCodec::new(ipc::MAX_FRAME_BYTES),
-                })),
-                cancel,
-                source_clock: Arc::new(Mutex::new(SourceClock::from_sample(
-                    snapshot.sampled_at,
-                    Instant::now(),
-                ))),
-                snapshot: Arc::new(Mutex::new(Arc::new(snapshot))),
-                activity: Arc::new(Mutex::new(ActivityObservation {
-                    generation: 0,
-                    state: ActivityState::Idle,
-                    pending: false,
-                })),
-                observed: Arc::new(Mutex::new(OutputObservation::default())),
-                account_usage: Arc::default(),
-                next: Arc::new(AtomicU64::new(1)),
-                alive: Arc::new(AtomicBool::new(true)),
-                visible: Arc::new(AtomicBool::new(true)),
-                wake: Arc::new(|_| {}),
-                reader: Mutex::new(None),
-                pending: Arc::new(Mutex::new(BTreeMap::new())),
-                file_pending: Arc::new(Mutex::new(BTreeMap::new())),
-                text_copy_pending: Arc::new(Mutex::new(BTreeMap::new())),
-                text_copies: AtomicUsize::new(0),
-                visibility_tx,
-                visibility_worker: Mutex::new(None),
-            }),
+            inner: Arc::new(Inner::new(
+                InnerPayload {
+                    id: session.id,
+                    session,
+                    upgrade_recovery: None,
+                    proof,
+                    wire: Arc::new(Mutex::new(Wire {
+                        stream,
+                        codec: FrameCodec::new(ipc::MAX_FRAME_BYTES),
+                        body_requested: body_requested.clone(),
+                    })),
+                    cancel,
+                    publication: Arc::new(Publications::new(snapshot)),
+                    body_requested,
+                    user_item_seen: Arc::new(AtomicBool::new(user_item_seen)),
+                    activity: Arc::new(Mutex::new(ActivityObservation {
+                        generation: 0,
+                        state: ActivityState::Idle,
+                        pending: false,
+                    })),
+                    observed: Arc::new(Mutex::new(OutputObservation::default())),
+                    account_usage: Arc::default(),
+                    next: Arc::new(AtomicU64::new(1)),
+                    alive: Arc::new(AtomicBool::new(true)),
+                    visible: Arc::new(AtomicBool::new(true)),
+                    wake: Arc::new(|_| {}),
+                    reader: Mutex::new(None),
+                    pending: Arc::new(Mutex::new(BTreeMap::new())),
+                    file_pending: Arc::new(Mutex::new(BTreeMap::new())),
+                    text_copy_pending: Arc::new(Mutex::new(BTreeMap::new())),
+                    text_copies: AtomicUsize::new(0),
+                    visibility_tx,
+                    visibility_worker: Mutex::new(None),
+                    retirement_complete: None,
+                },
+                retirement,
+            )),
         }
     }
 
@@ -745,6 +1409,81 @@ impl ClientHandle {
         self.install_snapshot_for_test(snapshot);
     }
 
+    /// Apply a fixture publication through the production delta validator and
+    /// append-lineage recorder. A full-snapshot fixture intentionally resets
+    /// that lineage and cannot stand in for a streaming delta benchmark.
+    #[cfg(test)]
+    pub(crate) fn publish_presentation_for_test(&self, update: super::presentation::Presentation) {
+        let (base, revision) = self.inner.publication.capture();
+        let mut lineage = base.lineage.clone();
+        let candidates = append::Lineage::candidates(&update, &base.snapshot);
+        let next = update
+            .apply(&base.snapshot)
+            .expect("fixture publication obeys production fences");
+        lineage.record(candidates, &next);
+        let full = Publication::next(&base, next, true, lineage);
+        let metadata = full.hidden.as_ref().unwrap().clone();
+        self.inner.publication.publish(
+            &base,
+            revision,
+            &self.inner.body_requested,
+            Some(full),
+            metadata,
+            false,
+        );
+    }
+
+    /// Build normal daemon-style deltas while retaining the production
+    /// transaction validator and weak append authority. Full reset fixtures
+    /// deliberately keep using publish_snapshot_for_test instead.
+    #[cfg(test)]
+    pub(crate) fn publish_delta_snapshot_for_test(&self, mut next: Snapshot) {
+        use super::presentation::{ChildUpdate, ItemChange, Presentation};
+        let previous = self.snapshot();
+        let changes = |old: &[Arc<super::Item>], items: &[Arc<super::Item>]| {
+            let old: std::collections::HashMap<_, _> = old
+                .iter()
+                .map(|item| (item.id.as_str(), item.as_ref()))
+                .collect();
+            items
+                .iter()
+                .filter_map(|item| {
+                    let before = old.get(item.id.as_str()).copied();
+                    (before != Some(item.as_ref())).then(|| ItemChange::between(before, item))
+                })
+                .collect()
+        };
+        let order = next.items.iter().map(|item| item.id.clone()).collect();
+        let parent = changes(&previous.items, &next.items);
+        next.items.clear();
+        let children = next
+            .subagents
+            .iter_mut()
+            .map(|child| {
+                let old = previous
+                    .subagents
+                    .iter()
+                    .find(|old| old.id == child.id)
+                    .map_or(&[][..], |old| old.items.as_slice());
+                let update = ChildUpdate {
+                    id: child.id.clone(),
+                    order: child.items.iter().map(|item| item.id.clone()).collect(),
+                    changes: changes(old, &child.items),
+                };
+                child.items.clear();
+                update
+            })
+            .collect();
+        self.publish_presentation_for_test(Presentation {
+            base_generation: previous.generation,
+            file_changes_unchanged: false,
+            metadata: next,
+            order,
+            changes: parent,
+            children,
+        });
+    }
+
     /// Queues a report as the reader thread would on its arrival, and says
     /// whether it would have woken the surface.
     #[cfg(test)]
@@ -785,6 +1524,29 @@ impl ClientHandle {
     #[cfg(test)]
     pub(crate) fn replace_snapshot_for_test(&self, snapshot: Snapshot) {
         self.install_snapshot_for_test(snapshot);
+    }
+
+    /// Observe disposal of this exact publication, independently of the UI's
+    /// presentation reclaimer. The signal follows destruction of its payload.
+    #[cfg(test)]
+    pub(crate) fn observe_snapshot_retirement_for_test(
+        &self,
+    ) -> std::sync::mpsc::Receiver<std::thread::ThreadId> {
+        let (completed, observed) = std::sync::mpsc::channel();
+        let publication = self.inner.publication.current.load();
+        assert!(
+            publication.resident,
+            "observe a resident transcript publication"
+        );
+        assert!(
+            publication
+                .retirement_complete
+                .lock()
+                .unwrap()
+                .replace(completed)
+                .is_none()
+        );
+        observed
     }
 
     /// Read-only metadata lookup. Does not subscribe, resume, or write a turn.
@@ -1022,6 +1784,19 @@ impl ClientHandle {
         upgrade_expected: Option<Session>,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
+        let retirement = ClientRetirement::for_client(session.id)?;
+        if intent == Intent::RetryStart
+            && (source.is_some()
+                || terminate_source
+                || selection.is_some()
+                || account_recovery.is_some()
+                || upgrade_expected.is_some()
+                || session.terminal.is_some()
+                || session.launch.session_id.is_none()
+                || session.native_continuity.retains_provider())
+        {
+            return Err("Only an exact explicit history start can be retried".into());
+        }
         if let Some(expected) = &upgrade_expected
             && (intent != Intent::Restore
                 || source.is_some()
@@ -1138,6 +1913,7 @@ impl ClientHandle {
                 &proof,
                 session,
                 &mut upgrade_recovery,
+                intent == Intent::RetryStart,
             )?
         };
         codec
@@ -1225,9 +2001,11 @@ impl ClientHandle {
         stream.set_read_timeout(None).map_err(|e| e.to_string())?;
         let mut reader_stream = stream.try_clone().map_err(|e| e.to_string())?;
         let cancel = stream.try_clone().map_err(|error| error.to_string())?;
+        let body_requested = Arc::new(AtomicBool::new(true));
         let wire = Arc::new(Mutex::new(Wire {
             stream,
             codec: FrameCodec::new(ipc::MAX_CLIENT_FRAME_BYTES),
+            body_requested: body_requested.clone(),
         }));
         let mut activity = ActivityObservation {
             generation: initial.generation,
@@ -1240,11 +2018,17 @@ impl ClientHandle {
         let activity = Arc::new(Mutex::new(activity));
         let observed = Arc::new(Mutex::new(early_observed));
         let account_usage = Arc::new(Mutex::new(early_usage));
-        let source_clock = Arc::new(Mutex::new(SourceClock::from_sample(
-            initial.sampled_at,
-            Instant::now(),
-        )));
-        let snapshot = Arc::new(Mutex::new(Arc::new(initial)));
+        // Attachment also serves non-UI callers that inspect the initial
+        // publication directly. The UI immediately sets its actual visibility;
+        // an unvisited hidden pane releases this body without preparing it.
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_client", chat_id = %session.id, resident_bytes = initial.transcript_bytes());
+        let user_item_seen = Arc::new(AtomicBool::new(
+            initial
+                .items
+                .iter()
+                .any(|item| item.role == super::Role::User),
+        ));
+        let publication = Arc::new(Publications::new(initial));
         let next = Arc::new(AtomicU64::new(attach_request + 1));
         let alive = Arc::new(AtomicBool::new(true));
         let visible = Arc::new(AtomicBool::new(false));
@@ -1252,30 +2036,36 @@ impl ClientHandle {
         let file_pending: FilePending = Arc::new(Mutex::new(BTreeMap::new()));
         let text_copy_pending: TextCopyPending = Arc::new(Mutex::new(BTreeMap::new()));
         let (visibility_tx, visibility_rx) = crossbeam_channel::bounded(1);
-        let inner = Arc::new(Inner {
-            id,
-            session,
-            upgrade_recovery,
-            proof: proof.clone(),
-            wire: wire.clone(),
-            cancel,
-            snapshot: snapshot.clone(),
-            source_clock: source_clock.clone(),
-            activity: activity.clone(),
-            observed: observed.clone(),
-            account_usage: account_usage.clone(),
-            next: next.clone(),
-            alive: alive.clone(),
-            wake: wake.clone(),
-            visible: visible.clone(),
-            reader: Mutex::new(None),
-            pending: pending.clone(),
-            file_pending: file_pending.clone(),
-            text_copy_pending: text_copy_pending.clone(),
-            text_copies: AtomicUsize::new(0),
-            visibility_tx,
-            visibility_worker: Mutex::new(None),
-        });
+        let inner = Arc::new(Inner::new(
+            InnerPayload {
+                id,
+                session,
+                upgrade_recovery,
+                proof: proof.clone(),
+                wire: wire.clone(),
+                cancel,
+                publication: publication.clone(),
+                body_requested: body_requested.clone(),
+                user_item_seen: user_item_seen.clone(),
+                activity: activity.clone(),
+                observed: observed.clone(),
+                account_usage: account_usage.clone(),
+                next: next.clone(),
+                alive: alive.clone(),
+                wake: wake.clone(),
+                visible: visible.clone(),
+                reader: Mutex::new(None),
+                pending: pending.clone(),
+                file_pending: file_pending.clone(),
+                text_copy_pending: text_copy_pending.clone(),
+                text_copies: AtomicUsize::new(0),
+                visibility_tx,
+                visibility_worker: Mutex::new(None),
+                #[cfg(test)]
+                retirement_complete: None,
+            },
+            retirement,
+        ));
         let visibility_wire = wire.clone();
         let visibility_alive = alive.clone();
         let visibility_value = visible.clone();
@@ -1284,6 +2074,7 @@ impl ClientHandle {
         let visibility_worker = thread::Builder::new()
             .name(format!("chat-visibility-{id}"))
             .spawn(move || {
+                trace_worker_stack("chat_visibility");
                 while visibility_rx.recv().is_ok() {
                     if !visibility_alive.load(Ordering::Acquire) {
                         break;
@@ -1318,6 +2109,8 @@ impl ClientHandle {
         // Ready consumes any pre-attachment unread edge; do not publish a wake
         // before the UI has installed the matching runtime generation.
         let worker = thread::Builder::new().name(format!("chat-client-{id}")).spawn(move || {
+            trace_worker_stack("chat_reader");
+            publication.bind_source_thread();
             let mut read_pending = false;
             let mut read_again = false;
             let mut resync = false;
@@ -1327,6 +2120,7 @@ impl ClientHandle {
                     Ok(None) => break "Chat daemon disconnected; exact session retained for reattachment".into(),
                     Err(error) => break format!("Chat daemon frame failed: {error}"),
                 };
+                if !body_requested.load(Ordering::Acquire) { codec.release_spare(); }
                 if envelope.version != PROTOCOL_VERSION || envelope.proof != proof { break "Chat daemon identity/version changed; refusing replacement".into(); }
                 if matches!(&envelope.message, ServerMessage::Response { response: ServerResponse::ChatClosed { .. } | ServerResponse::ChatTerminal { .. } }) {
                     let (chat_id, final_snapshot, terminal) = match envelope.message {
@@ -1338,14 +2132,24 @@ impl ClientHandle {
                     if terminal.is_some() && !final_snapshot.exited {
                         // A shared-server CLI is another view, not a closed
                         // native actor. Keep this connection and pending work.
-                        *snapshot.lock().unwrap_or_else(|p|p.into_inner())=Arc::new(final_snapshot);
+                        user_item_seen.fetch_or(final_snapshot.items.iter().any(|item| item.role == super::Role::User), Ordering::AcqRel);
+                        let resident = publication.replace(final_snapshot, &body_requested, false, false);
+                        if resident != Some(true) && body_requested.load(Ordering::Acquire) {
+                            resync = true;
+                            if visible.load(Ordering::Acquire) && !read_pending {
+                                if let Err(error) = transmit(&wire, &proof, next.fetch_add(1, Ordering::Relaxed), ClientRequest::ChatRead { chat_id: id, after_generation: None }) { break error; }
+                                read_pending = true;
+                            } else { read_again = true; }
+                        }
                         if let Some(reply) = envelope.request_id.and_then(|id| pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&id)) {
                             let _ = reply.try_send(Ok(terminal));
                         }
                         wake(Wake::Changed);
                         continue;
                     }
-                    *snapshot.lock().unwrap_or_else(|p|p.into_inner())=Arc::new(final_snapshot);
+                    alive.store(false, Ordering::Release);
+                    user_item_seen.fetch_or(final_snapshot.items.iter().any(|item| item.role == super::Role::User), Ordering::AcqRel);
+                    publication.replace(final_snapshot, &body_requested, false, true);
                     {
                         let mut activity = activity.lock().unwrap_or_else(|p| p.into_inner());
                         activity.state = ActivityState::Unknown;
@@ -1412,42 +2216,83 @@ impl ClientHandle {
                         read_pending = false;
                         if let Some(update) = update {
                             resync = false;
-                            let mut state = snapshot.lock().unwrap_or_else(|p| p.into_inner());
-                            SourceClock::observe(&mut source_clock.lock().unwrap_or_else(|p| p.into_inner()), update.sampled_at, Instant::now());
-                            *state = Arc::new(update);
-                            drop(state);
+                            user_item_seen.fetch_or(update.items.iter().any(|item| item.role == super::Role::User), Ordering::AcqRel);
+                            let resident = publication.replace(update, &body_requested, true, false);
+                            let state = publication.current.load();
+                            tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_client", chat_id = %id,
+                                resident_bytes = state.snapshot.transcript_bytes());
+                            if resident != Some(true) && body_requested.load(Ordering::Acquire) {
+                                resync = true; read_again = true;
+                            }
                             if visible.load(Ordering::Acquire) { wake(Wake::Changed); }
+                        } else if body_requested.load(Ordering::Acquire) && !publication.current.load().resident {
+                            // A conditional read was already in flight at hide.
+                            // Its unchanged response cannot hydrate an evicted base.
+                            resync = true;
+                            read_again = true;
                         }
                     },
                     ServerMessage::Response { response: ServerResponse::ChatUpdate { chat_id, update } } if chat_id == id => {
                         read_pending = false;
-                        let mut state = snapshot.lock().unwrap_or_else(|p| p.into_inner());
-                        let sampled_at = update.metadata.sampled_at;
-                        let applied = match update.apply(&state) {
-                            Ok(next) => {
-                                *state = Arc::new(next);
-                                SourceClock::observe(&mut source_clock.lock().unwrap_or_else(|p| p.into_inner()), sampled_at, Instant::now());
-                                true
-                            },
-                            Err(_) => false,
+                        let (base, revision) = publication.capture();
+                        let observed_user = update.changes.iter().any(|change| {
+                            let (super::presentation::ItemChange::Replace(item) | super::presentation::ItemChange::Append { item, .. }) = change;
+                            item.role == super::Role::User
+                        });
+                        let retain_body = body_requested.load(Ordering::Acquire) && base.resident;
+                        // Validate the full transaction before allowing a metadata
+                        // fallback. A failed full patch never publishes just its clock.
+                        let derived = if retain_body {
+                            let candidates = append::Lineage::candidates(&update, &base.snapshot);
+                            update.apply(&base.snapshot).map(|next| {
+                                let mut lineage = base.lineage.clone(); lineage.record(candidates, &next);
+                                let full = Publication::next(&base, next, true, lineage);
+                                let metadata = full.hidden.as_ref().unwrap().clone();
+                                (Some(full), metadata)
+                            })
+                        } else {
+                            update.metadata_for(&base.snapshot).map(|mut metadata| {
+                                metadata.evict_transcript();
+                                (None, Publication::next(&base, metadata, false, append::Lineage::default()))
+                            })
                         };
-                        drop(state);
-                        if !applied {
-                            resync = true;
-                            read_again = true;
+                        let committed = derived.map(|(full, metadata)| {
+                            #[cfg(test)]
+                            if full.is_some() { tests::pause_before_publication(id); }
+                            publication.publish(&base, revision, &body_requested, full, metadata, false)
+                        });
+                        let accepted = matches!(committed, Ok(Some(_)));
+                        user_item_seen.fetch_or(accepted && observed_user, Ordering::AcqRel);
+                        let resident = publication.current.load().resident;
+                        if !accepted || (body_requested.load(Ordering::Acquire) && !resident) {
+                            resync = true; read_again = true;
                         } else if visible.load(Ordering::Acquire) { wake(Wake::Changed); }
+                        let state = publication.current.load();
+                        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_client", chat_id = %id,
+                            resident_bytes = state.snapshot.transcript_bytes());
                     },
                     ServerMessage::Error(error) => {
                         read_pending = false;
-                        let mut state = snapshot.lock().unwrap_or_else(|p| p.into_inner());
-                        {
-                            let snapshot = Arc::make_mut(&mut state);
-                            if error.code == ipc::ProtocolErrorCode::TerminalUnavailable {
-                                snapshot.ready = false;
-                            }
-                            snapshot.error = Some(error.message);
+                        loop {
+                            let (base, revision) = publication.capture();
+                            let mut snapshot = (*base.snapshot).clone();
+                            if error.code == ipc::ProtocolErrorCode::TerminalUnavailable { snapshot.ready = false; }
+                            snapshot.error = Some(error.message.clone());
+                            let mut proposed = Some(if base.resident {
+                                Publication::resident(snapshot, base.clock, base.lineage.clone(), base.source_thread.clone())
+                            } else {
+                                Publication::owned(snapshot, base.clock, false, append::Lineage::default(), None, base.source_thread.clone())
+                            });
+                            let (old, current) = {
+                                let current_revision = publication.commit.lock().unwrap_or_else(|p| p.into_inner());
+                                let current = publication.current.load_full();
+                                let old = if *current_revision == revision && Arc::ptr_eq(&base, &current) { Some(publication.current.swap(proposed.take().unwrap())) } else { None };
+                                (old, current)
+                            };
+                            let applied = old.is_some(); drop(old); drop(current);
+                            if applied { break; }
                         }
-                        drop(state); wake(Wake::Changed);
+                        wake(Wake::Changed);
                     },
                     ServerMessage::HostShuttingDown => break "Chat daemon is shutting down".into(),
                     ServerMessage::Response { .. } => {},
@@ -1455,8 +2300,11 @@ impl ClientHandle {
                 }
                 if read_again && !read_pending && visible.load(Ordering::Acquire) {
                     read_again = false;
-                    let generation = snapshot.lock().unwrap_or_else(|p| p.into_inner()).generation;
-                    if let Err(error) = transmit(&wire, &proof, next.fetch_add(1, Ordering::Relaxed), ClientRequest::ChatRead { chat_id: id, after_generation: (!resync).then_some(generation) }) { break error; }
+                    let after_generation = {
+                        let state = publication.current.load();
+                        (!resync && (state.resident || !body_requested.load(Ordering::Acquire))).then_some(state.snapshot.generation)
+                    };
+                    if let Err(error) = transmit(&wire, &proof, next.fetch_add(1, Ordering::Relaxed), ClientRequest::ChatRead { chat_id: id, after_generation }) { break error; }
                     read_pending = true;
                 }
             };
@@ -1496,12 +2344,7 @@ impl ClientHandle {
         if let Some(id) = snapshot.session_id.clone() {
             session.launch.session_id = Some(id);
         }
-        if matches!(
-            snapshot.native_continuity,
-            super::NativeContinuity::Durable { .. }
-        ) {
-            session.native_continuity = snapshot.native_continuity.clone();
-        }
+        session.learn_native_continuity(&snapshot.native_continuity);
         session
     }
     pub(crate) fn upgrade_recovery(&self) -> Option<&(Session, Session)> {
@@ -1518,43 +2361,62 @@ impl ClientHandle {
     }
 
     pub fn snapshot(&self) -> Arc<Snapshot> {
-        self.inner
-            .snapshot
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
+        self.inner.publication.current.load().snapshot.clone()
     }
     pub(crate) fn snapshot_with_clock(&self) -> (Arc<Snapshot>, Option<SourceClock>) {
-        let snapshot = self
-            .inner
-            .snapshot
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let clock = self
-            .inner
-            .source_clock
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        (snapshot.clone(), *clock)
+        let state = self.inner.publication.current.load();
+        (state.snapshot.clone(), state.clock)
+    }
+
+    /// Control metadata for a hidden runtime, without borrowing its body.
+    /// A disconnected client's final publication must remain readable instead.
+    pub(crate) fn hidden_snapshot_with_clock(
+        &self,
+    ) -> Option<(Arc<Snapshot>, Option<SourceClock>)> {
+        let (mut snapshot, clock) = self.snapshot_with_clock();
+        if !self.inner.alive.load(Ordering::Acquire) {
+            return None;
+        }
+        Arc::make_mut(&mut snapshot).evict_transcript();
+        Some((snapshot, clock))
+    }
+
+    pub(crate) fn has_observed_user_item(&self) -> bool {
+        self.inner.user_item_seen.load(Ordering::Acquire)
+    }
+
+    /// A renderable publication, absent until a hidden client's full history
+    /// has been rehydrated. Metadata-only generations must never clear a
+    /// runtime's scroll/disclosure state as if they were empty conversations.
+    pub(crate) fn resident_snapshot_with_clock(
+        &self,
+    ) -> Option<(Arc<Snapshot>, Option<SourceClock>)> {
+        let state = self.inner.publication.current.load();
+        state
+            .resident
+            .then(|| (state.snapshot.clone(), state.clock))
     }
 
     #[cfg(test)]
     fn install_snapshot_for_test(&self, update: Snapshot) {
-        let mut state = self
-            .inner
-            .snapshot
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        SourceClock::observe(
-            &mut self
-                .inner
-                .source_clock
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()),
-            update.sampled_at,
-            Instant::now(),
+        self.inner.user_item_seen.fetch_or(
+            update
+                .items
+                .iter()
+                .any(|item| item.role == super::Role::User),
+            Ordering::AcqRel,
         );
-        *state = Arc::new(update);
+        let (base, revision) = self.inner.publication.capture();
+        let full = Publication::next(&base, update, true, append::Lineage::default());
+        let metadata = full.hidden.as_ref().unwrap().clone();
+        self.inner.publication.publish(
+            &base,
+            revision,
+            &self.inner.body_requested,
+            Some(full),
+            metadata,
+            false,
+        );
     }
 
     /// Drains one coalesced activity edge without touching presentation state.
@@ -1762,15 +2624,93 @@ impl ClientHandle {
             command,
         })
     }
+    pub(crate) fn known_append(
+        &self,
+        previous: &Arc<super::Item>,
+        current: &Arc<super::Item>,
+    ) -> bool {
+        self.inner
+            .publication
+            .current
+            .load()
+            .lineage
+            .proves(previous, current)
+    }
+
     pub fn set_visible(&self, visible: bool) -> Result<(), String> {
+        self.set_interest(visible, visible)
+    }
+
+    /// Keep control notifications flowing for queued commands without keeping
+    /// renderable history resident in an offscreen UI card.
+    pub(crate) fn set_interest(&self, interested: bool, retain_body: bool) -> Result<(), String> {
         if !self.inner.alive.load(Ordering::Acquire) {
             return Err("Chat is disconnected".into());
         }
-        let changed = self.inner.visible.swap(visible, Ordering::AcqRel) != visible;
-        if visible && changed {
-            // An idle daemon may have the same generation as our cached
-            // handshake. Present that cache now; a conditional read can
-            // legitimately return no update when a hidden pane reappears.
+        let changed = self.inner.visible.swap(interested, Ordering::AcqRel) != interested;
+        let (old, current, result) = {
+            let mut revision = self
+                .inner
+                .publication
+                .commit
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let current = self.inner.publication.current.load_full();
+            if !self.inner.alive.load(Ordering::Acquire) {
+                (None, current, Err("Chat is disconnected"))
+            } else {
+                let body_changed = self
+                    .inner
+                    .body_requested
+                    .swap(retain_body, Ordering::AcqRel)
+                    != retain_body;
+                if body_changed {
+                    *revision = revision
+                        .checked_add(1)
+                        .expect("chat body-policy revision exhausted");
+                }
+                let (old, published_resident, published_generation) = if !retain_body {
+                    match current.hidden.as_ref() {
+                        Some(metadata) => (
+                            Some(self.inner.publication.current.swap(metadata.clone())),
+                            metadata.resident,
+                            metadata.snapshot.generation,
+                        ),
+                        None => (None, current.resident, current.snapshot.generation),
+                    }
+                } else {
+                    (None, current.resident, current.snapshot.generation)
+                };
+                let observation = (
+                    *revision,
+                    published_resident,
+                    published_generation,
+                    old.is_some(),
+                );
+                (old, current, Ok((body_changed, observation)))
+            }
+        };
+        // No retry, allocation, Snapshot/lineage cloning or destruction under
+        // the gate. Show keeps the body-free node until fresh hydration arrives.
+        drop(old);
+        drop(current);
+        let (
+            body_changed,
+            (revision, published_resident, published_generation, metadata_installed),
+        ) = result.map_err(str::to_owned)?;
+        if changed || body_changed {
+            // This is the publication installed by this policy transaction,
+            // not a receipt for other aliases or retirement-queue completion.
+            tracing::trace!(target: "cagents::memory", process_id = std::process::id(),
+                owner = "chat_client_policy", chat_id = %self.inner.id,
+                requested_interested = interested, requested_retain_body = retain_body,
+                policy_revision = revision, published_generation, published_resident,
+                metadata_installed);
+        }
+        if interested && (changed || body_changed) {
+            // Controls can use retained metadata immediately. The visibility
+            // notification triggers an unconditional read for evicted history,
+            // even if the idle daemon's generation has not changed.
             (self.inner.wake)(Wake::Changed);
         }
         // Visibility is replaceable state, not an ordered provider frame. Coalesce
@@ -1898,34 +2838,49 @@ pub fn inventory() -> Result<Vec<Session>, String> {
 }
 impl Drop for Inner {
     fn drop(&mut self) {
+        let Some(retired) = self.owned.take() else {
+            return;
+        };
         // Socket EOF unregisters the subscription, never stops the daemon's actor.
-        self.alive.store(false, Ordering::Release);
-        let _ = self.visibility_tx.try_send(());
-        let _ = self.cancel.shutdown(Shutdown::Both);
-        if let Some(reader) = self
-            .reader
-            .get_mut()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
-            && reader.thread().id() != thread::current().id()
-        {
-            let _ = reader.join();
-        }
-        if let Some(worker) = self
-            .visibility_worker
-            .get_mut()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
-            && worker.thread().id() != thread::current().id()
-        {
-            let _ = worker.join();
-        }
+        retired.payload.alive.store(false, Ordering::Release);
+        let _ = retired.payload.visibility_tx.try_send(());
+        let _ = retired.payload.cancel.shutdown(Shutdown::Both);
+        self.retirement.enqueue(RetirementJob::Client(retired));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static REPLACEMENT_GATES: Mutex<
+        BTreeMap<usize, (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    > = Mutex::new(BTreeMap::new());
+
+    pub(super) fn pause_before_replacement(owner: usize) {
+        let gate = REPLACEMENT_GATES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&owner);
+        if let Some((paused, resume)) = gate {
+            paused.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+    }
+
+    static PUBLICATION_GATES: Mutex<
+        BTreeMap<TerminalId, (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    > = Mutex::new(BTreeMap::new());
+    pub(super) fn pause_before_publication(chat: TerminalId) {
+        let gate = PUBLICATION_GATES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&chat);
+        if let Some((paused, resume)) = gate {
+            paused.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+    }
 
     #[test]
     fn admission_capacity_is_typed_and_keeps_daemon_detail() {
@@ -2630,6 +3585,155 @@ mod tests {
         }
     }
 
+    #[test]
+    fn failed_saved_claude_restore_sends_no_start_request() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let live = host_proof("current");
+        let mut source = omp_card(Some(CONVERSATION), Some(host_proof("old")));
+        source.launch.provider = crate::agent::Provider::Claude;
+        source.launch.recipe.program = "must-not-run".into();
+        source.launch.recipe.arguments.clear();
+        let expected = source.clone();
+        let worker = thread::spawn(move || {
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            for step in 0..2 {
+                let request: ClientEnvelope = ipc::read_frame(&mut peer).unwrap().unwrap();
+                let message = match (step, request.request) {
+                    (0, ClientRequest::Connect { .. }) => ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof: live.clone(),
+                            resumed: Vec::new(),
+                        },
+                    },
+                    (1, ClientRequest::ResolveUpgradeChat { source }) if source == expected => {
+                        ServerMessage::Error(ipc::ProtocolError::new(
+                            ipc::ProtocolErrorCode::TerminalUnavailable,
+                            "Exact history is unavailable",
+                            false,
+                        ))
+                    }
+                    other => panic!("Unexpected saved history request: {other:?}"),
+                };
+                ipc::write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: live.clone(),
+                        message,
+                    },
+                )
+                .unwrap();
+            }
+            let extra: Option<ClientEnvelope> = ipc::read_frame(&mut peer).unwrap();
+            assert!(extra.is_none(), "a failed restore must not send ChatStart");
+        });
+        let result = ClientHandle::connect_on(
+            stream,
+            source,
+            Intent::Restore,
+            None,
+            false,
+            None,
+            None,
+            None,
+            |_| {},
+        );
+        assert!(result.is_err());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn explicit_retry_classifies_exact_history_reader_and_live_successor() {
+        for state in 0..5 {
+            let proof = host_proof("current");
+            let mut source = omp_card(Some(CONVERSATION), Some(proof.clone()));
+            source.launch.provider = crate::agent::Provider::Claude;
+            source.launch.recipe.program = "claude".into();
+            source.launch.recipe.arguments.clear();
+            let mut hosted = source.clone();
+            if state == 1 {
+                hosted.native_continuity =
+                    super::super::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            } else if state == 2 || state == 4 {
+                source.proof = Some(host_proof("previous"));
+            }
+            let expected = hosted.clone();
+            let expected_source = source.clone();
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            let server_proof = proof.clone();
+            let worker = thread::spawn(move || {
+                server
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+                for step in 0..2 {
+                    let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                    let response = match (step, request.request) {
+                        (0, ClientRequest::ChatList) => ServerResponse::ChatListed {
+                            sessions: if state < 3 {
+                                vec![expected.clone()]
+                            } else {
+                                vec![]
+                            },
+                        },
+                        (1, ClientRequest::ChatPrepareResume { source })
+                            if state < 3 && source == expected =>
+                        {
+                            ServerResponse::ChatResumePrepared {
+                                session: expected.clone(),
+                            }
+                        }
+                        (1, ClientRequest::ResolveUpgradeChat { source })
+                            if state >= 3 && source == expected_source =>
+                        {
+                            ServerResponse::UpgradeChatResolved {
+                                session: expected.clone(),
+                            }
+                        }
+                        other => panic!("unexpected explicit retry request: {other:?}"),
+                    };
+                    codec
+                        .write(
+                            &mut server,
+                            &ServerEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id: Some(request.request_id),
+                                proof: server_proof.clone(),
+                                message: ServerMessage::Response { response },
+                            },
+                        )
+                        .unwrap();
+                }
+            });
+            let result = restore(
+                &mut client,
+                &mut FrameCodec::new(ipc::MAX_FRAME_BYTES),
+                &mut 1,
+                &proof,
+                source,
+                &mut None,
+                true,
+            );
+            worker.join().unwrap();
+            match state {
+                0 | 3 => assert!(
+                    matches!(result, Ok(ClientRequest::ChatStart { session, source: None, terminate_source: false, .. }) if session == hosted)
+                ),
+                1 => assert!(
+                    matches!(result, Ok(ClientRequest::ChatAttach { session }) if session == hosted)
+                ),
+                2 | 4 => assert!(
+                    result
+                        .unwrap_err()
+                        .message
+                        .contains("changed the explicit retry request")
+                ),
+                _ => unreachable!(),
+            }
+        }
+    }
+
     fn negotiate_with_recovery(
         live: &HostSessionProof,
         session: Session,
@@ -2670,6 +3774,7 @@ mod tests {
             live,
             session,
             &mut recovery,
+            false,
         );
         (outcome, worker.join().unwrap(), recovery)
     }
@@ -2805,6 +3910,7 @@ mod tests {
             &live,
             omp_card(Some(CONVERSATION), Some(live.clone())),
             &mut None,
+            false,
         )
         .expect("a live proof attaches");
         assert!(matches!(attach, ClientRequest::ChatAttach { .. }));
@@ -3404,6 +4510,1065 @@ mod tests {
         );
     }
     #[test]
+    fn hidden_wire_client_releases_history_and_reveals_at_the_same_generation() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (hidden_tx, hidden_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            server
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let proof = host_proof("live");
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond = |codec: &mut FrameCodec, server: &mut UnixStream, request_id, message| {
+                codec
+                    .write(
+                        server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: proof.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+            };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                Some(connect.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                },
+            );
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart { session, .. } = start.request else {
+                panic!("chat start expected");
+            };
+            let chat_id = session.id;
+            let snapshot = || Snapshot {
+                generation: 41,
+                session_id: Some("exact-session".into()),
+                ready: true,
+                items: vec![Arc::new(super::super::Item {
+                    id: "history".into(),
+                    role: super::super::Role::Assistant,
+                    content: super::super::ItemContent::Text {
+                        text: "body".repeat(64 * 1024),
+                        thinking: false,
+                        phase: Default::default(),
+                    },
+                    started_at: None,
+                    at: None,
+                })],
+                ..Default::default()
+            };
+            respond(
+                &mut codec,
+                &mut server,
+                Some(start.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session,
+                        snapshot: snapshot(),
+                    },
+                },
+            );
+            let hidden: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                hidden.request,
+                ClientRequest::ChatVisibility { visible: false, .. }
+            ));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(hidden.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Accepted,
+                },
+            );
+            hidden_tx.send(()).unwrap();
+            let shown: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                shown.request,
+                ClientRequest::ChatVisibility { visible: true, .. }
+            ));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(shown.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Accepted,
+                },
+            );
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatChanged { chat_id },
+            );
+            let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(
+                matches!(
+                    read.request,
+                    ClientRequest::ChatRead {
+                        after_generation: None,
+                        ..
+                    }
+                ),
+                "the current generation is metadata only and cannot suppress hydration"
+            );
+            respond(
+                &mut codec,
+                &mut server,
+                Some(read.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatSnapshot {
+                        chat_id,
+                        snapshot: Some(snapshot()),
+                    },
+                },
+            );
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let handle = ClientHandle::connect_on(
+            client,
+            omp_card(None, None),
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            move |wake| {
+                let _ = wake_tx.send(wake);
+            },
+        )
+        .unwrap();
+        let body = Arc::downgrade(&handle.snapshot().items[0]);
+        let installed = handle.inner.publication.current.load_full();
+        let (released, retirement) = std::sync::mpsc::channel();
+        *installed.retirement_complete.lock().unwrap() = Some(released);
+        drop(installed);
+        handle.set_visible(false).unwrap();
+        hidden_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The actual wire hide edge no longer implies that the independent
+        // local disposal owner has completed. Wait for that exact payload,
+        // then retain the same real Weak-body release/residency oracles.
+        retirement.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(handle.snapshot().generation, 41);
+        assert_eq!(
+            handle.snapshot().session_id.as_deref(),
+            Some("exact-session")
+        );
+        assert!(body.upgrade().is_none());
+        assert!(handle.resident_snapshot_with_clock().is_none());
+        handle.set_visible(true).unwrap();
+        while handle.resident_snapshot_with_clock().is_none() {
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        assert_eq!(handle.snapshot().generation, 41);
+        assert_eq!(handle.snapshot().transcript_bytes(), 256 * 1024);
+        done_tx.send(()).unwrap();
+        worker.join().unwrap();
+        while !matches!(
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Wake::Disconnected(_)
+        ) {}
+        assert!(handle.set_visible(false).is_err());
+        assert_eq!(
+            handle.snapshot().transcript_bytes(),
+            256 * 1024,
+            "an unreachable daemon cannot rehydrate the last readable publication yet"
+        );
+    }
+
+    #[test]
+    fn hidden_control_subscribers_advance_metadata_without_rehydration_loops() {
+        use super::super::{
+            Item, ItemContent, Role,
+            presentation::{ItemChange, Presentation},
+        };
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (advance_tx, advance_rx) = std::sync::mpsc::channel();
+        let (stage_tx, stage_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            server
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let proof = host_proof("control-reader");
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond = |codec: &mut FrameCodec, server: &mut UnixStream, request_id, message| {
+                codec
+                    .write(
+                        server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: proof.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+            };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                Some(connect.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                },
+            );
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart { session, .. } = start.request else {
+                panic!("chat start expected");
+            };
+            let chat_id = session.id;
+            respond(
+                &mut codec,
+                &mut server,
+                Some(start.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session,
+                        snapshot: Snapshot {
+                            generation: 1,
+                            ..Default::default()
+                        },
+                    },
+                },
+            );
+            let interested: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                interested.request,
+                ClientRequest::ChatVisibility { visible: true, .. }
+            ));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(interested.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Accepted,
+                },
+            );
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatChanged { chat_id },
+            );
+            let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                read.request,
+                ClientRequest::ChatRead {
+                    after_generation: Some(1),
+                    ..
+                }
+            ));
+            let prompt = Item {
+                id: "received-prompt".into(),
+                role: Role::User,
+                content: ItemContent::Text {
+                    text: "prompt".repeat(64 * 1024),
+                    thinking: false,
+                    phase: Default::default(),
+                },
+                started_at: None,
+                at: None,
+            };
+            respond(
+                &mut codec,
+                &mut server,
+                Some(read.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatUpdate {
+                        chat_id,
+                        update: Presentation {
+                            base_generation: 99,
+                            file_changes_unchanged: true,
+                            metadata: Snapshot {
+                                generation: 100,
+                                ready: true,
+                                ..Default::default()
+                            },
+                            order: vec![],
+                            changes: vec![],
+                            children: vec![],
+                        },
+                    },
+                },
+            );
+            let resync: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(
+                matches!(
+                    resync.request,
+                    ClientRequest::ChatRead {
+                        after_generation: None,
+                        ..
+                    }
+                ),
+                "hidden controls must reject an update with a mismatched metadata base"
+            );
+            respond(
+                &mut codec,
+                &mut server,
+                Some(resync.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatSnapshot {
+                        chat_id,
+                        snapshot: Some(Snapshot {
+                            generation: 1,
+                            ..Default::default()
+                        }),
+                    },
+                },
+            );
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatChanged { chat_id },
+            );
+            let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                read.request,
+                ClientRequest::ChatRead {
+                    after_generation: Some(1),
+                    ..
+                }
+            ));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(read.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatUpdate {
+                        chat_id,
+                        update: Presentation {
+                            base_generation: 1,
+                            file_changes_unchanged: true,
+                            metadata: Snapshot {
+                                generation: 2,
+                                ready: true,
+                                ..Default::default()
+                            },
+                            order: vec![prompt.id.clone()],
+                            changes: vec![ItemChange::Replace(prompt.clone())],
+                            children: vec![],
+                        },
+                    },
+                },
+            );
+            let command: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(&command.request, ClientRequest::ChatCommand {
+                command: Command::Prompt { text, .. }, ..
+            } if text.len() > 1024 * 1024));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(command.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Accepted,
+                },
+            );
+            advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatChanged { chat_id },
+            );
+            let unchanged: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(
+                matches!(
+                    unchanged.request,
+                    ClientRequest::ChatRead {
+                        after_generation: Some(2),
+                        ..
+                    }
+                ),
+                "discarded bodies must not cause hidden control resync loops"
+            );
+            respond(
+                &mut codec,
+                &mut server,
+                Some(unchanged.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatSnapshot {
+                        chat_id,
+                        snapshot: None,
+                    },
+                },
+            );
+            // This ordered control edge lets the client prove it consumed the
+            // unchanged response while still hidden before requesting reveal.
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatActivity {
+                    chat_id,
+                    state: ActivityState::Working,
+                    generation: 2,
+                },
+            );
+            stage_tx.send(()).unwrap();
+            // The next frame must be reveal, not another automatic full read.
+            let shown: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                shown.request,
+                ClientRequest::ChatVisibility { visible: true, .. }
+            ));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(shown.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Accepted,
+                },
+            );
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatChanged { chat_id },
+            );
+            let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                read.request,
+                ClientRequest::ChatRead {
+                    after_generation: None,
+                    ..
+                }
+            ));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(read.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatSnapshot {
+                        chat_id,
+                        snapshot: Some(Snapshot {
+                            generation: 2,
+                            ready: true,
+                            items: vec![Arc::new(prompt)],
+                            ..Default::default()
+                        }),
+                    },
+                },
+            );
+            advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let handle = ClientHandle::connect_on(
+            client,
+            omp_card(None, None),
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            move |wake| {
+                let _ = wake_tx.send(wake);
+            },
+        )
+        .unwrap();
+        {
+            let mut wire = handle.inner.wire.lock().unwrap();
+            wire.codec
+                .write(&mut std::io::sink(), &"large prompt".repeat(128 * 1024))
+                .unwrap();
+            assert!(wire.codec.buffer_capacities_for_test().1 > 1024 * 1024);
+        }
+        handle.set_interest(true, false).unwrap();
+        while handle.snapshot().generation != 2 {
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle
+            .inner
+            .wire
+            .lock()
+            .unwrap()
+            .codec
+            .buffer_capacities_for_test()
+            .1
+            > 256 * 1024
+        {
+            assert!(
+                Instant::now() < deadline,
+                "hidden interested transport retained its large prompt buffer"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(handle.snapshot().ready);
+        assert_eq!(handle.snapshot().transcript_bytes(), 0);
+        assert!(handle.has_observed_user_item());
+        assert!(handle.resident_snapshot_with_clock().is_none());
+        handle
+            .send(Command::Prompt {
+                text: "large prompt".repeat(128 * 1024),
+                attachments: vec![],
+                mode: super::super::PromptMode::Send,
+            })
+            .unwrap();
+        assert!(
+            handle
+                .inner
+                .wire
+                .lock()
+                .unwrap()
+                .codec
+                .buffer_capacities_for_test()
+                .1
+                <= 256 * 1024,
+            "new large hidden commands release scratch without another visibility transition"
+        );
+        advance_tx.send(()).unwrap();
+        stage_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        while !matches!(
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Wake::Activity
+        ) {}
+        handle.set_visible(true).unwrap();
+        while handle.resident_snapshot_with_clock().is_none() {
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        assert_eq!(handle.snapshot().generation, 2);
+        assert_eq!(handle.snapshot().transcript_bytes(), 6 * 64 * 1024);
+        advance_tx.send(()).unwrap();
+        worker.join().unwrap();
+    }
+
+    fn paused_wire_publication(visibility: Option<bool>) {
+        use crate::chat::{
+            Item, ItemContent, Role,
+            presentation::{ItemChange, Presentation},
+        };
+        let text = |id: &str, body: &str| Item {
+            id: id.into(),
+            role: Role::Assistant,
+            started_at: None,
+            at: None,
+            content: ItemContent::Text {
+                text: body.into(),
+                thinking: false,
+                phase: Default::default(),
+            },
+        };
+        let initial = Snapshot {
+            generation: 1,
+            sampled_at: Some(1_000),
+            items: vec![Arc::new(text("live", "hello"))],
+            ..Default::default()
+        };
+        let update = Presentation {
+            file_changes_unchanged: false,
+            base_generation: 1,
+            metadata: Snapshot {
+                sampled_at: Some(50_000),
+                generation: 2,
+                ..Default::default()
+            },
+            order: vec!["live".into()],
+            changes: vec![ItemChange::between(
+                Some(&initial.items[0]),
+                &text("live", "hello tail"),
+            )],
+            children: vec![],
+        };
+        let card = omp_card(None, None);
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        PUBLICATION_GATES
+            .lock()
+            .unwrap()
+            .insert(card.id, (paused_tx, resume_rx));
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let (resync_tx, resync_rx) = std::sync::mpsc::channel();
+        let (hydrate_tx, hydrate_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let proof = host_proof("live");
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond = |codec: &mut FrameCodec, server: &mut UnixStream, request_id, message| {
+                codec
+                    .write(
+                        server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: proof.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+            };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                Some(connect.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                },
+            );
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart { session, .. } = start.request else {
+                panic!("expected new chat")
+            };
+            let chat_id = session.id;
+            respond(
+                &mut codec,
+                &mut server,
+                Some(start.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session,
+                        snapshot: initial,
+                    },
+                },
+            );
+            let visible: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                visible.request,
+                ClientRequest::ChatVisibility { visible: true, .. }
+            ));
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::Response {
+                    response: ServerResponse::ChatUpdate { chat_id, update },
+                },
+            );
+            if visibility == Some(true) {
+                loop {
+                    let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                    match request.request {
+                        ClientRequest::ChatVisibility { .. } => {}
+                        ClientRequest::ChatRead {
+                            after_generation, ..
+                        } => {
+                            assert_eq!(
+                                after_generation, None,
+                                "a hide/reveal collision requires unconditional body hydration"
+                            );
+                            resync_tx.send(()).unwrap();
+                            hydrate_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                            respond(
+                                &mut codec,
+                                &mut server,
+                                Some(request.request_id),
+                                ServerMessage::Response {
+                                    response: ServerResponse::ChatSnapshot {
+                                        chat_id,
+                                        snapshot: Some(Snapshot {
+                                            generation: 2,
+                                            sampled_at: Some(50_000),
+                                            items: vec![Arc::new(text("live", "hello tail"))],
+                                            ..Default::default()
+                                        }),
+                                    },
+                                },
+                            );
+                            break;
+                        }
+                        other => panic!("unexpected request during body resync: {other:?}"),
+                    }
+                }
+            }
+            done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let handle = ClientHandle::connect_on(
+            client,
+            card,
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            move |wake| {
+                let _ = wake_tx.send(wake);
+            },
+        )
+        .unwrap();
+        let installed = handle.snapshot_with_clock();
+        handle.set_visible(true).unwrap();
+        paused_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // The reader now holds a derived publication it has not installed.
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let ui = handle.clone();
+        let reading = thread::spawn(move || {
+            let (snapshot, clock) = ui.snapshot_with_clock();
+            let session = ui.session();
+            let resident = ui.resident_snapshot_with_clock().unwrap();
+            assert!(!ui.known_append(&snapshot.items[0], &snapshot.items[0]));
+            let _ = read_tx.send((snapshot, clock, session, ui.snapshot(), resident));
+        });
+        let (snapshot, clock, session, plain, resident) = read_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("presentation reads must not wait for the connection reader");
+        reading.join().unwrap();
+        assert!(Arc::ptr_eq(&snapshot, &installed.0));
+        assert!(Arc::ptr_eq(&plain, &installed.0));
+        assert_eq!(snapshot.generation, 1);
+        assert_eq!(clock.unwrap().sampled_at, 1_000);
+        assert_eq!(session.id, handle.inner.id);
+        assert!(Arc::ptr_eq(&resident.0, &installed.0));
+        assert_eq!(resident.1.unwrap().sampled_at, 1_000);
+        if let Some(reveal) = visibility {
+            // Hide must finish while the source reader is still paused.
+            let (hidden_tx, hidden_rx) = std::sync::mpsc::channel();
+            let hidden = handle.clone();
+            let hiding = thread::spawn(move || {
+                hidden.set_visible(false).unwrap();
+                if reveal {
+                    hidden.set_visible(true).unwrap();
+                }
+                hidden_tx.send(()).unwrap();
+            });
+            hidden_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("hide must not wait for body derivation");
+            hiding.join().unwrap();
+            assert_eq!(handle.snapshot().transcript_bytes(), 0);
+            assert_eq!(handle.snapshot_with_clock().1.unwrap().sampled_at, 1_000);
+            assert!(handle.resident_snapshot_with_clock().is_none());
+        }
+        resume_tx.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while handle.snapshot().generation != 2 {
+            assert!(
+                Instant::now() < until,
+                "derived publication was not committed"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let mut metadata_clock = None;
+        if visibility.is_some() {
+            let state = handle.inner.publication.current.load_full();
+            assert!(
+                !state.resident,
+                "a pre-hide derived body must not be installed after hide or hide/reveal"
+            );
+            assert_eq!(state.snapshot.transcript_bytes(), 0);
+            assert!(
+                state.lineage.is_empty(),
+                "hidden metadata cannot authorize an append across eviction"
+            );
+            assert_eq!(state.clock.unwrap().sampled_at, 50_000);
+            metadata_clock = state.clock;
+            if visibility == Some(true) {
+                resync_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(handle.resident_snapshot_with_clock().is_none());
+                hydrate_tx.send(()).unwrap();
+                while handle.resident_snapshot_with_clock().is_none() {
+                    wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+            }
+        }
+        let (published, clock) = handle.snapshot_with_clock();
+        if visibility != Some(false) {
+            assert!(
+                matches!(&published.items[0].content, ItemContent::Text { text, .. } if text == "hello tail")
+            );
+            assert_eq!(
+                handle.known_append(&installed.0.items[0], &published.items[0]),
+                visibility.is_none()
+            );
+        }
+        assert_eq!(published.sampled_at, Some(50_000));
+        let clock = clock.unwrap();
+        if visibility == Some(true) {
+            let metadata_clock = metadata_clock.unwrap();
+            assert!(clock.received_at >= metadata_clock.received_at);
+            assert!(clock.at(clock.received_at) >= metadata_clock.at(clock.received_at));
+        } else {
+            assert_eq!(clock.sampled_at, 50_000);
+        }
+        done_tx.send(()).unwrap();
+        worker.join().unwrap();
+    }
+    #[test]
+    fn readers_keep_the_installed_publication_while_the_next_is_built() {
+        paused_wire_publication(None);
+    }
+
+    #[test]
+    fn hide_while_body_is_derived_commits_only_metadata() {
+        paused_wire_publication(Some(false));
+    }
+
+    #[test]
+    fn hide_then_reveal_while_body_is_derived_requires_fresh_hydration() {
+        paused_wire_publication(Some(true));
+    }
+
+    #[test]
+    fn second_hide_reveal_fences_full_hydration_derived_from_metadata() {
+        use crate::chat::{Item, ItemContent, Role};
+        let text = |body: &str| {
+            Arc::new(Item {
+                id: "live".into(),
+                role: Role::Assistant,
+                started_at: None,
+                at: None,
+                content: ItemContent::Text {
+                    text: body.into(),
+                    thinking: false,
+                    phase: Default::default(),
+                },
+            })
+        };
+        let card = omp_card(None, None);
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (first_read_tx, first_read_rx) = std::sync::mpsc::channel();
+        let (send_full_tx, send_full_rx) = std::sync::mpsc::channel();
+        let (fresh_read_tx, fresh_read_rx) = std::sync::mpsc::channel();
+        let (hydrate_tx, hydrate_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let proof = host_proof("live");
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond = |codec: &mut FrameCodec, server: &mut UnixStream, request_id, message| {
+                codec
+                    .write(
+                        server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: proof.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+            };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                Some(connect.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                },
+            );
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart { session, .. } = start.request else {
+                panic!("expected start")
+            };
+            let chat_id = session.id;
+            respond(
+                &mut codec,
+                &mut server,
+                Some(start.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session,
+                        snapshot: Snapshot {
+                            generation: 1,
+                            sampled_at: Some(1_000),
+                            items: vec![text("initial")],
+                            ..Default::default()
+                        },
+                    },
+                },
+            );
+            // The first reveal requests a full body from nonresident metadata.
+            loop {
+                let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                match request.request {
+                    ClientRequest::ChatVisibility { visible: true, .. } => {
+                        respond(
+                            &mut codec,
+                            &mut server,
+                            None,
+                            ServerMessage::ChatChanged { chat_id },
+                        );
+                    }
+                    ClientRequest::ChatVisibility { visible: false, .. } => {}
+                    ClientRequest::ChatRead {
+                        after_generation, ..
+                    } => {
+                        assert_eq!(after_generation, None);
+                        first_read_tx.send(()).unwrap();
+                        send_full_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        respond(
+                            &mut codec,
+                            &mut server,
+                            Some(request.request_id),
+                            ServerMessage::Response {
+                                response: ServerResponse::ChatSnapshot {
+                                    chat_id,
+                                    snapshot: Some(Snapshot {
+                                        generation: 2,
+                                        sampled_at: Some(50_000),
+                                        items: vec![text("stale pre-hide body")],
+                                        ..Default::default()
+                                    }),
+                                },
+                            },
+                        );
+                        break;
+                    }
+                    other => panic!("unexpected first hydration request: {other:?}"),
+                }
+            }
+            loop {
+                let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                match request.request {
+                    ClientRequest::ChatVisibility { .. } => {}
+                    ClientRequest::ChatRead {
+                        after_generation, ..
+                    } => {
+                        assert_eq!(
+                            after_generation, None,
+                            "second hide/show must invalidate the full proposal even when metadata identity is unchanged"
+                        );
+                        fresh_read_tx.send(()).unwrap();
+                        hydrate_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        respond(
+                            &mut codec,
+                            &mut server,
+                            Some(request.request_id),
+                            ServerMessage::Response {
+                                response: ServerResponse::ChatSnapshot {
+                                    chat_id,
+                                    snapshot: Some(Snapshot {
+                                        generation: 2,
+                                        sampled_at: Some(60_000),
+                                        items: vec![text("fresh authorized body")],
+                                        ..Default::default()
+                                    }),
+                                },
+                            },
+                        );
+                        break;
+                    }
+                    other => panic!("unexpected fresh hydration request: {other:?}"),
+                }
+            }
+            done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let handle = ClientHandle::connect_on(
+            client,
+            card,
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            move |wake| {
+                let _ = wake_tx.send(wake);
+            },
+        )
+        .unwrap();
+        let old = handle.snapshot();
+        handle.set_visible(false).unwrap();
+        assert!(handle.resident_snapshot_with_clock().is_none());
+        handle.set_visible(true).unwrap();
+        first_read_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        REPLACEMENT_GATES.lock().unwrap().insert(
+            Arc::as_ptr(&handle.inner.publication) as usize,
+            (paused_tx, resume_rx),
+        );
+        send_full_tx.send(()).unwrap();
+        paused_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let metadata = handle.inner.publication.current.load_full();
+        assert!(!metadata.resident && metadata.hidden.is_none());
+        // This is the ABA case: second hide/show changes only body policy,
+        // retaining the identical nonresident Publication pointer.
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let hidden = handle.clone();
+        let hiding = thread::spawn(move || {
+            hidden.set_visible(false).unwrap();
+            hidden.set_visible(true).unwrap();
+            finished_tx.send(()).unwrap();
+        });
+        finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("visibility must not wait for full hydration derivation");
+        hiding.join().unwrap();
+        assert!(Arc::ptr_eq(
+            &metadata,
+            &handle.inner.publication.current.load_full()
+        ));
+        assert!(handle.resident_snapshot_with_clock().is_none());
+        assert_eq!(handle.snapshot_with_clock().1.unwrap().sampled_at, 1_000);
+        resume_tx.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while handle.snapshot().generation != 2 {
+            assert!(
+                Instant::now() < until,
+                "full response proposal did not commit"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let fallback = handle.inner.publication.current.load_full();
+        assert!(
+            !fallback.resident,
+            "a second hide/show must reject the pre-hide full hydration proposal"
+        );
+        assert_eq!(fallback.snapshot.generation, 2);
+        assert_eq!(fallback.clock.unwrap().sampled_at, 50_000);
+        assert_eq!(fallback.snapshot.transcript_bytes(), 0);
+        assert!(fallback.lineage.is_empty());
+        fresh_read_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            handle.resident_snapshot_with_clock().is_none(),
+            "pre-hide full response was never admitted"
+        );
+        hydrate_tx.send(()).unwrap();
+        while handle.resident_snapshot_with_clock().is_none() {
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let (snapshot, clock) = handle.snapshot_with_clock();
+        assert_eq!(snapshot.generation, 2);
+        assert_eq!(clock.unwrap().sampled_at, 60_000);
+        assert!(
+            matches!(&snapshot.items[0].content, ItemContent::Text { text, .. } if text == "fresh authorized body")
+        );
+        assert!(!handle.known_append(&old.items[0], &snapshot.items[0]));
+        done_tx.send(()).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn wire_updates_share_retained_items_and_request_full_resync_on_invalid_patch() {
         use crate::chat::{
             Item, ItemContent, Role,
@@ -3876,6 +6041,7 @@ mod tests {
         let wire = Mutex::new(Wire {
             stream,
             codec: FrameCodec::new(ipc::MAX_CLIENT_FRAME_BYTES),
+            body_requested: Arc::new(AtomicBool::new(true)),
         });
         let _held = wire.lock().unwrap();
         let error = transmit_text_copy(
@@ -4500,5 +6666,657 @@ mod tests {
         assert!(handle.inner.alive.load(Ordering::Acquire));
         released.send(()).unwrap();
         worker.join().unwrap();
+    }
+
+    // Test-only injected thread-factory failure, scoped to an exact fresh client.
+    // It exercises the real fallible empty-owner startup path before handshake.
+    static FAIL_RETIREMENT_START: Mutex<std::collections::BTreeSet<TerminalId>> =
+        Mutex::new(std::collections::BTreeSet::new());
+
+    pub(super) fn fail_retirement_start(id: TerminalId) -> bool {
+        FAIL_RETIREMENT_START
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&id)
+    }
+
+    fn retirement_text(body: String) -> Arc<super::super::Item> {
+        Arc::new(super::super::Item {
+            id: "retirement-source".into(),
+            role: super::super::Role::Assistant,
+            started_at: None,
+            at: None,
+            content: super::super::ItemContent::Text {
+                text: body,
+                thinking: false,
+                phase: Default::default(),
+            },
+        })
+    }
+
+    /// An actual existing FrameCodec/UnixStream connection; no provider fixture,
+    /// substitute JoinHandle, fabricated lifecycle or synthetic body ownership.
+    fn retirement_wire(
+        session: Session,
+        initial: Snapshot,
+        update: Option<super::super::presentation::Presentation>,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> (ClientHandle, JoinHandle<()>, std::sync::mpsc::Receiver<()>) {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (eof, observed_eof) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            handoff_handshake(&mut server, &mut codec);
+            let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart { session, .. } = request.request else {
+                panic!("expected actual ChatStart handshake")
+            };
+            let chat_id = session.id;
+            handoff_reply(
+                &mut server,
+                &mut codec,
+                Some(request.request_id),
+                &handoff_proof(),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session,
+                        snapshot: initial,
+                    },
+                },
+            );
+            if let Some(update) = update {
+                let visible: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                assert!(matches!(
+                    visible.request,
+                    ClientRequest::ChatVisibility { visible: true, .. }
+                ));
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    None,
+                    &handoff_proof(),
+                    ServerMessage::Response {
+                        response: ServerResponse::ChatUpdate { chat_id, update },
+                    },
+                );
+                let end: Option<ClientEnvelope> = codec.read(&mut server).unwrap();
+                assert!(
+                    end.is_none(),
+                    "Drop shutdown must close the real connection while its reader is paused"
+                );
+                eof.send(()).unwrap();
+            }
+        });
+        let client = ClientHandle::connect_on(
+            client,
+            session,
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            wake,
+        )
+        .unwrap();
+        (client, worker, observed_eof)
+    }
+
+    #[test]
+    fn dropping_a_paused_client_hands_off_both_joins_without_blocking_other_retirements() {
+        use super::super::presentation::{ItemChange, Presentation};
+        let session = omp_card(None, None);
+        let (paused, observed_pause) = std::sync::mpsc::channel();
+        let (resume, released) = std::sync::mpsc::channel();
+        PUBLICATION_GATES
+            .lock()
+            .unwrap()
+            .insert(session.id, (paused, released));
+        let before = retirement_text("before".into());
+        let after = retirement_text("before tail".into());
+        let update = Presentation {
+            base_generation: 1,
+            metadata: Snapshot {
+                generation: 2,
+                ..Default::default()
+            },
+            order: vec![after.id.clone()],
+            changes: vec![ItemChange::between(Some(&before), &after)],
+            children: vec![],
+            file_changes_unchanged: false,
+        };
+        let (callback, callbacks) = std::sync::mpsc::channel();
+        let (mut client, server, eof) = retirement_wire(
+            session,
+            Snapshot {
+                generation: 1,
+                items: vec![before],
+                ..Default::default()
+            },
+            Some(update),
+            move |wake| {
+                let _ = callback.send(wake);
+            },
+        );
+        let (finished, observed_finish) = std::sync::mpsc::channel();
+        Arc::get_mut(&mut client.inner).unwrap().retirement_complete = Some(finished);
+        let alive = client.inner.alive.clone();
+        client.set_visible(true).unwrap();
+        observed_pause.recv_timeout(Duration::from_secs(5)).unwrap();
+        while callbacks.try_recv().is_ok() {}
+        let (dropped, observed_drop) = std::sync::mpsc::channel();
+        let dropping = thread::spawn(move || {
+            drop(client);
+            dropped.send(thread::current().id()).unwrap();
+        });
+        let returned_while_paused = observed_drop.recv_timeout(Duration::from_secs(1));
+        let cancelled_while_paused = eof.recv_timeout(Duration::from_secs(1));
+        let unfinished_was_retained = observed_finish.try_recv().is_err();
+        let cancelled_before_resume = !alive.load(Ordering::Acquire);
+        let no_callback_before_resume = callbacks.try_recv().is_err();
+        // A second real owned payload has no connection threads to wait on.
+        // It must retire while the first real connection remains gated.
+        let mut independent = ClientHandle::fixture(omp_card(None, None), Snapshot::default());
+        let (other_finished, other_observed) = std::sync::mpsc::channel();
+        Arc::get_mut(&mut independent.inner)
+            .unwrap()
+            .retirement_complete = Some(other_finished);
+        drop(independent);
+        let other_retired_while_paused = other_observed.recv_timeout(Duration::from_secs(1));
+        // Always release/retire the real held reader before judging results.
+        resume.send(()).unwrap();
+        dropping.join().unwrap();
+        server.join().unwrap();
+        let released_on = observed_finish
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let late: Vec<_> = callbacks.try_iter().collect();
+        assert!(
+            cancelled_before_resume,
+            "alive must be fenced inline before the held reader resumes"
+        );
+        assert!(no_callback_before_resume);
+        assert!(late.iter().any(|wake| matches!(wake, Wake::Changed)));
+        assert!(
+            late.iter()
+                .any(|wake| matches!(wake, Wake::Disconnected(_))),
+            "real queued callbacks may arrive after Drop returns; their UI Target must remain fenced"
+        );
+        let dropped_on = returned_while_paused
+            .expect("dropping the last UI owner must not join its gated reader");
+        assert!(
+            cancelled_while_paused.is_ok(),
+            "actual socket shutdown must remain inline"
+        );
+        assert!(
+            unfinished_was_retained,
+            "never claim destruction/join completion while the reader is gated"
+        );
+        assert_ne!(released_on, dropped_on);
+        assert_eq!(
+            other_retired_while_paused.unwrap(),
+            released_on,
+            "one unfinished reader must not head-of-line block another ready payload"
+        );
+    }
+
+    #[test]
+    fn settled_reader_and_failed_join_release_the_actual_large_publication_off_the_dropping_thread()
+    {
+        let body = "large retained client body\n".repeat(200_000);
+        let bytes = body.len();
+        let (mut client, server, _) = retirement_wire(
+            omp_card(None, None),
+            Snapshot {
+                generation: 1,
+                items: vec![retirement_text(body)],
+                ..Default::default()
+            },
+            None,
+            |wake| {
+                if matches!(wake, Wake::Disconnected(_)) {
+                    panic!("fixture settled reader failure");
+                }
+            },
+        );
+        server.join().unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            let reader_done = client
+                .inner
+                .reader
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_finished();
+            let visibility_done = client
+                .inner
+                .visibility_worker
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_finished();
+            if reader_done && visibility_done {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "actual connection threads must settle before the final-owner test"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let publication = Arc::downgrade(&client.inner.publication);
+        let state = client.inner.publication.current.load_full();
+        assert_eq!(state.snapshot.transcript_bytes(), bytes);
+        let snapshot = Arc::downgrade(&state.snapshot);
+        let (body_released, body_completion) = std::sync::mpsc::channel();
+        *state.retirement_complete.lock().unwrap() = Some(body_released);
+        drop(state);
+        let (finished, observed_finish) = std::sync::mpsc::channel();
+        Arc::get_mut(&mut client.inner).unwrap().retirement_complete = Some(finished);
+        let dropping_thread = thread::current().id();
+        drop(client);
+        let released_on = observed_finish
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert_ne!(
+            released_on, dropping_thread,
+            "even a settled connection's large last publication belongs off UI"
+        );
+        assert!(
+            publication.upgrade().is_none(),
+            "retirement must release the actual publication owner"
+        );
+        assert_eq!(
+            body_completion
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap(),
+            released_on
+        );
+        assert!(
+            snapshot.upgrade().is_none(),
+            "retirement must destroy the final actual snapshot body, not only its handles"
+        );
+    }
+
+    #[test]
+    fn a_panicking_payload_does_not_strand_later_clients() {
+        struct CallbackOwner(std::sync::mpsc::Sender<std::thread::ThreadId>);
+        impl Drop for CallbackOwner {
+            fn drop(&mut self) {
+                let _ = self.0.send(thread::current().id());
+                panic!("fixture callback owner destructor");
+            }
+        }
+        let (destroyed, destruction) = std::sync::mpsc::channel();
+        let owned = CallbackOwner(destroyed);
+        let mut first = ClientHandle::fixture(omp_card(None, None), Snapshot::default());
+        Arc::get_mut(&mut first.inner).unwrap().wake = Arc::new(move |_| {
+            let _ = &owned;
+        });
+        let dropping_thread = thread::current().id();
+        drop(first);
+        let failed_on = destruction.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut next = ClientHandle::fixture(omp_card(None, None), Snapshot::default());
+        let (finished, completion) = std::sync::mpsc::channel();
+        Arc::get_mut(&mut next.inner).unwrap().retirement_complete = Some(finished);
+        drop(next);
+        assert_ne!(failed_on, dropping_thread);
+        assert_eq!(
+            completion.recv_timeout(Duration::from_secs(5)).unwrap(),
+            failed_on,
+            "the same process-owned worker must survive an ordinary payload destructor unwind"
+        );
+    }
+
+    #[test]
+    fn retirement_worker_start_failure_refuses_before_handshake_or_payload_admission() {
+        use std::io::Read;
+        let session = omp_card(None, None);
+        FAIL_RETIREMENT_START.lock().unwrap().insert(session.id);
+        let (client, mut server) = UnixStream::pair().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let result = ClientHandle::connect_on(
+            client,
+            session,
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            |_| {},
+        );
+        let Err(error) = result else {
+            panic!("thread factory failure must refuse the client");
+        };
+        assert!(error.message.contains("retirement worker startup failed"));
+        let mut byte = [0];
+        assert_eq!(
+            server.read(&mut byte).unwrap(),
+            0,
+            "no Connect/ChatStart or body ownership may precede retirement admission"
+        );
+    }
+
+    fn observed_large_publication() -> (
+        Arc<Publication>,
+        std::sync::Weak<Snapshot>,
+        std::sync::mpsc::Receiver<std::thread::ThreadId>,
+    ) {
+        let body = "large publication last owner\n".repeat(400_000);
+        let publication = Publication::initial(Snapshot {
+            generation: 1,
+            items: vec![retirement_text(body)],
+            ..Default::default()
+        });
+        let snapshot = Arc::downgrade(&publication.snapshot);
+        let (completed, completion) = std::sync::mpsc::channel();
+        *publication.retirement_complete.lock().unwrap() = Some(completed);
+        (publication, snapshot, completion)
+    }
+
+    #[test]
+    fn an_idle_hide_reports_the_installed_policy_without_another_source_frame() {
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::{Layer, layer::SubscriberExt};
+
+        #[derive(Default)]
+        struct Fields(BTreeMap<String, serde_json::Value>);
+        impl Visit for Fields {
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                self.0.insert(field.name().into(), value.into());
+            }
+            fn record_bool(&mut self, field: &Field, value: bool) {
+                self.0.insert(field.name().into(), value.into());
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.0.insert(field.name().into(), value.into());
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.0
+                    .insert(field.name().into(), format!("{value:?}").into());
+            }
+        }
+        struct Observe {
+            client: std::sync::Weak<Inner>,
+            rows: Arc<Mutex<Vec<BTreeMap<String, serde_json::Value>>>>,
+        }
+        impl<S: tracing::Subscriber> Layer<S> for Observe {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                if fields.0.get("owner") != Some(&serde_json::json!("chat_client_policy")) {
+                    return;
+                }
+                let client = self.client.upgrade().expect("caller still owns the client");
+                let _gate = client.publication.commit.try_lock().expect(
+                    "diagnostic subscriber must run after the publication gate is unlocked",
+                );
+                self.rows.lock().unwrap().push(fields.0);
+            }
+        }
+
+        let session = omp_card(None, None);
+        let (client, mut server) = UnixStream::pair().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let worker = thread::spawn(move || {
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            handoff_handshake(&mut server, &mut codec);
+            let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart { session, .. } = request.request else {
+                panic!("expected real client attachment")
+            };
+            handoff_reply(
+                &mut server,
+                &mut codec,
+                Some(request.request_id),
+                &handoff_proof(),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session,
+                        snapshot: Snapshot {
+                            generation: 41,
+                            items: vec![retirement_text("idle body".repeat(128 * 1024))],
+                            ..Default::default()
+                        },
+                    },
+                },
+            );
+            // Keep the real reader idle: never send an ACK, snapshot, update or
+            // other frame after attachment. Drain visibility only until Drop.
+            while codec.read::<ClientEnvelope>(&mut server).unwrap().is_some() {}
+        });
+        let handle = ClientHandle::connect_on(
+            client,
+            session,
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        let body = Arc::downgrade(&handle.snapshot().items[0]);
+        let installed = handle.inner.publication.current.load_full();
+        let (released, completion) = std::sync::mpsc::channel();
+        *installed.retirement_complete.lock().unwrap() = Some(released);
+        drop(installed);
+        let rows = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Observe {
+            client: Arc::downgrade(&handle.inner),
+            rows: rows.clone(),
+        });
+        tracing::subscriber::with_default(subscriber, || {
+            handle.set_visible(false).unwrap();
+            handle.set_visible(false).unwrap();
+            assert!(handle.resident_snapshot_with_clock().is_none());
+            assert_eq!(handle.snapshot().generation, 41);
+            handle.set_visible(true).unwrap();
+            // A show requests hydration; it must not claim the old body became
+            // resident merely because interest changed while the source is idle.
+            assert!(handle.resident_snapshot_with_clock().is_none());
+            handle.set_visible(true).unwrap();
+        });
+        completion.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(body.upgrade().is_none());
+        let observed = rows.lock().unwrap();
+        assert_eq!(
+            observed.len(),
+            2,
+            "unchanged calls must not spam policy events"
+        );
+        for (row, revision, requested, swapped) in [
+            (&observed[0], 1, false, true),
+            (&observed[1], 2, true, false),
+        ] {
+            assert_eq!(row["policy_revision"], revision);
+            assert_eq!(row["published_generation"], 41);
+            assert_eq!(row["published_resident"], false);
+            assert_eq!(row["metadata_installed"], swapped);
+            assert_eq!(row["requested_interested"], requested);
+            assert_eq!(row["requested_retain_body"], requested);
+            assert!(!row.contains_key("resident_bytes"));
+            assert!(!row.contains_key("released"));
+        }
+        drop(observed);
+        drop(handle);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn hiding_retires_the_actual_last_publication_body_off_the_caller() {
+        let client = ClientHandle::fixture(omp_card(None, None), Snapshot::default());
+        let (publication, body, completion) = observed_large_publication();
+        let identity = Arc::downgrade(&publication);
+        drop(client.inner.publication.current.swap(publication));
+        let caller = thread::current().id();
+        client.set_interest(false, false).unwrap();
+        assert!(!client.inner.publication.current.load().resident);
+        let destroyed_on = completion.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_ne!(destroyed_on, caller);
+        assert!(identity.upgrade().is_none());
+        assert!(
+            body.upgrade().is_none(),
+            "the actual large Snapshot must be released, not only a spare wrapper"
+        );
+    }
+
+    #[test]
+    fn a_final_arc_swap_reader_guard_retires_its_body_off_the_reader() {
+        let client = ClientHandle::fixture(omp_card(None, None), Snapshot::default());
+        let (publication, body, completion) = observed_large_publication();
+        drop(client.inner.publication.current.swap(publication));
+        let guard = client.inner.publication.current.load();
+        let original = Arc::as_ptr(&guard);
+        let publications = client.inner.publication.clone();
+        let writer = thread::spawn(move || {
+            assert_eq!(
+                publications.replace(
+                    Snapshot {
+                        generation: 2,
+                        ..Default::default()
+                    },
+                    &AtomicBool::new(true),
+                    false,
+                    false
+                ),
+                Some(true)
+            );
+        });
+        writer.join().unwrap();
+        assert_ne!(
+            Arc::as_ptr(&client.inner.publication.current.load()),
+            original
+        );
+        assert_eq!(
+            guard.snapshot.generation, 1,
+            "the real ArcSwap guard still owns the superseded publication"
+        );
+        assert!(body.upgrade().is_some());
+        assert!(completion.try_recv().is_err());
+        let reader = thread::current().id();
+        drop(guard);
+        assert_ne!(
+            completion.recv_timeout(Duration::from_secs(5)).unwrap(),
+            reader
+        );
+        assert!(body.upgrade().is_none());
+    }
+
+    #[test]
+    fn ordinary_reader_replacement_disposes_its_previous_body_on_that_reader() {
+        use super::super::presentation::{ItemChange, Presentation};
+        let body = "source reader disposal\n".repeat(200_000);
+        let before = retirement_text(body.clone());
+        let after = retirement_text(body + "tail");
+        let update = Presentation {
+            base_generation: 1,
+            metadata: Snapshot {
+                generation: 2,
+                ..Default::default()
+            },
+            order: vec![after.id.clone()],
+            changes: vec![ItemChange::between(Some(&before), &after)],
+            children: vec![],
+            file_changes_unchanged: false,
+        };
+        let (client, server, eof) = retirement_wire(
+            omp_card(None, None),
+            Snapshot {
+                generation: 1,
+                items: vec![before],
+                ..Default::default()
+            },
+            Some(update),
+            |_| {},
+        );
+        let reader = client
+            .inner
+            .reader
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .thread()
+            .id();
+        let current = client.inner.publication.current.load_full();
+        let previous_body = Arc::downgrade(&current.snapshot);
+        let (completed, completion) = std::sync::mpsc::channel();
+        *current.retirement_complete.lock().unwrap() = Some(completed);
+        drop(current);
+        client.set_visible(true).unwrap();
+        let disposal = completion.recv_timeout(Duration::from_secs(5));
+        // Release/finish the real wire before judging the thread oracle.
+        drop(client);
+        eof.recv_timeout(Duration::from_secs(5)).unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            disposal.unwrap(),
+            reader,
+            "ordinary source updates must keep actual prior-body disposal on their producer, preserving backpressure"
+        );
+        assert!(previous_body.upgrade().is_none());
+    }
+
+    #[test]
+    fn retirement_initialization_retries_after_a_thread_factory_error() {
+        let initializer = ClientRetirementInitializer::new();
+        let starts = AtomicUsize::new(0);
+        let failure = initializer.get_or_start(|| {
+            starts.fetch_add(1, Ordering::Relaxed);
+            ClientRetirement::start_with(|_| Err(io::Error::from(io::ErrorKind::WouldBlock)))
+        });
+        assert!(failure.is_err());
+        assert!(
+            initializer.owner.get().is_none(),
+            "failed startup must not poison later admission"
+        );
+        let owner = initializer
+            .get_or_start(|| {
+                starts.fetch_add(1, Ordering::Relaxed);
+                ClientRetirement::start_with(|worker| {
+                    thread::Builder::new()
+                        .name("chat-retire-initializer-fixture".into())
+                        .spawn(worker)
+                })
+            })
+            .unwrap();
+        let same = initializer
+            .get_or_start(|| {
+                panic!("a successful owner must be reused without another worker spawn")
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(&owner, &same));
+        assert_eq!(
+            starts.load(Ordering::Relaxed),
+            2,
+            "one failed attempt and one actual successful worker"
+        );
+        let worker = owner.worker.lock().unwrap().as_ref().unwrap().thread().id();
+        // Exercise real payload admission after successful retry, not merely a
+        // stored flag. The isolated worker is process-owned, just like shared().
+        let mut client = ClientHandle::fixture(omp_card(None, None), Snapshot::default());
+        let inner = Arc::get_mut(&mut client.inner).unwrap();
+        inner.retirement = owner;
+        let (finished, completion) = std::sync::mpsc::channel();
+        inner.retirement_complete = Some(finished);
+        drop(client);
+        assert_eq!(
+            completion.recv_timeout(Duration::from_secs(5)).unwrap(),
+            worker
+        );
     }
 }

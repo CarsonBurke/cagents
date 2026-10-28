@@ -12,6 +12,9 @@ pub(super) fn capture_document_link(
         Message::ChatUi(Action::OpenDocument(found, raw)) if found == target => {
             action(Action::OpenDocumentFrom(target, document.clone(), raw))
         }
+        Message::ChatUi(Action::OpenSharedDocument(found, raw)) if found == target => action(
+            Action::OpenDocumentFrom(target, document.clone(), raw.to_string()),
+        ),
         message => message,
     }
 }
@@ -56,7 +59,7 @@ const PROMPT_MEASURE: f32 = 560.0;
 /// short one is read in full where it lands.
 pub(super) const DELIVERY_FOLDED_HEIGHT: f32 = 180.0;
 /// The lines of a notice's event shown before it is opened.
-const NOTICE_LINES: usize = 3;
+pub(super) const NOTICE_LINES: usize = 3;
 
 const MESSAGE_ACTION_HEIGHT: f32 = 24.0;
 const MESSAGE_ACTION_FOOTER: f32 = MESSAGE_ACTION_HEIGHT + step::GAP_XS;
@@ -90,6 +93,66 @@ impl<'a> TranscriptRows<'a> {
             }
         }
         let index = self.children.len();
+        self.children.push(row);
+        self.trailing_footer = footer;
+        index
+    }
+}
+
+/// The loaded transcript keeps row descriptions; only its visible exchanges
+/// create widget trees. Finished visible exchanges still use retained::kept.
+struct VirtualRows<'a> {
+    children: Vec<virtualized::Row<'a>>,
+    gap: f32,
+    trailing_footer: f32,
+}
+impl<'a> VirtualRows<'a> {
+    fn new(gap: f32) -> Self {
+        Self {
+            children: vec![],
+            gap,
+            trailing_footer: 0.0,
+        }
+    }
+    fn push(&mut self, row: Element<'a, Message>) -> usize {
+        self.message(row, 0.0)
+    }
+    fn message(&mut self, row: Element<'a, Message>, footer: f32) -> usize {
+        self.append(
+            virtualized::Row::once(0, 0, 80.0, None, move || row),
+            self.gap,
+            footer,
+        )
+    }
+    fn lazy(
+        &mut self,
+        key: u64,
+        revision: u64,
+        estimate: f32,
+        aliases: Vec<iced::advanced::widget::Id>,
+        gap: f32,
+        footer: f32,
+        build: impl Fn() -> Element<'a, Message> + 'a,
+    ) -> usize {
+        let mut row = virtualized::Row::new(key, revision, estimate, None, build);
+        row.aliases = aliases;
+        self.append(row, gap, footer)
+    }
+    fn append(&mut self, mut row: virtualized::Row<'a>, gap: f32, footer: f32) -> usize {
+        if !self.children.is_empty() {
+            let gap = (gap - self.trailing_footer).max(0.0);
+            if gap > 0.0 {
+                let key = self.children.len() as u64;
+                self.children
+                    .push(virtualized::Row::new(key, 0, gap, None, move || {
+                        widget::Space::new().height(gap).into()
+                    }));
+            }
+        }
+        let index = self.children.len();
+        if row.key == 0 {
+            row.key = index as u64;
+        }
         self.children.push(row);
         self.trailing_footer = footer;
         index
@@ -267,7 +330,7 @@ const QUEUE_PREVIEW_LINES: usize = 2;
 /// How much of a waiting message is handed to its row to be laid out. Two
 /// lines never show more, and a hundred entries of sixteen kibibytes each
 /// would otherwise be shaped on every layout to draw two lines apiece.
-const QUEUE_PREVIEW_BYTES: usize = 480;
+const QUEUE_PREVIEW_BYTES: usize = prompt::QUEUE_PREVIEW_BYTES;
 
 /// When a waiting message goes to the agent, as its row marks it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,7 +345,7 @@ enum QueueTiming {
 /// with it.
 fn queue_row<'a>(
     timing: QueueTiming,
-    text: &'a str,
+    text: Cow<'a, str>,
     attachments: &'a [Attachment],
     controls: Vec<Element<'a, Message>>,
 ) -> Element<'a, Message> {
@@ -314,14 +377,11 @@ fn queue_row<'a>(
             .join(", ")
     };
     // A message of files alone is named by them rather than left blank.
-    let preview: Cow<'a, str> = if text.trim().is_empty() {
-        names().into()
-    } else {
-        let text = text.trim();
-        text[..text.floor_char_boundary(QUEUE_PREVIEW_BYTES)].into()
-    };
+    debug_assert!(text.len() <= QUEUE_PREVIEW_BYTES);
+    let has_text = !text.is_empty();
+    let preview: Cow<'a, str> = if has_text { text } else { names().into() };
     let mut details: Vec<Element<'a, Message>> = Vec::new();
-    if !attachments.is_empty() && !text.trim().is_empty() {
+    if !attachments.is_empty() && has_text {
         details.push(crate::interaction::tooltip(
             widget::row::with_children(vec![
                 crate::ui_controls::passive_icon(Icon::Attachment, design::COMPACT_ICON_SIZE),
@@ -380,13 +440,32 @@ fn queue_key(press: &text_editor::KeyPress, empty: bool) -> bool {
 
 /// A failure, as an entry of the transcript: what went wrong, set apart the
 /// way a system notice is and read in sequence with what it interrupted.
-fn notice_entry(message: &str, target: Target) -> Element<'static, Message> {
+#[cfg(test)]
+fn visible_notice_body(body: &str, expanded: bool) -> String {
+    if !expanded && body.lines().count() > NOTICE_LINES {
+        body.lines()
+            .take(NOTICE_LINES)
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        body.to_owned()
+    }
+}
+
+fn notice_identity(anchor: Option<&str>, message: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::hash::DefaultHasher::new();
+    ("transcript-notice", anchor, message).hash(&mut hash);
+    hash.finish()
+}
+
+fn notice_entry(message: &str, target: Target, identity: u64) -> Element<'static, Message> {
     widget::container(
         widget::row::with_children(vec![
             widget::icon(Icon::Warning.handle())
                 .size(design::COMPACT_ICON_SIZE)
                 .into(),
-            widget::container(selectable_prose::text(
+            widget::container(selectable_prose::logical_text(
                 vec![
                     iced::widget::text::Span::new(message.to_owned())
                         .color(design::warning_color(&cosmic::theme::active())),
@@ -396,6 +475,7 @@ fn notice_entry(message: &str, target: Target) -> Element<'static, Message> {
                 iced::Font::default(),
                 target,
                 None,
+                selectable_prose::Logical { identity, start: 0 },
             ))
             .width(Length::Fill)
             .into(),
@@ -692,6 +772,12 @@ impl Scroll {
     /// reader has already asked for from the one they are asking for now.
     pub(super) fn content(self) -> f32 {
         self.content
+    }
+    pub(super) fn from_top(self) -> f32 {
+        self.from_top
+    }
+    pub(super) fn window_height(self) -> f32 {
+        self.window
     }
 
     pub(super) fn page_height(self) -> f32 {
@@ -1240,6 +1326,310 @@ impl Runtime {
         }
     }
 
+    /// The logical copy/selection catalog is rebuilt only when exposed text
+    /// or disclosure changes, never for mouse motion, copying, find or timers.
+    pub(super) fn selection_document(
+        &self,
+    ) -> (
+        Arc<selection::Catalog>,
+        std::rc::Rc<std::cell::RefCell<selection::Bookmark>>,
+    ) {
+        use std::hash::{Hash, Hasher};
+        let mut fingerprint = std::hash::DefaultHasher::new();
+        self.selected_subagent.hash(&mut fingerprint);
+        let selected = self
+            .selected_subagent
+            .as_ref()
+            .and_then(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id));
+        let items = selected.map_or(self.snapshot.items.as_slice(), |agent| {
+            agent.items.as_slice()
+        });
+        // Cache preparation advances this epoch only for presented text or
+        // ordering edits. Metadata-only heartbeats and hidden-child streams
+        // must not rebuild the entire logical catalog.
+        self.presentation_revision.hash(&mut fingerprint);
+        selected
+            .map_or(self.snapshot.busy, |agent| {
+                agent.status == chat::ToolStatus::Running
+            })
+            .hash(&mut fingerprint);
+        let expanded = self
+            .selected_subagent
+            .as_ref()
+            .and_then(|id| self.child_expanded.get(id))
+            .unwrap_or(&self.expanded);
+        let mut expanded: Vec<_> = expanded.iter().collect();
+        expanded.sort_unstable();
+        expanded.hash(&mut fingerprint);
+        let mut opened: Vec<_> = self.opened.iter().collect();
+        opened.sort_unstable();
+        opened.hash(&mut fingerprint);
+        self.tool_groups_expanded.hash(&mut fingerprint);
+        // Typed summaries/guidance are ordinary labels. Only an exposed,
+        // bounded diagnostic preview has a matching logical text widget.
+        // Never hash or index the hidden original request dump here; explicit
+        // CopyFailure resolves the complete originals independently.
+        for incident in &self.failure_ui.incidents {
+            let exposed = selected.map_or_else(
+                || {
+                    !incident.active_recovery
+                        && incident.child_scope.is_none()
+                        && (incident.anchor.is_none()
+                            || self
+                                .turns
+                                .iter()
+                                .any(|turn| incident.anchor.as_ref() == Some(&turn.key)))
+                },
+                |agent| {
+                    self.incident_has_child_detail(incident, &agent.id)
+                        || agent.items.iter().any(|item| {
+                            self.failure_ui
+                                .child_item(&agent.id, &item.id)
+                                .is_some_and(|(found, _)| found.key == incident.key)
+                        })
+                },
+            );
+            if exposed && let Some(preview) = self.selection_failure_preview(incident) {
+                (preview, &incident.anchor).hash(&mut fingerprint);
+            }
+        }
+        self.queued
+            .as_ref()
+            .map(|queued| (queued.source.id, queued.presentation.revision))
+            .hash(&mut fingerprint);
+        let fingerprint = fingerprint.finish();
+        let mut document = self.selection_document.borrow_mut();
+        if document
+            .as_ref()
+            .is_none_or(|(revision, _)| *revision != fingerprint)
+        {
+            let mut builder = selection::Catalog::builder();
+            if let Some(agent) = selected {
+                for incident in self.failure_ui.incidents.iter().filter(|incident| {
+                    self.incident_has_child_detail(incident, &agent.id)
+                        && !agent.items.iter().any(|item| {
+                            self.failure_ui
+                                .child_item(&agent.id, &item.id)
+                                .is_some_and(|(found, _)| found.key == incident.key)
+                        })
+                }) {
+                    self.selection_failure(&mut builder, incident);
+                }
+                for item in items {
+                    if let Some((incident, first)) = self.failure_ui.child_item(&agent.id, &item.id)
+                    {
+                        if first {
+                            self.selection_failure(&mut builder, incident);
+                        }
+                        continue;
+                    }
+                    self.selection_item(&mut builder, item, turn::slot_of(item), true);
+                }
+            } else {
+                for incident in self.failure_ui.incidents.iter().filter(|incident| {
+                    !incident.active_recovery
+                        && incident.child_scope.is_none()
+                        && incident.anchor.is_none()
+                }) {
+                    self.selection_failure(&mut builder, incident);
+                }
+                for turn in &self.turns {
+                    for index in &turn.prompt {
+                        if let Some(item) = items.get(*index) {
+                            self.selection_item(&mut builder, item, turn::Slot::Prose, true);
+                        }
+                    }
+                    if self
+                        .opened
+                        .get(&turn.key)
+                        .copied()
+                        .unwrap_or(self.tool_groups_expanded)
+                    {
+                        for placed in &turn.steps {
+                            if let Some(item) = items.get(placed.index) {
+                                self.selection_item(&mut builder, item, placed.slot, true);
+                            }
+                        }
+                    }
+                    for placed in &turn.prose {
+                        if let Some(item) = items.get(placed.index) {
+                            self.selection_item(&mut builder, item, placed.slot, true);
+                        }
+                    }
+                    for incident in self.failure_ui.incidents.iter().filter(|incident| {
+                        !incident.active_recovery
+                            && incident.child_scope.is_none()
+                            && incident.anchor.as_ref() == Some(&turn.key)
+                    }) {
+                        self.selection_failure(&mut builder, incident);
+                    }
+                }
+                if let Some(queued) = &self.queued
+                    && let Some(prepared) = &queued.presentation.prepared
+                {
+                    builder.indexed(
+                        "queued-prompt",
+                        &[2],
+                        prepared.full.plain(),
+                        prepared.full.plain_prefixes(),
+                    );
+                }
+            }
+            let catalog =
+                builder.finish_reusing(document.as_ref().map(|(_, catalog)| catalog.as_ref()));
+            *document = Some((fingerprint, catalog));
+            self.find_navigation.changed_document();
+        }
+        let catalog = document.as_ref().unwrap().1.clone();
+        let bookmark = self
+            .selection_bookmarks
+            .borrow_mut()
+            .entry(self.selected_subagent.clone())
+            .or_insert_with(Default::default)
+            .clone();
+        (catalog, bookmark)
+    }
+
+    fn selection_failure_preview<'a>(
+        &'a self,
+        incident: &failure::Incident,
+    ) -> Option<(u64, &'a str)> {
+        self.failure_ui
+            .expanded
+            .contains(&incident.key)
+            .then_some(())?;
+        let (preview, _) = self.failure_preview(&incident.key)?;
+        Some((failure::diagnostic_preview_identity(&incident.key), preview))
+    }
+
+    fn selection_failure(
+        &self,
+        builder: &mut selection::DocumentBuilder,
+        incident: &failure::Incident,
+    ) {
+        if let Some((identity, preview)) = self.selection_failure_preview(incident) {
+            builder.logical(identity, Arc::from(preview));
+        }
+    }
+
+    fn selection_item(
+        &self,
+        builder: &mut selection::DocumentBuilder,
+        item: &chat::Item,
+        slot: turn::Slot,
+        detail: bool,
+    ) {
+        if item.role == chat::Role::User && !matches!(item.content, ItemContent::Delivery { .. }) {
+            if matches!(item.content, ItemContent::Text { .. }) {
+                if let Some(prompt) = self.prepared_prompt(item) {
+                    let text = prompt.shown(self.item_expanded(&item.id));
+                    builder.indexed(&item.id, &[2], text.plain(), text.plain_prefixes());
+                }
+            } else if matches!(item.content, ItemContent::Image { .. }) {
+                if let Some(text) = self
+                    .prepared_literal(item)
+                    .and_then(literal_content::Content::image_prompt)
+                {
+                    builder.indexed(&item.id, &[2], text.plain(), text.plain_prefixes());
+                }
+            } else {
+                let (text, _, _) = self.prompt_text(item);
+                builder.plain(&item.id, &[2], text.into());
+            }
+            return;
+        }
+        let Some(cached) = self.presentation_cache().get(&item.id) else {
+            return;
+        };
+        if cached.placeholder {
+            return;
+        }
+        if let Some(literal) = self.prepared_literal(item) {
+            literal.catalog(builder, item, detail && self.item_expanded(&item.id));
+            return;
+        }
+        if literal_content::Prepared::required(&item.content) {
+            return;
+        }
+        if slot == turn::Slot::Thinking && !self.item_expanded(&item.id) {
+            let selected = self
+                .selected_subagent
+                .as_ref()
+                .and_then(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id));
+            let (items, busy) = selected.map_or(
+                (self.snapshot.items.as_slice(), self.snapshot.busy),
+                |agent| {
+                    (
+                        agent.items.as_slice(),
+                        agent.status == chat::ToolStatus::Running,
+                    )
+                },
+            );
+            if reasoning_finished(items, busy, &item.id) {
+                return;
+            }
+        }
+        if matches!(
+            item.content,
+            ItemContent::Text { .. } | ItemContent::Delivery { .. }
+        ) {
+            if let ItemContent::Delivery {
+                kind: chat::DeliveryKind::Notice,
+                body,
+                ..
+            } = &item.content
+            {
+                let _ = body; // Literal Notice is indexed only from its exact accepted DTO above.
+            } else {
+                builder.markdown(&item.id, &[0], cached.markdown.items());
+            }
+        }
+        if let Some(coordinated) = &cached.coordination {
+            for (index, content) in coordinated.contents().enumerate() {
+                builder.markdown(&item.id, &[1, index as u32], content.items());
+            }
+        }
+        if detail && self.item_expanded(&item.id) {
+            if let Some(input) = &cached.tool_input {
+                builder.indexed(
+                    &item.id,
+                    &[4],
+                    input.text.clone(),
+                    input.reader_source.prefixes(),
+                );
+            }
+            if let Some(output) = &cached.tool_output {
+                if !output.text.is_empty() {
+                    builder.indexed(
+                        &item.id,
+                        &[5],
+                        output.text.clone(),
+                        output.reader_source.prefixes(),
+                    );
+                }
+            }
+            for (index, patch) in cached.patches.iter().enumerate() {
+                if !patch.text.is_empty() {
+                    builder.indexed(
+                        &item.id,
+                        &[6, index as u32],
+                        patch.text.clone(),
+                        patch.reader_source.prefixes(),
+                    );
+                }
+            }
+        }
+    }
+
+    fn child_find_revision(&self) -> Option<(u64, u64)> {
+        self.find.as_ref().map(|_| {
+            (
+                self.find_navigation.search_epoch(),
+                find_navigation::render_revision(self.target),
+            )
+        })
+    }
+
     fn view<'a>(
         &'a self,
         recovery: Option<auth_recovery::Recovery>,
@@ -1278,7 +1668,7 @@ impl Runtime {
             .as_ref()
             .and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id));
         let mut anchors = Vec::new();
-        let mut transcript = TranscriptRows::new(step::GAP_L);
+        let mut transcript = VirtualRows::new(step::GAP_L);
         let mut selected_identity: Option<Element<'_, Message>> = None;
         if let Some(agent) = selected {
             let provider = match self.session.launch.provider {
@@ -1382,32 +1772,6 @@ impl Runtime {
                 let Some(cached) = self.child_cache.get(&item.id) else {
                     continue;
                 };
-                let body: Element<'_, Message> = if item.role == chat::Role::User
-                    && !item.content.is_step()
-                {
-                    if matches!(item.content, ItemContent::Delivery { .. }) {
-                        self.delivery_view(item, cached, markdown_settings)
-                    } else {
-                        self.prompt_view(item)
-                    }
-                } else if let Some(coordinated) = cached
-                    .coordination
-                    .as_deref()
-                    .filter(|coordinated| coordinated.is_card())
-                {
-                    let raw = self
-                        .item_expanded(&item.id)
-                        .then(|| self.step_detail(item, cached, markdown_settings));
-                    self.coordination_card(item, cached, coordinated, markdown_settings, raw)
-                } else {
-                    match &item.content {
-                        ItemContent::Text { .. } => {
-                            self.prose_view(item, cached, turn::slot_of(item), markdown_settings)
-                        }
-                        ItemContent::Image { .. } => self.image_preview(item, cached),
-                        _ => self.step_view(item, cached, markdown_settings),
-                    }
-                };
                 let footer = if (item.role == chat::Role::User && !item.content.is_step())
                     || matches!(item.content, ItemContent::Text { .. })
                     || cached
@@ -1419,13 +1783,77 @@ impl Runtime {
                 } else {
                     0.0
                 };
-                let row_index = transcript.message(
-                    widget::container(body)
-                        .id(self.find_anchor(&item.id))
-                        .into(),
+                use std::hash::{Hash, Hasher};
+                let mut key = std::hash::DefaultHasher::new();
+                ("selected-child-item", &item.id).hash(&mut key);
+                let mut revision = std::hash::DefaultHasher::new();
+                (
+                    cached.revision,
+                    self.item_expanded(&item.id),
+                    self.child_find_revision(),
+                    dark,
+                )
+                    .hash(&mut revision);
+                let estimate = CachedItem::prose(&item.content).map_or(80.0, |body| {
+                    (body.len() as f32 / (content_width / 8.0).max(20.0))
+                        .ceil()
+                        .max(1.0)
+                        * 22.0
+                        + footer
+                });
+                let row_index = transcript.lazy(
+                    key.finish(),
+                    revision.finish(),
+                    estimate,
+                    vec![scroll::item_id(&item.id), self.find_anchor(&item.id)],
+                    step::GAP_L,
                     footer,
+                    move || {
+                        scroll::item(
+                            &item.id,
+                            widget::container(
+                                if item.role == chat::Role::User && !item.content.is_step() {
+                                    if matches!(item.content, ItemContent::Delivery { .. }) {
+                                        self.delivery_view(item, cached, markdown_settings)
+                                    } else {
+                                        self.prompt_view(item)
+                                    }
+                                } else if let Some(coordinated) = cached
+                                    .coordination
+                                    .as_deref()
+                                    .filter(|coordinated| coordinated.is_card())
+                                {
+                                    let raw = self
+                                        .item_expanded(&item.id)
+                                        .then(|| self.step_detail(item, cached, markdown_settings));
+                                    self.coordination_card(
+                                        item,
+                                        cached,
+                                        coordinated,
+                                        markdown_settings,
+                                        raw,
+                                    )
+                                } else {
+                                    match &item.content {
+                                        ItemContent::Text { .. } => self.prose_view(
+                                            item,
+                                            cached,
+                                            turn::slot_of(item),
+                                            markdown_settings,
+                                        ),
+                                        ItemContent::Image { .. } => {
+                                            self.image_preview(item, cached)
+                                        }
+                                        _ => self.step_view(item, cached, markdown_settings),
+                                    }
+                                },
+                            )
+                            .id(self.find_anchor(&item.id))
+                            .width(Length::Fill),
+                        )
+                    },
                 );
-                anchors.push((row_index, item.id.as_str()));
+                let _ = row_index; // Virtual placeholder bounds supply item anchors.
             }
         } else {
             if snapshot.has_earlier {
@@ -1463,14 +1891,49 @@ impl Runtime {
                 );
             }
             for turn in &self.turns {
-                transcript.push_with_gap(
-                    self.turn_view(turn, markdown_settings, dark),
+                use std::hash::{Hash, Hasher};
+                let mut key = std::hash::DefaultHasher::new();
+                turn.key.hash(&mut key);
+                let estimate = turn
+                    .prompt
+                    .iter()
+                    .chain(turn.prose.iter().map(|placed| &placed.index))
+                    .filter_map(|index| snapshot.items.get(*index))
+                    .map(|item| {
+                        CachedItem::prose(&item.content).map_or(60.0, |body| {
+                            ((body.len() as f32 / (content_width / 8.0).max(20.0))
+                                .ceil()
+                                .max(1.0)
+                                * 22.0)
+                                + 40.0
+                        })
+                    })
+                    .sum::<f32>()
+                    + if turn.steps.is_empty() { 0.0 } else { 48.0 };
+                let aliases = turn
+                    .prompt
+                    .iter()
+                    .chain(
+                        turn.prose
+                            .iter()
+                            .chain(&turn.steps)
+                            .map(|placed| &placed.index),
+                    )
+                    .filter_map(|index| snapshot.items.get(*index))
+                    .map(|item| scroll::item_id(&item.id))
+                    .collect();
+                transcript.lazy(
+                    key.finish(),
+                    self.turn_fingerprint(turn, dark),
+                    estimate,
+                    aliases,
                     if turn.prompt.is_empty() {
                         step::GAP_M
                     } else {
                         step::GAP_L
                     },
                     self.turn_trailing_footer(turn),
+                    move || self.turn_view(turn, markdown_settings, dark),
                 );
                 for incident in self.failure_ui.incidents.iter().filter(|incident| {
                     !incident.active_recovery
@@ -1540,6 +2003,19 @@ impl Runtime {
         // composer: it scrolls away with what it was about instead of
         // staying on screen until the next command happens to clear it.
         content.extend(self.plan_view());
+        if let Some(error) = self.preparation.error() {
+            content.push(
+                widget::row::with_children(vec![
+                    design::caption(error.to_owned()).width(Length::Fill).into(),
+                    crate::ui_controls::button::secondary("Retry loading")
+                        .on_press(action(Action::RetryMarkdown(target)))
+                        .into(),
+                ])
+                .spacing(step::GAP_S)
+                .width(Length::Fill)
+                .into(),
+            );
+        }
         if let Some(query) = &self.find {
             content.push(
                 widget::row::with_children(vec![
@@ -1552,7 +2028,11 @@ impl Runtime {
                             .width(Length::Fill),
                         move || action(Action::CloseFind(target)),
                     ),
-                    design::caption(if self.find_matches.is_empty() {
+                    design::caption(if let Some(error) = self.find_error() {
+                        error.to_owned()
+                    } else if self.find_searching() {
+                        "Searching…".to_owned()
+                    } else if self.find_matches.is_empty() {
                         "0 matches".to_owned()
                     } else {
                         format!(
@@ -1583,42 +2063,118 @@ impl Runtime {
                 .spacing(step::GAP_S)
                 .into(),
             );
+            if self.find_error().is_some() {
+                content.push(
+                    crate::ui_controls::button::secondary("Retry search")
+                        .on_press(action(Action::FindRetry(target)))
+                        .into(),
+                );
+            }
         }
         // The symmetric inset already exceeds the scrollbar rail. Reserving
         // the rail a second time would make transcript rows narrower than the
         // composer even though their outer column is shared.
-        let transcript = widget::column::with_children(transcript.children)
-            .padding(iced::Padding::new(step::GAP_M))
-            .width(Length::Fill);
+        let transcript =
+            widget::container(virtualized::column(transcript.children, Default::default()))
+                .padding(iced::Padding::new(step::GAP_M))
+                .width(Length::Fill);
         let transcript_index = content.len();
-        let transcript_layer = selection::transcript(
-            scroll::transcript(
-                transcript,
+        let transcript_layer = if self.visible.load(Ordering::Relaxed) {
+            let (catalog, bookmark) = self.selection_document();
+            crate::ui_memory::gate(selection::transcript_virtualized(
+                scroll::transcript_observed(
+                    transcript,
+                    target,
+                    self.selected_subagent.as_deref(),
+                    anchors,
+                    selected.is_some() || (!snapshot.has_later && self.paging().is_none()),
+                    selected
+                        .map_or(snapshot.items.as_slice(), |agent| agent.items.as_slice())
+                        .iter()
+                        .map(|item| (scroll::item_id(&item.id), item.id.as_str()))
+                        .chain(self.turns.iter().flat_map(|turn| {
+                            let key = turn
+                                .steps
+                                .first()
+                                .and_then(|step| snapshot.items.get(step.index));
+                            turn.steps.iter().filter_map(move |step| {
+                                Some((
+                                    scroll::steps_id(&key?.id),
+                                    snapshot.items.get(step.index)?.id.as_str(),
+                                ))
+                            })
+                        }))
+                        .collect(),
+                    self.observed_scroll.clone(),
+                    self.scroll_memory.clone(),
+                    if let Some(edge) = self.scroll_memory.edge(self.selected_subagent.as_deref()) {
+                        self.presentation_evicted
+                            || (edge == scroll::Edge::Latest
+                                && self.selected_subagent.is_none()
+                                && (snapshot.has_later
+                                    || snapshot.history_loading
+                                    || self.paging() == Some(Page::Latest)
+                                    || self.deferred_page == Some(HistoryNavigation::Latest)))
+                            || {
+                                let items = selected.map_or(snapshot.items.as_slice(), |agent| {
+                                    agent.items.as_slice()
+                                });
+                                match edge {
+                                    scroll::Edge::Start => items.first(),
+                                    scroll::Edge::End | scroll::Edge::Latest => items.last(),
+                                }
+                                .is_some_and(|item| {
+                                    self.presentation_cache()
+                                        .get(&item.id)
+                                        .is_none_or(|cached| cached.placeholder)
+                                })
+                            }
+                    } else {
+                        self.scroll_memory.restoration_pending(
+                            self.selected_subagent.as_deref(),
+                            self.presentation_evicted,
+                            |id| {
+                                self.active_item(id).is_some()
+                                    && self
+                                        .presentation_cache()
+                                        .get(id)
+                                        .is_none_or(|cached| cached.placeholder)
+                            },
+                        )
+                    },
+                    if self
+                        .scroll_memory
+                        .preserve_arrived(self.selected_subagent.as_deref())
+                    {
+                        selected
+                            .map_or(snapshot.items.as_slice(), |agent| agent.items.as_slice())
+                            .iter()
+                            .filter(|item| {
+                                self.presentation_cache()
+                                    .get(&item.id)
+                                    .is_none_or(|cached| cached.placeholder)
+                            })
+                            .map(|item| item.id.as_str())
+                            .collect()
+                    } else {
+                        Default::default()
+                    },
+                    Some(self.find_navigation.guard()),
+                ),
                 target,
                 self.selected_subagent.as_deref(),
-                anchors,
-                selected.is_some() || (!snapshot.has_later && self.paging().is_none()),
-                snapshot
-                    .items
-                    .iter()
-                    .map(|item| (scroll::item_id(&item.id), item.id.as_str()))
-                    .chain(self.turns.iter().flat_map(|turn| {
-                        let key = turn
-                            .steps
-                            .first()
-                            .and_then(|step| snapshot.items.get(step.index));
-                        turn.steps.iter().filter_map(move |step| {
-                            Some((
-                                scroll::steps_id(&key?.id),
-                                snapshot.items.get(step.index)?.id.as_str(),
-                            ))
-                        })
-                    }))
-                    .collect(),
-            ),
-            target,
-            self.selected_subagent.as_deref(),
-        );
+                catalog,
+                bookmark,
+            ))
+        } else {
+            // Overscan cards can remain mounted after model dehydration.
+            // Diff to a cheap child so no old retained paragraph survives.
+            crate::ui_memory::gate(
+                widget::Space::new()
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+        };
         // Keep the transcript mounted in its original layer slot while the
         // chooser is open, preserving its native scroll and selection state.
         content.push(crate::interaction::exclusive_layer(
@@ -1668,9 +2224,12 @@ impl Runtime {
             );
         } else if (self.disconnected || snapshot.exited) && self.auth_error().is_none() {
             let unresumable = self.offers_fresh_conversation();
+            let saved_history = self.has_connected_saved_history(snapshot);
             let enabled = !transitioning
                 && self.pending.is_none()
-                && self.attachment_chooser_pending.is_none();
+                && self.attachment_chooser_pending.is_none()
+                && self.pastes_pending == 0
+                && (!saved_history || !snapshot.history_loading);
             let mut controls = vec![
                 crate::design::caption(if unresumable {
                     // The provider's own sentence is already above this line,
@@ -1690,7 +2249,12 @@ impl Runtime {
                 })
                 .width(Length::Fill)
                 .into(),
-                icon(
+                if saved_history {
+                    widget::button::custom(design::caption("Resume conversation"))
+                        .class(crate::ui_controls::control_style(false, None))
+                        .on_press_maybe(enabled.then(|| action(Action::ResumeSaved(target))))
+                        .into()
+                } else { icon(
                     Icon::Refresh,
                     if unresumable {
                         "Resume this conversation again"
@@ -1699,7 +2263,7 @@ impl Runtime {
                     },
                     enabled,
                     Action::Reconnect(target),
-                ),
+                ) },
             ];
             if unresumable {
                 controls.push(icon(
@@ -2165,13 +2729,20 @@ impl Runtime {
                 .into(),
             );
         }
-        if snapshot.capabilities.attachments {
-            actions.push(icon(
-                Icon::Attachment,
-                "Attach files",
-                available && self.attachment_chooser_pending.is_none(),
-                Action::Attach(target),
-            ));
+        if self.accepts_draft_attachments() {
+            let editable = !transitioning
+                && (!snapshot.exited || self.has_connected_saved_history(snapshot))
+                && !self.closed_elsewhere
+                && !self.disconnected
+                && self.pending.is_none()
+                && self.queued.is_none()
+                && self.attachment_chooser_pending.is_none();
+            actions.push(
+                crate::ui_controls::icon_button(Icon::Attachment, "Attach files")
+                    .id(card_control_id(target.card, "chat-attach"))
+                    .on_press_maybe(editable.then(|| action(Action::Attach(target))))
+                    .into(),
+            );
         }
         // Commands are reached by typing `/`, which is how every agent surface
         // a user arrives from works and what the composer already answers to.
@@ -3186,35 +3757,23 @@ impl Runtime {
     /// An exchange is kept between frames, and built and laid out again only
     /// when something it draws changes, which is what stops a streaming
     /// answer from paying for every exchange above it twenty times a second.
-    /// The one thing that cannot be kept is an open step's raw output, whose
-    /// read-only editor borrows its text from the cache; an exchange showing
-    /// one is built afresh each frame, in the same place in the tree.
+    /// Open details own their text and share the same retained path. A
+    /// disclosure or changed item only invalidates its own exchange.
     fn turn_view<'a>(
         &'a self,
         turn: &'a turn::Turn,
         settings: markdown::Settings,
         dark: bool,
     ) -> Element<'a, Message> {
-        if !self.retainable(turn) {
-            return retained::fresh(self.turn_rows(
+        retained::kept(self.turn_fingerprint(turn, dark), move || {
+            self.turn_rows(
                 turn,
                 |item, cached| self.step_view(item, cached, settings),
                 |item, cached, coordinated| {
                     let raw = self
-                        .expanded
-                        .contains(&item.id)
+                        .item_expanded(&item.id)
                         .then(|| self.step_detail(item, cached, settings));
                     self.coordination_card(item, cached, coordinated, settings, raw)
-                },
-                settings,
-            ));
-        }
-        retained::kept(self.turn_fingerprint(turn, dark), move || {
-            self.turn_rows(
-                turn,
-                |item, cached| self.step_header(item, cached, false),
-                |item, cached, coordinated| {
-                    self.coordination_card(item, cached, coordinated, settings, None)
                 },
                 settings,
             )
@@ -3227,25 +3786,15 @@ impl Runtime {
         self.turn_view(&self.turns[0], settings, cosmic::theme::is_dark())
     }
 
-    /// Whether `turn` can be kept between frames: none of its steps is open.
-    fn retainable(&self, turn: &turn::Turn) -> bool {
-        turn.prompt
-            .iter()
-            .chain(
-                turn.steps
-                    .iter()
-                    .chain(&turn.prose)
-                    .map(|placed| &placed.index),
-            )
-            .filter_map(|index| self.snapshot.items.get(*index))
-            .all(|item| !self.expanded.contains(&item.id))
-    }
-
     /// Everything a retained exchange draws, folded into the value that
     /// decides whether it is drawn again.
     ///
     /// It reads the items' change tokens rather than their bodies, so it
     /// costs the same for a one-line answer as for a long one.
+    pub(super) fn find_turn_matches(&self, key: &str) -> bool {
+        self.find_matches.iter().any(|candidate| candidate == key)
+    }
+
     fn turn_fingerprint(&self, turn: &turn::Turn, dark: bool) -> u64 {
         self.turn_fingerprint_at(turn, dark, self.source_now_ms())
     }
@@ -3274,17 +3823,16 @@ impl Runtime {
             .hash(&mut hasher);
         self.opened.get(&turn.key).hash(&mut hasher);
         self.tool_groups_expanded.hash(&mut hasher);
-        self.find.hash(&mut hasher);
-        // Only reasoning uses the transcript's busy state to decide whether
-        // its disclosure has finished. Other rows derive activity from their
-        // own items and the group's status and duration.
-        if turn
-            .prose
-            .iter()
-            .any(|placed| placed.slot == turn::Slot::Thinking)
-        {
-            self.snapshot.busy.hash(&mut hasher);
-        }
+        self.find
+            .as_ref()
+            .filter(|_| self.find_turn_matches(&turn.key))
+            .map(|_| {
+                (
+                    self.find_navigation.search_epoch(),
+                    find_navigation::render_revision(self.target),
+                )
+            })
+            .hash(&mut hasher);
         // A running group's duration counts up, so its strip changes with the
         // clock; a finished one's is fixed at how long the work took.
         if !turn.steps.is_empty() {
@@ -3305,7 +3853,19 @@ impl Runtime {
             };
             // The latest observation can change at provider heartbeat speed
             // even when the rendered content and elapsed second are unchanged.
-            (&item.id, item.started_at.or(item.at), slot).hash(&mut hasher);
+            (
+                &item.id,
+                item.started_at.or(item.at),
+                slot,
+                self.item_expanded(&item.id),
+            )
+                .hash(&mut hasher);
+            if slot == Some(turn::Slot::Thinking) {
+                // A newer turn starting does not revive old reasoning that
+                // already has a final answer or later prompt after it.
+                reasoning_finished(&self.snapshot.items, self.snapshot.busy, &item.id)
+                    .hash(&mut hasher);
+            }
             // Only this item's badge changes on copy. Its dismissal timer
             // does not affect what the turn draws.
             self.copied
@@ -3446,11 +4006,27 @@ impl Runtime {
                 turn.steps
                     .iter()
                     .filter_map(|placed_step| placed(placed_step.index))
-                    .filter_map(|(item, cached)| {
-                        if self.failure_ui.item(&item.id).is_some() {
-                            return None;
-                        }
-                        Some(scroll::item(&item.id, step(item, cached)))
+                    .filter(|(item, _)| self.failure_ui.item(&item.id).is_none())
+                    .map(|(item, cached)| {
+                        let key = selection::logical_identity(&item.id, &[9]);
+                        let revision = cached.revision;
+                        // Header elements are cheap owned metadata; only a
+                        // mounted row creates their widget tree and geometry.
+                        let row = step(item, cached);
+                        let id = item.id.clone();
+                        let mut row = virtualized::Row::once(
+                            key,
+                            revision,
+                            56.0 + step::GAP_XS,
+                            Some(scroll::item_id(&id)),
+                            move || {
+                                widget::container(scroll::item(&id, row))
+                                    .padding(iced::Padding::ZERO.bottom(step::GAP_XS))
+                                    .into()
+                            },
+                        );
+                        row.anchor = true;
+                        row
                     })
                     .collect()
             });
@@ -3543,12 +4119,12 @@ impl Runtime {
                 .tone(crate::design::Tone::Themed(crate::design::muted_icon_color))
                 .into()
         };
-        let copy = |text: &str| {
-            (!text.trim().is_empty()).then(|| {
+        let copy = |text: &str, source: QueueCopy| {
+            (!text.is_empty()).then(|| {
                 small_icon(
                     Icon::Copy,
                     "Copy queued message",
-                    Action::CopyLiteral(text.to_owned()),
+                    Action::CopyQueued(target, source),
                 )
             })
         };
@@ -3560,7 +4136,20 @@ impl Runtime {
             let entry = QueueEntry::Provider(queued.id.clone());
             let recalling = self.is_recalling(&queued.id);
             let available = available && !recalling;
-            let mut controls: Vec<Element<'_, Message>> = copy(&queued.text).into_iter().collect();
+            let preview = self
+                .provider_queue
+                .borrow_mut()
+                .get(&self.snapshot, &queued.id);
+            let mut controls: Vec<Element<'_, Message>> = preview
+                .as_ref()
+                .and_then(|preview| {
+                    copy(
+                        &queued.text,
+                        QueueCopy::Provider(Arc::downgrade(preview), queued.id.clone()),
+                    )
+                })
+                .into_iter()
+                .collect();
             if caps.queue_remove {
                 // An entry the composer cannot hold whole keeps the control,
                 // so its absence is not left to be wondered at.
@@ -3607,7 +4196,10 @@ impl Runtime {
                     chat::QueueDelivery::NextStep => QueueTiming::NextStep,
                     chat::QueueDelivery::NextTurn => QueueTiming::NextTurn,
                 },
-                &queued.text,
+                preview.as_ref().map_or_else(
+                    || Cow::Borrowed("Message…"),
+                    |preview| Cow::Owned(preview.preview.to_string()),
+                ),
                 &queued.attachments,
                 controls,
             ));
@@ -3620,9 +4212,9 @@ impl Runtime {
                 } else {
                     QueueTiming::NextTurn
                 },
-                &followup.text,
+                followup.preview.as_str().into(),
                 &followup.attachments,
-                copy(&followup.text)
+                copy(&followup.text, QueueCopy::Local(followup.id))
                     .into_iter()
                     .chain([
                         control(
@@ -3766,21 +4358,53 @@ impl Runtime {
             .pending
             .as_ref()
             .is_some_and(|pending| pending.queued == Some(super::QueuedStep::Prompt));
+        let logical = selectable_prose::Logical {
+            identity: selection::logical_identity("queued-prompt", &[2]),
+            start: 0,
+        };
+        let body: Element<'a, Message> = if let Some(prepared) = &queued.presentation.prepared {
+            let mut settings =
+                design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+            settings.style.font = iced::Font::default();
+            if prepared.full.len() > 2048 {
+                let flow = queued.presentation.flow.markdown_entry(
+                    logical.identity,
+                    prepared.full.clone(),
+                    settings.style,
+                );
+                selectable_prose::flow_source(
+                    settings.text_size,
+                    settings.style.font,
+                    self.target,
+                    None,
+                    logical,
+                    flow,
+                )
+            } else {
+                selectable_prose::logical_text(
+                    prepared.full.spans(settings.style),
+                    settings.text_size,
+                    settings.style.font,
+                    self.target,
+                    None,
+                    logical,
+                )
+            }
+        } else {
+            widget::text(prompt::preview(queued.source.text()).0)
+                .size(design::TEXT_PROSE)
+                .into()
+        };
         let mut rows: Vec<Element<'a, Message>> = vec![
-            widget::container(selectable_prose::plain(
-                queued.text.trim_end(),
-                design::TEXT_PROSE,
-                iced::Font::default(),
-                self.target,
-            ))
-            .class(design::surface(
-                Some(design::accent_wash),
-                [design::RADIUS_M; 4],
-                false,
-            ))
-            .padding([step::GAP_S as u16, step::GAP_M as u16])
-            .max_width(PROMPT_MEASURE)
-            .into(),
+            widget::container(body)
+                .class(design::surface(
+                    Some(design::accent_wash),
+                    [design::RADIUS_M; 4],
+                    false,
+                ))
+                .padding([step::GAP_S as u16, step::GAP_M as u16])
+                .max_width(PROMPT_MEASURE)
+                .into(),
         ];
         for attachment in &queued.attachments {
             rows.push(
@@ -3806,7 +4430,10 @@ impl Runtime {
                 small_icon(
                     Icon::Copy,
                     "Copy queued message",
-                    Action::CopyLiteral(queued.text.clone()),
+                    Action::CopyQueued(
+                        self.target,
+                        QueueCopy::Initial(Arc::downgrade(&queued.source)),
+                    ),
                 ),
                 crate::ui_controls::icon_button(Icon::Undo, "Take the message back to edit it")
                     .compact()
@@ -3830,33 +4457,50 @@ impl Runtime {
     /// its author squared off. That asymmetry is what identifies the author
     /// without printing "You" above every message, and the narrower measure
     /// keeps a turn's opening findable when scrolling back.
-    fn prompt_view(&self, item: &chat::Item) -> Element<'static, Message> {
+    fn prompt_text(&self, item: &chat::Item) -> (String, bool, bool) {
+        if let ItemContent::Image {
+            reference: Some(reference),
+            ..
+        } = &item.content
+        {
+            return (reference.label(), true, false);
+        }
         let attachment = matches!(item.content, ItemContent::Image { .. });
         let text = match &item.content {
-            ItemContent::Text { text, .. } => text.clone(),
-            ItemContent::Image {
-                reference: Some(reference),
-                ..
-            } => reference.label(),
+            ItemContent::Text { text, .. } => text.as_str(),
             ItemContent::Image {
                 path, description, ..
-            } => Self::attachment_label(path, description).to_owned(),
-            content => turn::step_label(content).to_owned(),
+            } => Self::attachment_label(path, description),
+            content => turn::step_label(content),
         };
-        // Images stay beneath their prompt on its own side of the transcript,
-        // with the same bounded preview and viewer used for other images.
-        let long = !attachment && (text.lines().count() > 12 || text.chars().count() > 2000);
-        let expanded = self.item_expanded(&item.id);
-        let text = if long && !expanded {
-            text.lines()
-                .take(12)
-                .collect::<Vec<_>>()
-                .join("\n")
-                .chars()
-                .take(2000)
-                .collect::<String>()
+        if attachment {
+            (text.to_owned(), true, false)
         } else {
-            text
+            let (preview, long) = prompt::preview(text);
+            (preview, false, long)
+        }
+    }
+
+    fn prompt_view(&self, item: &chat::Item) -> Element<'static, Message> {
+        let prepared = self.prepared_prompt(item);
+        let attachment = matches!(item.content, ItemContent::Image { .. });
+        let image_text = self
+            .prepared_literal(item)
+            .and_then(literal_content::Content::image_prompt);
+        // Pending cold/replaced sources show only their own bounded prefix.
+        // Full literal text and catalog authority wait for the exact worker DTO.
+        let (fallback, attachment, pending_long) = if attachment {
+            (String::new(), true, false)
+        } else if prepared.is_some() {
+            (String::new(), false, false)
+        } else {
+            self.prompt_text(item)
+        };
+        let long = prepared.map_or(pending_long, |prompt| prompt.long);
+        let expanded = self.item_expanded(&item.id);
+        let logical = selectable_prose::Logical {
+            identity: selection::logical_identity(&item.id, &[2]),
+            start: 0,
         };
         let body: Element<'static, Message> = if attachment {
             // Empty unowned paths also represent documents and refused image
@@ -3869,24 +4513,67 @@ impl Runtime {
             } else {
                 widget::row::with_children(vec![
                     widget::icon(Icon::Attachment.handle()).size(12).into(),
-                    selectable_prose::plain(
-                        text,
-                        design::TEXT_CAPTION,
-                        iced::Font::default(),
-                        self.target,
-                    ),
+                    if let Some(text) = image_text {
+                        prose::paragraph(
+                            design::markdown_settings(
+                                &cosmic::theme::active(),
+                                design::TEXT_CAPTION,
+                            ),
+                            text,
+                            self.target,
+                            None,
+                            Some(logical),
+                            self.presentation_cache()
+                                .get(&item.id)
+                                .map(|cached| &cached.flow_cache),
+                        )
+                    } else if let ItemContent::Image {
+                        reference: Some(reference),
+                        ..
+                    } = &item.content
+                    {
+                        design::caption(reference.label()).into()
+                    } else {
+                        design::caption("Loading attachment…").into()
+                    },
                 ])
                 .spacing(step::GAP_XS)
                 .align_y(Alignment::Center)
                 .into()
             }
         } else {
-            let text = selectable_prose::plain(
-                text,
-                design::TEXT_PROSE,
-                iced::Font::default(),
-                self.target,
-            );
+            let text = if let Some(prompt) = prepared {
+                let text = prompt.shown(expanded);
+                let mut settings =
+                    design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+                settings.style.font = iced::Font::default();
+                if text.len() > 2048 {
+                    let flow = self.presentation_cache()[&item.id]
+                        .flow_cache
+                        .markdown_entry(logical.identity, text.clone(), settings.style);
+                    selectable_prose::flow_source(
+                        settings.text_size,
+                        settings.style.font,
+                        self.target,
+                        None,
+                        logical,
+                        flow,
+                    )
+                } else {
+                    selectable_prose::logical_text(
+                        text.spans(settings.style),
+                        settings.text_size,
+                        settings.style.font,
+                        self.target,
+                        None,
+                        logical,
+                    )
+                }
+            } else {
+                // This bounded nonselectable preview cannot certify a full
+                // source/catalog before preparation accepts the current Item.
+                widget::text(fallback).size(design::TEXT_PROSE).into()
+            };
             if long {
                 widget::column::with_children(vec![
                     text,
@@ -4047,36 +4734,26 @@ impl Runtime {
                 .into();
         }
         if *kind == chat::DeliveryKind::Notice {
+            let Some(notice) = self
+                .prepared_literal(item)
+                .and_then(literal_content::Content::notice)
+            else {
+                return design::caption("Loading notice…").into();
+            };
             let mut rows = vec![
                 widget::row::with_children(vec![
                     glyph(Icon::Attention),
-                    design::caption(summary.clone()).into(),
+                    literal_content::notice_summary(self, item, cached, settings),
                 ])
                 .spacing(step::GAP_S)
                 .align_y(Alignment::Center)
                 .into(),
             ];
-            if !body.is_empty() {
-                let long = body.lines().count() > NOTICE_LINES;
-                let text = if long && !expanded {
-                    body.lines()
-                        .take(NOTICE_LINES)
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                } else {
-                    body.clone()
-                };
-                rows.push(
-                    widget::container(selectable_prose::plain(
-                        text,
-                        design::TEXT_CAPTION,
-                        iced::Font::MONOSPACE,
-                        self.target,
-                    ))
-                    .width(Length::Fill)
-                    .into(),
-                );
-                if long {
+            if notice.body.full.len() != 0 {
+                rows.push(literal_content::notice_body(
+                    self, item, cached, settings, None,
+                ));
+                if notice.body.long {
                     rows.push(toggle("Show more"));
                 }
             }
@@ -4989,8 +5666,134 @@ mod issue1506_tests;
 mod user_image_preview_tests;
 
 #[cfg(test)]
+pub(super) fn prepared_runtime_for_test(items: &[chat::Item]) -> (Runtime, Arc<ClientHandle>) {
+    frame_cost::live_runtime(items)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_history_composer_exposes_attachment_control_without_enabling_send() {
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout, mouse,
+            widget::{Operation, Tree, operation::Focusable},
+        };
+        struct Bounds {
+            id: widget::Id,
+            rect: Option<iced::Rectangle>,
+        }
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                if id == Some(&self.id) {
+                    self.rect = Some(bounds);
+                }
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        for transitioning in [false, true] {
+            let (mut runtime, _) = frame_cost::live_runtime(&[]);
+            runtime.session.launch.session_id = Some("12345678-1234-4234-8234-123456789abc".into());
+            runtime.session.native_continuity = chat::NativeContinuity::ReconnectOnly;
+            runtime.session.proof = Some(crate::model::HostSessionProof {
+                host_session_id: "fixture-host".into(),
+                boot_id: "fixture-boot".into(),
+                host_incarnation: "fixture-incarnation".into(),
+            });
+            let snapshot = Snapshot {
+                session_id: runtime.session.launch.session_id.clone(),
+                exited: true,
+                read_only_reason: Some("Working directory no longer exists".into()),
+                ..Default::default()
+            };
+            runtime.connection = Connection::Live(Arc::new(ClientHandle::fixture(
+                runtime.session.clone(),
+                snapshot.clone(),
+            )));
+            runtime.snapshot = Arc::new(snapshot);
+            assert!(runtime.has_connected_saved_history(&runtime.snapshot));
+            assert!(!runtime.snapshot.capabilities.attachments);
+            let target = runtime.target;
+            let mut element = runtime.view(
+                None,
+                transitioning,
+                true,
+                &shortcuts,
+                600.0,
+                Place {
+                    name: "Fixture".into(),
+                    channel: None,
+                    branch: None,
+                },
+                true,
+                None,
+                vec![],
+            );
+            let mut tree = Tree::new(element.as_widget());
+            let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 800.0));
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+            );
+            let mut bounds = Bounds {
+                id: card_control_id(target.card, "chat-attach"),
+                rect: None,
+            };
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+            let rect = bounds
+                .rect
+                .expect("the composer mounts its attachment control");
+            assert!(rect.width > 0.0 && rect.height > 0.0 && rect.y < viewport.height);
+            let cursor =
+                mouse::Cursor::Available(iced::Point::new(rect.center_x(), rect.center_y()));
+            let mut messages = vec![];
+            let mut captured = vec![];
+            for event in [
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+            ] {
+                let mut shell = Shell::new(&mut messages);
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &iced::Event::Mouse(event),
+                    Layout::new(&node),
+                    cursor,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut shell,
+                    &viewport,
+                );
+                captured.push(shell.is_event_captured());
+            }
+            if transitioning {
+                assert!(messages.is_empty(), "switching disables draft controls");
+            } else {
+                // Clicking outside COSMIC's native editor first emits its
+                // ordinary ClearSelection. The following release must admit
+                // exactly one chooser, without editing/submitting the draft.
+                assert!(
+                    matches!(messages.as_slice(), [
+                        Message::ChatUi(Action::Composer(editor, text_editor::Action::ClearSelection)),
+                        Message::ChatUi(Action::Attach(found)),
+                    ] if *editor == target && *found == target),
+                    "attachment control emitted unexpected messages: {messages:?}; bounds={rect:?}; cursor={cursor:?}; viewport={viewport:?}; captured={captured:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn review_artifact_button_retains_exact_uri_and_rendered_origin_without_answering() {
@@ -5175,8 +5978,9 @@ mod tests {
             let mut snapshot = (*handle.snapshot()).clone();
             snapshot.generation += 1;
             Arc::make_mut(&mut snapshot.items[0]).at = recorded;
-            handle.publish_snapshot_for_test(snapshot);
+            handle.publish_delta_snapshot_for_test(snapshot);
             runtime.refresh();
+            preparation::drain_fixture(&mut runtime);
             assert_eq!(
                 runtime.cache["dated-retained-answer"].revision, revision,
                 "unchanged message body keeps prepared cache"
@@ -5253,14 +6057,18 @@ mod tests {
             ..parent.clone()
         };
         let mut snapshot = (*handle.snapshot()).clone();
+        // Publish the permission metadata already accepted by this Runtime;
+        // otherwise its no-thread draft fallback must clone each fresh Arc.
+        snapshot.permission_mode = runtime.snapshot.permission_mode.clone();
         snapshot.generation += 1;
         let child_id = native_child_fixture().id;
         snapshot.subagents.push(chat::Subagent {
             items: vec![Arc::new(child.clone())],
             ..native_child_fixture()
         });
-        handle.publish_snapshot_for_test(snapshot);
+        handle.publish_delta_snapshot_for_test(snapshot);
         runtime.refresh();
+        preparation::drain_fixture(&mut runtime);
         let renderer = crate::app::tests::headless_renderer();
         let target = runtime.target;
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -5271,6 +6079,7 @@ mod tests {
             let before_selection = app.chat_runtime_mut(target).unwrap().snapshot.clone();
             drop(app.handle_chat_ui(Action::SelectSubagent(target, selected)));
             let runtime = app.chat_runtime_mut(target).unwrap();
+            preparation::drain_fixture(runtime);
             assert!(Arc::ptr_eq(&before_selection, &runtime.snapshot));
             assert_eq!(runtime.cache[&parent.id].stamp.as_ref().unwrap().0, at);
             let expected = runtime.presentation_cache()[&item.id]
@@ -5356,9 +6165,10 @@ mod tests {
                     let mut snapshot = (*handle.snapshot()).clone();
                     snapshot.generation += 1;
                     Arc::make_mut(&mut snapshot.subagents[0].items[0]).at = recorded;
-                    handle.publish_snapshot_for_test(snapshot);
+                    handle.publish_delta_snapshot_for_test(snapshot);
                     let runtime = app.chat_runtime_mut(target).unwrap();
                     runtime.refresh();
+                    preparation::drain_fixture(runtime);
                     assert_eq!(
                         runtime.child_cache[&item.id].revision, revision,
                         "clock-only publication retains prepared child body"
@@ -5405,7 +6215,7 @@ mod tests {
         snapshot.generation += 1;
         Arc::make_mut(&mut snapshot.items[0]).at = None;
         Arc::make_mut(&mut snapshot.subagents[0].items[0]).at = None;
-        handle.publish_snapshot_for_test(snapshot);
+        handle.publish_delta_snapshot_for_test(snapshot);
         let runtime = app.chat_runtime_mut(target).unwrap();
         runtime.refresh();
         assert!(runtime.cache[&parent.id].stamp.is_none());
@@ -5462,14 +6272,18 @@ mod tests {
         };
         let (mut runtime, handle) = frame_cost::live_runtime(&[parent]);
         let mut snapshot = (*handle.snapshot()).clone();
+        // Publish the permission metadata already accepted by this Runtime;
+        // otherwise its no-thread draft fallback must clone each fresh Arc.
+        snapshot.permission_mode = runtime.snapshot.permission_mode.clone();
         snapshot.generation += 1;
         snapshot.subagents.push(chat::Subagent {
             status: chat::ToolStatus::Succeeded,
             items: vec![Arc::new(child)],
             ..native_child_fixture()
         });
-        handle.publish_snapshot_for_test(snapshot);
+        handle.publish_delta_snapshot_for_test(snapshot);
         runtime.refresh();
+        preparation::drain_fixture(&mut runtime);
         let target = runtime.target;
         let mut app = crate::app::tests::context_inspector_test_app(false);
         app.cards
@@ -5504,12 +6318,14 @@ mod tests {
             inspect(app.chat_runtime_mut(target).unwrap()).contains("Distinct parent reasoning")
         );
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("native-child".into()))));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
         drop(app.handle_chat_ui(Action::Toggle(target, "shared-thought".into())));
         drop(app.handle_chat_ui(Action::Unfold(target, "shared-thought#output".into())));
         assert!(
             inspect(app.chat_runtime_mut(target).unwrap()).contains("Distinct child reasoning")
         );
         drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
         drop(app.handle_chat_ui(Action::CloseFind(target)));
         let runtime = app.chat_runtime_mut(target).unwrap();
         assert!(!runtime.item_expanded("shared-thought"));
@@ -5521,6 +6337,7 @@ mod tests {
             inspect(app.chat_runtime_mut(target).unwrap()).contains("Distinct parent reasoning")
         );
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("native-child".into()))));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
         let runtime = app.chat_runtime_mut(target).unwrap();
         assert!(runtime.item_expanded("shared-thought"));
         assert!(runtime.part_unfolded("shared-thought#output"));
@@ -5528,6 +6345,7 @@ mod tests {
         drop(app.handle_chat_ui(Action::Toggle(target, "shared-thought".into())));
         drop(app.handle_chat_ui(Action::Unfold(target, "shared-thought#output".into())));
         drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
         let runtime = app.chat_runtime_mut(target).unwrap();
         assert!(runtime.item_expanded("shared-thought"));
         assert!(runtime.part_unfolded("shared-thought#output"));
@@ -5995,6 +6813,232 @@ mod tests {
     }
 
     #[test]
+    fn cold_child_find_acceptance_changes_retained_revision_without_another_query_edit() {
+        use iced::advanced::{layout, widget::Tree};
+        use iced::futures::StreamExt;
+        let item = |id: &str, text: String| {
+            Arc::new(chat::Item {
+                id: id.into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Text {
+                    text,
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                at: None,
+                started_at: None,
+            })
+        };
+        let (runtime, handle) = frame_cost::live_runtime(&[]);
+        let target = runtime.target;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.subagents = vec![chat::Subagent {
+            items: vec![
+                item("short", "child needle".into()),
+                Arc::new(chat::Item {
+                    id: "other".into(),
+                    role: chat::Role::Assistant,
+                    content: ItemContent::Tool {
+                        name: "Read".into(),
+                        input: "{}".into(),
+                        output: format!("{}needle", "unrelated\n".repeat(5000)),
+                        status: chat::ToolStatus::Succeeded,
+                    },
+                    at: None,
+                    started_at: None,
+                }),
+            ],
+            ..native_child_fixture()
+        }];
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("native-child".into()))));
+        drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        let mut task = app.resume_current_find(target, false);
+        // The admitted raw snapshot predates reader preparation. Its first
+        // accepted Pattern cannot authorize uncapping a later ready reader.
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        let before = app
+            .chat_runtime_mut(target)
+            .unwrap()
+            .child_find_revision()
+            .unwrap();
+        assert_eq!(
+            before.1, 0,
+            "raw worker has not published the shared Pattern"
+        );
+        let renderer = crate::app::tests::headless_renderer();
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        let mut tree = Tree::empty();
+        let render = |app: &mut Cagents, tree: &mut Tree| {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            let mut element = runtime.view(
+                None,
+                false,
+                true,
+                &shortcuts,
+                600.0,
+                Place {
+                    name: "project".into(),
+                    branch: None,
+                    channel: None,
+                },
+                true,
+                None,
+                vec![],
+            );
+            tree.diff(&mut element);
+            element.as_widget_mut().layout(
+                tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 800.0)),
+            );
+        };
+        render(&mut app, &mut tree);
+        let built = virtualized::constructed_rows();
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for _ in 0..8 {
+            let next = executor.block_on(async {
+                let mut stream =
+                    iced::runtime::task::into_stream(task).expect("real pending raw Find task");
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while let Some(effect) = stream.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(
+                            Message::ChatUi(
+                                action @ (Action::FindGroups(..)
+                                | Action::FindResume(..)
+                                | Action::FindAvailable),
+                            ),
+                        )) = effect
+                        {
+                            return action;
+                        }
+                    }
+                    panic!("raw Find completion");
+                })
+                .await
+                .unwrap()
+            });
+            task = app.handle_chat_ui(next);
+            if find_navigation::render_revision(target) != 0 {
+                break;
+            }
+        }
+        drop(task);
+        let after = app
+            .chat_runtime_mut(target)
+            .unwrap()
+            .child_find_revision()
+            .unwrap();
+        assert_eq!(
+            before.0, after.0,
+            "completion must not invent another user query edit"
+        );
+        assert_ne!(
+            before, after,
+            "accepted Pattern invalidates retained short native child rows"
+        );
+        assert!(after.1 != 0);
+        render(&mut app, &mut tree);
+        assert!(
+            virtualized::constructed_rows() > built,
+            "the existing native Tree rebuilds the changed child row"
+        );
+        // The first accepted raw snapshot names a closed step. Explicit
+        // disclosure creates its actual reader before the next raw scan;
+        // laying out the closed row alone does not prepare ToolText.
+        assert!(
+            app.chat_runtime_mut(target).unwrap().child_cache["other"]
+                .tool_output
+                .is_none(),
+            "the initial raw plan predates actual reader readiness"
+        );
+        drop(app.handle_chat_ui(Action::Toggle(target, "other".into())));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        assert!(app.chat_runtime_mut(target).unwrap().item_expanded("other"));
+        render(&mut app, &mut tree);
+        let (reader, text, cache_revision) = {
+            let cached = &app.chat_runtime_mut(target).unwrap().child_cache["other"];
+            let output = cached.tool_output.as_ref().unwrap();
+            (output.find_identity(), output.text.clone(), cached.revision)
+        };
+        assert!(!find_navigation::tool_uncapped(target, reader, &text));
+        // A real manual navigation cancellation leaves the current query and
+        // accepted stable groups intact, allowing the coalesced raw refresh.
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .find_navigation
+            .cancel();
+        let task = app.resume_current_find(target, false);
+        let raw_reply = |task| {
+            executor.block_on(async {
+                let mut stream = iced::runtime::task::into_stream(task)
+                    .expect("same-query current-reader raw worker");
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while let Some(effect) = stream.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(
+                            Message::ChatUi(action @ Action::FindGroups(..)),
+                        )) = effect
+                        {
+                            return action;
+                        }
+                    }
+                    panic!("second actual raw worker completion");
+                })
+                .await
+                .unwrap()
+            })
+        };
+        drop(app.handle_chat_ui(raw_reply(task)));
+        let current = app.chat_runtime_mut(target).unwrap();
+        let reader_phase = current.child_find_revision().unwrap();
+        assert_eq!(
+            reader_phase.0, after.0,
+            "reader readiness does not edit the query"
+        );
+        assert_ne!(
+            reader_phase.1, after.1,
+            "new exact uncapping bindings advance the accepted render phase"
+        );
+        assert_eq!(
+            current.child_cache["other"].revision, cache_revision,
+            "only accepted reader bindings changed"
+        );
+        assert!(find_navigation::tool_uncapped(target, reader, &text));
+        let built = virtualized::constructed_rows();
+        render(&mut app, &mut tree);
+        assert!(
+            virtualized::constructed_rows() > built,
+            "the same retained native Tree rebuilds for the second accepted reader plan"
+        );
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.subagents[0]
+            .items
+            .push(item("tail", "fresh unrelated tail".into()));
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .find_navigation
+            .cancel();
+        let task = app.resume_current_find(target, false);
+        drop(app.handle_chat_ui(raw_reply(task)));
+        assert_eq!(
+            find_navigation::render_revision(target),
+            reader_phase.1,
+            "an actual new raw result for unrelated tail append reuses unchanged exact reader bindings"
+        );
+    }
+
+    #[test]
     fn selected_child_find_navigation_resolves_real_scoped_widget_anchors() {
         use iced::advanced::{
             Layout, layout,
@@ -6038,6 +7082,7 @@ mod tests {
         let mut previous_anchor = None;
         for (child, item, framed) in [("a", "bc", "1:abc"), ("ab", "c", "2:abc")] {
             drop(app.handle_chat_ui(Action::SelectSubagent(target, Some(child.into()))));
+            preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
             let task = app.handle_chat_ui(Action::Find(target, "needle".into()));
             let runtime = app.chat_runtime_mut(target).unwrap();
             assert_eq!(runtime.find_matches, vec![item]);
@@ -6077,6 +7122,16 @@ mod tests {
                 count: usize,
             }
             impl Operation for Anchors {
+                fn custom(
+                    &mut self,
+                    _: Option<&widget::Id>,
+                    _: iced::Rectangle,
+                    state: &mut dyn std::any::Any,
+                ) {
+                    if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
+                        policy.visit = false;
+                    }
+                }
                 fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
                     visit(self);
                 }
@@ -6122,6 +7177,585 @@ mod tests {
     }
 
     #[test]
+    fn actual_find_actions_mount_deep_logical_matches_and_reject_late_navigation() {
+        drive_deep_find(false);
+    }
+    #[test]
+    fn actual_find_current_target_appends_keep_pending_geometry_through_parser_publications() {
+        drive_deep_find(true);
+    }
+    fn drive_deep_find(append_target: bool) {
+        use iced::advanced::{
+            Layout, Shell, layout, mouse,
+            widget::{Operation, Tree, operation},
+        };
+        use iced::futures::{FutureExt, StreamExt, stream::BoxStream};
+        type Effect = iced::runtime::Action<cosmic::Action<Message>>;
+        struct Visible {
+            identity: u64,
+            byte: usize,
+            translation: iced::Vector,
+            pending: Option<(iced::Vector, iced::Rectangle)>,
+            clips: Vec<iced::Rectangle>,
+            found: bool,
+            sample: Option<(iced::Rectangle, Vec<iced::Rectangle>)>,
+        }
+        impl Operation for Visible {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                let old = self.translation;
+                let pushed = if let Some((translation, viewport)) = self.pending.take() {
+                    let viewport = iced::Rectangle {
+                        x: viewport.x - self.translation.x,
+                        y: viewport.y - self.translation.y,
+                        ..viewport
+                    };
+                    self.clips.push(viewport);
+                    self.translation += translation;
+                    true
+                } else {
+                    false
+                };
+                visit(self);
+                if pushed {
+                    self.clips.pop();
+                }
+                self.translation = old;
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&widget::Id>,
+                viewport: iced::Rectangle,
+                _: iced::Rectangle,
+                translation: iced::Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                self.pending = Some((translation, viewport));
+            }
+            fn custom(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                if let Some(prose) = state.downcast_ref::<selectable_prose::State>()
+                    && let Some(local) = prose.logical_byte_bounds(self.identity, self.byte)
+                {
+                    let glyph = iced::Rectangle {
+                        x: bounds.x + local.x - self.translation.x,
+                        y: bounds.y + local.y - self.translation.y,
+                        ..local
+                    };
+                    self.sample = Some((glyph, self.clips.clone()));
+                    self.found |= !self.clips.is_empty()
+                        && self
+                            .clips
+                            .iter()
+                            .all(|clip| glyph.intersection(clip).is_some());
+                }
+            }
+        }
+        fn view<'a>(
+            runtime: &'a Runtime,
+            shortcuts: &'a crate::settings::KeyboardShortcuts,
+        ) -> Element<'a, Message> {
+            runtime.view(
+                None,
+                false,
+                true,
+                shortcuts,
+                600.0,
+                Place {
+                    name: "fixture".into(),
+                    branch: None,
+                    channel: None,
+                },
+                true,
+                None,
+                vec![],
+            )
+        }
+        fn push(streams: &mut Vec<BoxStream<'static, Effect>>, task: Task<Message>) {
+            if let Some(stream) = iced::runtime::task::into_stream(task) {
+                streams.push(stream.boxed());
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        let needle = "FW16_UNIQUE_DEEP_NEEDLE";
+        let paragraph = format!("{} {needle}", "wide prose café λ ".repeat(16_000));
+        let code = format!(
+            "```text\n{}{} {needle}\n```",
+            "bounded line\n".repeat(2_000),
+            "W".repeat(8_000)
+        );
+        let nested = format!(
+            "{}> {needle}",
+            (0..300)
+                .map(|index| format!("> Nested paragraph {index}\n>\n"))
+                .collect::<String>()
+        );
+        let output = format!(
+            "{}{} {needle}",
+            "tool line\n".repeat(2_000),
+            "Z".repeat(8_000)
+        );
+        for (child, content, path, byte) in [
+            (
+                false,
+                ItemContent::Text {
+                    text: paragraph.clone(),
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                vec![0, 0],
+                paragraph.find(needle).unwrap(),
+            ),
+            (
+                true,
+                ItemContent::Text {
+                    text: code.clone(),
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                vec![0, 0],
+                code.find(needle).unwrap() - "```text\n".len(),
+            ),
+            (
+                false,
+                ItemContent::Text {
+                    text: nested,
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                vec![0, 0, 300],
+                0,
+            ),
+            (
+                false,
+                ItemContent::Tool {
+                    name: "FixtureInspect".into(),
+                    input: "fixture".into(),
+                    output: output.clone(),
+                    status: chat::ToolStatus::Succeeded,
+                },
+                vec![5],
+                output.find(needle).unwrap(),
+            ),
+        ]
+        .into_iter()
+        .take(if append_target { 1 } else { 4 })
+        {
+            let item = chat::Item {
+                id: "deep-answer".into(),
+                role: chat::Role::Assistant,
+                content,
+                at: None,
+                started_at: None,
+            };
+            let (runtime, handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+            let target = runtime.target;
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            // Native navigation mutations require an authoritative open card,
+            // in addition to its live runtime. Exercise that admission guard.
+            let mut card = crate::app::tests::terminal_card_state();
+            card.id = target.card;
+            card.generation = target.generation;
+            card.kind = CardKind::Chat(runtime.session.clone());
+            let durable = Arc::make_mut(&mut app.durable);
+            durable.cards.push(card);
+            durable.focused = Some(target.card);
+            app.workspace = Cagents::rebuild_workspace(&app.durable);
+            app.cards
+                .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+            if child {
+                let mut snapshot = (*handle.snapshot()).clone();
+                snapshot.generation += 1;
+                snapshot.subagents = vec![chat::Subagent {
+                    id: "deep-child".into(),
+                    items: vec![Arc::new(item.clone())],
+                    ..native_child_fixture()
+                }];
+                handle.publish_snapshot_for_test(snapshot);
+                app.chat_runtime_mut(target).unwrap().refresh();
+                drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("deep-child".into()))));
+                preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            }
+            let delayed = !append_target && !child && path == [0, 0];
+            if append_target {
+                let mut snapshot = (*handle.snapshot()).clone();
+                snapshot.generation += 1;
+                snapshot.busy = true;
+                snapshot.items[0] = Arc::new(item.clone());
+                handle.publish_snapshot_for_test(snapshot);
+                app.chat_runtime_mut(target).unwrap().refresh();
+                preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            }
+            let mut streams = Vec::new();
+            let mut availability = Box::pin(flow_layout::availability_stream());
+            push(
+                &mut streams,
+                app.handle_chat_ui(Action::Find(target, needle.into())),
+            );
+            let identity = selection::logical_identity(&item.id, &path);
+            // Stall the actual worker boundary for the single large paragraph.
+            // Dropping the sender on panic releases the reclaimer immediately.
+            let mut release = delayed.then(preparation::hold_retirement);
+            let stale_request = delayed.then(|| {
+                let cache = flow_layout::Cache::default();
+                let entry = cache.entry(
+                    u64::MAX,
+                    vec![iced::widget::text::Span::new("old leaf".to_owned())].into(),
+                );
+                let mut state = entry.borrow_mut();
+                state.bind_target(target);
+                state.configure(600.0, iced::Pixels(14.0), iced::Font::default());
+                state
+                    .request()
+                    .expect("real request from an evicted unrelated leaf")
+            });
+            let mut stalled_locations = 0;
+            let mut tree = Tree::empty();
+            let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 500.0));
+            let limits = layout::Limits::new(iced::Size::ZERO, viewport.size());
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut seen = false;
+            let mut passes = 0;
+            let mut last_geometry = None;
+            let mut locations = std::collections::VecDeque::new();
+            let mut preparation_jobs = HashSet::new();
+            let mut buffered_reply = None;
+            let mut target_publications = 0;
+            let mut accepted_publications = 0;
+            while Instant::now() < deadline {
+                passes += 1;
+                // Materialize the actual admitted parser subscriptions once per
+                // recipe, including their real spawn_blocking worker/results.
+                for subscription in app
+                    .chat_runtime_mut(target)
+                    .unwrap()
+                    .preparation
+                    .subscriptions(target)
+                {
+                    for recipe in iced::advanced::subscription::into_recipes(subscription) {
+                        let mut hash = iced::advanced::subscription::Hasher::default();
+                        recipe.hash(&mut hash);
+                        if preparation_jobs.insert(std::hash::Hasher::finish(&hash)) {
+                            streams.push(
+                                recipe
+                                    .stream(iced::futures::stream::empty().boxed())
+                                    .map(|message| {
+                                        iced::runtime::Action::Output(cosmic::Action::App(message))
+                                    })
+                                    .boxed(),
+                            );
+                        }
+                    }
+                }
+                let mut effects = Vec::new();
+                executor.block_on(async {
+                    let mut index = 0;
+                    while index < streams.len() {
+                        let mut finished = false;
+                        for _ in 0..8 {
+                            match tokio::time::timeout(
+                                Duration::from_millis(1),
+                                streams[index].next(),
+                            )
+                            .await
+                            {
+                                Ok(Some(effect)) => effects.push(effect),
+                                Ok(None) => {
+                                    finished = true;
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        if finished {
+                            drop(streams.remove(index));
+                        } else {
+                            index += 1;
+                        }
+                    }
+                    // Drive the same coalesced current-state/change stream as
+                    // the native subscription, after actual permit release.
+                    if let Some(Some(message)) = availability.next().now_or_never() {
+                        effects.push(iced::runtime::Action::Output(cosmic::Action::App(message)));
+                    }
+                    // A native redraw is paced by the event loop. Keep this
+                    // fixture from exhausting a synthetic iteration cap while
+                    // real full-context shaping is still running off-thread.
+                    tokio::time::sleep(Duration::from_millis(16)).await;
+                });
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                let mut element = view(runtime, &shortcuts);
+                // Match the native runtime: initialize/reconcile the root tag
+                // and state before diffing its children or delivering events.
+                tree.diff(element.as_widget_mut());
+                let mut node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let mut messages = Vec::new();
+                for effect in effects {
+                    match effect {
+                        iced::runtime::Action::Widget(operation) => {
+                            let mut current = Some(operation);
+                            while let Some(mut operation) = current.take() {
+                                element.as_widget_mut().operate(
+                                    &mut tree,
+                                    Layout::new(&node),
+                                    &renderer,
+                                    operation.as_mut(),
+                                );
+                                if let operation::Outcome::Chain(next) = operation.finish() {
+                                    current = Some(next);
+                                }
+                            }
+                            node = element
+                                .as_widget_mut()
+                                .layout(&mut tree, &renderer, &limits);
+                        }
+                        iced::runtime::Action::Output(cosmic::Action::App(message)) => {
+                            messages.push(message)
+                        }
+                        _ => {}
+                    }
+                }
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &iced::Event::Window(iced::window::Event::RedrawRequested(
+                        iced::time::Instant::now(),
+                    )),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                let mut visible = Visible {
+                    identity,
+                    byte,
+                    translation: iced::Vector::ZERO,
+                    pending: None,
+                    clips: Vec::new(),
+                    found: false,
+                    sample: None,
+                };
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut visible,
+                );
+                let pending = runtime.find_navigation.pending();
+                if visible.sample.is_some() {
+                    last_geometry = visible.sample;
+                }
+                drop(element);
+                for message in messages {
+                    if append_target
+                        && target_publications == 0
+                        && buffered_reply.is_none()
+                        && matches!(&message, Message::ChatUi(Action::FlowReady(_, _, Some(_))))
+                    {
+                        // Hold an actual produced reply, including its source
+                        // and output admission, without blocking parser workers.
+                        buffered_reply = Some(message);
+                        continue;
+                    }
+                    if let Message::ChatUi(Action::FindLocated(_, _, _, location)) = &message {
+                        if release.is_some()
+                            && location
+                                .as_ref()
+                                .is_some_and(|location| location.shape_pending.is_some())
+                        {
+                            stalled_locations += 1;
+                        }
+                        if locations.len() == 16 {
+                            locations.pop_front();
+                        }
+                        locations.push_back(location.clone());
+                    }
+                    push(&mut streams, app.update(message));
+                }
+                if release.is_some() {
+                    assert!(
+                        app.chat_runtime_mut(target)
+                            .unwrap()
+                            .find_navigation
+                            .correction_count()
+                            .is_some_and(|count| count < 16),
+                        "delayed current geometry keeps Find pending without spending its correction budget"
+                    );
+                    if stalled_locations >= 24 {
+                        release.take().unwrap().send(()).unwrap();
+                    } else {
+                        // This exact stale same-card completion is rejected by
+                        // source ownership, but still delivers the real handler's
+                        // geometry wake. It cannot burn the current Find budget.
+                        push(
+                            &mut streams,
+                            app.handle_chat_ui(Action::FlowReady(
+                                target,
+                                stale_request.as_ref().unwrap().clone(),
+                                None,
+                            )),
+                        );
+                    }
+                }
+                if buffered_reply.is_some() {
+                    let runtime = app.chat_runtime_mut(target).unwrap();
+                    assert!(
+                        runtime
+                            .find_navigation
+                            .correction_count()
+                            .is_some_and(|count| count < 16),
+                        "current target publications preserve the pending Find correction budget"
+                    );
+                    let current = runtime.active_item(&item.id).unwrap().clone();
+                    let accepted = runtime.cache.get(&item.id).is_some_and(|cached| {
+                        !cached.placeholder
+                            && cached
+                                .item
+                                .as_ref()
+                                .is_some_and(|shown| Arc::ptr_eq(shown, &current))
+                    });
+                    if accepted
+                        && runtime.find_navigation.current_hit()
+                            == Some((item.id.as_str(), identity, byte))
+                    {
+                        let (catalog, _) = runtime.selection_document();
+                        let actual = catalog
+                            .owned_search_blocks(&HashSet::from([item.id.clone()]))
+                            .into_iter()
+                            .find(|(_, _, text)| text.contains(needle))
+                            .unwrap();
+                        assert_eq!((actual.1, actual.2.find(needle)), (identity, Some(byte)));
+                        accepted_publications = target_publications;
+                        if target_publications == 24 {
+                            assert!(
+                                actual.2.ends_with(" verified append 24"),
+                                "the exact current accepted catalog contains the final source publication"
+                            );
+                            push(&mut streams, app.update(buffered_reply.take().unwrap()));
+                        } else {
+                            target_publications += 1;
+                            use chat::presentation::{ItemChange, Presentation};
+                            let previous = handle.snapshot();
+                            let old = previous
+                                .items
+                                .iter()
+                                .find(|source| source.id == item.id)
+                                .unwrap();
+                            let mut next = (**old).clone();
+                            let ItemContent::Text { text, .. } = &mut next.content else {
+                                unreachable!();
+                            };
+                            text.push_str(&format!(" verified append {target_publications}"));
+                            let change = ItemChange::between(Some(old), &next);
+                            assert!(
+                                matches!(change, ItemChange::Append { .. }),
+                                "the real presentation validator receives an append delta"
+                            );
+                            let mut metadata = (*previous).clone();
+                            metadata.generation += 1;
+                            metadata.items.clear();
+                            handle.publish_presentation_for_test(Presentation {
+                                base_generation: previous.generation,
+                                file_changes_unchanged: false,
+                                metadata,
+                                order: vec![item.id.clone()],
+                                changes: vec![change],
+                                children: vec![],
+                            });
+                            let next = handle.snapshot().items[0].clone();
+                            assert!(
+                                handle.known_append(old, &next),
+                                "actual client lineage authenticates each current-target publication"
+                            );
+                            push(
+                                &mut streams,
+                                app.handle_chat_ui(Action::Wake(target, Wake::Changed)),
+                            );
+                        }
+                    }
+                }
+                if !pending && visible.found && (!append_target || accepted_publications == 24) {
+                    seen = true;
+                    break;
+                }
+            }
+            assert!(
+                !append_target
+                    || (target_publications == 24
+                        && accepted_publications == 24
+                        && buffered_reply.is_none()),
+                "more than sixteen real target appends were accepted and reindexed before releasing Flow"
+            );
+            assert!(
+                !delayed || stalled_locations >= 24,
+                "actual current geometry survived more than sixteen unrelated completion wakes"
+            );
+            assert!(
+                seen,
+                "actual Find action must expose the deep mounted glyph; child={child}, path={path:?}, byte={byte}, passes={passes}, streams={}, navigation={}, last_geometry={last_geometry:?}, locations={locations:?}",
+                streams.len(),
+                app.chat_runtime_mut(target)
+                    .unwrap()
+                    .find_navigation
+                    .diagnostic(),
+            );
+            // A collapsed tool exposes its output only after the real accepted
+            // Find plan expands it. Verify the same source oracle after that
+            // user path and actual mounted glyph, without pre-expanding it.
+            let (catalog, _) = app.chat_runtime_mut(target).unwrap().selection_document();
+            let actual = catalog
+                .owned_search_blocks(&HashSet::from([item.id.clone()]))
+                .into_iter()
+                .find(|(_, _, text)| text.contains(needle))
+                .expect("actual prepared source catalog includes the deep needle");
+            assert_eq!(actual.1, identity, "fixture logical path {path:?}");
+            assert_eq!(actual.2.find(needle), Some(byte), "fixture logical byte");
+            assert_eq!(
+                app.chat_runtime_mut(target).unwrap().find_matches.len(),
+                1,
+                "main matching-group count is preserved"
+            );
+            for forward in [true, false] {
+                // The single match wraps in both directions through the real
+                // action and creates a fresh guarded navigation intent.
+                drop(app.handle_chat_ui(Action::FindNext(target, forward)));
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                assert_eq!(runtime.find_index, 0);
+                let intent = runtime.find_navigation.guard();
+                assert!(intent.current());
+                drop(app.handle_chat_ui(Action::Scrolled(
+                    target,
+                    child.then(|| "deep-child".into()),
+                    Scroll::new(0.0, 10_000.0, 500.0),
+                    true,
+                )));
+                assert!(
+                    !intent.current(),
+                    "a late queued correction cannot override actual user navigation"
+                );
+                assert!(
+                    !app.chat_runtime_mut(target)
+                        .unwrap()
+                        .find_navigation
+                        .pending()
+                );
+            }
+        }
+        executor.shutdown_background();
+    }
+
+    #[test]
     fn find_reveals_long_prompts_and_restores_disclosures_in_each_transcript() {
         use iced::advanced::{
             Layout, layout,
@@ -6152,10 +7786,21 @@ mod tests {
         handle.publish_snapshot_for_test(snapshot);
         app.chat_runtime_mut(target).unwrap().refresh();
         let renderer = crate::app::tests::headless_renderer();
-        let rendered = |runtime: &Runtime| {
+        let rendered = |runtime: &mut Runtime| {
+            // A newly selected child has its own actual parser preparation;
+            // completing Flow cannot manufacture a missing prompt DTO.
+            preparation::drain_fixture(runtime);
             let mut element = runtime.prompt_view(runtime.active_item("same#opaque-id").unwrap());
             let mut tree = Tree::new(element.as_widget());
-            let node = element.as_widget_mut().layout(
+            let mut node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 8000.0)),
+            );
+            for cached in runtime.cache.values().chain(runtime.child_cache.values()) {
+                cached.flow_cache.complete_fixture();
+            }
+            node = element.as_widget_mut().layout(
                 &mut tree,
                 &renderer,
                 &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 8000.0)),
@@ -6184,19 +7829,35 @@ mod tests {
             text.0.join("\n")
         };
         assert!(!rendered(app.chat_runtime_mut(target).unwrap()).contains("parent-only-suffix"));
-        drop(app.handle_chat_ui(Action::Find(target, "parent-only-suffix".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "parent-only-suffix".into(),
+        ));
         assert!(
             rendered(app.chat_runtime_mut(target).unwrap()).contains("parent-only-suffix"),
             "a parent prompt Find match must be visible beyond its collapsed cutoff"
         );
-        drop(app.handle_chat_ui(Action::Find(target, "absent".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "absent".into(),
+        ));
         assert!(!rendered(app.chat_runtime_mut(target).unwrap()).contains("parent-only-suffix"));
-        drop(app.handle_chat_ui(Action::Find(target, "parent-only-suffix".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "parent-only-suffix".into(),
+        ));
         drop(app.handle_chat_ui(Action::CloseFind(target)));
         assert!(!rendered(app.chat_runtime_mut(target).unwrap()).contains("parent-only-suffix"));
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("native-child".into()))));
         assert!(!rendered(app.chat_runtime_mut(target).unwrap()).contains("child-only-suffix"));
-        drop(app.handle_chat_ui(Action::Find(target, "child-only-suffix".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "child-only-suffix".into(),
+        ));
         assert!(
             rendered(app.chat_runtime_mut(target).unwrap()).contains("child-only-suffix"),
             "a child prompt Find match must be visible beyond its collapsed cutoff"
@@ -6207,12 +7868,24 @@ mod tests {
                 .expanded
                 .contains("same#opaque-id")
         );
-        drop(app.handle_chat_ui(Action::Find(target, "absent".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "absent".into(),
+        ));
         assert!(!rendered(app.chat_runtime_mut(target).unwrap()).contains("child-only-suffix"));
-        drop(app.handle_chat_ui(Action::Find(target, "child-only-suffix".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "child-only-suffix".into(),
+        ));
         drop(app.handle_chat_ui(Action::CloseFind(target)));
         assert!(!rendered(app.chat_runtime_mut(target).unwrap()).contains("child-only-suffix"));
-        drop(app.handle_chat_ui(Action::Find(target, "child-only-suffix".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "child-only-suffix".into(),
+        ));
         drop(app.handle_chat_ui(Action::Toggle(target, "same#opaque-id".into())));
         drop(app.handle_chat_ui(Action::Toggle(target, "same#opaque-id".into())));
         drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
@@ -6224,7 +7897,11 @@ mod tests {
             "explicit child expansion survives search close and transcript switches"
         );
         drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
-        drop(app.handle_chat_ui(Action::Find(target, "parent-only-suffix".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "parent-only-suffix".into(),
+        ));
         drop(app.handle_chat_ui(Action::Toggle(target, "same#opaque-id".into())));
         drop(app.handle_chat_ui(Action::Toggle(target, "same#opaque-id".into())));
         drop(app.handle_chat_ui(Action::CloseFind(target)));
@@ -6303,6 +7980,1488 @@ mod tests {
             labels.iter().any(|label| label.contains("Conversation")),
             "{labels:?}"
         );
+    }
+
+    #[test]
+    fn native_app_reader_survives_cold_source_placeholder_until_actual_preparation_completes() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation},
+        };
+        struct Reader {
+            id: widget::Id,
+            move_bottom: Option<f32>,
+            top: Option<f32>,
+        }
+        impl Operation for Reader {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: iced::Rectangle,
+                _: iced::Rectangle,
+                translation: iced::Vector,
+                state: &mut dyn operation::Scrollable,
+            ) {
+                if id == Some(&self.id) {
+                    self.top = Some(translation.y);
+                    if let Some(bottom) = self.move_bottom.take() {
+                        state.scroll_to(iced::widget::scrollable::AbsoluteOffset {
+                            x: None,
+                            y: Some(bottom),
+                        });
+                    }
+                }
+            }
+        }
+        fn runtime(app: &Cagents, target: Target) -> &Runtime {
+            match &app.cards[&target.card] {
+                CardRuntime::Chat(runtime) => runtime,
+                _ => panic!("fixture chat"),
+            }
+        }
+        fn view(app: &Cagents, target: Target) -> Element<'_, Message> {
+            runtime(app, target).view(
+                None,
+                false,
+                true,
+                &app.settings.keyboard_shortcuts,
+                620.0,
+                Place {
+                    name: "restore-fixture".into(),
+                    branch: None,
+                    channel: None,
+                },
+                true,
+                None,
+                vec![],
+            )
+        }
+        let source = (0..80)
+            .map(|index| {
+                format!(
+                    "## Section {index:04}\n\nReading paragraph {index:04}: {}\n\n",
+                    "ordinary text ".repeat(12)
+                )
+            })
+            .collect::<String>();
+        let item = chat::Item {
+            id: "cold-rich".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: source,
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            at: None,
+            started_at: None,
+        };
+        let (mut live, handle) = frame_cost::live_runtime(&[item]);
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let mut target = live.target;
+        target.card = app.workspace.focused().unwrap();
+        live.target = target;
+        app.card_state_mut(target.card).unwrap().kind = CardKind::Chat(live.session.clone());
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(live)));
+        let renderer = crate::app::tests::headless_renderer();
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(620.0, 720.0));
+        let scroll = card_control_id(target.card, "chat-transcript");
+        let read = |element: &mut Element<'_, Message>, tree: &mut Tree, node: &layout::Node| {
+            let mut reader = Reader {
+                id: scroll.clone(),
+                move_bottom: None,
+                top: None,
+            };
+            element
+                .as_widget_mut()
+                .operate(tree, Layout::new(node), &renderer, &mut reader);
+            reader.top.expect("actual native transcript")
+        };
+        let expected;
+        {
+            let mut element = view(&app, target);
+            let mut tree = Tree::new(&element);
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let mut movement = Reader {
+                id: scroll.clone(),
+                move_bottom: Some(700.0),
+                top: None,
+            };
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut movement,
+            );
+            expected = read(&mut element, &mut tree, &node);
+            assert!(expected > 500.0);
+            // No subsequent layout: hide immediately after actual navigation.
+        }
+        let snapshot = (*runtime(&app, target).snapshot).clone();
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .set_visible(false)
+            .unwrap();
+        preparation::retirement_barrier();
+        assert!(runtime(&app, target).cache.is_empty());
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .set_visible(true)
+            .unwrap();
+        let mut tree;
+        {
+            let mut empty_wait = view(&app, target);
+            tree = Tree::new(&empty_wait);
+            empty_wait
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+        }
+        handle.replace_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        assert!(runtime(&app, target).cache["cold-rich"].placeholder);
+        assert!(runtime(&app, target).preparation.contains("cold-rich"));
+        {
+            let mut placeholder = view(&app, target);
+            tree.diff(placeholder.as_widget_mut());
+            placeholder
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+        }
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        assert!(!runtime(&app, target).cache["cold-rich"].placeholder);
+        let mut ready = view(&app, target);
+        tree.diff(ready.as_widget_mut());
+        let node = ready.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let actual = read(&mut ready, &mut tree, &node);
+        assert!(
+            (actual - expected).abs() <= 1.0,
+            "actual App/native Tree restored {actual} instead of {expected}"
+        );
+    }
+
+    // Task::batch wraps even zero effects in Some(empty stream). Observe the
+    // real native task protocol instead of its optional stream representation.
+    fn native_task_emits_nothing(task: Task<Message>) -> bool {
+        use iced::futures::StreamExt;
+        let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+            return true;
+        };
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let empty = executor.block_on(async {
+            tokio::time::timeout(Duration::from_millis(250), stream.next())
+                .await
+                .expect("empty native effect stream must settle")
+                .is_none()
+        });
+        executor.shutdown_background();
+        empty
+    }
+
+    #[test]
+    fn native_paginated_latest_waits_for_newest_source_after_ack_and_preserves_child_and_failure_readers()
+     {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation},
+        };
+        use iced::futures::StreamExt;
+        for case in ["success-main", "failure-main", "success-child"] {
+            struct Reader {
+                id: widget::Id,
+                move_bottom: Option<f32>,
+                top: Option<f32>,
+                travel: Option<f32>,
+                tail: bool,
+            }
+            impl Operation for Reader {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn custom(
+                    &mut self,
+                    _: Option<&widget::Id>,
+                    _: iced::Rectangle,
+                    state: &mut dyn std::any::Any,
+                ) {
+                    if let Some(prose) = state.downcast_ref::<selectable_prose::State>() {
+                        self.tail |= prose.plain.contains("LATEST_END_NATIVE_ATTESTATION");
+                    }
+                }
+                fn scrollable(
+                    &mut self,
+                    id: Option<&widget::Id>,
+                    viewport: iced::Rectangle,
+                    content: iced::Rectangle,
+                    translation: iced::Vector,
+                    state: &mut dyn operation::Scrollable,
+                ) {
+                    if id == Some(&self.id) {
+                        self.top = Some(translation.y);
+                        self.travel = Some((content.height - viewport.height).max(0.0));
+                        if let Some(bottom) = self.move_bottom.take() {
+                            state.scroll_to(iced::widget::scrollable::AbsoluteOffset {
+                                x: None,
+                                y: Some(bottom),
+                            });
+                        }
+                    }
+                }
+            }
+            fn runtime(app: &Cagents, target: Target) -> &Runtime {
+                match &app.cards[&target.card] {
+                    CardRuntime::Chat(runtime) => runtime,
+                    _ => panic!("fixture chat"),
+                }
+            }
+            fn view(app: &Cagents, target: Target) -> Element<'_, Message> {
+                runtime(app, target).view(
+                    None,
+                    false,
+                    true,
+                    &app.settings.keyboard_shortcuts,
+                    620.0,
+                    Place {
+                        name: "restore-fixture".into(),
+                        branch: None,
+                        channel: None,
+                    },
+                    true,
+                    None,
+                    vec![],
+                )
+            }
+            let source = (0..80)
+                .map(|index| {
+                    format!(
+                        "## Section {index:04}\n\nReading paragraph {index:04}: {}\n\n",
+                        "ordinary text ".repeat(12)
+                    )
+                })
+                .collect::<String>();
+            let item = chat::Item {
+                id: "cold-rich".into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Text {
+                    text: source,
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                at: None,
+                started_at: None,
+            };
+            let (mut live, handle) = frame_cost::live_runtime(&[item]);
+            let mut app = crate::app::tests::context_inspector_test_app(true);
+            let mut target = live.target;
+            target.card = app.workspace.focused().unwrap();
+            live.target = target;
+            app.card_state_mut(target.card).unwrap().kind = CardKind::Chat(live.session.clone());
+            app.cards
+                .insert(target.card, CardRuntime::Chat(Box::new(live)));
+            let mut initial = (*handle.snapshot()).clone();
+            initial.generation = 10;
+            initial.has_later = true;
+            let mut child = (*initial.items[0]).clone();
+            child.id = "child-rich".into();
+            initial.subagents.push(chat::Subagent {
+                id: "selected-child".into(),
+                kind: "fixture".into(),
+                description: "Child".into(),
+                status: chat::ToolStatus::Succeeded,
+                model: None,
+                waiting: false,
+                detail: String::new(),
+                background: false,
+                items: vec![Arc::new(child)],
+            });
+            handle.replace_snapshot_for_test(initial);
+            app.chat_runtime_mut(target).unwrap().refresh();
+            preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            let renderer = crate::app::tests::headless_renderer();
+            let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(620.0, 720.0));
+            let scroll = card_control_id(target.card, "chat-transcript");
+            let read = |element: &mut Element<'_, Message>,
+                        tree: &mut Tree,
+                        node: &layout::Node| {
+                let mut reader = Reader {
+                    id: scroll.clone(),
+                    move_bottom: None,
+                    top: None,
+                    travel: None,
+                    tail: false,
+                };
+                element
+                    .as_widget_mut()
+                    .operate(tree, Layout::new(node), &renderer, &mut reader);
+                (
+                    reader.top.expect("actual native transcript"),
+                    reader.travel.unwrap(),
+                    reader.tail,
+                )
+            };
+            let expected;
+            {
+                let mut element = view(&app, target);
+                let mut tree = Tree::new(&element);
+                let node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let mut movement = Reader {
+                    id: scroll.clone(),
+                    move_bottom: Some(700.0),
+                    top: None,
+                    travel: None,
+                    tail: false,
+                };
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut movement,
+                );
+                expected = read(&mut element, &mut tree, &node).0;
+                assert!(expected > 500.0);
+                // No subsequent layout: hide immediately after actual navigation.
+            }
+            let snapshot = (*runtime(&app, target).snapshot).clone();
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .set_visible(false)
+                .unwrap();
+            preparation::retirement_barrier();
+            assert!(runtime(&app, target).cache.is_empty());
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .set_visible(true)
+                .unwrap();
+            let mut tree;
+            {
+                let mut empty_wait = view(&app, target);
+                tree = Tree::new(&empty_wait);
+                empty_wait
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+            }
+            handle.replace_snapshot_for_test(snapshot);
+            app.chat_runtime_mut(target).unwrap().refresh();
+            assert!(runtime(&app, target).cache["cold-rich"].placeholder);
+            assert!(runtime(&app, target).preparation.contains("cold-rich"));
+            drop(app.handle_chat_ui(Action::Latest(target)));
+            let pending = runtime(&app, target)
+                .pending
+                .as_ref()
+                .expect("actual Latest dispatch");
+            assert_eq!(pending.page, Some(Page::Latest));
+            let pending_id = pending.id;
+            assert_eq!(
+                runtime(&app, target).scroll_memory.edge(None),
+                Some(scroll::Edge::Latest)
+            );
+            if case == "success-child" {
+                drop(app.handle_chat_ui(Action::SelectSubagent(
+                    target,
+                    Some("selected-child".into()),
+                )));
+                preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+                let mut child = view(&app, target);
+                tree.diff(child.as_widget_mut());
+                let node = child.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                let mut movement = Reader {
+                    id: scroll.clone(),
+                    move_bottom: Some(300.0),
+                    top: None,
+                    travel: None,
+                    tail: false,
+                };
+                child.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut movement,
+                );
+            }
+            let child_before = if case == "success-child" {
+                let mut child = view(&app, target);
+                tree.diff(child.as_widget_mut());
+                let node = child.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                Some(read(&mut child, &mut tree, &node))
+            } else {
+                None
+            };
+            let completion = app.handle_chat_ui(Action::CommandFinished(
+                target,
+                pending_id,
+                if case == "failure-main" {
+                    Err("Fixture newest-history request failed".into())
+                } else {
+                    Ok(())
+                },
+            ));
+            if case == "success-main" {
+                assert_eq!(
+                    runtime(&app, target).snapshot.generation,
+                    10,
+                    "ACK is not newer history arrival"
+                );
+                assert!(runtime(&app, target).snapshot.has_later);
+                assert_eq!(runtime(&app, target).page_request, Some((Page::Latest, 10)));
+                let mut placeholder = view(&app, target);
+                tree.diff(placeholder.as_widget_mut());
+                let node = placeholder
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let before = read(&mut placeholder, &mut tree, &node);
+                assert_eq!((before.0, before.1), (0.0, 0.0));
+                let executor = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                executor.block_on(async {
+                    let mut stream = iced::runtime::task::into_stream(completion)
+                        .expect("real successful PageLatest completion effects");
+                    let mut native_snap = false;
+                    while let Ok(Some(effect)) =
+                        tokio::time::timeout(Duration::from_millis(250), stream.next()).await
+                    {
+                        if let iced::runtime::Action::Widget(mut operation) = effect {
+                            placeholder.as_widget_mut().operate(
+                                &mut tree,
+                                Layout::new(&node),
+                                &renderer,
+                                operation.as_mut(),
+                            );
+                            native_snap = true;
+                        }
+                    }
+                    assert!(
+                        native_snap,
+                        "success uses actual typed native edge operation"
+                    );
+                });
+                executor.shutdown_background();
+                assert_eq!(
+                    read(&mut placeholder, &mut tree, &node),
+                    before,
+                    "fitting ACK operation cannot establish source arrival"
+                );
+            } else {
+                assert!(
+                    native_task_emits_nothing(completion),
+                    "failed or child-selected ACK emits no native scroll"
+                );
+            }
+            if case == "failure-main" {
+                assert_eq!(runtime(&app, target).scroll_memory.edge(None), None);
+                assert!(runtime(&app, target).page_request.is_none());
+                preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+                let mut ready = view(&app, target);
+                tree.diff(ready.as_widget_mut());
+                let node = ready.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                let actual = read(&mut ready, &mut tree, &node);
+                assert!(
+                    (actual.0 - expected).abs() <= 1.0,
+                    "failed Latest preserves old native reading anchor"
+                );
+                assert!(!actual.2);
+                continue;
+            }
+            preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            {
+                let mut old_ready = view(&app, target);
+                tree.diff(old_ready.as_widget_mut());
+                let node = old_ready
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let old = read(&mut old_ready, &mut tree, &node);
+                assert!(
+                    old.1 > 500.0 && !old.2,
+                    "actual old-generation Ready is large and has no newest end marker"
+                );
+                if let Some(before) = child_before {
+                    assert_eq!(
+                        old, before,
+                        "old parent ACK/Ready cannot move selected child"
+                    );
+                }
+            }
+            assert_eq!(
+                runtime(&app, target).scroll_memory.edge(None),
+                Some(scroll::Edge::Latest),
+                "old source Ready cannot fulfill explicit Latest"
+            );
+            if case == "success-main" {
+                let home = app
+                    .chat_scroll_key(&keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(keyboard::key::Named::Home),
+                        modified_key: keyboard::Key::Named(keyboard::key::Named::Home),
+                        physical_key: keyboard::key::Physical::Unidentified(
+                            keyboard::key::NativeCode::Unidentified,
+                        ),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::empty(),
+                        text: None,
+                        repeat: false,
+                    })
+                    .expect("actual Home dispatch after ACK");
+                assert_eq!(
+                    runtime(&app, target).scroll_memory.edge(None),
+                    Some(scroll::Edge::Start)
+                );
+                {
+                    let mut at_home = view(&app, target);
+                    tree.diff(at_home.as_widget_mut());
+                    let node = at_home
+                        .as_widget_mut()
+                        .layout(&mut tree, &renderer, &limits);
+                    let executor = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    executor.block_on(async {
+                        let mut stream = iced::runtime::task::into_stream(home)
+                            .expect("actual Home widget operation");
+                        let effect =
+                            tokio::time::timeout(Duration::from_millis(250), stream.next())
+                                .await
+                                .unwrap()
+                                .expect("Home effect");
+                        let iced::runtime::Action::Widget(mut operation) = effect else {
+                            panic!("Home widget operation");
+                        };
+                        at_home.as_widget_mut().operate(
+                            &mut tree,
+                            Layout::new(&node),
+                            &renderer,
+                            operation.as_mut(),
+                        );
+                    });
+                    executor.shutdown_background();
+                    assert_eq!(read(&mut at_home, &mut tree, &node).0, 0.0);
+                }
+                let dispatched = runtime(&app, target).next_command;
+                drop(app.handle_chat_ui(Action::Latest(target)));
+                assert_eq!(
+                    runtime(&app, target).next_command,
+                    dispatched,
+                    "post-ACK repeated Latest coalesces the existing request"
+                );
+                assert!(runtime(&app, target).pending.is_none());
+                assert_eq!(runtime(&app, target).page_request, Some((Page::Latest, 10)));
+                assert_eq!(
+                    runtime(&app, target).scroll_memory.edge(None),
+                    Some(scroll::Edge::Latest),
+                    "post-ACK explicit Latest supersedes actual Home even while provider request coalesces"
+                );
+            }
+
+            let mut latest = (*handle.snapshot()).clone();
+            latest.generation = 11;
+            latest.has_later = false;
+            latest.history_loading = false;
+            let ItemContent::Text { text, .. } = &mut Arc::make_mut(&mut latest.items[0]).content
+            else {
+                panic!("text fixture");
+            };
+            for index in 80..120 {
+                text.push_str(&format!(
+                    "\n\n## Newest section {index:04}\n\n{}\n\n",
+                    "new authoritative source ".repeat(12)
+                ));
+            }
+            text.push_str("\n\nLATEST_END_NATIVE_ATTESTATION\n");
+            handle.replace_snapshot_for_test(latest);
+            app.chat_runtime_mut(target).unwrap().refresh();
+            assert_eq!(runtime(&app, target).snapshot.generation, 11);
+            assert!(!runtime(&app, target).snapshot.has_later);
+            assert!(runtime(&app, target).page_request.is_none());
+            if case == "success-child" {
+                let mut child = view(&app, target);
+                tree.diff(child.as_widget_mut());
+                let node = child.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                assert_eq!(
+                    read(&mut child, &mut tree, &node),
+                    child_before.unwrap(),
+                    "parent ACK/newest source cannot move selected child"
+                );
+                drop(child);
+                drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+            }
+            assert!(
+                runtime(&app, target).cache["cold-rich"].placeholder,
+                "newest source uses real cold preparation"
+            );
+            {
+                let mut pending = view(&app, target);
+                tree.diff(pending.as_widget_mut());
+                pending
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+            }
+            preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            assert!(!runtime(&app, target).cache["cold-rich"].placeholder);
+            let mut ready = view(&app, target);
+            tree.diff(ready.as_widget_mut());
+            let node = ready.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let actual = read(&mut ready, &mut tree, &node);
+            assert!(
+                actual.1 > 500.0 && (actual.0 - actual.1).abs() <= 1.0 && actual.2,
+                "actual newest-generation Ready must mount its end marker at native end, got {actual:?}, old reading top {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_deferred_latest_fetch_preserves_later_home_and_wheel_across_replacement_source() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation},
+        };
+        use iced::futures::StreamExt;
+        struct Reader {
+            id: widget::Id,
+            bottom: Option<f32>,
+            top: f32,
+            travel: f32,
+            bounds: iced::Rectangle,
+        }
+        impl Operation for Reader {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                viewport: iced::Rectangle,
+                content: iced::Rectangle,
+                translation: iced::Vector,
+                state: &mut dyn operation::Scrollable,
+            ) {
+                if id == Some(&self.id) {
+                    self.top = translation.y;
+                    self.travel = (content.height - viewport.height).max(0.0);
+                    self.bounds = viewport;
+                    if let Some(bottom) = self.bottom.take() {
+                        state.scroll_to(iced::widget::scrollable::AbsoluteOffset {
+                            x: None,
+                            y: Some(bottom),
+                        });
+                    }
+                }
+            }
+        }
+        fn runtime(app: &Cagents, target: Target) -> &Runtime {
+            match &app.cards[&target.card] {
+                CardRuntime::Chat(runtime) => runtime,
+                _ => panic!("fixture chat"),
+            }
+        }
+        fn view(app: &Cagents, target: Target) -> Element<'_, Message> {
+            runtime(app, target).view(
+                None,
+                false,
+                true,
+                &app.settings.keyboard_shortcuts,
+                620.0,
+                Place {
+                    name: "restore-fixture".into(),
+                    branch: None,
+                    channel: None,
+                },
+                true,
+                None,
+                vec![],
+            )
+        }
+        for case in [
+            "home",
+            "wheel",
+            "child",
+            "failure",
+            "follow",
+            "ordinary",
+            "coalesced",
+            "intermediate",
+            "find",
+        ] {
+            let item = chat::Item {
+                id: "old-window-only".into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Text {
+                    text: (0..100)
+                        .map(|index| {
+                            format!("## Old {index}\n\n{}\n\n", "reader source ".repeat(12))
+                        })
+                        .collect(),
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                at: None,
+                started_at: None,
+            };
+            let (mut live, handle) = frame_cost::live_runtime(&[item]);
+            let mut app = crate::app::tests::context_inspector_test_app(true);
+            let mut target = live.target;
+            target.card = app.workspace.focused().unwrap();
+            live.target = target;
+            app.card_state_mut(target.card).unwrap().kind = CardKind::Chat(live.session.clone());
+            app.cards
+                .insert(target.card, CardRuntime::Chat(Box::new(live)));
+            let mut initial = (*handle.snapshot()).clone();
+            initial.generation = 10;
+            initial.has_later = true;
+            let mut child = (*initial.items[0]).clone();
+            child.id = "unrelated-child".into();
+            initial.subagents.push(chat::Subagent {
+                id: "child".into(),
+                kind: "fixture".into(),
+                description: "Child".into(),
+                status: chat::ToolStatus::Succeeded,
+                model: None,
+                waiting: false,
+                detail: String::new(),
+                background: false,
+                items: vec![Arc::new(child)],
+            });
+            handle.replace_snapshot_for_test(initial);
+            app.chat_runtime_mut(target).unwrap().refresh();
+            preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            let renderer = crate::app::tests::headless_renderer();
+            let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(620.0, 720.0));
+            let read = |element: &mut Element<'_, Message>,
+                        tree: &mut Tree,
+                        node: &layout::Node,
+                        bottom| {
+                let mut reader = Reader {
+                    id: card_control_id(target.card, "chat-transcript"),
+                    bottom,
+                    top: -1.0,
+                    travel: -1.0,
+                    bounds: iced::Rectangle::default(),
+                };
+                element
+                    .as_widget_mut()
+                    .operate(tree, Layout::new(node), &renderer, &mut reader);
+                reader
+            };
+            let mut tree;
+            {
+                let mut element = view(&app, target);
+                tree = Tree::new(&element);
+                let node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                read(&mut element, &mut tree, &node, Some(700.0));
+                assert!(read(&mut element, &mut tree, &node, None).top > 500.0);
+            }
+            let unrelated = if matches!(case, "ordinary" | "coalesced") {
+                None
+            } else {
+                drop(app.chat_send(
+                    target,
+                    Command::SetPermissionMode {
+                        mode: "manual".into(),
+                    },
+                    false,
+                ));
+                Some(runtime(&app, target).pending.as_ref().unwrap().id)
+            };
+            drop(app.handle_chat_ui(Action::Latest(target)));
+            if unrelated.is_some() {
+                assert_eq!(
+                    runtime(&app, target).deferred_page,
+                    Some(HistoryNavigation::Latest)
+                );
+            }
+            assert_eq!(
+                runtime(&app, target).scroll_memory.edge(None),
+                Some(scroll::Edge::Latest)
+            );
+            let mut find_guard = None;
+            let expected;
+            if case == "find" {
+                // Accept a real Find query before certifying its navigation
+                // guard; refresh correctly cancels navigation without a query.
+                drop(find_navigation::find_for_test(
+                    &mut app,
+                    target,
+                    "Old 50".into(),
+                ));
+                let (catalog, _) = runtime(&app, target).selection_document();
+                let (_, identity, _) = catalog
+                    .owned_search_blocks(&HashSet::from(["old-window-only".into()]))
+                    .into_iter()
+                    .find(|(_, _, text)| text.as_ref() == "Old 50")
+                    .expect("actual prepared Find heading");
+                let intent = runtime(&app, target).find_navigation.guard();
+                let epoch = runtime(&app, target).find_navigation.document_epoch();
+                let mut element = view(&app, target);
+                tree.diff(element.as_widget_mut());
+                let node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let executor = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let location = executor.block_on(async {
+                    let mut stream = iced::runtime::task::into_stream(scroll::locate_logical(
+                        target,
+                        "old-window-only".into(),
+                        identity,
+                        0,
+                    ))
+                    .unwrap();
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while let Some(effect) = stream.next().await {
+                            match effect {
+                                iced::runtime::Action::Widget(mut operation) => {
+                                    element.as_widget_mut().operate(
+                                        &mut tree,
+                                        Layout::new(&node),
+                                        &renderer,
+                                        operation.as_mut(),
+                                    );
+                                    let _ = operation.finish();
+                                }
+                                iced::runtime::Action::Output(location) => {
+                                    return location.expect("actual native Find location");
+                                }
+                                _ => {}
+                            }
+                        }
+                        panic!("actual locator completion");
+                    })
+                    .await
+                    .unwrap()
+                });
+                executor.block_on(async {
+                    let task =
+                        scroll::apply_find_location(target, location, intent.clone(), Some(epoch));
+                    let mut stream = iced::runtime::task::into_stream(task).unwrap();
+                    let effect = tokio::time::timeout(Duration::from_millis(250), stream.next())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let iced::runtime::Action::Widget(mut operation) = effect else {
+                        panic!("actual Find widget operation")
+                    };
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        operation.as_mut(),
+                    );
+                    let _ = operation.finish();
+                });
+                executor.shutdown_background();
+                let after = read(&mut element, &mut tree, &node, None);
+                assert!(
+                    after.top > 500.0 && after.top < after.travel,
+                    "actual accepted Find owns an interior reader"
+                );
+                assert!(intent.document_current(epoch));
+                find_guard = Some((intent, epoch));
+                expected = Some(after.top);
+            } else if case == "follow" {
+                expected = None;
+            } else if case == "wheel" {
+                let mut element = view(&app, target);
+                tree.diff(element.as_widget_mut());
+                let node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let before = read(&mut element, &mut tree, &node, None);
+                let mut messages = vec![];
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                        delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: 3.0 },
+                    }),
+                    Layout::new(&node),
+                    iced::mouse::Cursor::Available(before.bounds.center()),
+                    &renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut iced::advanced::Shell::new(&mut messages),
+                    &before.bounds,
+                );
+                let after = read(&mut element, &mut tree, &node, None);
+                assert!(
+                    after.top > 0.0 && after.top < before.top,
+                    "actual wheel moved native reader"
+                );
+                expected = Some(after.top);
+            } else {
+                for repetition in 0..if case == "coalesced" { 2 } else { 1 } {
+                    if repetition == 1 {
+                        let count = runtime(&app, target).next_command;
+                        drop(app.handle_chat_ui(Action::Latest(target)));
+                        assert_eq!(
+                            runtime(&app, target).next_command,
+                            count,
+                            "explicit Latest coalesces accepted fetch"
+                        );
+                        assert_eq!(
+                            runtime(&app, target).scroll_memory.edge(None),
+                            Some(scroll::Edge::Latest)
+                        );
+                    }
+                    let home = app
+                        .chat_scroll_key(&keyboard::Event::KeyPressed {
+                            key: keyboard::Key::Named(keyboard::key::Named::Home),
+                            modified_key: keyboard::Key::Named(keyboard::key::Named::Home),
+                            physical_key: keyboard::key::Physical::Unidentified(
+                                keyboard::key::NativeCode::Unidentified,
+                            ),
+                            location: keyboard::Location::Standard,
+                            modifiers: keyboard::Modifiers::empty(),
+                            text: None,
+                            repeat: false,
+                        })
+                        .expect("actual later Home dispatch");
+                    let mut element = view(&app, target);
+                    tree.diff(element.as_widget_mut());
+                    let node = element
+                        .as_widget_mut()
+                        .layout(&mut tree, &renderer, &limits);
+                    let executor = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    executor.block_on(async {
+                        let mut stream = iced::runtime::task::into_stream(home).unwrap();
+                        let effect =
+                            tokio::time::timeout(Duration::from_millis(250), stream.next())
+                                .await
+                                .unwrap()
+                                .unwrap();
+                        let iced::runtime::Action::Widget(mut operation) = effect else {
+                            panic!("Home widget operation")
+                        };
+                        element.as_widget_mut().operate(
+                            &mut tree,
+                            Layout::new(&node),
+                            &renderer,
+                            operation.as_mut(),
+                        );
+                    });
+                    executor.shutdown_background();
+                    assert_eq!(read(&mut element, &mut tree, &node, None).top, 0.0);
+                }
+                expected = Some(0.0);
+            }
+            if let Some(unrelated) = unrelated {
+                assert_eq!(
+                    runtime(&app, target).deferred_page,
+                    Some(HistoryNavigation::Latest),
+                    "reader intent cannot cancel the fetch"
+                );
+                drop(app.handle_chat_ui(Action::CommandFinished(target, unrelated, Ok(()))));
+            }
+            if let Some((intent, epoch)) = &find_guard {
+                assert!(
+                    intent.document_current(*epoch),
+                    "resuming the deferred FETCH cannot cancel current Find intent/document"
+                );
+            }
+            let fetch = runtime(&app, target)
+                .pending
+                .as_ref()
+                .expect("deferred FETCH resumed despite later reader intent");
+            assert_eq!(fetch.page, Some(Page::Latest));
+            let fetch_id = fetch.id;
+            assert_eq!(runtime(&app, target).page_request, Some((Page::Latest, 10)));
+            if expected.is_some() {
+                assert_ne!(
+                    runtime(&app, target).scroll_memory.edge(None),
+                    Some(scroll::Edge::Latest)
+                );
+            }
+            let mut child_before = None;
+            if case == "child" {
+                drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child".into()))));
+                preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+                let mut element = view(&app, target);
+                tree.diff(element.as_widget_mut());
+                let node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                read(&mut element, &mut tree, &node, Some(300.0));
+                child_before = Some(read(&mut element, &mut tree, &node, None).top);
+            }
+            drop(app.handle_chat_ui(Action::CommandFinished(
+                target,
+                fetch_id.wrapping_add(1),
+                Ok(()),
+            )));
+            assert_eq!(
+                runtime(&app, target).pending.as_ref().unwrap().id,
+                fetch_id,
+                "stale ACK cannot consume the actual fetch"
+            );
+            let ack = app.handle_chat_ui(Action::CommandFinished(
+                target,
+                fetch_id,
+                if case == "failure" {
+                    Err("fixture latest failed".into())
+                } else {
+                    Ok(())
+                },
+            ));
+            if let Some((intent, epoch)) = &find_guard {
+                assert!(
+                    intent.document_current(*epoch),
+                    "PageLatest ACK cannot invalidate current accepted Find"
+                );
+            }
+            if expected.is_some() {
+                assert!(
+                    native_task_emits_nothing(ack),
+                    "resumed fetch cannot issue a new reader snap"
+                );
+            }
+            if case == "failure" {
+                let mut element = view(&app, target);
+                tree.diff(element.as_widget_mut());
+                let node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                assert_eq!(
+                    read(&mut element, &mut tree, &node, None).top,
+                    expected.unwrap()
+                );
+                continue;
+            }
+            if case == "intermediate" {
+                let mut intermediate = (*handle.snapshot()).clone();
+                intermediate.generation = 11;
+                intermediate.has_later = true;
+                intermediate.history_loading = false;
+                Arc::make_mut(&mut intermediate.items[0]).id = "intermediate-no-old-ids".into();
+                handle.replace_snapshot_for_test(intermediate);
+                app.chat_runtime_mut(target).unwrap().refresh();
+                assert!(
+                    runtime(&app, target).page_request.is_none(),
+                    "existing Runtime clears page metadata on intermediate source"
+                );
+                {
+                    let mut pending = view(&app, target);
+                    tree.diff(pending.as_widget_mut());
+                    pending
+                        .as_widget_mut()
+                        .layout(&mut tree, &renderer, &limits);
+                }
+                preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+                let mut ready = view(&app, target);
+                tree.diff(ready.as_widget_mut());
+                let node = ready.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                assert_eq!(
+                    read(&mut ready, &mut tree, &node, None).top,
+                    expected.unwrap(),
+                    "intermediate replacement also preserves Home"
+                );
+            }
+            let mut latest = (*handle.snapshot()).clone();
+            latest.generation = if case == "intermediate" { 12 } else { 11 };
+            latest.has_later = false;
+            latest.history_loading = false;
+            let replacement = Arc::make_mut(&mut latest.items[0]);
+            replacement.id = "replacement-with-no-old-ids".into();
+            let ItemContent::Text { text, .. } = &mut replacement.content else {
+                panic!("text fixture")
+            };
+            *text = (0..120)
+                .map(|index| format!("## New {index}\n\n{}\n\n", "replacement source ".repeat(12)))
+                .collect();
+            handle.replace_snapshot_for_test(latest);
+            app.chat_runtime_mut(target).unwrap().refresh();
+            assert!(runtime(&app, target).page_request.is_none());
+            if let Some(before) = child_before {
+                let mut element = view(&app, target);
+                tree.diff(element.as_widget_mut());
+                let node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                assert_eq!(
+                    read(&mut element, &mut tree, &node, None).top,
+                    before,
+                    "main replacement token cannot move selected child"
+                );
+                drop(element);
+                drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+            }
+            assert!(runtime(&app, target).cache["replacement-with-no-old-ids"].placeholder);
+            {
+                let mut pending = view(&app, target);
+                tree.diff(pending.as_widget_mut());
+                pending
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+            }
+            preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            let mut ready = view(&app, target);
+            tree.diff(ready.as_widget_mut());
+            let node = ready.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let actual = read(&mut ready, &mut tree, &node, None);
+            assert!(actual.travel > 500.0);
+            if let Some(expected) = expected {
+                assert!(
+                    (actual.top - expected).abs() <= 1.0,
+                    "{case}: replacement top {} must preserve later reader {expected}",
+                    actual.top
+                );
+            } else {
+                assert!(
+                    (actual.top - actual.travel).abs() <= 1.0,
+                    "unsuperseded Latest still follows newest source"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_app_dispatches_home_end_and_latest_while_cold_placeholder_fits() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation},
+        };
+        use iced::futures::StreamExt;
+        for command in ["Home", "End", "Latest"] {
+            struct Reader {
+                id: widget::Id,
+                move_bottom: Option<f32>,
+                top: Option<f32>,
+                travel: Option<f32>,
+            }
+            impl Operation for Reader {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn scrollable(
+                    &mut self,
+                    id: Option<&widget::Id>,
+                    viewport: iced::Rectangle,
+                    content: iced::Rectangle,
+                    translation: iced::Vector,
+                    state: &mut dyn operation::Scrollable,
+                ) {
+                    if id == Some(&self.id) {
+                        self.top = Some(translation.y);
+                        self.travel = Some((content.height - viewport.height).max(0.0));
+                        if let Some(bottom) = self.move_bottom.take() {
+                            state.scroll_to(iced::widget::scrollable::AbsoluteOffset {
+                                x: None,
+                                y: Some(bottom),
+                            });
+                        }
+                    }
+                }
+            }
+            fn runtime(app: &Cagents, target: Target) -> &Runtime {
+                match &app.cards[&target.card] {
+                    CardRuntime::Chat(runtime) => runtime,
+                    _ => panic!("fixture chat"),
+                }
+            }
+            fn view(app: &Cagents, target: Target) -> Element<'_, Message> {
+                runtime(app, target).view(
+                    None,
+                    false,
+                    true,
+                    &app.settings.keyboard_shortcuts,
+                    620.0,
+                    Place {
+                        name: "restore-fixture".into(),
+                        branch: None,
+                        channel: None,
+                    },
+                    true,
+                    None,
+                    vec![],
+                )
+            }
+            fn dispatch(app: &mut Cagents, target: Target, command: &str) -> Task<Message> {
+                if command == "Latest" {
+                    app.handle_chat_ui(Action::Latest(target))
+                } else {
+                    let key = if command == "Home" {
+                        keyboard::key::Named::Home
+                    } else {
+                        keyboard::key::Named::End
+                    };
+                    app.chat_scroll_key(&keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(key.clone()),
+                        modified_key: keyboard::Key::Named(key),
+                        physical_key: keyboard::key::Physical::Unidentified(
+                            keyboard::key::NativeCode::Unidentified,
+                        ),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::empty(),
+                        text: None,
+                        repeat: false,
+                    })
+                    .expect("actual chat keyboard dispatch")
+                }
+            }
+            let source = (0..80)
+                .map(|index| {
+                    format!(
+                        "## Section {index:04}\n\nReading paragraph {index:04}: {}\n\n",
+                        "ordinary text ".repeat(12)
+                    )
+                })
+                .collect::<String>();
+            let item = chat::Item {
+                id: "cold-rich".into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Text {
+                    text: source,
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                at: None,
+                started_at: None,
+            };
+            let (mut live, handle) = frame_cost::live_runtime(&[item]);
+            let mut app = crate::app::tests::context_inspector_test_app(true);
+            let mut target = live.target;
+            target.card = app.workspace.focused().unwrap();
+            live.target = target;
+            app.card_state_mut(target.card).unwrap().kind = CardKind::Chat(live.session.clone());
+            app.cards
+                .insert(target.card, CardRuntime::Chat(Box::new(live)));
+            let mut seeded = (*handle.snapshot()).clone();
+            let mut child_item = (*seeded.items[0]).clone();
+            child_item.id = "child-rich".into();
+            seeded.subagents.push(chat::Subagent {
+                id: "selected-child".into(),
+                kind: "fixture".into(),
+                description: "Child".into(),
+                status: chat::ToolStatus::Succeeded,
+                model: None,
+                waiting: false,
+                detail: String::new(),
+                background: false,
+                items: vec![Arc::new(child_item)],
+            });
+            handle.replace_snapshot_for_test(seeded);
+            app.chat_runtime_mut(target).unwrap().refresh();
+            preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            let renderer = crate::app::tests::headless_renderer();
+            let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(620.0, 720.0));
+            let scroll = card_control_id(target.card, "chat-transcript");
+            let read = |element: &mut Element<'_, Message>,
+                        tree: &mut Tree,
+                        node: &layout::Node| {
+                let mut reader = Reader {
+                    id: scroll.clone(),
+                    move_bottom: None,
+                    top: None,
+                    travel: None,
+                };
+                element
+                    .as_widget_mut()
+                    .operate(tree, Layout::new(node), &renderer, &mut reader);
+                (
+                    reader.top.expect("actual native transcript"),
+                    reader.travel.unwrap(),
+                )
+            };
+            let expected;
+            {
+                let mut element = view(&app, target);
+                let mut tree = Tree::new(&element);
+                let node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let mut movement = Reader {
+                    id: scroll.clone(),
+                    move_bottom: Some(700.0),
+                    top: None,
+                    travel: None,
+                };
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut movement,
+                );
+                expected = read(&mut element, &mut tree, &node).0;
+                assert!(expected > 500.0);
+                // No subsequent layout: hide immediately after actual navigation.
+            }
+            let snapshot = (*runtime(&app, target).snapshot).clone();
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .set_visible(false)
+                .unwrap();
+            preparation::retirement_barrier();
+            assert!(runtime(&app, target).cache.is_empty());
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .set_visible(true)
+                .unwrap();
+            let mut tree;
+            {
+                let mut empty_wait = view(&app, target);
+                tree = Tree::new(&empty_wait);
+                empty_wait
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+            }
+            handle.replace_snapshot_for_test(snapshot);
+            app.chat_runtime_mut(target).unwrap().refresh();
+            assert!(runtime(&app, target).cache["cold-rich"].placeholder);
+            assert!(runtime(&app, target).preparation.contains("cold-rich"));
+            let stale = Target {
+                generation: target.generation + 1,
+                ..target
+            };
+            assert!(
+                native_task_emits_nothing(app.handle_chat_ui(Action::Latest(stale))),
+                "stale generation cannot emit a card-ID-only scroll operation"
+            );
+            assert_eq!(runtime(&app, target).scroll_memory.edge(None), None);
+            let task = dispatch(&mut app, target, command);
+            {
+                let mut placeholder = view(&app, target);
+                tree.diff(placeholder.as_widget_mut());
+                let node = placeholder
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let before = read(&mut placeholder, &mut tree, &node);
+                assert_eq!(before, (0.0, 0.0), "actual cold App placeholder fits");
+                let executor = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                executor.block_on(async {
+                    let mut stream = iced::runtime::task::into_stream(task)
+                        .expect("actual keyboard/Latest native operation");
+                    let action = tokio::time::timeout(Duration::from_millis(250), stream.next())
+                        .await
+                        .unwrap()
+                        .expect("native operation effect");
+                    let iced::runtime::Action::Widget(mut operation) = action else {
+                        panic!("expected actual widget operation");
+                    };
+                    placeholder.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        operation.as_mut(),
+                    );
+                });
+                executor.shutdown_background();
+                assert_eq!(
+                    read(&mut placeholder, &mut tree, &node),
+                    before,
+                    "actual fitting snap has unchanged native translation"
+                );
+            }
+            preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            assert!(!runtime(&app, target).cache["cold-rich"].placeholder);
+            let mut ready = view(&app, target);
+            tree.diff(ready.as_widget_mut());
+            let node = ready.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let actual = read(&mut ready, &mut tree, &node);
+            assert!(
+                actual.1 > 500.0,
+                "actual authoritative Ready remains the large transcript"
+            );
+            assert!(
+                (actual.0 - if command == "Home" { 0.0 } else { actual.1 }).abs() <= 1.0,
+                "actual App/native Tree {command} produced {actual:?} instead of the explicit edge (old reading top {expected})"
+            );
+            drop(ready);
+            let held = dispatch(&mut app, target, command);
+            drop(app.handle_chat_ui(Action::SelectSubagent(
+                target,
+                Some("selected-child".into()),
+            )));
+            preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            {
+                let mut child = view(&app, target);
+                tree.diff(child.as_widget_mut());
+                let node = child.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                let mut movement = Reader {
+                    id: scroll.clone(),
+                    move_bottom: Some(300.0),
+                    top: None,
+                    travel: None,
+                };
+                child.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut movement,
+                );
+                let before = read(&mut child, &mut tree, &node);
+                assert!(before.0 > 500.0 && before.0 < before.1);
+                let executor = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                executor.block_on(async {
+                    let mut stream = iced::runtime::task::into_stream(held)
+                        .expect("held actual App edge dispatch");
+                    let action = tokio::time::timeout(Duration::from_millis(250), stream.next())
+                        .await
+                        .unwrap()
+                        .expect("held widget effect");
+                    let iced::runtime::Action::Widget(mut operation) = action else {
+                        panic!("widget operation");
+                    };
+                    child.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        operation.as_mut(),
+                    );
+                });
+                executor.shutdown_background();
+                assert_eq!(
+                    read(&mut child, &mut tree, &node),
+                    before,
+                    "held parent Home/End/Latest cannot affect selected child"
+                );
+            }
+            assert_eq!(
+                runtime(&app, target)
+                    .scroll_memory
+                    .edge(Some("selected-child")),
+                None
+            );
+            assert_eq!(
+                runtime(&app, target).scroll_memory.edge(None),
+                Some(if command == "Home" {
+                    scroll::Edge::Start
+                } else {
+                    if command == "Latest" {
+                        scroll::Edge::Latest
+                    } else {
+                        scroll::Edge::End
+                    }
+                })
+            );
+            drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+            preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            let mut parent = view(&app, target);
+            tree.diff(parent.as_widget_mut());
+            let node = parent.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let actual = read(&mut parent, &mut tree, &node);
+            assert!(actual.1 > 500.0);
+            assert!(
+                (actual.0 - if command == "Home" { 0.0 } else { actual.1 }).abs() <= 1.0,
+                "original selected context retains its own explicit edge"
+            );
+        }
     }
 
     #[test]
@@ -6598,8 +9757,10 @@ mod tests {
                     text.push_str(" streamed detail");
                 }
                 snapshot.items[0] = Arc::new(item);
-                handle.publish_snapshot_for_test(snapshot);
+                snapshot.generation += 1;
+                handle.publish_delta_snapshot_for_test(snapshot);
                 runtime.refresh();
+                preparation::drain_fixture(runtime);
                 assert!(runtime.expanded.contains("live-thought"));
                 continue;
             }
@@ -7493,10 +10654,12 @@ mod tests {
         };
         let items = frame_cost::transcript(1);
         let (runtime, _handle) = frame_cost::live_runtime(&items);
-        let prompt = items
+        let prompt = runtime
+            .snapshot
+            .items
             .iter()
             .find(|item| item.role == chat::Role::User)
-            .expect("user prompt");
+            .expect("accepted user prompt");
         let expected = match &prompt.content {
             ItemContent::Text { text, .. } => text.clone(),
             _ => panic!("fixture prompt must be text"),
@@ -7505,7 +10668,11 @@ mod tests {
         let content = widget::column::with_children(vec![
             runtime.prompt_view(prompt),
             transcript_body("Queued message", runtime.target),
-            notice_entry("Provider warning", runtime.target),
+            notice_entry(
+                "Provider warning",
+                runtime.target,
+                notice_identity(None, "Provider warning"),
+            ),
             output.view(
                 crate::settings::EditorSyntaxTheme::Auto,
                 None,
@@ -7628,6 +10795,903 @@ mod tests {
     }
 
     #[test]
+    fn forgetting_a_conversation_releases_catalog_and_selection_contexts() {
+        let (mut runtime, _handle) = frame_cost::live_runtime(&frame_cost::transcript(1));
+        let (catalog, _) = runtime.selection_document();
+        let backing = Arc::downgrade(&catalog);
+        assert!(catalog.retained_plain_bytes() > 0);
+        drop(catalog);
+        runtime.forget_transcript();
+        assert!(runtime.selection_document.borrow().is_none());
+        assert!(runtime.selection_bookmarks.borrow().is_empty());
+        assert!(
+            backing.upgrade().is_none(),
+            "no orphan logical plaintext owner survives reset"
+        );
+    }
+
+    #[test]
+    fn notice_projection_keeps_exact_visible_newlines() {
+        for body in ["short", "short\n", "short\n\n"] {
+            assert_eq!(visible_notice_body(body, false), body);
+            assert_eq!(visible_notice_body(body, true), body);
+        }
+        let long = "line\n".repeat(NOTICE_LINES + 1);
+        assert_eq!(
+            visible_notice_body(&long, false),
+            vec!["line"; NOTICE_LINES].join("\n")
+        );
+        assert_eq!(visible_notice_body(&long, true), long);
+    }
+
+    #[test]
+    fn failure_catalog_keeps_visible_turn_order_and_duplicate_messages_distinct() {
+        let items: Vec<_> = frame_cost::transcript(2)
+            .into_iter()
+            .filter(|item| item.role == chat::Role::User || item.id.ends_with("-answer"))
+            .collect();
+        let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+        assert_eq!(runtime.turns.len(), 2);
+        let first = runtime.turns[0].key.clone();
+        let second = runtime.turns[1].key.clone();
+        let raw = format!(
+            "Repeated failure\n{}\nHIDDEN_DIAGNOSTIC_END",
+            "original raw bytes ".repeat(8192)
+        );
+        runtime.failures = vec![
+            (Some(first.clone()), raw.clone()),
+            (Some(second.clone()), raw.clone()),
+        ];
+        runtime.error = Some("Current failure".into());
+        runtime.refresh_failure_ui();
+        let keys: Vec<_> = runtime
+            .failure_ui
+            .incidents
+            .iter()
+            .map(|incident| incident.key.clone())
+            .collect();
+        assert_eq!(
+            keys.len(),
+            3,
+            "different prompt scopes retain distinct incidents"
+        );
+        let (collapsed, _) = runtime.selection_document();
+        assert!(
+            !collapsed
+                .search_blocks()
+                .iter()
+                .any(|(_, text)| text.contains("Repeated failure")
+                    || text.contains("Current failure"))
+        );
+        for key in &keys {
+            runtime.failure_ui.expanded.insert(key.clone());
+            runtime.cache_failure_preview(key);
+        }
+        let (catalog, _) = runtime.selection_document();
+        let blocks = catalog.search_blocks();
+        let position = |identity| {
+            blocks
+                .iter()
+                .position(|(candidate, _)| *candidate == identity)
+                .unwrap()
+        };
+        let first_notice = position(failure::diagnostic_preview_identity(&keys[0]));
+        let second_notice = position(failure::diagnostic_preview_identity(&keys[1]));
+        let second_prompt = &items[runtime.turns[1].prompt[0]];
+        assert!(first_notice < position(selection::logical_identity(&second_prompt.id, &[2])));
+        assert!(second_notice > first_notice);
+        assert_eq!(blocks.last().unwrap().1.as_ref(), "Current failure");
+        assert_eq!(blocks[first_notice].1.len(), 8192);
+        assert_eq!(blocks[second_notice].1.len(), 8192);
+        assert!(
+            !blocks
+                .iter()
+                .any(|(_, text)| text.contains("HIDDEN_DIAGNOSTIC_END"))
+        );
+        assert_eq!(
+            runtime.failure_details(&keys[0]).as_deref(),
+            Some(raw.as_str())
+        );
+        assert_eq!(
+            runtime.failure_details(&keys[1]).as_deref(),
+            Some(raw.as_str())
+        );
+        // A same-anchor source replacement must retire the old preview and
+        // its catalog identity, rather than keep invisible original bytes.
+        runtime.failures[0].1 = "Replacement failure at the original first prompt".into();
+        runtime.refresh_failure_ui();
+        let (replacement, _) = runtime.selection_document();
+        assert!(
+            replacement
+                .text(failure::diagnostic_preview_identity(&keys[0]))
+                .is_none()
+        );
+        assert_eq!(
+            replacement
+                .text(failure::diagnostic_preview_identity(&keys[1]))
+                .unwrap()
+                .len(),
+            8192
+        );
+        assert!(
+            runtime
+                .failure_ui
+                .incidents
+                .iter()
+                .any(|incident| incident.anchor.as_ref() == Some(&first)
+                    && runtime.failure_details(&incident.key).as_deref()
+                        == Some(runtime.failures[0].1.as_str()))
+        );
+    }
+
+    fn web_search_selection_fixture() -> (Runtime, Arc<ClientHandle>, chat::Item, String) {
+        let query = "search query";
+        let title = "Search title";
+        let url = "https://example.test/source#L22";
+        let snippet = format!(
+            "{}WEB_SEARCH_FIND_NEEDLE",
+            "literal α é excerpt ".repeat(2000)
+        );
+        assert!(
+            query.len() + title.len() + url.len() + snippet.len() < 64 * 1024,
+            "public stored metadata fixture remains below the Store shrink threshold"
+        );
+        let item = chat::Item {
+            id: "web-search".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::WebSearch {
+                query: query.into(),
+                results: vec![chat::SearchResult {
+                    title: title.into(),
+                    url: url.into(),
+                    snippet: snippet.clone(),
+                }],
+            },
+            at: None,
+            started_at: None,
+        };
+        let expected = [query, title, url, snippet.as_str()].join("\n\n");
+        let (runtime, handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+        (runtime, handle, item, expected)
+    }
+
+    fn copy_web_search_native(select_all: bool) {
+        use iced::advanced::{
+            layout,
+            widget::{Operation, Tree},
+        };
+        let (runtime, _handle, item, expected) = web_search_selection_fixture();
+        let target = runtime.target;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let key = runtime.turns[0].key.clone();
+        runtime.opened.insert(key, true);
+        let (catalog, bookmark) = runtime.selection_document();
+        let canonical = runtime
+            .snapshot
+            .items
+            .iter()
+            .find(|source| source.id == item.id)
+            .unwrap();
+        let content = runtime.step_detail(
+            canonical,
+            &runtime.cache[&item.id],
+            design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+        );
+        let mut element =
+            selection::transcript_virtualized(content, target, None, catalog, bookmark);
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 100_000.0));
+        let mut node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        runtime.cache[&item.id].flow_cache.complete_fixture();
+        node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        #[derive(Default)]
+        struct TextBounds(Vec<(Arc<str>, iced::Rectangle)>);
+        impl Operation for TextBounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn custom(
+                &mut self,
+                _: Option<&iced::advanced::widget::Id>,
+                bounds: iced::Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                if let Some(prose) = state.downcast_ref::<selectable_prose::State>() {
+                    self.0.push((prose.plain.clone(), bounds));
+                }
+            }
+        }
+        let mut bounds = TextBounds::default();
+        element.as_widget_mut().operate(
+            &mut tree,
+            iced::advanced::Layout::new(&node),
+            &renderer,
+            &mut bounds,
+        );
+        assert_eq!(bounds.0.first().unwrap().0.as_ref(), "search query");
+        assert!(
+            bounds
+                .0
+                .last()
+                .unwrap()
+                .0
+                .ends_with("WEB_SEARCH_FIND_NEEDLE")
+        );
+        #[derive(Default)]
+        struct ClipboardText(String);
+        impl iced::advanced::Clipboard for ClipboardText {
+            fn read(&self, _: iced::advanced::clipboard::Kind) -> Option<String> {
+                Some(self.0.clone())
+            }
+            fn write(&mut self, _: iced::advanced::clipboard::Kind, text: String) {
+                self.0 = text;
+            }
+        }
+        let first = bounds.0.first().unwrap().1;
+        let last = bounds.0.last().unwrap().1;
+        let start = iced::Point::new(first.x, first.y + 3.0);
+        let end = if select_all {
+            start
+        } else {
+            iced::Point::new(last.x + last.width + 5.0, last.y + last.height + 1.0)
+        };
+        let mut events = vec![(
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+            start,
+        )];
+        if !select_all {
+            events.push((
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: end }),
+                end,
+            ));
+        }
+        events.push((
+            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                iced::mouse::Button::Left,
+            )),
+            end,
+        ));
+        for key in if select_all {
+            vec!["a", "c"]
+        } else {
+            vec!["c"]
+        } {
+            events.push((
+                iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(key.into()),
+                    modified_key: keyboard::Key::Character(key.into()),
+                    physical_key: keyboard::key::Physical::Unidentified(
+                        keyboard::key::NativeCode::Unidentified,
+                    ),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::CTRL,
+                    text: None,
+                    repeat: false,
+                }),
+                end,
+            ));
+        }
+        let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 100_000.0));
+        let mut clipboard = ClipboardText::default();
+        for (event, point) in events {
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                iced::advanced::Layout::new(&node),
+                iced::mouse::Cursor::Available(point),
+                &renderer,
+                &mut clipboard,
+                &mut iced::advanced::Shell::new(&mut messages),
+                &viewport,
+            );
+        }
+        assert_eq!(
+            clipboard.0, expected,
+            "actual native WebSearch selection copies query/title/URL/snippet in visible source order through the Runtime Catalog"
+        );
+    }
+
+    #[test]
+    fn native_web_search_ctrl_a_copy_keeps_all_visible_literal_fields() {
+        copy_web_search_native(true);
+    }
+
+    #[test]
+    fn native_web_search_drag_copy_keeps_visible_field_boundaries() {
+        copy_web_search_native(false);
+    }
+
+    #[test]
+    fn actual_web_search_find_indexes_visible_result_snippet() {
+        use iced::futures::StreamExt;
+        let (runtime, _handle, item, _) = web_search_selection_fixture();
+        let target = runtime.target;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "WEB_SEARCH_FIND_NEEDLE".into(),
+        ));
+        drop(app.handle_chat_ui(Action::FindNext(target, true)));
+        let task = app.resume_current_find(target, false);
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let reply = executor.block_on(async {
+            let mut stream =
+                iced::runtime::task::into_stream(task).expect("actual prepared Catalog Find task");
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while let Some(effect) = stream.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
+                        action @ Action::FindIndexed(..),
+                    ))) = effect
+                    {
+                        return action;
+                    }
+                }
+                panic!("actual Catalog worker reply");
+            })
+            .await
+            .unwrap()
+        });
+        drop(app.handle_chat_ui(reply));
+        let hit = app
+            .chat_runtime_mut(target)
+            .unwrap()
+            .find_navigation
+            .current_hit();
+        assert!(
+            hit.is_some_and(|(id, _, _)| id == item.id),
+            "actual admitted WebSearch Find locates the visible snippet through its prepared Runtime Catalog"
+        );
+    }
+
+    #[test]
+    fn queued_and_notice_widgets_copy_through_logical_catalog() {
+        use iced::advanced::{
+            layout,
+            widget::{Operation, Tree},
+        };
+        let items = frame_cost::transcript(1);
+        let mut delivery = items[0].clone();
+        delivery.id = "delivery-notice".into();
+        delivery.content = ItemContent::Delivery {
+            kind: chat::DeliveryKind::Notice,
+            from: String::new(),
+            sender: String::new(),
+            summary: "Provider report".into(),
+            body: "Delivered warning".into(),
+        };
+        let mut sources = items.clone();
+        sources.push(delivery);
+        let (mut runtime, _handle) = frame_cost::live_runtime(&sources);
+        let delivery = runtime.snapshot.items.last().unwrap().clone();
+        let queued = Queued {
+            source: prompt::LocalSource::new("Queued message".into()),
+            presentation: prompt::LocalPresentation::default(),
+            resolved_text: "Queued message".into(),
+            attachments: vec![],
+            model: None,
+            draft: runtime.session.clone(),
+            since: None,
+            rechecking: false,
+        };
+        let source = queued.source.clone();
+        runtime.queued = Some(queued);
+        let (run, ready) = preparation::local_reply_for_test(&mut runtime);
+        let prepared = runtime
+            .preparation
+            .accept_local(runtime.target, run, &source, ready)
+            .unwrap();
+        let mut queued = runtime.queued.take().unwrap();
+        prepared.install_local(&mut queued.presentation);
+        let cached = &runtime.cache[&delivery.id];
+        let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+        let first = notice_identity(Some("turn-a"), "Repeated failure");
+        let second = notice_identity(Some("turn-b"), "Repeated failure");
+        assert_ne!(first, second);
+        let mut builder = selection::Catalog::builder();
+        builder.logical(first, Arc::from("Repeated failure"));
+        builder.plain("queued-prompt", &[2], Arc::from("Queued message"));
+        builder.plain(&delivery.id, &[2], Arc::from("Delivered warning"));
+        builder.logical(second, Arc::from("Repeated failure"));
+        let content = widget::column::with_children(vec![
+            notice_entry("Repeated failure", runtime.target, first),
+            runtime.queued_view(&queued),
+            runtime.delivery_view(&delivery, &cached, settings),
+            notice_entry("Repeated failure", runtime.target, second),
+        ]);
+        let mut element = selection::transcript_virtualized(
+            content,
+            runtime.target,
+            None,
+            builder.finish(),
+            Default::default(),
+        );
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 1200.0));
+        let mut node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        #[derive(Default)]
+        struct ReadText(Vec<(String, iced::Rectangle)>);
+        impl Operation for ReadText {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn custom(
+                &mut self,
+                _: Option<&iced::advanced::widget::Id>,
+                bounds: iced::Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                if let Some(prose) = state.downcast_mut::<selectable_prose::State>() {
+                    self.0.push((prose.plain.to_string(), bounds));
+                }
+            }
+        }
+        let mut text = ReadText::default();
+        element.as_widget_mut().operate(
+            &mut tree,
+            iced::advanced::Layout::new(&node),
+            &renderer,
+            &mut text,
+        );
+        assert_eq!(
+            text.0
+                .iter()
+                .map(|(text, _)| text.clone())
+                .collect::<Vec<_>>(),
+            [
+                "Repeated failure",
+                "Queued message",
+                "Delivered warning",
+                "Repeated failure"
+            ]
+        );
+        #[derive(Default)]
+        struct ClipboardText(String);
+        impl iced::advanced::Clipboard for ClipboardText {
+            fn read(&self, _: iced::advanced::clipboard::Kind) -> Option<String> {
+                Some(self.0.clone())
+            }
+            fn write(&mut self, _: iced::advanced::clipboard::Kind, contents: String) {
+                self.0 = contents;
+            }
+        }
+        let first = text.0.first().unwrap().1;
+        let last = text.0.last().unwrap().1;
+        let start = iced::Point::new(first.x, first.y + 3.0);
+        let end = iced::Point::new(last.x + last.width + 5.0, last.y + last.height + 1.0);
+        let mut clipboard = ClipboardText::default();
+        let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 1200.0));
+        for (event, pointer) in [
+            (
+                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+                start,
+            ),
+            (
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: end }),
+                end,
+            ),
+            (
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )),
+                end,
+            ),
+            (
+                iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character("c".into()),
+                    modified_key: keyboard::Key::Character("c".into()),
+                    physical_key: keyboard::key::Physical::Unidentified(
+                        keyboard::key::NativeCode::Unidentified,
+                    ),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::CTRL,
+                    text: None,
+                    repeat: false,
+                }),
+                end,
+            ),
+        ] {
+            let mut messages = Vec::new();
+            let mut shell = iced::advanced::Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                iced::advanced::Layout::new(&node),
+                iced::mouse::Cursor::Available(pointer),
+                &renderer,
+                &mut clipboard,
+                &mut shell,
+                &viewport,
+            );
+            assert!(shell.is_event_captured());
+            if shell.is_layout_invalid() {
+                node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+            }
+        }
+        assert_eq!(
+            clipboard.0,
+            "Repeated failure\n\nQueued message\n\nDelivered warning\n\nRepeated failure"
+        );
+    }
+
+    #[test]
+    fn pointer_copy_across_visual_paragraph_and_code_chunks_adds_no_separators() {
+        use iced::advanced::{
+            layout,
+            widget::{Operation, Tree},
+        };
+        use iced::futures::StreamExt;
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for (source, raw_code) in [
+            ("bounded αβ words ".repeat(300), false),
+            ("αβ item line\n\n".repeat(300), true),
+            ("αβ item line\r\n\r\n".repeat(300), true),
+        ] {
+            let item = chat::Item {
+                id: "copy-source".into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Text {
+                    text: source.clone(),
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                at: None,
+                started_at: None,
+            };
+            let (runtime, _handle) = frame_cost::live_runtime(&[item]);
+            let target = runtime.target;
+            let cached = &runtime.cache["copy-source"];
+            let mut builder = selection::Catalog::builder();
+            let item = cached.item.as_ref().unwrap().id.clone();
+            if raw_code {
+                // Code copy retains the raw CRLF and terminal newline rather
+                // than testing only a Markdown parser's normalized projection.
+                builder.plain(&item, &[0], Arc::from(source.as_str()));
+            } else {
+                builder.markdown(&item, &[0], cached.markdown.items());
+            }
+            let catalog = builder.finish();
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.cards
+                .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+            let expected = catalog
+                .search_blocks()
+                .into_iter()
+                .map(|(_, text)| text.to_string())
+                .collect::<String>();
+            let code_source: Arc<str> = Arc::from(source.as_str());
+            let reader_source = super::super::reader_source::Source::new(&source);
+            let make = |app: &Cagents| {
+                let Some(CardRuntime::Chat(runtime)) = app.cards.get(&target.card) else {
+                    panic!("copy fixture retains its live runtime");
+                };
+                let cached = &runtime.cache["copy-source"];
+                let body = if raw_code {
+                    let code = prose::code_text(
+                        code_source.clone(),
+                        Arc::from([]),
+                        design::TEXT_BODY.into(),
+                        iced::Font::MONOSPACE,
+                        target,
+                        None,
+                        Some(selectable_prose::Logical {
+                            identity: selection::logical_identity(&item, &[0]),
+                            start: 0,
+                        }),
+                        Some(cached.flow_cache.clone()),
+                        Some(reader_source.clone()),
+                    );
+                    widget::scrollable(code)
+                        .direction(iced::widget::scrollable::Direction::Horizontal(
+                            iced::widget::scrollable::Scrollbar::new(),
+                        ))
+                        .width(Length::Fill)
+                        .into()
+                } else {
+                    prose::view(
+                        cached,
+                        design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+                        target,
+                        None,
+                    )
+                };
+                let content = scroll::transcript(body, target, None, vec![], true, vec![]);
+                selection::transcript_virtualized(
+                    content,
+                    target,
+                    None,
+                    catalog.clone(),
+                    Default::default(),
+                )
+            };
+            let mut element = make(&app);
+            let renderer = crate::app::tests::headless_renderer();
+            let mut tree = Tree::new(&element);
+            let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 30000.0));
+            let mut node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            // Follow actual Redraw -> FlowRequest -> admitted worker ->
+            // FlowReady -> owner revision -> retained diff/layout. Completing
+            // an Entry directly cannot invalidate a retained paragraph node.
+            let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 30000.0));
+            let mut settled = false;
+            for _ in 0..64 {
+                let mut messages = Vec::new();
+                let mut shell = iced::advanced::Shell::new(&mut messages);
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &iced::Event::Window(iced::window::Event::RedrawRequested(
+                        iced::time::Instant::now(),
+                    )),
+                    iced::advanced::Layout::new(&node),
+                    iced::mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut shell,
+                    &viewport,
+                );
+                let invalid = shell.is_layout_invalid();
+                let mut shaped = false;
+                drop(element);
+                for message in messages {
+                    let is_request = matches!(&message, Message::ChatUi(Action::FlowRequest(..)));
+                    let task = app.update(message);
+                    if !is_request {
+                        drop(task);
+                        continue;
+                    }
+                    shaped = true;
+                    let ready = executor.block_on(async {
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            let mut task = task;
+                            let mut available = Box::pin(flow_layout::availability_stream());
+                            for _ in 0..64 {
+                                if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                                    while let Some(effect) = stream.next().await {
+                                        if let iced::runtime::Action::Output(cosmic::Action::App(
+                                            message @ Message::ChatUi(Action::FlowReady(..)),
+                                        )) = effect
+                                        {
+                                            return message;
+                                        }
+                                    }
+                                }
+                                // A denied admission waits for the same real
+                                // availability notification used by the UI.
+                                task =
+                                    app.update(available.next().await.expect("Flow availability"));
+                            }
+                            panic!("actual Flow request did not complete");
+                        })
+                        .await
+                        .expect("bounded actual Flow worker completes")
+                    });
+                    drop(app.update(ready));
+                }
+                element = make(&app);
+                tree.diff(element.as_widget_mut());
+                node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                if !invalid && !shaped {
+                    settled = true;
+                    break;
+                }
+            }
+            assert!(settled, "actual Flow and transcript layouts converge");
+            #[derive(Default)]
+            struct ReadText(Vec<(String, iced::Rectangle, usize, bool)>);
+            impl Operation for ReadText {
+                fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                    operate(self);
+                }
+                fn custom(
+                    &mut self,
+                    _: Option<&iced::advanced::widget::Id>,
+                    bounds: iced::Rectangle,
+                    state: &mut dyn std::any::Any,
+                ) {
+                    if let Some(prose) = state.downcast_mut::<selectable_prose::State>() {
+                        if prose.empty_line_caret() {
+                            assert_eq!(
+                                bounds.width, 0.0,
+                                "caret adds no horizontal content extent"
+                            );
+                            assert!(bounds.height > 0.0);
+                            let logical = prose.logical.as_ref().unwrap();
+                            let caret = prose
+                                .logical_byte_bounds(logical.identity, logical.start)
+                                .expect("empty physical row exposes its logical caret");
+                            assert!(caret.width > 0.0 && caret.height > 0.0);
+                        }
+                        self.0.push((
+                            prose.plain.to_string(),
+                            bounds,
+                            prose.logical.as_ref().map_or(0, |logical| logical.start),
+                            prose.empty_line_caret(),
+                        ));
+                    }
+                }
+            }
+            let mut text = ReadText::default();
+            element.as_widget_mut().operate(
+                &mut tree,
+                iced::advanced::Layout::new(&node),
+                &renderer,
+                &mut text,
+            );
+            assert!(
+                !text.0.is_empty(),
+                "current selectable glyph geometry is mounted"
+            );
+            if raw_code {
+                assert_eq!(
+                    expected, source,
+                    "raw code oracle preserves every newline byte"
+                );
+                assert!(
+                    text.0.iter().filter(|(_, _, _, caret)| *caret).count() > 1,
+                    "both middle and terminal empty rows are mounted"
+                );
+                assert!(
+                    text.0.len() > 2,
+                    "code selection crosses real physical row widgets"
+                );
+                let ending = if source.contains("\r\n") {
+                    "\r\n"
+                } else {
+                    "\n"
+                };
+                for (plain, _, start, caret) in &text.0 {
+                    if *caret {
+                        assert_eq!(
+                            plain, ending,
+                            "visual blank retains its exact LF/CRLF bytes"
+                        );
+                        assert_eq!(
+                            source.get(*start..*start + plain.len()),
+                            Some(plain.as_str()),
+                            "blank caret belongs to its current logical source slice"
+                        );
+                    }
+                }
+                let terminal = text.0.last().unwrap();
+                assert!(
+                    terminal.3,
+                    "terminal physical blank has real caret geometry"
+                );
+                assert_eq!(
+                    terminal.2 + terminal.0.len(),
+                    source.len(),
+                    "terminal caret covers the original source endpoint"
+                );
+            } else {
+                assert_eq!(
+                    text.0.len(),
+                    1,
+                    "paragraph preserves one full-context shaped flow"
+                );
+                assert_eq!(text.0[0].0, expected);
+            }
+            #[derive(Default)]
+            struct ClipboardText(String);
+            impl iced::advanced::Clipboard for ClipboardText {
+                fn read(&self, _: iced::advanced::clipboard::Kind) -> Option<String> {
+                    Some(self.0.clone())
+                }
+                fn write(&mut self, _: iced::advanced::clipboard::Kind, contents: String) {
+                    self.0 = contents;
+                }
+            }
+            let first = text.0.first().unwrap().1;
+            let last = text.0.last().unwrap().1;
+            let start = iced::Point::new(first.x, first.y + 3.0);
+            let end = iced::Point::new(last.x + last.width + 5.0, last.y + last.height + 1.0);
+            let mut selections = vec![(start, end, expected.as_str())];
+            if raw_code {
+                let blank = &text.0[1];
+                let next = &text.0[2];
+                assert!(blank.3 && !next.3);
+                assert_eq!(
+                    next.2,
+                    blank.2 + blank.0.len(),
+                    "middle blank and next row are adjacent original source ranges"
+                );
+                selections.push((
+                    iced::Point::new(blank.1.x + 5.0, blank.1.y + blank.1.height / 2.0),
+                    iced::Point::new(next.1.x, next.1.y + 3.0),
+                    &source[blank.2..next.2],
+                ));
+            }
+            let mut clipboard = ClipboardText::default();
+            for (start, end, expected_selection) in selections {
+                for (event, pointer) in [
+                    (
+                        iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                            iced::mouse::Button::Left,
+                        )),
+                        start,
+                    ),
+                    (
+                        iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: end }),
+                        end,
+                    ),
+                    (
+                        iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                            iced::mouse::Button::Left,
+                        )),
+                        end,
+                    ),
+                    (
+                        iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                            key: keyboard::Key::Character("c".into()),
+                            modified_key: keyboard::Key::Character("c".into()),
+                            physical_key: keyboard::key::Physical::Unidentified(
+                                keyboard::key::NativeCode::Unidentified,
+                            ),
+                            location: keyboard::Location::Standard,
+                            modifiers: keyboard::Modifiers::CTRL,
+                            text: None,
+                            repeat: false,
+                        }),
+                        end,
+                    ),
+                ] {
+                    let mut messages = Vec::new();
+                    let mut shell = iced::advanced::Shell::new(&mut messages);
+                    element.as_widget_mut().update(
+                        &mut tree,
+                        &event,
+                        iced::advanced::Layout::new(&node),
+                        iced::mouse::Cursor::Available(pointer),
+                        &renderer,
+                        &mut clipboard,
+                        &mut shell,
+                        &viewport,
+                    );
+                    assert!(shell.is_event_captured());
+                    if shell.is_layout_invalid() {
+                        node = element
+                            .as_widget_mut()
+                            .layout(&mut tree, &renderer, &limits);
+                    }
+                }
+                assert_eq!(
+                    clipboard.0, expected_selection,
+                    "pointer copy preserves exact logical bytes, including empty physical rows"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn waiting_queue_is_bounded_and_independent_of_transcript_scroll() {
         let mut runtime = Runtime::draft(
             Target {
@@ -7654,6 +11718,7 @@ mod tests {
         runtime.followups.push(super::super::Followup {
             id: 0,
             text: "Local follow-up".into(),
+            preview: "Local follow-up".into(),
             attachments: Vec::new(),
         });
         assert!(runtime.queue_view().is_some());
@@ -7788,6 +11853,19 @@ mod tests {
     }
 
     #[test]
+    fn new_turn_activity_keeps_completed_historical_reasoning_retained() {
+        let items = frame_cost::transcript(3);
+        let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+        let idle = fingerprints(&runtime, true);
+        Arc::make_mut(&mut runtime.snapshot).busy = true;
+        assert_eq!(
+            idle,
+            fingerprints(&runtime, true),
+            "all fixture reasoning already has a later final answer"
+        );
+    }
+
+    #[test]
     fn busy_changes_invalidate_only_turns_containing_reasoning() {
         let mut items = frame_cost::transcript(2);
         items.retain(|item| !matches!(item.content, ItemContent::Text { thinking: true, .. }));
@@ -7846,23 +11924,12 @@ mod tests {
             "reasoning"
         ));
 
-        // Even reasoning already followed by an answer keeps its busy
-        // dependency; this change does not localize cross-item completion.
+        // Completed historical reasoning keeps its retained presentation when
+        // another turn changes the conversation's busy state.
         let (mut history, _handle) = frame_cost::live_runtime(&frame_cost::transcript(1));
         let idle = fingerprints(&history, true);
         Arc::make_mut(&mut history.snapshot).busy = true;
-        for (turn, (idle, busy)) in history
-            .turns
-            .iter()
-            .zip(idle.iter().zip(fingerprints(&history, true)))
-        {
-            assert_eq!(
-                *idle != busy,
-                turn.prose
-                    .iter()
-                    .any(|placed| placed.slot == turn::Slot::Thinking)
-            );
-        }
+        assert_eq!(idle, fingerprints(&history, true));
     }
 
     #[test]
@@ -7926,13 +11993,39 @@ mod tests {
         items: &[chat::Item],
         generation: u64,
     ) {
-        handle.publish_snapshot_for_test(Snapshot {
+        handle.publish_delta_snapshot_for_test(Snapshot {
             generation,
             ready: true,
             items: items.iter().cloned().map(Arc::new).collect(),
             ..Snapshot::default()
         });
         runtime.refresh();
+        preparation::drain_fixture(runtime);
+    }
+
+    #[test]
+    fn prose_only_refresh_keeps_prompt_strings_and_turn_group_allocations() {
+        let mut items = frame_cost::transcript(1);
+        let (mut runtime, handle) = frame_cost::live_runtime(&items);
+        let prompt = runtime.history[0].as_ptr();
+        let turns = runtime.turns.as_ptr();
+        let prose = runtime.turns.last().unwrap().prose.as_ptr();
+        let ItemContent::Text { text, .. } = &mut items.last_mut().unwrap().content else {
+            unreachable!()
+        };
+        text.push_str(" More streamed text.");
+        publish(&mut runtime, &handle, &items, 20);
+        assert_eq!(
+            runtime.history[0].as_ptr(),
+            prompt,
+            "unchanged history strings are not cloned"
+        );
+        assert_eq!(
+            runtime.turns.as_ptr(),
+            turns,
+            "unchanged placement is not regrouped"
+        );
+        assert_eq!(runtime.turns.last().unwrap().prose.as_ptr(), prose);
     }
 
     #[test]
@@ -8149,10 +12242,10 @@ mod tests {
         assert_ne!(toggled, fingerprint(&runtime, false), "the syntax theme");
     }
 
-    /// An open step shows its output in an editor that borrows from the
-    /// cache, so its exchange is built afresh rather than kept.
+    /// Open details own their content, and remain reusable until a rendered
+    /// input changes. Disclosure itself must change that key.
     #[test]
-    fn an_exchange_with_an_open_step_is_not_retained() {
+    fn an_open_steps_retained_key_changes_once_for_its_disclosure() {
         let items = frame_cost::transcript(1);
         let (mut runtime, _handle) = frame_cost::live_runtime(&items);
         let strip = runtime
@@ -8160,12 +12253,17 @@ mod tests {
             .iter()
             .position(|turn| !turn.steps.is_empty())
             .expect("a group with steps");
-        assert!(runtime.retainable(&runtime.turns[strip]));
+        let closed = runtime.turn_fingerprint(&runtime.turns[strip], true);
         let step = runtime.turns[strip].steps[0].index;
         runtime
             .expanded
             .insert(runtime.snapshot.items[step].id.clone());
-        assert!(!runtime.retainable(&runtime.turns[strip]));
+        let opened = runtime.turn_fingerprint(&runtime.turns[strip], true);
+        assert_ne!(closed, opened);
+        assert_eq!(
+            opened,
+            runtime.turn_fingerprint(&runtime.turns[strip], true)
+        );
     }
 
     /// Every kind of Markdown block an answer can hold is drawn by the
@@ -9412,6 +13510,60 @@ mod tests {
                     "{width}: inline panels must not push the composer out of the window: {bounds:?}"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod prepared_disclosure_tests {
+    use super::*;
+
+    #[test]
+    fn prose_disclosure_keeps_prepared_source_and_palette_owners() {
+        let item = chat::Item {
+            id: "prepared-thought".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: format!(
+                    "Long **thought** {}\n\n```rust\nlet answer = 42;\n```",
+                    "ordinary words ".repeat(10_000)
+                ),
+                thinking: true,
+                phase: chat::Phase::Commentary,
+            },
+            at: None,
+            started_at: None,
+        };
+        let (mut live, _handle) = frame_cost::live_runtime(&[item]);
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let mut target = live.target;
+        target.card = app.workspace.focused().unwrap();
+        live.target = target;
+        let cached = &live.cache["prepared-thought"];
+        let revision = cached.revision;
+        let item = cached.item.clone().expect("prepared item owner");
+        let palettes = cached
+            .palette_views
+            .clone()
+            .expect("worker prepared syntax palettes");
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(live)));
+        for expanded in [true, false, true] {
+            drop(app.handle_chat_ui(Action::Toggle(target, "prepared-thought".into())));
+            let CardRuntime::Chat(runtime) = &app.cards[&target.card] else {
+                panic!("mounted chat")
+            };
+            assert_eq!(runtime.expanded.contains("prepared-thought"), expanded);
+            let cached = &runtime.cache["prepared-thought"];
+            assert_eq!(
+                cached.revision, revision,
+                "disclosure must not rebuild prepared prose"
+            );
+            assert!(Arc::ptr_eq(cached.item.as_ref().unwrap(), &item));
+            let current = cached.palette_views.as_ref().unwrap();
+            assert!(Arc::ptr_eq(&current[0], &palettes[0]));
+            assert!(Arc::ptr_eq(&current[1], &palettes[1]));
         }
     }
 }

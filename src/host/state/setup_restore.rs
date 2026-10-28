@@ -596,6 +596,12 @@ mod tests {
         current.host_incarnation = HostIncarnation::new("replacement");
         let _lease = crate::daemon::HostLease::acquire(&paths, &current).unwrap();
         let mut state = HostState::new(current);
+        // Original-holder restoration also restores durable execution
+        // authority, just as production startup does after opening its model.
+        state.install_model(
+            super::super::super::model::Registry::at(&root.join("model.sqlite3")).unwrap(),
+        );
+        assert!(state.execution_registry.is_some());
         state.enable_holder_recovery();
         let host = Arc::new(HostLock::new(state));
         let _cleanup = CloseFixtureTerminals(host.clone());

@@ -408,6 +408,43 @@ a proven **NotCreated** outcome permits a fresh attempt; **OutcomeUnknown**
 requires manual inspection. The Git ownership lock is held through the durable
 Created commit, and a failure to release it is reported rather than hidden.
 
+## Channel work
+
+Open a channel and choose **Work** beside **Conversations** to see the PRs
+tracked in that channel. Return to **Conversations** to use its terminals and
+chats. Changing this view keeps those sessions running.
+
+Use **Track PR…** to enter the forge host, repository and PR number, or type or
+paste a full PR URL into **Repository**. The URL stays editable while the host
+and number update. Editing the host or number switches to separate identity
+fields. Review the identity and choose the channel's role before submitting:
+
+| Role | Meaning |
+| --- | --- |
+| **Contributing** | Declared implementation work |
+| **Stewarding** | Responsibility for progressing the work |
+| **Review only** | Reviewing without claiming implementation |
+| **Reference** | Related context without claiming ownership |
+
+**Working on** groups contributions and stewardship. **Reviews and references**
+keeps related PRs separate. A channel can track several PRs, including PRs in
+different repositories or forks. Checking out a branch does not declare a
+contribution, and switching branches or removing a checkout does not move the
+channel's tracked work.
+
+PR observations show when they were last read. **Refresh** checks tracked PRs;
+an unavailable forge preserves the previous observation. Closed, merged and
+ended work remains in **History**. Confirm a fresh work role before an earlier
+contribution to a reopened PR counts as ongoing work again. A new review alone
+does not restart that contribution. Page counts describe only the loaded
+pages; use the current-page and history controls to browse further.
+
+**Change role** corrects a relation, and **End tracking** moves it to history.
+Leaving an edited tracking form offers **Keep editing** or **Discard draft**.
+Submitted changes continue independently of the view. If a result is
+unconfirmed, use **Check result** or **Retry original change**; retry preserves
+the original target, role and operation.
+
 ## Work board
 
 The Work board answers "what was I working on?" across every open project. The
@@ -505,8 +542,8 @@ and `--token` makes the removal refuse if anything changed since that plan.
 
 While a removal runs, no session can start inside the worktree. It is refused
 when a terminal, chat or agent works there, an automation run is in progress
-there, or any process of yours has its working directory or an open file
-inside it, the shell running `cagents work rm` included. Processes in
+there, or any process of yours has its working directory, an open file or a
+mapped file inside it, the shell running `cagents work rm` included. Processes in
 containers are not seen; stop them first. Sessions in other worktrees keep
 running, and the daemon refuses to upgrade or shut down until the removal
 finishes. Agents may read plans, but only you can remove a worktree.
@@ -773,11 +810,24 @@ or repeat an alert: desktop delivery and local persistence are not one transacti
   logical pixels; a terminal font size you already saved is kept.
 - Editor settings can override the terminal font family and size. **Ctrl+=**,
   **Ctrl+-**, and **Ctrl+0** zoom or reset the focused editor or terminal.
-- **Ctrl+F** finds in the open file, highlighting all matches. **Enter** and
-  **Shift+Enter** move forward and backward; replacement controls offer one
-  match or all matches.
+- **Ctrl+F** opens Find and focuses its query. Click the buffer to keep editing,
+  undoing and redoing with Find open; the match count updates without moving
+  your caret. **Enter** / **Shift+Enter** in the query and **F3** / **Shift+F3**
+  in the buffer move between matches. **Escape** closes Find and focuses the buffer.
+- Find offers **Aa** (match case), **Word** (whole words), and `.*` (regular
+  expressions). Invalid expressions show an inline error. **Selection** searches
+  only the selection captured when enabled. Matching preferences persist for
+  the user; the selection scope lasts only for this open strip. Editing or
+  undoing pauses a scoped search so it cannot replace text in a different
+  region. Select the new range and turn **Selection** off and on to resume.
+- Replace or Replace all uses the same matching options. Regular expressions
+  expand captures such as `$1`; plain replacements can **Preserve case** for
+  upper, lower and title case matches. Replace all is one undo step.
 - With a language server running, diagnostics appear in the gutter and under
-  the affected text. **Ctrl+Space** requests completion; arrow keys choose a
+  the affected text. They stay visible while you edit and follow inserted or
+  removed lines until the server publishes a new set. **F8** / **Shift+F8**
+  move to the next or previous diagnostic and show its message; the command
+  palette offers the same actions. **Ctrl+Space** requests completion; arrow keys choose a
   result and **Tab** or **Enter** applies it. Hover over a symbol for details,
   use **Ctrl+click** or **F12** for its definition, and **Shift+F12** for references.
 - Images open as previews. File, view, edit, and diff controls sit in a toolbar

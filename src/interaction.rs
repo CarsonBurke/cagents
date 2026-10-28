@@ -32,11 +32,30 @@ pub fn focused_escape<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
     on_escape: impl Fn() -> Message + 'a,
 ) -> Element<'a, Message> {
+    focused_key(content, move |event| {
+        matches!(
+            event,
+            cosmic::iced::keyboard::Event::KeyPressed {
+                key: cosmic::iced::keyboard::Key::Named(cosmic::iced::keyboard::key::Named::Escape),
+                ..
+            }
+        )
+        .then(|| on_escape())
+    })
+}
+
+/// Route a key from the field that actually owns native focus, before the
+/// native input consumes it. Other fields and already captured events keep
+/// their own keyboard handling, including after programmatic focus changes.
+pub fn focused_key<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    on_key: impl Fn(&cosmic::iced::keyboard::Event) -> Option<Message> + 'a,
+) -> Element<'a, Message> {
     Effect {
         content: content.into(),
-        kind: Kind::FocusedEscape,
+        kind: Kind::FocusedKey,
         tip: None,
-        on_escape: Some(Box::new(on_escape)),
+        on_focused_key: Some(Box::new(on_key)),
     }
     .into()
 }
@@ -67,7 +86,7 @@ pub fn keyboard_list<'a, Message: 'a>(
         content: content.into(),
         kind: Kind::KeyboardList(enabled),
         tip: None,
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
@@ -79,7 +98,7 @@ pub fn keyboard_list_row<'a, Message: 'a>(
         content: content.into(),
         kind: Kind::ListRow,
         tip: None,
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
@@ -100,7 +119,7 @@ pub fn keyboard_list_entry<'a, Message: 'a>(
         content: content.into(),
         kind: Kind::ListEntry,
         tip: None,
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
@@ -237,7 +256,7 @@ pub fn reserve_tab_history<'a, Message: 'a>(
         content: content.into(),
         kind: Kind::TabHistory(enabled),
         tip: None,
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
@@ -249,7 +268,7 @@ pub fn hover<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Eleme
         content: content.into(),
         kind: Kind::Hover,
         tip: None,
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
@@ -263,7 +282,7 @@ pub fn drive_animation<'a, Message: 'a>(
         content: content.into(),
         kind: Kind::DriveAnimation(active),
         tip: None,
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
@@ -356,7 +375,7 @@ fn reveal_width_aligned<'a, Message: 'a>(
             leading,
         },
         tip: None,
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
@@ -376,7 +395,7 @@ pub fn fade<'a, Message: 'a>(
         content: content.into(),
         kind: Kind::Fade(progress.clamp(0.0, 1.0)),
         tip: None,
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
@@ -413,7 +432,7 @@ fn tooltip_positioned<'a, Message: 'a>(
             prefer_above,
             content: None,
         }),
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
@@ -431,7 +450,7 @@ pub fn context_menu<'a, Message: Clone + 'static>(
         content: layer(content.into(), context_menu::surface(menu)),
         kind: Kind::ContextMenu,
         tip: None,
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
@@ -446,7 +465,7 @@ pub fn context_menu_lazy<'a, Message: Clone + 'static>(
         content: layer(content.into(), context_menu::lazy_surface(builder)),
         kind: Kind::ContextMenu,
         tip: None,
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
@@ -461,7 +480,7 @@ pub fn keyboard_modal<'a, Message: 'a>(
         content: content.into(),
         kind: Kind::KeyboardModal,
         tip: None,
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
@@ -472,7 +491,7 @@ pub fn opaque<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Elem
         content: content.into(),
         kind: Kind::Opaque,
         tip: None,
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
@@ -1221,7 +1240,7 @@ fn fill_overflow_fade(renderer: &mut Renderer, bounds: Rectangle, from: Color, t
 #[derive(Clone, Copy)]
 enum Kind {
     KeyboardList(bool),
-    FocusedEscape,
+    FocusedKey,
     ListRow,
     ListEntry,
     TabHistory(bool),
@@ -1243,7 +1262,7 @@ struct Effect<'a, Message> {
     content: Element<'a, Message>,
     kind: Kind,
     tip: Option<Tip<'a, Message>>,
-    on_escape: Option<Box<dyn Fn() -> Message + 'a>>,
+    on_focused_key: Option<Box<dyn Fn(&cosmic::iced::keyboard::Event) -> Option<Message> + 'a>>,
 }
 
 struct Tip<'a, Message> {
@@ -1277,7 +1296,7 @@ impl<'a, Message: 'a> Tip<'a, Message> {
 struct HoverTag;
 struct TabHistoryTag;
 struct KeyboardListTag;
-struct FocusedEscapeTag;
+struct FocusedKeyTag;
 struct ListRowTag;
 struct FadeTag;
 struct TooltipTag;
@@ -1331,7 +1350,7 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
     fn tag(&self) -> tree::Tag {
         match self.kind {
             Kind::KeyboardList(_) => tree::Tag::of::<KeyboardListTag>(),
-            Kind::FocusedEscape => tree::Tag::of::<FocusedEscapeTag>(),
+            Kind::FocusedKey => tree::Tag::of::<FocusedKeyTag>(),
             Kind::ListRow | Kind::ListEntry => tree::Tag::of::<ListRowTag>(),
             Kind::TabHistory(_) => tree::Tag::of::<TabHistoryTag>(),
             Kind::Hover => tree::Tag::of::<HoverTag>(),
@@ -1442,18 +1461,12 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        if let Some(on_escape) = &self.on_escape
-            && matches!(
-                event,
-                Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
-                    key: cosmic::iced::keyboard::Key::Named(
-                        cosmic::iced::keyboard::key::Named::Escape
-                    ),
-                    ..
-                })
-            )
-            && !shell.is_event_captured()
+        if let Some(on_key) = &self.on_focused_key
+            && let Event::Keyboard(event) = event
         {
+            if shell.is_event_captured() {
+                return;
+            }
             let mut focus = ChildFocus::default();
             self.content.as_widget_mut().operate(
                 &mut tree.children[0],
@@ -1461,8 +1474,10 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
                 renderer,
                 &mut focus,
             );
-            if focus.0 {
-                shell.publish(on_escape());
+            if focus.0
+                && let Some(message) = on_key(event)
+            {
+                shell.publish(message);
                 shell.capture_event();
                 return;
             }

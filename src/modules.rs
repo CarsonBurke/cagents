@@ -24,12 +24,18 @@ pub mod automations;
 pub mod browser;
 #[cfg(feature = "ui")]
 pub mod capability;
+pub mod channel_work;
+pub mod channel_work_api;
+#[cfg(feature = "ui")]
+pub mod channel_work_ui;
 pub mod chat;
 pub mod companion;
 pub mod control;
 pub(crate) mod daemon;
 #[cfg(feature = "ui")]
 pub(crate) mod daemon_health;
+#[cfg(any(feature = "host", all(test, target_os = "linux")))]
+pub(crate) mod descriptor_frame;
 #[cfg(feature = "ui")]
 pub mod design;
 pub mod device;
@@ -45,6 +51,8 @@ pub mod document_render;
 pub mod editor;
 #[cfg(feature = "ui")]
 pub(crate) mod editor_history;
+#[cfg(feature = "ui")]
+pub mod editor_search;
 #[cfg(feature = "ui")]
 pub mod external_editor;
 #[cfg(feature = "ui")]
@@ -128,6 +136,8 @@ pub mod transcript_location;
 pub mod tray;
 #[cfg(feature = "ui")]
 pub mod ui_controls;
+#[cfg(feature = "ui")]
+pub mod ui_memory;
 pub mod update;
 pub mod upgrade;
 pub mod work;
