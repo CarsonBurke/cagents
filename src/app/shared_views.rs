@@ -1556,6 +1556,9 @@ impl Cagents {
                     self.sync_closed_chat_draft(id);
                 }
                 let message = match self.cards.get(&id) {
+                    Some(CardRuntime::Repository(runtime)) if runtime.is_saving() => {
+                        "A pane was closed in another client. Its editor is retained here; wait for its save to finish before closing it."
+                    }
                     Some(CardRuntime::Repository(runtime))
                         if runtime.is_dirty()
                             && (runtime.has_editor_recovery()
@@ -1564,11 +1567,7 @@ impl Cagents {
                         "A pane was closed in another client. Its editor is retained here; resolve its file recovery or durability warning, then save any remaining edits before closing it."
                     }
                     Some(CardRuntime::Repository(runtime)) if !runtime.is_dirty() => {
-                        if runtime.is_saving() {
-                            "A pane was closed in another client. Its editor is retained here; wait for its save to finish before closing it."
-                        } else {
-                            "A pane was closed in another client. Its editor is retained here; resolve its file recovery or durability warning before closing it."
-                        }
+                        "A pane was closed in another client. Its editor is retained here; resolve its file recovery or durability warning before closing it."
                     }
                     _ => {
                         "A pane was closed in another client. Its unsaved edits are retained here; save or discard them before closing it."
@@ -1687,14 +1686,14 @@ impl Cagents {
                         && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&pane.id)
                         && runtime.blocks_navigation()
                     {
-                        let message = if runtime.is_dirty()
+                        let message = if runtime.is_saving() {
+                            "Another client changed this pane. Wait for its save to finish before adopting that change."
+                        } else if runtime.is_dirty()
                             && (runtime.has_editor_recovery() || runtime.has_durability_warning())
                         {
                             "Another client changed this pane. Resolve this editor's file recovery or durability warning, then save any remaining edits before adopting that change."
                         } else if runtime.is_dirty() {
                             "Another client changed this pane. Save or discard its unsaved edits before adopting that change."
-                        } else if runtime.is_saving() {
-                            "Another client changed this pane. Wait for its save to finish before adopting that change."
                         } else {
                             "Another client changed this pane. Resolve this editor's file recovery or durability warning before adopting that change."
                         };
@@ -4537,6 +4536,175 @@ mod tests {
         app.status = None;
         app.notices.clear();
 
+        // Start the actual save path against this attested file/root, keeping
+        // the returned worker task unpolled until peer retention is observed.
+        // An edit made while saving remains dirty, but Save/Discard are disabled.
+        {
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&pane.id) else {
+                unreachable!()
+            };
+            assert!(
+                runtime
+                    .configure_save_recovery(Default::default(), vec![directory.path().to_owned()])
+            );
+        }
+        for replacement in [false, true] {
+            let saved_text = format!("submitted before peer change: {replacement}\n");
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&pane.id) else {
+                unreachable!()
+            };
+            for action in [
+                EditorAction::SelectAll,
+                EditorAction::Edit(EditorEdit::Paste(Arc::new(saved_text.clone()))),
+            ] {
+                drop(runtime.update(RepositoryAction::EditorAction {
+                    card: pane.id,
+                    action,
+                }));
+            }
+            let save = runtime.request_save_with_sync_warning_for_test(pane.id);
+            assert!(runtime.is_dirty() && runtime.is_saving());
+            assert!(!runtime.can_save() && !runtime.inspector_context().can_discard);
+            for action in [
+                EditorAction::SelectAll,
+                EditorAction::Edit(EditorEdit::Paste(Arc::new("later edits\n".into()))),
+            ] {
+                drop(runtime.update(RepositoryAction::EditorAction {
+                    card: pane.id,
+                    action,
+                }));
+            }
+            let identity = &**runtime as *const RepositoryRuntime;
+            let save_root = runtime.retained_editor_root().unwrap();
+            let view = &mut app.workspace_model.views[0];
+            view.panes = vec![pane.clone()];
+            if replacement {
+                let CardKind::Repository(incoming) = &mut view.panes[0].kind else {
+                    unreachable!()
+                };
+                incoming.selected_file = Some("peer.txt".into());
+            } else {
+                view.panes.clear();
+            }
+            let mut save = Some(save);
+            let mut previous_notice = None;
+            for reason in [
+                "saving",
+                "dirty-warning",
+                "saving-warning",
+                "completed-warning",
+                "warning",
+            ] {
+                let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&pane.id) else {
+                    unreachable!()
+                };
+                if reason == "dirty-warning" {
+                    settle(runtime, save.take().unwrap()).await;
+                    assert_eq!(runtime.editor_text().as_deref(), Some("later edits\n"));
+                    assert!(!runtime.is_saving());
+                    assert!(runtime.is_dirty() && runtime.has_durability_warning());
+                } else if reason == "saving-warning" {
+                    // A retry also preserves its pre-existing warning while
+                    // the save is active, so wait must outrank both reasons.
+                    save = Some(runtime.request_save_with_sync_warning_for_test(pane.id));
+                    for action in [
+                        EditorAction::SelectAll,
+                        EditorAction::Edit(EditorEdit::Paste(Arc::new("latest edits\n".into()))),
+                    ] {
+                        drop(runtime.update(RepositoryAction::EditorAction {
+                            card: pane.id,
+                            action,
+                        }));
+                    }
+                    assert!(runtime.is_dirty() && runtime.has_durability_warning());
+                } else if reason == "completed-warning" {
+                    settle(runtime, save.take().unwrap()).await;
+                    assert_eq!(runtime.editor_text().as_deref(), Some("latest edits\n"));
+                    assert!(runtime.is_dirty() && runtime.has_durability_warning());
+                    assert_eq!(std::fs::read_to_string(&path).unwrap(), "later edits\n");
+                } else if reason == "warning" {
+                    drop(runtime.update(RepositoryAction::DiscardEdits { card: pane.id }));
+                    assert_eq!(runtime.editor_text().as_deref(), Some("later edits\n"));
+                    assert!(!runtime.is_dirty() && runtime.has_durability_warning());
+                }
+                let saving = matches!(reason, "saving" | "saving-warning");
+                assert_eq!(runtime.is_saving(), saving);
+                if saving {
+                    assert!(!runtime.can_save() && !runtime.inspector_context().can_discard);
+                    let text = runtime.editor_text();
+                    drop(runtime.update(RepositoryAction::DiscardEdits { card: pane.id }));
+                    assert_eq!(
+                        runtime.editor_text(),
+                        text,
+                        "Discard is disabled while saving"
+                    );
+                    assert!(runtime.is_dirty() && runtime.is_saving());
+                }
+                retention_full_read(&mut app);
+                assert_eq!(app.notices.entries.len(), 1);
+                let id = app.notices.entries[0].id;
+                assert_ne!(Some(id), previous_notice);
+                let message = &app.notices.entries[0].notice.message;
+                assert_eq!(
+                    message.to_ascii_lowercase().contains("wait for its save"),
+                    saving
+                );
+                assert_eq!(
+                    message.contains("then save any remaining edits"),
+                    matches!(reason, "dirty-warning" | "completed-warning")
+                );
+                assert_eq!(
+                    message.contains("file recovery or durability warning"),
+                    !saving
+                );
+                assert!(!message.to_ascii_lowercase().contains("discard"));
+                retention_full_read(&mut app);
+                assert_eq!(app.notices.entries[0].id, id);
+                assert_eq!(app.notices.entries[0].repeats, 1);
+                drop(app.update(Message::DismissNotice(id)));
+                retention_full_read(&mut app);
+                assert!(app.notices.is_empty());
+                let Some(CardRuntime::Repository(runtime)) = app.cards.get(&pane.id) else {
+                    panic!("waiting or discarding must not detach the retained editor");
+                };
+                assert_eq!(&**runtime as *const RepositoryRuntime, identity);
+                assert!(runtime.blocks_navigation());
+                assert!(Arc::ptr_eq(
+                    &runtime.retained_editor_root().unwrap(),
+                    &save_root
+                ));
+                previous_notice = Some(id);
+            }
+            // Explicit Reload resolves the warning. Restore the original peer
+            // descriptor and dirty buffer before the pending-Reload contract.
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&pane.id) else {
+                unreachable!()
+            };
+            let reload = runtime.update(RepositoryAction::Reload { card: pane.id });
+            settle(runtime, reload).await;
+            assert!(!runtime.has_durability_warning() && !runtime.blocks_navigation());
+            app.workspace_model.views[0].panes = vec![pane.clone()];
+            retention_full_read(&mut app);
+            assert!(!app.shared_views.retention_incidents.contains_key(&pane.id));
+        }
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&pane.id) else {
+            unreachable!()
+        };
+        for action in [
+            EditorAction::SelectAll,
+            EditorAction::Edit(EditorEdit::Paste(Arc::new(original_text.clone()))),
+        ] {
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card: pane.id,
+                action,
+            }));
+        }
+        assert!(runtime.is_dirty() && !runtime.is_saving());
+        // The explicit successful Reload above established the current read
+        // root. The original pending-Reload continuation retains this root.
+        let root = runtime.retained_editor_root().unwrap();
+        app.notices.clear();
+
         // Removing the actual file makes the proposed Reload fail. Keeping its
         // task unpolled fixes the interleaving without a sleep or fake callback.
         std::fs::remove_file(&path).unwrap();
@@ -4734,7 +4902,7 @@ mod tests {
                 unreachable!()
             };
             let identity = &**runtime as *const RepositoryRuntime;
-            for reason in ["dirty", "dirty-warning", "warning"] {
+            for reason in ["saving", "dirty-warning", "warning"] {
                 let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&pane.id) else {
                     unreachable!()
                 };
@@ -4745,7 +4913,8 @@ mod tests {
                     assert_eq!(runtime.editor_text().as_deref(), Some("B\n"));
                 }
                 assert_eq!(runtime.is_dirty(), reason != "warning");
-                assert_eq!(runtime.has_durability_warning(), reason != "dirty");
+                assert_eq!(runtime.is_saving(), reason == "saving");
+                assert_eq!(runtime.has_durability_warning(), reason != "saving");
                 assert!(runtime.blocks_navigation());
                 retention_full_read(&mut app);
                 assert_eq!(app.notices.entries.len(), 1, "{reason}, {replacement}");
@@ -4753,9 +4922,10 @@ mod tests {
                 let id = notice.id;
                 assert_ne!(Some(id), previous_notice);
                 let message = notice.notice.message.clone();
+                assert!(!message.to_ascii_lowercase().contains("discard"));
                 assert_eq!(
-                    message.to_ascii_lowercase().contains("discard"),
-                    reason == "dirty"
+                    message.to_ascii_lowercase().contains("wait for its save"),
+                    reason == "saving"
                 );
                 assert_eq!(
                     message.contains("then save any remaining edits"),
@@ -4763,7 +4933,7 @@ mod tests {
                 );
                 assert_eq!(
                     message.contains("file recovery or durability warning"),
-                    reason != "dirty"
+                    reason != "saving"
                 );
                 assert_eq!(
                     app.shared_views.retention_incidents[&pane.id].reason,
