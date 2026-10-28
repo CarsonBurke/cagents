@@ -605,6 +605,361 @@ fn scoped_remote_removal_refuses_before_the_actual_ssh_resolver() {
     isolated(&["remote"], remote_refusal);
 }
 
+fn project_completion(task: Task<Message>) -> Message {
+    use cosmic::iced::futures::StreamExt;
+    let mut stream = cosmic::iced::runtime::task::into_stream(task).expect("project close task");
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async move {
+            while let Some(action) = stream.next().await {
+                if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
+                    message @ Message::ProjectUi(
+                        Action::RemovedProject { .. } | Action::ProjectSessionsClosed(..),
+                    ),
+                )) = action
+                {
+                    return message;
+                }
+            }
+            panic!("project close task produced no owning completion")
+        })
+}
+
+fn standalone_retained_app(
+    label: &str,
+) -> (
+    Cagents,
+    ProjectRemoval,
+    WorkspaceModel,
+    crate::chat::Session,
+    CardId,
+) {
+    let (removal, model, mut session, _) = fixture();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let runtime = PathBuf::from(std::env::var_os(ROOT).unwrap()).join(label);
+    fs::create_dir(&runtime).unwrap();
+    app.worktree_protections.use_fixture_runtime(runtime);
+    app.workspace_model = model.clone();
+    Arc::make_mut(&mut app.durable).workspace_model_identity = Some(model.identity);
+    app.sidebar_model.projects.push(
+        SidebarProject::new(
+            removal.project,
+            RepositoryId::new(),
+            removal.name.clone(),
+            removal.repository.clone(),
+            vec![],
+            vec![],
+        )
+        .with_kind(ProjectKind::Folder),
+    );
+    app.known_worktree_roots.insert(removal.repository.clone());
+    app.active_workspace = Some(removal.repository.clone());
+    Arc::make_mut(&mut app.durable).active_channel = None;
+    session.launch.provider = crate::agent::Provider::Claude;
+    session.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+    session.native_continuity = crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+    assert!(session.has_valid_native_continuity());
+    let card = crate::app::chat_ui::tests::restored_chat_with_draft_fixture(
+        &mut app,
+        session.clone(),
+        "Keep this standalone retained Claude draft",
+    );
+    assert_eq!(app.durable.active_channel, None);
+    assert!(
+        app.durable
+            .channels
+            .iter()
+            .all(|channel| !channel.cards.contains(&card))
+    );
+    assert_eq!(app.workspace.focused(), Some(card));
+    (app, removal, model, session, card)
+}
+
+fn exact_retained_close(
+    connection: &mut Connection,
+    session: &crate::chat::Session,
+) -> ClientEnvelope {
+    let request = connection.request();
+    assert!(
+        matches!(&request.request,
+        ClientRequest::ChatCloseRetained { session: actual } if actual == session),
+        "empty inventory must demand the exact retained source close receipt"
+    );
+    request
+}
+
+fn standalone_retained_removal(role: &str) {
+    let authority = expected_authority(role);
+    for accepted in [false, true] {
+        let (mut app, removal, before, session, card) =
+            standalone_retained_app(&format!("standalone-{accepted}"));
+        let saved = app.card_state(card).unwrap().clone();
+        let drafts = app.persistent_workspace().chat_drafts.clone();
+        let focus = app.workspace.focused();
+        let expected = authority.clone();
+        let original = session.clone();
+        let mut closed = before.clone();
+        closed.fold(
+            8,
+            &ModelEdit::CloseProject {
+                repository: removal.repository.clone(),
+            },
+        );
+        let peer = Peer::new(move |server| {
+            let mut initial = server.connect(&expected, false).unwrap();
+            initial.model(&before);
+            initial.chats(vec![]);
+            let close = exact_retained_close(&mut initial, &original);
+            if !accepted {
+                initial.refuse(&close);
+                initial.eof();
+                return;
+            }
+            initial.response(&close, ServerResponse::Accepted);
+            initial.terminals(vec![]);
+            initial.eof();
+            let mut final_connection = server.connect(&expected, false).unwrap();
+            final_connection.model(&before);
+            let edit = final_connection.request();
+            assert!(matches!(&edit.request,
+                ClientRequest::EditWorkspaceModel { edit: ModelEdit::CloseProject { repository } }
+                    if repository == &before.projects[0].repository));
+            final_connection.response(
+                &edit,
+                ServerResponse::WorkspaceModel {
+                    model: closed.clone(),
+                },
+            );
+            final_connection.eof();
+            // Canonical close has its own local completion gate. Reconfirm its
+            // exact saved owner, as a real Host may answer from its close receipt.
+            let mut local = server.connect(&expected, false).unwrap();
+            local.model(&closed);
+            local.chats(vec![]);
+            let close = exact_retained_close(&mut local, &original);
+            local.response(&close, ServerResponse::Accepted);
+            local.terminals(vec![]);
+            local.eof();
+        });
+        drop(app.handle_project_action(Action::Command {
+            project_id: removal.project,
+            worktree_id: None,
+            command: ProjectCommand::Remove,
+        }));
+        assert!(app.project_ui.remove_dialog.is_some());
+        let completion = project_completion(app.handle_project_action(Action::ConfirmRemove));
+        assert!(matches!(&completion,
+            Message::ProjectUi(Action::RemovedProject { result, .. }) if result.is_ok() == accepted));
+        let local = app.update(completion);
+        if accepted {
+            let completion = project_completion(local);
+            assert!(matches!(
+                &completion,
+                Message::ProjectUi(Action::ProjectSessionsClosed(_, _, Ok(_)))
+            ));
+            drop(app.update(completion));
+            assert!(app.sidebar_model.project(removal.project).is_none());
+            assert!(!app.card_state(card).unwrap().existence.is_open());
+        } else {
+            drop(local);
+            assert!(app.sidebar_model.project(removal.project).is_some());
+            assert_eq!(app.card_state(card), Some(&saved));
+            assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+            assert_eq!(app.workspace.focused(), focus);
+            assert!(app.workspace_model.project(&removal.repository).is_some());
+            assert!(
+                !app.workspace_model
+                    .closed_projects
+                    .contains(&removal.repository)
+            );
+            assert!(app.project_ui.removal_attempts.is_empty());
+            assert!(app.project_ui.removing.is_empty());
+            assert!(
+                app.status
+                    .as_ref()
+                    .is_some_and(|notice| notice.message.contains(REFUSAL))
+            );
+        }
+        peer.finished(usize::from(accepted && role == "user"));
+    }
+}
+
+#[test]
+fn standalone_retained_project_removal_requires_a_receipt_and_keeps_refused_work() {
+    isolated(
+        &["user", "user-no-start", "present"],
+        standalone_retained_removal,
+    );
+}
+
+fn retained_project_recovery(role: &str) {
+    let authority = expected_authority(role);
+    for accepted in [false, true] {
+        let (app, removal, model, session, _) =
+            standalone_retained_app(&format!("recovery-{accepted}"));
+        let ownership = app.project_session_ownership(removal.project);
+        let mut context = ProjectRemovalContext::capture();
+        context.expected_registry = Some(model.identity);
+        let expected = authority.clone();
+        let source = session.clone();
+        let peer = Peer::new(move |server| {
+            let mut initial = server.connect(&expected, false).unwrap();
+            initial.model(&model);
+            initial.chats(vec![source.clone()]);
+            let close = initial.chat_close(&source);
+            initial.refuse(&close);
+            initial.eof();
+            let mut recovery = server.connect(&expected, false).unwrap();
+            recovery.model(&model);
+            recovery.chats(vec![]);
+            let close = exact_retained_close(&mut recovery, &source);
+            if accepted {
+                recovery.response(&close, ServerResponse::Accepted);
+                recovery.terminals(vec![]);
+            } else {
+                recovery.refuse(&close);
+            }
+            recovery.eof();
+        });
+        let result = close_sessions_in_scope_with_context(
+            &removal.worktrees,
+            Some(&removal.repository),
+            &ownership,
+            None,
+            &context,
+        );
+        assert_eq!(result.is_ok(), accepted);
+        peer.finished(0);
+    }
+}
+
+#[test]
+fn retained_project_recovery_requires_exact_teardown_after_actor_inventory_disappears() {
+    isolated(
+        &["user-no-start", "present", "empty"],
+        retained_project_recovery,
+    );
+}
+
+fn retained_project_neighbors(role: &str) {
+    for same_id in [false, true] {
+        let (mut app, removal, model, source, original) =
+            standalone_retained_app(&format!("neighbors-{same_id}"));
+        let foreign = ProjectId::new();
+        let mut neighbor = source.clone();
+        if !same_id {
+            neighbor.id = TerminalId::new();
+        }
+        neighbor.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        let card = crate::app::chat_ui::tests::restored_chat_with_draft_fixture(
+            &mut app,
+            neighbor.clone(),
+            "Keep the neighboring project's draft",
+        );
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(crate::model::ProjectChannel {
+                id: ChannelId::new(),
+                project_id: foreign,
+                title: "Neighbor".into(),
+                title_source: Default::default(),
+                ordinal: 1,
+                shared: true,
+                cards: vec![card],
+                focused: Some(card),
+            });
+        let ownership = app.project_session_ownership(removal.project);
+        let mut context = ProjectRemovalContext::capture();
+        context.expected_registry = Some(model.identity);
+        let expected = expected_authority(role);
+        let peer = Peer::new(move |server| {
+            let mut connection = server.connect(&expected, false).unwrap();
+            connection.model(&model);
+            connection.chats(vec![neighbor]);
+            if !same_id {
+                let close = exact_retained_close(&mut connection, &source);
+                connection.response(&close, ServerResponse::Accepted);
+            }
+            connection.terminals(vec![]);
+            connection.eof();
+        });
+        close_sessions_in_scope_with_context(
+            &removal.worktrees,
+            Some(&removal.repository),
+            &ownership,
+            None,
+            &context,
+        )
+        .unwrap();
+        peer.finished(0);
+        assert!(app.card_state(original).unwrap().existence.is_open());
+        assert!(app.card_state(card).unwrap().existence.is_open());
+    }
+}
+
+#[test]
+fn retained_project_census_preserves_foreign_views_even_with_the_same_directory_or_session_id() {
+    isolated(&["user-no-start", "present"], retained_project_neighbors);
+}
+
+fn retained_project_successor(role: &str) {
+    let (mut app, removal, mut model, source, card) = standalone_retained_app("successor");
+    let drafts = app.persistent_workspace().chat_drafts.clone();
+    let focused = app.workspace.focused();
+    let mut replacement = source.clone();
+    replacement.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+    model.fold(
+        8,
+        &ModelEdit::CloseProject {
+            repository: removal.repository.clone(),
+        },
+    );
+    let expected = expected_authority(role);
+    let peer = Peer::new(move |server| {
+        let mut connection = server.connect(&expected, false).unwrap();
+        connection.model(&model);
+        connection.chats(vec![]);
+        let close = exact_retained_close(&mut connection, &source);
+        connection.response(&close, ServerResponse::Accepted);
+        connection.terminals(vec![]);
+        connection.eof();
+    });
+    let task =
+        app.apply_workspace_model_update(super::super::workspace_model_sync::ModelUpdate::Edited {
+            sequence: 8,
+            edit: ModelEdit::CloseProject {
+                repository: removal.repository.clone(),
+            },
+        });
+    let completion = project_completion(task);
+    assert!(matches!(
+        &completion,
+        Message::ProjectUi(Action::ProjectSessionsClosed(_, _, Ok(_)))
+    ));
+    peer.finished(0);
+    // A completed old close is not a receipt for a new conversation which
+    // acquired the same allocation while its UI callback waited.
+    app.install_chat_session(card, replacement.clone());
+    let saved = app.card_state(card).unwrap().clone();
+    drop(app.update(completion));
+    assert!(app.sidebar_model.project(removal.project).is_some());
+    assert_eq!(app.card_state(card), Some(&saved));
+    assert_eq!(
+        app.card_state(card).unwrap().kind,
+        CardKind::Chat(replacement)
+    );
+    assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+    assert_eq!(app.workspace.focused(), focused);
+    assert!(app.project_ui.close_failed.contains(&removal.project));
+}
+
+#[test]
+fn completed_project_close_cannot_retire_a_replacement_retained_conversation() {
+    isolated(&["user-no-start", "present"], retained_project_successor);
+}
+
 fn isolated(roles: &[&str], exercise: fn(&str)) {
     if let Some(role) = std::env::var_os(ROLE) {
         let role = role.to_str().unwrap();

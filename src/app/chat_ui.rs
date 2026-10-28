@@ -18490,6 +18490,31 @@ pub(super) mod tests {
         )));
     }
 
+    /// Admit a saved pane through insertion and Ready without a provider.
+    pub(in crate::app) fn restored_chat_with_draft_fixture(
+        app: &mut Cagents,
+        session: chat::Session,
+        draft: &str,
+    ) -> CardId {
+        drop(app.insert_chat_card(session.clone(), None, None));
+        let card = app.workspace.focused().unwrap();
+        let target = chat_runtime_attempt(app, card);
+        let handle = Arc::new(ClientHandle::fixture(
+            session.clone(),
+            Snapshot {
+                ready: true,
+                session_id: session.launch.session_id.clone(),
+                native_continuity: session.native_continuity.clone(),
+                ..Snapshot::default()
+            },
+        ));
+        answer_start(app, target, Ok(handle));
+        write(app, card, draft);
+        assert!(!app.chat_start_pending(card));
+        assert_eq!(chat_runtime(app, card).composer.text().trim_end(), draft);
+        card
+    }
+
     /// Whether `task` asks for the keyboard to go to `control`.
     ///
     /// Focus is a widget operation, not a message. Each operation the task
