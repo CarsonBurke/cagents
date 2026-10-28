@@ -2,17 +2,38 @@
 use crate::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::Mutex,
     time::{Duration, Instant},
 };
 
-/// Keep phase/command summaries well below the parent's 1 MiB stderr cap.
+/// Bound stream summaries within the parent's 1 MiB cap. ProcessFailure keeps
+/// only a 64 KiB prefix, so also retain the latest tiny records independently.
 /// Never log argv, stdin payloads or environment values here.
 pub(super) fn diagnostic(message: std::fmt::Arguments<'_>) {
     static REMAINING: Mutex<usize> = Mutex::new(256 * 1024);
     let record = format!("{message}\n");
+    assert!(record.len() <= 4096, "oversized scale diagnostic record");
+    let journal = if record.starts_with("PATHSPEC_PHASE_") {
+        Some("phase-progress")
+    } else if record.starts_with("PATHSPEC_GIT_") {
+        Some("git-progress")
+    } else {
+        None
+    };
+    if let Some(name) = journal {
+        let directory = PathBuf::from(
+            std::env::var_os("CAGENTS_LARGE_PATHSPEC_ROOT")
+                .expect("owning private contract namespace"),
+        );
+        // Publish atomically before entering the operation. A timeout during
+        // this write leaves the previous complete record, never a partial one.
+        let mut temporary = tempfile::NamedTempFile::new_in(&directory).unwrap();
+        temporary.write_all(record.as_bytes()).unwrap();
+        temporary.flush().unwrap();
+        temporary.persist(directory.join(name)).unwrap();
+    }
     let mut remaining = REMAINING.lock().unwrap_or_else(|p| p.into_inner());
     if *remaining == 0 {
         return;
@@ -30,7 +51,7 @@ pub(super) fn diagnostic(message: std::fmt::Arguments<'_>) {
     stderr.flush().unwrap();
 }
 
-/// An unfinished BEGIN remains in captured stderr if the parent deadline wins.
+/// An unfinished BEGIN remains in the private journal if the deadline wins.
 pub(super) fn phase<T>(name: &str, items: usize, operation: impl FnOnce() -> T) -> T {
     let started = Instant::now();
     diagnostic(format_args!(
@@ -42,6 +63,25 @@ pub(super) fn phase<T>(name: &str, items: usize, operation: impl FnOnce() -> T) 
         started.elapsed().as_millis()
     ));
     result
+}
+
+fn report_latest_progress(directory: &Path) {
+    for name in ["phase-progress", "git-progress"] {
+        let record = (|| -> std::io::Result<String> {
+            let mut record = String::new();
+            fs::File::open(directory.join(name))?
+                .take(4097)
+                .read_to_string(&mut record)?;
+            Ok(record)
+        })();
+        match record {
+            Ok(record) if record.len() <= 4096 => {
+                eprintln!("Latest scale {name} (diagnostic only, not custody proof):\n{record}");
+            }
+            Ok(_) => eprintln!("Latest scale {name}: oversized record refused"),
+            Err(error) => eprintln!("Latest scale {name}: unavailable ({:?})", error.kind()),
+        }
+    }
 }
 
 /// Runs `contract` as the only test of a private libtest subprocess,
@@ -184,6 +224,11 @@ pub(super) fn isolated_large_pathspec_test(name: &str, contract: impl FnOnce(&Pa
     }
     let stdout = String::from_utf8_lossy(&stdout);
     let stderr = String::from_utf8_lossy(&stderr);
+    if !success {
+        // Print outside ProcessFailure's prefix so a late phase remains visible
+        // even when the captured child stderr excerpt omitted it.
+        report_latest_progress(&directory.0);
+    }
     assert!(success, "{status}\n{stdout}\n{stderr}");
     assert!(
         stdout
