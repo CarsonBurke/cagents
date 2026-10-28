@@ -1369,6 +1369,8 @@ pub(super) fn card_session(card: &CardState) -> Option<TerminalId> {
 
 #[cfg(test)]
 mod tests {
+    mod authority;
+
     use super::*;
     use crate::agent::Provider;
 

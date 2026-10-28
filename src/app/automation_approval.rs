@@ -588,6 +588,8 @@ fn approval_focus(generation: u64, index: usize) -> Task<Message> {
 
 #[cfg(test)]
 mod tests {
+    mod authority;
+
     use super::*;
     use crate::{
         agent::Provider,
