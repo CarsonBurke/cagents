@@ -17985,13 +17985,17 @@ impl Application for Cagents {
                 .card_state(card)
                 .map_or("Repository".into(), |state| state.title.clone());
             let mut rows: Vec<Element<'_, Message>> = vec![
-                design::title(if runtime.has_durability_warning() {
+                design::title(if runtime.is_saving() {
+                    format!("Saving {title}")
+                } else if runtime.has_durability_warning() {
                     format!("Confirm the save to {title} before closing")
                 } else {
                     format!("Save changes to {title}?")
                 })
                 .into(),
-                design::body(if runtime.has_durability_warning() {
+                design::body(if runtime.is_saving() {
+                    "The file is saving. Wait for the save to finish. Any remaining edits or save warnings must be resolved before closing."
+                } else if runtime.has_durability_warning() {
                     "The file was replaced on disk, but its durability is still unconfirmed. Retry the save, or cancel and reload from disk before closing; discarding editor changes cannot resolve this warning."
                 } else {
                     "This editor has unsaved changes. Save them before closing, discard them, or keep the repository open."
@@ -22367,12 +22371,37 @@ mod tests {
         present(&app, &mut renderer, &mut tree);
         assert_frame_is_faithful(&app, &tree);
 
+        let labels = dialog_labels(&app, &renderer);
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.starts_with("Save changes to "))
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("Save them before closing, discard them"))
+        );
+
         // The save starts: Discard leaves, because there is nothing coherent
         // to abandon while a write is in flight.
         let task = app.update(Message::SaveAndCloseRepository(card));
         CloseSaveFixture::assert_saving(&app, card);
         present(&app, &mut renderer, &mut tree);
         assert_frame_is_faithful(&app, &tree);
+
+        let labels = dialog_labels(&app, &renderer);
+        assert!(labels.iter().any(|label| label.starts_with("Saving ")));
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("Wait for the save to finish"))
+        );
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label.contains("Save them before closing, discard them"))
+        );
 
         // The save fails: the buffer is dirty again and Discard comes back,
         // in the middle of the row rather than at its end.
@@ -22396,6 +22425,123 @@ mod tests {
             app.dirty_repository_close.is_some(),
             "a failed save leaves the dialog up"
         );
+        present(&app, &mut renderer, &mut tree);
+        assert_frame_is_faithful(&app, &tree);
+        let labels = dialog_labels(&app, &renderer);
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.starts_with("Save changes to "))
+        );
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label.contains("Wait for the save to finish"))
+        );
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+            unreachable!()
+        };
+        assert!(
+            labels
+                .iter()
+                .any(|label| Some(label.as_str()) == runtime.save_error())
+        );
+
+        // A completed but unconfirmed save keeps the dialog actionable. A
+        // retry must show saving instructions above the retained warning.
+        std::fs::write(&fixture.path, "A\n").unwrap();
+        let warning = fixture.post_persist_warning(&mut app, card);
+        drop(app.update(warning));
+        present(&app, &mut renderer, &mut tree);
+        assert_frame_is_faithful(&app, &tree);
+        let labels = dialog_labels(&app, &renderer);
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.starts_with("Confirm the save to "))
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("Retry the save, or cancel and reload"))
+        );
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+            unreachable!()
+        };
+        let warning = runtime.save_error().unwrap().to_owned();
+        assert!(runtime.has_durability_warning() && runtime.is_dirty());
+        assert!(labels.iter().any(|label| label == &warning));
+
+        let retry = app.update(Message::SaveAndCloseRepository(card));
+        CloseSaveFixture::assert_saving(&app, card);
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+            if runtime.is_dirty() && runtime.has_durability_warning() && !runtime.can_save())
+        );
+        present(&app, &mut renderer, &mut tree);
+        assert_frame_is_faithful(&app, &tree);
+        let labels = dialog_labels(&app, &renderer);
+        assert!(labels.iter().any(|label| label.starts_with("Saving ")));
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("Wait for the save to finish"))
+        );
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label.contains("Retry the save, or cancel and reload"))
+        );
+        assert!(
+            labels.iter().any(|label| label == &warning),
+            "the existing warning stays visible while retrying"
+        );
+
+        std::fs::remove_file(&fixture.path).unwrap();
+        let failed = task_app_message(retry);
+        assert!(matches!(
+            &failed,
+            Message::Repository(RepositoryAction::RetainedSaveFinished {
+                result: Err(crate::editor::retained_save::RetainedSaveError::Io(_)),
+                ..
+            })
+        ));
+        drop(app.update(failed));
+        present(&app, &mut renderer, &mut tree);
+        assert_frame_is_faithful(&app, &tree);
+        let labels = dialog_labels(&app, &renderer);
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.starts_with("Confirm the save to "))
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("Retry the save, or cancel and reload"))
+        );
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label.contains("Wait for the save to finish"))
+        );
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+            unreachable!()
+        };
+        assert!(runtime.has_durability_warning() && runtime.is_dirty() && !runtime.is_saving());
+        assert!(
+            labels
+                .iter()
+                .any(|label| Some(label.as_str()) == runtime.save_error()),
+            "the retry error and original warning stay visible"
+        );
+
+        // A later durable completion may finally close; the saving copy does
+        // not promise this when a failure or remaining edits keep it open.
+        std::fs::write(&fixture.path, "B\n").unwrap();
+        let completed = fixture.durable_retry(&mut app, card);
+        drop(app.update(completed));
+        assert!(app.dirty_repository_close.is_none());
         present(&app, &mut renderer, &mut tree);
         assert_frame_is_faithful(&app, &tree);
     }
