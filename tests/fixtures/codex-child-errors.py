@@ -7,6 +7,7 @@ runner with this script as the isolated Codex executable. Default prompts emit
 false/null/missing-retry child diagnostics before an authentic failed turn;
 `failed-turn`, `retry`, and `disconnect` select the neighboring cases. This
 models protocol/UI behavior only, not provider execution or account recovery.
+One fixture process owns one synthetic parent conversation.
 """
 import importlib.util
 import json
@@ -109,7 +110,7 @@ class Scenario:
         return [{"id": identifier, "result": result}, *after]
 
 
-def serve(connection, codex_home):
+def serve(connection, codex_home, scenario, request_lock):
     header = bytearray()
     while b"\r\n\r\n" not in header:
         header.extend(transport.exact(connection, 1))
@@ -120,10 +121,11 @@ def serve(connection, codex_home):
     accept = transport.base64.b64encode(transport.hashlib.sha1(
         key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
     connection.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n")
-    scenario = Scenario()
     while True:
         request = transport.receive(connection, lambda payload: connection.sendall(transport.frame(payload, opcode=10)))
-        for response in scenario.request(request, codex_home):
+        with request_lock:
+            responses = scenario.request(request, codex_home)
+        for response in responses:
             connection.sendall(transport.frame(response))
 
 
@@ -151,11 +153,12 @@ def main():
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(path))
     listener.listen()
+    scenario, request_lock = Scenario(), threading.Lock()
     while True:
         connection, _ = listener.accept()
         def worker(connection=connection):
             try:
-                serve(connection, os.environ["CODEX_HOME"])
+                serve(connection, os.environ["CODEX_HOME"], scenario, request_lock)
             except (EOFError, ConnectionError):
                 pass
             finally:
