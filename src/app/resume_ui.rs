@@ -1284,6 +1284,119 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn reopening_active_missing_history_keeps_its_native_projection() {
+        for nested in [false, true] {
+            let directories = tempfile::tempdir().unwrap();
+            let protections = tempfile::tempdir().unwrap();
+            let owner = directories.path().join("still-missing-owner");
+            let cwd = if nested {
+                owner.join("subdir")
+            } else {
+                owner.clone()
+            };
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.worktree_protections
+                .use_fixture_runtime(protections.path().into());
+            if nested {
+                app.known_worktree_roots.insert(owner.clone());
+            }
+            // Two actual distinct saved conversations, never relabelled copies
+            // of one capability. They also give the strip a real scroll extent.
+            let mut first = saved(&cwd);
+            first.session.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+            drop(app.resume_saved_conversation(first));
+            let sibling = app.workspace.focused().unwrap();
+            let mut second = saved(&cwd);
+            second.session.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+            drop(app.resume_saved_conversation(second));
+            let history = app.workspace.focused().unwrap();
+            assert_ne!(history, sibling);
+            let order = app.workspace.order().collect::<Vec<_>>();
+            assert_eq!(order.len(), 2);
+            for card in Arc::make_mut(&mut app.durable).cards.iter_mut() {
+                card.width_fraction = 1.0;
+            }
+            for &id in &order {
+                app.workspace
+                    .set_card_width(id, crate::workspace::CardWidth::Fraction(1.0))
+                    .unwrap();
+            }
+            app.workspace.resize_viewport(320.0);
+            app.workspace.native_scroll(137.5, 320.0);
+            assert_eq!(app.workspace.camera().offset(), 137.5);
+            let camera = app.workspace.camera();
+            let generation = app.workspace_view_generation;
+            let scroll_id = app.workspace_scroll_id.clone();
+            let cards = app.durable.cards.clone();
+            let card = app.card_state(history).unwrap().clone();
+            let CardKind::Chat(session) = &card.kind else {
+                panic!("the exact saved History card");
+            };
+            assert!(session.launch.needs_read_only_history());
+            let CardKind::Chat(other) = &app.card_state(sibling).unwrap().kind else {
+                panic!("distinct saved sibling");
+            };
+            assert_ne!(session.launch.session_id, other.launch.session_id);
+            let entry = SavedConversation {
+                card: history,
+                title: card.title.clone(),
+                session: session.clone(),
+                open: true,
+                updated_at_unix_ms: 2,
+            };
+            assert!(matches!(std::fs::metadata(&owner), Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound));
+            app.resume_ui.open = true;
+            let task = app.resume_saved_conversation(entry.clone());
+            assert_eq!(
+                task.units(),
+                1,
+                "only the existing requested FocusCard remains"
+            );
+            drop(task);
+            assert!(!app.resume_ui.open && app.resume_ui.error.is_none());
+            assert_eq!(app.active_workspace.as_deref(), Some(owner.as_path()));
+            assert!(app.durable.active_channel.is_none());
+            assert_eq!(app.workspace.focused(), Some(history));
+            assert_eq!(app.workspace.order().collect::<Vec<_>>(), order);
+            assert_eq!(app.workspace_view_generation, generation);
+            assert_eq!(app.workspace_scroll_id, scroll_id);
+            assert_eq!(app.workspace.camera().offset(), camera.offset());
+            assert_eq!(app.workspace.camera().target(), camera.target());
+            assert_eq!(app.durable.cards, cards);
+            assert_eq!(app.card_state(history).unwrap(), &card);
+            assert_eq!(session.launch.recipe.working_directory, cwd);
+            assert!(!owner.exists() && !cwd.exists());
+
+            // Controlled model/native projection lag: a genuine sibling is
+            // closing, but its old native row is still mounted. The same owner
+            // now has a DIFFERENT filtered projection and must be rebuilt.
+            let closing = Existence::Closing {
+                operation_id: crate::model::OperationId::new(),
+            };
+            Arc::make_mut(&mut app.durable)
+                .cards
+                .iter_mut()
+                .find(|card| card.id == sibling)
+                .unwrap()
+                .existence = closing.clone();
+            assert!(app.workspace.card(sibling).is_some());
+            app.resume_ui.open = true;
+            drop(app.resume_saved_conversation(entry));
+            assert!(!app.resume_ui.open && app.resume_ui.error.is_none());
+            assert_eq!(app.workspace.order().collect::<Vec<_>>(), [history]);
+            assert_ne!(app.workspace_view_generation, generation);
+            assert_ne!(app.workspace_scroll_id, scroll_id);
+            assert_eq!(app.card_state(sibling).unwrap().existence, closing);
+            assert_eq!(app.durable.cards.len(), cards.len());
+            assert_eq!(app.card_state(history).unwrap().kind, card.kind);
+            assert_eq!(app.active_workspace.as_deref(), Some(owner.as_path()));
+            assert!(!owner.exists() && !cwd.exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn reopening_active_history_rechecks_protection_when_its_owner_returns() {
         for nested in [false, true] {
             let directories = tempfile::tempdir().unwrap();

@@ -653,6 +653,7 @@ impl Cagents {
             // A deleted indexed root still owns its former nested sessions.
             // Only actual absence permits a logical view; an existing root or
             // any other metadata error must keep ordinary lease admission.
+            let was_channel = self.durable.active_channel.is_some();
             self.snapshot_workspace_scope();
             Arc::make_mut(&mut self.durable).active_channel = None;
             let roots = self
@@ -680,6 +681,18 @@ impl Cagents {
                 .is_some_and(|id| scoped.cards.iter().any(|card| card.id == id))
             {
                 scoped.focused = scoped.cards.first().map(|card| card.id);
+            }
+            // Reopening the active logical History view must not unmount its
+            // native surfaces. Compare the actual filtered projection, after
+            // checking owner absence; returned owners still need protection.
+            if self.active_workspace.as_ref() == Some(&owner)
+                && !was_channel
+                && self
+                    .workspace
+                    .order()
+                    .eq(scoped.cards.iter().map(|card| card.id))
+            {
+                return (true, Task::none());
             }
             let offset = self.worktree_offsets.get(&owner).copied();
             return (true, self.install_workspace_scope(scoped, owner, offset));
