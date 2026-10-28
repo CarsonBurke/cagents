@@ -1060,9 +1060,8 @@ impl EditorDocument {
                 let Some(recorded) = self.content.perform_edit(edit) else {
                     return Applied::Unchanged;
                 };
-                // A final bare `\r` is a byte the protocol does not count, and
-                // `protocol_edit` measures against the edited buffer only; while
-                // either side ends in one, the server gets the whole document.
+                // Preserve the existing conservative full-sync fallback
+                // when either buffer ends in a bare carriage return.
                 let protocol = if trailing_cr || trailing_carriage_return(&self.content).is_some() {
                     None
                 } else {
@@ -1326,17 +1325,19 @@ impl EditBuffer for ProtocolTracked<'_> {
         };
         // Measured before the replacement lands, like every other edit the
         // server is told about.
-        let range = caret_position(self.content, start)
-            .zip(caret_position(self.content, end))
+        let range = exact_caret_position(self.content, start)
+            .zip(exact_caret_position(self.content, end))
             .map(|(start, end)| LspRange::new(start, end));
         let trailing_cr = trailing_carriage_return(self.content).is_some();
         self.content
             .replace_range_with_breaks(start, end, replacement, replacement_breaks);
-        // A final bare carriage return has no protocol column. Replaying
-        // its removal would otherwise report an empty range and leave the
-        // server holding a byte that the editor has removed.
+        // Preserve the existing final-CR full-sync fallback during replay.
         self.edits.push(
-            if trailing_cr || trailing_carriage_return(self.content).is_some() {
+            if expected.contains('\r')
+                || replacement.contains('\r')
+                || trailing_cr
+                || trailing_carriage_return(self.content).is_some()
+            {
                 None
             } else {
                 range.map(|range| LspTextEdit {
@@ -1423,33 +1424,15 @@ fn byte_column(line: &str, character: u32) -> usize {
         .map_or(line.len(), |(at, _)| at)
 }
 
-/// Byte range of the given zero-based line inside `text`, excluding its
-/// terminator.
+/// Byte range of the given zero-based protocol line inside `text`, excluding
+/// its terminator.
 ///
-/// Deliberately identical to `Snapshot::line_span` in [`crate::lsp`]: lines
-/// break on `\n` alone and a `\r` immediately before one is its partner, not
-/// content. Every [`LspPosition`] crossing this boundary was produced in that
-/// numbering, so anything else here would address the wrong line.
+/// Lines are counted by [`crate::lsp::line_starts`], the numbering every
+/// [`LspPosition`] crossing this boundary was produced in.
 fn line_span(text: &str, line: u32) -> Option<Range<usize>> {
-    let line = usize::try_from(line).unwrap_or(usize::MAX);
-    let mut start = 0;
-    let mut index = 0;
-    loop {
-        let end = text[start..].find('\n').map_or(text.len(), |at| start + at);
-        if index == line {
-            let content_end = if end > start && text.as_bytes()[end - 1] == b'\r' {
-                end - 1
-            } else {
-                end
-            };
-            return Some(start..content_end);
-        }
-        if end == text.len() {
-            return None;
-        }
-        start = end + 1;
-        index += 1;
-    }
+    let mut starts = crate::lsp::line_starts(text).skip(usize::try_from(line).ok()?);
+    let start = starts.next()?;
+    Some(start..crate::lsp::line_end(text, starts.next()))
 }
 
 /// Byte offset of a protocol position inside `text`, or `None` when it names a
@@ -1461,18 +1444,19 @@ fn byte_offset(text: &str, at: LspPosition) -> Option<usize> {
 
 /// Protocol position of a byte offset into `text`.
 ///
-/// The reference implementation [`caret_position`] is checked against; see
-/// [`scalar_column`].
+/// The string reference that [`caret_position`] is checked against; see
+/// [`scalar_column`]. An offset between the `\r` and the `\n` of a `\r\n`
+/// has no position of its own and clamps to the end of the line that `\r\n`
+/// ends: a column counting the `\r` would name a character the line does not
+/// have, and `Snapshot::to_utf16` refuses that outright.
 #[cfg(test)]
 fn position_for_offset(text: &str, offset: usize) -> LspPosition {
     let offset = char_boundary(text, offset);
-    let line = u32::try_from(text[..offset].matches('\n').count()).unwrap_or(u32::MAX);
-    // Clamped to the line's *content*, not merely to the offset: [`line_span`]
-    // drops a `\r` that the editor treats as a terminator of its own and will
-    // happily park a caret after. A column that counted such a `\r` would name
-    // a character the protocol's line does not have, and
-    // `Snapshot::to_utf16` refuses that outright — silently failing every
-    // hover, completion and definition made from that caret.
+    let line = crate::lsp::line_starts(text)
+        .skip(1)
+        .take_while(|start| *start <= offset)
+        .count();
+    let line = u32::try_from(line).unwrap_or(u32::MAX);
     let span = line_span(text, line).unwrap_or(0..offset);
     let content = &text[span.start..offset.min(span.end)];
     LspPosition::new(line, scalar_column(content, content.len()))
@@ -1488,16 +1472,10 @@ fn char_boundary(text: &str, offset: usize) -> usize {
     offset
 }
 
-// Editor lines against protocol lines.
-//
-// These two do not agree, and no amount of column arithmetic hides it:
-// `cosmic_text`'s `LineIter` breaks a buffer on a bare `\r` and on `\n\r` as
-// well as on `\n`, while [`crate::lsp`] counts `\n` alone. A file carrying a
-// stray carriage return therefore has two different line numberings at once.
-// Byte offsets into [`text_editor::Content::text`] are the one space both
-// sides provably share, so every conversion below goes through an offset
-// rather than passing a line index off as if it meant the same thing on both
-// sides of the boundary.
+// Editor lines against protocol lines. cosmic-text treats LFCR as one
+// terminator, while LSP counts its LF and CR as two breaks. Edits can also
+// leave a CR and its following LF in separate native terminators. Conversions
+// must read the serialized line endings without materializing the document.
 
 /// What [`text_editor::Content::text`] writes after this line: nothing after
 /// the last one, and a newline for an unterminated line in the middle.
@@ -1550,14 +1528,9 @@ fn caret_for_offset(
     caret
 }
 
-/// Index of the editor line whose bare `\r` terminator is the buffer's very
-/// last byte, if there is one.
-///
-/// [`line_span`] ends a protocol line before a `\r` that sits at its end,
-/// and the last protocol line ends at the end of the buffer — so a buffer
-/// finishing in a bare `\r` has one byte the protocol does not count. The
-/// editor disagrees: it breaks on that `\r` and will park a caret after it.
-/// This is the one place the two numberings have to be reconciled by hand.
+/// The penultimate line when its final bare CR needs conservative full sync.
+/// LSP treats it as a line break; this existing full-sync fallback remains
+/// conservative while coordinate conversion uses the protocol numbering.
 fn trailing_carriage_return(content: &text_editor::Content<cosmic::Renderer>) -> Option<usize> {
     let last = content.line_count().checked_sub(1)?;
     let previous = last.checked_sub(1)?;
@@ -1571,15 +1544,127 @@ fn trailing_carriage_return(content: &text_editor::Content<cosmic::Renderer>) ->
         .then_some(previous)
 }
 
+/// The protocol position reached by reading a text from its start, fed in
+/// pieces so that a buffer can be read a line at a time without serializing
+/// it.
+///
+/// Implements the same line breaks as [`crate::lsp::line_starts`], which the
+/// tests hold it to. Whether a `\r` ends a line on its own or begins a
+/// `\r\n` depends on the character after it, so that decision waits for the
+/// caller to say what follows.
+#[derive(Clone, Copy, Debug, Default)]
+struct ProtocolCursor {
+    line: u32,
+    /// Scalars on `line` so far.
+    character: u32,
+    /// The last character read was a `\r` that `line` and `character` do
+    /// not account for yet.
+    carriage_return: bool,
+}
+
+impl ProtocolCursor {
+    /// Reads `text`, which continues whatever has been read so far.
+    fn feed(&mut self, text: &str) {
+        for piece in text.split_inclusive(['\r', '\n']) {
+            let (content, terminator) = match piece.as_bytes().last() {
+                Some(&byte @ (b'\r' | b'\n')) => (&piece[..piece.len() - 1], Some(byte)),
+                _ => (piece, None),
+            };
+            if !content.is_empty() {
+                self.settle();
+                let scalars = u32::try_from(content.chars().count()).unwrap_or(u32::MAX);
+                self.character = self.character.saturating_add(scalars);
+            }
+            match terminator {
+                // One break, whether it ends a `\r\n` or stands alone.
+                Some(b'\n') => {
+                    self.carriage_return = false;
+                    self.break_line();
+                }
+                Some(_) => {
+                    self.settle();
+                    self.carriage_return = true;
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// Resolves a pending `\r` as a line break of its own, for a caller that
+    /// knows the next character is not `\n`.
+    fn settle(&mut self) {
+        if std::mem::take(&mut self.carriage_return) {
+            self.break_line();
+        }
+    }
+
+    fn break_line(&mut self) {
+        self.line = self.line.saturating_add(1);
+        self.character = 0;
+    }
+
+    /// The position of the point reached so far, given the character after
+    /// it; `None` when that point lies between the `\r` and the `\n` of a
+    /// `\r\n`, which the protocol cannot address.
+    fn exact(self, next: Option<char>) -> Option<LspPosition> {
+        match (self.carriage_return, next) {
+            (true, Some('\n')) => None,
+            (true, _) => Some(LspPosition::new(self.line.saturating_add(1), 0)),
+            (false, _) => Some(LspPosition::new(self.line, self.character)),
+        }
+    }
+
+    /// Like [`ProtocolCursor::exact`], with a point inside a `\r\n` clamped to
+    /// the end of the line that `\r\n` ends.
+    fn clamped(self, next: Option<char>) -> LspPosition {
+        self.exact(next)
+            .unwrap_or_else(|| LspPosition::new(self.line, self.character))
+    }
+}
+
+/// The protocol reading of everything in the buffer before `caret`.
+fn protocol_cursor(
+    content: &text_editor::Content<cosmic::Renderer>,
+    caret: text_editor::Position,
+) -> Option<ProtocolCursor> {
+    let lines = content.line_count();
+    if caret.line >= lines {
+        return None;
+    }
+    let mut cursor = ProtocolCursor::default();
+    for index in 0..caret.line {
+        content.with_line(index, |text, ending| {
+            cursor.feed(text);
+            cursor.feed(terminator_str(ending, index + 1 == lines));
+        })?;
+    }
+    content.with_line(caret.line, |text, _| {
+        cursor.feed(&text[..char_boundary(text, caret.column)]);
+    })?;
+    Some(cursor)
+}
+
+/// The character the buffer's text holds right after `caret`, counting its
+/// line's terminator; `None` at the end of the document.
+fn char_after(
+    content: &text_editor::Content<cosmic::Renderer>,
+    caret: text_editor::Position,
+) -> Option<char> {
+    let last = caret.line + 1 == content.line_count();
+    content
+        .with_line(caret.line, |text, ending| {
+            text[char_boundary(text, caret.column)..]
+                .chars()
+                .next()
+                .or_else(|| terminator_str(ending, last).chars().next())
+        })
+        .flatten()
+}
+
 /// Protocol position of the editor's caret, without serializing the buffer.
 ///
-/// Equivalent to `position_for_offset(&content.text(), caret_offset(..))`,
-/// and deliberately so: a caret always sits inside a line's *content* and
-/// never on the `\r` of a `\r\n` that [`line_span`] excludes, so that clamp
-/// is a no-op here and the walk can accumulate scalars as it goes. Protocol
-/// lines break on `\n` alone while the editor also breaks on a bare `\r`,
-/// so one protocol line can span several editor lines and the scalar count
-/// only resets at a terminator containing `\n`.
+/// Ordinary LF/CRLF buffers use their persistent native line index. Other
+/// topologies use the same CR/LF protocol rules without serializing the buffer.
 fn caret_position(
     content: &text_editor::Content<cosmic::Renderer>,
     caret: text_editor::Position,
@@ -1595,29 +1680,19 @@ fn caret_position(
             u32::try_from(column).ok()?,
         ));
     }
-    let lines = content.line_count();
-    if caret.line >= lines {
-        return None;
+    Some(protocol_cursor(content, caret)?.clamped(char_after(content, caret)))
+}
+
+/// Edits cannot address a caret between the bytes of a CRLF terminator.
+fn exact_caret_position(
+    content: &text_editor::Content<cosmic::Renderer>,
+    caret: text_editor::Position,
+) -> Option<LspPosition> {
+    if content.text_snapshot().protocol_compatible_lines() {
+        caret_position(content, caret)
+    } else {
+        protocol_cursor(content, caret)?.exact(char_after(content, caret))
     }
-    let trailing_cr = trailing_carriage_return(content);
-    let mut line = 0u32;
-    let mut scalars = 0usize;
-    for index in 0..caret.line {
-        let terminator = content.with_line(index, |text, ending| {
-            scalars += text.chars().count();
-            terminator_str(ending, index + 1 == lines)
-        })?;
-        if terminator.contains('\n') {
-            line = line.saturating_add(1);
-            scalars = 0;
-        } else if trailing_cr != Some(index) {
-            scalars += terminator.chars().count();
-        }
-    }
-    content.with_line(caret.line, |text, _| {
-        let column = scalars + text[..char_boundary(text, caret.column)].chars().count();
-        LspPosition::new(line, u32::try_from(column).unwrap_or(u32::MAX))
-    })
 }
 
 /// The editor's caret as an external editor counts it.
@@ -1711,54 +1786,35 @@ fn caret_for_position(
         });
     }
     let lines = content.line_count();
-    let trailing_cr = trailing_carriage_return(content);
-    let target = usize::try_from(at.character).unwrap_or(usize::MAX);
-    let mut line = 0u32;
-    let mut consumed = 0usize;
-    let mut found = None;
+    let mut cursor = ProtocolCursor::default();
     for index in 0..lines {
-        if line > at.line {
-            break;
-        }
-        let Some((position, scalars, terminator)) = content.with_line(index, |text, ending| {
-            let remaining = target.saturating_sub(consumed);
-            (
-                text_editor::Position {
-                    line: index,
-                    column: text
-                        .char_indices()
-                        .nth(remaining)
-                        .map_or(text.len(), |(byte, _)| byte),
-                },
-                text.chars().count(),
-                terminator_str(ending, index + 1 == lines),
-            )
-        }) else {
-            break;
-        };
-        let on_target = line == at.line;
-        if on_target {
-            found = Some(position);
-            if consumed + scalars >= target {
-                break;
+        let column = content.with_line(index, |text, ending| {
+            let terminator = terminator_str(ending, index + 1 == lines);
+            // No protocol line's content continues from one editor line into
+            // the next: every editor terminator ends a protocol line, except
+            // a `\r` whose `\n` ends the empty editor line after it, and that
+            // empty line holds no content. So the first editor line to start
+            // on or after the target line holds all of it there is to hold.
+            let start = cursor.clamped(text.chars().next().or_else(|| terminator.chars().next()));
+            if start.line == at.line {
+                let remaining = at.character.saturating_sub(start.character);
+                return Some(byte_column(text, remaining));
             }
-        }
-        if trailing_cr == Some(index) {
-            // The protocol line ends at this `\r`; the empty editor line
-            // after it is not a place a protocol position can name.
-            break;
-        }
-        if terminator.contains('\n') {
-            if on_target {
-                break;
+            if start.line > at.line {
+                return Some(0);
             }
-            line = line.saturating_add(1);
-            consumed = 0;
-        } else {
-            consumed += scalars + terminator.chars().count();
+            cursor.feed(text);
+            cursor.feed(terminator);
+            None
+        })?;
+        if let Some(column) = column {
+            return Some(text_editor::Position {
+                line: index,
+                column,
+            });
         }
     }
-    found
+    None
 }
 
 /// The protocol edit that describes a change the buffer has just made.
@@ -1767,8 +1823,7 @@ fn caret_for_position(
 /// double-clicked word reports its selection as a single point, so a guess
 /// would tell the server one character went where a whole word did. The
 /// start is read off the edited buffer, where nothing before it moved; the
-/// end is the start advanced over the removed text in protocol terms, where
-/// lines break on `\n` alone.
+/// end advances over removed text using the same protocol line numbering.
 ///
 /// `None` where the start has no protocol position; the caller then falls
 /// back to the full document.
@@ -1776,15 +1831,30 @@ fn protocol_edit(
     content: &text_editor::Content<cosmic::Renderer>,
     change: &TextChange,
 ) -> Option<LspTextEdit> {
-    let start = caret_position(content, change.start)?;
-    let mut end = start;
-    for character in change.removed.chars() {
-        if character == '\n' {
-            end = LspPosition::new(end.line.checked_add(1)?, 0);
-        } else {
-            end = LspPosition::new(end.line, end.character.checked_add(1)?);
-        }
+    // A CR can pair with a neighboring LF across a replacement boundary.
+    // Full synchronization also clears standing diagnostic ranges whose
+    // offsets cannot be shifted from this edit payload alone.
+    if change.removed.contains('\r') || change.inserted.contains('\r') {
+        return None;
     }
+    let (start, end) = if content.text_snapshot().protocol_compatible_lines() {
+        let start = caret_position(content, change.start)?;
+        let mut end = start;
+        for character in change.removed.chars() {
+            if character == '\n' {
+                end = LspPosition::new(end.line.checked_add(1)?, 0);
+            } else {
+                end = LspPosition::new(end.line, end.character.checked_add(1)?);
+            }
+        }
+        (start, end)
+    } else {
+        let mut cursor = protocol_cursor(content, change.start)?;
+        let after = char_after(content, change.inserted_end());
+        let start = cursor.exact(change.removed.chars().next().or(after))?;
+        cursor.feed(&change.removed);
+        (start, cursor.exact(after)?)
+    };
     Some(LspTextEdit {
         range: LspRange::new(start, end),
         new_text: change.inserted.clone(),
@@ -17595,7 +17665,7 @@ mod tests {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "α\rbeta\nsecond\n");
         runtime.set_editor_diagnostics(vec![crate::lsp::LspDiagnostic::new(
-            LspRange::new(LspPosition::new(0, 2), LspPosition::new(0, 6)),
+            LspRange::new(LspPosition::new(1, 0), LspPosition::new(1, 4)),
             crate::lsp::LspSeverity::Error,
             "bad beta".into(),
             None,
@@ -18729,26 +18799,18 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_carriage_return_is_a_line_break_to_the_editor_and_not_to_the_protocol() {
-        // The editor's `LineIter` breaks on a lone `\r`; `crate::lsp` counts
-        // `\n` alone. This buffer therefore has three lines to the editor and
-        // two to the protocol, and a caret that survives the trip proves the
-        // conversion goes through byte offsets rather than through a line
-        // index that means different things on each side.
+    fn a_bare_carriage_return_is_a_line_break_to_the_editor_and_to_the_protocol() {
+        // LSP 3.17 ends a line at a lone `\r`, as the editor's `LineIter`
+        // does, so both see three lines here.
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "old\rmac\n");
         drop(runtime.take_lsp_intents());
 
-        let inside_the_second_editor_line = LspPosition::new(0, 5);
-        assert!(runtime.move_cursor_to(inside_the_second_editor_line));
-        assert_eq!(
-            runtime.cursor_position(),
-            Some(inside_the_second_editor_line)
-        );
-        assert!(
-            !runtime.move_cursor_to(LspPosition::new(2, 0)),
-            "the protocol sees two lines here, whatever the editor does"
-        );
+        let inside_the_second_line = LspPosition::new(1, 2);
+        assert!(runtime.move_cursor_to(inside_the_second_line));
+        assert_eq!(runtime.cursor_position(), Some(inside_the_second_line));
+        assert!(runtime.move_cursor_to(LspPosition::new(2, 0)));
+        assert!(!runtime.move_cursor_to(LspPosition::new(3, 0)));
     }
 
     /// The external caret for the editor-native caret at `line` and byte
@@ -18877,36 +18939,30 @@ mod tests {
     }
 
     #[test]
-    fn a_caret_after_a_stripped_carriage_return_reports_a_position_the_protocol_can_hold() {
-        // `crate::lsp` drops a `\r` sitting immediately before a line's
-        // terminating `\n`, or at the end of the buffer, from that line's
-        // content — while the editor treats the same `\r` as a terminator of
-        // its own and will park a caret after it. A column that counted the
-        // `\r` would name a character the protocol's line does not have, which
-        // `Snapshot::to_utf16` refuses with `PositionOutOfRange`: every hover,
-        // completion and definition asked from that caret would silently fail.
+    fn a_position_never_counts_a_terminator_as_a_character() {
+        // A column counting a `\r` would name a character the protocol's
+        // line does not have, which `Snapshot::to_utf16` refuses with
+        // `PositionOutOfRange`: every hover, completion and definition asked
+        // from that caret would silently fail.
         assert_eq!(
             position_for_offset("a\r", 2),
-            LspPosition::new(0, 1),
-            "the buffer's trailing bare `\\r` is not a character of line zero"
+            LspPosition::new(1, 0),
+            "a final `\\r` ends line zero and begins an empty line one"
         );
         assert_eq!(
             position_for_offset("x\n\r\ny", 3),
             LspPosition::new(1, 0),
-            "the editor reads `\\n\\r` as one terminator, the protocol reads `\\r\\n`; \
-             either way line one is empty"
+            "between the `\\r` and `\\n` of a `\\r\\n` is the end of the line it ends"
         );
 
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "a\r");
         drop(runtime.take_lsp_intents());
-        // The end of this buffer is a place `move_cursor_to` cannot name, so
-        // the caret is driven there the way a keypress would.
         drop(runtime.update(RepositoryAction::EditorAction {
             card,
             action: text_editor::Action::Move(text_editor::Motion::DocumentEnd),
         }));
-        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(0, 1)));
+        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(1, 0)));
         assert_eq!(runtime.take_lsp_intents(), Vec::new());
     }
 
@@ -20918,8 +20974,8 @@ mod tests {
 
     #[test]
     fn an_edit_at_a_final_bare_carriage_return_resends_the_whole_document() {
-        // The protocol does not count a buffer's final bare `\r`, so removing
-        // it has no protocol range measured on the edited buffer alone.
+        // Keep conservative full sync around a final CR even though the
+        // corrected protocol numbering can now address that line break.
         let text = "a\r";
         let mut document = EditorDocument::unlinked(
             PathBuf::from("mac.txt"),
@@ -20959,7 +21015,7 @@ mod tests {
             assert_eq!(buffer_text(&runtime), text);
             assert!(
                 !runtime.lsp_edits_exact,
-                "a trailing CR cannot be addressed by a protocol range"
+                "the conservative final-CR full-sync fallback is retained"
             );
             assert_eq!(
                 runtime.take_lsp_intents(),

@@ -673,6 +673,40 @@ pub enum LspError {
 // Versioned snapshots and coordinate conversion
 // ---------------------------------------------------------------------------
 
+/// Byte offset at which each protocol line of `text` starts, in order. The
+/// first is always `0`.
+///
+/// LSP 3.17, "Text Documents": the end-of-line sequences are `\n`, `\r\n`
+/// and `\r`, so that client and server split a document into the same lines.
+/// A `\r` therefore ends a line unless a `\n` follows it, and `\n\r` is two
+/// line breaks. Every line number exchanged with a server means a line in this
+/// sense; the editor's own numbering differs and is reconciled against this
+/// one by its callers.
+pub(crate) fn line_starts(text: &str) -> impl Iterator<Item = usize> + '_ {
+    let bytes = text.as_bytes();
+    std::iter::once(0).chain(
+        bytes
+            .iter()
+            .enumerate()
+            .filter_map(move |(index, byte)| match byte {
+                b'\n' => Some(index + 1),
+                b'\r' if bytes.get(index + 1) != Some(&b'\n') => Some(index + 1),
+                _ => None,
+            }),
+    )
+}
+
+/// Where the content of a protocol line ends, given where the next one starts
+/// (`None` for the last line): before its terminator, which belongs to no
+/// line's content.
+pub(crate) fn line_end(text: &str, next: Option<usize>) -> usize {
+    match next {
+        None => text.len(),
+        Some(next) if text.as_bytes()[..next].ends_with(b"\r\n") => next - 2,
+        Some(next) => next - 1,
+    }
+}
+
 /// One immutable version of a document's text plus its line index.
 #[derive(Debug)]
 struct Snapshot {
@@ -753,12 +787,9 @@ impl Snapshot {
 
     fn protocol_lines(&self) -> &[u32] {
         self.line_starts.get_or_init(|| {
-            let mut lines = vec![0];
-            for (index, byte) in self.full_text().bytes().enumerate() {
-                if byte == b'\n' {
-                    lines.push(u32::try_from(index + 1).unwrap_or(u32::MAX));
-                }
-            }
+            let lines: Vec<_> = line_starts(self.full_text())
+                .map(|start| u32::try_from(start).unwrap_or(u32::MAX))
+                .collect();
             lines.into()
         })
     }
@@ -779,14 +810,8 @@ impl Snapshot {
         }
         let lines = self.protocol_lines();
         let start = *lines.get(line as usize)? as usize;
-        let end = lines
-            .get(line as usize + 1)
-            .map_or(self.byte_len(), |next| *next as usize - 1);
-        let end = if end > start && self.full_text().as_bytes().get(end - 1) == Some(&b'\r') {
-            end - 1
-        } else {
-            end
-        };
+        let next = lines.get(line as usize + 1).map(|next| *next as usize);
+        let end = line_end(self.full_text(), next);
         Some(start..end)
     }
 
@@ -8329,6 +8354,171 @@ pub(crate) mod tests {
             }],
         );
         assert_eq!(item.range, LspRange::default());
+    }
+
+    #[test]
+    fn native_editor_positions_and_snapshots_agree_across_protocol_line_endings() {
+        use crate::repository_widget::{
+            LspChangeText, LspIntent, RepositoryAction, RepositoryRuntime, text_editor,
+        };
+
+        // Native cosmic-text groups LFCR into one terminator. LSP defines LF,
+        // CRLF and CR, so LFCR contains an otherwise invisible empty line.
+        // Hard-coded native/protocol rows keep a self-consistent wrong pair
+        // of converters from hiding the original offset defect.
+        for (text, native_line, protocol_line) in [
+            ("é\n🌲b", 1, 1),
+            ("é\r\n🌲b", 1, 1),
+            ("é\r🌲b", 1, 1),
+            ("é\n\r🌲b", 1, 2),
+            ("é\n\r\n🌲b", 2, 2),
+            ("é\r\nx\n\r🌲b", 2, 3),
+        ] {
+            let card = crate::model::CardId::new();
+            let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, text);
+            let intents = runtime.take_lsp_intents();
+            let [
+                LspIntent::Open {
+                    version,
+                    text: LspChangeText::Snapshot(source),
+                    ..
+                },
+            ] = intents.as_slice()
+            else {
+                panic!("the actual editor load publishes its immutable source");
+            };
+            let snapshot = Snapshot::from_native(*version, source.clone());
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Move(text_editor::Motion::DocumentEnd),
+            }));
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Move(text_editor::Motion::Left),
+            }));
+            let expected = LspPosition::new(protocol_line, 1);
+            assert_eq!(runtime.cursor_position(), Some(expected), "{text:?}");
+            let wire = snapshot
+                .to_utf16(runtime.cursor_position().unwrap())
+                .unwrap();
+            assert_eq!(wire, lsp_types::Position::new(protocol_line, 2), "{text:?}");
+            assert!(matches!(
+                snapshot.from_utf16(lsp_types::Position::new(protocol_line, 1)),
+                Err(LspError::SplitSurrogate { .. })
+            ));
+            // Drive the return trip from a known wire coordinate, then inspect
+            // the real native caret in bytes rather than round-tripping only
+            // through the two LSP helpers under test.
+            for (scalar, utf16, byte) in [(0, 0, 0), (1, 2, 4), (2, 3, 5)] {
+                let at = snapshot
+                    .from_utf16(lsp_types::Position::new(protocol_line, utf16))
+                    .unwrap();
+                assert_eq!(at, LspPosition::new(protocol_line, scalar));
+                assert!(runtime.move_cursor_to(at));
+                let native = runtime.navigation().unwrap().editor.unwrap().caret;
+                assert_eq!(
+                    (native.line, native.column),
+                    (native_line, byte),
+                    "{text:?}"
+                );
+                assert_eq!(runtime.cursor_position(), Some(at));
+            }
+            if source.protocol_compatible_lines() {
+                assert_eq!(
+                    source.serialization_count(),
+                    0,
+                    "normal line coordinates stay lazy"
+                );
+            }
+            assert_eq!(runtime.editor_text().as_deref(), Some(text));
+        }
+    }
+
+    #[test]
+    fn lfcr_editor_edits_use_the_snapshot_protocol_coordinates() {
+        use crate::repository_widget::{
+            LspChangeText, LspIntent, RepositoryAction, RepositoryRuntime, text_editor,
+        };
+
+        for (text, protocol_line) in [("é\n\r🌲b", 2), ("é\r🌲b", 1), ("é\r\n🌲b", 1)] {
+            let card = crate::model::CardId::new();
+            let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, text);
+            let intents = runtime.take_lsp_intents();
+            let [
+                LspIntent::Open {
+                    version,
+                    text: LspChangeText::Snapshot(source),
+                    ..
+                },
+            ] = intents.as_slice()
+            else {
+                panic!("actual native load");
+            };
+            let base = Snapshot::from_native(*version, source.clone());
+            assert!(runtime.move_cursor_to(LspPosition::new(protocol_line, 1)));
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Edit(text_editor::Edit::Insert('!')),
+            }));
+            let intents = runtime.take_lsp_intents();
+            let [
+                LspIntent::Change {
+                    text: LspChangeText::Snapshot(expected),
+                    ..
+                },
+            ] = intents.as_slice()
+            else {
+                panic!("the actual edit publishes a new immutable source");
+            };
+            let edits = runtime.take_lsp_edits();
+            let changes = build_incremental(&base, &edits, &expected.text()).unwrap();
+            assert_eq!(changes.len(), 1);
+            assert_eq!(
+                changes[0].range,
+                Some(lsp_types::Range::new(
+                    lsp_types::Position::new(protocol_line, 2),
+                    lsp_types::Position::new(protocol_line, 2),
+                ))
+            );
+            assert_eq!(changes[0].text, "!");
+            assert_eq!(
+                runtime.editor_text().as_deref(),
+                Some(text.replace("🌲b", "🌲!b").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn a_native_carriage_return_edit_at_a_line_boundary_uses_full_synchronization() {
+        use crate::repository_widget::{
+            LspChangeText, LspIntent, RepositoryAction, RepositoryRuntime, text_editor,
+        };
+
+        let card = crate::model::CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "🌲\nb");
+        drop(runtime.take_lsp_intents());
+        assert!(runtime.move_cursor_to(LspPosition::new(0, 1)));
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new("\r".into()))),
+        }));
+        let intents = runtime.take_lsp_intents();
+        let [
+            LspIntent::Change {
+                version,
+                text: LspChangeText::Snapshot(source),
+            },
+        ] = intents.as_slice()
+        else {
+            panic!("the real editor mutation publishes its complete current source");
+        };
+        assert_eq!(source.text().as_ref(), "🌲\r\nb");
+        assert!(runtime.take_lsp_edits().is_empty());
+        let snapshot = Snapshot::from_native(*version, source.clone());
+        let target = snapshot.from_utf16(lsp_types::Position::new(1, 1)).unwrap();
+        assert!(runtime.move_cursor_to(target));
+        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(1, 1)));
+        assert_eq!(snapshot.line_content(1).as_deref(), Some("b"));
     }
 
     #[test]
