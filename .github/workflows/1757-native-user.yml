@@ -1,0 +1,125 @@
+name: PR1757 temporary hosted User native qualification
+
+# Temporary supplementary evidence only. Retain artifacts and close WITHOUT
+# MERGING; this is not an enduring product workflow or broad CI acceptance.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/1757-native-user.yml
+      - scripts/ci/1757-native/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native1757-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: 2
+  RUSTUP_TOOLCHAIN: 1.93.0
+  NATIVE1757_TARGET: /tmp/native1757-target-${{ github.run_id }}-${{ github.run_attempt }}
+  NATIVE1757_EVIDENCE: /tmp/native1757-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+  NATIVE1757_CONTROL: /tmp/native1757-control-${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  native:
+    if: github.repository == 'CarsonBurke/cagents' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'ci/1757-user-native'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 155
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Assert genuine hosted User before checkout or fixture paths
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, sys
+          if sys.flags.optimize:
+              raise RuntimeError('Optimized Python is forbidden')
+          if any(n.startswith('CAGENTS') or n in ('AUTH','AGENT_TOKEN','SESSION_TOKEN') for n in os.environ):
+              raise RuntimeError('Inherited role/context is forbidden, including empty values')
+          assert os.environ.get('GITHUB_ACTIONS') == 'true'
+          assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+          evidence = pathlib.Path(os.environ['NATIVE1757_EVIDENCE'])
+          evidence.mkdir(mode=0o700)
+          (evidence/'natural-user-preflight.json').write_text(json.dumps({'natural_absence':True,'empty_presence_refused':True,'authority_removed_or_rewritten':False,'before_fixture_paths':True},indent=2)+'\n')
+          PY
+
+      - name: Checkout immutable same-repository control head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Archive reviewed control and exact native sources
+        env:
+          CONTROL_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,shutil,subprocess
+          assert not [n for n in os.environ if n.startswith('CAGENTS') or n in ('AUTH','AGENT_TOKEN','SESSION_TOKEN')]
+          def git(*args): return subprocess.check_output(['git',*args],text=True,timeout=30).strip()
+          evidence=pathlib.Path(os.environ['NATIVE1757_EVIDENCE'])
+          control=pathlib.Path(os.environ['NATIVE1757_CONTROL'])
+          base='bcd82ef6cce2033da86dfb6c4fad1dfcda62f48a'
+          head=git('rev-parse','HEAD')
+          assert head==os.environ['CONTROL_HEAD'] and not git('status','--porcelain')
+          changed=git('diff','--name-only',base,head).splitlines()
+          assert changed and all(p=='.github/workflows/1757-native-user.yml' or p.startswith('scripts/ci/1757-native/') for p in changed)
+          subprocess.run(['git','merge-base','--is-ancestor',base,head],check=True,timeout=30)
+          setup='.github/actions/setup-linux-build/action.yml'
+          assert git('rev-parse',head+':'+setup)=='f24f0b0a90c31306518ff7253463a52b63a3c0e3'
+          products=[('3c3b1fef5bbddbba360b125df4658a8c9b8112eb','077d3edf6e253594b90ff1416f3a9dfd485a75f6'),('d4de5ce658c9f5524628891e1d3849e5e3d47895','5616effbb028c40fafda8d7f5ca087cff8b4fbd5')]
+          for source,tree in products:
+              subprocess.run(['git','fetch','--no-tags','origin',source],check=True,timeout=60)
+              assert git('rev-parse',source+'^{tree}')==tree
+          assert git('diff','--name-only','c686a2c95fe6ddf609b524c786f154cb1ba9bbd0',products[1][0]).splitlines()==['src/app/chat_ui/first_start_checkpoint_tests.rs']
+          shutil.copytree('scripts/ci/1757-native',control)
+          hashes={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in control.iterdir() if p.is_file()}
+          workflow=pathlib.Path('.github/workflows/1757-native-user.yml')
+          shutil.copy2(workflow,evidence/'workflow-control.yml')
+          shutil.copy2(setup,evidence/'setup-action.yml')
+          shutil.copytree(control,evidence/'control-scripts')
+          (evidence/'control.json').write_text(json.dumps({'head':head,'tree':git('rev-parse','HEAD^{tree}'),'base':base,'changed':changed,'products':products,'script_sha256':hashes,'workflow_sha256':hashlib.sha256(workflow.read_bytes()).hexdigest(),'setup_blob':'f24f0b0a90c31306518ff7253463a52b63a3c0e3','workflow_ref':os.environ.get('GITHUB_WORKFLOW_REF'),'workflow_sha':os.environ.get('GITHUB_WORKFLOW_SHA'),'scope':'Temporary exact native X11 route, not product source acceptance'},indent=2)+'\n')
+          PY
+
+      - name: Prepare pinned build toolchains and native dependencies
+        timeout-minutes: 20
+        uses: ./.github/actions/setup-linux-build
+
+      - name: Install ordinary private X11 accessibility tools
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          sudo apt-get install --yes --no-install-recommends xvfb xauth openbox xdotool xclip imagemagick ffmpeg python3-pyatspi python3-pil at-spi2-core dbus-x11 mesa-utils libgl1-mesa-dri mesa-vulkan-drivers libxcb-shape0 libxcb-xfixes0 libxkbcommon-x11-0
+          dpkg-query -W xvfb xauth openbox xdotool xclip imagemagick ffmpeg python3-pyatspi python3-pil at-spi2-core > "$NATIVE1757_EVIDENCE/native-packages.txt"
+          df -h > "$NATIVE1757_EVIDENCE/disk-before.txt"
+
+      - name: Actual matched development runner on exact baseline then exact after
+        timeout-minutes: 112
+        run: |
+          set -euo pipefail
+          python3 "$NATIVE1757_CONTROL/run-qualification.py"
+
+      - name: Retain every raw result and failure, separate from product source
+        if: always()
+        run: |
+          set -euo pipefail
+          if test -f "$NATIVE1757_CONTROL/retain-evidence.py" && test -d "$NATIVE1757_EVIDENCE"; then
+            python3 "$NATIVE1757_CONTROL/retain-evidence.py"
+          fi
+
+      - name: Upload immutable raw native evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pr1757-native-user-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/native1757-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: error
+          include-hidden-files: true
