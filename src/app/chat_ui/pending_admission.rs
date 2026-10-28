@@ -239,7 +239,7 @@ impl Cagents {
                         .map_err(|error| format!("Session writer disconnected: {error}"))?
                 })
                 .await
-                .map_err(|error| error.message)
+                .map_err(|error| error.to_string())
                 .and_then(|result| result),
                 Err(error) => Err(error),
             };
@@ -653,7 +653,7 @@ impl Cagents {
                     let _ = sender.try_send((operation, wake));
                 })
                 .map(|(handle, witness)| (Arc::new(handle), witness))
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.message)
             })
             .await
             .unwrap_or_else(|error| Err(error.to_string()));
