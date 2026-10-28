@@ -1277,7 +1277,12 @@ fn original_old_boot_visual_restores_named_account_history_then_starts_twice_ove
             let identity = writer.actor_identity().unwrap();
             assert_eq!(started.session().id, id);
             assert_eq!(started.session().launch, prepared.launch);
-            assert_eq!(started.session().proof, prepared.proof);
+            // Preparation grants no live presentation authority. Explicit
+            // Start returns the installed owner's current daemon proof.
+            assert_eq!(
+                started.session().proof,
+                Some(fixture.host.lock().unwrap().proof().clone())
+            );
             assert!(started.snapshot().ready);
             wait(
                 || {
