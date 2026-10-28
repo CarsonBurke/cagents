@@ -5134,7 +5134,8 @@ pub struct Cagents {
     /// model's behalf. Asking twice would mint a second project on one checkout.
     workspace_model_opens: HashSet<PathBuf>,
     workspace_model_rx: async_channel::Receiver<workspace_model_sync::ModelUpdate>,
-    workspace_model_tx: async_channel::Sender<crate::workspace_model::ModelEdit>,
+    workspace_model_tx: async_channel::Sender<workspace_model_sync::QueuedEdit>,
+    workspace_model_reopens: workspace_model_sync::ReopenTracking,
     activation_rx: async_channel::Receiver<instance::UiActivation>,
     notification_ui: notification_ui::State,
     attention_focus_epoch: u64,
@@ -5514,9 +5515,19 @@ impl Cagents {
         }
         let project_id = project_id.unwrap_or_default();
         if open_cards && let Ok(repository) = crate::workspace_model::canonical_repository(&path) {
-            if self.project_ui.is_reopening(&repository) {
+            if self.project_ui.is_reopening(&repository)
+                && !self.workspace_model_reopens.can_retry(&repository)
+            {
                 self.status = Some(TransientNotice::warning(
                     "This project is still opening. Try again when it finishes.",
+                ));
+                return Task::none();
+            }
+            if self.project_ui.removal_attempts.contains_key(&repository)
+                || self.project_ui.removing.contains_key(&repository)
+            {
+                self.status = Some(TransientNotice::warning(
+                    "Wait for this project to finish removal before reopening it.",
                 ));
                 return Task::none();
             }
@@ -5531,12 +5542,34 @@ impl Cagents {
                 ));
                 return Task::none();
             }
+            // Only this new explicit attempt replaces failed/deferred intent;
+            // passive reads retain its protection and never replay its edit.
+            let previous: Vec<_> = self
+                .project_ui
+                .reopening
+                .iter()
+                .filter(|(_, pending)| **pending == repository)
+                .map(|(project, _)| *project)
+                .collect();
+            for project in previous {
+                self.workspace_model_reopens.invalidate(project);
+                self.project_ui.reopening.remove(&project);
+            }
             self.project_ui.closed.remove(&repository);
+            self.workspace_model_reopens.invalidate(project_id);
             self.project_ui.reopening.insert(project_id, repository);
         }
         self.repository_load_sequence = self.repository_load_sequence.wrapping_add(1);
         let generation = self.repository_load_sequence;
         self.repository_generations.insert(project_id, generation);
+        if open_cards && let Some(repository) = self.project_ui.reopening.get(&project_id) {
+            self.workspace_model_reopens.begin(
+                project_id,
+                repository.clone(),
+                self.workspace_model.identity,
+                Some(generation),
+            );
+        }
         if let Some(previous) = self
             .repository_pr_cancellations
             .insert(project_id, CancellationToken::new())
@@ -13871,6 +13904,7 @@ impl Application for Cagents {
             workspace_model_opens: HashSet::new(),
             workspace_model_rx,
             workspace_model_tx,
+            workspace_model_reopens: workspace_model_sync::ReopenTracking::default(),
             activation_rx,
             notification_ui: notification_ui::State::default(),
             attention_focus_epoch: 0,
@@ -14612,6 +14646,7 @@ impl Application for Cagents {
                                 if let Some(repository) =
                                     self.project_ui.reopening.remove(&project_id)
                                 {
+                                    self.workspace_model_reopens.remap(project_id, existing_id);
                                     self.project_ui.reopening.insert(existing_id, repository);
                                     self.publish_project_opened(existing_id);
                                 }
@@ -14802,7 +14837,9 @@ impl Application for Cagents {
                         ]);
                     }
                     Err(error) => {
-                        self.project_ui.reopening.remove(&project_id);
+                        if open_cards {
+                            self.inventory_failed_reopen(project_id);
+                        }
                         let unavailable = GitHubAvailability::Failed {
                             detail: error.clone(),
                         };
@@ -28488,6 +28525,7 @@ mod tests {
             // Unbounded and unread: a fixture publishes into a queue nobody
             // drains, which is what keeps a test off the daemon entirely.
             workspace_model_tx: async_channel::unbounded().0,
+            workspace_model_reopens: workspace_model_sync::ReopenTracking::default(),
             activation_rx: async_channel::unbounded().1,
             notification_ui: notification_ui::State::default(),
             attention_focus_epoch: 0,
