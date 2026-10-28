@@ -357,6 +357,50 @@ fn named_resume_case(name: &str, fail_retirement: bool, finish_with_close: bool)
         );
     }
 
+    if !fail_retirement {
+        // The real never-confirmed actor has a valid named issued descriptor
+        // and completed retirement. It is obsolete metadata, not authority to
+        // resume this history. Exercise the both-None confirmation case before
+        // any successful successor exists.
+        let failed = registry
+            .lock()
+            .unwrap()
+            .native_actor_ownerships(None, 128)
+            .unwrap()
+            .into_iter()
+            .filter(|owner| owner.source().id == requested.id)
+            .collect::<Vec<_>>();
+        assert_eq!(failed.len(), 1);
+        let retired = registry
+            .lock()
+            .unwrap()
+            .native_actor_retirement(failed[0].actor())
+            .unwrap()
+            .unwrap();
+        assert_eq!(retired.confirmed_session(), None);
+        let source = retired.source().clone();
+        assert!(source.has_valid_native_continuity());
+        assert_eq!(source.launch.session_id, requested.launch.session_id);
+        let trace_before = fs::read(root.join("provider-trace.jsonl")).unwrap();
+        assert!(process(&host, 0, ClientRequest::ChatPrepareResume { source }).is_err());
+        assert_eq!(
+            fs::read(root.join("provider-trace.jsonl")).unwrap(),
+            trace_before
+        );
+        assert_eq!(fs::read(&history).unwrap(), history_before);
+        assert!(host.lock().unwrap().chats.is_empty());
+        assert!(host.lock().unwrap().native_actor_startups.is_empty());
+        assert_eq!(
+            registry
+                .lock()
+                .unwrap()
+                .native_actor_ownerships(None, 128)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
     // The exact original request is retried only after the real failed owner
     // finishes normal Close, including a previously failed retirement write.
     let client = connect(chat::Intent::RetryStart).unwrap();
