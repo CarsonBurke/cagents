@@ -27,12 +27,25 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository
     name: Literal 8b7 HOST checkout safety and HOST/UI checks
     runs-on: ubuntu-22.04
-    timeout-minutes: 120
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
         working-directory: product
     steps:
+      - name: Require a natural User execution context
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, sys
+          markers = ('CAGENTS_AGENT_AUTHORITY', 'CAGENTS_AGENT_TOKEN', 'CAGENTS_SESSION_TOKEN')
+          inherited = [name for name in markers if name in os.environ]
+          if inherited:
+              print('Natural User qualification refused: inherited delegation markers present: ' + ', '.join(inherited), file=sys.stderr)
+              raise SystemExit(1)
+          PY
+
       - name: Check out the research workflow source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
