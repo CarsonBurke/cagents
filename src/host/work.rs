@@ -1847,10 +1847,12 @@ mod tests {
             .pending = None;
         std::fs::write(&new_file, "edit in newly tracked directory after retry\n").unwrap();
         wait_for(&mut scanner, "native edit after recovery", &|tracked| {
-            tracked
-                .pending
-                .as_ref()
-                .is_some_and(|change| change.worktrees.contains(&primary))
+            tracked.covered
+                && tracked.scan_error.is_none()
+                && tracked
+                    .pending
+                    .as_ref()
+                    .is_some_and(|change| change.worktrees.contains(&primary) && !change.topology)
         });
     }
 
