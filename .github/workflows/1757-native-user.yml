@@ -66,7 +66,7 @@ jobs:
           def git(*args): return subprocess.check_output(['git',*args],text=True,timeout=30).strip()
           evidence=pathlib.Path(os.environ['NATIVE1757_EVIDENCE'])
           control=pathlib.Path(os.environ['NATIVE1757_CONTROL'])
-          base='bcd82ef6cce2033da86dfb6c4fad1dfcda62f48a'
+          base='cc6c60a213ee6e234da762023b9da3535f7f82f3'
           head=git('rev-parse','HEAD')
           assert head==os.environ['CONTROL_HEAD'] and not git('status','--porcelain')
           changed=git('diff','--name-only',base,head).splitlines()

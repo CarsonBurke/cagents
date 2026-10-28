@@ -8,7 +8,7 @@ import subprocess
 import sys
 
 HERE = Path(__file__).resolve().parent
-BASE = 'bcd82ef6cce2033da86dfb6c4fad1dfcda62f48a'
+BASE = 'cc6c60a213ee6e234da762023b9da3535f7f82f3'
 PRODUCTS = [
     ('before', '3c3b1fef5bbddbba360b125df4658a8c9b8112eb', '077d3edf6e253594b90ff1416f3a9dfd485a75f6'),
     ('after', 'd4de5ce658c9f5524628891e1d3849e5e3d47895', '5616effbb028c40fafda8d7f5ca087cff8b4fbd5'),
