@@ -239,7 +239,7 @@ impl Cagents {
                         .map_err(|error| format!("Session writer disconnected: {error}"))?
                 })
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.message)
                 .and_then(|result| result),
                 Err(error) => Err(error),
             };
@@ -664,7 +664,7 @@ impl Cagents {
         })
     }
 
-    fn retained_chat_history_opened(
+    pub(super) fn retained_chat_history_opened(
         &mut self,
         target: Target,
         ready: HistoryReady,
@@ -749,7 +749,7 @@ impl Cagents {
         })
     }
 
-    fn retained_chat_history_committed(
+    pub(super) fn retained_chat_history_committed(
         &mut self,
         target: Target,
         result: Result<(), String>,
