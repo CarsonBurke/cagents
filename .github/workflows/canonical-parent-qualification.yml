@@ -106,15 +106,15 @@ jobs:
           assert len(SCHEMA) == len(set(SCHEMA)) == 27
           assert not any(n.endswith(('::writer_lock_child', '::hot_journal_child')) for n in SCHEMA)
           variants = [
-              ('channel-baseline', 'channel', 'fd537aaf299e73314f07ae57fe7bab777c5d2bd9',
-               '36cacf5ece6c0743037e8718aab7026165c11b35', CHANNEL[:1], 11),
-              ('channel-fixed', 'channel', 'fbc8af341b5eac5b3fff4905f84df98ab59b7515',
-               '867024bf92d672c35f5fa2756a1d6d541cf82ab1', CHANNEL, None),
-              ('schema-baseline', 'schema', '191b8559dacdbb2c4965a99284fe3412f024413d',
-               'aa6d68da62c3f9fa9b197c9e0cd9e8873ccce004',
+              ('channel-baseline', 'channel', '4d18d788d03588621907b423a2df0e129f6e689c',
+               'd29a84875327ccdfeb8ad7b07d01d17722c5f8f2', CHANNEL[:1], 11),
+              ('channel-fixed', 'channel', '197030bf6cfc88feb3a3539649f7d92adf11fe49',
+               '21c75edc5dee2786114f871abbc5c17914d7c2b9', CHANNEL, None),
+              ('schema-baseline', 'schema', '4d18d788d03588621907b423a2df0e129f6e689c',
+               'd29a84875327ccdfeb8ad7b07d01d17722c5f8f2',
                ['host::model::schema::tests::published_twelve_wal_damage_preserves_primary_wal_and_permissions'], 617),
-              ('schema-fixed', 'schema', '892989a86988ef44f25a606b58b15e60c0e3508d',
-               'ad745503253e8e79b47db8db61406069c2e91351', SCHEMA, None),
+              ('schema-fixed', 'schema', '595cf3b651b69fd2a9518941c9895105fca03660',
+               '0d093ce117a0e71ec45798c751ca72b9d8bb44b6', SCHEMA, None),
           ]
           paths = [
               'Cargo.toml', 'Cargo.lock', 'build.rs', '.cargo/config.toml',
