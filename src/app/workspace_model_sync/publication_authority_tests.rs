@@ -3492,3 +3492,659 @@ fn a_closed_publication_queue_keeps_reopen_protection_and_allows_an_explicit_new
     assert_eq!(app.durable.cards, cards);
     assert_eq!(app.persistent_workspace().chat_drafts, drafts);
 }
+
+/// Admit through the same command and confirmation as the project menu. Dropping
+/// the returned task deliberately leaves the destructive helper unexecuted.
+fn admit_project_removal(
+    app: &mut crate::app::Cagents,
+    project: crate::model::ProjectId,
+    repository: &Path,
+) -> crate::app::project_ui::RemovalOrigin {
+    use crate::app::project_ui::Action;
+    drop(app.handle_project_action(Action::Command {
+        project_id: project,
+        worktree_id: None,
+        command: crate::sidebar::ProjectCommand::Remove,
+    }));
+    drop(app.handle_project_action(Action::ConfirmRemove));
+    app.project_ui.removal_attempts[repository].origin.clone()
+}
+
+fn removed_project_model(mut model: WorkspaceModel, repository: &Path) -> WorkspaceModel {
+    model.sequence += 1;
+    model
+        .projects
+        .retain(|project| project.repository != repository);
+    model
+        .channels
+        .retain(|channel| channel.repository != repository);
+    model.closed_projects.retain(|path| path != repository);
+    model.closed_projects.push(repository.to_path_buf());
+    model
+}
+
+#[test]
+fn confirmed_removal_supersedes_retryable_reopen_in_either_observer_close_order() {
+    use crate::app::{Message, project_ui::Action};
+    for observer_first in [false, true] {
+        let (_directory, mut app, project, channel, repository, requests, canonical) =
+            publication_reconciliation_fixture();
+        take_creation_publications(&requests);
+        let queued = enqueue_explicit_reopen(&mut app, &requests, project);
+        let reopen = queued.reopen.clone().unwrap();
+        drop(
+            app.update(Message::WorkspaceModelObserved(framed_reopen_failure(
+                queued,
+            ))),
+        );
+        assert!(app.current_reopen(&reopen) && app.workspace_model_reopens.can_retry(&repository));
+        let origin = admit_project_removal(&mut app, project, &repository);
+        let closed = removed_project_model(canonical, &repository);
+        let cards = app.durable.cards.clone();
+        let drafts = app.durable.chat_drafts.clone();
+        if observer_first {
+            drop(
+                app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+                    closed.clone(),
+                ))),
+            );
+            assert!(app.current_reopen(&reopen));
+            assert!(!app.project_ui.closed.contains(&repository));
+            assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+            assert_eq!(app.durable.cards, cards);
+            assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+        }
+        drop(app.handle_project_action(Action::RemovedProject {
+            origin,
+            result: Ok(closed.clone()),
+        }));
+        if !observer_first {
+            drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(closed))));
+        }
+        assert!(!app.project_ui.removal_attempts.contains_key(&repository));
+        assert!(!app.project_ui.removing.contains_key(&repository));
+        assert!(!app.project_ui.is_reopening(&repository) && !app.current_reopen(&reopen));
+        assert!(!app.workspace_model_reopens.can_retry(&repository));
+        assert!(app.project_ui.closed.contains(&repository));
+        assert!(app.channel_ui.is_deleting(channel) || app.channel_ui.was_deleted(channel));
+        while let Ok(queued) = requests.try_recv() {
+            assert!(!matches!(queued.edit, ModelEdit::ReopenProject { .. }));
+        }
+    }
+}
+
+#[test]
+fn failed_removal_keeps_retryable_reopen_work_and_releases_the_matching_spinner() {
+    use crate::app::{Message, project_ui::Action};
+    let (_directory, mut app, project, channel, repository, requests, canonical) =
+        publication_reconciliation_fixture();
+    take_creation_publications(&requests);
+    let queued = enqueue_explicit_reopen(&mut app, &requests, project);
+    let reopen = queued.reopen.clone().unwrap();
+    drop(
+        app.update(Message::WorkspaceModelObserved(framed_reopen_failure(
+            queued,
+        ))),
+    );
+    let origin = admit_project_removal(&mut app, project, &repository);
+    assert!(app.project_ui.removing.contains_key(&repository));
+    let generation = app.repository_generations[&project];
+    let cards = app.durable.cards.clone();
+    let drafts = app.durable.chat_drafts.clone();
+    let focused = app.workspace.focused();
+    drop(app.project_load_task(
+        repository.clone(),
+        Some(project),
+        true,
+        Some(ProjectKind::Folder),
+    ));
+    assert_eq!(app.repository_generations[&project], generation);
+    assert!(app.current_reopen(&reopen));
+    assert_eq!(app.project_ui.removal_attempts[&repository].origin, origin);
+    assert!(
+        requests.is_empty(),
+        "pending removal must not enqueue a new reopen"
+    );
+    drop(app.handle_project_action(Action::RemovedProject {
+        origin: origin.clone(),
+        result: Err("Private removal fixture refused the operation".into()),
+    }));
+    assert!(!app.project_ui.removing.contains_key(&repository));
+    assert!(!app.project_ui.removal_attempts.contains_key(&repository));
+    assert!(!app.project_ui.close_started_for(project));
+    assert!(app.current_reopen(&reopen) && app.workspace_model_reopens.can_retry(&repository));
+    assert!(
+        app.status
+            .as_ref()
+            .is_some_and(|notice| notice.message.contains("Could not remove project"))
+    );
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+            removed_project_model(canonical, &repository),
+        ))),
+    );
+    assert!(!app.project_ui.closed.contains(&repository));
+    assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+    assert_eq!(app.durable.cards, cards);
+    assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+    assert_eq!(app.workspace.focused(), focused);
+    let retry = admit_project_removal(&mut app, project, &repository);
+    assert_ne!(retry, origin, "a user retry is a new removal confirmation");
+}
+
+#[test]
+fn an_unsettled_reopen_refuses_project_removal_without_losing_its_close_shield() {
+    use crate::app::{Message, project_ui::Action};
+    let (_directory, mut app, project, channel, repository, requests, canonical) =
+        publication_reconciliation_fixture();
+    take_creation_publications(&requests);
+    let queued = enqueue_explicit_reopen(&mut app, &requests, project);
+    let reopen = queued.reopen.unwrap();
+    let cards = app.durable.cards.clone();
+    let drafts = app.durable.chat_drafts.clone();
+    drop(app.handle_project_action(Action::Command {
+        project_id: project,
+        worktree_id: None,
+        command: crate::sidebar::ProjectCommand::Remove,
+    }));
+    drop(app.handle_project_action(Action::ConfirmRemove));
+    assert!(app.project_ui.removal_attempts.is_empty());
+    assert!(!app.project_ui.removing.contains_key(&repository));
+    assert!(app.current_reopen(&reopen));
+    assert!(
+        app.status
+            .as_ref()
+            .is_some_and(|notice| notice.message.contains("finish opening"))
+    );
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+            removed_project_model(canonical, &repository),
+        ))),
+    );
+    assert!(!app.project_ui.closed.contains(&repository));
+    assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+    assert_eq!(app.durable.cards, cards);
+    assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+    assert!(requests.is_empty());
+}
+
+#[test]
+fn old_removal_replies_cannot_cross_a_registry_or_settle_an_aba_successor_confirmation() {
+    use crate::app::{Message, project_ui::Action};
+    for old_sequence in [Some(1), Some(10_000), None] {
+        let (_directory, mut app, project, channel, repository, requests, canonical) =
+            publication_reconciliation_fixture();
+        take_creation_publications(&requests);
+        let queued = enqueue_explicit_reopen(&mut app, &requests, project);
+        drop(
+            app.update(Message::WorkspaceModelObserved(framed_reopen_failure(
+                queued,
+            ))),
+        );
+        let old = admit_project_removal(&mut app, project, &repository);
+        let old_result = if let Some(sequence) = old_sequence {
+            let mut closed = removed_project_model(canonical.clone(), &repository);
+            closed.sequence = sequence;
+            Ok(closed)
+        } else {
+            Err("Old A removal failed".to_owned())
+        };
+        let foreign = WorkspaceModel {
+            identity: uuid::Uuid::new_v4(),
+            sequence: 2,
+            ..WorkspaceModel::default()
+        };
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+                foreign.clone(),
+            ))),
+        );
+        let cards = app.durable.cards.clone();
+        let drafts = app.durable.chat_drafts.clone();
+        let focused = app.workspace.focused();
+        drop(app.handle_project_action(Action::RemovedProject {
+            origin: old.clone(),
+            result: old_result.clone(),
+        }));
+        assert_eq!(
+            app.workspace_model, foreign,
+            "neither high nor low foreign sequence is current authority"
+        );
+        assert_eq!(app.durable.workspace_model_identity, Some(foreign.identity));
+        assert!(app.project_ui.removal_attempts.is_empty());
+        assert!(!app.project_ui.removing.contains_key(&repository));
+        assert!(app.project_ui.is_reopening(&repository));
+        assert!(app.sidebar_model.project(project).is_some());
+        assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+        let mut fresh_foreign = foreign;
+        fresh_foreign.sequence += 1;
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+                fresh_foreign.clone(),
+            ))),
+        );
+        assert_eq!(
+            app.workspace_model, fresh_foreign,
+            "old A cannot poison B's sequence watermark"
+        );
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+                canonical.clone(),
+            ))),
+        );
+        let queued = enqueue_explicit_reopen(&mut app, &requests, project);
+        let successor_reopen = queued.reopen.clone().unwrap();
+        drop(
+            app.update(Message::WorkspaceModelObserved(framed_reopen_failure(
+                queued,
+            ))),
+        );
+        let successor = admit_project_removal(&mut app, project, &repository);
+        assert_ne!(successor, old);
+        let current = app.workspace_model.clone();
+        drop(app.handle_project_action(Action::RemovedProject {
+            origin: old,
+            result: old_result,
+        }));
+        assert_eq!(app.workspace_model, current);
+        assert_eq!(
+            app.project_ui.removal_attempts[&repository].origin,
+            successor
+        );
+        assert!(app.project_ui.removing.contains_key(&repository));
+        assert!(app.current_reopen(&successor_reopen));
+        assert!(!app.project_ui.closed.contains(&repository));
+        assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+        assert_eq!(app.durable.cards, cards);
+        assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+        assert_eq!(app.workspace.focused(), focused);
+        drop(app.handle_project_action(Action::RemovedProject {
+            origin: successor,
+            result: Err("Current confirmation failed".into()),
+        }));
+        assert!(!app.project_ui.removing.contains_key(&repository));
+        assert!(app.current_reopen(&successor_reopen));
+    }
+}
+
+#[test]
+fn a_newer_canonical_open_defeats_stale_successful_removal_without_sticking_its_spinner() {
+    use crate::app::{Message, project_ui::Action};
+    let (_directory, mut app, project, channel, repository, requests, canonical) =
+        publication_reconciliation_fixture();
+    take_creation_publications(&requests);
+    let queued = enqueue_explicit_reopen(&mut app, &requests, project);
+    drop(
+        app.update(Message::WorkspaceModelObserved(framed_reopen_failure(
+            queued,
+        ))),
+    );
+    let origin = admit_project_removal(&mut app, project, &repository);
+    let closed = removed_project_model(canonical.clone(), &repository);
+    let mut opened = reopened_project_model(canonical, &repository);
+    opened.sequence = closed.sequence + 1;
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+            opened.clone(),
+        ))),
+    );
+    let cards = app.durable.cards.clone();
+    let drafts = app.durable.chat_drafts.clone();
+    let focused = app.workspace.focused();
+    drop(app.handle_project_action(Action::RemovedProject {
+        origin,
+        result: Ok(closed),
+    }));
+    assert_eq!(app.workspace_model, opened);
+    assert!(!app.project_ui.removal_attempts.contains_key(&repository));
+    assert!(!app.project_ui.removing.contains_key(&repository));
+    assert!(!app.project_ui.close_started_for(project));
+    assert!(!app.project_ui.closed.contains(&repository));
+    assert!(!app.project_ui.closing.contains_key(&project));
+    assert!(!app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel));
+    assert!(app.sidebar_model.project(project).is_some());
+    assert_eq!(app.durable.cards, cards);
+    assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+    assert_eq!(app.workspace.focused(), focused);
+}
+
+#[test]
+fn successful_removal_still_retires_the_same_reopen_nonce_after_passive_inventory_changes() {
+    use crate::app::project_ui::Action;
+    let (_directory, mut app, project, channel, repository, requests, canonical) =
+        publication_reconciliation_fixture();
+    take_creation_publications(&requests);
+    drop(app.project_load_task(
+        repository.clone(),
+        Some(project),
+        true,
+        Some(ProjectKind::Folder),
+    ));
+    let (tx, stopped) = async_channel::unbounded();
+    drop(stopped);
+    app.workspace_model_tx = tx;
+    app.publish_project_opened(project);
+    assert!(app.workspace_model_reopens.can_retry(&repository));
+    let before = app.workspace_model_reopens.active[&project].clone();
+    let origin = admit_project_removal(&mut app, project, &repository);
+    drop(app.project_load_task(
+        repository.clone(),
+        Some(project),
+        false,
+        Some(ProjectKind::Folder),
+    ));
+    app.publish_project_opened(project);
+    let refreshed = app.workspace_model_reopens.active[&project].clone();
+    assert_eq!(refreshed.nonce, before.nonce);
+    assert_ne!(refreshed.inventory_generation, before.inventory_generation);
+    assert!(app.current_reopen(&refreshed));
+    drop(app.handle_project_action(Action::RemovedProject {
+        origin,
+        result: Ok(removed_project_model(canonical, &repository)),
+    }));
+    assert!(!app.project_ui.removal_attempts.contains_key(&repository));
+    assert!(!app.project_ui.is_reopening(&repository));
+    assert!(!app.workspace_model_reopens.active.contains_key(&project));
+    assert!(!app.workspace_model_reopens.can_retry(&repository));
+    assert!(app.project_ui.closed.contains(&repository));
+    assert!(app.channel_ui.is_deleting(channel) || app.channel_ui.was_deleted(channel));
+}
+
+#[test]
+fn an_observed_close_does_not_release_pending_removal_admission_when_its_spinner_stops() {
+    use crate::app::{Message, project_ui::Action};
+    let (_directory, mut app, project, _channel, repository, requests, canonical) =
+        publication_reconciliation_fixture();
+    take_creation_publications(&requests);
+    let origin = admit_project_removal(&mut app, project, &repository);
+    let closed = removed_project_model(canonical, &repository);
+    drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(closed))));
+    assert_eq!(app.project_ui.removal_attempts[&repository].origin, origin);
+    assert!(!app.project_ui.removing.contains_key(&repository));
+    let generation = app.repository_load_sequence;
+    drop(app.project_load_task(
+        repository.clone(),
+        Some(project),
+        true,
+        Some(ProjectKind::Folder),
+    ));
+    assert_eq!(
+        app.repository_load_sequence, generation,
+        "a pending helper still owns removal admission after observer close"
+    );
+    assert!(!app.project_ui.is_reopening(&repository));
+    drop(app.handle_project_action(Action::Command {
+        project_id: project,
+        worktree_id: None,
+        command: crate::sidebar::ProjectCommand::Remove,
+    }));
+    drop(app.handle_project_action(Action::ConfirmRemove));
+    assert_eq!(app.project_ui.removal_attempts.len(), 1);
+    assert_eq!(app.project_ui.removal_attempts[&repository].origin, origin);
+    while let Ok(queued) = requests.try_recv() {
+        assert!(!matches!(queued.edit, ModelEdit::ReopenProject { .. }));
+    }
+    drop(app.handle_project_action(Action::RemovedProject {
+        origin,
+        result: Err("Removal helper finished after the observed close".into()),
+    }));
+    assert!(!app.project_ui.removal_attempts.contains_key(&repository));
+}
+
+#[test]
+fn observer_close_callbacks_lose_their_generation_across_registry_replacement_and_aba() {
+    use crate::{
+        app::{
+            Message,
+            project_ui::{Action, ProjectSessionClosure},
+        },
+        model::{ProjectId, RepositoryId},
+        sidebar::SidebarProject,
+    };
+    for successor in ["open", "closed", "aba-closed"] {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().canonicalize().unwrap();
+        let project = ProjectId::new();
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        app.sidebar_model.projects.push(
+            SidebarProject::new(
+                project,
+                RepositoryId::new(),
+                "Private observer-close fixture".into(),
+                repository.clone(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_kind(ProjectKind::Folder),
+        );
+        // No project channels need draining, so this real Connected schedules
+        // the scoped session helper immediately. Its returned task is held.
+        let a = removed_project_model(
+            WorkspaceModel {
+                identity: uuid::Uuid::new_v4(),
+                sequence: 4,
+                ..WorkspaceModel::default()
+            },
+            &repository,
+        );
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+                a.clone(),
+            ))),
+        );
+        let old_generation = app.project_ui.close_generation[&project];
+        assert!(app.project_ui.close_in_flight_for(project));
+        let old_cancellation = app.project_ui.close_cancellation_for(project).unwrap();
+        let b = WorkspaceModel {
+            identity: uuid::Uuid::new_v4(),
+            sequence: 1,
+            ..WorkspaceModel::default()
+        };
+        let mut current = if successor == "closed" {
+            removed_project_model(b, &repository)
+        } else {
+            reopened_project_model(b, &repository)
+        };
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+                current.clone(),
+            ))),
+        );
+        assert!(old_cancellation.is_cancelled());
+        if successor == "aba-closed" {
+            current = a;
+            current.sequence += 1;
+            drop(
+                app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+                    current.clone(),
+                ))),
+            );
+        }
+        let expected_generation = app.project_ui.close_generation.get(&project).copied();
+        if successor == "open" {
+            assert_eq!(expected_generation, None);
+            assert!(!app.project_ui.closing.contains_key(&project));
+            assert!(!app.project_ui.closed.contains(&repository));
+        } else {
+            assert_ne!(expected_generation, Some(old_generation));
+            assert!(expected_generation.is_some());
+            assert!(app.project_ui.close_in_flight_for(project));
+        }
+        let cards = app.durable.cards.clone();
+        let drafts = app.durable.chat_drafts.clone();
+        let focused = app.workspace.focused();
+        drop(app.handle_project_action(Action::ProjectSessionsClosed(
+            project,
+            old_generation,
+            Ok(ProjectSessionClosure::for_roots(vec![repository.clone()])),
+        )));
+        assert_eq!(app.workspace_model, current);
+        assert!(
+            app.sidebar_model.project(project).is_some(),
+            "{successor}: old registry's completed helper cannot retire the current row"
+        );
+        assert_eq!(
+            app.project_ui.close_generation.get(&project).copied(),
+            expected_generation
+        );
+        assert_eq!(app.durable.cards, cards);
+        assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+        assert_eq!(app.workspace.focused(), focused);
+        if let Some(generation) = expected_generation {
+            // The fresh B (or fresh A after ABA) close remains actionable;
+            // invalidating A's earlier callback must not strand this one.
+            drop(app.handle_project_action(Action::ProjectSessionsClosed(
+                project,
+                generation,
+                Ok(ProjectSessionClosure::for_roots(vec![repository.clone()])),
+            )));
+            assert!(app.sidebar_model.project(project).is_none());
+        }
+    }
+}
+
+/// A real observer tombstone schedules a close of an empty folder project.
+/// Keep its task unexecuted so the resulting generation can arrive out of order.
+fn queued_observer_close_fixture() -> (
+    tempfile::TempDir,
+    crate::app::Cagents,
+    crate::model::ProjectId,
+    PathBuf,
+    WorkspaceModel,
+    u64,
+) {
+    use crate::{
+        app::Message,
+        model::{ProjectId, RepositoryId},
+        sidebar::SidebarProject,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let repository = directory.path().canonicalize().unwrap();
+    let project = ProjectId::new();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.sidebar_model.projects.push(
+        SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "Private held observer close".into(),
+            repository.clone(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .with_kind(ProjectKind::Folder),
+    );
+    let closed = removed_project_model(
+        WorkspaceModel {
+            identity: uuid::Uuid::new_v4(),
+            sequence: 18,
+            ..WorkspaceModel::default()
+        },
+        &repository,
+    );
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+            closed.clone(),
+        ))),
+    );
+    let generation = app.project_ui.close_generation[&project];
+    assert!(app.project_ui.close_in_flight_for(project));
+    (directory, app, project, repository, closed, generation)
+}
+
+#[test]
+fn same_registry_reconnect_after_a_missed_reopen_invalidates_the_old_close_callback() {
+    use crate::app::{
+        Message,
+        project_ui::{Action, ProjectSessionClosure},
+    };
+    let (_directory, mut app, project, repository, closed, generation) =
+        queued_observer_close_fixture();
+    assert_eq!(closed.sequence, 19);
+    let cancellation = app.project_ui.close_cancellation_for(project).unwrap();
+    let opened = reopened_project_model(closed, &repository);
+    assert_eq!(opened.sequence, 20);
+    // The watcher missed the ReopenProject edge. Its reconnect is to the same
+    // registry, but the fresh full model proves this repository is open again.
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+            opened.clone(),
+        ))),
+    );
+    assert!(cancellation.is_cancelled());
+    assert!(!app.project_ui.closed.contains(&repository));
+    assert!(!app.project_ui.closing.contains_key(&project));
+    assert!(!app.project_ui.close_generation.contains_key(&project));
+    assert!(!app.project_ui.close_in_flight_for(project));
+    drop(app.handle_project_action(Action::AwaitClosedProject(project, generation)));
+    drop(app.handle_project_action(Action::ProjectSessionsClosed(
+        project,
+        generation,
+        Ok(ProjectSessionClosure::for_roots(vec![repository.clone()])),
+    )));
+    assert_eq!(app.workspace_model, opened);
+    assert_eq!(
+        app.sidebar_model.project(project).unwrap().repository,
+        repository
+    );
+    assert!(!app.project_ui.closed.contains(&repository));
+    assert!(!app.project_ui.close_generation.contains_key(&project));
+}
+
+#[test]
+fn a_current_inventory_replacing_the_project_repository_fences_old_close_launch_and_completion() {
+    use crate::app::{
+        Message,
+        project_ui::{Action, ProjectSessionClosure},
+    };
+    let (directory, mut app, project, repository, closed, generation) =
+        queued_observer_close_fixture();
+    let successor = directory.path().join("replacement-folder");
+    std::fs::create_dir(&successor).unwrap();
+    let successor = successor.canonicalize().unwrap();
+    let cancellation = app.project_ui.close_cancellation_for(project).unwrap();
+    drop(app.project_load_task(
+        successor.clone(),
+        Some(project),
+        false,
+        Some(ProjectKind::Folder),
+    ));
+    let inventory_generation = app.repository_generations[&project];
+    // The actual bounded folder loader returns the same requested project ID
+    // with a new repository. No Git/provider/helper process is needed.
+    let loaded = crate::app::load_project(
+        &successor,
+        Some(project),
+        tokio_util::sync::CancellationToken::default(),
+        Some(ProjectKind::Folder),
+    )
+    .unwrap();
+    drop(app.update(Message::RepositoryLoaded {
+        open_cards: false,
+        project_id: project,
+        generation: inventory_generation,
+        result: Ok(Box::new(loaded)),
+    }));
+    assert_eq!(
+        app.sidebar_model.project(project).unwrap().repository,
+        successor
+    );
+    assert_eq!(app.workspace_model, closed);
+    // Exercise both callback boundaries: a queued poll cannot launch its old
+    // generation against S's roots, and a completed R helper cannot retire S.
+    drop(app.handle_project_action(Action::AwaitClosedProject(project, generation)));
+    assert!(cancellation.is_cancelled());
+    assert!(!app.project_ui.close_in_flight_for(project));
+    assert!(!app.project_ui.close_generation.contains_key(&project));
+    drop(app.handle_project_action(Action::ProjectSessionsClosed(
+        project,
+        generation,
+        Ok(ProjectSessionClosure::for_roots(vec![repository.clone()])),
+    )));
+    assert_eq!(
+        app.sidebar_model.project(project).unwrap().repository,
+        successor
+    );
+    assert!(!app.project_ui.closed.contains(&successor));
+    assert!(!app.project_ui.closing.contains_key(&project));
+    assert!(!app.project_ui.close_generation.contains_key(&project));
+}

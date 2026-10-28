@@ -5528,6 +5528,14 @@ impl Cagents {
                 ));
                 return Task::none();
             }
+            if self.project_ui.removal_attempts.contains_key(&repository)
+                || self.project_ui.removing.contains_key(&repository)
+            {
+                self.status = Some(TransientNotice::warning(
+                    "Wait for this project to finish removal before reopening it.",
+                ));
+                return Task::none();
+            }
             if self
                 .project_ui
                 .closing
