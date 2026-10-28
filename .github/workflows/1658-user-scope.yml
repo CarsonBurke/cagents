@@ -17,7 +17,7 @@ concurrency:
 env:
   CARGO_BUILD_JOBS: 2
   RUSTUP_TOOLCHAIN: 1.93.0
-  CARGO_TARGET_DIR: ${{ runner.temp }}/1658-user48-target
+  CARGO_TARGET_DIR: /tmp/user48-target-${{ github.run_id }}-${{ github.run_attempt }}
   USER48_EVIDENCE_DIR: /tmp/user48-evidence-${{ github.run_id }}-${{ github.run_attempt }}
   USER48_CONTROL_HEAD: ${{ github.event.pull_request.head.sha }}
 
