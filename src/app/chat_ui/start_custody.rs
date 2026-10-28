@@ -17,6 +17,12 @@ pub(super) struct StartAdmission {
     valid: bool,
 }
 
+/// A private pane-lifetime fence, never provider retirement authority.
+pub(super) struct StartPaneOwner {
+    target: Target,
+    handle: Arc<ClientHandle>,
+}
+
 type Checkpoint = Result<std::sync::mpsc::Receiver<Result<(), String>>, String>;
 
 pub(super) fn await_checkpoint(checkpoint: Checkpoint) -> Result<(), String> {
@@ -600,6 +606,26 @@ impl Cagents {
         if let Err(error) = result.and_then(|()| context.admit_custody(&entry)) {
             return self.finish_start_cleanup(entry.operation, close_pane, Err(error));
         }
+        // Pin the actual mounted connection before Close. Its provider may
+        // learn a UUID while the exact old alias is being retired. A new
+        // connection or descriptor-only replacement cannot inherit this pin.
+        if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&entry.card)
+            && let Some(handle) = runtime.handle()
+            && let Some(observed) = &entry.observed
+            && let Some(current) = self.chat_return_session(entry.card)
+            && entry.permits_observed_identity_learning(observed, &current)
+            && self.card_state(entry.card).is_some_and(
+                |card| matches!(&card.kind, CardKind::Chat(source) if source == &current),
+            )
+        {
+            self.chat_ui.custody_pane_owners.insert(
+                entry.operation,
+                StartPaneOwner {
+                    target: runtime.target,
+                    handle: handle.clone(),
+                },
+            );
+        }
         cosmic::task::future(async move {
             let operation = entry.operation;
             let result = tokio::task::spawn_blocking(move || close(&entry, &context))
@@ -651,6 +677,7 @@ impl Cagents {
         match result {
             Ok(()) => return self.release_start_custody(operation, close_pane, true),
             Err(error) => {
+                self.chat_ui.custody_pane_owners.remove(&operation);
                 if let Some(entry) = Arc::make_mut(&mut self.durable)
                     .native_start_custody
                     .iter_mut()
@@ -740,6 +767,7 @@ impl Cagents {
                 .custody_close_requested
                 .contains(&entry.operation);
         self.chat_ui.custody_releases.remove(&entry.operation);
+        let pane_owner = self.chat_ui.custody_pane_owners.remove(&entry.operation);
         if entry.workspace != self.durable.id {
             self.status = Some(TransientNotice::warning(
                 "Return to the original workspace to finish conversation cleanup.",
@@ -823,10 +851,22 @@ impl Cagents {
                     .custody_admissions
                     .retain(|target, _| active.contains(target));
                 let current = self.chat_return_session(entry.card);
+                let pane_lifetime_matches = pane_owner.as_ref().is_none_or(|owner| matches!(self.cards.get(&entry.card), Some(CardRuntime::Chat(runtime)) if runtime.target == owner.target && runtime.handle().is_some_and(|handle| Arc::ptr_eq(handle, &owner.handle))));
+                let pane_matches = current.as_ref().is_some_and(|current| {
+                    self.card_state(entry.card).is_some_and(
+                        |card| matches!(&card.kind, CardKind::Chat(source) if source == current),
+                    ) && pane_lifetime_matches
+                        && (current == &entry.source
+                            || Some(current) == entry.observed.as_ref()
+                            || entry.observed.as_ref().is_some_and(|observed| {
+                                entry.permits_observed_identity_learning(observed, current)
+                                    && pane_owner.is_some()
+                            }))
+                });
                 if ended
                     && !close_pane
                     && entry.source.is_unstarted()
-                    && current.as_ref() == entry.observed.as_ref()
+                    && pane_matches
                     && current.as_ref() != Some(&entry.source)
                     && !self.pane_transfer_pending(entry.card)
                 {
@@ -837,10 +877,7 @@ impl Cagents {
                     self.replace_chat_conversation(entry.card, draft.clone());
                     return self.open_chat_draft(entry.card, draft);
                 }
-                if close_pane
-                    && (current.as_ref() == Some(&entry.source)
-                        || current.as_ref() == entry.observed.as_ref())
-                {
+                if close_pane && pane_matches {
                     if self.chat_has_unresolved_start_custody(entry.card) {
                         return self.retry_start_custody(entry.card, true);
                     }
@@ -853,6 +890,11 @@ impl Cagents {
                     return self
                         .remove_chat_card(entry.card, None)
                         .unwrap_or_else(Task::none);
+                }
+                if close_pane {
+                    self.status = Some(TransientNotice::warning(
+                        "The previous conversation stopped. This pane changed while cleanup was pending, so its current conversation was kept.",
+                    ));
                 }
             }
             Err(error) => {

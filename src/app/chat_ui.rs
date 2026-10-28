@@ -621,6 +621,7 @@ pub(super) struct State {
     custody_cleanup: HashSet<uuid::Uuid>,
     custody_admissions: HashMap<Target, start_custody::StartAdmission>,
     custody_cleanup_writers: HashMap<uuid::Uuid, Arc<crate::persistence::StateStore>>,
+    custody_pane_owners: HashMap<uuid::Uuid, start_custody::StartPaneOwner>,
     custody_cleanup_scopes: HashMap<uuid::Uuid, start_custody::StartCleanupScope>,
     custody_close_requested: HashSet<uuid::Uuid>,
     custody_cleanup_requested: HashSet<uuid::Uuid>,
@@ -669,6 +670,7 @@ impl Default for State {
             custody_cleanup: HashSet::new(),
             custody_admissions: HashMap::new(),
             custody_cleanup_writers: HashMap::new(),
+            custody_pane_owners: HashMap::new(),
             custody_cleanup_scopes: HashMap::new(),
             custody_close_requested: HashSet::new(),
             custody_cleanup_requested: HashSet::new(),
@@ -18788,6 +18790,29 @@ pub(super) mod tests {
 
     pub(in crate::app) fn attempted_start_target_fixture(app: &Cagents, card: CardId) -> Target {
         chat_runtime(app, card).target
+    }
+
+    /// Synthetic replacement identity negative, not a provider Start or
+    /// authority fixture. Keep descriptor bytes equal to isolate lifetime fences.
+    pub(in crate::app) fn replace_custody_pane_lifetime_fixture(
+        app: &mut Cagents,
+        card: CardId,
+        connection: bool,
+    ) {
+        let target = (!connection).then(|| app.chat_ui.next_target(card));
+        let runtime = match app.cards.get_mut(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime,
+            _ => panic!("mounted custody owner"),
+        };
+        if let Some(target) = target {
+            runtime.retarget(target);
+        } else {
+            let handle = runtime.handle().unwrap();
+            runtime.connection = Connection::Live(Arc::new(ClientHandle::fixture(
+                handle.session(),
+                (*handle.snapshot()).clone(),
+            )));
+        }
     }
 
     pub(in crate::app) fn attempted_start_draft_fixture(app: &Cagents, card: CardId) -> String {
