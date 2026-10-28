@@ -1,9 +1,14 @@
-//! A visible modal instance owns the native interaction state beneath it.
+//! A visible target or action instance owns the native interaction state beneath it.
 //! Keeping a static button ID across a replacement must not carry an earlier
 //! pointer press into the new instance's release action.
 use super::*;
 
-pub(crate) fn owned_surface<'a, Message: 'a, Key: Copy + Eq + 'static>(
+/// Retain native interaction state only while the target and action instance match.
+///
+/// Include the target identity, generation, and action role in `key` when these can
+/// change beneath a retained widget. An unchanged key preserves presses and focus;
+/// a replacement key rebuilds the child state before it can act on the new target.
+pub fn owned_surface<'a, Message: 'a, Key: Copy + Eq + 'static>(
     content: impl Into<Element<'a, Message>>,
     key: Key,
 ) -> Element<'a, Message> {

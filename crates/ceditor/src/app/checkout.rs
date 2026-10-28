@@ -35,6 +35,21 @@ pub(crate) enum Action {
     Open(PathBuf),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HistoryControl {
+    RetainedOpen(OperationId, u64),
+    RecentOpen(OperationId, u64),
+    Retry(OperationId, u64),
+    CloseHistory,
+}
+
+fn history_control<'a>(
+    key: HistoryControl,
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    cagents::interaction::owned_surface(content, key)
+}
+
 #[derive(Clone)]
 enum Base {
     PullRequest { target: CheckoutTarget, authority: Option<WorktreeAuthority> },
@@ -492,13 +507,25 @@ impl Editor {
                             let pending = owner.recovery_summary();
                             if !pending.is_clear() {
                                 rows.push(widget::text::body(format!("Private recovery pending: {} preparations, {} publications.", pending.pending_preparations, pending.pending_publications)).into());
-                                rows.push(widget::button::standard("Retry private recovery").on_press_maybe((!self.checkout_retry_pending.contains(id)).then_some(Message::Checkout(Action::RetryPrivate(*id)))).into());
+                                rows.push(history_control(
+                                    HistoryControl::Retry(*id, owner.generation()),
+                                    widget::button::standard("Retry private recovery")
+                                        .on_press_maybe(
+                                            (!self.checkout_retry_pending.contains(id)).then_some(
+                                                Message::Checkout(Action::RetryPrivate(*id)),
+                                            ),
+                                        ),
+                                ));
                             } else if retained.created.is_none() {
                                 rows.push(widget::text::body("Private steps are clear. The original creation still needs journal reconciliation; its ownership is retained.").into());
                             }
                         }
-                        if retained.created.is_some() {
-                            rows.push(widget::button::standard("Open retained worktree").on_press(Message::Checkout(Action::OpenRecorded(*id))).into());
+                        if let Some(created) = &retained.created {
+                            rows.push(history_control(
+                                HistoryControl::RetainedOpen(*id, created.generation()),
+                                widget::button::standard("Open retained worktree")
+                                    .on_press(Message::Checkout(Action::OpenRecorded(*id))),
+                            ));
                         }
                     } else {
                         rows.push(widget::text::body("The original worker outcome is pending or requires reconciliation. Its admission remains retained.").into());
@@ -517,19 +544,18 @@ impl Editor {
                     );
                 }
                 rows.push(design::caption(&report.detail).into());
-                if self.retained_created_checkout(report.operation_id).is_some() {
-                    rows.push(
+                if let Some(created) = self.retained_created_checkout(report.operation_id) {
+                    rows.push(history_control(
+                        HistoryControl::RecentOpen(report.operation_id, created.generation()),
                         widget::button::standard("Open worktree")
-                            .on_press(Message::Checkout(Action::OpenRecorded(report.operation_id)))
-                            .into(),
-                    );
+                            .on_press(Message::Checkout(Action::OpenRecorded(report.operation_id))),
+                    ));
                 }
             }
-            rows.push(
-                widget::button::standard("Close")
-                    .on_press(Message::Checkout(Action::Cancel))
-                    .into(),
-            );
+            rows.push(history_control(
+                HistoryControl::CloseHistory,
+                widget::button::standard("Close").on_press(Message::Checkout(Action::Cancel)),
+            ));
             return Some(dialog_overlay(
                 dialog_surface(
                     widget::container(widget::scrollable(
@@ -641,6 +667,215 @@ mod tests {
     use super::super::tests::{editor, git, git_fixture, open_real_git, run_tasks, sidebar_action};
     use super::*;
 
+    fn control_pointer(
+        view: &mut Element<'_, Message>,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer,
+        label: &str,
+        index: usize,
+        event: iced::mouse::Event,
+    ) -> Vec<Message> {
+        use iced::advanced::{Layout, Shell, layout, mouse};
+        let viewport = iced::Rectangle::with_size(iced::Size::new(1000.0, 800.0));
+        let node = view.as_widget_mut().layout(
+            tree,
+            renderer,
+            &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+        );
+        let accessible =
+            view.as_widget()
+                .a11y_nodes(Layout::new(&node), tree, mouse::Cursor::Unavailable);
+        let button = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .filter(|entry| entry.node().label() == Some(label))
+            .nth(index)
+            .expect("the selected control is present in the actual widget tree");
+        assert!(!button.node().is_disabled());
+        let bounds = button.node().bounds().unwrap();
+        let point = iced::Point::new(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        assert!(
+            viewport.contains(point),
+            "the control must be in the viewport"
+        );
+        let mut messages = Vec::new();
+        view.as_widget_mut().update(
+            tree,
+            &iced::Event::Mouse(event),
+            Layout::new(&node),
+            mouse::Cursor::Available(point),
+            renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &viewport,
+        );
+        messages
+    }
+
+    fn check_history_press_ownership(
+        app: &mut Editor,
+        first: &WorktreeOperationReport,
+        second: &WorktreeOperationReport,
+    ) {
+        use iced::advanced::{renderer::Headless, widget::Tree};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let renderer = runtime
+            .block_on(<cosmic::Renderer as Headless>::new(
+                iced::Font::DEFAULT,
+                iced::Pixels::from(16),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let press = iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left);
+        let release = iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left);
+        assert!(
+            app.checkout_owners.is_empty(),
+            "both original carriers were adopted"
+        );
+        assert_ne!(first.operation_id, second.operation_id);
+        let saved_history = std::mem::replace(
+            &mut app.checkout_history,
+            vec![first.clone(), second.clone()],
+        );
+        // This is a controlled chronological projection change, not an assertion
+        // that a provider or a private-recovery worker was exercised by this frame.
+        app.checkout_history[0].created_at_unix_ms = 2;
+        app.checkout_history[1].created_at_unix_ms = 1;
+        app.trim_checkout_history();
+        drop(app.update(Message::Checkout(Action::History)));
+        assert!(app.checkout_history_open);
+        let mut before = app.checkout_view().unwrap();
+        let mut tree = Tree::new(before.as_widget());
+        assert!(
+            control_pointer(&mut before, &mut tree, &renderer, "Open worktree", 0, press)
+                .is_empty()
+        );
+        drop(before);
+        app.checkout_history[0].created_at_unix_ms = 0;
+        app.trim_checkout_history();
+        assert_eq!(app.checkout_history[0].operation_id, second.operation_id);
+        let mut after = app.checkout_view().unwrap();
+        tree.diff(after.as_widget_mut());
+        assert!(
+            control_pointer(
+                &mut after,
+                &mut tree,
+                &renderer,
+                "Open worktree",
+                0,
+                release
+            )
+            .is_empty(),
+            "an A press cannot become B's Open action after a retained-tree rebuild"
+        );
+        assert!(
+            control_pointer(&mut after, &mut tree, &renderer, "Open worktree", 0, press).is_empty()
+        );
+        let messages = control_pointer(
+            &mut after,
+            &mut tree,
+            &renderer,
+            "Open worktree",
+            0,
+            release,
+        );
+        assert!(
+            matches!(messages.as_slice(), [Message::Checkout(Action::OpenRecorded(id))] if *id == second.operation_id),
+            "a fresh B click must still select B's original carrier"
+        );
+        drop(after);
+        let mut unchanged = app.checkout_view().unwrap();
+        tree.diff(unchanged.as_widget_mut());
+        assert!(
+            control_pointer(
+                &mut unchanged,
+                &mut tree,
+                &renderer,
+                "Open worktree",
+                1,
+                press
+            )
+            .is_empty()
+        );
+        drop(unchanged);
+        let mut unchanged = app.checkout_view().unwrap();
+        tree.diff(unchanged.as_widget_mut());
+        let messages = control_pointer(
+            &mut unchanged,
+            &mut tree,
+            &renderer,
+            "Open worktree",
+            1,
+            release,
+        );
+        assert!(
+            matches!(messages.as_slice(), [Message::Checkout(Action::OpenRecorded(id))] if *id == first.operation_id),
+            "the same A control must keep a valid press across an unchanged rebuild"
+        );
+        drop(unchanged);
+        // Exercise role/generation replacement through the production wrapper.
+        // These are widget ownership cases, not private-cleanup end-to-end tests.
+        let retry = HistoryControl::Retry(first.operation_id, 1);
+        for (original, replacement) in [
+            (retry, HistoryControl::Retry(second.operation_id, 1)),
+            (retry, HistoryControl::Retry(first.operation_id, 2)),
+            (retry, HistoryControl::RetainedOpen(first.operation_id, 1)),
+            (retry, HistoryControl::RecentOpen(first.operation_id, 1)),
+            (retry, HistoryControl::CloseHistory),
+            (
+                HistoryControl::RetainedOpen(first.operation_id, 1),
+                HistoryControl::RetainedOpen(second.operation_id, 1),
+            ),
+            (
+                HistoryControl::RetainedOpen(first.operation_id, 1),
+                HistoryControl::RetainedOpen(first.operation_id, 2),
+            ),
+            (
+                HistoryControl::RecentOpen(first.operation_id, 1),
+                HistoryControl::RecentOpen(first.operation_id, 2),
+            ),
+        ] {
+            let control = |key| {
+                history_control(
+                    key,
+                    widget::button::standard("Action").on_press(Message::Checkout(Action::Cancel)),
+                )
+            };
+            let mut before = control(original);
+            let mut tree = Tree::new(before.as_widget());
+            assert!(
+                control_pointer(&mut before, &mut tree, &renderer, "Action", 0, press).is_empty()
+            );
+            drop(before);
+            let mut after = control(replacement);
+            tree.diff(after.as_widget_mut());
+            assert!(
+                control_pointer(&mut after, &mut tree, &renderer, "Action", 0, release).is_empty()
+            );
+            assert!(
+                control_pointer(&mut after, &mut tree, &renderer, "Action", 0, press).is_empty()
+            );
+            assert!(
+                matches!(
+                    control_pointer(&mut after, &mut tree, &renderer, "Action", 0, release)
+                        .as_slice(),
+                    [Message::Checkout(Action::Cancel)]
+                ),
+                "a fresh replacement action remains usable"
+            );
+        }
+        app.checkout_history = saved_history;
+        drop(app.update(Message::Checkout(Action::Cancel)));
+        assert!(!app.checkout_history_open);
+    }
+
     fn click_retained_checkout(app: &Editor, label: &str, expected_description: &str) -> Message {
         use iced::advanced::{Layout, Shell, layout, mouse, renderer::Headless, widget::Tree};
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -679,8 +914,50 @@ mod tests {
             command = command.env(MARKER, name).env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_SYSTEM", "/dev/null").env("GIT_CONFIG_GLOBAL", "/dev/null");
             command.timeout = Some(Duration::from_secs(60));
             let output = SystemProcessExecutor.execute(&command, &CancellationToken::new()).unwrap();
+            {
+                use std::io::Write as _;
+                let mut stdout = std::io::stdout().lock();
+                writeln!(
+                    stdout,
+                    "BEGIN captured child stdout: parent={name} child={name}"
+                )
+                .unwrap();
+                stdout.write_all(&output.stdout).unwrap();
+                writeln!(
+                    stdout,
+                    "\nEND captured child stdout: parent={name} child={name}"
+                )
+                .unwrap();
+            }
+            {
+                use std::io::Write as _;
+                let mut stderr = std::io::stderr().lock();
+                writeln!(
+                    stderr,
+                    "BEGIN captured child stderr: parent={name} child={name}"
+                )
+                .unwrap();
+                stderr.write_all(&output.stderr).unwrap();
+                writeln!(
+                    stderr,
+                    "\nEND captured child stderr: parent={name} child={name}"
+                )
+                .unwrap();
+            }
             assert!(output.success, "{}", String::from_utf8_lossy(&output.stderr));
             assert!(String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed; 0 failed"), "exact child must actually run once: {}", String::from_utf8_lossy(&output.stdout));
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let expected = format!("test {name} ... ok");
+            assert!(
+                stdout.lines().any(|line| line == expected),
+                "the exact selected child must pass: {stdout}"
+            );
+            assert!(
+                stdout
+                    .lines()
+                    .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")),
+                "the exact child must report 1 passed, 0 failed and 0 ignored: {stdout}"
+            );
             return;
         }
         let repository = git_fixture(); let data = tempfile::tempdir().unwrap();
@@ -690,7 +967,7 @@ mod tests {
         let card = open_real_git(&mut app, repository.path(), None);
         let authority = app.tab(card).unwrap().worktree_authority.clone().unwrap();
         let head = cagents::repository::Oid::parse(&git(repository.path(), &["rev-parse", "HEAD"])).unwrap();
-        app.begin_commit_checkout(authority, head);
+        app.begin_commit_checkout(authority.clone(), head.clone());
         drop(app.update(Message::Checkout(Action::Branch("retained-child".into()))));
         drop(app.update(Message::Checkout(Action::Destination(destination.to_string_lossy().into_owned()))));
         let task = app.update(Message::Checkout(Action::Resolve)); run_tasks(&mut app, task);
@@ -736,6 +1013,35 @@ mod tests {
         let task = app.update(emitted); run_tasks(&mut app, task);
         assert!(app.tabs.iter().any(|tab| tab.created_worktree.as_ref().is_some_and(|cap| cap.operation() == id)));
         assert!(app.checkout_owners.is_empty(), "the SAME settled carrier is now owned by the mounted tab");
+        // Produce a distinct real B carrier before the cached native ownership
+        // checks. Reusing/relabeling A would conceal a wrong-target selection.
+        app.begin_commit_checkout(authority, head);
+        drop(app.update(Message::Checkout(Action::Branch("retained-second".into()))));
+        drop(
+            app.update(Message::Checkout(Action::Destination(
+                data.path()
+                    .join("second-created")
+                    .to_string_lossy()
+                    .into_owned(),
+            ))),
+        );
+        let task = app.update(Message::Checkout(Action::Resolve));
+        run_tasks(&mut app, task);
+        let second_id = app.checkout_dialog.as_ref().unwrap().id;
+        let task = app.update(Message::Checkout(Action::Create));
+        run_tasks(&mut app, task);
+        let second = app.checkout_owners[&second_id].as_ref().unwrap();
+        assert!(second.created.is_some(), "{:?}", second.authority_error);
+        let second_report = second.report.clone();
+        let second_path = second.created.as_ref().unwrap().record().path.clone();
+        let task = app.update(Message::Checkout(Action::Open(second_path)));
+        run_tasks(&mut app, task);
+        assert!(app.tabs.iter().any(|tab| {
+            tab.created_worktree
+                .as_ref()
+                .is_some_and(|cap| cap.operation() == second_id)
+        }));
+        check_history_press_ownership(&mut app, &original_report, &second_report);
         app.tabs.clear(); app.active = None;
         std::fs::rename(&destination, data.path().join("parked")).unwrap();
         std::fs::create_dir(&destination).unwrap(); std::fs::write(destination.join("foreign"), "untouched").unwrap();

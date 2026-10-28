@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 mod context_menu;
 mod owned_surface;
-pub(crate) use owned_surface::owned_surface;
+pub use owned_surface::owned_surface;
 mod focus_snapshot;
 pub(crate) use focus_snapshot::{FocusSnapshot, observe_focus};
 mod list_navigation;
