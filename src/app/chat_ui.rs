@@ -6641,6 +6641,38 @@ impl Cagents {
         }
         Subscription::batch(subscriptions)
     }
+    pub(super) fn retain_chat_after_creation_refusal(
+        &mut self,
+        card: CardId,
+        scope: &crate::workspace_model::views::Scope,
+    ) -> bool {
+        let runtime = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
+            _ => self.chat_ui.parked.get(&card).map(Box::as_ref),
+        };
+        if self.draft_start_scope(card).as_ref() != Some(scope)
+            || !runtime.is_some_and(|runtime| {
+                runtime.handle().is_some()
+                    && !runtime.disconnected
+                    && self.card_state(card).is_some_and(|state| {
+                        state.existence.is_open()
+                            && matches!(&state.kind, CardKind::Chat(session)
+                                if !session.is_unstarted() && session == &runtime.session)
+                    })
+            })
+        {
+            return false;
+        }
+        let message = "This conversation could not be shared. It is kept only in this window; the current conversation is still attached.";
+        if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
+            runtime.error = Some(message.into());
+        }
+        if let Some(runtime) = self.chat_ui.parked.get_mut(&card) {
+            runtime.error = Some(message.into());
+        }
+        true
+    }
+
     pub(super) fn shared_chat_has_local_work(&self, card: CardId) -> bool {
         let runtime = match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),

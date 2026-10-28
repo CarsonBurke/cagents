@@ -298,6 +298,37 @@ impl Cagents {
         self.reconcile_workspace_model()
     }
 
+    /// Refusing publication does not retire an already accepted conversation.
+    /// Capture the original scoped Insert before retiring its pending overlay;
+    /// an unrelated callback cannot protect or republish a different pane.
+    pub(super) fn refuse_shared_view_edit(&mut self, scope: &Scope, operation: uuid::Uuid) {
+        let Some((_, owner, change)) = self
+            .shared_views
+            .pending
+            .iter()
+            .find(|(id, _, _)| *id == operation)
+        else {
+            return;
+        };
+        if owner != scope {
+            return;
+        }
+        if let Change::Insert { pane, .. } = change
+            && matches!(pane.kind, CardKind::Chat(_))
+        {
+            let card = pane.id;
+            // A newer canonical owner or retirement has its own authority.
+            // An old Insert refusal must not reclassify that newer source.
+            if !self.workspace_model.views.iter().any(|view| {
+                view.panes.iter().any(|pane| pane.id == card) || view.retired.contains(&card)
+            }) && self.retain_chat_after_creation_refusal(card, scope)
+            {
+                self.retain_local_pane(card);
+            }
+        }
+        self.shared_views.refused(operation);
+    }
+
     pub(super) fn retain_local_pane(&mut self, id: CardId) {
         self.shared_views.retained.insert(id);
         Arc::make_mut(&mut self.durable).local_only_cards.insert(id);
@@ -1568,6 +1599,21 @@ impl Cagents {
                 || self
                     .card_state(id)
                     .is_some_and(|card| card.kind.is_utility())
+            {
+                continue;
+            }
+            // A refused first publication keeps its already-started source
+            // local until the user closes it. Persisted local-only custody
+            // survives UI reopen, but never overrides canonical retirement.
+            if self.shared_views.retained.contains(&id)
+                && self.card_state(id).is_some_and(
+                    |card| matches!(&card.kind, CardKind::Chat(session) if !session.is_unstarted()),
+                )
+                && !self
+                    .workspace_model
+                    .views
+                    .iter()
+                    .any(|view| view.retired.contains(&id))
             {
                 continue;
             }

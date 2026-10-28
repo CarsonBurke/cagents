@@ -707,9 +707,16 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
     // Fresh Claude emits Ready before a native Session frame. Keep the original
     // already-confirmed case, and also clear the first command while identity
     // is still absent: neither an ID nor a pending command protects that pane.
-    for (late_native_identity, wake_before_ack) in
-        [(false, true), (false, false), (true, true), (true, false)]
-    {
+    for (late_native_identity, wake_before_ack, refuse_creation) in [
+        (false, true, false),
+        (false, false, false),
+        (true, true, false),
+        (true, false, false),
+        (false, true, true),
+        (false, false, true),
+        (true, true, true),
+        (true, false, true),
+    ] {
         use crate::app::workspace_model_sync::ModelUpdate;
         use crate::workspace_model::{
             ModelChannel, ModelEdit,
@@ -846,6 +853,49 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
         assert!(runtime(&app, card).pending.is_none());
         assert!(runtime(&app, card).queued.is_none());
         assert!(!app.shared_chat_has_local_work(card));
+        let mut edits = std::iter::from_fn(|| published.try_recv().ok()).collect::<Vec<_>>();
+        if refuse_creation {
+            let operation = edits
+                .iter()
+                .find_map(|edit| match edit {
+                    ModelEdit::ChangeView {
+                        operation,
+                        change: Change::Insert { pane, .. },
+                        ..
+                    } if pane.id == card => Some(*operation),
+                    _ => None,
+                })
+                .unwrap();
+            // Unknown callbacks cannot retain a pane or consume its real intent.
+            drop(app.apply_workspace_model_update(ModelUpdate::ViewRefused {
+                scope: scope.clone(),
+                operation: uuid::Uuid::new_v4(),
+                error: "unrelated refused edit".into(),
+            }));
+            assert!(!app.durable.local_only_cards.contains(&card));
+            drop(app.apply_workspace_model_update(ModelUpdate::ViewRefused {
+                scope: Scope::Channel(crate::model::ChannelId::new()),
+                operation,
+                error: "same nonce in the wrong scope".into(),
+            }));
+            assert!(!app.durable.local_only_cards.contains(&card));
+            drop(app.apply_workspace_model_update(ModelUpdate::ViewRefused {
+                scope: scope.clone(),
+                operation,
+                error: "first publication refused after prompt acceptance".into(),
+            }));
+            assert!(app.durable.local_only_cards.contains(&card));
+            assert!(
+                runtime(&app, card)
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("could not be shared")
+            );
+            assert!(Arc::ptr_eq(runtime(&app, card).handle().unwrap(), &handle));
+            assert_eq!(runtime(&app, card).session.id, actor);
+            assert!(!app.shared_chat_has_local_work(card));
+        }
         if late_native_identity {
             assert!(runtime(&app, card).session.launch.session_id.is_none());
             drop(app.apply_workspace_model_update(ModelUpdate::Read(empty.clone())));
@@ -857,7 +907,7 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
             assert!(app.card_state(card).unwrap().existence.is_open());
             assert_eq!(app.workspace.focused(), Some(card));
             let saved = app.persistent_workspace();
-            assert!(!saved.local_only_cards.contains(&card));
+            assert_eq!(saved.local_only_cards.contains(&card), refuse_creation);
             assert_eq!(
                 saved
                     .channels
@@ -898,7 +948,7 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
         assert!(app.card_state(card).unwrap().existence.is_open());
         assert_eq!(app.workspace.focused(), Some(card));
         let saved = app.persistent_workspace();
-        assert!(!saved.local_only_cards.contains(&card));
+        assert_eq!(saved.local_only_cards.contains(&card), refuse_creation);
         assert_eq!(
             saved
                 .channels
@@ -908,7 +958,7 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
                 .cards,
             vec![card]
         );
-        let edits = std::iter::from_fn(|| published.try_recv().ok()).collect::<Vec<_>>();
+        edits.extend(std::iter::from_fn(|| published.try_recv().ok()));
         assert_eq!(edits.iter().filter(|edit| matches!(edit, ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. } if pane.id == card)).count(), 1);
         assert!(!edits.iter().any(|edit| matches!(edit, ModelEdit::ChangeView { change: Change::Remove { id }, .. } if *id == card)));
         let pane = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
@@ -916,8 +966,25 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
         accepted.sequence += 1;
         accepted.views[0].panes = vec![pane];
         accepted.views[0].revision += 1;
+        if refuse_creation {
+            // UI-only reconstruction carries the exact saved local source;
+            // it may neither republish the refusal nor lose the live reader.
+            app.shared_views = crate::app::shared_views::State::for_workspace(&saved);
+            app.acknowledge_view_edit(scope.clone(), None);
+            for _ in 0..3 {
+                drop(
+                    app.apply_workspace_model_update(ModelUpdate::Read(
+                        app.workspace_model.clone(),
+                    )),
+                );
+                assert!(Arc::ptr_eq(runtime(&app, card).handle().unwrap(), &handle));
+                assert_eq!(runtime(&app, card).session.id, actor);
+                assert!(app.card_state(card).unwrap().existence.is_open());
+                assert_eq!(app.workspace.focused(), Some(card));
+            }
+        }
         for edit in edits {
-            if let ModelEdit::ChangeView { operation, .. } = edit {
+            if !refuse_creation && let ModelEdit::ChangeView { operation, .. } = edit {
                 drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
                     scope: scope.clone(),
                     operation: Some(operation),
@@ -940,5 +1007,15 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
         ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. } if pane.id == card))
         );
         assert!(!app.chat_start_pending(card));
+        if refuse_creation {
+            // Retaining a refused creation grants no authority to override a
+            // later canonical retirement, even while the provider is busy.
+            let mut retired = app.workspace_model.clone();
+            retired.sequence += 1;
+            retired.views[0].retired.push(card);
+            drop(app.apply_workspace_model_update(ModelUpdate::Read(retired)));
+            assert!(app.cards.get(&card).is_none());
+            assert!(!app.card_state(card).unwrap().existence.is_open());
+        }
     }
 }
