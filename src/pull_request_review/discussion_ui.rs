@@ -774,6 +774,7 @@ impl State {
                     composer.authority = authority;
                     composer.range = self.range.clone();
                     self.cache_dirty = true;
+                    self.discussion.drafts_saved = false;
                     return ActionTask::none();
                 }
                 let Destination::Line(anchor) = &composer.destination else {
@@ -1992,6 +1993,70 @@ mod tests {
             "Keep across restart"
         );
     }
+
+    #[tokio::test]
+    async fn reanchored_file_draft_restores_its_new_authority_after_restart() {
+        use cosmic::iced::futures::StreamExt;
+
+        async fn save(state: &mut State) {
+            let mut stream = iced::runtime::task::into_stream(state.persist_cache()).unwrap();
+            let mut saved = false;
+            while let Some(action) = stream.next().await {
+                if let iced::runtime::Action::Output(action) = action {
+                    if let super::super::Action::CacheSaved { result, .. } = &action {
+                        assert!(result.is_ok(), "{result:?}");
+                        saved = true;
+                    }
+                    drop(state.update_inner(action));
+                }
+            }
+            assert!(saved, "the cache write must finish before restarting");
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let cache_path = directory.path().join("cache");
+        let mut state = ready();
+        state.cache = Some(Arc::new(cache::JsonStore::new(cache_path.clone())));
+        drop(state.update_discussion(Action::BeginFile("file.rs".into())));
+        state.discussion.composer.as_mut().unwrap().content =
+            text_editor::Content::with_text("Keep this file comment");
+        save(&mut state).await;
+
+        let mut current = loaded(vec![entry("file.rs", ChangeKind::Modified)], vec![]);
+        current.context.head_oid = "d".repeat(40);
+        current.pull_request.head_ref_oid = current.context.head_oid.clone();
+        current.range.head = Oid::parse(current.context.head_oid.as_str()).unwrap();
+        current.range.merge_base = Oid::parse("e".repeat(40)).unwrap();
+        state.adopt(&current);
+        drop(state.update_discussion(Action::Reanchor));
+        // Re-anchoring must persist without another keystroke marking the draft dirty.
+        save(&mut state).await;
+        let target = state.target.clone().unwrap();
+        let key =
+            PullRequestKey::new(target.repository.clone(), target.pull_request.number).unwrap();
+        drop(state);
+
+        let reopened = cache::JsonStore::new(cache_path);
+        let snapshot = cache::Store::load(&reopened, &key).unwrap().unwrap();
+        let mut restored = State::new(
+            Arc::new(ScriptedApi::new()),
+            RepositoryService::system("git"),
+        );
+        restored.target = Some(target);
+        restored.adopt_cache(snapshot);
+        restored.adopt(&current);
+        let composer = restored.discussion.composer.as_ref().unwrap();
+        assert_eq!(composer.content.text(), "Keep this file comment");
+        assert_eq!(composer.destination, Destination::File("file.rs".into()));
+        assert_eq!(composer.authority.context, current.context);
+        assert_eq!(composer.range.as_ref(), Some(&current.range));
+        assert_eq!(
+            composer.authority.merge_base.as_ref(),
+            Some(&current.range.merge_base)
+        );
+        assert!(!restored.composer_stale(composer));
+    }
+
     #[test]
     fn unresolved_write_receipt_survives_recovery_and_still_fences_mutations() {
         let mut state = ready();
