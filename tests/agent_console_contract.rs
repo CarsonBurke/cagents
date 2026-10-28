@@ -344,7 +344,12 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
     ]);
     let deadline = Instant::now() + Duration::from_secs(10);
     let second = loop {
-        let second = fixture.cli(&["agent", "status", agent]);
+        let arguments = ["agent", "status", agent];
+        let output = fixture.output_until(&arguments, deadline);
+        assert!(output.status.success(), "{arguments:?}: {output:?}");
+        let second: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(second["ok"], true, "{second}");
+        let second = second["data"].clone();
         if second["run"]["id"] != first_run && second["run"]["state"] == "Succeeded" {
             break second;
         }
@@ -370,6 +375,31 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
     );
     let closed = fixture.cli(&["agent", "close", agent]);
     assert_eq!(closed["agent"]["closed"], true);
+}
+
+#[test]
+fn repeated_private_cli_capture_does_not_renew_original_deadline() {
+    let root = tempfile::tempdir().unwrap();
+    let command = |script: &str| {
+        let mut spec = private_cli_capture::private_cli(root.path());
+        spec.program = "/bin/sh".into();
+        spec.arguments.clear();
+        spec.args(["-c", script])
+    };
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let output =
+        private_cli_capture::capture(command("sleep 2; printf first-poll"), deadline).unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"first-poll");
+
+    // This finite command fits a renewed four-second budget, but cannot
+    // finish in what remains after the first poll. Unlike a 300-second
+    // stall, it distinguishes a renewed budget from the original deadline.
+    let failure = private_cli_capture::capture(command("printf next-poll; exec sleep 3"), deadline)
+        .unwrap_err();
+    assert_eq!(failure.kind, cagents::process::ProcessFailureKind::TimedOut);
+    assert!(failure.started, "first poll exhausted the fixture budget");
+    assert_eq!(failure.stdout, b"next-poll");
 }
 
 #[test]
