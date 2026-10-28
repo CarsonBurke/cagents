@@ -27,6 +27,12 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   remove and reopen the project to enable Git features; existing open folder
   projects keep their identity and channels. `cagents project open PATH` and
   `cagents channel spawn --repository PATH` accept the same folders.
+- `cagents project open PATH` selects the project’s primary checkout in one
+  running local window, preferring the last focused window, without opening a
+  terminal. Draft confirmations and active saves finish before selection.
+- `cagents project list` lists shared projects by creation rank, newest first.
+  Each window keeps its own saved sidebar order, including projects you drag
+  into a custom position.
 - Each worktree has a horizontal strip of panes: terminals, native chats,
   editors, repository views, and browsers. A tab strip contains only its
   selected worktree or channel. A **pane** is one independently focused surface;

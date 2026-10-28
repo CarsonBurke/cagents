@@ -3553,6 +3553,18 @@ fn project_output(
     client: &mut ControlClient,
     command: ResolvedProject,
 ) -> Result<CommandOutput, AppError> {
+    project_output_with_activation(client, command, |repository| {
+        if let Err(error) = instance::activate_project(repository) {
+            tracing::warn!(%error, "project registered, but window selection was unavailable");
+        }
+    })
+}
+
+fn project_output_with_activation(
+    client: &mut ControlClient,
+    command: ResolvedProject,
+    activate: impl FnOnce(&Path),
+) -> Result<CommandOutput, AppError> {
     match command {
         ResolvedProject::Open { repository, kind } => {
             // The same upsert a window publishes when it opens a repository,
@@ -3572,6 +3584,9 @@ fn project_output(
                     "the daemon accepted the project but did not report it",
                 )
             })?;
+            // Shared existence is committed first. Only one local window gets
+            // the separate selection request; headless use still succeeds.
+            activate(&repository);
             let human = project_line(&project);
             Ok(CommandOutput {
                 command: "project.open",
@@ -3581,8 +3596,8 @@ fn project_output(
         }
         ResolvedProject::List => {
             let model = client.read_workspace_model().map_err(protocol_error)?;
-            // Newest first, the order `channel list` answers in and the order
-            // the sidebar renders.
+            // Shared creation rank, newest first. Each window independently
+            // persists its custom sidebar order.
             let mut projects = model.projects.iter().collect::<Vec<_>>();
             projects.sort_by(|left, right| right.ordinal.cmp(&left.ordinal));
             let human = projects
@@ -4779,8 +4794,14 @@ mod tests {
     /// resolves, not the path the user named: a fixture that never ran `git`
     /// could not tell the two apart, which is how a key no window could match
     /// shipped.
+    #[cfg(target_os = "linux")]
     #[test]
     fn channel_spawn_opens_the_project_then_creates_the_channel_it_minted() {
+        if !crate::test_git::isolated_test(
+            "control::tests::channel_spawn_opens_the_project_then_creates_the_channel_it_minted",
+        ) {
+            return;
+        }
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let peer_proof = proof("session", "boot", "incarnation");
         // No usable `git` means there is no key to derive and nothing this test
@@ -4910,36 +4931,63 @@ mod tests {
     /// A real repository, because every key here is whatever `git` resolves
     /// rather than the path the test names. `None` when there is no usable
     /// `git`, so the suite skips instead of failing on a machine without one.
-    fn git_checkout() -> Option<tempfile::TempDir> {
-        let checkout = tempfile::tempdir().unwrap();
-        let initialized = Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(checkout.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        initialized
-            .is_ok_and(|status| status.success())
-            .then_some(checkout)
-    }
-
-    fn git(checkout: &Path, arguments: &[&str]) {
-        let status = Command::new("git")
-            .args(arguments)
-            .current_dir(checkout)
+    #[cfg(target_os = "linux")]
+    fn git_fixture_output(
+        checkout: &Path,
+        arguments: &[&str],
+    ) -> Result<crate::process::ProcessOutput, crate::process::ProcessFailure> {
+        use crate::process::{
+            CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor,
+        };
+        let mut command = CommandSpec::new("git")
+            .cwd(checkout)
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "tag.gpgsign=false",
+                "-c",
+                "init.templateDir=",
+            ])
+            .args(arguments.iter().copied())
+            .timeout(Duration::from_secs(10))
+            .output_limits(64 * 1024, 64 * 1024);
+        for (name, _) in std::env::vars_os() {
+            if name.as_encoded_bytes().starts_with(b"GIT_") {
+                command = command.env_remove(name);
+            }
+        }
+        command = command
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_AUTHOR_NAME", "Cagents")
             .env("GIT_AUTHOR_EMAIL", "cagents@example.invalid")
             .env("GIT_COMMITTER_NAME", "Cagents")
-            .env("GIT_COMMITTER_EMAIL", "cagents@example.invalid")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .expect("git runs");
-        assert!(status.success(), "git {arguments:?}");
+            .env("GIT_COMMITTER_EMAIL", "cagents@example.invalid");
+        SystemProcessExecutor.execute(&command, &CancellationToken::new())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn git_checkout() -> Option<tempfile::TempDir> {
+        let checkout = tempfile::tempdir().unwrap();
+        git_fixture_output(checkout.path(), &["init", "--quiet", "--template="])
+            .is_ok_and(|output| output.success)
+            .then_some(checkout)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn git(checkout: &Path, arguments: &[&str]) {
+        let output = git_fixture_output(checkout, arguments).expect("bounded fixture git runs");
+        assert!(
+            output.success,
+            "git {arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// The project a shell opens is the project a window opens, from wherever
@@ -4949,8 +4997,14 @@ mod tests {
     /// is `<common>/worktrees/<name>`, so keying on that would give one
     /// checkout one project per worktree the user ever ran the verb from, and
     /// the sidebar would fill with duplicates of the same repository.
+    #[cfg(target_os = "linux")]
     #[test]
     fn project_open_keys_one_project_from_every_worktree_of_one_checkout() {
+        if !crate::test_git::isolated_test(
+            "control::tests::project_open_keys_one_project_from_every_worktree_of_one_checkout",
+        ) {
+            return;
+        }
         let Some(checkout) = git_checkout() else {
             return;
         };
@@ -4988,8 +5042,14 @@ mod tests {
     /// a process behind that the user never asked for and did not get a result
     /// from. `ResolvedProject` is the proof this ordering cannot drift -
     /// `project_output` takes nothing else, and only `resolved` makes one.
+    #[cfg(target_os = "linux")]
     #[test]
     fn open_folder_identity_survives_git_initialization_for_projects_and_channels() {
+        if !crate::test_git::isolated_test(
+            "control::tests::open_folder_identity_survives_git_initialization_for_projects_and_channels",
+        ) {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let mut model = WorkspaceModel::default();
@@ -5029,8 +5089,14 @@ mod tests {
         assert!(resolve_repository(Some(root), Some(&model)).is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn project_resolution_rejects_files_and_accepts_plain_folders() {
+        if !crate::test_git::isolated_test(
+            "control::tests::project_resolution_rejects_files_and_accepts_plain_folders",
+        ) {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let file = directory.path().join("file");
         std::fs::write(&file, b"not a directory\n").unwrap();
@@ -5065,8 +5131,14 @@ mod tests {
     /// resolves and the name the checkout carries, and it reports the project
     /// the registry ended up holding - including the rank, which only the
     /// registry knows.
+    #[cfg(target_os = "linux")]
     #[test]
     fn project_open_publishes_the_upsert_a_window_would_and_reports_the_row() {
+        if !crate::test_git::isolated_test(
+            "control::tests::project_open_publishes_the_upsert_a_window_would_and_reports_the_row",
+        ) {
+            return;
+        }
         let Some(checkout) = git_checkout() else {
             return;
         };
@@ -5129,8 +5201,13 @@ mod tests {
         }
         .resolved()
         .unwrap();
-        let output = project_output(&mut client, resolved).unwrap();
+        let mut selected = None;
+        let output = project_output_with_activation(&mut client, resolved, |path| {
+            selected = Some(path.to_path_buf());
+        })
+        .unwrap();
         server.join().unwrap();
+        assert_eq!(selected, Some(expected.clone()));
         assert_eq!(output.command, "project.open");
         assert_eq!(output.data["project"]["ordinal"], json!(2));
         assert_eq!(output.data["sequence"], json!(4));
@@ -5139,6 +5216,119 @@ mod tests {
             format!("{}\t{name}", expected.display()),
             "one tab-separated line: repository, name"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn project_open_production_wrapper_selects_only_its_private_runtime() {
+        const TEST: &str =
+            "control::tests::project_open_production_wrapper_selects_only_its_private_runtime";
+        const CHILD: &str = "CAGENTS_TEST_PRIVATE_PROJECT_ACTIVATION";
+        const PREFIX: &str = "cagents-project-activation-fixture-";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(TEST)) {
+            let runtime = tempfile::Builder::new().prefix(PREFIX).tempdir().unwrap();
+            let command = crate::process::CommandSpec::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, TEST)
+                .env("XDG_RUNTIME_DIR", runtime.path().as_os_str());
+            let output = crate::test_git::run(crate::test_git::isolated_command(command));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed;"));
+            return;
+        }
+        let runtime = PathBuf::from(
+            std::env::var_os("XDG_RUNTIME_DIR").expect("explicit private child runtime"),
+        );
+        assert!(runtime.is_absolute());
+        assert!(
+            runtime
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(PREFIX)
+        );
+        assert_eq!(
+            std::fs::read_dir(&runtime).unwrap().count(),
+            0,
+            "never bind in an existing application runtime"
+        );
+        let listener = std::os::unix::net::UnixListener::bind(
+            instance::activation_fixture_primary_socket(&runtime),
+        )
+        .unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let repository = PathBuf::from("/private fixture/project with spaces/λ");
+        let selected = repository.clone();
+        let activation = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(5))
+                    }
+                    result => panic!("private activation connection missing: {result:?}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut std::io::BufReader::new(&stream), &mut line).unwrap();
+            let encoded = line.strip_prefix("project ").unwrap().trim_end();
+            assert_eq!(serde_json::from_str::<PathBuf>(encoded).unwrap(), selected);
+            std::io::Write::write_all(&mut stream, b"ok\n").unwrap();
+        });
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let served = repository.clone();
+        let peer_proof = proof("session", "boot", "incarnation");
+        let model = thread::spawn(move || {
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, peer_proof.clone(), peer_proof.clone()),
+            )
+            .unwrap();
+            let opened: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(
+                matches!(&opened.request, ClientRequest::EditWorkspaceModel {
+                edit: ModelEdit::ReopenProject { repository, kind: crate::model::ProjectKind::Folder, .. }
+            } if repository == &served)
+            );
+            let model = WorkspaceModel {
+                projects: vec![ModelProject {
+                    repository: served,
+                    name: "Fixture".into(),
+                    kind: crate::model::ProjectKind::Folder,
+                    ordinal: 1,
+                }],
+                identity: uuid::Uuid::new_v4(),
+                sequence: 1,
+                ..WorkspaceModel::default()
+            };
+            write_frame(
+                &mut server_stream,
+                &model_envelope(opened.request_id, peer_proof, model),
+            )
+            .unwrap();
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let output = project_output(
+            &mut client,
+            ResolvedProject::Open {
+                repository,
+                kind: crate::model::ProjectKind::Folder,
+            },
+        )
+        .unwrap();
+        assert_eq!(output.command, "project.open");
+        model.join().unwrap();
+        activation.join().unwrap();
     }
 
     /// A listing is of the registry, which records no source: a project a

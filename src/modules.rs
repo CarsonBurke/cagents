@@ -154,3 +154,6 @@ pub mod workspace;
 pub mod workspace_model;
 #[cfg(feature = "ui")]
 pub mod workspace_widget;
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod test_git;

@@ -1413,6 +1413,7 @@ impl ApplicationLease {
 #[cfg(feature = "ui")]
 #[derive(Debug, Clone)]
 pub struct UiActivation {
+    pub project: Option<PathBuf>,
     pub token: Option<String>,
     pub session: Option<crate::model::TerminalId>,
     pub update: Option<UiUpdateRequest>,
@@ -1522,6 +1523,174 @@ impl Drop for UiActivationListener {
         }
         let _ = fs::remove_file(&self.socket_path);
     }
+}
+
+/// A view-routing hint captured without filesystem work on the event thread.
+/// Publishing runs on a worker; it grants no project or mutation authority.
+#[cfg(feature = "ui")]
+#[derive(Debug, Clone)]
+pub(crate) struct FocusedWindowHint {
+    runtime: PathBuf,
+    slot: String,
+    observed: u128,
+}
+
+#[cfg(feature = "ui")]
+pub(crate) fn capture_focused_window() -> Option<FocusedWindowHint> {
+    if crate::device::is_remote() {
+        return None;
+    }
+    let runtime = env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())?;
+    Some(FocusedWindowHint {
+        runtime,
+        slot: window_slot().to_owned(),
+        observed: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos(),
+    })
+}
+
+#[cfg(feature = "ui")]
+impl FocusedWindowHint {
+    pub(crate) fn publish(self) -> io::Result<()> {
+        require_owned_runtime_directory(&self.runtime)?;
+        record_focused_window_at(&self.runtime, &self.slot, self.observed)
+    }
+}
+
+fn focus_hint_lock(runtime: &Path, write: bool) -> io::Result<OwnedLock> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(write)
+        .create(write)
+        .mode(PRIVATE_FILE_MODE)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(runtime.join(format!("{APPLICATION_LOCK_FILE}-focus")))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.uid() != current_uid() || metadata.nlink() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "focus hint is not a private owned regular file",
+        ));
+    }
+    if write {
+        file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
+    }
+    // SAFETY: the returned owner keeps the descriptor live until unlock.
+    if unsafe {
+        libc::flock(
+            file.as_raw_fd(),
+            if write { libc::LOCK_EX } else { libc::LOCK_SH },
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(OwnedLock(file))
+}
+
+fn parse_focus_hint(text: &str) -> Option<(u128, &str)> {
+    let (observed, slot) = match text.split_once('\n') {
+        Some((stamp, slot)) if stamp.parse::<u128>().is_ok() => (stamp.parse().ok()?, slot.trim()),
+        _ => (0, text.trim()), // Existing versions stored the slot alone.
+    };
+    validate_window_slot(slot).ok()?;
+    Some((observed, slot))
+}
+
+#[cfg(feature = "ui")]
+fn record_focused_window_at(runtime: &Path, slot: &str, observed: u128) -> io::Result<()> {
+    validate_window_slot(slot)?;
+    let lock = focus_hint_lock(runtime, true)?;
+    let mut previous = String::new();
+    (&*lock).take(1024).read_to_string(&mut previous)?;
+    if parse_focus_hint(&previous).is_some_and(|(stamp, _)| stamp > observed) {
+        return Ok(());
+    }
+    lock.set_len(0)?;
+    std::io::Seek::rewind(&mut &*lock)?;
+    writeln!(&*lock, "{observed}\n{slot}")
+}
+
+#[cfg(all(feature = "ui", test))]
+fn record_focused_window_in(runtime: &Path, slot: &str) -> io::Result<()> {
+    record_focused_window_at(runtime, slot, 1)
+}
+
+#[cfg(test)]
+pub(crate) fn activation_fixture_primary_socket(runtime: &Path) -> PathBuf {
+    runtime.join(slot_socket_name(PRIMARY_WINDOW))
+}
+
+/// Select a project in one running window, without starting the UI or a terminal.
+/// JSON preserves spaces and Unicode in canonical repository paths.
+pub fn activate_project(repository: &Path) -> io::Result<bool> {
+    if crate::device::is_remote() {
+        return Ok(false);
+    }
+    let Some(runtime) = env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    else {
+        return Ok(false);
+    };
+    activate_project_in(&runtime, repository)
+}
+
+fn activate_project_in(runtime: &Path, repository: &Path) -> io::Result<bool> {
+    if !repository.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "project path must be absolute",
+        ));
+    }
+    let encoded = serde_json::to_string(repository).map_err(io::Error::other)?;
+    if "project ".len() + encoded.len() + 1 > MAX_ACTIVATION_LINE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "project activation request is too large",
+        ));
+    }
+    require_owned_runtime_directory(runtime)?;
+    let mut slots = Vec::new();
+    if let Ok(lock) = focus_hint_lock(runtime, false) {
+        let mut hint = String::new();
+        if (&*lock).take(1024).read_to_string(&mut hint).is_ok()
+            && let Some((_, slot)) = parse_focus_hint(&hint)
+        {
+            slots.push(slot.to_owned());
+        }
+    }
+    slots.push(PRIMARY_WINDOW.to_owned());
+    slots.extend(running_window_slots(&runtime)?);
+    let mut tried = std::collections::HashSet::new();
+    for slot in slots {
+        if !tried.insert(slot.clone()) || !window_matches_selected_device(&slot)? {
+            continue;
+        }
+        let mut stream = match UnixStream::connect(runtime.join(slot_socket_name(&slot))) {
+            Ok(stream) => stream,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
+        stream.set_read_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
+        writeln!(stream, "project {encoded}")?;
+        if read_capped_line(&stream)? == "ok" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Asks a running UI to focus its window. Returns `true` when that instance
@@ -1840,6 +2009,7 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
                 // receiver reports a failure instead of a silent no-op.
                 if events
                     .send_blocking(UiActivation {
+                        project: None,
                         token,
                         session: None,
                         update: None,
@@ -1854,8 +2024,24 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
             Ok(ActivationRequest::Session(session, token)) => {
                 if events
                     .send_blocking(UiActivation {
+                        project: None,
                         token,
                         session: Some(session),
+                        update: None,
+                    })
+                    .is_err()
+                {
+                    let _ = writeln!(&stream, "error: window is no longer accepting activations");
+                    break;
+                }
+                let _ = writeln!(&stream, "ok");
+            }
+            Ok(ActivationRequest::Project(project)) => {
+                if events
+                    .send_blocking(UiActivation {
+                        project: Some(project),
+                        token: None,
+                        session: None,
                         update: None,
                     })
                     .is_err()
@@ -1869,6 +2055,7 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
                 let (response, receiver) = std::sync::mpsc::sync_channel(1);
                 if events
                     .send_blocking(UiActivation {
+                        project: None,
                         token: None,
                         session: None,
                         update: Some(UiUpdateRequest { action, response }),
@@ -1891,6 +2078,7 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
 
 #[cfg(feature = "ui")]
 enum ActivationRequest {
+    Project(PathBuf),
     Activate(Option<String>),
     Session(crate::model::TerminalId, Option<String>),
     Shutdown,
@@ -1942,6 +2130,17 @@ fn parse_activation_request(line: &str) -> io::Result<ActivationRequest> {
             id.parse::<crate::model::TerminalId>()
                 .map(|id| ActivationRequest::Session(id, token.map(str::to_owned)))
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        }
+        Some(("project", encoded)) => {
+            let path: PathBuf = serde_json::from_str(encoded)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            if !path.is_absolute() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "project path must be absolute",
+                ));
+            }
+            Ok(ActivationRequest::Project(path))
         }
         Some(("activate", token)) if !token.is_empty() => {
             Ok(ActivationRequest::Activate(Some(token.to_owned())))
@@ -2891,6 +3090,84 @@ mod tests {
         assert!(window_matches_selected_device(PRIMARY_WINDOW).unwrap());
         assert!(window_matches_selected_device("window-2").unwrap());
         assert!(!window_matches_selected_device("device-0123456789abcdef").unwrap());
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn project_activation_preserves_paths_and_targets_only_last_focused_window() {
+        let runtime = tempdir().unwrap();
+        let (first_tx, first_rx) = async_channel::unbounded();
+        let (second_tx, second_rx) = async_channel::unbounded();
+        let _first = UiActivationListener::bind_named(
+            runtime.path(),
+            slot_socket_name(PRIMARY_WINDOW),
+            first_tx,
+        )
+        .unwrap();
+        let _second =
+            UiActivationListener::bind_named(runtime.path(), slot_socket_name("second"), second_tx)
+                .unwrap();
+        record_focused_window_in(runtime.path(), "second").unwrap();
+        let repository = Path::new("/tmp/project with spaces/λ.git");
+        assert!(activate_project_in(runtime.path(), repository).unwrap());
+        assert_eq!(
+            second_rx.recv_blocking().unwrap().project.as_deref(),
+            Some(repository)
+        );
+        assert!(first_rx.try_recv().is_err());
+        assert!(
+            matches!(parse_activation_request("project \"/tmp/project with spaces\"").unwrap(), ActivationRequest::Project(path) if path == Path::new("/tmp/project with spaces"))
+        );
+        assert!(parse_activation_request("project \"relative\"").is_err());
+        assert!(parse_activation_request("project not-json").is_err());
+        assert!(activate_project_in(runtime.path(), Path::new("relative")).is_err());
+        assert!(
+            activate_project_in(
+                runtime.path(),
+                &PathBuf::from(format!("/{}", "x".repeat(MAX_ACTIVATION_LINE_BYTES)))
+            )
+            .is_err()
+        );
+        drop(_second);
+        assert!(activate_project_in(runtime.path(), repository).unwrap());
+        assert_eq!(
+            first_rx.recv_blocking().unwrap().project.as_deref(),
+            Some(repository)
+        );
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn delayed_focus_worker_cannot_replace_a_newer_hint_or_modify_a_hardlink() {
+        let runtime = tempdir().unwrap();
+        record_focused_window_at(runtime.path(), "newer", 2).unwrap();
+        record_focused_window_at(runtime.path(), "older", 1).unwrap();
+        let hint = fs::read_to_string(
+            runtime
+                .path()
+                .join(format!("{APPLICATION_LOCK_FILE}-focus")),
+        )
+        .unwrap();
+        assert_eq!(parse_focus_hint(&hint), Some((2, "newer")));
+        let outside = runtime.path().join("outside");
+        fs::write(&outside, "keep contents").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::remove_file(
+            runtime
+                .path()
+                .join(format!("{APPLICATION_LOCK_FILE}-focus")),
+        )
+        .unwrap();
+        fs::hard_link(
+            &outside,
+            runtime
+                .path()
+                .join(format!("{APPLICATION_LOCK_FILE}-focus")),
+        )
+        .unwrap();
+        assert!(record_focused_window_at(runtime.path(), "newer", 3).is_err());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "keep contents");
+        assert_eq!(fs::metadata(&outside).unwrap().mode() & 0o777, 0o644);
     }
 
     #[cfg(feature = "ui")]

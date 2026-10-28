@@ -181,6 +181,43 @@ impl Cagents {
         effect.map_or_else(Task::none, |effect| self.channel_work_effect(effect))
     }
 
+    /// CLI selection uses the same draft confirmation as visible navigation.
+    /// The frozen message preserves its no-terminal selection when replayed.
+    pub(super) fn defer_project_activation_for_work(
+        &mut self,
+        repository: PathBuf,
+    ) -> Option<Task<Message>> {
+        if !self.channel_work_is_main() {
+            return None;
+        }
+        let owner = self.channel_work.view.owner()?;
+        let confirming = self.channel_work.view.has_confirmation();
+        if confirming
+            && !matches!(
+                &self.channel_work.deferred,
+                Some(Deferred::Navigation { message, .. })
+                    if matches!(message.as_ref(), Message::ActivateProject(_))
+            )
+        {
+            // A different user navigation already owns this confirmation.
+            // Keep the pending request until that newer choice settles.
+            return Some(Task::none());
+        }
+        self.channel_work.deferred = Some(Deferred::Navigation {
+            registry: self.workspace_model.identity,
+            repository: Some(repository.clone()),
+            message: Box::new(Message::ActivateProject(repository)),
+        });
+        self.project_ui.activation = None;
+        Some(if confirming {
+            // Another CLI open replaces the destination, not the live form
+            // or the existing Keep/Discard interaction.
+            Task::none()
+        } else {
+            self.update_channel_work(ui::Action::Close(owner))
+        })
+    }
+
     /// Only stable navigation is deferred through the Work draft guard. Pane
     /// commands, sends, launches and deletion are never captured or replayed.
     pub(super) fn intercept_channel_work_navigation(
@@ -506,6 +543,9 @@ impl Cagents {
                                     worktree.id == *worktree_id && worktree.path == *path
                                 })
                         }),
+                    Message::ActivateProject(repository) => {
+                        repository.is_absolute() && captured_repository.as_ref() == Some(repository)
+                    }
                     Message::FocusCard(card) => {
                         self.workspace.order().any(|id| id == *card)
                             && self
@@ -572,13 +612,18 @@ impl Cagents {
         let effect = self.channel_work.view.escape();
         if was_confirming && !self.channel_work.view.has_confirmation() {
             self.channel_work.deferred = None;
+            self.project_ui.activation = None;
         }
         effect.map_or_else(Task::none, |effect| self.channel_work_effect(effect))
     }
 
     pub(super) fn update_channel_work(&mut self, action: ui::Action) -> Task<Message> {
         let keep = matches!(&action, ui::Action::Keep(..));
+        let was_confirming = self.channel_work.view.has_confirmation();
         let effect = self.channel_work.view.update(action);
+        if was_confirming && !self.channel_work.view.has_confirmation() {
+            self.project_ui.activation = None;
+        }
         if keep && !self.channel_work.view.has_confirmation() {
             self.channel_work.deferred = None;
         }
@@ -2650,6 +2695,92 @@ mod tests {
                 app.channel_work.view.refresh().is_none(),
                 "{source} really began a read, and coalesces another"
             );
+        }
+    }
+
+    #[test]
+    fn cli_project_selection_respects_work_drafts_and_keeps_the_latest_destination() {
+        fn folder(app: &mut Cagents, path: &Path) -> PathBuf {
+            let path = path.canonicalize().unwrap();
+            app.sidebar_model.projects.push(
+                SidebarProject::new(
+                    ProjectId::new(),
+                    RepositoryId::new(),
+                    "CLI selection fixture".into(),
+                    path.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .with_kind(ProjectKind::Folder),
+            );
+            path
+        }
+        let mut renderer = super::super::tests::headless_renderer();
+        for dirty in [false, true] {
+            let (mut app, home) = main_fixture();
+            let (_, original, _) = two_channels(&mut app, home);
+            let first_directory = tempfile::tempdir().unwrap();
+            let latest_directory = tempfile::tempdir().unwrap();
+            let first = folder(&mut app, first_directory.path());
+            let latest = folder(&mut app, latest_directory.path());
+            let cards = app
+                .durable
+                .cards
+                .iter()
+                .map(|card| (card.id, card.kind.clone(), card.existence.clone()))
+                .collect::<Vec<_>>();
+            let owner = app.channel_work.view.owner().unwrap();
+            if dirty {
+                dirty_native_form(&mut app, &mut renderer);
+            }
+            drop(app.update(Message::ActivateProject(first.clone())));
+            if dirty {
+                assert!(app.channel_work.view.has_confirmation());
+                assert_eq!(app.channel_work.view.owner(), Some(owner));
+                assert_eq!(app.durable.active_channel, Some(home.channel));
+                assert_eq!(app.workspace.focused(), Some(original));
+                assert!(app.project_ui.activation.is_none());
+                // A newer CLI open updates the captured destination without
+                // replacing the draft or its already-visible confirmation.
+                drop(app.update(Message::ActivateProject(latest.clone())));
+                assert!(app.channel_work.view.has_confirmation());
+                assert_eq!(app.channel_work.view.owner(), Some(owner));
+                let mut native = native(&app, Cache::new(), &mut renderer, 700.0);
+                let point = bounds(&native, "Keep editing").center();
+                let keep = click(&mut native, &mut renderer, point)
+                    .into_iter()
+                    .find(|message| matches!(message, Message::ChannelWork(ui::Action::Keep(..))))
+                    .unwrap();
+                let _ = native.into_cache();
+                drop(app.update(keep));
+                assert!(app.channel_work_is_main());
+                assert!(!app.channel_work.view.has_confirmation());
+                assert_eq!(app.durable.active_channel, Some(home.channel));
+                assert_eq!(app.workspace.focused(), Some(original));
+                assert!(app.channel_work.deferred.is_none());
+                assert!(app.project_ui.activation.is_none());
+                // The retained dirty form still guards a later open. Discard
+                // replays exactly the newest no-terminal project selection.
+                drop(app.update(Message::ActivateProject(first.clone())));
+                drop(app.update(Message::ActivateProject(latest.clone())));
+                discard_native(&mut app, &mut renderer);
+            }
+            assert!(!app.channel_work_is_main());
+            assert_eq!(
+                app.active_workspace.as_ref(),
+                Some(if dirty { &latest } else { &first })
+            );
+            assert_eq!(app.durable.active_channel, None);
+            assert_eq!(
+                app.durable
+                    .cards
+                    .iter()
+                    .map(|card| (card.id, card.kind.clone(), card.existence.clone()))
+                    .collect::<Vec<_>>(),
+                cards,
+                "CLI selection preserves the existing panes without launching another"
+            );
+            assert!(app.project_ui.activation.is_none());
         }
     }
 

@@ -29,6 +29,7 @@ mod notification_ui;
 mod operation_recovery_ui;
 mod palette_ui;
 mod pr_checkout_ui;
+mod project_activation;
 mod project_ui;
 mod pull_request_ui;
 mod refresh_ui;
@@ -4417,6 +4418,9 @@ pub enum Message {
     },
     WindowScaleFactorChanged(f32),
     WindowResized(f32, f32),
+    ActivateProject(PathBuf),
+    ResumeProjectActivation,
+    NativeWindowFocused(window::Id, Option<instance::FocusedWindowHint>),
     ActivateUi {
         token: Option<String>,
     },
@@ -5519,7 +5523,9 @@ impl Cagents {
             self.repository_generations.insert(project_id, generation);
             return self.device_project_read_task(path, project_id, generation, kind);
         }
-        let project_id = project_id.unwrap_or_default();
+        let project_id = project_id
+            .or_else(|| self.project_ui.pending_loads.get(&path).copied())
+            .unwrap_or_default();
         if open_cards && let Ok(repository) = crate::workspace_model::canonical_repository(&path) {
             if self.project_ui.is_reopening(&repository) {
                 self.status = Some(TransientNotice::warning(
@@ -5541,6 +5547,9 @@ impl Cagents {
             self.project_ui.closed.remove(&repository);
             self.project_ui.reopening.insert(project_id, repository);
         }
+        self.project_ui
+            .pending_loads
+            .insert(path.clone(), project_id);
         self.repository_load_sequence = self.repository_load_sequence.wrapping_add(1);
         let generation = self.repository_load_sequence;
         self.repository_generations.insert(project_id, generation);
@@ -10348,6 +10357,7 @@ impl Cagents {
             self.cancel_workspace_preview();
             return Task::none();
         }
+        self.project_ui.activation = None;
         let first = self.chrome_ui.workspace_preview.replace(action).is_none();
         self.workspace_cycle_modifiers = modifiers
             & (keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT | keyboard::Modifiers::LOGO);
@@ -14276,6 +14286,9 @@ impl Application for Cagents {
         if let Some(task) = self.intercept_channel_work_navigation(&message) {
             return task;
         }
+        if project_activation::supersedes_project_activation(&message) {
+            self.project_ui.activation = None;
+        }
         if !self.workspace.is_animating() && self.context_inspector_transition.is_none() {
             // Whatever this message starts is measured from now. Its first
             // frame then moves it by the time since the input that began it,
@@ -14286,7 +14299,7 @@ impl Application for Cagents {
         // Camera-only events cannot change labels, selected worktrees, or
         // repository bindings. Keep per-frame work proportional to visible
         // columns rather than rebuilding every card's chrome.
-        let camera_only = matches!(
+        let mut camera_only = matches!(
             &message,
             Message::Frame(_)
                 | Message::Viewport {
@@ -14294,7 +14307,7 @@ impl Application for Cagents {
                     ..
                 }
         );
-        let reconcile_row_selection = !matches!(
+        let mut reconcile_row_selection = !matches!(
             &message,
             Message::Sidebar(SidebarAction::ScrollProjects(_) | SidebarAction::NavigateRow { .. })
         ) && matches!(
@@ -14511,6 +14524,7 @@ impl Application for Cagents {
                 if self.repository_generations.get(&project_id) != Some(&generation) {
                     return Task::none();
                 }
+                self.finish_project_activation_load(project_id, result.is_ok());
                 self.refresh_ui.projects.remove(&project_id);
                 self.refresh_ui.finished(
                     project_id,
@@ -14655,7 +14669,10 @@ impl Application for Cagents {
                                     self.publish_project_opened(existing_id);
                                 }
                             }
-                            return task;
+                            return Task::batch([
+                                task,
+                                cosmic::task::message(Message::ResumeProjectActivation),
+                            ]);
                         }
                         if let Some(session) = &self.session {
                             session.save_project(loaded.project.clone());
@@ -14753,6 +14770,9 @@ impl Application for Cagents {
                         }
                         self.sidebar_model
                             .apply_project_order(&self.durable.project_order);
+                        if self.remember_sidebar_project_order() {
+                            self.persist();
+                        }
                         self.sync_worktree_operation_rows();
                         self.sidebar_model.data_state = SidebarDataState::Ready;
                         let pr_enrichment =
@@ -16319,15 +16339,23 @@ impl Application for Cagents {
             }
             Message::Frame(frame) => {
                 let inspector_task = self.advance_context_inspector_transition(frame);
-                let Some(elapsed) = self.frame_clock.elapsed(frame) else {
+                if let Some(elapsed) = self.frame_clock.elapsed(frame) {
+                    if self.focused_repository_is_saving() {
+                        return inspector_task;
+                    }
+                    let update = self.workspace.tick(elapsed);
+                    Task::batch([inspector_task, self.apply_viewport(update, true, false)])
+                } else {
                     let deferred = self.release_deferred_navigation_if_unblocked();
-                    return Task::batch([inspector_task, deferred]);
-                };
-                if self.focused_repository_is_saving() {
-                    return inspector_task;
+                    let task = Task::batch([inspector_task, deferred]);
+                    if self.project_ui.activation.is_none() {
+                        return task;
+                    }
+                    // An idle frame may predate the clock start in this pass.
+                    // A ready CLI selection still needs the common admission
+                    // and binding tail, even when no animation can advance.
+                    task
                 }
-                let update = self.workspace.tick(elapsed);
-                Task::batch([inspector_task, self.apply_viewport(update, true, false)])
             }
             Message::LifecycleSweep => self.lifecycle_sweep(),
             Message::LifecycleSweepElapsed(generation) => self.lifecycle_sweep_elapsed(generation),
@@ -16410,6 +16438,34 @@ impl Application for Cagents {
                     self.context_inspector_transition = None;
                 }
                 self.sync_context_overlay_state()
+            }
+            Message::ActivateProject(repository) => {
+                self.request_project_activation(repository);
+                Task::none()
+            }
+            Message::ResumeProjectActivation => Task::none(),
+            Message::NativeWindowFocused(window, hint) => {
+                let publish: Task<Message> = if self.core.main_window_id() == Some(window) {
+                    hint.map_or_else(Task::none, |hint| {
+                        iced::Task::future(async move {
+                            match tokio::task::spawn_blocking(move || hint.publish()).await {
+                                Ok(Ok(())) => {}
+                                result => {
+                                    tracing::warn!(?result, "could not publish focused-window hint")
+                                }
+                            }
+                        })
+                        .discard()
+                    })
+                } else {
+                    Task::none()
+                };
+                Task::batch([
+                    self.update(Message::RefreshUi(refresh_ui::Action::Focused(
+                        window, true,
+                    ))),
+                    publish,
+                ])
             }
             Message::ActivateUi { token } => self.activate_main_window(token),
             Message::ActivateSession { session, token } => {
@@ -17659,6 +17715,14 @@ impl Application for Cagents {
         // and it is the one place that can bound the history.
         // Before the notices drain, so one raised by a committed draft is
         // recorded with this update rather than the next.
+        let activation_was_pending = self.project_ui.activation.is_some();
+        let task = Task::batch([task, self.resume_project_activation()]);
+        if activation_was_pending && self.project_ui.activation.is_none() {
+            // A resumed selection can change scope even on a camera frame.
+            camera_only = false;
+            terminal_metadata_unchanged = false;
+            reconcile_row_selection = true;
+        }
         self.reconcile_terminal_review_owner();
         let task = Task::batch([task, self.flush_settings_on_blur()]);
         if !terminal_metadata_unchanged {
@@ -17801,15 +17865,18 @@ impl Application for Cagents {
                 UiActivationSource(self.activation_rx.clone()),
                 ui_activation_stream,
             )
-            .map(|activation| match activation.update {
-                Some(request) => Message::UiUpdate(request),
-                None => match activation.session {
-                    Some(session) => Message::ActivateSession {
-                        session,
-                        token: activation.token,
-                    },
-                    None => Message::ActivateUi {
-                        token: activation.token,
+            .map(|activation| match activation.project {
+                Some(repository) => Message::ActivateProject(repository),
+                None => match activation.update {
+                    Some(request) => Message::UiUpdate(request),
+                    None => match activation.session {
+                        Some(session) => Message::ActivateSession {
+                            session,
+                            token: activation.token,
+                        },
+                        None => Message::ActivateUi {
+                            token: activation.token,
+                        },
                     },
                 },
             }),
@@ -17827,8 +17894,9 @@ impl Application for Cagents {
                 iced::Event::Window(window::Event::Closed) => {
                     Some(Message::WindowClosed(event_window))
                 }
-                iced::Event::Window(window::Event::Focused) => Some(Message::RefreshUi(
-                    refresh_ui::Action::Focused(event_window, true),
+                iced::Event::Window(window::Event::Focused) => Some(Message::NativeWindowFocused(
+                    event_window,
+                    instance::capture_focused_window(),
                 )),
                 iced::Event::Window(window::Event::Unfocused) => Some(Message::RefreshUi(
                     refresh_ui::Action::Focused(event_window, false),
@@ -20423,6 +20491,7 @@ mod tests {
         assert!(
             activations
                 .send_blocking(instance::UiActivation {
+                    project: None,
                     token: None,
                     session: None,
                     update: None,
