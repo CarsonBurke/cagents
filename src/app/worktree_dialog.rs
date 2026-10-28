@@ -1632,6 +1632,16 @@ mod tests {
                     first
                 );
             }
+            if matches!(mode, "prefix" | "hex") {
+                git(
+                    &root,
+                    &[
+                        "update-ref",
+                        "refs/tags/refs/heads/derived-from-selected",
+                        &first,
+                    ],
+                );
+            }
             let creation = fixture.app.update(input);
             let finished = creation_message(creation).await;
             let Message::WorktreeOperationFinished {
@@ -1785,6 +1795,25 @@ mod tests {
             let destination_head = git(&destination, &["rev-parse", "HEAD"]);
             assert_eq!(destination_head, selected);
             assert_ne!(destination_head, first);
+            assert_eq!(
+                git(
+                    &root,
+                    &[
+                        "show-ref",
+                        "--verify",
+                        "--hash",
+                        "refs/heads/derived-from-selected"
+                    ]
+                ),
+                selected
+            );
+            assert_eq!(
+                git(
+                    &root,
+                    &["rev-parse", "refs/tags/refs/heads/derived-from-selected"]
+                ),
+                first
+            );
             assert_eq!(git(&root, &["symbolic-ref", "HEAD"]), full_ref);
             assert_eq!(git(&root, &["rev-parse", "HEAD"]), selected);
             assert_eq!(git(&root, &["rev-parse", "refs/heads/topic"]), first);
