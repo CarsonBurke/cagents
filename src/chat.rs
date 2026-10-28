@@ -1808,8 +1808,8 @@ pub enum ItemContent {
         /// `Agent "Review" finished`, or the one a teammate wrote for its
         /// message. Empty when there is none.
         summary: String,
-        /// A report's or message's Markdown, or the output a notice quotes,
-        /// with the harness's framing removed.
+        /// A report/message with harness framing removed, a notice's quoted
+        /// output, or provider context retained verbatim without interpretation.
         body: String,
     },
 }
