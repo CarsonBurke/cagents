@@ -211,6 +211,7 @@ impl Daemon {
                                     snapshot: crate::chat::Snapshot {
                                         ready: true,
                                         session_id: session.launch.session_id.clone(),
+                                        native_continuity: session.native_continuity.clone(),
                                         ..Default::default()
                                     },
                                     session,
@@ -285,6 +286,10 @@ impl Daemon {
                                     }
                                 }
                                 pending.lock().unwrap().remove(&session.id);
+                                // The real HOST publishes installed Claude
+                                // continuity at successful admission, while a
+                                // pending request remains ReconnectOnly.
+                                session.native_continuity = crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
                                 admitted.lock().unwrap().push(session.clone());
                                 if lose_first_reply && count == 1 {
                                     // Admission succeeded; only its reply is lost.
@@ -296,6 +301,7 @@ impl Daemon {
                                     snapshot: crate::chat::Snapshot {
                                         ready: true,
                                         session_id: session.launch.session_id.clone(),
+                                        native_continuity: session.native_continuity.clone(),
                                         ..Default::default()
                                     },
                                     session,

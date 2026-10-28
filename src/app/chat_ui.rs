@@ -3189,6 +3189,12 @@ impl Runtime {
             && snapshot.requests.is_empty()
     }
 
+    fn has_connected_saved_history(&self, snapshot: &Snapshot) -> bool {
+        !self.disconnected
+            && self.handle().is_some_and(|handle| handle.is_connected())
+            && self.is_saved_history_snapshot(snapshot)
+    }
+
     pub(super) fn parent_transcript_selected(&self) -> bool {
         self.selected_subagent.is_none()
     }
@@ -4521,7 +4527,7 @@ impl Runtime {
     pub(super) fn inspector_runtime_status(&self) -> InspectorRuntimeStatus {
         if self.disconnected {
             InspectorRuntimeStatus::Attention
-        } else if self.is_saved_history_snapshot(&self.snapshot) {
+        } else if self.has_connected_saved_history(&self.snapshot) {
             if self.snapshot.history_loading {
                 InspectorRuntimeStatus::Loading
             } else {
@@ -9333,8 +9339,19 @@ impl Cagents {
                     return Task::none();
                 };
                 let snapshot = handle.snapshot();
-                if !handle.is_connected()
-                    || !runtime.is_saved_history_snapshot(&snapshot)
+                if runtime.disconnected || !handle.is_connected() {
+                    // The reader can disconnect after its button was drawn.
+                    // Recover its normal read-only attachment first; a stale
+                    // Resume click must neither become a launch nor do nothing.
+                    return self.start_chat(
+                        target.card,
+                        session,
+                        chat::Intent::Restore,
+                        None,
+                        false,
+                    );
+                }
+                if !runtime.is_saved_history_snapshot(&snapshot)
                     || snapshot.history_loading
                     || runtime.pending.is_some()
                     || runtime.attachment_chooser_pending.is_some()
@@ -19421,6 +19438,10 @@ mod tests {
                 app.chat_ui.attempt(card).is_none(),
                 "opening history does not start work"
             );
+            assert!(
+                chat_runtime(&app, card)
+                    .has_connected_saved_history(&chat_runtime(&app, card).snapshot)
+            );
 
             drop(app.handle_chat_ui(Action::ResumeSaved(target)));
             let attempt = app.chat_ui.attempt(card).unwrap();
@@ -19521,6 +19542,71 @@ mod tests {
                 app.chat_ui.attempt(card).is_none(),
                 "mutation {mutation} must not start work"
             );
+        }
+    }
+
+    #[test]
+    fn disconnected_saved_history_reconnects_without_borrowing_explicit_start_permission() {
+        for stale_resume_click in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+            let target = chat_runtime(&app, card).target;
+            let mut source = chat_runtime(&app, card).session.clone();
+            source.launch.session_id = Some(KNOWN_THREAD.into());
+            source.native_continuity = chat::NativeContinuity::ReconnectOnly;
+            let mut previous = source.clone();
+            previous.proof.as_mut().unwrap().host_incarnation = "previous-reader-host".into();
+            let handle = Arc::new(
+                ClientHandle::fixture_upgrade_handshake(
+                    previous,
+                    source.clone(),
+                    Snapshot {
+                        session_id: source.launch.session_id.clone(),
+                        exited: true,
+                        read_only_reason: Some(
+                            "Saved conversation; no provider was started".into(),
+                        ),
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+            );
+            // The scripted peer has actually closed its socket after a framed
+            // handshake. Observe the real reader's EOF without consuming a UI
+            // wake or assigning its alive/disconnected flags in the fixture.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while handle.is_connected() {
+                assert!(
+                    Instant::now() < deadline,
+                    "framed peer EOF must reach the client"
+                );
+                std::thread::yield_now();
+            }
+            app.replace_chat_conversation(card, source.clone());
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.session = source.clone();
+            runtime.snapshot = handle.snapshot();
+            runtime.connection = Connection::Live(handle);
+            assert!(!runtime.disconnected, "the UI wake has not been consumed");
+            assert!(runtime.is_saved_history_snapshot(&runtime.snapshot));
+            assert!(
+                !runtime.has_connected_saved_history(&runtime.snapshot),
+                "show Reconnect rather than Resume"
+            );
+            assert_eq!(
+                runtime.inspector_runtime_status(),
+                InspectorRuntimeStatus::Attention
+            );
+            assert!(!app.chat_ui.explicit_starts.contains_key(&card));
+            drop(app.handle_chat_ui(if stale_resume_click {
+                Action::ResumeSaved(target)
+            } else {
+                Action::Reconnect(target)
+            }));
+            let attempt = app.chat_ui.attempt(card).unwrap();
+            assert_eq!(attempt.intent, chat::Intent::Restore);
+            assert_eq!(attempt.session, source);
+            assert!(!app.chat_ui.explicit_starts.contains_key(&card));
         }
     }
 

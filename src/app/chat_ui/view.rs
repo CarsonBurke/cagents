@@ -2224,7 +2224,7 @@ impl Runtime {
             );
         } else if (self.disconnected || snapshot.exited) && self.auth_error().is_none() {
             let unresumable = self.offers_fresh_conversation();
-            let saved_history = self.is_saved_history_snapshot(snapshot);
+            let saved_history = self.has_connected_saved_history(snapshot);
             let enabled = !transitioning
                 && self.pending.is_none()
                 && self.attachment_chooser_pending.is_none()
