@@ -963,6 +963,17 @@ fn retained_project_successor(role: &str) {
     assert_eq!(app.persistent_workspace().chat_drafts, drafts);
     assert_eq!(app.workspace.focused(), focused);
     assert!(app.project_ui.close_failed.contains(&removal.project));
+    assert_eq!(
+        app.selected_project_removal_blocker(removal.project),
+        None,
+        "a finished refusal permits a new explicit removal confirmation"
+    );
+    drop(app.handle_project_action(Action::Command {
+        project_id: removal.project,
+        worktree_id: None,
+        command: ProjectCommand::Remove,
+    }));
+    assert!(app.project_ui.remove_dialog.is_some());
 }
 
 #[test]
