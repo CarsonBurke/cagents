@@ -12,7 +12,7 @@
 use super::{SharedHost, SharedRegistry, caller, directory, registry};
 use crate::{
     agent_execution::{
-        Authority, Lineage, Origin,
+        AcceptanceError, Authority, Lineage, Origin,
         mailbox::{Inbox, Message, Outgoing, Party, Reach, Receipt, Seal, Sent, State, To},
     },
     chat::{self, runtime::Rejection},
@@ -38,7 +38,7 @@ pub(in crate::host) fn send(
     host: &SharedHost,
     authority: &Authority,
     outgoing: Outgoing,
-) -> Result<Sent, String> {
+) -> Result<Sent, AcceptanceError> {
     outgoing.validate()?;
     let (_, session) = caller(host, authority)?;
     let live = directory::live_sessions(host);
