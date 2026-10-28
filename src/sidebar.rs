@@ -1634,6 +1634,88 @@ fn file_statuses(entries: &[ChangedPath]) -> BTreeMap<RepoPath, FileStatus> {
     statuses
 }
 
+fn exact_file_statuses(entries: &[ChangedPath]) -> BTreeMap<&RepoPath, FileStatus> {
+    let mut statuses = BTreeMap::new();
+    for entry in entries {
+        if let Some(status) = FileStatus::from_change(entry) {
+            statuses
+                .entry(&entry.path)
+                .and_modify(|current: &mut FileStatus| *current = (*current).max(status))
+                .or_insert(status);
+        }
+    }
+    statuses
+}
+
+/// Deleted index paths are useful placeholders, but cannot replace the shape
+/// of a live file or directory. Keep their complete review rows in Changes.
+fn files_tree_paths(snapshot: &RepositorySnapshot) -> Vec<RepoPath> {
+    if snapshot.status.entries.is_empty() {
+        return snapshot
+            .files
+            .paths
+            .iter()
+            .chain(&snapshot.files.ignored)
+            .cloned()
+            .collect();
+    }
+    let deleted: BTreeSet<_> = snapshot
+        .status
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.area == ChangeArea::Unstaged
+                && entry.kind == ChangeKind::Deleted
+                && entry.conflict.is_none()
+        })
+        .map(|entry| &entry.path)
+        .collect();
+    let untracked: BTreeSet<_> = snapshot
+        .status
+        .entries
+        .iter()
+        .filter(|entry| entry.area == ChangeArea::Untracked && entry.kind == ChangeKind::Untracked)
+        .map(|entry| &entry.path)
+        .collect();
+    // ls-files includes index entries whose working file was deleted. Only
+    // positive working-deletion evidence may exclude one from the live shape;
+    // a staged deletion alone says nothing about a recreated working file.
+    let mut paths: BTreeSet<_> = snapshot
+        .files
+        .paths
+        .iter()
+        .chain(&snapshot.files.ignored)
+        .filter(|path| !deleted.contains(path) || untracked.contains(path))
+        .collect();
+    let live_files: BTreeSet<_> = paths.iter().map(|path| (*path).as_path()).collect();
+    let live_directories: BTreeSet<_> = live_files
+        .iter()
+        .flat_map(|path| path.ancestors().skip(1))
+        .chain(
+            snapshot
+                .files
+                .ignored_directories
+                .iter()
+                .flat_map(|path| path.as_path().ancestors()),
+        )
+        .filter(|path| !path.as_os_str().is_empty())
+        .collect();
+    for entry in &snapshot.status.entries {
+        let path = entry.path.as_path();
+        // Both lookups are component-aware. An ordered ancestor set avoids a
+        // full listing scan for every status path in a large worktree.
+        if !live_directories.contains(path)
+            && !path
+                .ancestors()
+                .skip(1)
+                .any(|ancestor| live_files.contains(ancestor))
+        {
+            paths.insert(&entry.path);
+        }
+    }
+    paths.into_iter().cloned().collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileRowChrome {
     label: Box<str>,
@@ -2208,19 +2290,8 @@ impl SourceControlModel {
             .len();
         let change_count_label = (changed_paths > 0).then(|| tab_count_label(changed_paths));
         let mut files = if browse_files {
-            // Staged deletions are absent from ls-files, but remain navigable
-            // review rows with their D decoration in this snapshot.
-            let mut paths = snapshot.files.paths.clone();
-            paths.extend(snapshot.files.ignored.iter().cloned());
-            paths.extend(
-                snapshot
-                    .status
-                    .entries
-                    .iter()
-                    .map(|entry| entry.path.clone()),
-            );
             file_rows_from_tree(build_file_tree_with_directories(
-                &paths,
+                &files_tree_paths(snapshot),
                 &snapshot.files.ignored_directories,
             ))
         } else {
@@ -2238,8 +2309,18 @@ impl SourceControlModel {
         } else {
             BTreeMap::new()
         };
+        let exact_statuses = if browse_files {
+            exact_file_statuses(&snapshot.status.entries)
+        } else {
+            BTreeMap::new()
+        };
         for row in &mut files {
-            row.status = statuses.get(&row.path).copied();
+            row.status = if row.directory {
+                statuses.get(&row.path)
+            } else {
+                exact_statuses.get(&row.path)
+            }
+            .copied();
             row.ignored = ignored.contains(&row.path)
                 || row
                     .path
@@ -15780,6 +15861,264 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn files_keep_replacement_directory_children_visible_after_a_file_deletion() {
+        for area in [ChangeArea::Staged, ChangeArea::Unstaged] {
+            let mut snapshot = snapshot();
+            let deleted = ["node", "gone.rs", "node-other/deleted.rs"];
+            snapshot.status.entries = deleted
+                .iter()
+                .map(|path| changed(repo_path(path), area, ChangeKind::Deleted, None))
+                .chain([changed(
+                    repo_path("node/child.txt"),
+                    ChangeArea::Untracked,
+                    ChangeKind::Untracked,
+                    None,
+                )])
+                .collect();
+            snapshot.files.paths =
+                vec![repo_path("node/child.txt"), repo_path("node-other/kept.rs")];
+            if area == ChangeArea::Unstaged {
+                // Cached index entries remain in ls-files after an unstaged
+                // working deletion, even though they are no longer live files.
+                snapshot.files.paths.extend(deleted.map(repo_path));
+            }
+            snapshot.files.paths.sort();
+            let model = SourceControlModel::ready(main_key(), &snapshot);
+            let row = |path| {
+                model
+                    .files
+                    .iter()
+                    .find(|row| row.path == repo_path(path))
+                    .unwrap()
+            };
+            assert!(row("node").directory);
+            assert_eq!(row("node").status, Some(FileStatus::Deleted));
+            assert!(!row("node/child.txt").directory);
+            assert_eq!(row("node/child.txt").status, Some(FileStatus::Untracked));
+            for path in ["gone.rs", "node-other/deleted.rs"] {
+                assert!(!row(path).directory);
+                assert_eq!(row(path).status, Some(FileStatus::Deleted));
+            }
+            assert_eq!(
+                model
+                    .files
+                    .iter()
+                    .map(|row| &row.path)
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                model.files.len(),
+                "no duplicate path identities"
+            );
+            let group = model
+                .groups()
+                .iter()
+                .find(|group| group.area == area)
+                .unwrap();
+            for path in deleted {
+                assert!(
+                    group
+                        .rows()
+                        .iter()
+                        .any(|row| row.entry.path == repo_path(path))
+                );
+            }
+            assert_eq!(group.rows().len(), deleted.len());
+
+            let mut state = SidebarState::default();
+            let visible = |state: &SidebarState, query: &str| {
+                visible_file_rows(
+                    &model.files,
+                    &state.expanded_directories,
+                    query,
+                    !query.is_empty(),
+                    false,
+                )
+                .0
+                .iter()
+                .map(|row| row.path.display().into_owned())
+                .collect::<Vec<_>>()
+            };
+            assert_eq!(visible(&state, ""), ["node", "node-other", "gone.rs"]);
+            let toggle = SidebarAction::ToggleDirectory {
+                key: main_key(),
+                path: repo_path("node"),
+            };
+            state.apply(&toggle);
+            assert_eq!(
+                visible(&state, ""),
+                ["node", "node/child.txt", "node-other", "gone.rs"]
+            );
+            assert_eq!(visible(&state, "child.txt"), ["node/child.txt"]);
+            state.apply(&toggle);
+            assert_eq!(visible(&state, ""), ["node", "node-other", "gone.rs"]);
+            assert_eq!(visible(&state, "child.txt"), ["node/child.txt"]);
+        }
+    }
+
+    #[test]
+    fn files_keep_replacement_file_exact_status_without_deleted_descendant_rollup() {
+        for area in [ChangeArea::Staged, ChangeArea::Unstaged] {
+            let mut snapshot = snapshot();
+            let deleted = ["node/old.txt", "gone.rs", "node-other/deleted.rs"];
+            snapshot.status.entries = deleted
+                .iter()
+                .map(|path| changed(repo_path(path), area, ChangeKind::Deleted, None))
+                .chain([changed(
+                    repo_path("node"),
+                    ChangeArea::Untracked,
+                    ChangeKind::Untracked,
+                    None,
+                )])
+                .collect();
+            snapshot.files.paths = vec![repo_path("node"), repo_path("node-other/kept.rs")];
+            if area == ChangeArea::Unstaged {
+                snapshot.files.paths.extend(deleted.map(repo_path));
+            }
+            snapshot.files.paths.sort();
+            let model = SourceControlModel::ready(main_key(), &snapshot);
+            let row = |path| {
+                model
+                    .files
+                    .iter()
+                    .find(|row| row.path == repo_path(path))
+                    .unwrap()
+            };
+            assert!(!row("node").directory, "the new file stays openable");
+            assert_eq!(row("node").status, Some(FileStatus::Untracked));
+            assert!(
+                row("node-other").directory,
+                "prefix neighbors are unrelated paths"
+            );
+            assert_eq!(row("node-other").status, Some(FileStatus::Deleted));
+            assert_eq!(
+                row("node-other/deleted.rs").status,
+                Some(FileStatus::Deleted)
+            );
+            assert_eq!(row("gone.rs").status, Some(FileStatus::Deleted));
+            assert!(
+                !model
+                    .files
+                    .iter()
+                    .any(|row| row.path == repo_path("node/old.txt"))
+            );
+            assert_eq!(
+                model
+                    .files
+                    .iter()
+                    .filter(|row| row.path == repo_path("node"))
+                    .count(),
+                1
+            );
+            let group = model
+                .groups()
+                .iter()
+                .find(|group| group.area == area)
+                .unwrap();
+            for path in deleted {
+                assert!(
+                    group
+                        .rows()
+                        .iter()
+                        .any(|row| row.entry.path == repo_path(path))
+                );
+            }
+            assert_eq!(group.rows().len(), deleted.len());
+
+            let mut state = SidebarState::default();
+            state.apply(&SidebarAction::ToggleDirectory {
+                key: main_key(),
+                path: repo_path("node-other"),
+            });
+            let (visible, _) =
+                visible_file_rows(&model.files, &state.expanded_directories, "", false, false);
+            assert!(visible.iter().any(|row| row.path == repo_path("node")));
+            assert!(
+                visible
+                    .iter()
+                    .any(|row| row.path == repo_path("node-other/deleted.rs"))
+            );
+            let (filtered, _) = visible_file_rows(
+                &model.files,
+                &state.expanded_directories,
+                "node",
+                true,
+                false,
+            );
+            assert!(
+                filtered.iter().any(|row| row.path == repo_path("node")
+                    && row.status == Some(FileStatus::Untracked))
+            );
+            assert!(
+                visible_file_rows(
+                    &model.files,
+                    &state.expanded_directories,
+                    "old.txt",
+                    true,
+                    false
+                )
+                .0
+                .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn files_keep_positive_same_path_untracked_shape_over_deleted_index_evidence() {
+        let mut snapshot = snapshot();
+        snapshot.files.paths = vec![repo_path("node")];
+        snapshot.status.entries = ["node", "node/old.txt", "node-other/deleted.rs"]
+            .map(|path| {
+                changed(
+                    repo_path(path),
+                    ChangeArea::Unstaged,
+                    ChangeKind::Deleted,
+                    None,
+                )
+            })
+            .into_iter()
+            .chain([changed(
+                repo_path("node"),
+                ChangeArea::Untracked,
+                ChangeKind::Untracked,
+                None,
+            )])
+            .collect();
+        // The positive leaf, rather than a later reinserted deletion ghost,
+        // must fence descendant ghosts before the generic tree emitter runs.
+        assert_eq!(
+            files_tree_paths(&snapshot),
+            [repo_path("node"), repo_path("node-other/deleted.rs")]
+        );
+        let model = SourceControlModel::ready(main_key(), &snapshot);
+        let node = model
+            .files
+            .iter()
+            .find(|row| row.path == repo_path("node"))
+            .unwrap();
+        assert!(!node.directory);
+        // Both exact-path facts remain; retain the established badge priority.
+        assert_eq!(node.status, Some(FileStatus::Deleted));
+        assert!(
+            !model
+                .files
+                .iter()
+                .any(|row| row.path == repo_path("node/old.txt"))
+        );
+        for (area, expected) in [(ChangeArea::Unstaged, 3), (ChangeArea::Untracked, 1)] {
+            assert_eq!(
+                model
+                    .groups()
+                    .iter()
+                    .find(|group| group.area == area)
+                    .unwrap()
+                    .rows()
+                    .len(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn files_decorations_follow_replaced_snapshot_and_plain_folders_stay_clean() {
         let model = source_control();
         assert_eq!(
@@ -16022,27 +16361,55 @@ pub(crate) mod tests {
         };
         assert_eq!(
             paths(&state, scope, false),
-            ["src", "src/app.rs", "src/sidebar.rs", "README.md"]
+            [
+                "assets",
+                "assets/logo.png",
+                "src",
+                "src/app.rs",
+                "src/sidebar.rs",
+                "README.md",
+                "notes.txt",
+            ]
         );
         state.apply(&SidebarAction::ToggleChangeDirectory {
             key: main_key(),
             scope,
             path: repo_path("src"),
         });
-        assert_eq!(paths(&state, scope, false), ["src", "README.md"]);
+        assert_eq!(
+            paths(&state, scope, false),
+            ["assets", "assets/logo.png", "src", "README.md", "notes.txt"]
+        );
         assert_eq!(
             paths(&state, ChangeTreeScope::Branch, false),
-            ["src", "src/app.rs", "src/sidebar.rs", "README.md"]
+            [
+                "assets",
+                "assets/logo.png",
+                "src",
+                "src/app.rs",
+                "src/sidebar.rs",
+                "README.md",
+                "notes.txt",
+            ]
         );
         assert_eq!(
             paths(&state, scope, true),
-            ["src/app.rs", "src/sidebar.rs", "README.md"]
+            [
+                "assets/logo.png",
+                "src/app.rs",
+                "src/sidebar.rs",
+                "README.md",
+                "notes.txt"
+            ]
         );
         let saved = state.saved_view();
         let serialized = serde_json::to_string(&saved).unwrap();
         let mut restored = SidebarState::default();
         restored.restore_view(serde_json::from_str(&serialized).unwrap());
-        assert_eq!(paths(&restored, scope, false), ["src", "README.md"]);
+        assert_eq!(
+            paths(&restored, scope, false),
+            ["assets", "assets/logo.png", "src", "README.md", "notes.txt"]
+        );
     }
 
     #[test]
@@ -16092,24 +16459,47 @@ pub(crate) mod tests {
         };
         // A fresh tree shows only top-level rows; loading the whole project
         // tree stays cheap until the user opens folders.
-        assert_eq!(paths(&state, false, ""), ["src", "README.md"]);
+        assert_eq!(
+            paths(&state, false, ""),
+            ["assets", "src", "README.md", "notes.txt"]
+        );
         state.apply(&SidebarAction::ToggleDirectory {
             key: main_key(),
             path: repo_path("src"),
         });
         assert_eq!(
             paths(&state, false, ""),
-            ["src", "src/app.rs", "src/sidebar.rs", "README.md"]
+            [
+                "assets",
+                "src",
+                "src/app.rs",
+                "src/sidebar.rs",
+                "README.md",
+                "notes.txt"
+            ]
         );
         // Flat mode and filters ignore expansion without losing tree state.
         assert_eq!(
             paths(&state, true, ""),
-            ["src/app.rs", "src/sidebar.rs", "README.md"]
+            [
+                "assets/logo.png",
+                "src/app.rs",
+                "src/sidebar.rs",
+                "README.md",
+                "notes.txt"
+            ]
         );
         assert_eq!(paths(&state, true, "sidebar"), ["src/sidebar.rs"]);
         assert_eq!(
             paths(&state, false, ""),
-            ["src", "src/app.rs", "src/sidebar.rs", "README.md"]
+            [
+                "assets",
+                "src",
+                "src/app.rs",
+                "src/sidebar.rs",
+                "README.md",
+                "notes.txt"
+            ]
         );
         // Diff and change review always expand, independent of the file tree.
         let (expanded, _) = visible_file_rows(
@@ -16124,7 +16514,15 @@ pub(crate) mod tests {
                 .iter()
                 .map(|row| row.path.display().into_owned())
                 .collect::<Vec<_>>(),
-            ["src", "src/app.rs", "src/sidebar.rs", "README.md"]
+            [
+                "assets",
+                "assets/logo.png",
+                "src",
+                "src/app.rs",
+                "src/sidebar.rs",
+                "README.md",
+                "notes.txt"
+            ]
         );
     }
 
