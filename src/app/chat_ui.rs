@@ -7927,6 +7927,17 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
+        // Saved history accepts local draft edits and history navigation, not
+        // provider work. A stale submit/command must not install a pending
+        // prompt that could later be mistaken for work to retry after resume.
+        if (runtime.snapshot.exited || runtime.snapshot.read_only_reason.is_some())
+            && matches!(
+                &command,
+                Command::Prompt { .. } | Command::Slash { .. } | Command::Compact
+            )
+        {
+            return Task::none();
+        }
         // A queued first message goes out ahead of anything else, and
         // nothing is sent past it while it waits.
         if runtime.pending.is_some()
@@ -9688,6 +9699,18 @@ impl Cagents {
                 }
             }
             Action::Submit(target, mode) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                // Match the disabled Send control before account routing,
+                // paste deferral or queue mutation can consume the draft.
+                if !runtime.is_draft()
+                    && (runtime.disconnected
+                        || runtime.snapshot.exited
+                        || runtime.snapshot.read_only_reason.is_some())
+                {
+                    return Task::none();
+                }
                 if let Some((account, generation, revision)) =
                     self.automatic_chat_account(target, mode)
                 {
@@ -19485,6 +19508,15 @@ mod tests {
             let draft = runtime.composer.text();
             let attachments = runtime.attachments.clone();
             drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+            drop(app.chat_send(
+                target,
+                Command::Prompt {
+                    text: draft.clone(),
+                    attachments: attachments.clone(),
+                    mode: PromptMode::Send,
+                },
+                true,
+            ));
             let runtime = chat_runtime(&app, card);
             assert_eq!(runtime.composer.text(), draft);
             assert_eq!(runtime.attachments, attachments);

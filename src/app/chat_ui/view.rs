@@ -5760,10 +5760,12 @@ mod tests {
             let cursor =
                 mouse::Cursor::Available(iced::Point::new(rect.center_x(), rect.center_y()));
             let mut messages = vec![];
+            let mut captured = vec![];
             for event in [
                 mouse::Event::ButtonPressed(mouse::Button::Left),
                 mouse::Event::ButtonReleased(mouse::Button::Left),
             ] {
+                let mut shell = Shell::new(&mut messages);
                 element.as_widget_mut().update(
                     &mut tree,
                     &iced::Event::Mouse(event),
@@ -5771,16 +5773,18 @@ mod tests {
                     cursor,
                     &renderer,
                     &mut clipboard::Null,
-                    &mut Shell::new(&mut messages),
+                    &mut shell,
                     &viewport,
                 );
+                captured.push(shell.is_event_captured());
             }
             if transitioning {
                 assert!(messages.is_empty(), "switching disables draft controls");
             } else {
                 assert!(
                     matches!(messages.as_slice(), [Message::ChatUi(Action::Attach(found))]
-                    if *found == target)
+                    if *found == target),
+                    "attachment control emitted unexpected messages: {messages:?}; bounds={rect:?}; cursor={cursor:?}; viewport={viewport:?}; captured={captured:?}"
                 );
             }
         }
