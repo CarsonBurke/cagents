@@ -4,18 +4,61 @@ use crate::sidebar::SidebarChannel;
 use crate::workspace_model::ModelEdit;
 use std::collections::BTreeMap;
 
+#[cfg(test)]
+mod session_close_authority_tests;
+
+/// Original caller and workspace for one asynchronous session close.
+pub(super) struct SessionCloseContext {
+    authority: crate::agent_execution::Authority,
+    remote: bool,
+    registry: Option<uuid::Uuid>,
+}
+
+impl SessionCloseContext {
+    pub(super) fn capture(registry: uuid::Uuid) -> Self {
+        Self {
+            authority: crate::agent_execution::Authority::from_environment(),
+            remote: crate::device::is_remote(),
+            registry: (registry != crate::workspace_model::NO_REGISTRY).then_some(registry),
+        }
+    }
+
+    pub(super) fn scoped(&self) -> bool {
+        self.authority.token().is_some()
+    }
+
+    pub(super) fn admit_remote(&self) -> Result<(), String> {
+        if self.scoped() && self.remote {
+            return Err(
+                "An inherited session capability cannot close conversations on a remote device"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn socket(&self) -> Result<PathBuf, String> {
+        self.admit_remote()?;
+        crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())
+    }
+}
+
 /// Closes the daemon's live sessions behind `sessions`, by the identities the
 /// daemon itself reports rather than the saved descriptors, together with the
 /// source terminal a converted chat keeps running.
-pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
+pub(super) fn close_sessions(
+    sessions: Vec<CardKind>,
+    context: &SessionCloseContext,
+) -> Result<(), String> {
     if !sessions
         .iter()
         .any(|kind| matches!(kind, CardKind::Terminal(_) | CardKind::Chat(_)))
+        && !context.scoped()
     {
         return Ok(());
     }
-    let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-    let Some(mut client) = connect(&socket)? else {
+    let socket = context.socket()?;
+    let Some(mut client) = connect(&socket, context)? else {
         return no_daemon_close_result(&sessions);
     };
     // Query live identities: a saved descriptor can predate an upgrade or handoff.
@@ -37,7 +80,7 @@ pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
                 // Only a fresh inventory may turn a close error into success,
                 // read on a fresh connection: a failed request can leave this
                 // one out of step with the daemon.
-                let Some(fresh) = connect(&socket)? else {
+                let Some(fresh) = connect(&socket, context)? else {
                     return if may_have_retained_owner(live) {
                         Err(error.to_string())
                     } else {
@@ -75,7 +118,7 @@ pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
                 other => Err(format!("Channel terminal could not be closed: {other:?}")),
             });
         if let Err(error) = result {
-            let Some(fresh) = connect(&socket)? else {
+            let Some(fresh) = connect(&socket, context)? else {
                 return no_daemon_close_result(&sessions);
             };
             client = fresh;
@@ -116,16 +159,41 @@ fn no_daemon_close_result(sessions: &[CardKind]) -> Result<(), String> {
 
 /// A connection to the daemon, or `None` when no daemon is running. Retained
 /// native owners can outlive it, so callers must not treat this as their exit.
-fn connect(socket: &std::path::Path) -> Result<Option<crate::control::ControlClient>, String> {
+fn connect(
+    socket: &std::path::Path,
+    context: &SessionCloseContext,
+) -> Result<Option<crate::control::ControlClient>, String> {
     match crate::control::ControlClient::connect(socket) {
-        Ok(client) => Ok(Some(client)),
+        Ok(mut client) => {
+            if context.scoped() {
+                client
+                    .authenticate(context.authority.clone())
+                    .map_err(|error| error.to_string())?;
+            }
+            if let Some(registry) = context.registry {
+                let model = client
+                    .read_workspace_model()
+                    .map_err(|error| error.to_string())?;
+                if model.identity != registry {
+                    return Err(
+                        "The workspace connection changed. Review the conversation before closing it again."
+                            .into(),
+                    );
+                }
+            }
+            Ok(Some(client))
+        }
         Err(crate::control::ControlError::Connect(error))
             if matches!(
                 error.kind(),
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
             ) =>
         {
-            Ok(None)
+            if context.scoped() {
+                Err("Cannot verify this session's close while the daemon is unavailable.".into())
+            } else {
+                Ok(None)
+            }
         }
         Err(error) => Err(format!(
             "Cannot reach the daemon to close sessions: {error}"
@@ -685,9 +753,12 @@ impl Cagents {
             .filter(|card| cards.contains(&card.id) && card.existence.is_open())
             .map(|card| card.kind.clone())
             .collect();
+        let registry = self.workspace_model.identity;
+        let context = SessionCloseContext::capture(registry);
         if !sessions
             .iter()
             .any(|kind| matches!(kind, CardKind::Terminal(_) | CardKind::Chat(_)))
+            && !context.scoped()
         {
             self.channel_ui.deleting.remove(&id);
             return Task::batch([leave, self.finish_delete_channel(id)]);
@@ -728,7 +799,7 @@ impl Cagents {
             id,
             ChannelCloseAttempt {
                 operation,
-                registry: self.workspace_model.identity,
+                registry,
                 project,
                 members: cards,
                 inactive,
@@ -736,7 +807,7 @@ impl Cagents {
             },
         );
         let close = cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || close_sessions(sessions))
+            let result = tokio::task::spawn_blocking(move || close_sessions(sessions, &context))
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
@@ -1591,7 +1662,7 @@ mod tests {
         assert_eq!(app.durable.channels[0].title, "My project name");
     }
 
-    fn chat_session() -> crate::chat::Session {
+    pub(super) fn chat_session() -> crate::chat::Session {
         crate::chat::Session {
             native_continuity: Default::default(),
             owned_codex_listener: None,
@@ -1771,7 +1842,7 @@ mod tests {
     /// A window whose active channel, "Investigation", holds a live
     /// conversation, beside an empty "Migration": (window, doomed, survivor,
     /// conversation).
-    fn channel_with_a_conversation() -> (Cagents, ChannelId, ChannelId, CardId) {
+    pub(super) fn channel_with_a_conversation() -> (Cagents, ChannelId, ChannelId, CardId) {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let project = ProjectId::new();
         let doomed = ChannelId::new();
