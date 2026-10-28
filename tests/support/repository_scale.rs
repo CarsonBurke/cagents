@@ -4,8 +4,45 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    time::Duration,
+    sync::Mutex,
+    time::{Duration, Instant},
 };
+
+/// Keep phase/command summaries well below the parent's 1 MiB stderr cap.
+/// Never log argv, stdin payloads or environment values here.
+pub(super) fn diagnostic(message: std::fmt::Arguments<'_>) {
+    static REMAINING: Mutex<usize> = Mutex::new(256 * 1024);
+    let record = format!("{message}\n");
+    let mut remaining = REMAINING.lock().unwrap_or_else(|p| p.into_inner());
+    if *remaining == 0 {
+        return;
+    }
+    let mut stderr = std::io::stderr().lock();
+    if record.len() >= *remaining {
+        *remaining = 0;
+        stderr
+            .write_all(b"PATHSPEC_DIAGNOSTICS_TRUNCATED\n")
+            .unwrap();
+    } else {
+        *remaining -= record.len();
+        stderr.write_all(record.as_bytes()).unwrap();
+    }
+    stderr.flush().unwrap();
+}
+
+/// An unfinished BEGIN remains in captured stderr if the parent deadline wins.
+pub(super) fn phase<T>(name: &str, items: usize, operation: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    diagnostic(format_args!(
+        "PATHSPEC_PHASE_BEGIN phase={name} items={items} elapsed_ms=0"
+    ));
+    let result = operation();
+    diagnostic(format_args!(
+        "PATHSPEC_PHASE_END phase={name} items={items} elapsed_ms={}",
+        started.elapsed().as_millis()
+    ));
+    result
+}
 
 /// Runs `contract` as the only test of a private libtest subprocess,
 /// against a repository in a 0700 namespace under `/var/tmp`; the
