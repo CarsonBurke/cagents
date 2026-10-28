@@ -78,8 +78,13 @@ when finished. The fixture directory can then be removed.
 The daemon removes `CAGENTS_*` variables from a provider's environment, so
 optional fixture behaviors are switched on by files in
 `$fixture_root/home/.claude`, the fixture's Claude config directory. The
-error files are read for every prompt; the others take effect from the
-provider's next start.
+reply and error files are read for every prompt; the others take effect from
+the provider's next start.
+
+To check how an answer renders, copy a Markdown file to `fixture-reply.md`.
+Each later turn answers with that file's contents instead of the default
+sentence, so replacing the file changes the next answer. A few turns with a
+long file give a transcript long enough to scroll.
 
 For provider failure checks, write a diagnostic such as `Failed to
 authenticate: OAuth session expired and could not be refreshed` to
