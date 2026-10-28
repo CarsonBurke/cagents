@@ -1261,12 +1261,12 @@ impl Registry {
         trigger: crate::automations::Trigger,
         next: Option<Occurrence>,
         confirmed_manual: bool,
+        limits: Result<crate::agent_execution::ConcurrencyLimits, String>,
         now_ms: u64,
     ) -> Result<Claimed, String> {
         use crate::automations::{SkipReason, Trigger};
-        // Read outside the write transaction, but require policy only for new
-        // acceptance: retries and proven precheck cleanup need no new slot.
-        let limits = crate::host::agent_execution::concurrency_limits();
+        // The broker reads policy before locking Registry. Require the result
+        // only for new acceptance: an exact retry needs no new slot.
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1418,12 +1418,12 @@ impl Registry {
         &mut self,
         firing_id: Uuid,
         outcome: super::super::automations::precheck::Outcome,
+        limits: Result<crate::agent_execution::ConcurrencyLimits, String>,
         now_ms: u64,
     ) -> Result<Option<crate::agent_execution::Accepted>, String> {
         use crate::{automations::SkipReason, host::automations::precheck::Outcome};
-        // Read outside the write transaction, but require policy only for new
-        // acceptance: retries and proven precheck cleanup need no new slot.
-        let limits = crate::host::agent_execution::concurrency_limits();
+        // A proved cleanup result must progress even when the broker could
+        // not read policy. Only a new acceptance below consumes this result.
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1816,6 +1816,7 @@ mod tests {
                     },
                     None,
                     true,
+                    crate::host::agent_execution::concurrency_limits(),
                     200,
                 )
                 .unwrap();
@@ -1830,6 +1831,7 @@ mod tests {
                             skip: None,
                             diagnostic: "proved precheck exit".into()
                         },
+                        crate::host::agent_execution::concurrency_limits(),
                         300,
                     )
                     .unwrap()
@@ -1886,6 +1888,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 200,
             )
             .unwrap();
@@ -1905,7 +1908,12 @@ mod tests {
         corrupt_capacity_settings(&path);
         assert!(
             registry
-                .finish_automation_precheck(claim.firing.id, Outcome::Passed, 400)
+                .finish_automation_precheck(
+                    claim.firing.id,
+                    Outcome::Passed,
+                    crate::host::agent_execution::concurrency_limits(),
+                    400
+                )
                 .unwrap()
                 .is_none()
         );
@@ -1966,6 +1974,7 @@ mod tests {
                 crate::automations::Trigger::Manual { request },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 200,
             )
             .unwrap();
@@ -1995,6 +2004,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 200,
             )
             .unwrap();
@@ -2008,6 +2018,7 @@ mod tests {
                 crate::automations::Trigger::Manual { request },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 300,
             )
             .unwrap();
@@ -2025,6 +2036,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 300,
             )
             .err()
@@ -2032,7 +2044,12 @@ mod tests {
         assert!(error.contains("Cannot read agent concurrency settings"));
         assert_eq!(registry.automation(fresh.id).unwrap(), fresh);
         let error = registry
-            .finish_automation_precheck(precheck.firing.id, Outcome::Passed, 300)
+            .finish_automation_precheck(
+                precheck.firing.id,
+                Outcome::Passed,
+                crate::host::agent_execution::concurrency_limits(),
+                300,
+            )
             .err()
             .expect("passing precheck cannot bypass unreadable concurrency policy");
         assert!(error.contains("Cannot read agent concurrency settings"));
@@ -2140,6 +2157,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 200,
             )
             .unwrap();
@@ -2153,6 +2171,7 @@ mod tests {
                 .finish_automation_precheck(
                     claim.firing.id,
                     crate::host::automations::precheck::Outcome::Passed,
+                    crate::host::agent_execution::concurrency_limits(),
                     220
                 )
                 .unwrap()
@@ -2273,7 +2292,16 @@ mod tests {
             request: Uuid::new_v4(),
         };
         let claimed = registry
-            .claim_automation(automation.id, 1, None, trigger.clone(), None, true, 200)
+            .claim_automation(
+                automation.id,
+                1,
+                None,
+                trigger.clone(),
+                None,
+                true,
+                crate::host::agent_execution::concurrency_limits(),
+                200,
+            )
             .unwrap();
         assert!(claimed.created);
         let accepted = claimed.accepted.unwrap();
@@ -2286,7 +2314,16 @@ mod tests {
 
         let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
         let repeated = registry
-            .claim_automation(automation.id, 1, None, trigger, None, true, 300)
+            .claim_automation(
+                automation.id,
+                1,
+                None,
+                trigger,
+                None,
+                true,
+                crate::host::agent_execution::concurrency_limits(),
+                300,
+            )
             .unwrap();
         assert!(!repeated.created);
         assert!(
@@ -2350,6 +2387,7 @@ mod tests {
                     },
                     None,
                     true,
+                    crate::host::agent_execution::concurrency_limits(),
                     200,
                 )
                 .unwrap();
@@ -2361,6 +2399,7 @@ mod tests {
                         skip: Some(SkipReason::PrecheckExit),
                         diagnostic: "not ready".into(),
                     },
+                    crate::host::agent_execution::concurrency_limits(),
                     300,
                 )
                 .unwrap();
@@ -2434,6 +2473,7 @@ mod tests {
                 },
                 Some(next.clone()),
                 false,
+                crate::host::agent_execution::concurrency_limits(),
                 200,
             )
             .unwrap();
@@ -2449,6 +2489,7 @@ mod tests {
                 .finish_automation_precheck(
                     claimed.firing.id,
                     crate::host::automations::precheck::Outcome::Passed,
+                    crate::host::agent_execution::concurrency_limits(),
                     230
                 )
                 .unwrap()
@@ -2572,6 +2613,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 200,
             )
             .unwrap();
@@ -2611,6 +2653,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 200,
             )
             .unwrap();
@@ -2624,6 +2667,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 201,
             )
             .unwrap();
@@ -2661,6 +2705,7 @@ mod tests {
                     },
                     None,
                     true,
+                    crate::host::agent_execution::concurrency_limits(),
                     200,
                 )
                 .unwrap();
@@ -2676,7 +2721,16 @@ mod tests {
         };
         assert!(
             registry
-                .claim_automation(extra.id, 1, None, trigger.clone(), None, true, 201)
+                .claim_automation(
+                    extra.id,
+                    1,
+                    None,
+                    trigger.clone(),
+                    None,
+                    true,
+                    crate::host::agent_execution::concurrency_limits(),
+                    201
+                )
                 .is_err()
         );
         registry
@@ -2698,7 +2752,16 @@ mod tests {
         );
         assert!(
             registry
-                .claim_automation(extra.id, 1, None, trigger.clone(), None, true, 203)
+                .claim_automation(
+                    extra.id,
+                    1,
+                    None,
+                    trigger.clone(),
+                    None,
+                    true,
+                    crate::host::agent_execution::concurrency_limits(),
+                    203
+                )
                 .is_err()
         );
         registry
@@ -2709,6 +2772,7 @@ mod tests {
                     skip: Some(crate::automations::SkipReason::PrecheckExit),
                     diagnostic: "not ready".into(),
                 },
+                crate::host::agent_execution::concurrency_limits(),
                 204,
             )
             .unwrap();
@@ -2718,7 +2782,16 @@ mod tests {
         );
         assert!(
             registry
-                .claim_automation(extra.id, 1, None, trigger, None, true, 205)
+                .claim_automation(
+                    extra.id,
+                    1,
+                    None,
+                    trigger,
+                    None,
+                    true,
+                    crate::host::agent_execution::concurrency_limits(),
+                    205
+                )
                 .is_ok()
         );
         assert_eq!(registry.active_automation_firings().unwrap().len(), 4);
@@ -2729,6 +2802,7 @@ mod tests {
                 .finish_automation_precheck(
                     firings[0],
                     crate::host::automations::precheck::Outcome::Passed,
+                    crate::host::agent_execution::concurrency_limits(),
                     206,
                 )
                 .unwrap()
@@ -2761,6 +2835,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 200,
             )
             .unwrap();
@@ -2877,6 +2952,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 200,
             )
             .unwrap();
@@ -2901,6 +2977,7 @@ mod tests {
                 .finish_automation_precheck(
                     claim.firing.id,
                     crate::host::automations::precheck::Outcome::Passed,
+                    crate::host::agent_execution::concurrency_limits(),
                     300
                 )
                 .unwrap()
@@ -2929,6 +3006,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 200,
             )
             .unwrap();
@@ -2960,6 +3038,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 202,
             )
             .unwrap();
@@ -3030,6 +3109,7 @@ mod tests {
                     local: "2026-09-27T09:01".into(),
                 }),
                 false,
+                crate::host::agent_execution::concurrency_limits(),
                 9999,
             )
             .unwrap();
@@ -3057,6 +3137,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 200,
             )
             .unwrap();
@@ -3094,6 +3175,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 200,
             )
             .unwrap();
@@ -3128,6 +3210,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 200,
             )
             .unwrap();
@@ -3270,6 +3353,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 200,
             )
             .unwrap();
@@ -3362,6 +3446,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 300,
             )
             .unwrap()
@@ -3391,6 +3476,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 200,
             )
             .unwrap();
@@ -3410,6 +3496,7 @@ mod tests {
             .finish_automation_precheck(
                 claim.firing.id,
                 crate::host::automations::precheck::Outcome::Passed,
+                crate::host::agent_execution::concurrency_limits(),
                 220,
             )
             .unwrap()
@@ -3534,6 +3621,7 @@ mod tests {
                             local: "2026-09-29T09:00".into(),
                         }),
                         false,
+                        crate::host::agent_execution::concurrency_limits(),
                         300,
                     )
                     .unwrap()
@@ -3632,6 +3720,7 @@ mod tests {
                         },
                         None,
                         true,
+                        crate::host::agent_execution::concurrency_limits(),
                         now,
                     )
                     .unwrap()
@@ -3762,6 +3851,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 200,
             )
             .unwrap();
@@ -3812,6 +3902,7 @@ mod tests {
                     },
                     None,
                     true,
+                    crate::host::agent_execution::concurrency_limits(),
                     230
                 )
                 .is_err()
@@ -4150,6 +4241,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 200,
             )
             .unwrap();
@@ -4164,6 +4256,7 @@ mod tests {
                 .finish_automation_precheck(
                     claim.firing.id,
                     crate::host::automations::precheck::Outcome::Passed,
+                    crate::host::agent_execution::concurrency_limits(),
                     400
                 )
                 .unwrap()
@@ -4303,6 +4396,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 200,
             )
             .unwrap();
@@ -4363,7 +4457,12 @@ mod tests {
              BEGIN SELECT RAISE(ABORT, 'fixture exact retirement failure'); END;",
         ).unwrap();
         let error = registry
-            .finish_automation_precheck(claim.firing.id, Outcome::Passed, 400)
+            .finish_automation_precheck(
+                claim.firing.id,
+                Outcome::Passed,
+                crate::host::agent_execution::concurrency_limits(),
+                400,
+            )
             .unwrap_err();
         assert!(error.contains("fixture exact retirement failure"));
         assert_eq!(registry.automation(created.id).unwrap(), blocked);
@@ -4381,7 +4480,12 @@ mod tests {
             .unwrap();
         assert!(
             registry
-                .finish_automation_precheck(claim.firing.id, Outcome::Passed, 400)
+                .finish_automation_precheck(
+                    claim.firing.id,
+                    Outcome::Passed,
+                    crate::host::agent_execution::concurrency_limits(),
+                    400
+                )
                 .unwrap()
                 .is_none()
         );
@@ -4449,6 +4553,7 @@ mod tests {
                     local: "second fixture minute".into(),
                 }),
                 false,
+                crate::host::agent_execution::concurrency_limits(),
                 60_000,
             )
             .unwrap();
@@ -4461,6 +4566,7 @@ mod tests {
                         skip: None,
                         diagnostic: "Previous-boot command effects are uncertain".into(),
                     },
+                    crate::host::agent_execution::concurrency_limits(),
                     60_001,
                 )
                 .unwrap()
@@ -4579,6 +4685,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 300,
             )
             .unwrap();
@@ -4656,6 +4763,7 @@ mod tests {
                     },
                     None,
                     true,
+                    crate::host::agent_execution::concurrency_limits(),
                     200,
                 )
                 .unwrap();
@@ -4712,6 +4820,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 300,
             )
             .unwrap();

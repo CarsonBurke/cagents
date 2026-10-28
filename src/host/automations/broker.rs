@@ -190,6 +190,7 @@ impl Handle {
         }
         service::validate_target(&host, &automation.definition, &automation.target_identity)?;
         agent_execution::selected_account(&automation.definition.agent)?;
+        let limits = agent_execution::concurrency_limits();
         let claim = self
             .0
             .registry
@@ -202,6 +203,7 @@ impl Handle {
                 Trigger::Manual { request },
                 automation.next,
                 confirmed,
+                limits,
                 service::now()?,
             )?;
         let firing = claim.firing.clone();
@@ -491,6 +493,7 @@ impl Handle {
                 } else {
                     previous
                 };
+                let limits = agent_execution::concurrency_limits();
                 let claim = self
                     .0
                     .registry
@@ -505,6 +508,7 @@ impl Handle {
                         },
                         Some(plan.next),
                         false,
+                        limits,
                         now,
                     )?;
                 checking |= claim.created
@@ -644,7 +648,8 @@ impl Handle {
                 return Ok(true);
             }
             Ok(Status::Complete(outcome)) => {
-                let accepted = self.0.registry.lock().unwrap_or_else(|p| p.into_inner()).finish_automation_precheck(firing.id, outcome, now)?;
+                let limits = agent_execution::concurrency_limits();
+                let accepted = self.0.registry.lock().unwrap_or_else(|p| p.into_inner()).finish_automation_precheck(firing.id, outcome, limits, now)?;
                 if let Some(accepted) = accepted {
                     let automation = self.0.registry.lock().unwrap_or_else(|p| p.into_inner()).automation(firing.automation)?;
                     match service::validate_target(host, &automation.definition, &automation.target_identity) {
@@ -774,6 +779,9 @@ fn run_attention(detail: &crate::automations::RunDetail) -> Option<crate::notifi
         },
     })
 }
+
+#[cfg(test)]
+mod policy_contention_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1079,6 +1087,7 @@ mod tests {
                         },
                         None,
                         true,
+                        crate::host::agent_execution::concurrency_limits(),
                         200,
                     )
                     .unwrap();
@@ -1134,6 +1143,7 @@ mod tests {
                         },
                         Some(next.clone()),
                         false,
+                        crate::host::agent_execution::concurrency_limits(),
                         300,
                     )
                     .unwrap();
@@ -1211,6 +1221,7 @@ mod tests {
                                 local: "later".into(),
                             }),
                             false,
+                            crate::host::agent_execution::concurrency_limits(),
                             400,
                         )
                         .unwrap()
@@ -1331,6 +1342,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 200,
             )
             .unwrap();
@@ -1422,6 +1434,7 @@ mod tests {
                 },
                 None,
                 true,
+                crate::host::agent_execution::concurrency_limits(),
                 200,
             )
             .unwrap();

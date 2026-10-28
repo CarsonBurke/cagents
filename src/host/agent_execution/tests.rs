@@ -1096,6 +1096,7 @@ fn interactive_work_claims_automation_agent_before_cleanup_or_reuse() {
             },
             None,
             true,
+            crate::host::agent_execution::concurrency_limits(),
             now(),
         )
         .unwrap()
@@ -1318,6 +1319,7 @@ fn claim_fixture(host: &SharedHost, automation: &crate::automations::Automation)
             },
             None,
             true,
+            crate::host::agent_execution::concurrency_limits(),
             now(),
         )
         .unwrap()

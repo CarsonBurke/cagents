@@ -147,7 +147,7 @@ pub(super) fn concurrency_limits() -> Result<crate::agent_execution::Concurrency
     let Some(path) = crate::instance::settings_path() else {
         return Ok(Default::default());
     };
-    match crate::settings::load(path) {
+    match crate::settings::try_load(path) {
         Ok(settings) => Ok(settings.agent_concurrency),
         Err(crate::settings::SettingsError::Io(error))
             if error.kind() == std::io::ErrorKind::NotFound =>

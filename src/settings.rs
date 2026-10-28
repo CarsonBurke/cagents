@@ -1958,7 +1958,7 @@ pub fn default_path() -> Result<PathBuf, SettingsError> {
     instance::settings_path().ok_or(SettingsError::DirectoryUnavailable)
 }
 
-fn settings_lock(path: &Path) -> Result<File, SettingsError> {
+fn settings_lock(path: &Path, nonblocking: bool) -> Result<File, SettingsError> {
     use std::os::fd::AsRawFd;
     let parent = settings_parent(path)?;
     prepare_private_directory(parent)?;
@@ -1972,8 +1972,9 @@ fn settings_lock(path: &Path) -> Result<File, SettingsError> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&lock_path)?;
     validate_owned_regular_file(&lock_path, &lock.metadata()?)?;
+    let operation = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
     // SAFETY: the returned file owns the locked descriptor until dropped.
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+    if unsafe { libc::flock(lock.as_raw_fd(), operation) } != 0 {
         return Err(io::Error::last_os_error().into());
     }
     Ok(lock)
@@ -1987,7 +1988,7 @@ pub fn save_merged(
     desired: &AppSettings,
 ) -> Result<(), SettingsError> {
     let path = path.as_ref();
-    let _lock = settings_lock(path)?;
+    let _lock = settings_lock(path, false)?;
     let current = load_unlocked(path)?.settings;
     let mut current = toml::Value::try_from(current)?;
     merge_changed_fields(
@@ -2027,8 +2028,17 @@ pub fn load(path: impl AsRef<Path>) -> Result<AppSettings, SettingsError> {
 
 /// Loads settings along with what the file holds that this build set aside.
 pub fn load_detailed(path: impl AsRef<Path>) -> Result<Loaded, SettingsError> {
-    let path = path.as_ref();
-    let _lock = settings_lock(path)?;
+    load_detailed_with_lock(path.as_ref(), false)
+}
+
+/// Uses the normal validated load path, but returns `WouldBlock` when another
+/// settings writer owns the lock instead of waiting for it.
+pub(crate) fn try_load(path: impl AsRef<Path>) -> Result<AppSettings, SettingsError> {
+    load_detailed_with_lock(path.as_ref(), true).map(|loaded| loaded.settings)
+}
+
+fn load_detailed_with_lock(path: &Path, nonblocking: bool) -> Result<Loaded, SettingsError> {
+    let _lock = settings_lock(path, nonblocking)?;
     let loaded = load_unlocked(path)?;
     for setting in &loaded.foreign {
         setting.warn();
@@ -2049,7 +2059,7 @@ fn load_unlocked(path: &Path) -> Result<Loaded, SettingsError> {
 
 pub fn save(path: impl AsRef<Path>, settings: &AppSettings) -> Result<(), SettingsError> {
     let path = path.as_ref();
-    let _lock = settings_lock(path)?;
+    let _lock = settings_lock(path, false)?;
     save_unlocked(path, settings)
 }
 
