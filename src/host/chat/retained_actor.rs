@@ -1634,12 +1634,16 @@ pub(in crate::host) fn reconcile_startup_losses(host: &SharedHost) -> Result<(),
 /// only an already removed presentation, before orphan adoption consults it.
 pub(in crate::host) fn reconcile_previous_boot_history(host: &SharedHost) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(30);
-    let proof = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .proof()
-        .clone();
-    let registry = super::super::agent_execution::registry(host)?;
+    let (proof, registry) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(registry) = state.execution_registry.clone() else {
+            // A damaged model still permits exact orphan-terminal recovery.
+            // Preserve native history until its registry can be opened; do not
+            // prevent the recovery-only listener from exposing checked Close.
+            return Ok(());
+        };
+        (state.proof().clone(), registry)
+    };
     let mut after = None;
     loop {
         let page = registry
