@@ -367,6 +367,30 @@ async fn retained_read_failure_requires_a_current_editable_original_root_to_reat
     ));
 
     std::fs::write(&path, "disk").unwrap();
+    // Matching path and bytes do not replace the retained physical read root.
+    // This is a real read through a separately opened Root, not a forged result.
+    let fresh_root = crate::editor::read_file_at(
+        root.path(),
+        Path::new("live.txt"),
+        crate::editor::PdfTone::Original,
+        None,
+    );
+    assert_eq!(
+        fresh_root.as_ref().unwrap().source(),
+        Some(Path::new("live.txt"))
+    );
+    let task = runtime.update(RepositoryAction::FileLoadedAt {
+        identity: identity.clone(),
+        result: fresh_root,
+    });
+    settle(&mut runtime, task).await;
+    assert!(!runtime.original_read_attested);
+    assert_eq!(runtime.editor_text().as_deref(), Some("disk"));
+    assert!(Arc::ptr_eq(
+        &original,
+        &runtime.retained_editor_root().unwrap()
+    ));
+
     let stale = crate::editor::read_file_at(
         root.path(),
         Path::new("live.txt"),
