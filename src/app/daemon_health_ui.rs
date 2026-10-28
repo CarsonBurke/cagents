@@ -871,6 +871,12 @@ mod tests {
                     Some(device_ui::file_editor_id()),
                     "the mounted device editor owns focus above the daemon review"
                 );
+            } else if scene == "clean-device" {
+                assert_eq!(
+                    super::super::tests::focused_element(app.dialog().unwrap(), restoring),
+                    Some(widget::Id::new("device-tools.directory")),
+                    "the remounted clean Device directory owns focus above the daemon review"
+                );
             } else {
                 assert_eq!(restoring.units(), 0, "{scene} cannot emit a focus effect");
             }

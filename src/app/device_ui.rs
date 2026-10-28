@@ -317,6 +317,30 @@ impl Cagents {
         self.reconcile_shared_views()
     }
 
+    /// A covering dialog replaces the Device subtree, so even a clean editor
+    /// loses its native focus. Restore only a control in the remounted surface;
+    /// ordinary focus reconciliation must still preserve the user's selection.
+    pub(super) fn focus_device_after_cover(&self) -> Task<Message> {
+        if !self.device_dialog_on_top()
+            || self.device_ui.busy
+            || self.device_ui.configure
+            || self.device_ui.image.is_some()
+        {
+            return Task::none();
+        }
+        let target = if self.device_ui.panel == Panel::Files && self.device_ui.file.is_some() {
+            file_editor_id()
+        } else {
+            widget::Id::new("device-tools.directory")
+        };
+        crate::interaction::guarded_focus(
+            target,
+            Vec::new(),
+            Some(self.device_ui.keyboard_scope.clone()),
+        )
+        .map(cosmic::Action::App)
+    }
+
     /// Restore only the surface exposed by closing Device files. In
     /// particular, a retained recovery must keep keyboard ownership rather
     /// than returning it to a background terminal or composer.

@@ -16156,6 +16156,9 @@ impl Application for Cagents {
                 if self.transient_work_close.take().is_none() {
                     return Task::none();
                 }
+                if self.device_dialog_on_top() {
+                    return self.focus_device_after_cover();
+                }
                 if self.daemon_health_ui.confirmation {
                     return if self.daemon_health_is_covered() {
                         self.focus_exposed_dialog()

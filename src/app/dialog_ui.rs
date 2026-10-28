@@ -515,4 +515,208 @@ pub(super) mod tests {
             "the exact mounted current destination still focuses normally"
         );
     }
+
+    #[test]
+    fn transient_close_restores_clean_device_through_the_actual_popup_cache() {
+        use iced::{
+            advanced::{
+                clipboard,
+                widget::{Operation, operation},
+            },
+            futures::{FutureExt, StreamExt},
+            runtime::{UserInterface, user_interface::Cache},
+        };
+        type Ui<'a> = UserInterface<'a, cosmic::Action<Message>, cosmic::Theme, cosmic::Renderer>;
+
+        fn apply(ui: &mut Ui<'_>, renderer: &cosmic::Renderer, task: Task<Message>) {
+            let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                return;
+            };
+            loop {
+                match stream.next().now_or_never() {
+                    Some(Some(iced::runtime::Action::Widget(mut operation))) => {
+                        for step in 0..8 {
+                            ui.operate(renderer, operation.as_mut());
+                            match operation.finish() {
+                                operation::Outcome::Chain(next) => {
+                                    assert!(step < 7, "bounded native focus chain");
+                                    operation = next;
+                                }
+                                operation::Outcome::None => break,
+                                _ => panic!("focus must not emit provider or application work"),
+                            }
+                        }
+                    }
+                    Some(None) => break,
+                    _ => panic!("expected immediate native focus effects"),
+                }
+            }
+        }
+        fn focused(ui: &mut Ui<'_>, renderer: &cosmic::Renderer) -> Vec<Option<widget::Id>> {
+            #[derive(Default)]
+            struct Probe(Vec<Option<widget::Id>>);
+            impl Operation for Probe {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn focusable(
+                    &mut self,
+                    id: Option<&widget::Id>,
+                    _: iced::Rectangle,
+                    state: &mut dyn operation::Focusable,
+                ) {
+                    if state.is_focused() {
+                        self.0.push(id.cloned());
+                    }
+                }
+            }
+            let mut probe = Probe::default();
+            ui.operate(renderer, &mut probe);
+            probe.0
+        }
+
+        let mut failures = Vec::new();
+        for scene in ["directory", "clean-file", "dirty-file"] {
+            for daemon in [true, false] {
+                let mut app = super::super::tests::context_inspector_test_app(false);
+                app.context_inspector_open = false;
+                app.automation_ui.update(crate::automation_ui::Action::New);
+                app.automation_ui
+                    .update(crate::automation_ui::Action::Field(
+                        crate::automation_ui::Field::Name,
+                        "Retained draft".into(),
+                    ));
+                assert!(app.automation_ui.draft_dirty());
+                assert!(!app.automation_ui.draft_dialog_open());
+                app.daemon_health_ui.confirmation = daemon;
+                app.device_ui.open = true;
+                if scene != "directory" {
+                    drop(app.update_device(device_ui::Action::Read("retained.txt".into())));
+                    drop(app.update_device(device_ui::Action::Loaded {
+                        generation: 1,
+                        result: Ok(crate::device_service::Reply::Text("original".into())),
+                    }));
+                    if scene == "dirty-file" {
+                        drop(app.update_device(device_ui::Action::Edit(
+                            cosmic::widget::text_editor::Action::Edit(
+                                cosmic::widget::text_editor::Edit::Insert('!'),
+                            ),
+                        )));
+                    }
+                }
+                assert_eq!(app.device_ui.dirty(), scene == "dirty-file");
+                let window = window::Id::unique();
+                app.core.set_main_window_id(Some(window));
+                let owner = if scene == "directory" {
+                    widget::Id::new("device-tools.directory")
+                } else {
+                    device_ui::file_editor_id()
+                };
+                let bounds = iced::Size::new(1000.0, 900.0);
+                let mut renderer = super::super::tests::headless_renderer();
+
+                // This is the actual app frame, including COSMIC_dialog/popover.
+                // Carry its native cache across every mounted-owner transition.
+                let mut ui = UserInterface::build(
+                    cosmic::ApplicationExt::view_main(&app),
+                    bounds,
+                    Cache::new(),
+                    &mut renderer,
+                );
+                ui.operate(
+                    &renderer,
+                    &mut operation::focusable::focus::<()>(owner.clone()),
+                );
+                assert_eq!(focused(&mut ui, &renderer), [Some(owner.clone())]);
+                let cache = ui.into_cache();
+
+                let opening = app.update(Message::WindowCloseRequested(window));
+                assert_eq!(app.transient_work_close, Some(window));
+                let mut ui = UserInterface::build(
+                    cosmic::ApplicationExt::view_main(&app),
+                    bounds,
+                    cache,
+                    &mut renderer,
+                );
+                apply(&mut ui, &renderer, opening);
+                assert_eq!(
+                    focused(&mut ui, &renderer),
+                    [Some(widget::Id::new("dialog.transient-close.cancel"))]
+                );
+                let mut messages = Vec::new();
+                ui.update(
+                    &[iced::Event::Keyboard(key_press(
+                        keyboard::key::Named::Enter,
+                    ))],
+                    iced::mouse::Cursor::Unavailable,
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                let cancel = messages
+                    .into_iter()
+                    .find_map(|message| match message {
+                        cosmic::Action::App(Message::CancelTransientWorkClose) => {
+                            Some(Message::CancelTransientWorkClose)
+                        }
+                        _ => None,
+                    })
+                    .expect("the mounted upper Cancel emits its real reducer action");
+                let cache = ui.into_cache();
+
+                let restoring = app.update(cancel);
+                assert!(app.transient_work_close.is_none());
+                assert!(app.device_ui.open);
+                assert!(app.automation_ui.draft_dirty());
+                assert_eq!(app.daemon_health_ui.confirmation, daemon);
+                let mut ui = UserInterface::build(
+                    cosmic::ApplicationExt::view_main(&app),
+                    bounds,
+                    cache,
+                    &mut renderer,
+                );
+                // Deliberately no focus operation to Device after this point.
+                apply(&mut ui, &renderer, restoring);
+                let actual = focused(&mut ui, &renderer);
+                if actual != [Some(owner.clone())] {
+                    failures.push(format!(
+                        "scene={scene}, daemon={daemon}: restored focus {actual:?}"
+                    ));
+                }
+                let mut typing = key_press(keyboard::key::Named::Space);
+                if let keyboard::Event::KeyPressed {
+                    key,
+                    modified_key,
+                    text,
+                    ..
+                } = &mut typing
+                {
+                    *key = keyboard::Key::Character("x".into());
+                    *modified_key = keyboard::Key::Character("x".into());
+                    *text = Some("x".into());
+                }
+                let mut messages = Vec::new();
+                ui.update(
+                    &[iced::Event::Keyboard(typing)],
+                    iced::mouse::Cursor::Unavailable,
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                let typed = messages.iter().any(|message| match message {
+                    cosmic::Action::App(Message::Device(device_ui::Action::Path(_))) => {
+                        scene == "directory"
+                    }
+                    cosmic::Action::App(Message::Device(device_ui::Action::Edit(_))) => {
+                        scene != "directory"
+                    }
+                    _ => false,
+                });
+                if !typed {
+                    failures.push(format!("scene={scene}, daemon={daemon}: restored Device cannot type without refocus"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:?}");
+    }
 }
