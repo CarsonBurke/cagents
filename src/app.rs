@@ -17099,6 +17099,22 @@ impl Application for Cagents {
                 // The dialog is an overlay, so it has already seen the
                 // keystroke by the time this runs, and what it does with one
                 // is its own affair.
+                // The inspector's advertised toggle closes this foreground
+                // surface; it must not be blocked with the workspace behind it.
+                if self.context_inspector_is_overlay()
+                    && !self.modal_is_open()
+                    && workspace_widget::global_shortcut(
+                        &event,
+                        &self.settings.keyboard_shortcuts,
+                        self.focused_pane(),
+                    ) == Some(workspace_widget::GlobalShortcut::ToggleInspector)
+                    && let keyboard::Event::KeyPressed { modifiers, .. } = &event
+                {
+                    return self.run_workspace_command(
+                        workspace_widget::GlobalShortcut::ToggleInspector,
+                        *modifiers,
+                    );
+                }
                 if self.workspace_inputs_blocked() {
                     return Task::none();
                 }
@@ -24155,6 +24171,82 @@ mod tests {
         assert!(!startup.context_inspector_is_overlay());
         assert!(!startup.context_inspector_overlay_active);
         assert!(startup.context_inspector_restore_focus.is_none());
+    }
+
+    #[test]
+    fn context_overlay_toggle_shortcut_honors_bindings_capture_and_modal_priority() {
+        let press = |key: &str, modifiers, repeat| keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character(key.into()),
+            modified_key: keyboard::Key::Character(key.into()),
+            physical_key: keyboard::key::Physical::Code(if key == "t" {
+                keyboard::key::Code::KeyT
+            } else {
+                keyboard::key::Code::KeyI
+            }),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat,
+        };
+        let default = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        for captured in [false, true] {
+            for custom in [false, true] {
+                let mut app = context_inspector_test_app(true);
+                let modifiers = if custom {
+                    app.settings.keyboard_shortcuts.toggle_inspector = vec!["Ctrl+Alt+I".into()];
+                    keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT
+                } else {
+                    default
+                };
+                let _ = app.update(Message::WindowResized(902.0, 800.0));
+                assert!(app.context_inspector_is_overlay());
+                assert!(app.workspace_inputs_blocked());
+                let focused = app.workspace.focused();
+                let count = app.workspace.order().count();
+
+                // Other workspace commands and retired/default bindings do not
+                // escape through the inspector's one permitted close action.
+                let _ = app.update(Message::KeyEvent {
+                    event: press("t", keyboard::Modifiers::CTRL, false),
+                    captured,
+                });
+                assert_eq!(app.workspace.order().count(), count);
+                if custom {
+                    let _ = app.update(Message::KeyEvent {
+                        event: press("i", default, false),
+                        captured,
+                    });
+                    assert!(app.context_inspector_open);
+                }
+                let _ = app.update(Message::KeyEvent {
+                    event: press("i", modifiers, true),
+                    captured,
+                });
+                assert!(app.context_inspector_open, "repeat must not toggle twice");
+
+                // A real form dialog above the inspector owns keyboard input.
+                app.device_ui.open = true;
+                assert!(app.modal_is_open());
+                let _ = app.update(Message::KeyEvent {
+                    event: press("i", modifiers, false),
+                    captured,
+                });
+                assert!(app.device_ui.open);
+                assert!(app.context_inspector_open);
+                app.device_ui.open = false;
+
+                let _ = app.update(Message::KeyEvent {
+                    event: press("i", modifiers, false),
+                    captured,
+                });
+                assert!(!app.context_inspector_open);
+                settle_context_inspector_transition(&mut app);
+                assert!(!app.context_inspector_is_overlay());
+                assert!(!app.workspace_inputs_blocked());
+                assert_eq!(app.workspace.focused(), focused);
+                assert_eq!(app.workspace.order().count(), count);
+            }
+        }
     }
 
     #[test]
