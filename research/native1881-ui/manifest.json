@@ -1,0 +1,68 @@
+{
+  "schema": 1,
+  "prepared_state": "private source only; no workflow/harness import or execution; independent and Root publication review required",
+  "sources": {
+    "after": {
+      "head": "ad664eaf63dc9ba27144637a11f03ed5100fdf29",
+      "tree": "91864515367304362f3cf19480938b4434806614"
+    },
+    "before": {
+      "head": "87d17f5767c39c7304f87b6fbf20e2f51930fc53",
+      "tree": "500b8cc5c8bd34eba067d9302fdee3a0c40e32ec"
+    },
+    "publisher": {
+      "head": "078dc43d86b128dfa19fee348f48cbbd1b00c708",
+      "tree": "acf22bccb0e2ea88e62458a07bda82bedd429b5d"
+    },
+    "visibility": {
+      "head": "7e697f3609d932a19ec3ec1b3467ece712cb63eb",
+      "tree": "c795d895f7786f97295e069bda72654f32e5fb78"
+    }
+  },
+  "fixture_selector": "app::latency_ui::isolation_tests::actual_app_fixture_mounts_and_interacts_without_service_attempts",
+  "fixture_test_blob": "c978012e64e6b5ea52c14d477d54d3126cfa4993",
+  "product_selectors": [
+    "app::chat_ui::scrollbar_press_tests::native_app_chat_thumb_drag_clears_the_window_resize_band_at_narrow_and_wide_widths",
+    "app::chat_ui::scrollbar_press_tests::native_app_split_chat_thumb_drag_scrolls_without_resizing_the_pane",
+    "app::chat_ui::scrollbar_press_tests::native_app_chat_keeps_the_outer_pane_resize_gesture",
+    "app::chat_ui::scrollbar_press_tests::native_app_expanded_sidebar_thumb_and_outer_resize_handle_have_distinct_gestures",
+    "app::inspector_resize_clearance_tests::docked_inspector_native_thumb_scrolls_clear_of_right_and_bottom_resize_bands",
+    "app::inspector_resize_clearance_tests::docked_inspector_keeps_its_leading_resize_gesture_and_native_close_control",
+    "app::inspector_resize_clearance_tests::shared_body_bottom_clearance_covers_cards_sidebar_and_inspector_without_a_second_status_gap"
+  ],
+  "control_refusals": {
+    "publisher": [
+      "no publisher may own this queue",
+      "App startup, input or subscriptions attempted service work"
+    ],
+    "visibility": [
+      "newly exposed resident transcript must mount after closing the overlay"
+    ]
+  },
+  "baseline_policy": "After and before must pass; controls require actual101 plus exact owning parent failure and causal assertion, never timeout/compile failure/generic parent panic.",
+  "observer_sha256": "bb1e8fd0d14444697198d6c495425ab18038ff2d389d7eee2e29f3f463fe3a6a",
+  "observer_component_review_sha256": "64512aa89482e02c85cbde7240b349af0443821015390e7f0d73252d1e8ae9ca",
+  "observer_kernel_regression_result_sha256": "741d0fe8a6eca6d3c57d52c155211d7445115c89b9fd93d87948e28b3b925bbe",
+  "kernel_contract_sha256": "9c96ff05c61969383dd0781dc2761fb08c15e5e5977a44d20b72edbf3fd8fa53",
+  "kernel_contract_origin_r4_sha256": "9032cad0e8a9dba5ce60acabd2539c8b2fd6eaa0cbe203ee0e00bd735317aaf2",
+  "harness_sha256": "bd2dc4008b8bde4d0051737b8923702316bd999c043485895e93953db656e736",
+  "workflow_sha256": "49d085694ad505a6e360525579ae514438dce71b9442edfc1b119550ec1d7f4e",
+  "setup_sha256": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052",
+  "qualified_setup_source": {
+    "head": "1633e661dae18dc2faf8c876b4fae00469ad2a8b",
+    "tree": "c26888175fe61c8d9088d874184c74c984afb5d1",
+    "path": ".github/actions/setup-linux-build/action.yml",
+    "semantics": "Ubuntu22, Rust1.93.0, checksum-pinned Zig0.15.2, original native packages and compiler/libclang setup. Not wholeCI pass evidence."
+  },
+  "product_source_reviews": {
+    "after_whole_sha256": "f9284e29f46edb2f9881ea4903409717f69fe94f7d406235ec4f6467e984486b",
+    "before_whole_sha256": "d66597e9a3d9fa6d264302cd95b2115a33919739502cfc1e92953f825ef83c51"
+  },
+  "limits": [
+    "Compiler and headless owning-test evidence only, no actual native window/provider/auth/lease/P0 or screenshot qualification",
+    "UIbincheck, UIlib tests and latencyUIlib tests remain three serial isolated invocations; no HOST/UI union",
+    "Normally built matched CLI/daemon/integratedUI artifact gate remains required before actual nativeC; no artifacts from this workflow claim matched-set status",
+    "Caller authority/HOME/no-start/account scope inherited unchanged; no User marker constructed or authority removed",
+    "No local B mutex/admission logic and no stale EA154 observer reused"
+  ]
+}
