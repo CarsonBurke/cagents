@@ -120,6 +120,33 @@ scripts/run-development --browserless   # no Servo; saved browser URLs open exte
 scripts/run-development                 # with the embedded browser
 ```
 
+For diagnostic native layout and input work, `scripts/run-development
+--native-fixture` builds the same three isolated development products and adds
+the existing `latency-harness` feature to the browserless UI. This opens the
+normal App and main native window with in-memory data. It does not prepare a
+device, recover a saved window, install account state, publish a workspace,
+observe or start a daemon, or connect to a provider. Backend actions are
+unavailable; resize, scroll, focus, local transcript find and selection remain
+local. The initial dataset is eight failed terminal cards, not a populated chat,
+repository, sidebar or inspector qualification workload.
+
+Use a coordinated private compositor and private XDG directories for captures.
+The runner preserves inherited `HOME`, agent authority, no-start and scope
+variables. Do not clear or replace authority to launch a fixture. This mode
+accepts no UI arguments, daemon restart or hot reload. It also refuses launcher
+handshakes and helper modes. A UI built without `latency-harness` refuses fixture
+environment variables, so selecting the wrong executable cannot start services.
+`CAGENTS_NATIVE_UI_FIXTURE=1` selects interactive mode; it cannot be combined with
+the automatic `CAGENTS_LATENCY_OUTPUT` benchmark. The legacy redraw benchmark
+script still changes `HOME` and is a separate workflow, not the inherited-home
+native capture route.
+
+Fixture captures can qualify the mounted native UI and the local interactions
+actually exercised with a reviewed dataset. They do not qualify provider starts,
+saved-session recovery, daemon lifecycle, permissions, authentication or native
+SDK readiness. Record the exact source, dataset, runner, viewport, scale, theme
+and interaction states alongside any screenshot comparison.
+
 | Option | Effect |
 | --- | --- |
 | `--browserless` | Build without Servo and open saved browser URLs in the system browser |

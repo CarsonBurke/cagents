@@ -73,6 +73,8 @@ fn trace_worker_stack(role: &'static str) {
 }
 
 fn connect_daemon(path: &std::path::Path) -> io::Result<UnixStream> {
+    #[cfg(feature = "latency-harness")]
+    crate::latency_fixture::deny_services()?;
     #[cfg(feature = "ui")]
     let health_request = crate::daemon_health::begin();
     let result = UnixStream::connect(path);

@@ -67,9 +67,6 @@ ui=$(python3 "$root/scripts/build-ceditor-product" cagents-ui \
     --locked --release --no-default-features --features development,latency-harness --bin cagents-ui)
 sandbox=$(mktemp -d /tmp/cagents-latency-runtime.XXXXXXXX)
 cleanup() {
-    if [ -n "${active_runtime-}" ]; then
-        XDG_RUNTIME_DIR=$active_runtime "$cli" daemon stop-for-rebuild --including-subagents >/dev/null 2>&1 || :
-    fi
     rm -rf -- "$sandbox"
 }
 trap cleanup EXIT
@@ -90,7 +87,6 @@ while [ "$run" -le 5 ]; do
         printf '%s\n' "Latency UI run $run failed or timed out; no baseline accepted." >&2
         exit 1
     fi
-    "$cli" daemon stop-for-rebuild --including-subagents >/dev/null 2>&1 || :
     active_runtime=
     jq -e --argjson run "$run" '
         .schema_version == 1 and .metric == "redraw_scheduling" and

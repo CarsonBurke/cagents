@@ -1646,8 +1646,13 @@ impl Runtime {
             return self.pending_admission_view();
         }
         let target = self.target;
+        #[cfg(feature = "latency-harness")]
+        let backend_available = !crate::latency_fixture::enabled();
+        #[cfg(not(feature = "latency-harness"))]
+        let backend_available = true;
         // Nothing is sent past a first message still waiting to go.
-        let available = !transitioning
+        let available = backend_available
+            && !transitioning
             && !self.closed_elsewhere
             && !self.disconnected
             && !self.snapshot.exited
@@ -2199,7 +2204,8 @@ impl Runtime {
         if self.closed_elsewhere {
             content.push(self.closed_draft_controls(transitioning));
         } else if self.capacity_refused {
-            let enabled = !transitioning
+            let enabled = backend_available
+                && !transitioning
                 && self.pending.is_none()
                 && self.attachment_chooser_pending.is_none()
                 && (!self.is_draft()
@@ -2225,7 +2231,8 @@ impl Runtime {
         } else if (self.disconnected || snapshot.exited) && self.auth_error().is_none() {
             let unresumable = self.offers_fresh_conversation();
             let saved_history = self.has_connected_saved_history(snapshot);
-            let enabled = !transitioning
+            let enabled = backend_available
+                && !transitioning
                 && self.pending.is_none()
                 && self.attachment_chooser_pending.is_none()
                 && self.pastes_pending == 0

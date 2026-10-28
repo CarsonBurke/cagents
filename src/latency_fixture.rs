@@ -13,10 +13,39 @@ pub const WARMUP_STEPS: usize = 32;
 pub const MEASURED_STEPS: usize = 256;
 pub const FIXTURE_VERSION: &str = "adjacent-card-focus-v1";
 const SEED: u64 = 0x4341_4745_4e54_5338;
+pub const INTERACTIVE_ENV: &str = "CAGENTS_NATIVE_UI_FIXTURE";
+
+/// Both diagnostic modes are in-process UI workloads, never service callers.
+/// Presence fails closed even when a malformed value is rejected at startup.
+pub fn enabled() -> bool {
+    std::env::var_os(INTERACTIVE_ENV).is_some()
+        || std::env::var_os("CAGENTS_LATENCY_OUTPUT").is_some()
+}
+
+pub fn deny_services() -> io::Result<()> {
+    if enabled() {
+        #[cfg(test)]
+        SERVICE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Native UI fixtures cannot connect to or start a daemon",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+static SERVICE_ATTEMPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn service_attempts() -> usize {
+    SERVICE_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst)
+}
 
 #[derive(Debug)]
 pub struct Fixture {
-    output: PathBuf,
+    output: Option<PathBuf>,
     random: u64,
     index: usize,
     issued: usize,
@@ -24,14 +53,30 @@ pub struct Fixture {
 
 impl Fixture {
     pub fn from_env() -> Option<Self> {
-        let output = PathBuf::from(std::env::var_os("CAGENTS_LATENCY_OUTPUT")?);
-        assert!(output.is_absolute(), "latency output must be absolute");
+        let interactive = std::env::var_os(INTERACTIVE_ENV);
+        let output = std::env::var_os("CAGENTS_LATENCY_OUTPUT").map(PathBuf::from);
+        if let Some(value) = interactive {
+            assert_eq!(value, "1", "native UI fixture value must be 1");
+            assert!(
+                output.is_none(),
+                "interactive fixtures do not produce latency reports"
+            );
+        } else {
+            assert!(
+                output.as_ref()?.is_absolute(),
+                "latency output must be absolute"
+            );
+        }
         Some(Self {
             output,
             random: SEED,
             index: 0,
             issued: 0,
         })
+    }
+
+    pub fn automatic(&self) -> bool {
+        self.output.is_some()
     }
 
     /// Caller starts at card zero and requests another step only after settlement.
@@ -57,6 +102,9 @@ impl Fixture {
     }
 
     pub fn finish(&self, recorder: &mut InteractionLatency, scale: f64) -> io::Result<()> {
+        let output = self.output.as_ref().ok_or_else(|| {
+            io::Error::other("interactive UI fixtures do not measure redraw latency")
+        })?;
         recorder.abandon_pending();
         if cfg!(debug_assertions) {
             return Err(io::Error::other("latency fixture requires a release build"));
@@ -93,7 +141,7 @@ impl Fixture {
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&self.output)?;
+            .open(output)?;
         serde_json::to_writer_pretty(&mut file, &report)?;
         file.sync_all()
     }
@@ -290,7 +338,7 @@ mod tests {
     #[test]
     fn fixed_seed_workload_is_reproducible_adjacent_and_bounded() {
         let new = || Fixture {
-            output: PathBuf::new(),
+            output: Some(PathBuf::new()),
             random: SEED,
             index: 0,
             issued: 0,

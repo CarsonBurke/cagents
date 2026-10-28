@@ -2543,6 +2543,30 @@ fn window_geometry_message(event: &window::Event) -> Option<Message> {
     }
 }
 
+fn native_window_subscription() -> Subscription<Message> {
+    event::listen_with(|event, status, event_window| match event {
+        iced::Event::Keyboard(event) => Some(Message::KeyEvent {
+            event,
+            captured: matches!(status, event::Status::Captured),
+        }),
+        iced::Event::Window(window::Event::Rescaled(scale)) => {
+            Some(Message::WindowScaleFactorChanged(scale))
+        }
+        iced::Event::Window(window::Event::CloseRequested) => {
+            Some(Message::WindowCloseRequested(event_window))
+        }
+        iced::Event::Window(window::Event::Closed) => Some(Message::WindowClosed(event_window)),
+        iced::Event::Window(window::Event::Focused) => Some(Message::RefreshUi(
+            refresh_ui::Action::Focused(event_window, true),
+        )),
+        iced::Event::Window(window::Event::Unfocused) => Some(Message::RefreshUi(
+            refresh_ui::Action::Focused(event_window, false),
+        )),
+        iced::Event::Window(event) => window_geometry_message(&event),
+        _ => None,
+    })
+}
+
 fn is_tab_press(event: &keyboard::Event) -> Option<bool> {
     match event {
         keyboard::Event::KeyPressed {
@@ -13774,11 +13798,17 @@ impl Application for Cagents {
             tracing::warn!(target: "cagents::chat_stage", error_code = ?error.raw_os_error(),
                 "Could not enable opt-in chat stage measurements");
         }
-        std::thread::spawn(chat_ui::prune_pasted_images);
         core.window.show_headerbar = false;
         core.window.border_padding = Some(0);
         #[cfg(feature = "latency-harness")]
         let latency_fixture = crate::latency_fixture::Fixture::from_env();
+        #[cfg(feature = "latency-harness")]
+        let fixture = latency_fixture.is_some();
+        #[cfg(not(feature = "latency-harness"))]
+        let fixture = false;
+        if !fixture {
+            std::thread::spawn(chat_ui::prune_pasted_images);
+        }
         let Bootstrap {
             workspace: durable,
             session,
@@ -13842,18 +13872,22 @@ impl Application for Cagents {
         // the whole of its life, so the observer starts with the window rather
         // than with the first card that happens to need a daemon.
         let (hosted_terminals_tx, hosted_terminals_rx) = async_channel::unbounded();
-        terminal_adoption::observe_hosted_inventory(hosted_terminals_tx);
+        if !fixture {
+            terminal_adoption::observe_hosted_inventory(hosted_terminals_tx);
+        }
         // The daemon owns the shared sidebar model for the same reason it owns
         // the terminal inventory: it outlives every window. Both threads start
         // with the window, so a channel created elsewhere appears without the
         // window having to do anything first.
         let (workspace_model_updates, workspace_model_rx) = async_channel::unbounded();
         let (workspace_model_tx, workspace_model_requests) = async_channel::unbounded();
-        workspace_model_sync::observe_workspace_model(workspace_model_updates.clone());
-        workspace_model_sync::publish_workspace_model(
-            workspace_model_updates,
-            workspace_model_requests,
-        );
+        if !fixture {
+            workspace_model_sync::observe_workspace_model(workspace_model_updates.clone());
+            workspace_model_sync::publish_workspace_model(
+                workspace_model_updates,
+                workspace_model_requests,
+            );
+        }
         let activation_rx = activation_rx.unwrap_or_else(|| async_channel::unbounded().1);
         let window_scale_factor = core.scale_factor().max(0.01);
         let settings_draft = SettingsDraft::from_settings(&settings);
@@ -13960,7 +13994,11 @@ impl Application for Cagents {
             source_control_mutations: HashMap::new(),
             operation_recovery: Default::default(),
             device_ui: device_ui::State::default(),
-            account_ui: account_ui::State::installation(),
+            account_ui: if fixture {
+                account_ui::State::default()
+            } else {
+                account_ui::State::installation()
+            },
             automation_ui: crate::automation_ui::State::default(),
             work_ui: crate::work_ui::State::default(),
             channel_work: channel_work::State::default(),
@@ -14173,6 +14211,12 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        #[cfg(feature = "latency-harness")]
+        if self.latency_fixture.is_some() {
+            // Stop before normal completion/presence bookkeeping as well as
+            // command dispatch. Fixtures own no daemon actors or services.
+            return self.update_native_fixture(message);
+        }
         // Pane callbacks retain their rendering origin while queued. Unwrap
         // once before all message-dependent policy and completion bookkeeping.
         let (message, pane_origin) = match message {
@@ -17763,6 +17807,10 @@ impl Application for Cagents {
     }
 
     fn subscription(&self) -> Subscription<Message> {
+        #[cfg(feature = "latency-harness")]
+        if self.latency_fixture.is_some() {
+            return self.native_fixture_subscription();
+        }
         let operation_subscriptions = self.worktree_progress_subscriptions();
         let mut subscriptions = vec![
             self.chat_subscription(),
@@ -17813,29 +17861,7 @@ impl Application for Cagents {
                     },
                 },
             }),
-            event::listen_with(|event, status, event_window| match event {
-                iced::Event::Keyboard(event) => Some(Message::KeyEvent {
-                    event,
-                    captured: matches!(status, event::Status::Captured),
-                }),
-                iced::Event::Window(window::Event::Rescaled(scale_factor)) => {
-                    Some(Message::WindowScaleFactorChanged(scale_factor))
-                }
-                iced::Event::Window(window::Event::CloseRequested) => {
-                    Some(Message::WindowCloseRequested(event_window))
-                }
-                iced::Event::Window(window::Event::Closed) => {
-                    Some(Message::WindowClosed(event_window))
-                }
-                iced::Event::Window(window::Event::Focused) => Some(Message::RefreshUi(
-                    refresh_ui::Action::Focused(event_window, true),
-                )),
-                iced::Event::Window(window::Event::Unfocused) => Some(Message::RefreshUi(
-                    refresh_ui::Action::Focused(event_window, false),
-                )),
-                iced::Event::Window(event) => window_geometry_message(&event),
-                _ => None,
-            }),
+            native_window_subscription(),
         ];
         if let Some(session) = &self.session {
             subscriptions.push(
@@ -18669,7 +18695,10 @@ impl Application for Cagents {
             (self.latency_focus == self.workspace.focused())
                 .then(|| self.latency.pending_generation())
                 .flatten(),
-            self.latency_fixture.is_some() && !self.latency_fixture_started,
+            self.latency_fixture
+                .as_ref()
+                .is_some_and(|fixture| fixture.automatic())
+                && !self.latency_fixture_started,
         );
         #[cfg(not(feature = "latency-harness"))]
         surface
@@ -18679,6 +18708,10 @@ impl Application for Cagents {
 impl Drop for Cagents {
     fn drop(&mut self) {
         self.latency.abandon_pending();
+        #[cfg(feature = "latency-harness")]
+        if self.latency_fixture.is_some() {
+            return;
+        }
         self.persist();
         self.fold_settings_drafts();
         if let Err(error) = self.save_settings_now() {
