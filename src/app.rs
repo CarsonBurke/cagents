@@ -5523,6 +5523,14 @@ impl Cagents {
                 ));
                 return Task::none();
             }
+            if self.project_ui.removal_attempts.contains_key(&repository)
+                || self.project_ui.removing.contains_key(&repository)
+            {
+                self.status = Some(TransientNotice::warning(
+                    "Wait for this project to finish removal before reopening it.",
+                ));
+                return Task::none();
+            }
             if self
                 .project_ui
                 .closing
@@ -14834,8 +14842,7 @@ impl Application for Cagents {
                     }
                     Err(error) => {
                         if open_cards {
-                            self.workspace_model_reopens.invalidate(project_id);
-                            self.project_ui.reopening.remove(&project_id);
+                            self.inventory_failed_reopen(project_id);
                         }
                         let unavailable = GitHubAvailability::Failed {
                             detail: error.clone(),
