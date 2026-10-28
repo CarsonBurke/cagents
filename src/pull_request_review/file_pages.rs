@@ -420,6 +420,57 @@ mod tests {
     }
 
     #[test]
+    fn refresh_rechecks_uncertain_later_marks_after_completed_pagination() {
+        for remote_viewed in [false, true] {
+            let mut state = thousand_files();
+            let path = RepoPath::parse("file-0105.rs").unwrap();
+            drop(state.update(Action::FilePage(PageAction::More)));
+            answer(&mut state, vec![remote_file("file-0105.rs", true)], "me");
+            assert!(state.pages.cursor.is_none());
+            let mut snapshot = loaded(
+                state.files.iter().map(|file| file.entry.clone()).collect(),
+                (0..100)
+                    .map(|i| remote_file(&format!("file-{i:04}.rs"), true))
+                    .collect(),
+            );
+            snapshot.next_file_cursor = Some("page-2".into());
+
+            // An already-started refresh must not overwrite the newer lost
+            // receipt, even though its optimistic value differs from GitHub.
+            drop(state.update(Action::Refresh));
+            drop(state.update(Action::ToggleViewed(path.clone())));
+            drop(state.update(Action::ViewedApplied {
+                generation: state.generation,
+                authority_revision: state.authority_revision,
+                results: vec![(path, false, ViewedOutcome::Unknown("lost receipt".into()))],
+            }));
+            finish_load(&mut state, snapshot.clone());
+            assert!(!state.files[105].viewed);
+            assert_eq!(state.files[105].sync, ViewedSync::Unverified);
+            assert!(state.pages.cursor.is_none());
+
+            // The requested recovery read starts after the outcome. Reopen
+            // its completed page without throwing away known earlier marks.
+            drop(state.update(Action::Refresh));
+            finish_load(&mut state, snapshot);
+            assert!(!state.files[105].viewed);
+            assert_eq!(state.files[105].sync, ViewedSync::Unknown);
+            assert_eq!(state.files[0].sync, ViewedSync::Settled);
+            assert!(state.files[0].viewed);
+            assert_eq!(state.pages.cursor.as_deref(), Some("page-2"));
+            assert!(state.pages.loading);
+            answer(
+                &mut state,
+                vec![remote_file("file-0105.rs", remote_viewed)],
+                "me",
+            );
+            assert_eq!(state.files[105].viewed, remote_viewed);
+            assert_eq!(state.files[105].sync, ViewedSync::Settled);
+            assert!(state.pages.cursor.is_none());
+        }
+    }
+
+    #[test]
     fn hiding_viewed_directories_uses_the_same_clamped_window_for_loading() {
         let (mut state, _) = state();
         drop(state.update(Action::Open(target(1))));

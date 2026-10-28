@@ -1552,6 +1552,7 @@ impl State {
                 }
             }
         }
+        let mut verify_later_marks = false;
         for file in &mut self.files {
             if !authority_changed
                 && let Some((viewed, sync)) = previous.get(&file.entry.path)
@@ -1560,8 +1561,24 @@ impl State {
                     || file.sync == ViewedSync::Unknown)
             {
                 file.viewed = *viewed;
-                file.sync = *sync;
+                if *sync == ViewedSync::Unverified
+                    && file.sync == ViewedSync::Unknown
+                    && !self.viewed_after_load.contains(&file.entry.path)
+                {
+                    // A fresh first page cannot verify an uncertain write on
+                    // a later page. Keep its optimistic mark while rereading
+                    // pagination, including pages completed before the write.
+                    verify_later_marks = true;
+                } else {
+                    file.sync = *sync;
+                }
             }
+        }
+        if verify_later_marks {
+            self.pages.cursor = loaded.next_file_cursor.clone();
+            self.pages.seen.clear();
+            self.pages.error = None;
+            self.pages.hydrate_all = true;
         }
         self.cache_dirty |= authority_changed
             || entries_changed
