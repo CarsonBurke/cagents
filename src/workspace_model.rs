@@ -539,6 +539,38 @@ mod tests {
     use crate::model::ChannelTitleSource;
 
     #[test]
+    fn navigation_folding_keeps_missing_channels_above_the_saved_mixed_order() {
+        let repository = PathBuf::from("/repo/.git");
+        let worktree = NavigationItem::Worktree("/repo".into());
+        let old = NavigationItem::Channel(ChannelId::new());
+        let first = NavigationItem::Channel(ChannelId::new());
+        let newest = NavigationItem::Channel(ChannelId::new());
+        let added_worktree = NavigationItem::Worktree("/repo/.worktrees/new".into());
+        let mut model = WorkspaceModel::default();
+        model.navigation_orders.push(NavigationOrder {
+            repository: repository.clone(),
+            items: vec![worktree.clone(), old.clone()],
+        });
+        let visible = vec![
+            newest.clone(),
+            first.clone(),
+            worktree.clone(),
+            old.clone(),
+            added_worktree,
+        ];
+        model.fold(
+            1,
+            &ModelEdit::ReorderNavigation {
+                repository,
+                source: worktree,
+                before: Some(old),
+                fallback: visible.clone(),
+            },
+        );
+        assert_eq!(model.navigation_orders[0].items, visible);
+    }
+
+    #[test]
     fn conversation_title_proof_roundtrips_without_changing_existing_edit_prefix() {
         let old = ModelEdit::SuggestChannelTitle {
             id: ChannelId::new(),
