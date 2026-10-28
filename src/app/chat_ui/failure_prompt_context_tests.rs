@@ -444,6 +444,18 @@ fn refresh_keeps_adjacent_opaque_notes_visible_without_aliasing_their_scopes() {
             runtime.failure_ui.incidents[0].anchor.as_deref(),
             Some("legacy-first")
         );
+        let first_key = runtime.failure_ui.incidents[0].key.clone();
+        runtime.failure_ui.expanded.insert(first_key.clone());
+        runtime.cache_failure_preview(&first_key);
+        assert_eq!(
+            runtime
+                .selection_document()
+                .0
+                .text(diagnostic_preview_identity(&first_key))
+                .as_deref(),
+            Some(raw),
+            "the production transcript catalog must expose the opaque notice"
+        );
 
         let mut next = (*handle.snapshot()).clone();
         next.generation += 1;
@@ -455,6 +467,16 @@ fn refresh_keeps_adjacent_opaque_notes_visible_without_aliasing_their_scopes() {
         )));
         handle.publish_snapshot_for_test(next);
         runtime.refresh();
+        assert_eq!(runtime.failures[0].0.as_deref(), Some("legacy-second"));
+        assert_eq!(
+            runtime
+                .selection_document()
+                .0
+                .text(diagnostic_preview_identity(&first_key))
+                .as_deref(),
+            Some(raw),
+            "clearing the current error must retain the visible captured note"
+        );
         publish_error(&mut runtime, &handle, raw);
         assert_eq!(runtime.failures.len(), 2);
         assert_eq!(runtime.failures[1].0.as_deref(), Some("legacy-third"));
@@ -466,6 +488,23 @@ fn refresh_keeps_adjacent_opaque_notes_visible_without_aliasing_their_scopes() {
         for incident in &runtime.failure_ui.incidents {
             assert_eq!(incident.anchor.as_deref(), Some("legacy-first"));
             assert_eq!(runtime.failure_details(&incident.key).as_deref(), Some(raw));
+        }
+        let keys = runtime
+            .failure_ui
+            .incidents
+            .iter()
+            .map(|incident| incident.key.clone())
+            .collect::<Vec<_>>();
+        for key in &keys {
+            runtime.failure_ui.expanded.insert(key.clone());
+            runtime.cache_failure_preview(key);
+        }
+        let (catalog, _) = runtime.selection_document();
+        for key in &keys {
+            assert_eq!(
+                catalog.text(diagnostic_preview_identity(key)).as_deref(),
+                Some(raw)
+            );
         }
 
         // An absent opaque item has no same-message proof. Do not move its
@@ -484,6 +523,21 @@ fn refresh_keeps_adjacent_opaque_notes_visible_without_aliasing_their_scopes() {
         assert_eq!(
             runtime.failure_ui.incidents[1].anchor.as_deref(),
             Some("legacy-first")
+        );
+        let historical_key = runtime.failure_ui.incidents[0].key.clone();
+        runtime.failure_ui.expanded.insert(historical_key.clone());
+        runtime.cache_failure_preview(&historical_key);
+        let (catalog, _) = runtime.selection_document();
+        assert!(
+            catalog
+                .text(diagnostic_preview_identity(&historical_key))
+                .is_none()
+        );
+        assert_eq!(
+            catalog
+                .text(diagnostic_preview_identity(&keys[1]))
+                .as_deref(),
+            Some(raw)
         );
     }
 }
