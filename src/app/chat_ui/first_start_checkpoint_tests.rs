@@ -306,6 +306,7 @@ fn failed_first_start_checkpoint_restores_only_the_current_unclaimed_composer() 
         "scope",
         "runtime-replaced",
         "source-replaced",
+        "replacement-both",
     ] {
         let (mut app, _directory, card, target) = fixture();
         app.context_inspector_open = false;
@@ -372,6 +373,15 @@ fn failed_first_start_checkpoint_restores_only_the_current_unclaimed_composer() 
                 };
                 source.launch.recipe.arguments.push("changed source".into());
             }
+            "replacement-both" => {
+                let mut replacement = source.clone();
+                replacement.launch.recipe.arguments.push("new owner".into());
+                app.card_state_mut(card).unwrap().kind = CardKind::Chat(replacement.clone());
+                match app.cards.get_mut(&card).unwrap() {
+                    CardRuntime::Chat(runtime) => runtime.session = replacement,
+                    _ => unreachable!(),
+                }
+            }
             "stale" => {
                 app.chat_ui
                     .draft_checkpoints
@@ -381,6 +391,7 @@ fn failed_first_start_checkpoint_restores_only_the_current_unclaimed_composer() 
             }
             _ => {}
         }
+        let retained_source = runtime(&app, card).session.clone();
         let recovery = app.draft_start_checkpointed(target, attempt, result);
         let chosen = (context == "other-control").then(sidebar::search_focus_id);
         let task = chosen.as_ref().map_or_else(Task::none, |id| {
@@ -397,7 +408,7 @@ fn failed_first_start_checkpoint_restores_only_the_current_unclaimed_composer() 
             "{context}: execute the actual recovery task on the rendered widget tree"
         );
         no_starter(&app, card);
-        assert_eq!(runtime(&app, card).session, source);
+        assert_eq!(runtime(&app, card).session, retained_source);
         assert_eq!(
             runtime(&app, card).composer.text(),
             "First prompt remains local"

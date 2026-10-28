@@ -7807,13 +7807,18 @@ impl Cagents {
             })
     }
 
-    fn restore_failed_draft_start_focus(&self, target: Target) -> Task<Message> {
+    fn restore_failed_draft_start_focus(
+        &self,
+        target: Target,
+        source: &chat::Session,
+    ) -> Task<Message> {
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) else {
             return Task::none();
         };
         if !self.refresh_ui.focused
             || !self.card_holds_keyboard(target.card)
             || runtime.target != target
+            || runtime.session != *source
             || !runtime.choosing()
             || !runtime.session.is_unstarted()
             || !self.card_state(target.card).is_some_and(|state| {
@@ -7888,24 +7893,25 @@ impl Cagents {
             }
             _ => false,
         });
+        let source = pending.source.clone();
         self.chat_ui.phases.remove(&target.card);
         if !source_matches || !context_matches {
             self.release_draft_start_capture(target.card);
-            return self.restore_failed_draft_start_focus(target);
+            return self.restore_failed_draft_start_focus(target, &source);
         }
         if creation_revoked {
             self.release_draft_start_capture(target.card);
             if let Some(runtime) = self.chat_card_runtime_mut(target) {
                 runtime.error = Some("This pane was closed or its creation was refused. Nothing was started. Your draft is retained; copy it before closing this pane.".into());
             }
-            return self.restore_failed_draft_start_focus(target);
+            return self.restore_failed_draft_start_focus(target, &source);
         }
         if !message_matches || self.modal_is_open() {
             self.release_draft_start_capture(target.card);
             if let Some(runtime) = self.chat_card_runtime_mut(target) {
                 runtime.error = Some("The draft or its workspace changed while saving. Nothing was started; review it and send again.".into());
             }
-            return self.restore_failed_draft_start_focus(target);
+            return self.restore_failed_draft_start_focus(target, &source);
         }
         if let Err(error) = result {
             self.release_draft_start_capture(target.card);
@@ -7913,7 +7919,7 @@ impl Cagents {
             if let Some(runtime) = self.chat_card_runtime_mut(target) {
                 runtime.error = Some("The conversation could not be saved, so nothing was started. Your draft is retained; check the workspace save notice before trying again.".into());
             }
-            return self.restore_failed_draft_start_focus(target);
+            return self.restore_failed_draft_start_focus(target, &source);
         }
         let pending = self
             .chat_ui
