@@ -147,6 +147,10 @@ impl State {
         self.schedule.finished(project, succeeded);
     }
 
+    pub(super) fn forget(&mut self, project: ProjectId) {
+        self.schedule.retain(|known| known != project);
+    }
+
     #[cfg(test)]
     pub(super) fn is_stale(&self, project: ProjectId) -> bool {
         self.schedule.stale.contains(&project)
