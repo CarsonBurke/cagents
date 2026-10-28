@@ -314,6 +314,77 @@ fn observed_selection_changes_invalidate_idle_controls_without_inventing_goal_tr
 }
 
 #[test]
+fn malformed_required_models_cannot_adopt_a_revision_with_retained_old_selection() {
+    for route in 0..3 {
+        let attaching = route == 2;
+        for model in [
+            None,
+            Some(Value::Null),
+            Some(json!(false)),
+            Some(json!(42)),
+            Some(json!("")),
+            Some(json!(" \t")),
+        ] {
+            let mut adapter = adapter();
+            adapter.receive(json!({"method":"thread/settings/updated","params":{
+                "threadId":"thread-exact","threadSettings":{"model":"original-model","effort":"low"}
+            }})).unwrap();
+            let read = command(&mut adapter, Operation::Get);
+            adapter
+                .receive(json!({"id":read.writes[0]["id"],"result":{"goal":null}}))
+                .unwrap();
+            if route == 1 {
+                // A malformed notification cannot release a real outstanding
+                // Goal RPC; the transport owner still owns its retirement.
+                drop(command(&mut adapter, Operation::Get));
+            }
+            let frame = if attaching {
+                let initialize = adapter.initialize().unwrap();
+                let initialized = adapter
+                    .receive(json!({"id":initialize.writes[0]["id"],"result":{
+                        "codexHome":adapter.expected_home,"userAgent":"fixture"
+                    }}))
+                    .unwrap();
+                let resume = initialized
+                    .writes
+                    .iter()
+                    .find(|frame| frame["method"] == "thread/resume")
+                    .unwrap();
+                let mut result = json!({
+                    "thread":{"id":"thread-exact","canAcceptDirectInput":true,"status":{"type":"idle"}},
+                    "reasoningEffort":"low","initialTurnsPage":{"data":[],"nextCursor":null}
+                });
+                if let Some(model) = model {
+                    result["model"] = model;
+                }
+                json!({"id":resume["id"],"result":result})
+            } else {
+                let mut settings = json!({"effort":"low"});
+                if let Some(model) = model {
+                    settings["model"] = model;
+                }
+                json!({"method":"thread/settings/updated","params":{
+                    "threadId":"thread-exact","threadSettings":settings
+                }})
+            };
+            let before = snapshot(&mut adapter);
+            let physical = adapter.goal.as_ref().unwrap().pending().cloned();
+            let applied = adapter.applied_selection.clone();
+            let next_id = adapter.next_id;
+            let error = adapter.receive(frame).unwrap_err();
+            assert!(error.contains("model"));
+            assert_eq!(adapter.selected.as_deref(), Some("original-model"));
+            assert_eq!(adapter.reasoning.as_deref(), Some("low"));
+            assert_eq!(adapter.applied_selection, applied);
+            assert_eq!(snapshot(&mut adapter), before);
+            assert_eq!(adapter.goal.as_ref().unwrap().pending(), physical.as_ref());
+            assert_eq!(adapter.next_id, next_id);
+            assert!(adapter.goal_settings.is_none());
+        }
+    }
+}
+
+#[test]
 fn autonomous_goal_work_applies_explicit_model_and_effort_before_the_goal_rpc() {
     for operation in [
         Operation::SetObjective("Use my selected model".into()),

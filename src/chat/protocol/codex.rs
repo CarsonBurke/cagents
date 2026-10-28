@@ -2642,6 +2642,7 @@ impl Adapter for Codex {
                     self.skills(&mut step)?;
                 }
                 Pending::Attach => {
+                    let model = required_model(result)?;
                     let thread = &result["thread"];
                     let id = string(thread, "id")?;
                     if self.thread.as_ref().is_some_and(|expected| expected != id) {
@@ -2657,11 +2658,9 @@ impl Adapter for Codex {
                     self.thread = Some(id.into());
                     self.attached = true;
                     self.direct_input = thread["canAcceptDirectInput"].as_bool() == Some(true);
-                    let changed_controls = self.changing_selection(
-                        result["model"].as_str(),
-                        result["reasoningEffort"].as_str(),
-                    )?;
-                    self.selected = result["model"].as_str().map(str::to_owned);
+                    let changed_controls =
+                        self.changing_selection(Some(model), result["reasoningEffort"].as_str())?;
+                    self.selected = Some(model.to_owned());
                     self.effective_model = self.selected.clone();
                     self.service_tier = result["serviceTier"].as_str().map(str::to_owned);
                     self.service_tier_revision = self.service_tier_revision.saturating_add(1);
@@ -3356,7 +3355,7 @@ impl Adapter for Codex {
                     return Ok(step);
                 }
                 let settings = &params["threadSettings"];
-                let actual_model = settings["model"].as_str().filter(|model| !model.is_empty());
+                let actual_model = Some(required_model(settings)?);
                 let actual_reasoning = settings["effort"].as_str().map(str::to_owned);
                 let valid_reasoning = settings.get("effort").is_none_or(|effort| {
                     effort.is_null() || effort.as_str().is_some_and(|effort| !effort.is_empty())
@@ -3395,12 +3394,10 @@ impl Adapter for Codex {
                     .push(Event::PermissionMode(mode.map(str::to_owned)));
                 if !self.selection_dirty {
                     let changed_controls = self.changing_selection(
-                        params["threadSettings"]["model"].as_str(),
+                        actual_model,
                         params["threadSettings"]["effort"].as_str(),
                     )?;
-                    self.selected = params["threadSettings"]["model"]
-                        .as_str()
-                        .map(str::to_owned);
+                    self.selected = actual_model.map(str::to_owned);
                     self.reasoning = params["threadSettings"]["effort"]
                         .as_str()
                         .map(str::to_owned);
@@ -4047,6 +4044,13 @@ fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
     value[key]
         .as_str()
         .ok_or_else(|| format!("Unsupported Codex frame: missing string {key}"))
+}
+fn required_model(value: &Value) -> Result<&str, String> {
+    let model = string(value, "model")?;
+    if model.trim().is_empty() {
+        return Err("Unsupported Codex frame: empty model".into());
+    }
+    Ok(model)
 }
 fn array<'a>(value: &'a Value, key: &str) -> Result<&'a Vec<Value>, String> {
     value[key]
@@ -6783,7 +6787,7 @@ mod tests {
         parent
             .pending
             .insert(json!("attach").to_string(), Pending::Attach);
-        let attached = parent.receive(json!({"id":"attach","result":{"thread":{"id":"thread-exact","status":{"type":"idle"}},"initialTurnsPage":{"data":[],"nextCursor":null}}})).unwrap();
+        let attached = parent.receive(json!({"id":"attach","result":{"thread":{"id":"thread-exact","status":{"type":"idle"}},"model":"model","initialTurnsPage":{"data":[],"nextCursor":null}}})).unwrap();
         let list = attached
             .writes
             .iter()
@@ -7402,7 +7406,7 @@ mod tests {
             let confirmed = adapter
                 .receive(json!({"method":"thread/settings/updated","params":{
                     "threadId":"thread-exact",
-                    "threadSettings": {"approvalPolicy":approval,"sandboxPolicy":{"type":sandbox}}
+                    "threadSettings": {"model":"model","effort":null,"approvalPolicy":approval,"sandboxPolicy":{"type":sandbox}}
                 }}))
                 .unwrap();
             assert!(
@@ -7413,7 +7417,7 @@ mod tests {
         }
         let custom = adapter.receive(json!({"method":"thread/settings/updated","params":{
             "threadId":"thread-exact",
-            "threadSettings": {"approvalPolicy":"on-failure","sandboxPolicy":{"type":"workspaceWrite"}}
+            "threadSettings": {"model":"model","effort":null,"approvalPolicy":"on-failure","sandboxPolicy":{"type":"workspaceWrite"}}
         }})).unwrap();
         assert!(custom.events.contains(&Event::PermissionMode(None)));
         adapter.busy = true;
@@ -7795,8 +7799,8 @@ mod tests {
             json!({"threadId":"thread-exact","excludeTurns":true,"initialTurnsPage":{"limit":20,"sortDirection":"desc","itemsView":"full"}})
         );
         let wrong = adapter
-            .receive(json!({"id":resume["id"],"result":{"thread":{"id":"tree-id-not-thread"}}}));
-        assert!(wrong.is_err());
+            .receive(json!({"id":resume["id"],"result":{"thread":{"id":"tree-id-not-thread"},"model":"model"}}));
+        assert!(wrong.unwrap_err().contains("different thread"));
     }
 
     #[test]
