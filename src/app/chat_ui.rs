@@ -291,6 +291,13 @@ pub enum Action {
     ImageNext(bool),
     ImageFit,
     ImageExternal,
+    /// A context menu, viewer control or shortcut acting on displayed pixels.
+    Image(images::ImageRef, images::ImageCommand),
+    /// PNG encoding finished; `None` when a newer copy superseded it first.
+    ImageCopied(
+        text_copy::Intent,
+        Result<Option<images::clipboard::Png>, String>,
+    ),
     CopyLiteral(String),
     CopySharedCode(Target, Arc<str>),
     CopyQueued(Target, QueueCopy),
@@ -452,6 +459,8 @@ impl Action {
                 | Self::ImageNext(_)
                 | Self::ImageFit
                 | Self::ImageExternal
+                | Self::Image(images::ImageRef::Viewer(_), _)
+                | Self::ImageCopied(..)
         )
     }
 
@@ -10769,17 +10778,30 @@ impl Cagents {
                 }
             }
             Action::ImageExternal => {
-                if let Some(url) = self
+                if let Some(image) = self
                     .chat_ui
                     .image_viewer
                     .as_ref()
-                    .and_then(|gallery| gallery.url())
+                    .map(images::Gallery::selected_image)
                 {
-                    return cosmic::task::future(async move {
-                        Message::ExternalLinkOpened(images::open_external(url).await)
-                    });
+                    return self.image_command(image, images::ImageCommand::OpenExternally);
                 }
             }
+            Action::Image(image, command) => return self.image_command(image, command),
+            // A superseded copy reports nothing, not even its failure.
+            Action::ImageCopied(intent, _) if !intent.is_current() => {}
+            Action::ImageCopied(intent, result) => match result {
+                Ok(Some(png)) => {
+                    self.status = Some(TransientNotice::success("Copied image"));
+                    return intent.write_data(png);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.status = Some(
+                        TransientNotice::error("Could not copy the image").with_details(error),
+                    );
+                }
+            },
             Action::CopyQueued(target, source) => {
                 if self
                     .card_state(target.card)
@@ -12055,6 +12077,313 @@ mod tests {
         drop(app.update(Message::ChatUi(Action::CloseImage)));
         assert!(!app.modal_is_open());
     }
+    #[test]
+    fn image_actions_follow_the_displayed_pixels_into_the_clipboard() {
+        use iced::clipboard::mime::AsMimeTypes;
+        use iced::futures::StreamExt;
+        type Effect = iced::runtime::Action<cosmic::Action<Message>>;
+        fn run(task: Task<Message>) -> Vec<Effect> {
+            let Some(stream) = iced::runtime::task::into_stream(task) else {
+                return Vec::new();
+            };
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(stream.collect())
+        }
+        fn copied(app: &mut Cagents, effects: Vec<Effect>) -> Vec<String> {
+            let mut offered = Vec::new();
+            for effect in effects {
+                let iced::runtime::Action::Output(cosmic::Action::App(message)) = effect else {
+                    panic!("encoding reports back before touching the clipboard");
+                };
+                for effect in run(app.update(message)) {
+                    if let iced::runtime::Action::Clipboard(
+                        iced::runtime::clipboard::Action::WriteData(data, _),
+                    ) = effect
+                    {
+                        let png = data.as_bytes("image/png").expect("PNG is offered");
+                        let decoded = image::load_from_memory(&png).unwrap().into_rgba8();
+                        assert_eq!(decoded.into_raw(), [9, 8, 7, 255]);
+                        offered.extend(data.available().iter().cloned());
+                    }
+                }
+            }
+            offered
+        }
+        // A notice raised directly, or one `update` has already moved to the log.
+        fn notice(app: &Cagents) -> (NoticeSeverity, String) {
+            app.status
+                .as_ref()
+                .or_else(|| app.notices.entries.back().map(|entry| &entry.notice))
+                .map(|notice| (notice.severity, notice.message.clone()))
+                .expect("the action reports its outcome")
+        }
+        let _context = text_copy::isolated_context();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let runtime = match app.cards.get_mut(&card).unwrap() {
+            CardRuntime::Chat(runtime) => runtime,
+            _ => unreachable!(),
+        };
+        let content = ItemContent::Image {
+            path: "shots/result.png".into(),
+            description: "Generated image".into(),
+            reference: None,
+        };
+        let mut cached = CachedItem::new(&content, runtime.syntax_theme);
+        let shown = iced::widget::image::Handle::from_rgba(1, 1, vec![9, 8, 7, 255]);
+        cached.image = Some(shown.clone());
+        runtime.cache.insert("image".into(), cached);
+        Arc::make_mut(&mut runtime.snapshot).items = vec![
+            chat::Item {
+                id: "image".into(),
+                role: chat::Role::Assistant,
+                content,
+                started_at: None,
+                at: None,
+            }
+            .into(),
+        ];
+        let target = runtime.target;
+        let expected_path = runtime
+            .session
+            .launch
+            .recipe
+            .working_directory
+            .join("shots/result.png");
+        let preview = images::ImageRef::Transcript(target, shown.id());
+
+        // Copy image path: a relative provider path resolves in its own cwd.
+        let effects = run(app.image_command(preview, images::ImageCommand::CopyPath));
+        assert!(matches!(
+            effects.as_slice(),
+            [iced::runtime::Action::Clipboard(iced::runtime::clipboard::Action::Write { contents, .. })]
+                if Path::new(contents) == expected_path
+        ));
+        assert_eq!(notice(&app).1, "Copied image path");
+
+        // Copy image: encoded off the UI thread, then offered as image/png.
+        let effects = run(app.image_command(preview, images::ImageCommand::Copy));
+        assert_eq!(copied(&mut app, effects), ["image/png"]);
+        assert_eq!(notice(&app).1, "Copied image");
+
+        // A menu opened on pixels that have since been replaced acts on nothing.
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .cache
+            .get_mut("image")
+            .unwrap()
+            .image = Some(iced::widget::image::Handle::from_rgba(
+            1,
+            1,
+            vec![1, 1, 1, 255],
+        ));
+        assert!(run(app.image_command(preview, images::ImageCommand::Copy)).is_empty());
+        assert_eq!(notice(&app).0, NoticeSeverity::Warning);
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .cache
+            .get_mut("image")
+            .unwrap()
+            .image = Some(shown.clone());
+
+        // Open image from the menu opens the viewer on the same pixels.
+        drop(app.image_command(preview, images::ImageCommand::Open));
+        let viewer = app.chat_ui.image_viewer.as_ref().unwrap().selected_image();
+        assert_eq!(viewer, images::ImageRef::Viewer(shown.id()));
+        assert!(Action::Image(viewer, images::ImageCommand::Copy).allowed_while_modal());
+        assert!(Action::ImageCopied(text_copy::Intent::begin(), Ok(None)).allowed_while_modal());
+        assert!(!Action::Image(preview, images::ImageCommand::Copy).allowed_while_modal());
+
+        // Ctrl+C in the viewer copies the image it shows, by physical key on
+        // any layout (here Cyrillic), once per press rather than per repeat.
+        app.status = None;
+        app.notices.entries.clear();
+        let control_c = |repeat| keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character("с".into()),
+            modified_key: keyboard::Key::Character("с".into()),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyC),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::CTRL,
+            text: None,
+            repeat,
+        };
+        let press = app.update(Message::KeyEvent {
+            event: control_c(false),
+            captured: false,
+        });
+        // The chord's repeats, arriving while the press is still encoding,
+        // neither copy again nor cancel the copy the press started.
+        assert!(
+            run(app.update(Message::KeyEvent {
+                event: control_c(true),
+                captured: false,
+            }))
+            .is_empty()
+        );
+        assert_eq!(copied(&mut app, run(press)), ["image/png"]);
+        assert_eq!(notice(&app).1, "Copied image");
+        assert!(
+            app.chat_ui.image_viewer.is_some(),
+            "copying keeps the viewer open"
+        );
+
+        // Escape is the viewer's own rather than the app-wide key handler's,
+        // so nothing focused beneath the viewer can claim it first, while the
+        // Escape that its open context menu claims closes only that menu.
+        let escape = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        };
+        drop(app.update(Message::KeyEvent {
+            event: escape.clone(),
+            captured: true,
+        }));
+        assert!(app.chat_ui.image_viewer.is_some());
+        {
+            use iced::advanced::layout::{Layout, Limits};
+            use iced::advanced::widget::Tree;
+            use iced::advanced::{Shell, clipboard, mouse};
+            let renderer = crate::app::tests::headless_renderer();
+            let window = iced::Size::new(1000.0, 800.0);
+            let viewport = iced::Rectangle::with_size(window);
+            let gallery = app.chat_ui.image_viewer.as_ref().unwrap();
+            let mut element = gallery.view();
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &Limits::new(iced::Size::ZERO, window),
+            );
+            let pointer = mouse::Cursor::Available(viewport.center());
+            let mut send =
+                |element: &mut Element<'_, Message>, tree: &mut Tree, event: iced::Event| {
+                    let mut messages = Vec::new();
+                    element.as_widget_mut().update(
+                        tree,
+                        &event,
+                        Layout::new(&node),
+                        pointer,
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut Shell::new(&mut messages),
+                        &viewport,
+                    );
+                    messages
+                        .iter()
+                        .filter(|message| matches!(message, Message::ChatUi(Action::CloseImage)))
+                        .count()
+                };
+            let mut menu_open = |element: &mut Element<'_, Message>, tree: &mut Tree| {
+                element
+                    .as_widget_mut()
+                    .overlay(
+                        tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &viewport,
+                        iced::Vector::ZERO,
+                    )
+                    .is_some()
+            };
+            send(
+                &mut element,
+                &mut tree,
+                iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+            );
+            assert!(
+                menu_open(&mut element, &mut tree),
+                "the image's menu opened"
+            );
+            assert_eq!(
+                send(
+                    &mut element,
+                    &mut tree,
+                    iced::Event::Keyboard(escape.clone())
+                ),
+                0
+            );
+            assert!(
+                !menu_open(&mut element, &mut tree),
+                "Escape closed the menu"
+            );
+            assert_eq!(
+                send(&mut element, &mut tree, iced::Event::Keyboard(escape)),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn only_literal_image_paths_are_offered_for_copying() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let runtime = match app.cards.get_mut(&card).unwrap() {
+            CardRuntime::Chat(runtime) => runtime,
+            _ => unreachable!(),
+        };
+        let image = |path: &str, reference: Option<chat::ImageReference>| ItemContent::Image {
+            path: path.into(),
+            description: String::new(),
+            reference,
+        };
+        let path = |runtime: &Runtime, content: ItemContent| {
+            images::clipboard::copyable_path(runtime, &content)
+        };
+        assert_eq!(
+            path(&*runtime, image("/abs/shot.png", None)).as_deref(),
+            Some("/abs/shot.png")
+        );
+        assert!(path(&*runtime, image("data:image/png;base64,AAAA", None)).is_none());
+        assert!(path(&*runtime, image("https://example.com/a.png", None)).is_none());
+        assert!(path(&*runtime, image("", None)).is_none());
+        let managed = chat::ImageReference {
+            id: uuid::Uuid::new_v4(),
+            number: 1,
+            device: uuid::Uuid::new_v4(),
+            name: "Pasted image".into(),
+            sha256: "a".repeat(64),
+            extension: "png".into(),
+        };
+        assert!(
+            path(&*runtime, image("/private/asset-digest.png", Some(managed))).is_none(),
+            "a managed asset's snapshot path is not an authority to expose"
+        );
+        let cached = format!(
+            "/run/user/1000/cagents/chat-{}/image-{}.png",
+            uuid::Uuid::new_v4(),
+            "0f".repeat(32)
+        );
+        assert!(
+            path(&*runtime, image(&cached, None)).is_none(),
+            "a provider image decoded into the private transcript cache is ephemeral"
+        );
+        assert!(
+            path(&*runtime, image(&format!("file://{cached}"), None)).is_none(),
+            "nor is its file URL"
+        );
+        assert!(path(&*runtime, image("/abs/image-0f.png", None)).is_some());
+        assert_eq!(
+            path(&*runtime, image("file:///abs/shot%20one.png", None)).as_deref(),
+            Some("/abs/shot one.png"),
+            "a file URL names the same file the viewer offers"
+        );
+        assert!(path(&*runtime, image("relative.png", None)).is_some());
+        runtime.selected_subagent = Some("child".into());
+        assert!(
+            path(&*runtime, image("relative.png", None)).is_none(),
+            "a child's relative path has no known working directory"
+        );
+    }
+
     #[test]
     fn image_loads_ignore_replaced_items_and_retired_runtime_generations() {
         let mut app = crate::app::tests::context_inspector_test_app(false);

@@ -60,6 +60,23 @@ pub fn focused_key<'a, Message: 'a>(
     .into()
 }
 
+/// Answer a key that nothing inside `content` claimed, wherever focus is. An
+/// open context menu claims the Escape that closes it, for example, so only a
+/// second Escape reaches the surface around it. Unlike an application-wide key
+/// subscription, nothing outside `content` can claim the key first.
+pub fn unclaimed_key<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    on_key: impl Fn(&cosmic::iced::keyboard::Event) -> Option<Message> + 'a,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::UnclaimedKey,
+        tip: None,
+        on_focused_key: Some(Box::new(on_key)),
+    }
+    .into()
+}
+
 #[derive(Default)]
 struct ChildFocus(bool);
 
@@ -1256,6 +1273,7 @@ enum Kind {
     },
     Opaque,
     KeyboardModal,
+    UnclaimedKey,
 }
 
 struct Effect<'a, Message> {
@@ -1297,6 +1315,7 @@ struct HoverTag;
 struct TabHistoryTag;
 struct KeyboardListTag;
 struct FocusedKeyTag;
+struct UnclaimedKeyTag;
 struct ListRowTag;
 struct FadeTag;
 struct TooltipTag;
@@ -1351,6 +1370,7 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         match self.kind {
             Kind::KeyboardList(_) => tree::Tag::of::<KeyboardListTag>(),
             Kind::FocusedKey => tree::Tag::of::<FocusedKeyTag>(),
+            Kind::UnclaimedKey => tree::Tag::of::<UnclaimedKeyTag>(),
             Kind::ListRow | Kind::ListEntry => tree::Tag::of::<ListRowTag>(),
             Kind::TabHistory(_) => tree::Tag::of::<TabHistoryTag>(),
             Kind::Hover => tree::Tag::of::<HoverTag>(),
@@ -1461,7 +1481,8 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        if let Some(on_key) = &self.on_focused_key
+        if matches!(self.kind, Kind::FocusedKey)
+            && let Some(on_key) = &self.on_focused_key
             && let Event::Keyboard(event) = event
         {
             if shell.is_event_captured() {
@@ -1588,6 +1609,18 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             shell,
             viewport,
         );
+        if matches!(self.kind, Kind::UnclaimedKey)
+            && !shell.is_event_captured()
+            && let Event::Keyboard(event) = event
+            && let Some(message) = self
+                .on_focused_key
+                .as_ref()
+                .and_then(|on_key| on_key(event))
+        {
+            shell.publish(message);
+            shell.capture_event();
+            return;
+        }
         if matches!(self.kind, Kind::TabHistory(_)) {
             return;
         }

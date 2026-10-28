@@ -12618,6 +12618,7 @@ impl Cagents {
             }
             InspectorAction::ResizeFinished => self.save_settings_task(false),
             InspectorAction::CopyLspDiagnostic(diagnostic) => {
+                chat_ui::invalidate_copy_intent();
                 iced::clipboard::write(diagnostic.copy_text()).map(cosmic::Action::App)
             }
             // A request's answer is rendered by this very panel, so dismissing
@@ -17041,7 +17042,9 @@ impl Application for Cagents {
             },
             Message::CancelDialog => self.cancel_form_dialog(),
             Message::KeyEvent { event, captured } => {
-                if let keyboard::Event::KeyPressed { key: keyboard::Key::Character(key), modifiers, .. } = &event
+                // A held chord copies once, so its repeats must not cancel the
+                // copy its first press started.
+                if let keyboard::Event::KeyPressed { key: keyboard::Key::Character(key), modifiers, repeat: false, .. } = &event
                     && modifiers.command() && (key.eq_ignore_ascii_case("c") || key.eq_ignore_ascii_case("x"))
                 {
                     chat_ui::invalidate_copy_intent();
@@ -17062,12 +17065,38 @@ impl Application for Cagents {
                 if let keyboard::Event::ModifiersChanged(modifiers) = &event {
                     self.keyboard_modifiers = *modifiers;
                 }
-                if self.chat_ui.image_viewer.is_some() {
-                    if let keyboard::Event::KeyPressed { key, .. } = &event {
+                if let Some(gallery) = &self.chat_ui.image_viewer {
+                    if let keyboard::Event::KeyPressed {
+                        key,
+                        physical_key,
+                        modifiers,
+                        repeat,
+                        ..
+                    } = &event
+                    {
                         match key {
-                            keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                                self.chat_ui.image_viewer = None
+                            // Layout-independent, like the other Ctrl chords.
+                            keyboard::Key::Character(_)
+                                if modifiers.command()
+                                    && !modifiers.shift()
+                                    && !modifiers.alt()
+                                    && !modifiers.logo()
+                                    && key
+                                        .to_latin(*physical_key)
+                                        .is_some_and(|key| key.eq_ignore_ascii_case(&'c')) =>
+                            {
+                                // A held chord copies once.
+                                if *repeat {
+                                    return Task::none();
+                                }
+                                let image = gallery.selected_image();
+                                return self.handle_chat_ui(chat_ui::Action::Image(
+                                    image,
+                                    chat_ui::images::ImageCommand::Copy,
+                                ));
                             }
+                            // Escape is the viewer's own (`Gallery::view`), so that
+                            // one an open context menu claims closes only the menu.
                             keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
                                 self.chat_ui.image_viewer.as_mut().unwrap().next(false);
                             }

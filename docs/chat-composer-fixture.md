@@ -90,3 +90,11 @@ and copyable. Collapse them while the first turn is still busy, stop that
 turn, and reopen the saved chat; compare the completed and restored content.
 The fixture represents a reproducible payload path, not a captured user
 conversation or evidence about the provider's answer prose.
+
+For image preview and viewer checks, copy a PNG to
+`"$fixture_root/home/fixture-image.png"` before spawning the agent. Native
+launches drop `CAGENTS_*` variables, so the fixture reads the image from its
+provider home; `CAGENTS_FIXTURE_IMAGE` overrides the path when the script runs
+directly. Each turn then also returns that image as a provider-produced base64
+image block, recorded in the synthetic history like other frames. Paste an image into the composer to
+cover a user-attached image in the same transcript. Use synthetic images only.
