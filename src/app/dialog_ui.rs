@@ -704,12 +704,14 @@ pub(super) mod tests {
                     &mut messages,
                 );
                 let typed = messages.iter().any(|message| match message {
-                    cosmic::Action::App(Message::Device(device_ui::Action::Path(_))) => {
-                        scene == "directory"
+                    cosmic::Action::App(Message::Device(device_ui::Action::Path(value))) => {
+                        scene == "directory" && value == "x"
                     }
-                    cosmic::Action::App(Message::Device(device_ui::Action::Edit(_))) => {
-                        scene != "directory"
-                    }
+                    cosmic::Action::App(Message::Device(device_ui::Action::Edit(
+                        cosmic::widget::text_editor::Action::Edit(
+                            cosmic::widget::text_editor::Edit::Insert('x'),
+                        ),
+                    ))) => scene != "directory",
                     _ => false,
                 });
                 if !typed {
