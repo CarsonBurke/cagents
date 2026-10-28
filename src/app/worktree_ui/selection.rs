@@ -1932,6 +1932,14 @@ mod tests {
         f.app.worktree_selection.after_retire = Some(Arc::new(move || {
             capture.lock().unwrap().push(std::thread::current().id())
         }));
+        // update sends retirement immediately; hold its worker before the
+        // drain so guard assertions cannot race the cleanup being checked.
+        let (entered, receive) = crossbeam_channel::bounded(1);
+        let (release, wait) = crossbeam_channel::bounded(1);
+        f.app.worktree_selection.before_retire = Some(Arc::new(move || {
+            entered.send(std::thread::current().id()).unwrap();
+            wait.recv_timeout(Duration::from_secs(10)).unwrap();
+        }));
         f.app.worktree_protections.expire_navigation_retry();
         let first = open(&mut f.app, &f.next);
         let message = prepared(first);
@@ -1946,6 +1954,7 @@ mod tests {
         assert!(f.app.shared_views.deferred_default.is_none());
         let before = f.app.durable.cards.len();
         let retirement = f.app.update(message);
+        assert_ne!(receive.recv_timeout(Duration::from_secs(3)).unwrap(), ui);
         assert_eq!(f.app.active_workspace.as_ref(), Some(&f.next));
         assert_eq!(f.app.durable.cards.len(), before);
         assert_eq!(f.app.shared_views.deferred_default.as_ref(), Some(&f.next));
@@ -1955,6 +1964,9 @@ mod tests {
             crate::worktree_cleanup::fixture_protection(&f.runtime, &f.old, true).is_err(),
             "old guards remain until retirement"
         );
+        assert!(crate::worktree_cleanup::fixture_protection(&f.runtime, &f.next, true).is_err());
+        assert!(retired_on.lock().unwrap().is_empty());
+        release.send(()).unwrap();
         let done = retired(retirement);
         no_effect(f.app.update(done));
         assert!(!retired_on.lock().unwrap().is_empty());
