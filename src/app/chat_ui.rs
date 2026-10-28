@@ -9638,7 +9638,7 @@ impl Cagents {
                     })
                     .await
                     .unwrap_or_else(|error| Err(error.to_string()));
-                    action(Action::ResumePrepared(operation, result))
+                    self::action(Action::ResumePrepared(operation, result))
                 });
             }
             Action::ResumePrepared(target, result) => {
@@ -9742,7 +9742,7 @@ impl Cagents {
                         .unwrap_or_else(|error| Err(error.to_string())),
                         Err(error) => Err(error),
                     };
-                    action(Action::ResumeCommitted(target, result))
+                    self::action(Action::ResumeCommitted(target, result))
                 });
             }
             Action::ResumeCommitted(target, result) => {
