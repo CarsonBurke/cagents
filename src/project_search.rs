@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::process::CancellationToken;
 
 mod ignore_policy;
+mod traversal;
 
 pub const RESULT_LIMIT: usize = 2_000;
 const BATCH_SIZE: usize = 64;
@@ -83,7 +84,23 @@ pub fn search(
     root: &Path,
     options: &Options,
     cancellation: &CancellationToken,
+    publish: impl FnMut(Progress) -> bool,
+) {
+    search_with_limits(
+        root,
+        options,
+        cancellation,
+        publish,
+        traversal::Limits::default(),
+    );
+}
+
+fn search_with_limits(
+    root: &Path,
+    options: &Options,
+    cancellation: &CancellationToken,
     mut publish: impl FnMut(Progress) -> bool,
+    limits: traversal::Limits,
 ) {
     if cancellation.is_cancelled() {
         return;
@@ -141,6 +158,14 @@ pub fn search(
     };
     let guarded_root = match crate::fs_safety::Root::open(root) {
         Ok(root) => root,
+        Err(error) if traversal::descriptor_exhausted(&error) => {
+            publish(Progress::Error(
+                traversal::Stop::Resource(format!("Folder descriptors: {error}"))
+                    .message()
+                    .unwrap(),
+            ));
+            return;
+        }
         Err(error) => {
             publish(Progress::Error(format!(
                 "Could not search this folder: {error}"
@@ -158,7 +183,9 @@ pub fn search(
         Ok(policy) => policy,
         Err(error) => {
             if !cancellation.is_cancelled() {
-                publish(Progress::Error(error));
+                publish(Progress::Error(
+                    traversal::Stop::Resource(error).message().unwrap(),
+                ));
             }
             return;
         }
@@ -171,16 +198,27 @@ pub fn search(
     if cancellation.is_cancelled() {
         return;
     }
-    // Keep each ancestor iterator open rather than collecting its remaining
-    // siblings when descending. ReadDir/kernel buffering is implementation
-    // dependent; live directory handles grow with depth, not sibling count.
-    let mut directories = match std::fs::read_dir(root) {
-        Ok(directory) => vec![directory],
-        Err(_) => {
-            skipped += 1;
-            Vec::new()
-        }
-    };
+    let mut directories = traversal::Traversal::new(limits);
+    let mut cancelled = || cancellation.is_cancelled();
+    // Error callbacks can run arbitrary caller work. Release every retained
+    // directory iterator before disclosing an incomplete search to that caller.
+    macro_rules! stop {
+        ($stop:expr) => {{
+            let stop = $stop;
+            drop(directories);
+            if !cancellation.is_cancelled()
+                && let Some(message) = stop.message()
+            {
+                publish(Progress::Error(message));
+            }
+            return;
+        }};
+    }
+    match directories.descend(root, &mut cancelled) {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => skipped += 1,
+        Err(stop) => stop!(stop),
+    }
     loop {
         if cancellation.is_cancelled() {
             return;
@@ -190,31 +228,18 @@ pub fn search(
             .unwrap_or_else(|error| error.into_inner())
             .error()
         {
-            publish(Progress::Error(error));
-            return;
+            stop!(traversal::Stop::Resource(error));
         }
-        let Some(directory) = directories.last_mut() else {
-            break;
-        };
-        let entry = match directory.next() {
-            Some(Ok(entry)) => entry,
-            Some(Err(_)) => {
+        let entry = match directories.next(&mut cancelled) {
+            Ok(Some(Ok(entry))) => entry,
+            Ok(Some(Err(_))) => {
                 skipped += 1;
                 continue;
             }
-            None => {
-                directories.pop();
-                continue;
-            }
+            Ok(None) => break,
+            Err(stop) => stop!(stop),
         };
-        let kind = match entry.file_type() {
-            Ok(kind) => kind,
-            Err(_) => {
-                skipped += 1;
-                continue;
-            }
-        };
-        let path = entry.path();
+        let traversal::Entry { path, kind } = entry;
         if !policy
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -226,9 +251,10 @@ pub fn search(
             return;
         }
         if kind.is_dir() {
-            match std::fs::read_dir(&path) {
-                Ok(directory) => directories.push(directory),
-                Err(_) => skipped += 1,
+            match directories.descend(&path, &mut cancelled) {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => skipped += 1,
+                Err(stop) => stop!(stop),
             }
             continue;
         }
@@ -242,13 +268,30 @@ pub fn search(
             skipped += 1;
             continue;
         };
-        let Ok(file) = crate::fs_safety::open_beneath(&guarded_root, path) else {
-            skipped += 1;
-            continue;
+        let file = match crate::fs_safety::open_beneath(&guarded_root, path) {
+            Ok(file) => file,
+            Err(error) if error.is_resource_exhausted() => {
+                stop!(traversal::Stop::Resource(format!(
+                    "File descriptors: {error}"
+                )));
+            }
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
         };
-        if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
-            skipped += 1;
-            continue;
+        match file.metadata() {
+            Ok(metadata) if metadata.is_file() => {}
+            Err(error) if traversal::descriptor_exhausted(&error) => {
+                drop(file);
+                stop!(traversal::Stop::Resource(format!(
+                    "File descriptors: {error}"
+                )));
+            }
+            _ => {
+                skipped += 1;
+                continue;
+            }
         }
         let path = path.to_path_buf();
         let mut reader = BufReader::with_capacity(SEARCH_BLOCK_BYTES, file);
@@ -266,6 +309,12 @@ pub fn search(
                 Ok(0) => break,
                 Ok(read) => read,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if traversal::descriptor_exhausted(&error) => {
+                    drop(reader);
+                    stop!(traversal::Stop::Resource(format!(
+                        "File descriptors: {error}"
+                    )));
+                }
                 Err(_) => {
                     skipped += 1;
                     break;
@@ -277,6 +326,12 @@ pub fn search(
             if tail_start != bytes.len() {
                 match complete_native_line(&mut reader, &mut bytes, tail_start, cancellation) {
                     Ok(eof) => finished = eof,
+                    Err(error) if traversal::descriptor_exhausted(&error) => {
+                        drop(reader);
+                        stop!(traversal::Stop::Resource(format!(
+                            "File descriptors: {error}"
+                        )));
+                    }
                     Err(_) => {
                         bytes.truncate(tail_start);
                         invalid_file = true;
@@ -303,6 +358,12 @@ pub fn search(
                             break;
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) if traversal::descriptor_exhausted(&error) => {
+                            drop(reader);
+                            stop!(traversal::Stop::Resource(format!(
+                                "File descriptors: {error}"
+                            )));
+                        }
                         Err(_) => {
                             invalid_file = true;
                             finished = true;
@@ -411,7 +472,7 @@ pub fn search(
         .error()
     {
         if !cancellation.is_cancelled() {
-            publish(Progress::Error(error));
+            stop!(traversal::Stop::Resource(error));
         }
         return;
     }
