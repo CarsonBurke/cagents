@@ -14233,6 +14233,25 @@ impl Application for Cagents {
             Message::UtilityPaneUi(message) => (*message, true),
             message => (message, false),
         };
+        // Include the common postlude as well as repository dispatch. Layout,
+        // redraw and worker execution remain separate measurements.
+        let editor_performance = if cfg!(debug_assertions)
+            && tracing::enabled!(target: "cagents::editor_performance", tracing::Level::DEBUG)
+            && let Message::Repository(action) = &message
+        {
+            let kind = match action {
+                RepositoryAction::EditorAction {
+                    action: repository_widget::EditorAction::Edit(_),
+                    ..
+                } => Some("edit"),
+                RepositoryAction::WorkingDiffDue { .. } => Some("pause"),
+                RepositoryAction::WorkingDiffLoaded { .. } => Some("result"),
+                _ => None,
+            };
+            kind.map(|kind| (action.card(), kind, Instant::now()))
+        } else {
+            None
+        };
         let notice_control = self.notice_control_severity();
         let attention_scope_changed = matches!(
             &message,
@@ -15130,25 +15149,6 @@ impl Application for Cagents {
                 Task::batch(tasks)
             }
             Message::Repository(action) => {
-                // Measure the actual owning update thread, including runtime
-                // edits, intent draining and synchronous navigation bookkeeping.
-                // This deliberately excludes later layout/redraw and worker CPU.
-                let editor_performance = if cfg!(debug_assertions)
-                    && tracing::enabled!(target: "cagents::editor_performance", tracing::Level::DEBUG)
-                {
-                    let kind = match &action {
-                        RepositoryAction::EditorAction {
-                            action: repository_widget::EditorAction::Edit(_),
-                            ..
-                        } => Some("edit"),
-                        RepositoryAction::WorkingDiffDue { .. } => Some("pause"),
-                        RepositoryAction::WorkingDiffLoaded { .. } => Some("result"),
-                        _ => None,
-                    };
-                    kind.map(|kind| (kind, Instant::now()))
-                } else {
-                    None
-                };
                 self.retain_repository_operation(&action);
                 if matches!(&action, RepositoryAction::Save { .. } | RepositoryAction::AutoSaveDue { .. }) && !self.prepare_editor_save(action.card()) {
                     if let RepositoryAction::AutoSaveDue { identity, revision, ticket } = &action
@@ -15321,11 +15321,6 @@ impl Application for Cagents {
                 }
                 if !self.project_ui.closing.is_empty() {
                     tasks.push(self.complete_closed_projects());
-                }
-                if let Some((kind, started)) = editor_performance {
-                    tracing::debug!(target: "cagents::editor_performance", %card, kind,
-                        update_us = started.elapsed().as_secs_f64() * 1_000_000.0,
-                        "repository owning-thread update");
                 }
                 Task::batch(tasks)
             }
@@ -17898,6 +17893,11 @@ impl Application for Cagents {
         let activation = self.retry_notification_activation();
         let visibility = self.sync_visible_attention();
         self.sync_notification_presence();
+        if let Some((card, kind, started)) = editor_performance {
+            tracing::debug!(target: "cagents::editor_performance", %card, kind,
+                update_us = started.elapsed().as_secs_f64() * 1_000_000.0,
+                "repository owning-thread update");
+        }
         Task::batch([task, activation, visibility])
     }
 
