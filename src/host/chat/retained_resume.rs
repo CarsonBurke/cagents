@@ -126,6 +126,72 @@ fn validate_evidence(
     Ok(())
 }
 
+fn validate_resume_account(source: &Session, evidence: &Evidence<'_>) -> Result<(), String> {
+    let captured = evidence.scope.map_err(str::to_owned)?;
+    captured.revalidate()?;
+    let launch = super::prepare_native_process_launch(
+        &source.launch,
+        Some(crate::model::agent_recovery::fresh_native_environment(
+            Provider::Claude,
+            false,
+        )),
+        &Default::default(),
+        None,
+    )
+    .map_err(|error| error.message)?;
+    let selected =
+        LaunchAccountScope::resolve(Provider::Claude, &launch.recipe.working_directory, |name| {
+            launch
+                .recipe
+                .environment
+                .get(name)
+                .map(std::ffi::OsString::from)
+        })?;
+    if !same_scope(captured, &selected) {
+        return Err("Claude disk resume would select a different physical account home".into());
+    }
+    Ok(())
+}
+
+/// A retired archived predecessor cannot authorize the requested allocation.
+/// Authenticate its own exact history/private receipt before ignoring it, and
+/// carry its witness through the final registry recheck with the current one.
+fn archived_predecessor(
+    registry: &super::super::agent_execution::SharedRegistry,
+    requested: &Session,
+    ownership: &NativeActorOwnership,
+    retirement: &NativeActorRetirement,
+    proof: &HostSessionProof,
+) -> Result<ArchivedHistory, String> {
+    let source = retirement.source();
+    let archived = registry
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .archived_history(source, ownership, retirement, &proof.boot_id)?
+        .ok_or("Pending cleanup intent never grants disk resume authority")?;
+    let verified = match Handle::inspect_retained_retirement(ownership.owner(), proof)? {
+        crate::chat::runtime::RetirementInspection::Verified(verified) => verified,
+        crate::chat::runtime::RetirementInspection::Running
+        | crate::chat::runtime::RetirementInspection::ExitedUnproved => {
+            return Err(
+                "The archived Claude predecessor has no authenticated completed retirement".into(),
+            );
+        }
+    };
+    if !verified.receipt().installed {
+        return Err("Archived history requires actual installed actor retirement".into());
+    }
+    let evidence = retirement_evidence(&verified);
+    validate_evidence(source, ownership, retirement, &evidence, Some(&archived))?;
+    // ArchivedHistory requires no terminal. The private receipt must agree;
+    // no retired predecessor may hide an independently owned original pair.
+    if evidence.paired_holder.is_some() {
+        return Err("Archived Claude predecessor retained unexpected paired ownership".into());
+    }
+    validate_resume_account(requested, &evidence)?;
+    Ok(archived)
+}
+
 fn current_admission(
     host: &SharedHost,
     source: &Session,
@@ -285,7 +351,7 @@ pub(super) fn prepare_resume_verified(
     let registry = super::super::agent_execution::registry(host)?;
     let mut after = None;
     let mut matched = false;
-    let mut archived_history = None;
+    let mut archived_history = Vec::new();
     loop {
         let page = registry
             .lock()
@@ -301,21 +367,24 @@ pub(super) fn prepare_resume_verified(
             {
                 continue;
             }
-            if ownership.is_pending() && ownership.source().id != source.id {
-                return Err("Pending cleanup intent never grants disk resume authority".into());
-            }
             let retirement = registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .native_actor_retirement(ownership.actor())?;
-            if retirement
-                .as_ref()
-                .is_some_and(|receipt| receipt.is_pending())
-                && ownership.source().id != source.id
-            {
-                return Err("Pending cleanup retirement never grants disk resume authority".into());
-            }
             if ownership.source().id != source.id {
+                if ownership.is_pending()
+                    || retirement
+                        .as_ref()
+                        .is_some_and(|receipt| receipt.is_pending())
+                {
+                    let retirement = retirement
+                        .as_ref()
+                        .ok_or("Pending cleanup intent never grants disk resume authority")?;
+                    archived_history.push(archived_predecessor(
+                        &registry, source, &ownership, retirement, &proof,
+                    )?);
+                    continue;
+                }
                 // A known second writer is never made safe by this actor's
                 // receipt. Unknown provider identities remain the ordinary
                 // launch admission's responsibility, not an inferred absence.
@@ -380,34 +449,7 @@ pub(super) fn prepare_resume_verified(
             if matched {
                 return Err("The saved Claude pane matches more than one retired actor".into());
             }
-            let captured = evidence.scope.map_err(str::to_owned)?;
-            captured.revalidate()?;
-            let launch = super::prepare_native_process_launch(
-                &source.launch,
-                Some(crate::model::agent_recovery::fresh_native_environment(
-                    Provider::Claude,
-                    false,
-                )),
-                &Default::default(),
-                None,
-            )
-            .map_err(|e| e.message)?;
-            let selected = LaunchAccountScope::resolve(
-                Provider::Claude,
-                &launch.recipe.working_directory,
-                |name| {
-                    launch
-                        .recipe
-                        .environment
-                        .get(name)
-                        .map(std::ffi::OsString::from)
-                },
-            )?;
-            if !same_scope(captured, &selected) {
-                return Err(
-                    "Claude disk resume would select a different physical account home".into(),
-                );
-            }
+            validate_resume_account(source, &evidence)?;
             match (&evidence.source.terminal, evidence.paired_holder) {
                 (None, None) => {}
                 (Some(terminal), Some(pair))
@@ -429,10 +471,12 @@ pub(super) fn prepare_resume_verified(
                 }
             }
             matched = true;
-            archived_history = archived;
+            if let Some(archived) = archived {
+                archived_history.push(archived);
+            }
         }
     }
-    if let Some(archived) = &archived_history {
+    for archived in &archived_history {
         registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())

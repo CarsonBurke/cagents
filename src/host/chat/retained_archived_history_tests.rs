@@ -7,7 +7,178 @@ use crate::{
     host::model::Registry,
     process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor},
 };
-use std::{fs, os::unix::fs::PermissionsExt, path::Path};
+use std::{
+    fs,
+    io::Read,
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
+    path::Path,
+};
+
+/// Containment uses an original-process pidfd, never an unpinned numeric kill.
+/// This proves only fixture execution exit, not semantic actor retirement.
+fn contain_process(process: &crate::daemon::holder_registry::Process) -> Result<(), String> {
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, process.pid, 0) } as i32;
+    if raw < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error.to_string())
+        };
+    }
+    let original = unsafe { OwnedFd::from_raw_fd(raw) };
+    match crate::daemon::holder_registry::Process::read(process.pid) {
+        Ok(actual) if actual == *process => {}
+        Ok(_) => return Ok(()), // Original exited; a reused PID is not ours.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    }
+    if unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            original.as_raw_fd(),
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    } < 0
+    {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error.to_string());
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut poll = libc::pollfd {
+            fd: original.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("Owned fixture process did not exit after containment".into());
+        }
+        let result = unsafe { libc::poll(&mut poll, 1, remaining.as_millis().min(100) as i32) };
+        if result > 0 && poll.revents & libc::POLLIN != 0 {
+            return Ok(());
+        }
+        if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+    }
+}
+
+fn contain_record(record: &crate::daemon::holder_registry::Record) -> Result<(), String> {
+    let root = contain_process(&record.root);
+    let holder = contain_process(&record.holder);
+    root.and(holder)
+}
+
+struct OwnedHelperGuard(crate::daemon::holder_registry::Record);
+impl OwnedHelperGuard {
+    fn capture(root: &Path, handle: &Handle) -> Self {
+        let identity = handle
+            .actor_identity()
+            .expect("real helper identity required");
+        let guard = Self(identity.record);
+        // Persist actual custody for the parent before any installed-helper
+        // assertion can panic. This file is not a retirement/authority proof.
+        let directory = root.join("owned-helpers");
+        fs::create_dir_all(&directory).unwrap();
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join(format!("{}.json", identity.instance)))
+            .unwrap();
+        serde_json::to_writer(file, &guard.0).unwrap();
+        guard
+    }
+}
+impl Drop for OwnedHelperGuard {
+    fn drop(&mut self) {
+        if let Err(error) = contain_record(&self.0) {
+            eprintln!("fixture containment remains unproved: {error}");
+        }
+    }
+}
+
+fn contain_directory(directory: &Path) -> Result<(), String> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut first_error = None;
+    for entry in entries {
+        let result = (|| {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let kind = entry.file_type().map_err(|error| error.to_string())?;
+            if kind.is_dir() {
+                contain_directory(&entry.path())?;
+            } else if kind.is_file() && entry.path().extension().is_some_and(|ext| ext == "json") {
+                let file = fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(entry.path())
+                    .map_err(|error| error.to_string())?;
+                let metadata = file.metadata().map_err(|error| error.to_string())?;
+                if !metadata.is_file()
+                    || metadata.uid() != unsafe { libc::geteuid() }
+                    || metadata.mode() & 0o077 != 0
+                    || metadata.nlink() != 1
+                    || metadata.len() > 4096
+                {
+                    return Err("Unsafe fixture custody record".into());
+                }
+                let mut bytes = Vec::new();
+                file.take(4097)
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| error.to_string())?;
+                let Ok(record) =
+                    serde_json::from_slice::<crate::daemon::holder_registry::Record>(&bytes)
+                else {
+                    return Ok(());
+                };
+                if record.kind != crate::daemon::holder_registry::Kind::Native
+                    || record.application != crate::instance::APPLICATION_ID
+                    || record.boot
+                        != crate::daemon::read_boot_id().map_err(|error| error.to_string())?
+                {
+                    return Err("Fixture custody changed its application or boot".into());
+                }
+                contain_record(&record)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+struct DirectoryGuard(std::path::PathBuf);
+impl DirectoryGuard {
+    fn contain(&self) -> Result<(), String> {
+        // The parent allocated this fresh private root. Only its own real
+        // native discoveries and captured owner records are inspected.
+        let discoveries = contain_directory(&self.0.join("run"));
+        let captured = contain_directory(&self.0.join("owned-helpers"));
+        discoveries.and(captured)
+    }
+}
+impl Drop for DirectoryGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.contain() {
+            eprintln!("fixture directory containment remains unproved: {error}");
+        }
+    }
+}
 
 fn isolated() -> Option<std::path::PathBuf> {
     const CHILD: &str = "CAGENTS_ARCHIVED_HISTORY_RUNTIME_TEST";
@@ -39,6 +210,7 @@ fn isolated() -> Option<std::path::PathBuf> {
         }
     }
     let helper = super::super::retained_actor_tests::retained_helper_executable();
+    let guardian = DirectoryGuard(root.path().into());
     let command = command
         .args(["--exact", &test, "--nocapture", "--test-threads=1"])
         .cwd(root.path())
@@ -60,6 +232,35 @@ fn isolated() -> Option<std::path::PathBuf> {
         .timeout(Duration::from_secs(90))
         .output_limits(256 * 1024, 256 * 1024);
     let output = SystemProcessExecutor.execute(&command, &CancellationToken::new());
+    let containment_probe = root.path().join("parent-containment-required.json");
+    let detached = containment_probe.exists().then(|| {
+        let record: crate::daemon::holder_registry::Record =
+            serde_json::from_slice(&fs::read(containment_probe).unwrap()).unwrap();
+        [record.root, record.holder].map(|process| {
+            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, process.pid, 0) } as i32;
+            assert!(
+                raw >= 0,
+                "detached fixture process disappeared before its parent took custody"
+            );
+            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            assert_eq!(
+                crate::daemon::holder_registry::Process::read(process.pid).unwrap(),
+                process
+            );
+            let mut poll = libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(
+                unsafe { libc::poll(&mut poll, 1, 0) },
+                0,
+                "fixture must leave actual execution for parent containment"
+            );
+            fd
+        })
+    });
+    let contained = guardian.contain();
     let retained = root.keep();
     let (stdout, stderr) = match &output {
         Ok(output) => (&output.stdout, &output.stderr),
@@ -67,6 +268,20 @@ fn isolated() -> Option<std::path::PathBuf> {
     };
     fs::write(retained.join("test.stdout"), stdout).unwrap();
     fs::write(retained.join("test.stderr"), stderr).unwrap();
+    contained.expect("every escaped fixture helper/provider must have observed execution exit");
+    if let Some(detached) = detached {
+        for fd in detached {
+            let mut poll = libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert!(
+                unsafe { libc::poll(&mut poll, 1, 0) } > 0 && poll.revents & libc::POLLIN != 0,
+                "parent did not observe exact detached fixture execution exit"
+            );
+        }
+    }
     let output = output.expect("bounded archived-history child must settle");
     assert!(
         output.success,
@@ -77,6 +292,23 @@ fn isolated() -> Option<std::path::PathBuf> {
     );
     println!("archived-history fixture evidence: {}", retained.display());
     None
+}
+
+#[test]
+fn authenticated_archive_parent_contains_helpers_after_abrupt_child_exit() {
+    let Some(root) = isolated() else { return };
+    let fixture = Fixture::new(root);
+    // This actual helper is installed and detached from the executor's process
+    // group. Exit without Rust destructors to exercise parent-owned custody.
+    // The record is custody only and is never consumed as retirement proof.
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(fixture.root.join("parent-containment-required.json"))
+        .unwrap();
+    serde_json::to_writer(file, &fixture.identity.record).unwrap();
+    std::process::exit(0);
 }
 
 fn wait(mut predicate: impl FnMut() -> bool, reason: &str) {
@@ -111,6 +343,7 @@ struct Fixture {
     historical: crate::agent_execution::Agent,
     run: crate::agent_execution::Run,
     _context: Arc<chat::protocol::ExecutionContext>,
+    _cleanup: OwnedHelperGuard,
 }
 
 impl Fixture {
@@ -220,6 +453,7 @@ impl Fixture {
         let handle =
             Handle::start_remote_owned(spec, source.clone(), prepared, environment, |_| {})
                 .unwrap();
+        let cleanup = OwnedHelperGuard::capture(&root, &handle);
         let identity = handle.actor_identity().unwrap();
         wait(
             || handle.attachment_snapshot().ready && handle.confirmed_session_id().is_some(),
@@ -280,6 +514,7 @@ impl Fixture {
             historical: agent,
             run,
             _context: context,
+            _cleanup: cleanup,
         }
     }
 
@@ -303,40 +538,6 @@ impl Fixture {
             !self.root.join("prompts").exists(),
             "recovery injected provider input"
         );
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let handles: Vec<_> = self
-            .host
-            .lock()
-            .unwrap()
-            .chats
-            .values()
-            .map(|record| record.handle.clone())
-            .collect();
-        for handle in handles {
-            let _ = handle.close();
-            let _ = handle.finish_retained_close();
-            if let Some(identity) = handle.actor_identity() {
-                for process in [&identity.record.root, &identity.record.holder] {
-                    if process.is_current() {
-                        unsafe {
-                            libc::kill(process.pid, libc::SIGKILL);
-                        }
-                    }
-                }
-            }
-        }
-        // Failure containment only; this is never the successful close oracle.
-        for process in [&self.identity.record.root, &self.identity.record.holder] {
-            if process.is_current() {
-                unsafe {
-                    libc::kill(process.pid, libc::SIGKILL);
-                }
-            }
-        }
     }
 }
 
@@ -472,6 +673,8 @@ fn authenticated_legacy_archive_joins_retirement_and_prepares_explicit_resume_wi
     let resumed = fixture.host.lock().unwrap().chats[&resumed_id]
         .handle
         .clone();
+    let _resumed_cleanup = OwnedHelperGuard::capture(&fixture.root, &resumed);
+    let resumed_identity = resumed.actor_identity().unwrap();
     wait(
         || {
             resumed.attachment_snapshot().ready
@@ -498,6 +701,229 @@ fn authenticated_legacy_archive_joins_retirement_and_prepares_explicit_resume_wi
         },
     )
     .unwrap();
+    let second_source = store
+        .lock()
+        .unwrap()
+        .native_actor_retirement(resumed_identity.instance)
+        .unwrap()
+        .unwrap()
+        .source()
+        .clone();
+    let second = super::super::process_inner(
+        &fixture.host,
+        17,
+        ClientRequest::ChatPrepareResume {
+            source: second_source.clone(),
+        },
+    )
+    .unwrap();
+    let ServerResponse::ChatResumePrepared { session: second } = second else {
+        panic!("a retired archived predecessor blocked the second explicit resume")
+    };
+    assert_ne!(second.id, resumed_id);
+    assert_eq!(second.launch, fixture.source.launch);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("launches"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    assert!(!fixture.root.join("prompts").exists());
+
+    let other_home = fixture.root.join("other-physical-home");
+    fs::create_dir(&other_home).unwrap();
+    let mut changed_scope = second_source.clone();
+    changed_scope.launch.recipe.environment.insert(
+        "CLAUDE_CONFIG_DIR".into(),
+        other_home.to_string_lossy().into_owned(),
+    );
+    assert!(
+        super::super::process_inner(
+            &fixture.host,
+            17,
+            ClientRequest::ChatPrepareResume {
+                source: changed_scope,
+            }
+        )
+        .is_err(),
+        "archived predecessor permitted a changed physical account"
+    );
+
+    // A real additional allocation with only Pending registration must still
+    // block the requested B, even though archived predecessor A is fully safe.
+    let mut pending_source = fixture.source.clone();
+    pending_source.id = TerminalId::new();
+    pending_source.native_continuity = chat::NativeContinuity::ReconnectOnly;
+    let context =
+        Arc::new(chat::protocol::ExecutionContext::capture(&fixture.root.join("project")).unwrap());
+    let (mut spec, adapter) = chat::protocol::create(&pending_source.launch).unwrap();
+    spec.execution = Some(context);
+    let prepared = adapter.prepared_launch_identity().unwrap();
+    let environment = spec.environment.clone();
+    let pending =
+        Handle::start_remote_owned(spec, pending_source, prepared, environment, |_| {}).unwrap();
+    let _pending_cleanup = OwnedHelperGuard::capture(&fixture.root, &pending);
+    let identity = pending.actor_identity().unwrap();
+    let inspection = Handle::inspect_remote(&identity.record, proof.clone()).unwrap();
+    enroll_pending(
+        &fixture.host,
+        &identity,
+        &inspection.source,
+        &inspection.previous_sources,
+        inspection
+            .launch_account_scope
+            .as_ref()
+            .map_err(String::as_str),
+        false,
+    )
+    .unwrap();
+    let prepare_again = || {
+        super::super::process_inner(
+            &fixture.host,
+            17,
+            ClientRequest::ChatPrepareResume {
+                source: second_source.clone(),
+            },
+        )
+    };
+    assert!(
+        prepare_again().is_err(),
+        "row-only Pending became retired predecessor authority"
+    );
+    fs::write(fixture.root.join("emit-permission"), "emit").unwrap();
+    wait(
+        || pending.owns_work(),
+        "additional Pending helper did not expose real work",
+    );
+    assert!(
+        prepare_again().is_err(),
+        "active Pending predecessor was ignored"
+    );
+    contain_process(&identity.record.holder).unwrap();
+    wait(
+        || {
+            matches!(
+                Handle::inspect_retained_retirement(&identity.record, &proof),
+                Ok(RetirementInspection::ExitedUnproved)
+            )
+        },
+        "additional helper exit was not classified unproved",
+    );
+    assert!(
+        prepare_again().is_err(),
+        "unproved Pending predecessor was ignored"
+    );
+    assert!(!fixture.root.join("prompts").exists());
+}
+
+fn reconciliation_authority_case(root: std::path::PathBuf, replacement: bool) {
+    let fixture = Fixture::new(root);
+    let store = fixture.registry();
+    store
+        .lock()
+        .unwrap()
+        .fresh_agent_authority(&HostedSession::Chat(fixture.source.clone()))
+        .unwrap();
+    fixture.handle.close().unwrap();
+    let inspection = inspect!(fixture);
+    assert!(inspection.state.close.completed && inspection.state.close.exited);
+    assert_eq!(inspection.state.outbox_ack, inspection.state.outbox_latest);
+    let ownership = store
+        .lock()
+        .unwrap()
+        .native_actor_ownership(fixture.identity.instance)
+        .unwrap()
+        .unwrap();
+    let mut issued = inspection.previous_sources;
+    issued.push(inspection.source.clone());
+    // Reproduce the crash cutpoint with typed APIs and authentic inspected
+    // aliases: archival committed, real helper retired, SQL receipt uncommitted.
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .archive_previous_boot_execution(
+                &ownership,
+                &fixture.host.lock().unwrap().proof().boot_id,
+                &issued,
+                &inspection.source
+            )
+            .unwrap()
+    );
+    let mut newer = fixture.source.clone();
+    newer
+        .launch
+        .recipe
+        .arguments
+        .push("--fixture-newer-owner".into());
+    if replacement {
+        // Typed negative fixture metadata represents a newer exact capability;
+        // it grants this test no provider execution or fabricated helper alias.
+        store
+            .lock()
+            .unwrap()
+            .fresh_agent_authority(&HostedSession::Chat(newer.clone()))
+            .unwrap();
+    }
+    fixture.handle.finish_retained_close().unwrap();
+    assert!(matches!(
+        Handle::inspect_retained_retirement(
+            &fixture.identity.record,
+            fixture.source.proof.as_ref().unwrap()
+        )
+        .unwrap(),
+        RetirementInspection::Verified(_)
+    ));
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .native_actor_retirement(fixture.identity.instance)
+            .unwrap()
+            .is_none()
+    );
+    reconcile_retired_actors(&fixture.host).unwrap();
+    let store = store.lock().unwrap();
+    assert!(
+        store
+            .native_actor_retirement(fixture.identity.instance)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        store
+            .retained_agent_authority_source(fixture.source.id)
+            .unwrap(),
+        replacement.then_some(HostedSession::Chat(newer))
+    );
+    assert_eq!(store.agent_run(fixture.run.id).unwrap(), fixture.run);
+    drop(store);
+    let prepared = super::super::retained_resume::prepare_resume(&fixture.host, &fixture.source);
+    if replacement {
+        assert!(
+            prepared.is_err(),
+            "old retirement bypassed a newer authority"
+        );
+    } else {
+        assert!(
+            prepared.unwrap(),
+            "one startup pass did not finish exact authority retirement"
+        );
+    }
+    assert!(!fixture.root.join("prompts").exists());
+}
+
+#[test]
+fn authenticated_retirement_reconciliation_retires_original_authority_in_one_pass() {
+    let Some(root) = isolated() else { return };
+    reconciliation_authority_case(root, false);
+}
+
+#[test]
+fn authenticated_retirement_reconciliation_preserves_a_newer_authority() {
+    let Some(root) = isolated() else { return };
+    reconciliation_authority_case(root, true);
 }
 
 #[test]
@@ -531,10 +957,7 @@ fn authenticated_legacy_archive_preserves_an_unproved_helper_exit() {
     let Some(root) = isolated() else { return };
     let fixture = Fixture::new(root);
     assert!(fixture.identity.record.holder.is_current());
-    assert_eq!(
-        unsafe { libc::kill(fixture.identity.record.holder.pid, libc::SIGKILL) },
-        0
-    );
+    contain_process(&fixture.identity.record.holder).unwrap();
     let proof = fixture.host.lock().unwrap().proof().clone();
     wait(
         || {
@@ -563,7 +986,14 @@ fn authenticated_legacy_archive_preserves_actual_helper_continuity_loss() {
     fixture.handle.close().unwrap();
     let closed = inspect!(fixture);
     assert!(closed.state.close.completed && closed.state.close.exited);
-    assert!(closed.state.continuity_loss.is_some());
+    let loss = closed.state.continuity_loss.unwrap();
+    assert!(
+        loss.reason
+            .contains("outcome journal overflowed before the daemon committed"),
+        "{}",
+        loss.reason
+    );
+    assert!(!loss.acknowledged);
     assert!(fixture.handle.finish_retained_close().is_err());
     reconcile_previous_boot_history(&fixture.host).unwrap();
     fixture.assert_preserved();
