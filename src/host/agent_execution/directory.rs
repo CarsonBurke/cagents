@@ -5,7 +5,7 @@ use super::{SharedHost, caller, registry};
 use crate::{
     agent::{ActivityState, Provider},
     agent_execution::{
-        Authority, Lineage, Origin,
+        Authority, HostedSession, Lineage, Origin,
         directory::{Delegation, Directory, Entry, Owner, Relation, Scope, Surface},
     },
     model::TerminalId,
@@ -19,6 +19,7 @@ use std::{
 /// What the host lock yields; everything slower happens after releasing it.
 pub(super) struct Live {
     pub(super) id: TerminalId,
+    source: HostedSession,
     pub(super) surface: Surface,
     pub(super) provider: Option<Provider>,
     pub(super) title: Option<String>,
@@ -35,11 +36,20 @@ pub(super) fn read(
     // as a caller outside cagents rather than failing the whole listing.
     let (caller_origin, caller) = caller(host, authority).unwrap_or((Origin::User, None));
     let mut live = live_sessions(host);
-    let (model, delegations, lineages) = {
+    let (model, delegations, lineages, scopes) = {
         let registry = registry(host)?;
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         let model = registry.model()?;
         let lineages = registry.session_lineages(live.iter().map(|entry| entry.id))?;
+        let current = live
+            .iter()
+            .map(|entry| (entry.id, &entry.source))
+            .collect::<BTreeMap<_, _>>();
+        let matches = |cached: &HostedSession| match current.get(&cached.id()) {
+            Some(source) => registry.authenticated_session_alias(cached, source),
+            None => Ok(false),
+        };
+        let scopes = session_scopes(&model, &matches)?;
         let mut delegations = BTreeMap::new();
         // Only a live session's delegation is listed, so only its latest run
         // is read.
@@ -47,7 +57,7 @@ pub(super) fn read(
             let Some(session) = &agent.session else {
                 continue;
             };
-            if !live.iter().any(|entry| entry.id == session.id()) {
+            if !matches(session)? {
                 continue;
             }
             let run = registry.latest_agent_run(agent.id)?;
@@ -64,7 +74,7 @@ pub(super) fn read(
                 ),
             );
         }
-        (model, delegations, lineages)
+        (model, delegations, lineages, scopes)
     };
     let lineage = |id: TerminalId| lineages.get(&id).copied().unwrap_or(Lineage(id));
     // A plain shell is listed only where it matters: as the caller, or as the
@@ -111,7 +121,6 @@ pub(super) fn read(
         }
     };
 
-    let scopes = session_scopes(&model);
     let mut me = None;
     let mut sessions = Vec::new();
     for live in live {
@@ -249,8 +258,14 @@ pub(super) fn live_sessions(host: &SharedHost) -> Vec<Live> {
         if record.handle.is_completed() {
             continue;
         }
+        let mut source = record.session.clone();
+        source.launch.session_id = record
+            .handle
+            .confirmed_session_id()
+            .or(source.launch.session_id);
         live.push(Live {
             id: *id,
+            source: HostedSession::Chat(source),
             surface: Surface::Chat,
             provider: Some(record.session.launch.provider),
             // Resident metadata only; a directory read never loads a transcript.
@@ -268,9 +283,18 @@ pub(super) fn live_sessions(host: &SharedHost) -> Vec<Live> {
         {
             continue;
         }
+        // Raw terminal records retain launch continuity; the descriptor pins
+        // the currently hosted worker to this daemon's authenticated proof.
+        let Ok(descriptor) = state.descriptor(0, *id) else {
+            continue;
+        };
+        if descriptor.session.continuity.live_proof().is_none() {
+            continue;
+        }
         let activity = record.handle.agent_activity();
         live.push(Live {
             id: *id,
+            source: HostedSession::Terminal(descriptor.session),
             surface: Surface::Terminal,
             provider: activity.map(|activity| activity.provider),
             title: record.conversation_title().map(str::to_owned),
@@ -285,18 +309,26 @@ pub(super) fn live_sessions(host: &SharedHost) -> Vec<Live> {
 /// are ambiguous; neither cwd nor window focus chooses one of them.
 fn session_scopes(
     model: &crate::workspace_model::WorkspaceModel,
-) -> BTreeMap<TerminalId, Option<crate::agent_execution::Placement>> {
+    mut matches: impl FnMut(&HostedSession) -> Result<bool, String>,
+) -> Result<BTreeMap<TerminalId, Option<crate::agent_execution::Placement>>, String> {
     let mut scopes: BTreeMap<TerminalId, Option<crate::agent_execution::Placement>> =
         BTreeMap::new();
     for view in &model.views {
         for pane in &view.panes {
-            let id = match &pane.kind {
-                crate::model::CardKind::Chat(session) => session.id,
-                crate::model::CardKind::Terminal(session) => session.id,
+            let source = match &pane.kind {
+                crate::model::CardKind::Chat(session) => HostedSession::Chat(session.clone()),
+                crate::model::CardKind::Terminal(session) => {
+                    HostedSession::Terminal(session.clone())
+                }
                 _ => continue,
             };
+            // A saved pane may outlive its actor. UUID equality cannot bind its
+            // old scope to a replacement launch; accepted adoption aliases can.
+            if !matches(&source)? {
+                continue;
+            }
             scopes
-                .entry(id)
+                .entry(source.id())
                 .and_modify(|known| {
                     if known.as_ref() != Some(&view.scope) {
                         *known = None;
@@ -305,7 +337,7 @@ fn session_scopes(
                 .or_insert_with(|| Some(view.scope.clone()));
         }
     }
-    scopes
+    Ok(scopes)
 }
 
 #[cfg(test)]
@@ -399,16 +431,22 @@ mod tests {
         strip.panes.push(pane.clone());
         model.views.push(strip);
         let worktree = model.views[0].scope.clone();
-        assert_eq!(session_scopes(&model)[&id], Some(worktree));
+        assert_eq!(
+            session_scopes(&model, |_| Ok(true)).unwrap()[&id],
+            Some(worktree)
+        );
         model.views.clear();
         let channel = ChannelId::new();
         let mut first = View::empty(Scope::Channel(channel));
         first.panes.push(pane.clone());
         model.views.push(first.clone());
-        assert_eq!(session_scopes(&model)[&id], Some(channel.into()));
+        assert_eq!(
+            session_scopes(&model, |_| Ok(true)).unwrap()[&id],
+            Some(channel.into())
+        );
         model.views.push(first);
         assert_eq!(
-            session_scopes(&model)[&id],
+            session_scopes(&model, |_| Ok(true)).unwrap()[&id],
             Some(channel.into()),
             "duplicate same-channel metadata is unambiguous"
         );
@@ -416,7 +454,7 @@ mod tests {
         other.panes.push(pane);
         model.views.push(other);
         assert_eq!(
-            session_scopes(&model)[&id],
+            session_scopes(&model, |_| Ok(true)).unwrap()[&id],
             None,
             "conflicting legacy descriptors choose no channel"
         );
