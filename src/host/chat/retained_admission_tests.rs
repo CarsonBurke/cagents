@@ -164,6 +164,31 @@ fn start(host: &SharedHost, session: Session) -> Result<ServerResponse, Protocol
     )
 }
 
+static FAILED_CONFIRMATION: std::sync::OnceLock<(
+    std::sync::mpsc::SyncSender<TerminalId>,
+    std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+)> = std::sync::OnceLock::new();
+
+pub(super) fn pause_failed_confirmation(id: TerminalId) {
+    if let Some((ready, resume)) = FAILED_CONFIRMATION.get() {
+        ready.send(id).unwrap();
+        resume
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(15))
+            .unwrap();
+    }
+}
+
+#[test]
+fn named_claude_resume_failure_preserves_replacement_attachment() {
+    named_resume_case(
+        "named_claude_resume_failure_preserves_replacement_attachment",
+        false,
+        false,
+    );
+}
+
 #[test]
 fn named_claude_resume_failure_retires_before_exact_retry() {
     named_resume_case(
@@ -296,14 +321,100 @@ fn named_resume_case(name: &str, fail_retirement: bool, finish_with_close: bool)
             |_| {},
         )
     };
-    let failure = match connect(chat::Intent::Start) {
+    let replaced = name == "named_claude_resume_failure_preserves_replacement_attachment";
+    let first = if replaced {
+        let (ready, paused) = std::sync::mpsc::sync_channel(1);
+        let (resume, released) = std::sync::mpsc::sync_channel(1);
+        FAILED_CONFIRMATION
+            .set((ready, std::sync::Mutex::new(released)))
+            .unwrap();
+        thread::scope(|scope| {
+            let starting = scope.spawn(|| connect(chat::Intent::Start));
+            assert_eq!(
+                paused.recv_timeout(Duration::from_secs(15)).unwrap(),
+                requested.id
+            );
+            let (source, old, instance) = {
+                let state = host.lock().unwrap();
+                let record = &state.chats[&requested.id];
+                (
+                    record.session.clone(),
+                    record.handle.clone(),
+                    record.execution_instance,
+                )
+            };
+            let owner = old.actor_identity().unwrap().record;
+            let weak = Arc::downgrade(&host);
+            let id = requested.id;
+            let replacement = Handle::adopt_remote(&owner, source, proof.clone(), move |update| {
+                changed_owned(&weak, id, instance, update);
+            })
+            .unwrap();
+            assert!(old.same_actor(&replacement));
+            assert!(!old.same_attachment(&replacement));
+            {
+                let mut state = host.lock().unwrap();
+                let record = state.chats.get_mut(&requested.id).unwrap();
+                assert!(record.handle.same_attachment(&old));
+                record.handle = replacement.clone();
+            }
+            resume.send(()).unwrap();
+            let result = starting.join().unwrap();
+            assert!(
+                host.lock().unwrap().chats[&requested.id]
+                    .handle
+                    .same_attachment(&replacement)
+            );
+            assert!(host.lock().unwrap().native_actor_startups.is_empty());
+            assert!(
+                super::super::agent_execution::registry(&host)
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .retained_agent_authority_source(requested.id)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                owner.holder.is_current(),
+                "replacement helper must survive stale cleanup"
+            );
+            // The failed request cannot retire this new authenticated proxy.
+            // Its ordinary Close remains available and finishes real teardown.
+            process(
+                &host,
+                0,
+                ClientRequest::ChatClose {
+                    chat_id: requested.id,
+                },
+            )
+            .unwrap();
+            result
+        })
+    } else {
+        connect(chat::Intent::Start)
+    };
+    let failure = match first {
         Err(failure) => failure,
         Ok(handle) => {
             let _ = handle.close();
             panic!("unconfirmed initialization must not become a successful attachment");
         }
     };
-    assert!(failure.message.contains("75"), "{}", failure.message);
+    if replaced {
+        assert!(
+            failure.message.contains("changed its owner"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            fs::read_to_string(root.join("provider-trace.jsonl"))
+                .unwrap()
+                .contains("owned-fixture-resume-refused-once")
+        );
+    } else {
+        assert!(failure.message.contains("75"), "{}", failure.message);
+    }
     let registry = super::super::agent_execution::registry(&host).unwrap();
     if fail_retirement {
         assert!(

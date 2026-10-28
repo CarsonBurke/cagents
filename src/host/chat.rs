@@ -1788,6 +1788,8 @@ fn start_with_execution(
                 match confirmation {
                     Ok(confirmed) => response = Some(confirmed),
                     Err(message) => {
+                        #[cfg(test)]
+                        retained_admission_tests::pause_failed_confirmation(id);
                         // A named resume confirms its exact conversation in the
                         // initialize reply, without a prompt. Keep the ordinary HOST
                         // record and semantic consumer until normal Close commits all
@@ -1799,6 +1801,16 @@ fn start_with_execution(
                                 unavailable("The unconfirmed conversation lost its cleanup owner")
                             })?;
                             if !record.handle.same_attachment(&installed_handle) {
+                                // A new authenticated proxy for this very same
+                                // installed actor owns cleanup now. Release
+                                // only this obsolete startup reservation; a
+                                // different actor keeps its original evidence.
+                                let same_actor = record.execution_instance == execution_instance
+                                    && record.handle.same_actor(&installed_handle);
+                                drop(state);
+                                if same_actor && let Some(context) = &execution {
+                                    retained_actor::forget_startup(host, &startup_source, context);
+                                }
                                 return Err(unavailable(
                                     "The unconfirmed conversation changed its owner",
                                 ));
