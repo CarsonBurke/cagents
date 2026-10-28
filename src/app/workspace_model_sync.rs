@@ -322,16 +322,18 @@ fn publish_with(
                             updates.send_blocking(ModelUpdate::NavigationFailed(error.to_string()));
                     }
                     if matches!(&request, ModelEdit::SuggestConversationTitle { .. }) {
-                        if let Some(client) = client.as_mut() {
-                            if let Ok(model) = client.read_workspace_model() {
-                                // A refused suggestion is not replayed against a newer
-                                // owner. Restore the authoritative name after optimism.
-                                let _ = updates.send_blocking(ModelUpdate::Read(model));
-                            }
+                        if let Some(model) = client
+                            .as_mut()
+                            .and_then(|client| client.read_workspace_model().ok())
+                        {
+                            // A refused suggestion is not replayed against a newer
+                            // owner. Restore the authoritative name after optimism.
+                            let _ = updates.send_blocking(ModelUpdate::Read(model));
                         } else {
-                            // Authentication or remote scope refused before an edit
-                            // connection existed. Reconcile only this still-owned
-                            // candidate from the UI's last confirmed model.
+                            // Authentication may refuse before a connection exists,
+                            // or the canonical read may fail after a definite edit
+                            // refusal. Reconcile only the still-owned candidate
+                            // from the UI's last confirmed model in either case.
                             let _ =
                                 updates.send_blocking(ModelUpdate::TitleRefused(request.clone()));
                         }
