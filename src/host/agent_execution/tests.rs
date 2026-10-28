@@ -5005,11 +5005,51 @@ fn console_submit_reloads_limits_without_claiming_refused_interaction() {
         caller: 1,
         global: 1,
     });
-    let ServerResponse::Agent(Reply::Accepted(retried)) = invoke(authority).unwrap() else {
+    let ServerResponse::Agent(Reply::Accepted(retried)) = invoke(authority.clone()).unwrap() else {
         panic!("accepted console request must remain idempotent at capacity")
     };
     assert!(!retried.created);
     assert_eq!(retried.run.id, followup.run.id);
+    // Policy is required only to admit new work. A bad edit cannot erase a
+    // durable acceptance or cause its prompt to be submitted again.
+    std::fs::write(&settings_path, "[agent_concurrency\n").unwrap();
+    let ServerResponse::Agent(Reply::Accepted(retried)) = invoke(authority.clone()).unwrap() else {
+        panic!("accepted console request must survive unreadable policy")
+    };
+    assert!(!retried.created);
+    assert_eq!(retried.agent.id, agent.id);
+    assert_eq!(retried.run.id, followup.run.id);
+    let before_refusal = store.lock().unwrap().model().unwrap();
+    for (key, prompt, expected) in [
+        (
+            "configured-console-followup",
+            "DIFFERENT_PROMPT",
+            "idempotency key",
+        ),
+        (
+            "new-console-key-under-invalid-policy",
+            "NEW_PROMPT",
+            "Cannot read agent concurrency settings",
+        ),
+    ] {
+        let error = super::super::client::process_request(
+            &host,
+            37,
+            ClientRequest::Agent {
+                authority: authority.clone(),
+                operation: Operation::Console {
+                    agent: agent.id,
+                    command: ConsoleCommand::Submit {
+                        prompt: prompt.into(),
+                        idempotency_key: key.into(),
+                    },
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(error.message.contains(expected), "{}", error.message);
+        assert_eq!(store.lock().unwrap().model().unwrap(), before_refusal);
+    }
     assert_eq!(
         std::fs::read(path.parent().unwrap().join("prompts")).unwrap(),
         after_prompts

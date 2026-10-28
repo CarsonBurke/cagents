@@ -100,7 +100,11 @@ impl std::fmt::Display for LimitReached {
                 self.capacity.holders.len() - 12
             )?;
         }
-        f.write_str("\nWait for running work or close interrupted agents with `cagents agent close --interrupted`.")
+        f.write_str("\nWait for running work or close this caller's interrupted agents with `cagents agent close --interrupted`.")?;
+        if self.capacity.scope == CapacityScope::Global {
+            f.write_str("\nThe global limit includes every caller. A user shell can close interrupted agents across callers with `cagents agent close --interrupted --all`; session agents must ask the user for that cleanup.")?;
+        }
+        Ok(())
     }
 }
 #[derive(Debug, thiserror::Error)]
@@ -711,6 +715,32 @@ pub enum ProviderEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capacity_refusal_explains_caller_and_global_cleanup_authority() {
+        let refusal = |scope| LimitReached {
+            capacity: Capacity {
+                running: 50,
+                limit: 50,
+                scope,
+                holders: vec![],
+            },
+            retryable: true,
+        };
+        let caller = refusal(CapacityScope::Caller).to_string();
+        assert!(caller.contains("50/50 reservations"));
+        assert!(caller.contains("this caller's interrupted agents"));
+        assert!(caller.contains("`cagents agent close --interrupted`"));
+        assert!(!caller.contains("--all"));
+
+        // A foreign interrupted holder never finishes merely by waiting, and
+        // caller-scoped cleanup cannot release that global reservation.
+        let global = refusal(CapacityScope::Global).to_string();
+        assert!(global.contains("global limit includes every caller"));
+        assert!(global.contains("A user shell"));
+        assert!(global.contains("`cagents agent close --interrupted --all`"));
+        assert!(global.contains("session agents must ask the user"));
+    }
 
     #[test]
     fn waiting_is_observable_without_settling_the_run() {

@@ -1437,22 +1437,27 @@ fn console_with_limits(
         } => {
             let gate = agent_gate(host, id);
             let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+            let request = Submit {
+                name: None,
+                destination: Destination::Existing(id),
+                prompt,
+                idempotency_key,
+            };
+            request.validate()?;
+            // An exact accepted retry needs no new reservation. Preserve its
+            // receipt even if saved policy has since become unreadable.
+            if let Some(previous) = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .previous_agent_acceptance(&agent.origin, &request)?
+            {
+                return Ok(Reply::Accepted(previous));
+            }
             let limits = concurrency_limits()?;
             let accepted = registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .submit_agent_with_limits(
-                    &agent.origin,
-                    &Submit {
-                        name: None,
-                        destination: Destination::Existing(id),
-                        prompt,
-                        idempotency_key,
-                    },
-                    None,
-                    limits,
-                    now(),
-                )?;
+                .submit_agent_with_limits(&agent.origin, &request, None, limits, now())?;
             registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
