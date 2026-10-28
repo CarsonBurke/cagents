@@ -1606,7 +1606,9 @@ impl Cagents {
             let existing = self.card_state(pane.id).cloned();
             // A restored shared terminal may have waited for the registry
             // while lifecycle hydration was admitted. Once its authoritative
-            // descriptor arrives, admit that exact identity again.
+            // descriptor arrives, admit that exact identity again. An
+            // optimistic reservation still waits; its equal echoes must not
+            // repeatedly restart lifecycle hydration.
             let no_start = !self
                 .terminal_starts
                 .lock()
@@ -1618,7 +1620,10 @@ impl Cagents {
                     .is_some_and(|card| matches!(card.residency, Residency::Hydrating { .. }));
             let failed_pending = pane.pending_terminal_start
                 && matches!(self.cards.get(&pane.id), Some(CardRuntime::Failed(_)));
-            if matches!(pane.kind, CardKind::Terminal(_)) && no_start && (waiting || failed_pending)
+            if accepted_default
+                && matches!(pane.kind, CardKind::Terminal(_))
+                && no_start
+                && (waiting || failed_pending)
             {
                 self.cards.insert(pane.id, CardRuntime::Loading);
                 let exposure = existing
@@ -4868,6 +4873,78 @@ mod tests {
         app.workspace_model.views = vec![view];
         drop(app.reconcile_shared_views());
         assert!(app.terminal_starts.lock().unwrap().contains_key(&id));
+    }
+
+    #[test]
+    fn pending_terminal_reservation_survives_equal_reads_and_final_save_ack() {
+        use super::super::workspace_model_sync::ModelUpdate;
+
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _, _, _) = channel_move_fixture();
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        let model = app.workspace_model.clone();
+        drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(model))));
+        app.shared_views.pending.clear();
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        let session = fresh_terminal_session(LaunchRecipe::shell(PathBuf::from("/repo")).unwrap());
+        // The ordinary insert publishes its optimistic reservation. The
+        // authority's unchanged view has not acknowledged it, so no terminal
+        // process may start while the window saves its durable intent.
+        drop(app.insert_terminal_card(session.clone(), Some((0, 0))));
+        let id = app.workspace.focused().unwrap();
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| matches!(edit,
+            ModelEdit::ChangeView { operation, change: Change::Insert { pane, .. }, .. }
+                if operation == id.as_uuid() && pane.id == id && pane.pending_terminal_start))
+        );
+        let model = app.workspace_model.clone();
+        assert!(
+            model
+                .views
+                .iter()
+                .all(|view| view.panes.iter().all(|pane| pane.id != id))
+        );
+        let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
+        super::super::tests::install_window_close_storage(&mut app, directory.path());
+        let task = app.update(Message::WindowCloseRequested(window));
+        assert!(app.pending_window_close.is_some());
+        let snapshot = app.persistent_workspace();
+        for _ in 0..3 {
+            drop(
+                app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+                    model.clone(),
+                ))),
+            );
+            assert_eq!(app.persistent_workspace(), snapshot);
+            assert!(app.durable.pending_terminal_creations.contains(&id));
+            assert!(app.terminal_starts.lock().unwrap().is_empty());
+            assert!(app.exit.is_none());
+            assert_eq!(app.core.main_window_id(), Some(window));
+        }
+        let completed = super::super::tests::window_close_test_message(&mut app, task);
+        assert!(matches!(
+            &completed,
+            Message::WindowCloseFlushed { result: Ok(()), .. }
+        ));
+        let saved = app
+            .session
+            .as_ref()
+            .unwrap()
+            .operation_store()
+            .load_workspace(app.durable.id, None)
+            .unwrap()
+            .unwrap();
+        assert!(saved.pending_terminal_creations.contains(&id));
+        assert!(saved.cards.iter().any(|card| card.id == id
+            && card.existence.is_open()
+            && matches!(&card.kind, CardKind::Terminal(current) if current == &session)));
+        drop(app.update(completed));
+        assert!(app.exit.is_some());
+        assert!(app.pending_window_close.is_none());
+        assert_eq!(app.core.main_window_id(), None);
+        assert!(app.terminal_starts.lock().unwrap().is_empty());
     }
 
     #[test]

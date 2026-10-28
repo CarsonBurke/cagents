@@ -7493,9 +7493,16 @@ impl Cagents {
                 })
                 .map(|card| card.id)
                 .collect::<HashSet<_>>();
-            Arc::make_mut(&mut self.durable)
+            if self
+                .durable
                 .pending_terminal_creations
-                .retain(|id| open.contains(id));
+                .iter()
+                .any(|id| !open.contains(id))
+            {
+                Arc::make_mut(&mut self.durable)
+                    .pending_terminal_creations
+                    .retain(|id| open.contains(id));
+            }
         }
         self.focus_save_pending = false;
         self.snapshot_workspace_scope();
