@@ -5,7 +5,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use serde::{Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
-use super::{Registry, automation_audit, automation_notifications};
+use super::{AutomationPrecheckError, Registry, automation_audit, automation_notifications};
 use crate::automations::LifecycleCause;
 use crate::automations::{
     Automation, Definition, Firing, FiringState, HistoryCursor, HistoryPage, MAX_HISTORY_PAGE,
@@ -1420,7 +1420,7 @@ impl Registry {
         outcome: super::super::automations::precheck::Outcome,
         limits: Result<crate::agent_execution::ConcurrencyLimits, String>,
         now_ms: u64,
-    ) -> Result<Option<crate::agent_execution::Accepted>, String> {
+    ) -> Result<Option<crate::agent_execution::Accepted>, AutomationPrecheckError> {
         use crate::{automations::SkipReason, host::automations::precheck::Outcome};
         // A proved cleanup result must progress even when the broker could
         // not read policy. Only a new acceptance below consumes this result.
@@ -1438,7 +1438,9 @@ impl Registry {
         }
         let mut automation = read_automation(&tx, firing.automation)?;
         if automation.active_firing != Some(firing_id) {
-            return Err("Precheck no longer owns this automation's active slot".into());
+            return Err("Precheck no longer owns this automation's active slot"
+                .to_owned()
+                .into());
         }
         if firing.state == FiringState::Interrupted {
             // The caller has now read the exact durable cleanup receipt. It
@@ -1492,7 +1494,7 @@ impl Registry {
                 &mut firing,
                 &definition,
                 &key,
-                limits?,
+                limits.map_err(AutomationPrecheckError::PolicyUnavailable)?,
                 now_ms,
             )?
         };
@@ -2052,7 +2054,9 @@ mod tests {
             )
             .err()
             .expect("passing precheck cannot bypass unreadable concurrency policy");
-        assert!(error.contains("Cannot read agent concurrency settings"));
+        assert!(
+            matches!(error, AutomationPrecheckError::PolicyUnavailable(message) if message.contains("Cannot read agent concurrency settings"))
+        );
         assert_eq!(
             registry.automation_firing(precheck.firing.id).unwrap(),
             precheck.firing
@@ -4464,7 +4468,9 @@ mod tests {
                 400,
             )
             .unwrap_err();
-        assert!(error.contains("fixture exact retirement failure"));
+        assert!(
+            matches!(error, AutomationPrecheckError::Other(message) if message.contains("fixture exact retirement failure"))
+        );
         assert_eq!(registry.automation(created.id).unwrap(), blocked);
         assert_eq!(
             registry.automation_audit(created.id, None, 100).unwrap(),
