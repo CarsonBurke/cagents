@@ -384,6 +384,16 @@ impl Fixture {
 
 #[test]
 fn canonical_reconnect_only_cleanup_resolves_its_registered_real_helper_without_reclassification() {
+    for variable in [
+        crate::agent_execution::AUTHORITY_ENV,
+        "CAGENTS_AGENT_TOKEN",
+        "CAGENTS_SESSION_TOKEN",
+    ] {
+        assert!(
+            std::env::var_os(variable).is_none(),
+            "registered-owner qualification requires a genuine User/CI launch; inherited role variables must not be cleared"
+        );
+    }
     let Some(root) = isolated() else { return };
     let mut fixture = Fixture::with_source(root, false, true);
     let saved: Session =

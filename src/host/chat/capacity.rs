@@ -654,6 +654,16 @@ mod tests {
 
     #[test]
     fn canonical_reconnect_only_reader_still_closes_through_the_normal_authenticated_receipt() {
+        for variable in [
+            crate::agent_execution::AUTHORITY_ENV,
+            "CAGENTS_AGENT_TOKEN",
+            "CAGENTS_SESSION_TOKEN",
+        ] {
+            assert!(
+                std::env::var_os(variable).is_none(),
+                "normal-reader qualification requires a genuine User/CI launch; inherited role variables must not be replaced"
+            );
+        }
         let host = host();
         let (_directory, source, handle) = history_reader(&host, false);
         assert!(source.is_saved_claude_history());
