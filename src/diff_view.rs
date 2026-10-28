@@ -1522,6 +1522,19 @@ pub fn load_repository_diff_with_options_and_font(
     }
 }
 
+/// Keep one token per original LF-delimited line, including an unterminated
+/// line containing only whitespace. Every line gets the same prefix, so a NUL
+/// in the source cannot collide with the marker. LF and its absence at EOF
+/// remain distinct; these comparison tokens never become displayed text.
+fn whitespace_line_tokens(text: &str) -> String {
+    text.split_inclusive('\n')
+        .flat_map(|line| {
+            std::iter::once('\0')
+                .chain(line.chars().filter(|ch| *ch == '\n' || !ch.is_whitespace()))
+        })
+        .collect()
+}
+
 /// The editor gutter needs only new-side changed line numbers. This path
 /// creates neither display rows nor syntax/width work, including for large files.
 pub fn build_line_changes(
@@ -1536,12 +1549,10 @@ pub fn build_line_changes(
     }
     let normalized;
     let (old, new) = if ignore_whitespace {
-        let normalize = |text: &str| {
-            text.chars()
-                .filter(|ch| *ch == '\n' || !ch.is_whitespace())
-                .collect::<String>()
-        };
-        normalized = (normalize(before), normalize(after));
+        normalized = (
+            whitespace_line_tokens(before),
+            whitespace_line_tokens(after),
+        );
         (normalized.0.as_str(), normalized.1.as_str())
     } else {
         (before, after)
@@ -1649,13 +1660,10 @@ fn build_diff_rows_from_sources(
     }
     let normalized;
     let (old_tokens, new_tokens) = if ignore_whitespace {
-        // Retain line separators and final-newline identity. Do not join lines.
-        let normalize = |text: &str| {
-            text.chars()
-                .filter(|ch| *ch == '\n' || !ch.is_whitespace())
-                .collect::<String>()
-        };
-        normalized = (normalize(before), normalize(after));
+        normalized = (
+            whitespace_line_tokens(before),
+            whitespace_line_tokens(after),
+        );
         (normalized.0.as_str(), normalized.1.as_str())
     } else {
         (before.as_ref(), after)
@@ -2319,6 +2327,186 @@ mod tests {
             new_line.additions, 1,
             "normalization preserves line separators"
         );
+    }
+
+    #[test]
+    fn whitespace_only_final_lines_keep_rich_rows_and_gutter_positions() {
+        type Case = (String, String, [usize; 2], [u32; 2], [Vec<usize>; 2]);
+        let mut cases: Vec<Case> = vec![
+            ("".into(), "".into(), [0, 0], [0, 0], [vec![], vec![]]),
+            ("".into(), "\n".into(), [0, 1], [1, 0], [vec![0], vec![]]),
+            ("a".into(), "a\n".into(), [1, 1], [1, 1], [vec![0], vec![0]]),
+            ("\0".into(), "".into(), [1, 0], [0, 1], [vec![], vec![0]]),
+            (
+                "\0\n".into(),
+                "\0".into(),
+                [1, 1],
+                [1, 1],
+                [vec![0], vec![0]],
+            ),
+        ];
+        for whitespace in [" ", "\t", "\u{2003}", "\u{a0}", "\u{2028}", "\t \u{2003}"] {
+            cases.extend([
+                (
+                    "".into(),
+                    whitespace.into(),
+                    [0, 1],
+                    [1, 0],
+                    [vec![0], vec![]],
+                ),
+                (
+                    "a\n".into(),
+                    format!("a\n{whitespace}"),
+                    [1, 2],
+                    [1, 0],
+                    [vec![1], vec![]],
+                ),
+                (
+                    "\n".into(),
+                    whitespace.into(),
+                    [1, 1],
+                    [1, 1],
+                    [vec![0], vec![0]],
+                ),
+                (
+                    format!("a\n{whitespace}"),
+                    format!("a\n{whitespace}\n"),
+                    [2, 2],
+                    [1, 1],
+                    [vec![1], vec![1]],
+                ),
+                (
+                    "a\n ".into(),
+                    format!("a\n{whitespace}"),
+                    [2, 2],
+                    [0, 0],
+                    [vec![], vec![]],
+                ),
+                (
+                    "a\n\n".into(),
+                    format!("a\n{whitespace}\n"),
+                    [2, 2],
+                    [0, 0],
+                    [vec![], vec![]],
+                ),
+                (
+                    "\0".into(),
+                    whitespace.into(),
+                    [1, 1],
+                    [1, 1],
+                    [vec![0], vec![0]],
+                ),
+            ]);
+        }
+        let token = CancellationToken::new();
+        for (before, after, counts, changes, gutter) in cases {
+            for reverse in [false, true] {
+                let (old, new, counts, changes, added) = if reverse {
+                    (
+                        &after,
+                        &before,
+                        [counts[1], counts[0]],
+                        [changes[1], changes[0]],
+                        &gutter[1],
+                    )
+                } else {
+                    (&before, &after, counts, changes, &gutter[0])
+                };
+                let model = build_document_diff_with_options(
+                    old.as_str(),
+                    new,
+                    Path::new("whitespace.rs"),
+                    crate::settings::EditorSyntaxTheme::Auto,
+                    true,
+                    &token,
+                )
+                .expect("rich comparison remains valid with whitespace-only final lines");
+                assert_eq!(model.before.as_ref(), old.as_str());
+                assert_eq!(model.after.as_ref(), new.as_str());
+                assert_eq!(model.line_counts, counts, "{old:?} -> {new:?}");
+                assert_eq!(
+                    [model.additions, model.deletions],
+                    changes,
+                    "{old:?} -> {new:?}"
+                );
+                assert_eq!(
+                    build_line_changes(old, new, true, &token).unwrap(),
+                    *added,
+                    "gutter positions must address original lines: {old:?} -> {new:?}"
+                );
+                for (side, count) in counts.into_iter().enumerate() {
+                    let expected = (1..=count as u32).collect::<Vec<_>>();
+                    let inline = model
+                        .inline_rows
+                        .iter()
+                        .filter_map(|row| {
+                            if side == 0 {
+                                row.old_line
+                            } else {
+                                row.new_line
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let split = model
+                        .split_rows
+                        .iter()
+                        .filter_map(|row| {
+                            if side == 0 {
+                                row.old_line
+                            } else {
+                                row.new_line
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        inline, expected,
+                        "inline rows cover every original line: {old:?} -> {new:?}"
+                    );
+                    assert_eq!(
+                        split, expected,
+                        "split rows cover every original line: {old:?} -> {new:?}"
+                    );
+                }
+                // Both layouts must display original whitespace and NUL bytes,
+                // with only the established optional line-ending annotation.
+                let sources = [
+                    old.split_inclusive('\n').collect::<Vec<_>>(),
+                    new.split_inclusive('\n').collect::<Vec<_>>(),
+                ];
+                let assert_display = |side: usize, line: u32, displayed: &str| {
+                    let raw = sources[side][line as usize - 1];
+                    let (body, marker) = if let Some(body) = raw.strip_suffix("\r\n") {
+                        (body, " [CRLF]")
+                    } else if let Some(body) = raw.strip_suffix('\n') {
+                        (body, " [LF]")
+                    } else {
+                        (raw, " [no newline]")
+                    };
+                    assert!(
+                        displayed == body || displayed == format!("{body}{marker}"),
+                        "original display bytes: {raw:?} rendered as {displayed:?}"
+                    );
+                };
+                for row in &model.inline_rows {
+                    if let Some(line) = row.new_line {
+                        assert_display(1, line, row.text.as_ref());
+                    } else if let Some(line) = row.old_line {
+                        assert_display(0, line, row.text.as_ref());
+                    }
+                }
+                for row in &model.split_rows {
+                    for (side, line, displayed) in [
+                        (0, row.old_line, row.old_text.as_deref()),
+                        (1, row.new_line, row.new_text.as_deref()),
+                    ] {
+                        assert_eq!(line.is_some(), displayed.is_some());
+                        if let (Some(line), Some(displayed)) = (line, displayed) {
+                            assert_display(side, line, displayed);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
