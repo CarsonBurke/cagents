@@ -663,8 +663,9 @@ pub enum RepositoryAction {
         line: usize,
     },
     StageSelected {
-        card: CardId,
+        identity: AsyncIdentity,
         stage: bool,
+        selection: crate::repository::PathSelection,
     },
     ApplyDiffSelection {
         card: CardId,
@@ -860,7 +861,8 @@ impl RepositoryAction {
     pub fn card(&self) -> CardId {
         match self {
             Self::SelectDiffRow { identity, .. }
-            | Self::OpenWorkingFileLocation { identity, .. } => identity.card,
+            | Self::OpenWorkingFileLocation { identity, .. }
+            | Self::StageSelected { identity, .. } => identity.card,
             Self::EndDiffSelection { card }
             | Self::MoveDiffSelection { card, .. }
             | Self::ClearDiffSelection { card }
@@ -888,7 +890,6 @@ impl RepositoryAction {
             | Self::Redo { card }
             | Self::BackToFiles { card }
             | Self::OpenExternal { card, .. }
-            | Self::StageSelected { card, .. }
             | Self::ApplyDiffSelection { card, .. }
             | Self::ApplyDiffHunk { card, .. }
             | Self::ApplySourceSurface { card, .. }
@@ -4623,6 +4624,42 @@ impl RepositoryRuntime {
                 .transpose()
                 .ok()?,
         })
+    }
+
+    /// Capture the selected row and its actual Git target separately: a followed
+    /// link keeps its row identity while staging the resolved target.
+    pub fn selected_staging_action(&self, card: CardId, stage: bool) -> Option<RepositoryAction> {
+        let command = if stage {
+            DiffPresentationCommand::StageFile
+        } else {
+            DiffPresentationCommand::UnstageFile
+        };
+        if !self.diff_presentation_available(command) {
+            return None;
+        }
+        Some(RepositoryAction::StageSelected {
+            identity: self.current_identity(card, self.selected_path()?.to_path_buf()),
+            stage,
+            selection: self.selected_staging_selection(stage)?,
+        })
+    }
+
+    /// A queued callback may only admit the exact offer the user activated.
+    /// Once admitted, the mutation queue owns the captured selection.
+    pub fn accepts_staging(
+        &self,
+        identity: &AsyncIdentity,
+        stage: bool,
+        selection: &crate::repository::PathSelection,
+    ) -> bool {
+        let command = if stage {
+            DiffPresentationCommand::StageFile
+        } else {
+            DiffPresentationCommand::UnstageFile
+        };
+        self.accepts_selected(identity)
+            && self.diff_presentation_available(command)
+            && self.selected_staging_selection(stage).as_ref() == Some(selection)
     }
 
     pub fn selected_discard_request(&self) -> Option<crate::repository::DiscardRequest> {
@@ -9422,32 +9459,8 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
     // Stage and unstage follow the file the buffer is; shared runtime guards
     // retain followed-target, saving and mutation behavior in every surface.
     if !runtime.reviews_pull_request() {
-        for (stage, icon, label, command) in [
-            (
-                true,
-                Icon::Plus,
-                "Stage file changes",
-                DiffPresentationCommand::StageFile,
-            ),
-            (
-                false,
-                Icon::Minus,
-                "Unstage file changes",
-                DiffPresentationCommand::UnstageFile,
-            ),
-        ] {
-            document_actions.push(
-                icon_button(
-                    icon,
-                    registered_command_hint(
-                        runtime,
-                        stage_file_hint_command(card, runtime, stage),
-                        label,
-                    ),
-                )
-                .on_press_maybe(runtime.diff_presentation_action(card, command))
-                .into(),
-            );
+        for stage in [true, false] {
+            document_actions.push(staging_file_control(card, runtime, stage));
         }
     }
     if !document_actions.is_empty() && runtime.source_surface != SourceSurface::Diff {
@@ -10469,9 +10482,9 @@ fn registered_diff_control<'a>(
                 choice: CommittedChoice::LastCommit,
                 ..
             } => Command::DiffHistory,
-            RepositoryAction::StageSelected { card, stage } => {
-                stage_file_hint_command(*card, runtime, *stage)
-            }
+            RepositoryAction::StageSelected {
+                identity, stage, ..
+            } => stage_file_hint_command(identity.card, runtime, *stage),
             RepositoryAction::DiscardEdits { .. } | RepositoryAction::RevertFile { .. } => {
                 Command::DiffRevert
             }
@@ -10521,18 +10534,69 @@ fn stage_file_hint_command(
     }
 }
 
+fn staging_control_owner(
+    action: &Option<RepositoryAction>,
+) -> Option<(AsyncIdentity, bool, crate::repository::PathSelection)> {
+    match action {
+        Some(RepositoryAction::StageSelected {
+            identity,
+            stage,
+            selection,
+        }) => Some((identity.clone(), *stage, selection.clone())),
+        _ => None,
+    }
+}
+
+fn staging_file_control(
+    card: CardId,
+    runtime: &RepositoryRuntime,
+    stage: bool,
+) -> Element<'_, RepositoryAction> {
+    let (icon, label, command) = if stage {
+        (
+            Icon::Plus,
+            "Stage file changes",
+            DiffPresentationCommand::StageFile,
+        )
+    } else {
+        (
+            Icon::Minus,
+            "Unstage file changes",
+            DiffPresentationCommand::UnstageFile,
+        )
+    };
+    let action = runtime.diff_presentation_action(card, command);
+    let owner = staging_control_owner(&action);
+    crate::ui_controls::owned(
+        owner,
+        icon_button(
+            icon,
+            registered_command_hint(
+                runtime,
+                stage_file_hint_command(card, runtime, stage),
+                label,
+            ),
+        )
+        .on_press_maybe(action),
+    )
+}
+
 fn labelled_diff_control<'a>(
     label: &'static str,
     tooltip: impl Into<std::borrow::Cow<'a, str>>,
     selected: bool,
     action: Option<RepositoryAction>,
 ) -> Element<'a, RepositoryAction> {
+    let owner = staging_control_owner(&action);
     crate::interaction::tooltip(
-        widget::button::custom(crate::design::caption(label))
-            .name(label)
-            .class(crate::ui_controls::control_style(selected, None))
-            .padding([space::XXS, space::S])
-            .on_press_maybe(action),
+        crate::ui_controls::owned(
+            owner,
+            widget::button::custom(crate::design::caption(label))
+                .name(label)
+                .class(crate::ui_controls::control_style(selected, None))
+                .padding([space::XXS, space::S])
+                .on_press_maybe(action),
+        ),
         tooltip,
     )
 }
@@ -17675,6 +17739,18 @@ mod tests {
             runtime.selected_staging_selection(false).is_none(),
             "the link's own staged bit must not unstage the link"
         );
+        let Some(RepositoryAction::StageSelected {
+            identity,
+            stage,
+            selection: captured,
+        }) = runtime.selected_staging_action(card, true)
+        else {
+            panic!("the followed target offers staging")
+        };
+        assert_eq!(identity.path, Path::new("AGENTS.md"));
+        assert!(stage);
+        assert_eq!(captured, selection);
+        assert!(runtime.accepts_staging(&identity, stage, &captured));
         assert!(runtime.can_show_diff());
 
         // A target with nothing to stage hides the command rather than
@@ -20249,6 +20325,341 @@ mod tests {
             generation: 1,
         };
         (runtime, identity)
+    }
+
+    #[test]
+    fn staging_callbacks_keep_the_selected_row_and_exact_current_offer() {
+        for stage in [true, false] {
+            for transition in [
+                "unchanged",
+                "path",
+                "reload",
+                "return_to_path",
+                "worktree",
+                "rename",
+                "unavailable",
+                "refresh",
+                "authority",
+                "dirty",
+                "saving",
+                "durability",
+                "review",
+            ] {
+                let card = CardId::new();
+                let (mut runtime, _) = diff_runtime(card);
+                runtime.document = DocumentState::Editable(EditorDocument::unlinked(
+                    "notes.txt".into(),
+                    "working\n".into(),
+                    blake3::hash(b"working\n"),
+                    false,
+                ));
+                let original = runtime.selected_staging_action(card, stage).unwrap();
+                let RepositoryAction::StageSelected {
+                    identity,
+                    stage: captured_stage,
+                    selection,
+                } = &original
+                else {
+                    unreachable!()
+                };
+                assert_eq!(*captured_stage, stage);
+                assert_eq!(original.card(), card);
+                assert!(runtime.accepts_staging(identity, stage, selection));
+                match transition {
+                    "unchanged" => {}
+                    "path" => runtime.selected.as_mut().unwrap().path = "other.txt".into(),
+                    "reload" => runtime.generation += 1,
+                    "return_to_path" => {
+                        runtime.selected.as_mut().unwrap().path = "other.txt".into();
+                        runtime.generation += 1;
+                        runtime.selected.as_mut().unwrap().path = "notes.txt".into();
+                        runtime.generation += 1;
+                    }
+                    "worktree" => runtime.descriptor.worktree = "/another-repository".into(),
+                    "rename" => {
+                        let file = runtime.selected.as_mut().unwrap();
+                        if stage {
+                            file.unstaged_old_path = Some("old-working.txt".into());
+                        } else {
+                            file.staged_old_path = Some("old-index.txt".into());
+                        }
+                    }
+                    "unavailable" => {
+                        let file = runtime.selected.as_mut().unwrap();
+                        if stage {
+                            file.unstaged = false;
+                        } else {
+                            file.staged = false;
+                        }
+                    }
+                    "refresh" => runtime.mutation_refresh_pending = true,
+                    "authority" => {
+                        runtime.set_git_mutation_unavailable_reason(Some("read only".into()))
+                    }
+                    "dirty" => {
+                        let DocumentState::Editable(document) = &mut runtime.document else {
+                            unreachable!()
+                        };
+                        document.dirty = true;
+                    }
+                    "saving" => {
+                        let DocumentState::Editable(document) = &mut runtime.document else {
+                            unreachable!()
+                        };
+                        document.active_save = Some(SaveTicket {
+                            id: 1,
+                            identity: identity.clone(),
+                            revision: 0,
+                            history_revision: 0,
+                            snapshot_source: document.content.text_snapshot(),
+                            snapshot: "working\n".into(),
+                            present: true,
+                            presence_id: 0,
+                        });
+                    }
+                    "durability" => {
+                        let DocumentState::Editable(document) = &mut runtime.document else {
+                            unreachable!()
+                        };
+                        document.durability_warning = Some("retry save".into());
+                    }
+                    "review" => {
+                        runtime.diff_basis = DiffBasis::PullRequest {
+                            number: 7,
+                            base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(),
+                            head: fixture_oid(1),
+                            merge_base: fixture_oid(2),
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    runtime.accepts_staging(identity, stage, selection),
+                    transition == "unchanged",
+                    "stale callback must retain its reviewed offer: {stage} / {transition}"
+                );
+                if let Some(RepositoryAction::StageSelected {
+                    identity,
+                    stage,
+                    selection,
+                }) = runtime.selected_staging_action(card, stage)
+                {
+                    assert!(runtime.accepts_staging(&identity, stage, &selection));
+                }
+            }
+        }
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        let file = runtime.selected.as_mut().unwrap();
+        file.staged_old_path = Some("index-old.txt".into());
+        file.unstaged_old_path = Some("working-old.txt".into());
+        for (stage, old_path) in [(true, "working-old.txt"), (false, "index-old.txt")] {
+            let Some(RepositoryAction::StageSelected {
+                identity,
+                stage: actual,
+                selection,
+            }) = runtime.selected_staging_action(card, stage)
+            else {
+                panic!("each half has its own offer")
+            };
+            assert_eq!(actual, stage);
+            assert_eq!(
+                selection.old_path.as_ref().unwrap().as_path(),
+                Path::new(old_path)
+            );
+            assert!(runtime.accepts_staging(&identity, stage, &selection));
+        }
+    }
+
+    #[test]
+    fn staging_controls_keep_native_press_with_their_exact_file_and_offer() {
+        use iced::advanced::clipboard;
+        use iced::runtime::{UserInterface, user_interface::Cache};
+        use iced::{Event, Point, Size, mouse};
+
+        fn control(
+            card: CardId,
+            runtime: &RepositoryRuntime,
+            stage: bool,
+            icon: bool,
+        ) -> Element<'_, RepositoryAction> {
+            if icon {
+                staging_file_control(card, runtime, stage)
+            } else {
+                diff_action_toolbar(card, runtime, 1000.0)
+            }
+        }
+        let mut renderer = headless_renderer();
+        let viewport = Size::new(1000.0, 600.0);
+        for icon in [false, true] {
+            for stage in [true, false] {
+                for transition in [
+                    "unchanged",
+                    "path",
+                    "reload",
+                    "rename",
+                    "worktree",
+                    "disabled_then_enabled",
+                ] {
+                    let card = CardId::new();
+                    let (mut runtime, _) = diff_runtime(card);
+                    let original = runtime.selected_staging_action(card, stage).unwrap();
+                    let RepositoryAction::StageSelected {
+                        identity,
+                        selection,
+                        ..
+                    } = &original
+                    else {
+                        unreachable!()
+                    };
+                    let (mut cache, pointer) = {
+                        let mut ui = UserInterface::build(
+                            control(card, &runtime, stage, icon),
+                            viewport,
+                            Cache::new(),
+                            &mut renderer,
+                        );
+                        let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+                        let label = if icon {
+                            if stage {
+                                "Stage file changes"
+                            } else {
+                                "Unstage file changes"
+                            }
+                        } else if stage {
+                            "Stage"
+                        } else {
+                            "Unstage"
+                        };
+                        let bounds = nodes
+                            .root()
+                            .iter()
+                            .chain(nodes.children())
+                            .find(|node| {
+                                node.node().role() == iced_accessibility::accesskit::Role::Button
+                                    && node
+                                        .node()
+                                        .label()
+                                        .is_some_and(|name| name.starts_with(label))
+                                    && !node.node().is_disabled()
+                            })
+                            .expect("the actual Stage control is enabled")
+                            .node()
+                            .bounds()
+                            .unwrap();
+                        let pointer = Point::new(
+                            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+                        );
+                        let mut messages = Vec::new();
+                        ui.update(
+                            &[Event::Mouse(mouse::Event::ButtonPressed(
+                                mouse::Button::Left,
+                            ))],
+                            mouse::Cursor::Available(pointer),
+                            &mut renderer,
+                            &mut clipboard::Null,
+                            &mut messages,
+                        );
+                        assert!(messages.is_empty(), "Stage answers on release");
+                        (ui.into_cache(), pointer)
+                    };
+                    match transition {
+                        "unchanged" => {}
+                        "path" => runtime.selected.as_mut().unwrap().path = "other.txt".into(),
+                        "reload" => runtime.generation += 1,
+                        "rename" => {
+                            let file = runtime.selected.as_mut().unwrap();
+                            if stage {
+                                file.unstaged_old_path = Some("old-working.txt".into());
+                            } else {
+                                file.staged_old_path = Some("old-index.txt".into());
+                            }
+                        }
+                        "worktree" => runtime.descriptor.worktree = "/another-repository".into(),
+                        "disabled_then_enabled" => {
+                            runtime.mutation_refresh_pending = true;
+                            assert!(!runtime.accepts_staging(identity, stage, selection));
+                            let ui = UserInterface::build(
+                                control(card, &runtime, stage, icon),
+                                viewport,
+                                cache,
+                                &mut renderer,
+                            );
+                            cache = ui.into_cache();
+                            runtime.mutation_refresh_pending = false;
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert_eq!(
+                        runtime.accepts_staging(identity, stage, selection),
+                        matches!(transition, "unchanged" | "disabled_then_enabled")
+                    );
+                    let mut ui = UserInterface::build(
+                        control(card, &runtime, stage, icon),
+                        viewport,
+                        cache,
+                        &mut renderer,
+                    );
+                    let cursor = mouse::Cursor::Available(pointer);
+                    let mut messages = Vec::new();
+                    ui.update(
+                        &[Event::Mouse(mouse::Event::ButtonReleased(
+                            mouse::Button::Left,
+                        ))],
+                        cursor,
+                        &mut renderer,
+                        &mut clipboard::Null,
+                        &mut messages,
+                    );
+                    assert_eq!(
+                        messages.len(),
+                        usize::from(transition == "unchanged"),
+                        "held press cannot transfer: icon={icon}, stage={stage}, {transition}"
+                    );
+                    if transition == "unchanged" {
+                        let [
+                            RepositoryAction::StageSelected {
+                                identity: actual,
+                                stage: actual_stage,
+                                selection: actual_selection,
+                            },
+                        ] = &messages[..]
+                        else {
+                            panic!("only the original captured stage offer activates")
+                        };
+                        assert_eq!(actual, identity);
+                        assert_eq!(*actual_stage, stage);
+                        assert_eq!(actual_selection, selection);
+                    }
+                    messages.clear();
+                    ui.update(
+                        &[
+                            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                        ],
+                        cursor,
+                        &mut renderer,
+                        &mut clipboard::Null,
+                        &mut messages,
+                    );
+                    let [
+                        RepositoryAction::StageSelected {
+                            identity,
+                            stage: actual,
+                            selection,
+                        },
+                    ] = &messages[..]
+                    else {
+                        panic!(
+                            "fresh press activates the current Stage offer: icon={icon}, stage={stage}, {transition}"
+                        )
+                    };
+                    assert_eq!(*actual, stage);
+                    assert!(runtime.accepts_staging(identity, stage, selection));
+                }
+            }
+        }
     }
 
     /// A ready text diff carrying the labels the staged basis produces.

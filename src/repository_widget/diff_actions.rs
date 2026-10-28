@@ -132,12 +132,14 @@ impl RepositoryRuntime {
                 card,
                 choice: CommittedChoice::LastCommit,
             },
-            StageFile | UnstageFile | StageOrUnstageFile => RepositoryAction::StageSelected {
-                card,
-                stage: command == StageFile
-                    || (command == StageOrUnstageFile
-                        && self.diff_presentation_available(StageFile)),
-            },
+            StageFile | UnstageFile | StageOrUnstageFile => {
+                return self.selected_staging_action(
+                    card,
+                    command == StageFile
+                        || (command == StageOrUnstageFile
+                            && self.diff_presentation_available(StageFile)),
+                );
+            }
             Revert if self.can_discard_edits() => RepositoryAction::DiscardEdits { card },
             Revert => RepositoryAction::RevertFile { card },
             Retry => RepositoryAction::RetryDiff { card },

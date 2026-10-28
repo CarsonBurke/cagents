@@ -2752,16 +2752,6 @@ impl Editor {
         })
     }
 
-    fn stage(&mut self, id: CardId, stage: bool) -> Task<Message> {
-        let Some(tab) = self.tab(id) else {
-            return Task::none();
-        };
-        let Some(selection) = tab.runtime.selected_staging_selection(stage) else {
-            return Task::none();
-        };
-        self.stage_selection(id, stage, vec![selection])
-    }
-
     fn refuse_git_mutation(&mut self, card: CardId) -> Task<Message> {
         self.notice = Some(self.tab(card).and_then(|tab| tab.sidebar.source_control.as_ref()).and_then(SourceControlModel::mutation_unavailable_reason).or_else(WorktreeAuthority::unsupported_reason).unwrap_or("The original worktree binding is unavailable. Reopen the worktree before changing Git state.").into());
         Task::none()
@@ -3638,8 +3628,20 @@ impl Application for Editor {
                     if let RepositoryAction::OpenFile { path, .. } = action {
                         return self.request_file(id, path);
                     }
-                    if let RepositoryAction::StageSelected { stage, .. } = action {
-                        return self.stage(id, stage);
+                    if let RepositoryAction::StageSelected {
+                        identity,
+                        stage,
+                        selection,
+                    } = action
+                    {
+                        if identity.card != id
+                            || !self.tab(id).is_some_and(|tab| {
+                                tab.runtime.accepts_staging(&identity, stage, &selection)
+                            })
+                        {
+                            return Task::none();
+                        }
+                        return self.stage_selection(id, stage, vec![selection]);
                     }
                     if let RepositoryAction::RefreshFiles { .. } = action {
                         return self.refresh(id);
@@ -8139,6 +8141,117 @@ mod tests {
             key, area: ChangeArea::Untracked, command: Group::Stage, selection_revision: stale_revision,
         });
         assert_eq!(git(root, &["diff", "--cached", "--name-only"]), "a.txt", "a captured header cannot retarget a later selection");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn standalone_staging_rejects_a_stale_file_callback_and_fresh_actions_target_only_the_new_file()
+    {
+        let directory = git_fixture();
+        let root = directory.path();
+        std::fs::write(root.join("other.txt"), "other original\n").unwrap();
+        git(root, &["add", "other.txt"]);
+        git(root, &["commit", "-m", "Add another file"]);
+        std::fs::write(root.join("tracked.txt"), "tracked change\n").unwrap();
+        std::fs::write(root.join("other.txt"), "other change\n").unwrap();
+        let mut app = editor();
+        let id = open_real_git(&mut app, root, Some("tracked.txt"));
+        let stale = app
+            .tab(id)
+            .unwrap()
+            .runtime
+            .selected_staging_action(id, true)
+            .expect("the original selected file offers Stage");
+        let task = app.update(Message::Repository(RepositoryAction::OpenFile {
+            card: id,
+            path: "other.txt".into(),
+        }));
+        run_tasks(&mut app, task);
+        assert_eq!(
+            app.tab(id).unwrap().runtime.selected_path(),
+            Some(Path::new("other.txt"))
+        );
+        let task = app.update(Message::Repository(stale));
+        run_tasks(&mut app, task);
+        assert!(git(root, &["diff", "--cached", "--name-only"]).is_empty());
+        assert!(app.git_groups.is_empty());
+        assert!(app.tabs.iter().all(|tab| tab.mutation.is_none()));
+
+        let stage = app
+            .tab(id)
+            .unwrap()
+            .runtime
+            .selected_staging_action(id, true)
+            .expect("the new selected file offers its own Stage action");
+        let task = app.update(Message::Repository(stage));
+        run_tasks(&mut app, task);
+        assert_eq!(git(root, &["diff", "--cached", "--name-only"]), "other.txt");
+        assert_eq!(git(root, &["show", ":tracked.txt"]), "original");
+        assert_eq!(git(root, &["show", ":other.txt"]), "other change");
+        let unstage = app
+            .tab(id)
+            .unwrap()
+            .runtime
+            .selected_staging_action(id, false)
+            .expect("the new selected file offers its own Unstage action");
+        let task = app.update(Message::Repository(unstage));
+        run_tasks(&mut app, task);
+        assert!(git(root, &["diff", "--cached", "--name-only"]).is_empty());
+        assert_eq!(git(root, &["show", ":tracked.txt"]), "original");
+        assert_eq!(git(root, &["show", ":other.txt"]), "other original");
+        assert_eq!(
+            std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
+            "tracked change\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("other.txt")).unwrap(),
+            "other change\n"
+        );
+        assert!(app.git_groups.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn standalone_admitted_staging_keeps_its_captured_file_after_navigation() {
+        let directory = git_fixture();
+        let root = directory.path();
+        std::fs::write(root.join("other.txt"), "other original\n").unwrap();
+        git(root, &["add", "other.txt"]);
+        git(root, &["commit", "-m", "Add another file"]);
+        std::fs::write(root.join("tracked.txt"), "tracked change\n").unwrap();
+        std::fs::write(root.join("other.txt"), "other change\n").unwrap();
+        let mut app = editor();
+        let id = open_real_git(&mut app, root, Some("tracked.txt"));
+        let captured = app
+            .tab(id)
+            .unwrap()
+            .runtime
+            .selected_staging_action(id, true)
+            .expect("the selected file offers Stage");
+        let admitted = app.update(Message::Repository(captured));
+        assert!(app.git_groups.get(root).unwrap().active.is_some());
+        let navigation = app.update(Message::Repository(RepositoryAction::OpenFile {
+            card: id,
+            path: "other.txt".into(),
+        }));
+        run_tasks(&mut app, navigation);
+        assert_eq!(
+            app.tab(id).unwrap().runtime.selected_path(),
+            Some(Path::new("other.txt"))
+        );
+        assert!(
+            git(root, &["diff", "--cached", "--name-only"]).is_empty(),
+            "the admitted worker has not been polled yet"
+        );
+        run_tasks(&mut app, admitted);
+        assert_eq!(
+            git(root, &["diff", "--cached", "--name-only"]),
+            "tracked.txt"
+        );
+        assert_eq!(git(root, &["show", ":tracked.txt"]), "tracked change");
+        assert_eq!(git(root, &["show", ":other.txt"]), "other original");
+        assert!(app.git_groups.is_empty());
+        assert!(app.tabs.iter().all(|tab| tab.mutation.is_none()));
     }
 
     #[test]

@@ -17018,7 +17018,12 @@ impl Application for Cagents {
                 }))
             }
 
-            Message::Repository(RepositoryAction::StageSelected { card, stage }) => {
+            Message::Repository(RepositoryAction::StageSelected {
+                identity,
+                stage,
+                selection,
+            }) => {
+                let card = identity.card;
                 if self.modal_is_open() {
                     return Task::none();
                 }
@@ -17033,9 +17038,9 @@ impl Application for Cagents {
                 else {
                     return Task::none();
                 };
-                let Some(selection) = runtime.selected_staging_selection(stage) else {
+                if !runtime.accepts_staging(&identity, stage, &selection) {
                     return Task::none();
-                };
+                }
                 let key = source.key.clone();
                 self.update(Message::Sidebar(if stage {
                     SidebarAction::Stage {
@@ -31129,6 +31134,170 @@ mod tests {
                 &Message::Sidebar(action)
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn repository_staging_refuses_departed_selection_before_queue_or_index_changes() {
+        async fn completion(task: Task<Message>) -> Message {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut stream = iced::runtime::task::into_stream(task)
+                    .expect("the accepted action starts its real worker");
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action
+                        && matches!(
+                            message,
+                            Message::Repository(RepositoryAction::FileLoadedAt { .. })
+                                | Message::SourceControlMutated { .. }
+                        )
+                    {
+                        return message;
+                    }
+                }
+                panic!("the worker finished without its expected completion");
+            })
+            .await
+            .expect("the file read or Git mutation must finish")
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Fixture")
+                .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Fixture")
+                .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output.stdout
+        };
+        git(&["init", "-q", "-b", "main"]);
+        for name in ["a.txt", "b.txt"] {
+            std::fs::write(root.join(name), "before\n").unwrap();
+        }
+        git(&["add", "a.txt", "b.txt"]);
+        git(&["commit", "-qm", "baseline"]);
+        for name in ["a.txt", "b.txt"] {
+            std::fs::write(root.join(name), "after\n").unwrap();
+        }
+
+        let mut app = context_inspector_test_app(true);
+        app.settings.editor_auto_save = false;
+        app.context_inspector_open = false;
+        let card = app.workspace.focused().unwrap();
+        let project = ProjectId::new();
+        let key = ActiveWorktreeKey {
+            project_id: project,
+            worktree_id: WorktreeId::new(),
+            canonical_path: root.clone(),
+        };
+        let view = RepositoryView {
+            project,
+            repository: root.clone(),
+            worktree: root.clone(),
+            selected_file: None,
+        };
+        app.card_state_mut(card).unwrap().kind = CardKind::Repository(view.clone());
+        app.cards.insert(
+            card,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::file_list_fixture(
+                view,
+                &["a.txt", "b.txt"],
+            ))),
+        );
+        let snapshot = RepositoryService::system("git")
+            .snapshot(&root, &CancellationToken::default())
+            .unwrap();
+        app.sidebar_model = SidebarModel::ready(
+            SidebarMode::Expanded,
+            vec![SidebarProject::new(
+                project,
+                RepositoryId::new(),
+                "staging fixture".into(),
+                root.clone(),
+                vec![sidebar::SidebarWorktree::from_durable(
+                    key.worktree_id,
+                    root.clone(),
+                    Some("main".into()),
+                )],
+                Vec::new(),
+            )],
+        )
+        .with_source_control(Some(SourceControlModel::ready(key.clone(), &snapshot)));
+        app.active_workspace = Some(root.clone());
+        assert!(app.sidebar_state.sync_active_worktree(
+            &app.sidebar_model,
+            &sidebar::SidebarFocus::Repository {
+                worktree: root.clone(),
+            },
+        ));
+
+        let read_a = app.update(Message::Repository(RepositoryAction::OpenFile {
+            card,
+            path: "a.txt".into(),
+        }));
+        drop(app.update(completion(read_a).await));
+        let CardRuntime::Repository(runtime) = &app.cards[&card] else {
+            unreachable!()
+        };
+        let held = runtime.selected_staging_action(card, true).unwrap();
+        let read_b = app.update(Message::Repository(RepositoryAction::OpenFile {
+            card,
+            path: "b.txt".into(),
+        }));
+        drop(app.update(completion(read_b).await));
+        let before = app
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .unwrap()
+            .groups()
+            .to_vec();
+        assert!(app.source_control_mutations.is_empty());
+
+        drop(app.update(Message::Repository(held)));
+        assert!(
+            app.source_control_mutations.is_empty(),
+            "a departed offer cannot enter the queue"
+        );
+        assert_eq!(
+            app.sidebar_model.source_control.as_ref().unwrap().groups(),
+            before.as_slice()
+        );
+        assert!(git(&["diff", "--cached", "--name-only", "-z"]).is_empty());
+
+        let CardRuntime::Repository(runtime) = &app.cards[&card] else {
+            unreachable!()
+        };
+        assert_eq!(runtime.selected_path(), Some(Path::new("b.txt")));
+        let fresh = runtime.selected_staging_action(card, true).unwrap();
+        let stage = app.update(Message::Repository(fresh));
+        assert!(matches!(
+            &app.source_control_mutations[&root].request,
+            Some(QueuedGitMutation::Stage(selection))
+                if selection.len() == 1 && selection[0].path.as_path() == Path::new("b.txt")
+        ));
+        let result = completion(stage).await;
+        assert!(matches!(
+            &result,
+            Message::SourceControlMutated { report: None, .. }
+        ));
+        // The completion releases the real queue. Its following refreshes are
+        // unrelated to captured-action admission and need not be polled here.
+        drop(app.update(result));
+        assert!(app.source_control_mutations.is_empty());
+        assert_eq!(git(&["diff", "--cached", "--name-only", "-z"]), b"b.txt\0");
+        assert_eq!(git(&["diff", "--name-only", "-z"]), b"a.txt\0");
     }
 
     #[test]
