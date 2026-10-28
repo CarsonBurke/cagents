@@ -414,6 +414,7 @@ struct Claude {
     pending: HashMap<String, Value>,
     retired: VecDeque<String>,
     controls: HashMap<String, Value>,
+    unknown_frames: HashSet<String>,
     streams: HashMap<String, Stream>,
     /// Blocks of the messages still streaming. Claude emits each block's
     /// assistant frame before that block stops, so a message's blocks are
@@ -492,6 +493,14 @@ struct Claude {
     forced_history: bool,
 }
 impl Claude {
+    fn warn_unknown(&mut self, kind: &str, name: &str) {
+        // Provider-controlled names cannot grow the rate-limit map forever.
+        let key = format!("{kind}:{}", super::diagnostic_preview(name.as_bytes(), 128));
+        if self.unknown_frames.len() < 64 && self.unknown_frames.insert(key.clone()) {
+            tracing::warn!(frame_type = %key, "Skipping unknown Claude protocol frame");
+        }
+    }
+
     fn remember_failure_receipt(&mut self, receipt: Option<[u8; 32]>) {
         if let Some(receipt) = receipt {
             self.failure_receipts.push_back(receipt);
@@ -1621,12 +1630,7 @@ impl Claude {
                         started_at: None,
                         at: None,
                     })),
-                    other => step.events.push(Event::Item(text_item(
-                        format!("{id}:{index}"),
-                        role,
-                        format!("Unsupported Claude content block {other}: {block}"),
-                        false,
-                    ))),
+                    other => self.warn_unknown("content", other),
                 }
             }
         }
@@ -2281,7 +2285,7 @@ impl Adapter for Claude {
                 title: None,
             });
         }
-        match string(&frame, "type") {
+        match required(&frame, "type")? {
             "control_request" => return self.permission(frame),
             "control_cancel_request" => {
                 self.retire(required(&frame, "request_id")?.into(), &mut step);
@@ -2863,7 +2867,7 @@ impl Adapter for Claude {
                 }
             }
             "keep_alive" => {}
-            other => return Err(format!("Unsupported Claude stream-json frame type {other}")),
+            other => self.warn_unknown("frame", other),
         }
         self.remember_failure_receipt(receipt);
         Ok(step)
@@ -4117,10 +4121,7 @@ impl Claude {
                         at: None,
                     },
                     other => {
-                        step.events.push(Event::Error {
-                            message: format!("Unsupported Claude streaming content block {other}"),
-                            fatal: false,
-                        });
+                        self.warn_unknown("stream content", other);
                         return Ok(());
                     }
                 };
@@ -4140,6 +4141,13 @@ impl Claude {
                 let index = event["index"].as_u64().ok_or("Claude delta has no index")?;
                 let delta = &event["delta"];
                 if matches!(string(delta, "type"), "signature_delta" | "citations_delta") {
+                    return Ok(());
+                }
+                if !matches!(
+                    string(delta, "type"),
+                    "text_delta" | "thinking_delta" | "input_json_delta"
+                ) {
+                    self.warn_unknown("stream delta", string(delta, "type"));
                     return Ok(());
                 }
                 let Some(item) = self
@@ -4276,10 +4284,7 @@ impl Claude {
                     fatal: false,
                 });
             }
-            other => step.events.push(Event::Error {
-                message: format!("Unsupported Claude API stream event {other}"),
-                fatal: false,
-            }),
+            other => self.warn_unknown("stream event", other),
         }
         Ok(())
     }
@@ -4611,10 +4616,7 @@ impl Claude {
             | "background_tasks_changed"
             | "vcs_state_changed"
             | "elicitation_complete" => {}
-            other => step.events.push(Event::Error {
-                message: format!("Unsupported Claude system event {other}: {frame}"),
-                fatal: false,
-            }),
+            other => self.warn_unknown("system", other),
         }
         Ok(())
     }
@@ -5599,6 +5601,108 @@ mod history_tests;
 mod tests {
     use super::*;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    #[test]
+    fn unknown_frames_do_not_interrupt_a_streamed_turn() {
+        let mut adapter = Claude::default();
+        adapter.busy = true;
+        for frame in [
+            json!({"type":"future_frame", "payload":"private protocol payload"}),
+            json!({"type":"system", "subtype":"future_system", "payload":"private protocol payload"}),
+        ] {
+            assert!(adapter.receive(frame).unwrap().events.is_empty());
+        }
+        adapter.receive(json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"m"}}})).unwrap();
+        for event in [
+            json!({"type":"future_stream_event"}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"future_content","opaque":"private protocol payload"}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"future_delta"}}),
+        ] {
+            assert!(
+                adapter
+                    .receive(json!({"type":"stream_event","event":event}))
+                    .unwrap()
+                    .events
+                    .is_empty()
+            );
+        }
+        adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}})).unwrap();
+        let delta = adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}})).unwrap();
+        assert!(
+            delta
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TextDelta { delta, .. } if delta == "answer"))
+        );
+        let result = adapter
+            .receive(
+                json!({"type":"result","subtype":"success","result":"answer","is_error":false}),
+            )
+            .unwrap();
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished {
+                outcome: crate::notifications::Kind::Succeeded,
+                ..
+            }
+        )));
+        assert!(
+            !result
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { .. }))
+        );
+        assert!(!adapter.busy);
+
+        let message = adapter.receive(json!({"type":"assistant","uuid":"unknown-body","message":{"role":"assistant","content":[{"type":"future_content","payload":"private protocol payload"}]}})).unwrap();
+        assert!(
+            !message
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Item(_) | Event::Error { .. }))
+        );
+    }
+
+    #[test]
+    fn unknown_frame_warnings_keep_bounded_names_and_cardinality() {
+        let mut adapter = Claude::default();
+        for index in 0..100 {
+            let name = format!("future-{index}-\u{1b}\n{}", "🦀".repeat(200));
+            adapter.receive(json!({"type":name})).unwrap();
+        }
+        assert_eq!(adapter.unknown_frames.len(), 64);
+        assert!(adapter.unknown_frames.iter().all(|key| {
+            key.len() <= "frame:".len() + 128 && !key.chars().any(char::is_control)
+        }));
+    }
+
+    #[test]
+    fn unknown_frame_tolerance_preserves_identity_and_known_protocol_errors() {
+        let mut adapter = Claude::default();
+        let session = uuid::Uuid::new_v4().to_string();
+        adapter.session_id = Some(session.clone());
+        assert!(
+            adapter
+                .receive(
+                    json!({"type":"future_frame","session_id":uuid::Uuid::new_v4().to_string()})
+                )
+                .unwrap_err()
+                .contains("different session ID")
+        );
+        assert_eq!(adapter.session_id.as_deref(), Some(session.as_str()));
+        assert!(adapter.receive(json!({"payload":"missing type"})).is_err());
+        let control = adapter.control(json!({"subtype":"initialize"})).unwrap();
+        let id = control.writes[0]["request_id"].clone();
+        assert!(adapter.receive(json!({"type":"control_response","response":{"request_id":id,"subtype":"future_response"}})).is_err());
+        let auth = adapter
+            .receive(json!({"type":"auth_status","error":"Authentication failed"}))
+            .unwrap();
+        assert!(auth.events.iter().any(|event| matches!(event, Event::Error { message, .. } if message == "Authentication failed")));
+        adapter.receive(json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"m"}}})).unwrap();
+        assert!(adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"unowned"}}})).is_err());
+        adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}})).unwrap();
+        assert!(adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta"}}})).is_err());
+    }
 
     #[test]
     fn unverified_owned_claude_image_history_never_downgrades_to_a_coincident_path() {

@@ -363,6 +363,25 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
     launch.provider.create_chat(launch)
 }
 
+/// A bounded diagnostic prefix, with terminal controls escaped. Inspect only
+/// the prefix needed for the preview, even when the provider sends a huge line.
+pub(crate) fn diagnostic_preview(bytes: &[u8], limit: usize) -> String {
+    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(limit)]);
+    let mut result = String::new();
+    for ch in text.chars() {
+        let escaped = if ch.is_control() {
+            ch.escape_default().to_string()
+        } else {
+            ch.to_string()
+        };
+        if result.len() + escaped.len() > limit {
+            break;
+        }
+        result.push_str(&escaped);
+    }
+    result
+}
+
 /// Reconstruct a saved reader without granting permission to launch a provider.
 /// Support is deliberately limited to adapters with a local history transport.
 pub(crate) fn create_history(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {

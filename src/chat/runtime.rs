@@ -2044,6 +2044,8 @@ impl Actor {
         let mut partial_started = None;
         let mut interrupt_sent = false;
         let mut interrupt_error = String::new();
+        let mut garbage_lines = 0usize;
+        let mut garbage_total = 0u64;
         loop {
             if self.stop.load(Ordering::Acquire) {
                 if closing.is_none() {
@@ -2092,13 +2094,34 @@ impl Actor {
                     frames_ready = true;
                     break;
                 }
-                let frame = serde_json::from_slice(&self.output[..newline]).map_err(|error| {
-                    format!("Unsupported provider stdout (expected JSON-lines): {error}")
-                })?;
+                let frame = match serde_json::from_slice(&self.output[..newline]) {
+                    Ok(frame) => {
+                        garbage_lines = 0;
+                        Some(frame)
+                    }
+                    Err(_) => {
+                        garbage_lines += 1;
+                        garbage_total = garbage_total.saturating_add(1);
+                        let preview =
+                            super::protocol::diagnostic_preview(&self.output[..newline], 200);
+                        if garbage_total <= 3 || garbage_total.is_power_of_two() {
+                            tracing::warn!(%preview, consecutive = garbage_lines, ignored_total = garbage_total, "Skipping non-JSON provider stdout line");
+                        }
+                        if garbage_lines >= 8 {
+                            return Err(format!(
+                                "Provider printed 8 consecutive invalid protocol lines. Last output: {preview}"
+                            ));
+                        }
+                        None
+                    }
+                };
                 self.output.drain(..=newline);
                 self.scanned = 0;
                 partial_started = None;
                 parsed += 1;
+                let Some(frame) = frame else {
+                    continue;
+                };
                 self.first_frame = true;
                 let step = self.adapter.receive(frame)?;
                 self.provider_step(step)?;
@@ -7166,14 +7189,72 @@ mod tests {
     }
 
     #[test]
-    fn non_json_stdout_fails_visibly_instead_of_scraping_ansi() {
+    fn json_line_noise_and_unknown_claude_frames_finish_through_the_real_pipe() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let provider = directory.path().join("claude");
+        std::fs::write(
+            &provider,
+            include_str!("../../tests/fixtures/claude-unknown-frames.py"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let launch = super::super::Launch {
+            provider: crate::agent::Provider::Claude,
+            recipe: crate::model::LaunchRecipe {
+                program: provider.to_string_lossy().into_owned(),
+                arguments: Vec::new(),
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+                unset_environment: Default::default(),
+            },
+            session_id: None,
+        };
+        let (spec, mut adapter) = super::super::protocol::claude::create(&launch).unwrap();
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        until(&handle, |snapshot| snapshot.ready);
+        handle
+            .command(Command::Prompt {
+                text: "Exercise unknown frames".into(),
+                attachments: Vec::new(),
+                mode: super::super::PromptMode::Send,
+            })
+            .unwrap();
+        let snapshot = until(&handle, |snapshot| {
+            !snapshot.busy
+                && snapshot.items.iter().any(|item| {
+                    matches!(&item.content, ItemContent::Text { text, .. }
+                        if text == "Fixture answer arrived after unknown frames and wrapper output.")
+                })
+        });
+        assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+        assert!(!snapshot.exited);
+        assert!(
+            snapshot
+                .items
+                .iter()
+                .all(|item| { !format!("{:?}", item.content).contains("fixture-private-payload") })
+        );
+        handle.close().unwrap();
+        assert!(handle.failure().is_none());
+    }
+
+    #[test]
+    fn json_line_noise_resets_its_failure_streak_after_each_valid_frame() {
+        let mut output = String::new();
+        for text in ["hello", " world"] {
+            output.push_str(&"wrapper diagnostic\n".repeat(7));
+            output.push_str(&format!("{}\n", json!({"text":text})));
+        }
         let spec = ProcessSpec {
             execution: None,
             messages: None,
             unset_environment: Default::default(),
             transport: TransportSpec::JsonLines,
             program: "/usr/bin/printf".into(),
-            arguments: vec!["not-json\\n".into()],
+            arguments: vec!["%s".into(), output],
             working_directory: std::env::temp_dir(),
             environment: BTreeMap::new(),
         };
@@ -7182,13 +7263,43 @@ mod tests {
         let handle =
             LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
         let snapshot = until(&handle, |snapshot| snapshot.exited);
-        assert!(
-            snapshot
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("Unsupported provider stdout")
+        assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+        assert_eq!(
+            unstamped(&snapshot.items),
+            vec![text("echo", "hello world")]
         );
+        handle.close().unwrap();
+        assert!(handle.failure().is_none());
+    }
+
+    #[test]
+    fn json_line_noise_fails_after_eight_lines_with_a_bounded_escaped_preview() {
+        let output = format!(
+            "{}\u{1b}[31m🦀{}\n",
+            "not-json\n".repeat(7),
+            "x".repeat(10_000)
+        );
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/usr/bin/printf".into(),
+            arguments: vec!["%s".into(), output],
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        let snapshot = until(&handle, |snapshot| snapshot.exited);
+        let error = snapshot.error.as_deref().unwrap();
+        assert!(error.contains("8 consecutive invalid protocol lines"));
+        assert!(error.contains("\\u{1b}[31m🦀"));
+        assert!(error.len() < 512);
+        assert!(!error.chars().any(char::is_control));
+        assert!(snapshot.items.is_empty());
         handle
             .close()
             .expect("failed provider can be explicitly retired");
@@ -7197,6 +7308,28 @@ mod tests {
             handle.failure().is_some(),
             "closing retains the failure diagnosis"
         );
+    }
+
+    #[test]
+    fn json_line_noise_does_not_swallow_a_valid_frames_adapter_error() {
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/usr/bin/printf".into(),
+            arguments: vec!["%s".into(), "wrapper noise\n{}\n".into()],
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        let snapshot = until(&handle, |snapshot| snapshot.exited);
+        assert_eq!(snapshot.error.as_deref(), Some("missing echo text"));
+        handle.close().unwrap();
+        assert!(handle.failure().is_some());
     }
 
     #[test]
