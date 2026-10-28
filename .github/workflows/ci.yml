@@ -30,6 +30,13 @@ jobs:
           persist-credentials: false
       - name: Install the pinned formatter
         run: rustup toolchain install 1.93.0 --profile minimal --component rustfmt
+      - name: Check development script contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/run-development-zig.py -v
+          PYTHONDONTWRITEBYTECODE=1 CHECK_FORMAT_CARGO_FIXTURE=1 python3 tests/check_format.py -v
+          sh -n scripts/run-development scripts/check-format
       - name: Check repository formatting
         run: scripts/check-format
 
