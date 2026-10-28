@@ -16153,12 +16153,15 @@ impl Application for Cagents {
                 self.begin_dirty_close(DirtyCloseIntent::Application(window), dirty)
             }
             Message::CancelTransientWorkClose => {
-                let had_cover = self.transient_work_close.take().is_some();
-                if had_cover
-                    && self.daemon_health_ui.confirmation
-                    && !self.daemon_health_is_covered()
-                {
-                    return self.focus_daemon_health_after_cover();
+                if self.transient_work_close.take().is_none() {
+                    return Task::none();
+                }
+                if self.daemon_health_ui.confirmation {
+                    return if self.daemon_health_is_covered() {
+                        self.focus_exposed_dialog()
+                    } else {
+                        self.focus_daemon_health_after_cover()
+                    };
                 }
                 let target = if self.automation_ui.draft_dialog_open() {
                     Some(crate::automation_ui::draft_dialog_focus_id())

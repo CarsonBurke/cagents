@@ -839,14 +839,41 @@ mod tests {
 
     #[test]
     fn transient_close_cancellation_only_resets_a_newly_exposed_daemon_review() {
-        for remaining_cover in [false, true] {
+        for scene in ["stale", "clean-device", "dirty-device"] {
             let mut app = daemon_restart_review_with_dirty_draft();
-            if remaining_cover {
+            let generation = app.daemon_health_ui.generation;
+            let target = app.daemon_health_ui.target.as_ref().unwrap().clone();
+            if scene != "stale" {
                 drop(app.update(Message::WindowCloseRequested(window::Id::unique())));
                 assert!(app.transient_work_close.is_some());
                 app.device_ui.open = true;
             }
-            drop(app.update(Message::CancelTransientWorkClose));
+            if scene == "dirty-device" {
+                use cosmic::widget::text_editor;
+                // The first request on fresh default Device state owns
+                // generation 1. Drop its worker task and inject the reply.
+                drop(app.update_device(device_ui::Action::Read("retained.txt".into())));
+                drop(app.update_device(device_ui::Action::Loaded {
+                    generation: 1,
+                    result: Ok(crate::device_service::Reply::Text("original".into())),
+                }));
+                drop(
+                    app.update_device(device_ui::Action::Edit(text_editor::Action::Edit(
+                        text_editor::Edit::Insert('!'),
+                    ))),
+                );
+                assert!(app.device_ui.dirty());
+            }
+            let restoring = app.update(Message::CancelTransientWorkClose);
+            if scene == "dirty-device" {
+                assert_eq!(
+                    super::super::tests::focused_element(app.dialog().unwrap(), restoring),
+                    Some(device_ui::file_editor_id()),
+                    "the mounted device editor owns focus above the daemon review"
+                );
+            } else {
+                assert_eq!(restoring.units(), 0, "{scene} cannot emit a focus effect");
+            }
             assert!(app.transient_work_close.is_none());
             assert_eq!(
                 app.daemon_health_ui.focus, 1,
@@ -854,6 +881,11 @@ mod tests {
             );
             assert!(app.daemon_health_ui.confirmation);
             assert!(!app.daemon_health_ui.restarting);
+            assert_eq!(app.daemon_health_ui.generation, generation);
+            assert!(Arc::ptr_eq(
+                app.daemon_health_ui.target.as_ref().unwrap(),
+                &target
+            ));
             assert!(app.automation_ui.draft_dirty());
         }
     }
