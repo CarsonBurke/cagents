@@ -2577,8 +2577,8 @@ fn window_geometry_message(event: &window::Event) -> Option<Message> {
     }
 }
 
-/// Whether the compositor tiles a window's right edge, which decides whether
-/// the shell offers a resize border along it.
+/// Whether a Wayland compositor fills the screen with a window or tiles its
+/// right edge, either of which removes the shell's resize border along it.
 fn window_edge_message(event: &iced::Event, window: window::Id) -> Option<Message> {
     use cosmic::cctk::sctk::reexports::csd_frame::WindowState;
     use iced::event::{PlatformSpecific, wayland};
@@ -2586,10 +2586,11 @@ fn window_edge_message(event: &iced::Event, window: window::Id) -> Option<Messag
     match event {
         iced::Event::PlatformSpecific(PlatformSpecific::Wayland(wayland::Event::Window(
             wayland::WindowEvent::WindowState(state),
-        ))) => Some(Message::WindowRightEdgeTiled(
+        ))) => Some(Message::WindowEdgeState {
             window,
-            state.contains(WindowState::TILED_RIGHT),
-        )),
+            filled: state.intersects(WindowState::MAXIMIZED | WindowState::FULLSCREEN),
+            right_edge_tiled: state.contains(WindowState::TILED_RIGHT),
+        }),
         _ => None,
     }
 }
@@ -4481,7 +4482,12 @@ pub enum Message {
     },
     WindowScaleFactorChanged(f32),
     WindowResized(f32, f32),
-    WindowRightEdgeTiled(window::Id, bool),
+    WindowEdgeState {
+        window: window::Id,
+        filled: bool,
+        right_edge_tiled: bool,
+    },
+    WindowFilled(window::Id, bool),
     ActivateUi {
         token: Option<String>,
     },
@@ -5257,6 +5263,10 @@ pub struct Cagents {
     /// it has been mapped. The native Opened and Resized events replace it.
     window_width: f32,
     window_height: f32,
+    /// Whether the main window is maximized or fullscreen, so the shell offers
+    /// no resize border. Tracked here rather than read from `core`, which only
+    /// learns it from Wayland window states.
+    window_filled: bool,
     /// Whether the compositor reports the main window's right edge as tiled,
     /// so the shell offers no resize border there.
     right_edge_tiled: bool,
@@ -6156,11 +6166,32 @@ impl Cagents {
     /// rightmost pane's scrollbar would lie wholly in that border. Maximized,
     /// fullscreen and right-tiled windows have no border there and stay flush.
     fn window_edge_inset(&self) -> f32 {
-        if self.core.window.is_maximized || self.right_edge_tiled {
+        if self.window_filled || self.right_edge_tiled {
             0.0
         } else {
             design::WINDOW_RESIZE_BORDER / self.settings.ui_scale
         }
+    }
+
+    /// The window width left to the interface beside the resize border.
+    fn content_width(&self) -> f32 {
+        (self.window_width - self.window_edge_inset()).max(0.0)
+    }
+
+    /// Reads whether the main window is maximized or fullscreen from the
+    /// windowing backend, which is what the shell's resize border consults.
+    /// Wayland also reports this through window states, but X11 has no such
+    /// event, so every resize asks again.
+    fn query_window_filled(&self) -> Task<Message> {
+        let Some(window) = self.core.main_window_id() else {
+            return Task::none();
+        };
+        iced::window::is_maximized(window)
+            .then(move |maximized| {
+                iced::window::mode(window)
+                    .map(move |mode| maximized || mode == iced::window::Mode::Fullscreen)
+            })
+            .map(move |filled| cosmic::Action::App(Message::WindowFilled(window, filled)))
     }
 
     fn new_pane_fraction(&self, configured: f32) -> f32 {
@@ -6176,12 +6207,12 @@ impl Cagents {
                 self.settings
                     .inspector_width
                     .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
-                    .min(self.window_width.max(0.0))
+                    .min(self.content_width())
                     * self.context_inspector_progress()
             } else {
                 0.0
             };
-            (self.window_width - sidebar - inspector).max(0.0)
+            (self.content_width() - sidebar - inspector).max(0.0)
         } else {
             self.workspace.viewport_width()
         };
@@ -12496,7 +12527,7 @@ impl Cagents {
             .inspector_width
             .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
         Some(
-            if self.window_width - navigation - inspector
+            if self.content_width() - navigation - inspector
                 >= crate::workspace::WidthLimits::default().minimum
             {
                 InspectorLayout::Docked
@@ -14144,6 +14175,7 @@ impl Application for Cagents {
             window_scale_factor,
             window_width: 1_600.0,
             window_height: 900.0,
+            window_filled: false,
             right_edge_tiled: false,
             settings_path,
             settings_write_blocked,
@@ -14304,7 +14336,7 @@ impl Application for Cagents {
             };
         let _ = app
             .workspace
-            .resize_viewport((app.window_width - sidebar_width - inspector_width).max(0.0));
+            .resize_viewport((app.content_width() - sidebar_width - inspector_width).max(0.0));
         #[cfg(feature = "latency-harness")]
         if app.latency_fixture.is_some() {
             app.cards = app
@@ -16615,9 +16647,20 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
-            Message::WindowRightEdgeTiled(window, tiled) => {
+            Message::WindowEdgeState {
+                window,
+                filled,
+                right_edge_tiled,
+            } => {
                 if self.core.main_window_id() == Some(window) {
-                    self.right_edge_tiled = tiled;
+                    self.window_filled = filled;
+                    self.right_edge_tiled = right_edge_tiled;
+                }
+                Task::none()
+            }
+            Message::WindowFilled(window, filled) => {
+                if self.core.main_window_id() == Some(window) {
+                    self.window_filled = filled;
                 }
                 Task::none()
             }
@@ -16632,7 +16675,7 @@ impl Application for Cagents {
                     self.context_inspector_open = false;
                     self.context_inspector_transition = None;
                 }
-                self.sync_context_overlay_state()
+                Task::batch([self.sync_context_overlay_state(), self.query_window_filled()])
             }
             Message::ActivateUi { token } => self.activate_main_window(token),
             Message::ActivateSession { session, token } => {
@@ -18496,7 +18539,7 @@ impl Application for Cagents {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let window_width = self.window_width;
+        let content_width = self.content_width();
         let sidebar_mode = self.projects_sidebar_mode();
         let sidebar = sidebar::view_cached(
             &self.sidebar_model,
@@ -18750,7 +18793,7 @@ impl Application for Cagents {
                 .settings
                 .inspector_width
                 .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
-                .min(window_width.max(0.0));
+                .min(content_width);
             let progress = self.context_inspector_progress();
             let visible_width = width * progress;
             let splitter: Element<'_, Message> = Splitter::new(
@@ -23327,7 +23370,17 @@ mod tests {
             assert_eq!(app.window_edge_inset(), inset, "{flags:?}");
         }
 
-        app.core.window.is_maximized = true;
+        // A maximized or fullscreen window has no border at all, whether the
+        // Wayland state or the backend query reports it.
+        let maximized = window_edge_message(&state(WindowState::MAXIMIZED), main)
+            .expect("window state event");
+        let _ = app.update(maximized);
+        assert_eq!(app.window_edge_inset(), 0.0);
+        let _ = app.update(Message::WindowFilled(main, false));
+        assert_eq!(app.window_edge_inset(), design::WINDOW_RESIZE_BORDER);
+        let _ = app.update(Message::WindowFilled(window::Id::unique(), true));
+        assert_eq!(app.window_edge_inset(), design::WINDOW_RESIZE_BORDER);
+        let _ = app.update(Message::WindowFilled(main, true));
         assert_eq!(app.window_edge_inset(), 0.0);
         assert!(window_edge_message(&iced::Event::Window(window::Event::Focused), main).is_none());
     }
@@ -28904,6 +28957,7 @@ mod tests {
             window_scale_factor: 1.0,
             window_width: 1_600.0,
             window_height: 900.0,
+            window_filled: false,
             right_edge_tiled: false,
             core,
             settings_path: None,

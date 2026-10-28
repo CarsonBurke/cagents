@@ -24,9 +24,13 @@ const DRAG_RESIZE_SUPPORTED: bool = true;
 const DRAG_RESIZE_SUPPORTED: bool = false;
 
 /// If supported by winit, returns a closure that implements cursor resize support.
+///
+/// `resize_border` is in logical pixels. It is scaled by the window's current
+/// scale factor on every event, so the border follows the window between
+/// outputs of different scales.
 pub fn event_func(
     window: &dyn winit::window::Window,
-    border_size: f64,
+    resize_border: f64,
 ) -> Option<
     Box<
         dyn FnMut(
@@ -38,19 +42,19 @@ pub fn event_func(
     if DRAG_RESIZE_SUPPORTED {
         // Keep track of cursor when it is within a resizeable border.
         let mut cursor_prev_resize_direction = None;
-        let mut cursor_position = None;
 
         Some(Box::new(
             move |window: &dyn winit::window::Window,
                   window_event: &winit::event::WindowEvent|
                   -> bool {
+                let border_size = resize_border * window.scale_factor();
+
                 // Keep track of border resize state and set cursor icon when in range
                 match window_event {
                     winit::event::WindowEvent::PointerMoved {
                         position,
                         ..
                     } => {
-                        cursor_position = Some(*position);
                         let location =
                             resize_direction(window, *position, border_size);
                         if location != cursor_prev_resize_direction {
@@ -71,15 +75,15 @@ pub fn event_func(
                                 finger_id: _, ..
                             },
                         primary: true,
+                        position,
                         ..
                     } => {
-                        // The window state can change between the last motion
-                        // and this press, as when it is tiled or maximized
-                        // under a still pointer, so the edge is checked again.
+                        // The press is located by its own position, not the
+                        // last motion: the pointer can re-enter the window
+                        // without moving, and the window state can change
+                        // under a still pointer.
                         if let Some(direction) =
-                            cursor_position.and_then(|position| {
-                                resize_direction(window, position, border_size)
-                            })
+                            resize_direction(window, *position, border_size)
                         {
                             let _res = window.drag_resize_window(direction);
                             return true;
