@@ -934,7 +934,7 @@ fn held_child_diagnostic_controls_do_not_retarget_a_replacement_incident() {
                 &mut clipboard::Null,
                 &mut messages,
             );
-            drop(ui);
+            let released_cache = ui.into_cache();
             let mut actions: Vec<_> = messages
                 .into_iter()
                 .filter_map(|message| match message {
@@ -974,58 +974,92 @@ fn held_child_diagnostic_controls_do_not_retarget_a_replacement_incident() {
                         );
                     }
                 }
-            } else {
-                assert_eq!(actions.len(), 1, "same incident keeps its held press");
-                let action = actions.pop().unwrap();
-                assert!(match &action {
-                    Action::CopyFailure(owner, key) if copy =>
-                        *owner == target && key == &original_key,
-                    Action::ToggleFailure(owner, key) if !copy =>
-                        *owner == target && key == &original_key,
-                    _ => false,
-                });
-                if copy {
-                    let task = app.handle_chat_ui(action);
-                    let contents = tokio::runtime::Builder::new_current_thread()
-                        .enable_time()
-                        .build()
-                        .unwrap()
-                        .block_on(async {
-                            let mut effects = iced::runtime::task::into_stream(task)
-                                .expect("same-incident Copy emits the actual clipboard effect");
-                            tokio::time::timeout(Duration::from_secs(1), async {
-                                while let Some(effect) = effects.next().await {
-                                    if let iced::runtime::Action::Clipboard(
-                                        iced::runtime::clipboard::Action::Write {
-                                            contents, ..
-                                        },
-                                    ) = effect
-                                    {
-                                        return contents;
-                                    }
-                                }
-                                panic!("diagnostic Copy must publish complete current originals");
-                            })
-                            .await
-                            .expect("bounded clipboard effect")
-                        });
-                    assert_eq!(
-                        contents,
-                        if scenario == 2 {
-                            replacement.as_str()
-                        } else {
-                            original.as_str()
-                        }
-                    );
-                } else {
-                    drop(app.handle_chat_ui(action));
-                    assert!(
-                        runtime(&app, target)
-                            .failure_ui
-                            .expanded
-                            .contains(&original_key)
+                // Cancelling an old press must leave the replacement usable.
+                // Retain the real widget cache after release so this checks
+                // recovery of the same mounted controls, not a fresh tree.
+                let mut ui =
+                    UserInterface::build(view(&app, target), size, released_cache, &mut renderer);
+                let pointer =
+                    control_bounds(&ui.a11y_nodes(iced::mouse::Cursor::Unavailable), &name)
+                        .center();
+                let mut fresh_messages = Vec::new();
+                for event in [
+                    iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: pointer }),
+                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                        iced::mouse::Button::Left,
+                    )),
+                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                        iced::mouse::Button::Left,
+                    )),
+                ] {
+                    ui.update(
+                        &[event],
+                        iced::mouse::Cursor::Available(pointer),
+                        &mut renderer,
+                        &mut clipboard::Null,
+                        &mut fresh_messages,
                     );
                 }
+                drop(ui);
+                actions = fresh_messages
+                    .into_iter()
+                    .filter_map(|message| match message {
+                        Message::ChatUi(
+                            action @ (Action::ToggleFailure(..) | Action::CopyFailure(..)),
+                        ) => Some(action),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(actions.len(), 1, "replacement accepts a fresh click");
+            } else {
+                assert_eq!(actions.len(), 1, "same incident keeps its held press");
+            }
+            let action = actions.pop().unwrap();
+            assert!(match &action {
+                Action::CopyFailure(owner, key) if copy => *owner == target && key == &current_key,
+                Action::ToggleFailure(owner, key) if !copy =>
+                    *owner == target && key == &current_key,
+                _ => false,
+            });
+            if copy {
+                let task = app.handle_chat_ui(action);
+                let contents = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let mut effects = iced::runtime::task::into_stream(task)
+                            .expect("current-incident Copy emits the actual clipboard effect");
+                        tokio::time::timeout(Duration::from_secs(1), async {
+                            while let Some(effect) = effects.next().await {
+                                if let iced::runtime::Action::Clipboard(
+                                    iced::runtime::clipboard::Action::Write { contents, .. },
+                                ) = effect
+                                {
+                                    return contents;
+                                }
+                            }
+                            panic!("diagnostic Copy must publish complete current originals");
+                        })
+                        .await
+                        .expect("bounded clipboard effect")
+                    });
+                assert_eq!(
+                    contents,
+                    if change_details {
+                        replacement.as_str()
+                    } else {
+                        original.as_str()
+                    }
+                );
+            } else {
+                drop(app.handle_chat_ui(action));
+                assert!(
+                    runtime(&app, target)
+                        .failure_ui
+                        .expanded
+                        .contains(&current_key)
+                );
             }
         }
     }
