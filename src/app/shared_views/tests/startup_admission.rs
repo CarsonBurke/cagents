@@ -2149,6 +2149,234 @@ fn failed_seed_retry_cannot_authorize_a_same_scope_canonical_successor() {
 }
 
 #[test]
+fn failed_scope_retry_preserves_a_changed_deleted_or_closed_sibling_and_both_drafts() {
+    if isolated("failed_scope_retry_preserves_a_changed_deleted_or_closed_sibling_and_both_drafts")
+    {
+        return;
+    }
+    use crate::app::workspace_model_sync::ModelUpdate;
+    let daemon = ScriptedDaemon::start();
+    for changed in [
+        "session",
+        "proof",
+        "recipe",
+        "canonical_deleted",
+        "deleted_before_refusal",
+        "canonical_retired",
+        "canonical_moved",
+        "local_closed",
+        "local_removed",
+        "title",
+        "legacy_unshared",
+    ] {
+        let (mut app, active, hidden, pane, identity) = cached_chat();
+        let mut sibling = pane.clone();
+        sibling.id = CardId::new();
+        let CardKind::Chat(session) = &mut sibling.kind else {
+            unreachable!()
+        };
+        session.id = TerminalId::new();
+        session.launch.session_id = Some("00000000-0000-4000-8000-000000000002".into());
+        let mut sibling_card = app.card_state(pane.id).unwrap().clone();
+        sibling_card.id = sibling.id;
+        sibling_card.kind = sibling.kind.clone();
+        {
+            let durable = Arc::make_mut(&mut app.durable);
+            durable.cards.push(sibling_card);
+            durable
+                .channels
+                .iter_mut()
+                .find(|channel| channel.id == hidden)
+                .unwrap()
+                .cards
+                .push(sibling.id);
+        }
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        let drafts = HashMap::from([
+            (pane.id, "Unchanged retry pane draft  ".to_owned()),
+            (sibling.id, "Original failed sibling draft  ".to_owned()),
+        ]);
+        app.chat_ui = chat_ui::State::with_drafts(drafts.clone());
+        let startup = app.initialize_runtimes();
+        settle(&mut app, startup);
+        let mut view = View::empty(hidden);
+        view.panes = vec![pane.clone()];
+        if changed != "legacy_unshared" {
+            view.panes.push(sibling.clone());
+        }
+        let canonical = model(identity, active, hidden, view);
+        let connected = app.apply_workspace_model_update(ModelUpdate::Connected(canonical.clone()));
+        settle(&mut app, connected);
+        let scope = Scope::Channel(hidden);
+        let failed = framed_seed(queued_seed(&rx, &scope), canonical.clone(), true);
+        if changed == "deleted_before_refusal" {
+            let mut deleted = canonical.clone();
+            deleted.sequence += 1;
+            deleted
+                .views
+                .iter_mut()
+                .find(|view| view.scope == scope)
+                .unwrap()
+                .panes
+                .retain(|entry| entry.id != sibling.id);
+            let read = app.apply_workspace_model_update(ModelUpdate::Read(deleted));
+            settle(&mut app, read);
+        }
+        apply_seed_updates(&mut app, failed);
+        let retry = app
+            .shared_chat_admission_failure(pane.id)
+            .unwrap()
+            .retry()
+            .unwrap();
+        let sibling_retry = app
+            .shared_chat_admission_failure(sibling.id)
+            .unwrap()
+            .retry()
+            .unwrap();
+        let attempt = app.shared_views.seed_admissions[&scope].attempt;
+
+        // The retained action belongs to A. Only B's current source/placement
+        // changes in the actual newer watcher snapshot, while projection waits.
+        let mut newer = canonical;
+        newer.sequence += 1;
+        let hidden_view = newer
+            .views
+            .iter_mut()
+            .find(|view| view.scope == scope)
+            .unwrap();
+        if matches!(
+            changed,
+            "canonical_deleted"
+                | "deleted_before_refusal"
+                | "canonical_retired"
+                | "canonical_moved"
+                | "legacy_unshared"
+        ) {
+            hidden_view.panes.retain(|entry| entry.id != sibling.id);
+            if changed == "canonical_retired" {
+                hidden_view.retired.push(sibling.id);
+            }
+        } else {
+            let entry = hidden_view
+                .panes
+                .iter_mut()
+                .find(|entry| entry.id == sibling.id)
+                .unwrap();
+            let CardKind::Chat(session) = &mut entry.kind else {
+                unreachable!()
+            };
+            match changed {
+                "session" => session.id = TerminalId::new(),
+                "proof" => session.proof.as_mut().unwrap().host_incarnation = "new-sibling".into(),
+                "recipe" => session
+                    .launch
+                    .recipe
+                    .arguments
+                    .push("new-sibling-source".into()),
+                "title" => entry.title = "New sibling title only".into(),
+                "local_closed" | "local_removed" => {}
+                _ => unreachable!(),
+            }
+        }
+        if changed == "canonical_moved" {
+            newer
+                .views
+                .iter_mut()
+                .find(|view| view.scope == Scope::Channel(active))
+                .unwrap()
+                .panes
+                .push(sibling.clone());
+        }
+        let read = app.apply_workspace_model_update(ModelUpdate::Read(newer.clone()));
+        settle(&mut app, read);
+        if changed == "local_closed" {
+            app.card_state_mut(sibling.id).unwrap().existence = Existence::Closing {
+                operation_id: crate::model::OperationId::new(),
+            };
+        } else if changed == "local_removed" {
+            Arc::make_mut(&mut app.durable)
+                .channels
+                .iter_mut()
+                .find(|channel| channel.id == hidden)
+                .unwrap()
+                .cards
+                .retain(|id| *id != sibling.id);
+        }
+        app.publish_view_changes();
+        let before_cards = [pane.id, sibling.id].map(|id| app.card_state(id).unwrap().clone());
+        let before_members = app.local_view_cards(&scope);
+        let task = app.retry_shared_chat_admission(retry);
+        settle(&mut app, task);
+        if matches!(changed, "title" | "legacy_unshared") {
+            let ModelEdit::SeedView { panes, .. } = queued_seed(&rx, &scope) else {
+                unreachable!()
+            };
+            assert!(
+                panes
+                    .iter()
+                    .any(|entry| entry.id == pane.id && entry.kind == pane.kind)
+            );
+            assert!(
+                panes
+                    .iter()
+                    .any(|entry| entry.id == sibling.id && entry.kind == sibling.kind)
+            );
+        } else {
+            assert!(
+                rx.is_empty(),
+                "{changed}: A cannot release B's failed admission"
+            );
+            let seed = &app.shared_views.seed_admissions[&scope];
+            assert!(seed.failed && !seed.retry_available);
+            assert_eq!(seed.attempt, attempt);
+            assert!(app.shared_views.seeding.contains(&scope));
+            let failure = app.shared_chat_admission_failure(pane.id).unwrap();
+            assert!(failure.retry().is_none());
+            assert!(failure.message().contains("Close and reopen this window"));
+            let stale = app.retry_shared_chat_admission(sibling_retry);
+            settle(&mut app, stale);
+            assert!(
+                rx.is_empty(),
+                "a sibling's retained action cannot reopen that scope either"
+            );
+        }
+        assert_eq!(
+            app.workspace_model, newer,
+            "{changed}: preserve authoritative sibling changes"
+        );
+        assert_eq!(
+            [pane.id, sibling.id].map(|id| app.card_state(id).unwrap().clone()),
+            before_cards
+        );
+        assert_eq!(app.local_view_cards(&scope), before_members);
+        for original in [&pane, &sibling] {
+            let CardKind::Chat(source) = &original.kind else {
+                unreachable!()
+            };
+            assert!(app.chat_awaiting_admission(original.id));
+            assert_eq!(
+                app.durable.pending_chat_admissions.get(&original.id),
+                Some(source)
+            );
+            let CardRuntime::Chat(runtime) = app.cards.get(&original.id).unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(&runtime.session, source);
+            assert_eq!(
+                app.persistent_workspace().chat_drafts.get(&original.id),
+                drafts.get(&original.id)
+            );
+        }
+        assert!(
+            daemon.requests().is_empty(),
+            "retry never attaches either provider"
+        );
+    }
+}
+
+#[test]
 fn closed_or_full_publisher_reports_seed_failure_without_admitting_cached_chat() {
     if isolated("closed_or_full_publisher_reports_seed_failure_without_admitting_cached_chat") {
         return;

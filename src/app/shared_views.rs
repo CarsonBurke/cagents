@@ -18,9 +18,12 @@ struct SeedAdmission {
     registry: uuid::Uuid,
     panes: Vec<Pane>,
     closed: Vec<CardId>,
+    shared_cards: HashSet<CardId>,
     attempt: Option<uuid::Uuid>,
     failed: bool,
     retry_available: bool,
+    // Preserve every failed source even if a later projection prunes its UI row.
+    failed_chats: Vec<SharedChatAdmissionRetry>,
 }
 
 /// A retry authorizes only another shared-view admission request, never a
@@ -35,6 +38,7 @@ struct SharedChatAdmissionRetrySource {
     scope: Scope,
     registry: uuid::Uuid,
     attempt: uuid::Uuid,
+    was_shared: bool,
 }
 
 impl std::fmt::Debug for SharedChatAdmissionRetry {
@@ -304,10 +308,12 @@ impl Cagents {
         seed.retry_available = retry_available;
         let registry = seed.registry;
         let panes = seed.panes.clone();
+        let shared_cards = seed.shared_cards.clone();
         let members = self
             .local_view_cards(&scope)
             .into_iter()
             .collect::<HashSet<_>>();
+        let mut failed_chats = Vec::new();
         for pane in panes {
             let CardKind::Chat(source) = pane.kind else {
                 continue;
@@ -322,27 +328,89 @@ impl Cagents {
             {
                 continue;
             }
+            let retry = SharedChatAdmissionRetry(Arc::new(SharedChatAdmissionRetrySource {
+                card: pane.id,
+                source,
+                scope: scope.clone(),
+                registry,
+                attempt,
+                was_shared: shared_cards.contains(&pane.id),
+            }));
+            failed_chats.push(retry.clone());
             self.shared_views.admission_failures.insert(
                 pane.id,
                 SharedChatAdmissionFailure {
                     message: error.clone(),
                     retry_available,
-                    retry: SharedChatAdmissionRetry(Arc::new(SharedChatAdmissionRetrySource {
-                        card: pane.id,
-                        source,
-                        scope: scope.clone(),
-                        registry,
-                        attempt,
-                    })),
+                    retry,
                 },
             );
         }
+        self.shared_views
+            .seed_admissions
+            .get_mut(&scope)
+            .unwrap()
+            .failed_chats = failed_chats;
         // Keep `seeding` set: an ordinary Read or persist must not immediately
         // resend a permanently refused request. Only an exact explicit retry
         // starts another attempt; canonical admission still requires its ACK.
         self.status = Some(TransientNotice::warning(format!(
             "Could not reconnect saved conversations: {error}. Their original sessions and unsent text are unchanged."
         )));
+    }
+
+    fn shared_chat_retry_local_source_current(
+        &self,
+        source: &SharedChatAdmissionRetrySource,
+    ) -> bool {
+        if self.workspace_model.identity != source.registry
+            || self.pane_close_owned(source.card)
+            || self.durable.local_only_cards.contains(&source.card)
+            || self.durable.pending_chat_admissions.get(&source.card) != Some(&source.source)
+            || !matches!(self.card_state(source.card), Some(card)
+                if card.existence.is_open() && matches!(&card.kind,
+                    CardKind::Chat(session) if session == &source.source))
+            || !self.chat_awaiting_admission(source.card)
+            || !matches!(self.cards.get(&source.card), Some(CardRuntime::Chat(runtime))
+                if runtime.session == source.source)
+        {
+            return false;
+        }
+        let mut owners = self
+            .local_view_scopes()
+            .into_iter()
+            .filter(|scope| self.local_view_cards(scope).contains(&source.card));
+        if owners.next().as_ref() != Some(&source.scope) || owners.next().is_some() {
+            return false;
+        }
+        true
+    }
+
+    fn shared_chat_retry_source_current(&self, source: &SharedChatAdmissionRetrySource) -> bool {
+        if !self.shared_chat_retry_local_source_current(source) {
+            return false;
+        }
+        let mut canonical = self
+            .workspace_model
+            .views
+            .iter()
+            .filter(|view| view.panes.iter().any(|pane| pane.id == source.card));
+        let Some(view) = canonical.next() else {
+            // A refused legacy migration may not have a canonical pane yet.
+            // Once observed, its later deletion cannot be treated as migration.
+            return !source.was_shared
+                && !self
+                    .workspace_model
+                    .views
+                    .iter()
+                    .any(|view| view.retired.contains(&source.card));
+        };
+        view.scope == source.scope
+            && !view.retired.contains(&source.card)
+            && canonical.next().is_none()
+            && view.panes.iter().filter(|pane| pane.id == source.card).all(
+                |pane| matches!(&pane.kind, CardKind::Chat(session) if session == &source.source),
+            )
     }
 
     pub(super) fn retry_shared_chat_admission(
@@ -357,68 +425,68 @@ impl Cagents {
         {
             return Task::none();
         }
-        let retry = &retry.0;
+        let source = &retry.0;
         let seed_matches = self
             .shared_views
             .seed_admissions
-            .get(&retry.scope)
+            .get(&source.scope)
             .is_some_and(|seed| {
                 seed.failed
                     && seed.retry_available
-                    && seed.registry == retry.registry
-                    && seed.attempt == Some(retry.attempt)
+                    && seed.registry == source.registry
+                    && seed.attempt == Some(source.attempt)
+                    && seed.failed_chats.contains(&retry)
             });
         if self.workspace_inputs_blocked()
             || self.focused_repository_is_saving()
-            || self.pane_close_owned(retry.card)
-            || self.workspace_model.identity != retry.registry
+            || self.workspace_model.identity != source.registry
             || !seed_matches
-            || self.shared_views.blocked.contains(&retry.scope)
-            || self.durable.local_only_cards.contains(&retry.card)
-            || self.durable.pending_chat_admissions.get(&retry.card) != Some(&retry.source)
-            || !matches!(self.card_state(retry.card), Some(card)
-                if card.existence.is_open() && matches!(&card.kind,
-                    CardKind::Chat(session) if session == &retry.source))
-            || !self.chat_awaiting_admission(retry.card)
-            || !matches!(self.cards.get(&retry.card), Some(CardRuntime::Chat(runtime))
-                if runtime.session == retry.source)
+            || self.shared_views.blocked.contains(&source.scope)
+            || !self.shared_chat_retry_local_source_current(source)
         {
-            return Task::none();
-        }
-        let mut owners = self
-            .local_view_scopes()
-            .into_iter()
-            .filter(|scope| self.local_view_cards(scope).contains(&retry.card));
-        if owners.next().as_ref() != Some(&retry.scope) || owners.next().is_some() {
             return Task::none();
         }
         let mut canonical = self
             .workspace_model
             .views
             .iter()
-            .filter(|view| view.panes.iter().any(|pane| pane.id == retry.card));
-        if let Some(view) = canonical.next() {
-            if view.scope != retry.scope || canonical.next().is_some() {
-                return Task::none();
+            .filter(|view| view.panes.iter().any(|pane| pane.id == source.card));
+        if canonical
+            .next()
+            .is_some_and(|view| view.scope != source.scope)
+            || canonical.next().is_some()
+        {
+            return Task::none();
+        }
+        // Retrying any card releases admission for the whole scope. Every
+        // originally failed source must still authorize that same release,
+        // including siblings whose obsolete failure row was pruned meanwhile.
+        let sources_current = self.shared_views.seed_admissions[&source.scope]
+            .failed_chats
+            .iter()
+            .all(|failed| self.shared_chat_retry_source_current(&failed.0));
+        if !sources_current {
+            self.shared_views
+                .seed_admissions
+                .get_mut(&source.scope)
+                .unwrap()
+                .retry_available = false;
+            for failure in self
+                .shared_views
+                .admission_failures
+                .values_mut()
+                .filter(|failure| failure.retry.0.scope == source.scope)
+            {
+                failure.retry_available = false;
+                failure.message = "This saved workspace changed. Close and reopen this window to reconnect. Saved drafts and sessions are retained".into();
             }
-            if view.panes.iter().any(|pane| {
-                pane.id == retry.card
-                    && !matches!(&pane.kind, CardKind::Chat(session) if session == &retry.source)
-            }) {
-                // The old local runtime remains inert until seed admission.
-                // Its retry must not authorize the canonical successor instead.
-                if let Some(failure) = self.shared_views.admission_failures.get_mut(&retry.card) {
-                    failure.retry_available = false;
-                    failure.message = "This saved conversation changed in another window. Close and reopen this window to reconnect. Saved drafts and sessions are retained".into();
-                }
-                return Task::none();
-            }
+            return Task::none();
         }
         self.shared_views
             .admission_failures
-            .retain(|_, failure| failure.retry.0.scope != retry.scope);
-        self.shared_views.seed_admissions.remove(&retry.scope);
-        self.shared_views.seeding.remove(&retry.scope);
+            .retain(|_, failure| failure.retry.0.scope != source.scope);
+        self.shared_views.seed_admissions.remove(&source.scope);
+        self.shared_views.seeding.remove(&source.scope);
         self.publish_view_changes();
         Task::none()
     }
@@ -1210,9 +1278,17 @@ impl Cagents {
                             registry: self.workspace_model.identity,
                             panes: legacy.clone(),
                             closed: closed.clone(),
+                            shared_cards: self
+                                .workspace_model
+                                .views
+                                .iter()
+                                .filter(|view| view.scope == scope)
+                                .flat_map(|view| view.panes.iter().map(|pane| pane.id))
+                                .collect(),
                             attempt: None,
                             failed: false,
                             retry_available: true,
+                            failed_chats: Vec::new(),
                         },
                     );
                     self.shared_views
