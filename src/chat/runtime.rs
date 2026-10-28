@@ -471,6 +471,13 @@ impl LocalHandle {
             }
             goal_directory = Some((identity, directory));
         }
+        // Ordinary UI chats have no managed Agent policy row. Only their
+        // authenticated holder's original pin can supply missing Goal checks.
+        // Keep this separate from run, spawn and cleanup custody.
+        let goal_launch_context = goal_launch_context(
+            spec.execution.clone(),
+            adopted_native.then_some(goal_directory.as_ref()).flatten(),
+        )?;
         let (wake, reader) = UnixStream::pair().map_err(|e| e.to_string())?;
         nonblocking(&wake)?;
         nonblocking(&reader)?;
@@ -532,6 +539,7 @@ impl LocalHandle {
                 let _owned_socket = owned_socket;
                 let mut actor = Actor {
                     launch_context: spec.execution.clone(),
+                    goal_launch_context,
                     launch_account_scope,
                     goal_directory,
                     goal_legacy_server,
@@ -1925,6 +1933,25 @@ type GoalDirectory = (
     Arc<std::fs::File>,
 );
 
+/// Only an authenticated adopted holder may supply a missing Goal policy.
+/// Identity-only context cannot spawn a provider or replace a supplied policy.
+fn goal_launch_context(
+    context: Option<Arc<super::protocol::ExecutionContext>>,
+    adopted_directory: Option<&GoalDirectory>,
+) -> Result<Option<Arc<super::protocol::ExecutionContext>>, String> {
+    if context.is_some() {
+        return Ok(context);
+    }
+    adopted_directory
+        .map(|(identity, directory)| {
+            super::protocol::validate_launch_directory(directory, *identity)?;
+            Ok(Arc::new(super::protocol::ExecutionContext::restored(
+                *identity,
+            )))
+        })
+        .transpose()
+}
+
 /// Work-authorizing goal operations require both original physical pins. A
 /// retained pathname or a later account selection cannot replace either pin.
 fn validate_goal_work(
@@ -2066,6 +2093,7 @@ struct Actor {
     goal_legacy_server: Option<super::protocol::ServerIdentity>,
     launch_account_scope: Option<crate::account::scope::LaunchAccountScope>,
     launch_context: Option<Arc<super::protocol::ExecutionContext>>,
+    goal_launch_context: Option<Arc<super::protocol::ExecutionContext>>,
     working_directory: std::path::PathBuf,
     child: Option<ChildGuard>,
     native_holder: Option<super::native_holder::Holder>,
@@ -2181,7 +2209,7 @@ impl Actor {
             self.launch_account_scope.as_ref(),
             self.adapter.server_identity(),
             self.goal_legacy_server.as_ref(),
-            self.launch_context.as_deref(),
+            self.goal_launch_context.as_deref(),
             self.goal_directory.as_ref(),
             &self.working_directory,
         )
@@ -2733,7 +2761,7 @@ impl Actor {
                 && let Err(error) = validate_goal_work(
                     self.launch_account_scope.as_ref(),
                     self.adapter.server_identity(),
-                    self.launch_context.as_deref(),
+                    self.goal_launch_context.as_deref(),
                     self.goal_directory.as_ref(),
                     &self.working_directory,
                 )
@@ -2932,7 +2960,7 @@ impl Actor {
             validate_goal_work(
                 self.launch_account_scope.as_ref(),
                 self.adapter.server_identity(),
-                self.launch_context.as_deref(),
+                self.goal_launch_context.as_deref(),
                 self.goal_directory.as_ref(),
                 &self.working_directory,
             )?;
@@ -2946,13 +2974,13 @@ impl Actor {
                     validate_goal_work(
                         self.launch_account_scope.as_ref(),
                         self.adapter.server_identity(),
-                        self.launch_context.as_deref(),
+                        self.goal_launch_context.as_deref(),
                         self.goal_directory.as_ref(),
                         &self.working_directory,
                     )?;
                 } else {
                     validate_goal_directory(
-                        self.launch_context.as_deref(),
+                        self.goal_launch_context.as_deref(),
                         self.goal_directory.as_ref(),
                         &self.working_directory,
                     )?;
@@ -6239,6 +6267,45 @@ mod tests {
             handle.close().unwrap();
             assert!(handle.pinned_launch_directory().is_err());
         }
+    }
+
+    #[test]
+    fn adopted_ui_goal_context_keeps_original_pin_and_supplied_policy_separate() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original");
+        let moved = root.path().join("moved");
+        let other = root.path().join("other");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let pin = Arc::new(std::fs::File::open(&original).unwrap());
+        let identity =
+            crate::agent_execution::DirectoryIdentity::from_metadata(&pin.metadata().unwrap());
+        let directory = (identity, pin);
+        assert!(goal_launch_context(None, None).unwrap().is_none());
+        let goal = goal_launch_context(None, Some(&directory))
+            .unwrap()
+            .unwrap();
+        assert_eq!(goal.directory_identity().unwrap(), Some(identity));
+        assert!(goal.directory_descriptor().is_none());
+        validate_goal_directory(Some(&goal), Some(&directory), &original).unwrap();
+
+        let expected = crate::agent_execution::DirectoryIdentity::from_metadata(
+            &std::fs::metadata(&other).unwrap(),
+        );
+        let managed = Arc::new(super::super::protocol::ExecutionContext::restored(expected));
+        let retained = goal_launch_context(Some(managed.clone()), Some(&directory))
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&retained, &managed));
+        assert!(validate_goal_directory(Some(&retained), Some(&directory), &original).is_err());
+        assert!(validate_goal_directory(Some(&goal), None, &original).is_err());
+
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        super::super::protocol::validate_launch_directory(&directory.1, identity).unwrap();
+        assert!(validate_goal_directory(Some(&goal), Some(&directory), &original).is_err());
+        assert_eq!(goal.directory_identity().unwrap(), Some(identity));
+        assert!(goal.directory_descriptor().is_none());
     }
 
     #[test]

@@ -915,6 +915,16 @@ impl Fixture {
                 &crate::agent_execution::HostedSession::Chat(source.clone()),
             )
             .unwrap();
+        assert!(
+            crate::host::agent_execution::registry(&original)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .retained_agent_directory(&retained)
+                .unwrap()
+                .is_none(),
+            "ordinary paired UI recovery must not depend on a managed Agent row"
+        );
         worker.preserve_for_restart().unwrap();
         drop(actor);
         drop(original);
