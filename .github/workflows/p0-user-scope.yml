@@ -212,7 +212,7 @@ jobs:
                           continue
                       comm = (entry / 'comm').read_text().strip()
                       args = (entry / 'cmdline').read_bytes().split(b'\0')
-                      owned = comm == 'cagentsd' or any(
+                      owned = comm in {'cagentsd', test_executable.name[:15]} or any(
                           str(root).encode() in arg for root in fixture_roots for arg in args)
                       if owned:
                           found.append({'pid': int(entry.name), 'comm': comm,
@@ -227,6 +227,12 @@ jobs:
               assert hashlib.sha256(test_executable.read_bytes()).hexdigest() == test_identity['sha256']
               phase = evidence / f'parent-{index}'
               phase.mkdir(mode=0o700)
+              baseline = remaining_fixture_processes()
+              (phase / 'preflight.json').write_text(json.dumps({
+                  'natural_authority_absent': 'CAGENTS_AGENT_AUTHORITY' not in os.environ,
+                  'preexisting_fixture_processes': baseline,
+              }, indent=2) + '\n')
+              assert not baseline, 'Unexpected fixture process before exact parent'
               before = set(pathlib.Path('/tmp').glob('updater1513-*'))
               assert not before, 'Unexpected pre-existing saved-ready fixture root'
               handles = {}
@@ -292,6 +298,7 @@ jobs:
                         'expected_selected_count': 1, 'outer_runtime_bound_seconds': 150,
                         'duration_seconds': time.monotonic() - started, 'child_logs': child_logs,
                         'test_executable': test_identity, 'helper': helper_identity,
+                        'preexisting_fixture_processes': baseline,
                         'child_log_monitoring': {'complete': len(child_logs) == 2 and not capture_errors,
                                                  'errors': capture_errors,
                                                  'scope': 'Observational only; missing capture is not a product test failure'},
