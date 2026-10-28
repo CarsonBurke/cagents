@@ -138,7 +138,7 @@ pub(super) fn close_sessions(
     Ok(())
 }
 
-fn may_have_retained_owner(session: &crate::chat::Session) -> bool {
+pub(super) fn may_have_retained_owner(session: &crate::chat::Session) -> bool {
     session.owned_codex_listener.is_some() || session.native_continuity.retains_provider()
 }
 

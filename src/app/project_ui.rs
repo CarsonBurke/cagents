@@ -983,6 +983,11 @@ impl Cagents {
                     if let Some(terminal) = &session.terminal {
                         record(terminal.id);
                     }
+                    if super::channel_ui::may_have_retained_owner(session) {
+                        // An unchanneled worktree pane can retain a provider
+                        // which the daemon's live actor inventory omits.
+                        ownership.retained_chats.push(session.clone());
+                    }
                 }
                 _ => {}
             }
@@ -999,6 +1004,24 @@ impl Cagents {
         // callback. Keep its owner and the committed close pending until it settles.
         if let Some(reason) = self.project_review_checkout_blocker(id) {
             self.status = Some(TransientNotice::warning(reason));
+            return Task::none();
+        }
+        if self.durable.cards.iter().any(|card| {
+            card.existence.is_open()
+                && matches!(&card.kind, CardKind::Chat(session)
+                    if super::channel_ui::may_have_retained_owner(session)
+                        && closure.ownership.contains(session.id, &session.launch.recipe.working_directory, &closure.scope)
+                        && !closure.ownership.chat_closed(session))
+        }) {
+            // A same-ID replacement can arrive after the worker acknowledged
+            // an older source. That receipt cannot retire the new conversation.
+            self.project_ui.close_in_flight.remove(&id);
+            self.project_ui.close_cancellations.remove(&id);
+            self.project_ui.close_failed.insert(id);
+            self.status = Some(TransientNotice::error(
+                "A project conversation changed before its close was confirmed. Review it and retry removal."
+                    .into(),
+            ));
             return Task::none();
         }
         let Some(repository) = self.project_ui.closing.remove(&id) else {
@@ -2469,7 +2492,7 @@ fn close_sessions_in_scope_with_context(
             continue;
         }
         let id = session.id;
-        if let Err(error) = client.close_chat(session) {
+        if let Err(error) = client.close_chat(session.clone()) {
             client = context
                 .connect_at(&socket)
                 .map_err(|reconnect| format!("Could not verify chat {id}: {reconnect}"))?;
@@ -2482,7 +2505,32 @@ fn close_sessions_in_scope_with_context(
             {
                 return Err(format!("Could not close chat {id}: {error}"));
             }
+            if super::channel_ui::may_have_retained_owner(&session) {
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    return Err("Project removal was cancelled.".into());
+                }
+                // A retained provider may survive disappearance from the live
+                // actor inventory. Demand its exact close receipt as well.
+                client
+                    .close_retained_chat(session.clone())
+                    .map_err(|error| format!("Could not confirm retained chat {id}: {error}"))?;
+            }
         }
+        project_sessions.record_chat_closed(session);
+    }
+    for session in project_sessions.retained_chats.clone() {
+        if !project_sessions.contains(session.id, &session.launch.recipe.working_directory, &scope)
+            || project_sessions.chat_closed(&session)
+        {
+            continue;
+        }
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err("Project removal was cancelled.".into());
+        }
+        client
+            .close_retained_chat(session.clone())
+            .map_err(|error| format!("Could not confirm retained chat {}: {error}", session.id))?;
+        project_sessions.record_chat_closed(session);
     }
     // A native chat may retain its source PTY. Close the actor first, then
     // inventory terminals again because that close may have retired the PTY.
@@ -2576,9 +2624,26 @@ struct ProjectSessionOwnership {
     protected: HashSet<TerminalId>,
     directories: std::collections::HashMap<TerminalId, Vec<PathBuf>>,
     local_database: Option<PathBuf>,
+    /// Exact local owners survive an empty or non-owning daemon inventory.
+    retained_chats: Vec<crate::chat::Session>,
+    /// Only these exact sources received a positive teardown acknowledgement.
+    closed_chats: HashMap<TerminalId, Vec<crate::chat::Session>>,
 }
 
 impl ProjectSessionOwnership {
+    fn chat_closed(&self, session: &crate::chat::Session) -> bool {
+        self.closed_chats
+            .get(&session.id)
+            .is_some_and(|closed| closed.contains(session))
+    }
+
+    fn record_chat_closed(&mut self, session: crate::chat::Session) {
+        self.closed_chats
+            .entry(session.id)
+            .or_default()
+            .push(session);
+    }
+
     fn extend_saved(
         &mut self,
         owners: Vec<(TerminalId, crate::persistence::SavedSessionOwner)>,
