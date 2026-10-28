@@ -12038,6 +12038,11 @@ impl Cagents {
     }
 
     fn set_workspace_surfaces_visible(&mut self, workspace_visible: bool) {
+        #[cfg(feature = "latency-harness")]
+        if self.latency_fixture.is_some() {
+            self.sync_native_fixture_visibility();
+            return;
+        }
         let visible_cards = self
             .durable
             .cards
@@ -14181,6 +14186,7 @@ impl Application for Cagents {
                 .is_some_and(|fixture| !fixture.automatic())
             {
                 chat_ui::resident_fixture::install(&mut app);
+                app.sync_native_fixture_visibility();
                 app.window_width /= app.settings.ui_scale;
                 app.window_height /= app.settings.ui_scale;
                 let theme = app.settings.app_theme.resolve(app.core.system_theme());

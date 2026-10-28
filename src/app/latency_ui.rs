@@ -197,7 +197,13 @@ impl Cagents {
                 if generation == self.workspace_view_generation =>
             {
                 if matches!(event, WorkspaceViewportEvent::Reordered { .. })
-                    || self.workspace_inputs_blocked()
+                    || (self.workspace_inputs_blocked()
+                        && matches!(
+                            event,
+                            WorkspaceViewportEvent::DragScrolled(_)
+                                | WorkspaceViewportEvent::PointerFocused(_)
+                                | WorkspaceViewportEvent::PointerRested(_)
+                        ))
                     || (matches!(event, WorkspaceViewportEvent::PointerRested(_))
                         && !self.settings.focus_follows_mouse)
                 {
@@ -353,6 +359,7 @@ impl Cagents {
             self.workspace.focused(),
             &update.transitions,
         );
+        self.sync_native_fixture_visibility();
         self.chrome_ui.tabs_focus = self.workspace.focused();
         let focus = self
             .workspace
