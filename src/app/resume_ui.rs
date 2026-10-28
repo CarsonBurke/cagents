@@ -536,9 +536,10 @@ fn index(
                 // it, and one cagents never named by its first message,
                 // unless the reader renamed it here.
                 std::collections::hash_map::Entry::Occupied(mut occupied) => {
-                    if let Some((card, untitled)) = occupied.get_mut().take()
+                    if let Some((card, untitled)) = *occupied.get()
                         && (found.named || found.titled && untitled)
                     {
+                        occupied.insert(None);
                         titles.push((card, found.title));
                     }
                 }
