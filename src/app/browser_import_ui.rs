@@ -338,7 +338,7 @@ mod tests {
                     drop(app.update_browser_import(Action::Extracted(
                         generation,
                         Arc::new(Transfer {
-                            cookies: Mutex::new(None),
+                            cookies: Mutex::new(Some(Vec::new())),
                             profiles: 0,
                             skipped: 0,
                             errors,
