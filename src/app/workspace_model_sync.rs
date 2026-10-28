@@ -5068,6 +5068,124 @@ mod tests {
         overlapping_passive_load_after_project_close(true);
     }
 
+    #[test]
+    fn a_replacement_registry_retires_old_passive_reads_without_cancelling_explicit_loads() {
+        for still_shared in [false, true] {
+            for failed in [false, true] {
+                let checkout = git_checkout().expect("the registry fixture requires Git");
+                let repository = canonical_repository(&checkout.path().join(".git")).unwrap();
+                let explicit_checkout = git_checkout().expect("the explicit fixture requires Git");
+                let explicit_repository =
+                    canonical_repository(&explicit_checkout.path().join(".git")).unwrap();
+                let shared_project = ModelProject {
+                    repository: repository.clone(),
+                    name: "passive registry source".into(),
+                    kind: ProjectKind::Git,
+                    ordinal: 1,
+                };
+                let mut app = super::super::tests::context_inspector_test_app(true);
+                let published = intercept_publishes(&mut app);
+                let cards = app.durable.cards.clone();
+                let focused = app.workspace.focused();
+                app.workspace_model = WorkspaceModel {
+                    projects: vec![shared_project.clone()],
+                    ..registry(Vec::new())
+                };
+                let stale = first_message(app.reconcile_workspace_model()).unwrap();
+                let Message::RepositoryLoaded {
+                    project_id,
+                    generation,
+                    ..
+                } = &stale
+                else {
+                    panic!("the original passive read must produce its real completion")
+                };
+                let (old, old_generation) = (*project_id, *generation);
+                let old_cancel = app.refresh_ui.projects[&old].clone();
+                let explicit = first_message(app.repository_load_task(
+                    explicit_repository.clone(),
+                    None,
+                    false,
+                ))
+                .unwrap();
+                let Message::RepositoryLoaded {
+                    project_id,
+                    generation,
+                    ..
+                } = &explicit
+                else {
+                    panic!("the independent explicit read must finish")
+                };
+                let (explicit_id, explicit_generation) = (*project_id, *generation);
+                let explicit_cancel = app.refresh_ui.projects[&explicit_id].clone();
+                let mut replacement = registry(Vec::new());
+                if still_shared {
+                    replacement.projects.push(shared_project);
+                }
+                let replacement_read =
+                    app.apply_workspace_model_update(ModelUpdate::Connected(replacement));
+                assert!(
+                    old_cancel.is_cancelled(),
+                    "a replaced registry cannot retain admission to its old passive read"
+                );
+                assert!(!app.workspace_model_loads.contains_key(&old));
+                assert!(!app.repository_generations.contains_key(&old));
+                assert!(!explicit_cancel.is_cancelled());
+                assert_eq!(
+                    app.repository_generations[&explicit_id],
+                    explicit_generation
+                );
+                let current = if still_shared {
+                    let (&id, (_, generation)) = app.workspace_model_loads.iter().next().unwrap();
+                    assert_ne!(id, old);
+                    assert!(*generation > old_generation);
+                    Some((id, *generation))
+                } else {
+                    assert!(app.workspace_model_loads.is_empty());
+                    assert!(!app.workspace_model_opens.contains(&repository));
+                    None
+                };
+                drain(&published);
+                let stale = if failed {
+                    Message::RepositoryLoaded {
+                        open_cards: false,
+                        project_id: old,
+                        generation: old_generation,
+                        result: Err("old registry's delayed failure".into()),
+                    }
+                } else {
+                    stale
+                };
+                assert!(first_message(app.update(stale)).is_none());
+                assert!(app.sidebar_model.projects.is_empty());
+                assert!(
+                    drain(&published).is_empty(),
+                    "an old passive completion cannot publish into the replacement registry"
+                );
+                if let Some((id, generation)) = current {
+                    assert_eq!(
+                        app.workspace_model_loads[&id],
+                        (repository.clone(), generation)
+                    );
+                    let loaded = first_message(replacement_read)
+                        .expect("the new registry admits its own real read");
+                    drop(app.update(loaded));
+                    assert_eq!(app.project_for_repository(&repository), Some(id));
+                } else {
+                    assert!(first_message(replacement_read).is_none());
+                }
+                drop(app.update(explicit));
+                assert_eq!(
+                    app.project_for_repository(&explicit_repository),
+                    Some(explicit_id)
+                );
+                assert_eq!(app.durable.cards, cards);
+                assert_eq!(app.workspace.focused(), focused);
+                assert_eq!(app.active_workspace, None);
+            }
+        }
+    }
+
     /// A channel another window created arrives as a scope, not as a
     /// conversation: N windows adopting one channel must not start N chats in
     /// it, and the cards inside a channel are each window's own business.
