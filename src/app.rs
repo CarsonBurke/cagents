@@ -6178,6 +6178,16 @@ impl Cagents {
         (self.window_width - self.window_edge_inset()).max(0.0)
     }
 
+    /// Re-derives what depends on [`Self::content_width`], such as whether the
+    /// inspector docks or overlays, after the window or its inset changes.
+    fn content_width_changed(&mut self) -> Task<Message> {
+        if self.focused_repository_is_saving() && self.context_inspector_is_overlay() {
+            self.context_inspector_open = false;
+            self.context_inspector_transition = None;
+        }
+        self.sync_context_overlay_state()
+    }
+
     /// Reads whether the main window is maximized or fullscreen from the
     /// windowing backend, which is what the shell's resize border consults.
     /// Wayland also reports this through window states, but X11 has no such
@@ -16652,17 +16662,29 @@ impl Application for Cagents {
                 filled,
                 right_edge_tiled,
             } => {
-                if self.core.main_window_id() == Some(window) {
-                    self.window_filled = filled;
-                    self.right_edge_tiled = right_edge_tiled;
+                if self.core.main_window_id() != Some(window) {
+                    return Task::none();
                 }
-                Task::none()
+                let inset = self.window_edge_inset();
+                self.window_filled = filled;
+                self.right_edge_tiled = right_edge_tiled;
+                if self.window_edge_inset() == inset {
+                    Task::none()
+                } else {
+                    self.content_width_changed()
+                }
             }
             Message::WindowFilled(window, filled) => {
-                if self.core.main_window_id() == Some(window) {
-                    self.window_filled = filled;
+                if self.core.main_window_id() != Some(window) {
+                    return Task::none();
                 }
-                Task::none()
+                let inset = self.window_edge_inset();
+                self.window_filled = filled;
+                if self.window_edge_inset() == inset {
+                    Task::none()
+                } else {
+                    self.content_width_changed()
+                }
             }
             Message::WindowResized(width, height) => {
                 if height.is_finite() && height > 0.0 {
@@ -16671,11 +16693,7 @@ impl Application for Cagents {
                 if width.is_finite() && width > 0.0 {
                     self.window_width = width;
                 }
-                if self.focused_repository_is_saving() && self.context_inspector_is_overlay() {
-                    self.context_inspector_open = false;
-                    self.context_inspector_transition = None;
-                }
-                Task::batch([self.sync_context_overlay_state(), self.query_window_filled()])
+                Task::batch([self.content_width_changed(), self.query_window_filled()])
             }
             Message::ActivateUi { token } => self.activate_main_window(token),
             Message::ActivateSession { session, token } => {
@@ -23383,6 +23401,33 @@ mod tests {
         let _ = app.update(Message::WindowFilled(main, true));
         assert_eq!(app.window_edge_inset(), 0.0);
         assert!(window_edge_message(&iced::Event::Window(window::Event::Focused), main).is_none());
+    }
+
+    #[test]
+    fn a_resize_border_change_alone_redocks_the_inspector() {
+        let mut app = context_inspector_test_app(true);
+        let main = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        app.settings.ui_scale = 1.0;
+        let _ = app.update(Message::WindowFilled(main, true));
+        // The narrowest window that still docks the inspector without a
+        // border, so the border's width alone decides between the layouts.
+        let docked = (600..3000)
+            .map(|width| width as f32)
+            .find(|&width| {
+                app.window_width = width;
+                !app.context_inspector_is_overlay()
+            })
+            .expect("a width that docks the inspector");
+        let _ = app.update(Message::WindowResized(docked, 900.0));
+        assert!(!app.context_inspector_overlay_active);
+
+        let _ = app.update(Message::WindowFilled(main, false));
+        assert!(app.context_inspector_is_overlay());
+        assert!(app.context_inspector_overlay_active);
+
+        let _ = app.update(Message::WindowFilled(main, true));
+        assert!(!app.context_inspector_overlay_active);
     }
 
     #[test]
