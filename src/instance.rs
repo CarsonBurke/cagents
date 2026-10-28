@@ -63,8 +63,15 @@ const PEER_PACKAGE_DIRECTORY: &str = "/usr/libexec/cagents-browserless";
 #[cfg(not(feature = "full"))]
 const PEER_PACKAGE_DIRECTORY: &str = "/usr/libexec/cagents";
 pub const UI_LAUNCH_HANDSHAKE_ENV: &str = "CAGENTS_UI_LAUNCH_HANDSHAKE";
+/// Older launchers understand only the final ready/error response. Progress
+/// requires a separate explicit capability to keep their stdout protocol valid.
+pub const UI_LAUNCH_RECOVERY_PROGRESS_ENV: &str = "CAGENTS_UI_LAUNCH_RECOVERY_PROGRESS";
 pub const UI_LAUNCH_READY: &str = "ready";
 pub const UI_LAUNCH_ERROR_PREFIX: &str = "error: ";
+/// A usable recovery window remains open while the updater reports failure.
+pub const UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX: &str = "recovery-incomplete: ";
+/// One bounded inventory announcement extends startup, without claiming ready.
+pub const UI_LAUNCH_RECOVERY_PROGRESS_PREFIX: &str = "recovering: ";
 
 pub const PRIMARY_WINDOW: &str = "primary";
 static WINDOW_SLOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -168,11 +175,92 @@ pub(crate) fn owned_lock(path: &Path, operation: i32) -> io::Result<OwnedLock> {
         ));
     }
     lock.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
+    owned_file_lock(lock, operation)
+}
+
+/// Acquire the existing drop-safe advisory lock on a file a confined storage
+/// caller has already opened and validated through its retained directory.
+pub(crate) fn owned_file_lock(lock: File, operation: i32) -> io::Result<OwnedLock> {
     // SAFETY: the descriptor remains owned by the returned file.
     if unsafe { libc::flock(lock.as_raw_fd(), operation) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(OwnedLock(lock))
+}
+
+/// Expected contention with the installation coordinator, distinct from a
+/// filesystem failure or a window that is already open.
+#[derive(Debug, Error)]
+#[error("an update is in progress")]
+pub struct UpdateInProgress;
+
+pub fn is_update_in_progress(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error.is::<UpdateInProgress>()
+            || error.downcast_ref::<io::Error>().is_some_and(|error| {
+                error
+                    .get_ref()
+                    .is_some_and(|inner| inner.is::<UpdateInProgress>())
+            })
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
+fn update_lock_error(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        io::Error::new(error.kind(), UpdateInProgress)
+    } else {
+        error
+    }
+}
+
+/// Observe an existing private lock without creating, repairing, or retaining
+/// it. This is a point-in-time status observation, never launch admission.
+#[cfg(feature = "ui")]
+pub(crate) fn private_lock_is_held(path: &Path) -> io::Result<bool> {
+    let named = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let safe = |metadata: &fs::Metadata| {
+        metadata.is_file()
+            && metadata.uid() == current_uid()
+            && metadata.mode() & 0o077 == 0
+            && metadata.nlink() == 1
+    };
+    if !safe(&named) {
+        return Err(io::Error::other("update ownership is unavailable"));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    let opened = file.metadata()?;
+    let same = |a: &fs::Metadata, b: &fs::Metadata| a.dev() == b.dev() && a.ino() == b.ino();
+    if !safe(&opened) || !same(&named, &opened) {
+        return Err(io::Error::other("update ownership changed"));
+    }
+    let held = match owned_file_lock(file, libc::LOCK_SH | libc::LOCK_NB) {
+        Ok(_probe) => false,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => true,
+        Err(error) => return Err(error),
+    };
+    let current = fs::symlink_metadata(path)?;
+    if !safe(&current) || !same(&opened, &current) {
+        return Err(io::Error::other("update ownership changed"));
+    }
+    Ok(held)
+}
+
+#[cfg(feature = "ui")]
+pub(crate) fn update_fence_held() -> io::Result<bool> {
+    private_lock_is_held(&runtime_directory()?.join(format!("{APPLICATION_LOCK_FILE}.update")))
 }
 
 /// A slot owns its full workspace snapshot; terminal identifiers still refer to
@@ -211,9 +299,7 @@ impl WindowLease {
             &runtime.join(format!("{APPLICATION_LOCK_FILE}.update")),
             libc::LOCK_SH | libc::LOCK_NB,
         )
-        .map_err(|error| {
-            io::Error::new(error.kind(), format!("an update is in progress: {error}"))
-        })?;
+        .map_err(update_lock_error)?;
         if !IS_DEVELOPMENT && peer_ui_predates_lease(Path::new(PEER_PACKAGE_DIRECTORY)) {
             return Err(io::Error::other(
                 "installed peer UI predates the shared-session lease; upgrade that package first",
@@ -268,6 +354,26 @@ impl WindowLease {
 
 pub fn ui_launch_handshake_requested() -> bool {
     env::var_os(UI_LAUNCH_HANDSHAKE_ENV).as_deref() == Some("1".as_ref())
+}
+
+/// Advertise the saved-pane inventory before the final readiness acknowledgement.
+/// This is progress only: the launcher must still await `report_ui_startup`.
+pub fn report_ui_recovery_progress(saved_chats: usize) -> io::Result<()> {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if ui_launch_handshake_requested()
+        && env::var_os(UI_LAUNCH_RECOVERY_PROGRESS_ENV).as_deref() == Some("1".as_ref())
+        && !REPORTED.swap(true, Ordering::AcqRel)
+    {
+        if saved_chats > crate::upgrade::handoff::MAX_SESSIONS {
+            return Err(io::Error::other(
+                "saved conversation inventory exceeds the recovery limit",
+            ));
+        }
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{UI_LAUNCH_RECOVERY_PROGRESS_PREFIX}{saved_chats}")?;
+        stdout.flush()?;
+    }
+    Ok(())
 }
 
 pub fn report_ui_startup(result: &Result<(), String>) -> io::Result<()> {
@@ -382,20 +488,48 @@ pub fn window_database_path(slot: &str) -> io::Result<PathBuf> {
 }
 
 pub fn window_database_paths() -> io::Result<Vec<PathBuf>> {
-    let primary = window_database_path(PRIMARY_WINDOW)?;
+    window_database_paths_at(window_database_path(PRIMARY_WINDOW)?)
+}
+
+fn window_database_paths_at(primary: PathBuf) -> io::Result<Vec<PathBuf>> {
+    // Old inactive snapshots are retained for ordinary reopening/migration.
+    // Bound enumeration before allocating paths or opening SQLite stores.
+    const MAX_STORES: usize = 1024;
+    const MAX_ENTRIES: usize = 8192;
     let mut paths = vec![primary.clone()];
     let windows = primary.parent().unwrap().join("windows");
     match fs::read_dir(windows) {
         Ok(entries) => {
-            for entry in entries {
+            for (index, entry) in entries.enumerate() {
+                if index >= MAX_ENTRIES {
+                    return Err(io::Error::other(
+                        "Saved window enumeration exceeds its bounded entry limit",
+                    ));
+                }
                 let entry = entry?;
                 if entry.file_type()?.is_dir()
                     && let Some(slot) = entry.file_name().to_str()
                     && validate_window_slot(slot).is_ok()
                 {
                     let path = entry.path().join("sessions.sqlite3");
-                    if path.is_file() {
-                        paths.push(path);
+                    match fs::symlink_metadata(&path) {
+                        Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                            if paths.len() >= MAX_STORES {
+                                return Err(io::Error::other(
+                                    "Saved window inventory exceeds its bounded store limit",
+                                ));
+                            }
+                            // Include symlinks so the NOFOLLOW reader reports
+                            // a refusal instead of silently omitting a store.
+                            paths.push(path);
+                        }
+                        Ok(_) => {
+                            return Err(io::Error::other(
+                                "Saved window store is not a regular database file",
+                            ));
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
                     }
                 }
             }
@@ -437,7 +571,7 @@ pub(crate) fn recovery_launch_fence() -> io::Result<OwnedLock> {
         &runtime_directory()?.join(format!("{APPLICATION_LOCK_FILE}.update")),
         libc::LOCK_SH | libc::LOCK_NB,
     )
-    .map_err(|error| io::Error::new(error.kind(), format!("an update is in progress: {error}")))
+    .map_err(update_lock_error)
 }
 
 static EDITOR_PROTECTION_READY: OnceLock<OwnedLock> = OnceLock::new();
@@ -472,7 +606,7 @@ pub(crate) fn verified_running_editors() -> io::Result<Vec<VerifiedWindow>> {
     verified_editors_in(&runtime_directory()?, Path::new("/proc"))
 }
 
-fn editor_executable(
+pub(crate) fn editor_executable(
     process: &Path,
     executable: io::Result<PathBuf>,
 ) -> io::Result<Option<PathBuf>> {
@@ -553,7 +687,7 @@ fn verified_editors_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<Verif
             .open(&lease_path)
             .map_err(|_| {
                 io::Error::other(
-                    "close older or unready independent editors before automatic cleanup",
+                    "close older or unready independent editors before removing worktrees",
                 )
             })?;
         let expected = lease.metadata()?;
@@ -681,6 +815,31 @@ pub(crate) fn verified_running_windows() -> io::Result<Vec<VerifiedWindow>> {
 pub(crate) fn verified_staged_windows() -> io::Result<Vec<VerifiedWindow>> {
     validate_stage_guard()?;
     verified_window_lease_owners_in(&runtime_directory()?, Path::new("/proc"))
+}
+
+/// A candidate whose exact daemon already owns the runtime may reopen while an
+/// older coordinator retains its shared legacy fence. Keep legacy exclusive UI
+/// owners excluded, and authenticate every modern window before routing.
+/// The caller must hold the launch fence and retain the returned legacy guard.
+pub(crate) fn verified_windows_for_daemon(
+    executable: &Path,
+) -> io::Result<(Vec<VerifiedWindow>, OwnedLock)> {
+    let runtime = runtime_directory()?;
+    let legacy = owned_lock(
+        &runtime.join(APPLICATION_LOCK_FILE),
+        libc::LOCK_SH | libc::LOCK_NB,
+    )?;
+    let windows = verified_window_lease_owners_in(&runtime, Path::new("/proc"))?;
+    if crate::daemon::running_executable()
+        .map_err(io::Error::other)?
+        .as_deref()
+        != Some(executable)
+    {
+        return Err(io::Error::other(
+            "candidate daemon ownership changed while checking windows",
+        ));
+    }
+    Ok((windows, legacy))
 }
 
 fn flock_owner(line: &str, metadata: &fs::Metadata) -> Option<u32> {
@@ -908,6 +1067,15 @@ impl UiUpdateGuard {
     }
 
     pub fn prepare_and_close_windows(&mut self, timeout: Duration) -> io::Result<Vec<String>> {
+        self.prepare_and_close_windows_with_preflight(timeout, |_| Ok(()))
+    }
+
+    /// Check flushed saved panes before committing any source window to close.
+    pub(crate) fn prepare_and_close_windows_with_preflight(
+        &mut self,
+        timeout: Duration,
+        preflight: impl FnOnce(&Self) -> io::Result<()>,
+    ) -> io::Result<Vec<String>> {
         let deadline = std::time::Instant::now() + timeout;
         let slots = running_window_slots(&self.runtime)?;
         for slot in &slots {
@@ -919,6 +1087,13 @@ impl UiUpdateGuard {
                 "update-prepare",
                 deadline.saturating_duration_since(std::time::Instant::now()),
             )?;
+        }
+        preflight(self)?;
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Source inspection exceeded the window preparation allowance; source windows remain usable",
+            ));
         }
         for slot in &slots {
             // A lost ACK cannot prove that the UI did not accept an irreversible close.
@@ -1931,6 +2106,32 @@ mod tests {
     }
 
     #[test]
+    fn confined_file_lock_contends_with_path_lock_and_releases_on_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("receipt.lock");
+        let initial = owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        drop(initial);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&path)
+            .unwrap();
+        let descriptor = file.as_raw_fd();
+        assert_ne!(
+            unsafe { libc::fcntl(descriptor, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        let held = owned_file_lock(file, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let busy = owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB)
+            .err()
+            .unwrap();
+        assert!(matches!(busy.raw_os_error(), Some(libc::EWOULDBLOCK)));
+        drop(held);
+        assert!(owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).is_ok());
+    }
+
+    #[test]
     fn verified_window_requires_its_exact_kernel_flock_not_an_open_descriptor() {
         let runtime = tempfile::tempdir().unwrap();
         let path = runtime.path().join(slot_lock_name(PRIMARY_WINDOW));
@@ -2173,11 +2374,11 @@ mod tests {
     fn device_window_relaunch_retains_target_and_missing_identity_fails_closed() {
         let runtime = tempdir().unwrap();
         let device = crate::device::Device {
-            name: "fw16".into(),
-            host: "fw16".into(),
+            name: "build-host".into(),
+            host: "build-host".into(),
             executable: "cagents".into(),
         };
-        let slot = crate::device::scoped_window_slot("fw16", "primary");
+        let slot = crate::device::scoped_window_slot("build-host", "primary");
         assert!(
             window_device_identity(runtime.path(), &slot, std::slice::from_ref(&device)).is_err()
         );
@@ -2185,18 +2386,45 @@ mod tests {
             runtime
                 .path()
                 .join(format!("{ACTIVATION_SOCKET_FILE}.{slot}.device")),
-            "fw16",
+            "build-host",
         )
         .unwrap();
         assert_eq!(
             window_device_identity(runtime.path(), &slot, std::slice::from_ref(&device)).unwrap(),
-            Some("fw16".into())
+            Some("build-host".into())
         );
         assert!(window_device_identity(runtime.path(), &slot, &[]).is_err());
         assert_eq!(
-            window_device_identity(runtime.path(), "fw16-primary", &[device]).unwrap(),
+            window_device_identity(runtime.path(), "build-host-primary", &[device]).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn saved_window_enumeration_retains_inactive_stores_and_refuses_excess() {
+        let root = tempdir().unwrap();
+        let primary = root.path().join("sessions.sqlite3");
+        let old = root.path().join("windows/september-copy/sessions.sqlite3");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::write(&old, "original legacy store bytes").unwrap();
+        let mut expected = vec![primary.clone(), old.clone()];
+        expected.sort();
+        assert_eq!(window_database_paths_at(primary.clone()).unwrap(), expected);
+        assert_eq!(fs::read(&old).unwrap(), b"original legacy store bytes");
+        for index in 0..1023 {
+            let path = root
+                .path()
+                .join(format!("windows/old-{index}/sessions.sqlite3"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, []).unwrap();
+        }
+        assert!(
+            window_database_paths_at(primary)
+                .unwrap_err()
+                .to_string()
+                .contains("bounded store limit")
+        );
+        assert_eq!(fs::read(&old).unwrap(), b"original legacy store bytes");
     }
 
     #[test]
@@ -2306,6 +2534,85 @@ mod tests {
         drop(guard);
         for worker in workers {
             assert_eq!(worker.join().unwrap(), ["update-prepare", "update-cancel"]);
+        }
+    }
+
+    #[test]
+    fn source_inspection_veto_cancels_all_prepared_windows_before_commit() {
+        let runtime = tempdir().unwrap();
+        let lock = owned_lock(
+            &runtime
+                .path()
+                .join(format!("{APPLICATION_LOCK_FILE}.update")),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        let legacy =
+            owned_lock(&runtime.path().join(APPLICATION_LOCK_FILE), libc::LOCK_SH).unwrap();
+        let mut workers = Vec::new();
+        for slot in [PRIMARY_WINDOW, "window-2"] {
+            let lease =
+                owned_lock(&runtime.path().join(slot_lock_name(slot)), libc::LOCK_EX).unwrap();
+            let listener =
+                std::os::unix::net::UnixListener::bind(runtime.path().join(slot_socket_name(slot)))
+                    .unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let (finished, completion) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                let _lease = lease;
+                let mut actions = Vec::new();
+                for _ in 0..2 {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    let stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "window request was not received"
+                                );
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => panic!("window accept: {error}"),
+                        }
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    actions.push(read_capped_line(&stream).unwrap());
+                    writeln!(&stream, "ok").unwrap();
+                }
+                finished.send(actions).unwrap();
+            });
+            workers.push((worker, completion));
+        }
+        let mut guard = UiUpdateGuard {
+            lock: Some(lock),
+            _legacy_fence: legacy,
+            runtime: runtime.path().into(),
+            prepared: vec![],
+            closed: vec![],
+            fallback_executable: None,
+        };
+        let error = guard
+            .prepare_and_close_windows_with_preflight(Duration::from_secs(5), |guard| {
+                assert_eq!(guard.prepared.len(), 2);
+                assert!(guard.closed.is_empty());
+                Err(io::Error::other("saved native pane has no exact migration"))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("saved native pane"));
+        assert!(guard.closed.is_empty());
+        drop(guard);
+        for (worker, completion) in workers {
+            assert_eq!(
+                completion.recv_timeout(Duration::from_secs(6)).unwrap(),
+                ["update-prepare", "update-cancel"]
+            );
+            worker.join().unwrap();
         }
     }
 
@@ -2714,6 +3021,75 @@ mod tests {
                 "cagents-ui.lock",
                 "cagents-ui.activate",
             )
+        );
+    }
+}
+
+#[cfg(all(test, feature = "ui"))]
+mod startup_update_tests {
+    use super::*;
+    #[test]
+    fn held_update_fence_is_typed_and_readonly_probe_preserves_original_ownership() {
+        let runtime = tempfile::tempdir().unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = runtime
+            .path()
+            .join(format!("{APPLICATION_LOCK_FILE}.update"));
+        let held = owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let original = fs::metadata(&path).unwrap();
+        let Err(error) = WindowLease::acquire_in(runtime.path(), false, None) else {
+            panic!("original update fence must block startup")
+        };
+        assert!(is_update_in_progress(&error));
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(error.to_string(), "an update is in progress");
+        assert!(private_lock_is_held(&path).unwrap());
+        assert!(owned_lock(&path, libc::LOCK_SH | libc::LOCK_NB).is_err());
+        assert_eq!(fs::metadata(&path).unwrap().ino(), original.ino());
+        assert_eq!(fs::metadata(&path).unwrap().mode(), original.mode());
+        drop(held);
+        assert!(!private_lock_is_held(&path).unwrap());
+        let missing = runtime.path().join("absent");
+        assert!(!private_lock_is_held(&missing).unwrap());
+        assert!(!missing.exists());
+        assert!(!is_update_in_progress(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "not an update"
+        )));
+        assert!(!is_update_in_progress(&update_lock_error(
+            io::Error::from_raw_os_error(libc::EACCES)
+        )));
+        assert!(!is_update_in_progress(&io::Error::from_raw_os_error(
+            libc::EAGAIN
+        )));
+    }
+    #[test]
+    fn existing_window_activation_still_uses_the_original_private_protocol_during_an_update() {
+        let runtime = tempfile::tempdir().unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let _held = owned_lock(
+            &runtime
+                .path()
+                .join(format!("{APPLICATION_LOCK_FILE}.update")),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        let (sender, receiver) = async_channel::unbounded();
+        let _listener = UiActivationListener::bind_in(runtime.path(), sender).unwrap();
+        assert!(activate_window_at_with_token(runtime.path(), PRIMARY_WINDOW, None).unwrap());
+        let activation = receiver.recv_blocking().unwrap();
+        assert!(
+            activation.update.is_none()
+                && activation.session.is_none()
+                && activation.token.is_none()
+        );
+        assert!(
+            private_lock_is_held(
+                &runtime
+                    .path()
+                    .join(format!("{APPLICATION_LOCK_FILE}.update"))
+            )
+            .unwrap()
         );
     }
 }

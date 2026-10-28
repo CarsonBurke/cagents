@@ -7,6 +7,8 @@ use std::{
 };
 
 use cagents::{
+    agent::Provider,
+    chat::{Attachment, ImageReference, Launch, Session},
     model::{
         BootId, BrowserId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind, CardState,
         ChannelId, Existence, Exposure, HostIncarnation, HostSessionId, HostSessionProof,
@@ -95,8 +97,11 @@ impl RestoreFixture {
             active_channel: None,
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
+            chat_draft_attachments: HashMap::new(),
+            agent_updates: BTreeMap::new(),
             repository_navigation: HashMap::new(),
             local_only_cards: Default::default(),
+            pending_chat_admissions: Default::default(),
             pending_terminal_creations: Default::default(),
             workspace_model_identity: None,
             cards: vec![
@@ -308,6 +313,115 @@ fn clean_shutdown_reopen_restores_workspace_catalog_and_live_host_proof() {
     assert_eq!(repository.worktree, fixture.worktree.path);
 
     reopened.shutdown().unwrap();
+}
+
+/// Exercise the production debounced writer, not only direct StateStore JSON:
+/// image-only drafts and metadata-only reorder must survive navigation saves.
+#[test]
+fn managed_image_drafts_survive_debounced_shutdown_navigation_and_metadata_only_edits() {
+    let directory = tempdir().unwrap();
+    let database = directory.path().join("image-draft-session.sqlite3");
+    let mut fixture = RestoreFixture::new();
+    let text_card = CardId::new();
+    let image_only_card = CardId::new();
+    for card in [text_card, image_only_card] {
+        fixture.workspace.cards.push(CardState {
+            id: card,
+            generation: 0,
+            title: "Unsent image draft".into(),
+            width_fraction: 0.5,
+            existence: Existence::Open,
+            exposure: Exposure::Offscreen,
+            residency: Residency::Cold,
+            kind: CardKind::Chat(Session {
+                id: TerminalId::new(),
+                launch: Launch {
+                    provider: Provider::Claude,
+                    recipe: LaunchRecipe {
+                        program: "claude".into(),
+                        arguments: Vec::new(),
+                        ..fixture.launch.clone()
+                    },
+                    session_id: None,
+                },
+                proof: None,
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: Default::default(),
+            }),
+        });
+    }
+    let device = uuid::Uuid::new_v4();
+    // The fixture tests exact receipt metadata durability. Blob validation
+    // and provider admission are separate contracts; neither runs here.
+    let image = |number, digest: &str| {
+        let id = uuid::Uuid::new_v4();
+        Attachment {
+            path: format!("/backend-owned/images/{id}.png").into(),
+            reference: Some(ImageReference {
+                id,
+                number,
+                device,
+                name: "literal {draft} *.png".into(),
+                sha256: digest.repeat(64),
+                extension: "png".into(),
+            }),
+        }
+    };
+    let first = image(41, "a");
+    let second = image(7, "b");
+    fixture.workspace.chat_drafts.insert(
+        text_card,
+        format!(
+            "Before {} between {} after",
+            second.reference.as_ref().unwrap().token(),
+            first.reference.as_ref().unwrap().token()
+        ),
+    );
+    fixture.workspace.chat_draft_attachments = HashMap::from([
+        (text_card, vec![first.clone(), second.clone()]),
+        (image_only_card, vec![first.clone()]),
+    ]);
+    fixture.persist(&database);
+
+    let (mut runtime, restored) = SessionRuntime::open(&database, fixture.boot_id.clone()).unwrap();
+    let mut state = restored.expect("debounced shutdown must retain image associations");
+    assert_eq!(state.chat_drafts, fixture.workspace.chat_drafts);
+    assert_eq!(
+        state.chat_draft_attachments,
+        fixture.workspace.chat_draft_attachments
+    );
+    assert!(!state.chat_drafts.contains_key(&image_only_card));
+    for id in [text_card, image_only_card] {
+        assert!(
+            matches!(&state.cards.iter().find(|card| card.id == id).unwrap().kind, CardKind::Chat(session) if session.is_unstarted())
+        );
+    }
+    state.active_worktree = Some("/srv/navigation-after-images".into());
+    runtime.snapshot(Arc::new(state.clone()));
+    // Cards and text do not change: a metadata-only update must replace the
+    // earlier queued navigation snapshot rather than disappear in debounce.
+    state
+        .chat_draft_attachments
+        .get_mut(&text_card)
+        .unwrap()
+        .reverse();
+    runtime.snapshot(Arc::new(state.clone()));
+    runtime.shutdown();
+    assert_eq!(runtime.last_error(), None);
+
+    let (mut runtime, restored) = SessionRuntime::open(&database, fixture.boot_id).unwrap();
+    let restored = restored.expect("image associations must survive a second restart");
+    assert_eq!(restored.active_worktree, state.active_worktree);
+    assert_eq!(restored.chat_drafts, state.chat_drafts);
+    assert_eq!(
+        restored.chat_draft_attachments[&text_card],
+        [second, first.clone()]
+    );
+    assert_eq!(restored.chat_draft_attachments[&image_only_card], [first]);
+    assert!(!restored.chat_drafts.contains_key(&image_only_card));
+    runtime.shutdown();
+    assert_eq!(runtime.last_error(), None);
 }
 
 #[test]

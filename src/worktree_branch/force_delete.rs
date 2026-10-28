@@ -7,10 +7,12 @@ const PROBE: &str = "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nif [ \"$1\" = prep
 const GUARD: &str = r##"#!/bin/sh
 set -eu
 input=$(/bin/cat)
+if [ "$1" = prepared ]; then "$CAGENTS_DELETE_REGISTRATION_GUARD"; fi
 if [ -n "$CAGENTS_DELETE_PREVIOUS_HOOK" ] && [ -x "$CAGENTS_DELETE_PREVIOUS_HOOK" ]; then
     printf '%s\n' "$input" | GIT_CONFIG_PARAMETERS="$CAGENTS_DELETE_PREVIOUS_CONFIG" "$CAGENTS_DELETE_PREVIOUS_HOOK" "$@"
 fi
 if [ "$1" = prepared ]; then
+    "$CAGENTS_DELETE_REGISTRATION_GUARD"
     while IFS=' ' read -r old new ref; do
         [ "$ref" = "$CAGENTS_DELETE_REF" ] || continue
         case "$new" in ''|*[!0]*) exit 1;; esac
@@ -42,14 +44,15 @@ pub(super) fn delete(
     full_ref: &str,
     oid: &str,
     cancel: &CancellationToken,
+    guards: &super::registered_heads::RegisteredHeads,
 ) -> Result<(), String> {
     let previous = run(
-        git_command(repository).args([
+        guards.scope(git_command(repository).args([
             "rev-parse",
             "--path-format=absolute",
             "--git-path",
             "hooks/reference-transaction",
-        ]),
+        ]))?,
         cancel,
     )?;
     let previous = String::from_utf8(previous.stdout).map_err(|error| error.to_string())?;
@@ -58,6 +61,7 @@ pub(super) fn delete(
         .prefix("cagents-branch-delete-")
         .tempdir()
         .map_err(|error| error.to_string())?;
+    let registration_guard = guards.write_proof(temporary.path())?;
     let hook = temporary.path().join("reference-transaction");
     let proof = temporary.path().join("prepared");
     std::fs::write(&hook, PROBE).map_err(|error| error.to_string())?;
@@ -70,15 +74,17 @@ pub(super) fn delete(
     // and this probe deliberately does not invoke repository policy hooks.
     let input = format!("start\nverify {full_ref} {oid}\nprepare\nabort\n");
     run(
-        git_command(repository)
-            .args([
-                std::ffi::OsString::from("-c"),
-                hooks.clone(),
-                "update-ref".into(),
-                "--stdin".into(),
-            ])
-            .env("CAGENTS_DELETE_PROOF", &proof)
-            .stdin(input.into_bytes()),
+        guards.scope(
+            git_command(repository)
+                .args([
+                    std::ffi::OsString::from("-c"),
+                    hooks.clone(),
+                    "update-ref".into(),
+                    "--stdin".into(),
+                ])
+                .env("CAGENTS_DELETE_PROOF", &proof)
+                .stdin(input.into_bytes()),
+        )?,
         cancel,
     )?;
     if std::fs::read(&proof).map_err(|_| {
@@ -107,27 +113,38 @@ pub(super) fn delete(
         previous_config.push(" ");
     }
     previous_config.push("'core.fsmonitor=false'");
-    let command = git_command(repository)
-        .args([
-            std::ffi::OsString::from("-c"),
-            hooks,
-            "branch".into(),
-            "-D".into(),
-            "--".into(),
-            branch.into(),
-        ])
-        .env("CAGENTS_DELETE_PROOF", &proof)
-        .env("CAGENTS_DELETE_PREVIOUS_HOOK", previous)
-        .env("CAGENTS_DELETE_PREVIOUS_CONFIG", previous_config)
-        .env("CAGENTS_DELETE_REF", full_ref)
-        .env("CAGENTS_DELETE_OID", oid)
-        .env("CAGENTS_DELETE_GIT", "git");
+    let command = guards.scope(
+        git_command(repository)
+            .args([
+                std::ffi::OsString::from("-c"),
+                hooks,
+                "branch".into(),
+                "-D".into(),
+                "--".into(),
+                branch.into(),
+            ])
+            .env("CAGENTS_DELETE_PROOF", &proof)
+            .env("CAGENTS_DELETE_PREVIOUS_HOOK", previous)
+            .env("CAGENTS_DELETE_PREVIOUS_CONFIG", previous_config)
+            .env("CAGENTS_DELETE_REF", full_ref)
+            .env("CAGENTS_DELETE_OID", oid)
+            .env("CAGENTS_DELETE_GIT", "git")
+            .env("CAGENTS_DELETE_REGISTRATION_GUARD", registration_guard),
+    )?;
     let output = SystemProcessExecutor
         .execute(&command, cancel)
         .and_then(|output| output.require_success(&command.program));
     if let Err(error) = output {
+        if let Err(identity) = guards.check() {
+            return Err(format!(
+                "Branch operation lost its original registration identity; inspect before retrying: {identity}; {}",
+                error.reported_detail()
+            ));
+        }
         let current = SystemProcessExecutor.execute(
-            &git_command(repository).args(["show-ref", "--verify", "--quiet", full_ref]),
+            &guards.scope(
+                git_command(repository).args(["show-ref", "--verify", "--quiet", full_ref]),
+            )?,
             cancel,
         );
         return Err(
@@ -150,6 +167,9 @@ pub(super) fn delete(
     {
         return Err("Branch was deleted, but its transaction proof was not retained".into());
     }
+    guards.check().map_err(|error| {
+        format!("Branch was deleted, but its registered checkout state changed: {error}")
+    })?;
     // Native branch deletion owns configuration cleanup. Inspect only this
     // exact subsection, preserving dotted sibling branch names.
     let section = format!("branch.{branch}");
@@ -164,7 +184,12 @@ pub(super) fn delete(
         })
         .collect();
     let pattern = format!("^{escaped}\\.[^.]+$");
-    let check = git_command(repository).args(["config", "--local", "--get-regexp", &pattern]);
+    let check = guards.scope(git_command(repository).args([
+        "config",
+        "--local",
+        "--get-regexp",
+        &pattern,
+    ]))?;
     let output = SystemProcessExecutor
         .execute(&check, cancel)
         .map_err(|error| {

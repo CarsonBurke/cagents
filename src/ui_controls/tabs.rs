@@ -28,7 +28,8 @@ pub struct ViewTab<'a, Message> {
     pub selected: bool,
     pub id: Option<widget::Id>,
     /// What choosing the tab raises. The selected tab publishes nothing:
-    /// choosing the view already on screen is not an intent.
+    /// choosing the view already on screen is not an intent. In
+    /// [`nested_view_tabs`] it returns from a page open beneath the view.
     pub on_press: Option<Message>,
 }
 
@@ -46,9 +47,29 @@ pub fn view_tabs<'a, Message: Clone + 'a>(
     tabs: Vec<ViewTab<'a, Message>>,
     compact: bool,
 ) -> Element<'a, Message> {
+    tab_row(tabs, compact, false)
+}
+
+/// [`view_tabs`] for views that open pages beneath themselves, such as a
+/// detail or a single record. The selected tab keeps the press message its
+/// caller gives it, which returns the view to its root while a page is open
+/// beneath it. With nothing open the caller passes none, so choosing the view
+/// already on screen is still never an intent.
+pub fn nested_view_tabs<'a, Message: Clone + 'a>(
+    tabs: Vec<ViewTab<'a, Message>>,
+    compact: bool,
+) -> Element<'a, Message> {
+    tab_row(tabs, compact, true)
+}
+
+fn tab_row<'a, Message: Clone + 'a>(
+    tabs: Vec<ViewTab<'a, Message>>,
+    compact: bool,
+    returns: bool,
+) -> Element<'a, Message> {
     let row = widget::row::with_children(
         tabs.into_iter()
-            .map(|tab| view_tab(tab, compact, None))
+            .map(|tab| tab_button(tab, compact, None, returns))
             .collect::<Vec<_>>(),
     )
     .spacing(space::XS)
@@ -62,6 +83,16 @@ pub fn view_tab<'a, Message: Clone + 'a>(
     tab: ViewTab<'a, Message>,
     compact: bool,
     leading: Option<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    tab_button(tab, compact, leading, false)
+}
+
+/// A view tab; `returns` keeps a selected tab's press message.
+fn tab_button<'a, Message: Clone + 'a>(
+    tab: ViewTab<'a, Message>,
+    compact: bool,
+    leading: Option<Element<'a, Message>>,
+    returns: bool,
 ) -> Element<'a, Message> {
     let ViewTab {
         label,
@@ -101,7 +132,7 @@ pub fn view_tab<'a, Message: Clone + 'a>(
         .selected(selected)
         .padding([0.0, if compact { space::S } else { space::M }])
         .height(view_tab_height(compact))
-        .on_press_maybe(if selected { None } else { on_press });
+        .on_press_maybe(if selected && !returns { None } else { on_press });
     if let Some(id) = id {
         button = button.id(id);
     }
