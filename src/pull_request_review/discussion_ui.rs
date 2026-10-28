@@ -1137,6 +1137,7 @@ impl State {
                     composer.authority = authority;
                     composer.range = self.range.clone();
                     self.cache_dirty = true;
+                    self.discussion.drafts_saved = false;
                     return ActionTask::none();
                 }
                 let Destination::Line(anchor) = &composer.destination else {
@@ -2457,6 +2458,77 @@ mod tests {
         assert!(state.cache_dirty);
         assert!(!state.cache_save_error);
         assert!(!state.discussion.drafts_saved);
+    }
+
+    #[test]
+    fn saved_file_draft_reanchor_fences_restart_and_persists_the_new_authority() {
+        use cache::Store;
+
+        let mut state = ready();
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(cache::JsonStore::new(directory.path().join("cache")));
+        state.cache = Some(store.clone());
+        drop(state.update_discussion(Action::BeginFile("file.rs".into())));
+        drop(
+            state.update_discussion(Action::Composer(text_editor::Action::Edit(
+                text_editor::Edit::Insert('x'),
+            ))),
+        );
+        let mut snapshot = cache::fixture();
+        snapshot.drafts = state.local_drafts();
+        snapshot.drafts_changed = state.drafts_need_save();
+        snapshot.drafts_owner = Some(state.cache_owner.clone());
+        snapshot.drafts_version = Some("original-draft".into());
+        store
+            .save(&snapshot, &cache::WriteOrder::fixture(1))
+            .unwrap();
+        state.drafts_cache_saved(snapshot.drafts_version.clone());
+        assert!(state.restart_blocker().is_none());
+
+        let mut next = loaded(vec![entry("file.rs", ChangeKind::Modified)], vec![]);
+        next.context.head_oid = "d".repeat(40);
+        next.range.head = crate::repository::Oid::parse("d".repeat(40)).unwrap();
+        state.adopt(&next);
+        // The earlier draft stays on its old authority until the user re-anchors.
+        assert_eq!(
+            state
+                .local_drafts()
+                .unwrap()
+                .composer
+                .unwrap()
+                .context
+                .head_oid,
+            "a".repeat(40)
+        );
+        state.cache_dirty = false;
+        drop(state.update_discussion(Action::Reanchor));
+        assert!(
+            state.restart_blocker().is_some(),
+            "the new anchor is not durable yet"
+        );
+        assert!(state.drafts_need_save());
+        assert!(state.cache_dirty);
+
+        snapshot.range = state.range.clone().unwrap();
+        snapshot.pull_request.head_ref_oid = snapshot.range.head.as_str().to_owned();
+        snapshot.drafts = state.local_drafts();
+        snapshot.drafts_changed = state.drafts_need_save();
+        snapshot.drafts_basis = state.draft_cache_basis();
+        snapshot.drafts_version = Some("reanchored-draft".into());
+        store
+            .save(&snapshot, &cache::WriteOrder::fixture(2))
+            .unwrap();
+        let saved = store.load(&snapshot.key).unwrap().unwrap();
+        let mut restored = ready();
+        restored.adopt(&next);
+        restored.restore_drafts(saved.drafts, saved.drafts_version);
+        let composer = restored.discussion.composer.as_ref().unwrap();
+        assert_eq!(composer.content.text().trim(), "x");
+        assert_eq!(composer.destination, Destination::File("file.rs".into()));
+        assert_eq!(composer.authority.context.head_oid, "d".repeat(40));
+        assert_eq!(composer.range.as_ref().unwrap().head, next.range.head);
+        state.drafts_cache_saved(snapshot.drafts_version);
+        assert!(state.restart_blocker().is_none());
     }
 
     #[test]
