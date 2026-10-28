@@ -3047,7 +3047,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
         };
-        fn wait_for_encoded_input(bytes: usize) {
+        fn wait_for_decoder_queue(busy: &mut tokio::sync::OwnedSemaphorePermit, bytes: usize) {
             let deadline = Instant::now() + Duration::from_secs(2);
             while budget().encoded.available_permits() != ENCODED_BUDGET - bytes {
                 assert!(
@@ -3056,6 +3056,19 @@ mod tests {
                 );
                 std::thread::yield_now();
             }
+            // A queued acquire_many takes this single released permit toward
+            // its full request. Immediate-Defer leaves it available. This
+            // proves actual waiting, even if the worker is descheduled just
+            // after encoded admission; no timing-based absence claim is used.
+            drop(busy.split(1).unwrap());
+            while budget().decode.available_permits() != 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "the user action must queue for transient decoder admission"
+                );
+                std::thread::yield_now();
+            }
+            assert_eq!(budget().encoded.available_permits(), ENCODED_BUDGET - bytes);
         }
         fn assert_released() {
             assert_eq!(budget().encoded.available_permits(), ENCODED_BUDGET);
@@ -3066,7 +3079,7 @@ mod tests {
         for mode in ["attach", "paste", "cancel-paste"] {
             let (ticket, lease) = attachment_draft::admit().unwrap();
             let mut lease = Some(lease);
-            let busy = budget().block_decoder();
+            let mut busy = budget().block_decoder();
             let (started, input) = mpsc::channel();
             let (finished, result) = mpsc::channel();
             let worker = std::thread::spawn(move || {
@@ -3092,7 +3105,7 @@ mod tests {
                 finished.send(outcome).unwrap();
             });
             let bytes = input.recv_timeout(Duration::from_secs(2)).unwrap();
-            wait_for_encoded_input(bytes);
+            wait_for_decoder_queue(&mut busy, bytes);
             assert!(
                 matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)),
                 "{mode} waits instead of reporting a false capacity error"
@@ -3116,7 +3129,7 @@ mod tests {
         let path = directory.path().join("selected.png");
         let bytes = png();
         std::fs::write(&path, &bytes).unwrap();
-        let busy = budget().block_decoder();
+        let mut busy = budget().block_decoder();
         let selected = path.clone();
         let (finished, result) = mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -3128,7 +3141,7 @@ mod tests {
                 .send(runtime.block_on(file_preview(selected, None)))
                 .unwrap();
         });
-        wait_for_encoded_input(bytes.len());
+        wait_for_decoder_queue(&mut busy, bytes.len());
         assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
         // The action already read its immutable input. A retry must not read
         // this changed path and silently show a different image.
