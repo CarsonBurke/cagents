@@ -16492,7 +16492,7 @@ pub(crate) mod tests {
                 row_interaction::capture_headers(row_interaction::HeaderPass::Draw, || {
                     ui.draw(
                         &mut renderer,
-                        &Theme::default(),
+                        &cosmic::Theme::default(),
                         &cosmic::iced::advanced::renderer::Style::default(),
                         cosmic::iced::mouse::Cursor::Unavailable,
                     );
