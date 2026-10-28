@@ -7403,15 +7403,17 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     base.into(),
                 ],
             ),
-            check_branch_absent: self.git_read(
-                &request.repository,
-                [
-                    OsString::from("show-ref"),
-                    OsString::from("--verify"),
-                    OsString::from("--quiet"),
-                    request.branch.full_ref().into(),
-                ],
-            ),
+            check_branch_absent: self
+                .git_read(
+                    &request.repository,
+                    [
+                        OsString::from("show-ref"),
+                        OsString::from("--verify"),
+                        OsString::from("--quiet"),
+                        request.branch.full_ref().into(),
+                    ],
+                )
+                .env("GIT_NO_LAZY_FETCH", "1"),
         })
     }
 
@@ -7469,15 +7471,17 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
     ) -> Result<WorktreeResidualState, RepositoryError> {
         let worktrees = self.list_worktrees(&request.repository, cancellation)?;
-        let command = self.git_read(
-            &request.repository,
-            [
-                OsString::from("show-ref"),
-                OsString::from("--verify"),
-                OsString::from("--quiet"),
-                request.branch.full_ref().into(),
-            ],
-        );
+        let command = self
+            .git_read(
+                &request.repository,
+                [
+                    OsString::from("show-ref"),
+                    OsString::from("--verify"),
+                    OsString::from("--quiet"),
+                    request.branch.full_ref().into(),
+                ],
+            )
+            .env("GIT_NO_LAZY_FETCH", "1");
         let branch_output = self.run(&command, cancellation)?;
         let branch_exists = match branch_output.exit_code {
             _ if branch_output.success => true,
@@ -11663,23 +11667,22 @@ mod tests {
     /// index lock and refreshed the index to inspect a string.
     #[test]
     fn every_command_that_plans_a_worktree_is_classified_as_a_read() {
-        let service = fake_service(Vec::new());
+        let service = fake_service(vec![success(b""), exit(1, b"")]);
         // The destination is validated against a real directory before any
         // command is built.
         let managed = tempfile::tempdir().unwrap();
-        let plan = service
-            .plan_worktree_creation(&CreateWorktreeRequest {
-                setup_intent: None,
-                repository: PathBuf::from("/repo"),
-                managed_root: managed.path().to_path_buf(),
-                managed_ignore_root: None,
-                destination: managed.path().join("feature"),
-                branch: ValidatedBranchName::parse("feature").unwrap(),
-                base: BaseRevision::LocalBranch(ValidatedBranchName::parse("main").unwrap()),
-                track: false,
-                operation_id: OperationId::new(),
-            })
-            .unwrap();
+        let request = CreateWorktreeRequest {
+            setup_intent: None,
+            repository: PathBuf::from("/repo"),
+            managed_root: managed.path().to_path_buf(),
+            managed_ignore_root: None,
+            destination: managed.path().join("feature"),
+            branch: ValidatedBranchName::parse("feature").unwrap(),
+            base: BaseRevision::LocalBranch(ValidatedBranchName::parse("main").unwrap()),
+            track: false,
+            operation_id: OperationId::new(),
+        };
+        let plan = service.plan_worktree_creation(&request).unwrap();
 
         for command in [
             &plan.validate_branch,
@@ -11701,6 +11704,28 @@ mod tests {
                 command.arguments
             );
         }
+        assert_eq!(
+            plan.check_branch_absent
+                .environment
+                .get(OsStr::new("GIT_NO_LAZY_FETCH")),
+            Some(&OsString::from("1"))
+        );
+        let residual = service
+            .reconcile_worktree(&request, &CancellationToken::new())
+            .unwrap();
+        assert!(!residual.branch_exists);
+        let commands = service.executor.commands.lock().unwrap();
+        assert_eq!(commands.len(), 2);
+        assert!(
+            commands[1]
+                .arguments
+                .iter()
+                .any(|argument| argument == "show-ref")
+        );
+        assert_eq!(
+            commands[1].environment.get(OsStr::new("GIT_NO_LAZY_FETCH")),
+            Some(&OsString::from("1"))
+        );
     }
 
     #[test]
