@@ -75,41 +75,85 @@ mod tests {
         let (mut app, project, ids) = fixture();
         let next = ProjectId::new();
         app.sidebar_model.projects.push(SidebarProject::new(
-            next, RepositoryId::new(), "Next project".into(), "/next-project".into(),
-            Vec::new(), Vec::new(),
+            next,
+            RepositoryId::new(),
+            "Next project".into(),
+            "/next-project".into(),
+            Vec::new(),
+            Vec::new(),
         ));
         let header = SelectionRow::Project(project);
         let active = SelectionRow::Channel(ids[2]);
         let idle = SelectionRow::Channel(ids[1]);
-        assert_eq!(app.sidebar_keyboard_neighbor(active, Named::ArrowDown), Some(idle));
+        assert_eq!(
+            app.sidebar_keyboard_neighbor(active, Named::ArrowDown),
+            Some(idle)
+        );
         app.chrome_ui.projects_collapsed = true;
-        assert_eq!(app.sidebar_keyboard_neighbor(header, Named::ArrowDown), Some(active));
-        assert_eq!(app.sidebar_keyboard_neighbor(active, Named::ArrowDown), Some(SelectionRow::Project(next)));
-        assert_eq!(app.sidebar_keyboard_neighbor(active, Named::End), Some(SelectionRow::Project(next)));
-        assert_eq!(app.sidebar_keyboard_neighbor(active, Named::Home), Some(header));
+        assert_eq!(
+            app.sidebar_keyboard_neighbor(header, Named::ArrowDown),
+            Some(active)
+        );
+        assert_eq!(
+            app.sidebar_keyboard_neighbor(active, Named::ArrowDown),
+            Some(SelectionRow::Project(next))
+        );
+        assert_eq!(
+            app.sidebar_keyboard_neighbor(active, Named::End),
+            Some(SelectionRow::Project(next))
+        );
+        assert_eq!(
+            app.sidebar_keyboard_neighbor(active, Named::Home),
+            Some(header)
+        );
         assert_eq!(app.sidebar_keyboard_neighbor(idle, Named::ArrowDown), None);
-        app.sidebar_state.apply(&SidebarAction::ToggleProject(project));
-        assert_eq!(app.sidebar_keyboard_neighbor(header, Named::ArrowDown), Some(SelectionRow::Project(next)));
+        app.sidebar_state
+            .apply(&SidebarAction::ToggleProject(project));
+        assert_eq!(
+            app.sidebar_keyboard_neighbor(header, Named::ArrowDown),
+            Some(SelectionRow::Project(next))
+        );
     }
 
     #[test]
     fn project_keyboard_activation_matches_folder_review_and_retry_actions() {
         let (mut app, project, _) = fixture();
         let row = SelectionRow::Project(project);
-        assert_eq!(app.sidebar_navigation_action(row), Some(SidebarAction::ToggleProject(project)));
+        assert_eq!(
+            app.sidebar_navigation_action(row),
+            Some(SidebarAction::ToggleProject(project))
+        );
         app.sidebar_model.projects[0].kind = ProjectKind::Folder;
-        assert_eq!(app.sidebar_navigation_action(row), Some(SidebarAction::OpenRepository {
-            project_id: project, repository: "/selection-project".into(),
-        }));
+        assert_eq!(
+            app.sidebar_navigation_action(row),
+            Some(SidebarAction::OpenRepository {
+                project_id: project,
+                repository: "/selection-project".into(),
+            })
+        );
         app.sidebar_model.projects[0].kind = ProjectKind::Git;
-        app.sidebar_state.apply(&SidebarAction::SetFilter(sidebar::SidebarFilter::PullRequests));
-        assert_eq!(app.sidebar_navigation_action(row), Some(SidebarAction::ToggleProject(project)));
+        app.sidebar_state.apply(&SidebarAction::SetFilter(
+            sidebar::SidebarFilter::PullRequests,
+        ));
+        assert_eq!(
+            app.sidebar_navigation_action(row),
+            Some(SidebarAction::ToggleProject(project))
+        );
         app.sidebar_model.projects[0].github_ready = true;
-        assert_eq!(app.sidebar_navigation_action(row), Some(SidebarAction::BrowsePullRequests { project_id: project }));
+        assert_eq!(
+            app.sidebar_navigation_action(row),
+            Some(SidebarAction::BrowsePullRequests {
+                project_id: project
+            })
+        );
         app.sidebar_model.projects[0].unreachable = Some("Missing folder".into());
-        assert_eq!(app.sidebar_navigation_action(row), Some(SidebarAction::RefreshProject {
-            project_id: project, repository: "/selection-project".into(),
-        }));
+        assert_eq!(
+            app.sidebar_navigation_action(row),
+            Some(SidebarAction::RefreshProject {
+                project_id: project,
+                repository: "/selection-project".into(),
+            })
+        );
         app.sidebar_model.projects[0].reloading = true;
         assert_eq!(app.sidebar_navigation_action(row), None);
     }
@@ -121,13 +165,20 @@ mod tests {
             app.chrome_ui.projects_collapsed = compact;
             app.context_inspector_open = false;
             drop(app.update(Message::Sidebar(SidebarAction::ToggleControls)));
-            drop(app.update(Message::Sidebar(SidebarAction::SearchChanged("channel".into()))));
-            drop(app.update(Message::Sidebar(SidebarAction::SetFilter(sidebar::SidebarFilter::PullRequests))));
+            drop(app.update(Message::Sidebar(SidebarAction::SearchChanged(
+                "channel".into(),
+            ))));
+            drop(app.update(Message::Sidebar(SidebarAction::SetFilter(
+                sidebar::SidebarFilter::PullRequests,
+            ))));
             let task = app.update(Message::Sidebar(SidebarAction::ToggleControls));
             assert!(!app.sidebar_state.controls_expanded());
             assert_eq!(app.sidebar_state.query(), "");
             assert_eq!(app.sidebar_state.filter(), sidebar::SidebarFilter::All);
-            assert_eq!(super::super::tests::focused(&app, task), Some(sidebar::search_toggle_focus_id()));
+            assert_eq!(
+                super::super::tests::focused(&app, task),
+                Some(sidebar::search_toggle_focus_id())
+            );
         }
     }
 
@@ -135,7 +186,11 @@ mod tests {
     fn group_confirmation_names_all_targets_and_preserves_unrelated_active_channel() {
         let (mut app, _, ids) = fixture();
         select(&mut app, &ids[..2]);
-        drop(app.begin_sidebar_group_delete());
+        let opening = app.begin_sidebar_group_delete();
+        assert_eq!(
+            super::super::tests::focused_element(app.sidebar_selection_dialog().unwrap(), opening),
+            Some(close_focus_id())
+        );
         let dialog = app.sidebar_selection_ui.dialog.as_ref().unwrap();
         assert_eq!(dialog.targets.len(), 2);
         assert!(
@@ -347,14 +402,9 @@ impl Dialog {
         self.targets[0].row
     }
 
-    /// Confirm, unless a blocker disables it; then Cancel, so focus never
-    /// lands on a dead control.
+    /// Every group deletion opens on its non-destructive dismissal.
     pub(super) fn focus_target(&self) -> widget::Id {
-        if self.blocked() > 0 {
-            close_focus_id()
-        } else {
-            focus_id()
-        }
+        close_focus_id()
     }
 
     fn blocked(&self) -> usize {
@@ -497,7 +547,11 @@ impl Cagents {
                 Ok(Target {
                     row,
                     directory: project.repository.clone(),
-                    label: channel_ui::channel_display_title(channel).to_owned(),
+                    label: channel_ui::channel_display_title(
+                        channel,
+                        self.sidebar_model.project(channel.project_id),
+                    )
+                    .into_owned(),
                     detail: project.name.clone(),
                     blocker,
                 })

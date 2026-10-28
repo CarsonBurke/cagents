@@ -5,7 +5,8 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use serde::{Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
-use super::Registry;
+use super::{Registry, automation_audit, automation_notifications};
+use crate::automations::LifecycleCause;
 use crate::automations::{
     Automation, Definition, Firing, FiringState, HistoryCursor, HistoryPage, MAX_HISTORY_PAGE,
     Occurrence, Summary,
@@ -69,6 +70,7 @@ pub(super) fn close_project(
         .map_err(|e| e.to_string())?;
     for record in records {
         let mut automation: Automation = decode(&record)?;
+        let was_enabled = automation.enabled;
         automation.revision = automation
             .revision
             .checked_add(1)
@@ -80,6 +82,10 @@ pub(super) fn close_project(
         automation.updated_ms = now_ms;
         write_revision(tx, &automation)?;
         write_automation(tx, &automation)?;
+        automation_audit::record(tx, &automation, LifecycleCause::ProjectClosed, None)?;
+        if was_enabled {
+            automation_notifications::queue(tx, &automation, LifecycleCause::ProjectClosed, None)?;
+        }
     }
     Ok(())
 }
@@ -298,6 +304,20 @@ impl Registry {
         }
         write_firing(&tx, &firing)?;
         write_automation(&tx, &automation)?;
+        if pause && automation.execution_revision == firing.revision {
+            automation_audit::record(
+                &tx,
+                &automation,
+                LifecycleCause::StartPaused,
+                Some(firing.id),
+            )?;
+            automation_notifications::queue(
+                &tx,
+                &automation,
+                LifecycleCause::StartPaused,
+                Some(firing.id),
+            )?;
+        }
         tx.execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
             .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
@@ -331,6 +351,27 @@ impl Registry {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|error| error.to_string())?;
         rows.into_iter().map(|record| decode(&record)).collect()
+    }
+
+    /// Target directories of automations with a firing in progress, including
+    /// one still in its precheck that has no agent yet.
+    pub(crate) fn active_automation_directories(&self) -> Result<Vec<std::path::PathBuf>, String> {
+        let mut query = self
+            .db
+            .prepare("SELECT record FROM automations WHERE active_firing IS NOT NULL")
+            .map_err(|error| error.to_string())?;
+        let records = query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+        records
+            .iter()
+            .map(|record| {
+                decode::<Automation>(record)
+                    .map(|automation| automation.definition.agent.target.directory)
+            })
+            .collect()
     }
 
     /// Precheck-only ownership has no hosted session in ordinary update
@@ -400,6 +441,18 @@ impl Registry {
         automation.updated_ms = now_ms;
         write_firing(&tx, &firing)?;
         write_automation(&tx, &automation)?;
+        automation_audit::record(
+            &tx,
+            &automation,
+            LifecycleCause::PrecheckInterrupted,
+            Some(firing.id),
+        )?;
+        automation_notifications::queue(
+            &tx,
+            &automation,
+            LifecycleCause::PrecheckInterrupted,
+            Some(firing.id),
+        )?;
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -432,7 +485,7 @@ impl Registry {
                 |row| row.get(0),
             )
             .map_err(|e| e.to_string())?;
-        if &agent != expected
+        if !super::execution::same_dispatch_agent(&agent, expected)
             || firing.agent != Some(agent.id)
             || firing.run.map(|id| id.to_string()).as_deref() != Some(latest.as_str())
             || automation.active_firing != Some(firing.id)
@@ -466,13 +519,21 @@ impl Registry {
         }
         firing.release_pending = false;
         automation.active_firing = None;
-        automation.blocked = None;
+        let recovered = automation.blocked.take().is_some();
         automation.updated_ms = now_ms;
         if agent.closed && automation.reuse_agent == Some(agent.id) {
             automation.reuse_agent = None;
         }
         write_firing(&tx, &firing)?;
         write_automation(&tx, &automation)?;
+        if recovered {
+            automation_audit::record(
+                &tx,
+                &automation,
+                LifecycleCause::ReleaseRecovered,
+                Some(firing.id),
+            )?;
+        }
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -504,6 +565,12 @@ impl Registry {
         automation.next = None;
         automation.updated_ms = now_ms;
         write_automation(&tx, &automation)?;
+        automation_audit::record(
+            &tx,
+            &automation,
+            LifecycleCause::ReleaseBlocked,
+            Some(firing.id),
+        )?;
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -512,6 +579,7 @@ impl Registry {
     pub(super) fn automation_dispatch_allowed_in(
         tx: &Transaction<'_>,
         accepted: &crate::agent_execution::Accepted,
+        current_agent: &crate::agent_execution::Agent,
         now_ms: u64,
     ) -> Result<bool, String> {
         let crate::agent_execution::Origin::Automation { id } = &accepted.agent.origin else {
@@ -559,8 +627,8 @@ impl Registry {
                 params![run.id.to_string(), run.revision, encode(&run)?],
             )
             .map_err(|error| error.to_string())?;
-            if accepted.agent.session.is_none() {
-                let mut agent = accepted.agent.clone();
+            if current_agent.session.is_none() {
+                let mut agent = current_agent.clone();
                 agent.closed = true;
                 tx.execute(
                     "UPDATE agents SET closed=1,record=?2 WHERE id=?1",
@@ -741,6 +809,14 @@ impl Registry {
         automation.updated_ms = now_ms;
         write_firing(&tx, &firing)?;
         write_automation(&tx, &automation)?;
+        if state == FiringState::Interrupted {
+            automation_audit::record(
+                &tx,
+                &automation,
+                LifecycleCause::RunInterrupted,
+                Some(firing.id),
+            )?;
+        }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(Some(firing))
     }
@@ -873,6 +949,7 @@ impl Registry {
         }
         write_revision(&tx, &automation)?;
         write_automation(&tx, &automation)?;
+        automation_audit::record(&tx, &automation, LifecycleCause::Edited, None)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(automation)
     }
@@ -912,6 +989,16 @@ impl Registry {
         automation.updated_ms = now_ms;
         write_revision(&tx, &automation)?;
         write_automation(&tx, &automation)?;
+        automation_audit::record(
+            &tx,
+            &automation,
+            if automation.enabled {
+                LifecycleCause::Enabled
+            } else {
+                LifecycleCause::Disabled
+            },
+            None,
+        )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(automation)
     }
@@ -928,14 +1015,28 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        let automation = read_automation(&tx, id)?;
+        let mut automation = read_automation(&tx, id)?;
         require_revision(&automation, expected_revision)?;
         if automation.active_firing.is_some() || automation.blocked.is_some() {
             return Err("Cancel and confirm the active or interrupted run has closed before removing this automation".into());
         }
         require_closed_reuse(&tx, &automation)?;
-        tx.execute("UPDATE automations SET deleted_ms=?2,enabled=0,next_due_ms=NULL,revision=revision+1,updated_ms=?2 WHERE id=?1", params![id.to_string(), now_ms])
-            .map_err(|error| error.to_string())?;
+        automation.revision = automation
+            .revision
+            .checked_add(1)
+            .ok_or("Automation revision overflow")?;
+        automation.execution_revision = automation.revision;
+        automation.enabled = false;
+        automation.next = None;
+        automation.updated_ms = now_ms;
+        write_revision(&tx, &automation)?;
+        write_automation(&tx, &automation)?;
+        automation_audit::record(&tx, &automation, LifecycleCause::Removed, None)?;
+        tx.execute(
+            "UPDATE automations SET deleted_ms=?2 WHERE id=?1",
+            params![id.to_string(), now_ms],
+        )
+        .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())
     }
 
@@ -1031,6 +1132,7 @@ pub(super) fn create_automation_in(
             super::repository_key(&automation.definition.agent.target.repository)?],
     ).map_err(|error| error.to_string())?;
     write_revision(tx, &automation)?;
+    automation_audit::record(tx, &automation, LifecycleCause::Created, None)?;
     Ok(automation)
 }
 
@@ -1277,6 +1379,20 @@ impl Registry {
         automation.updated_ms = now_ms;
         write_firing(&tx, &firing)?;
         write_automation(&tx, &automation)?;
+        if !project_open {
+            automation_audit::record(
+                &tx,
+                &automation,
+                LifecycleCause::ProjectUnavailable,
+                Some(firing.id),
+            )?;
+            automation_notifications::queue(
+                &tx,
+                &automation,
+                LifecycleCause::ProjectUnavailable,
+                Some(firing.id),
+            )?;
+        }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(Claimed {
             firing,
@@ -1318,6 +1434,15 @@ impl Registry {
             automation.blocked = None;
             automation.updated_ms = now_ms;
             write_automation(&tx, &automation)?;
+            automation_audit::record(
+                &tx,
+                &automation,
+                LifecycleCause::PrecheckRecovered,
+                Some(firing.id),
+            )?;
+            // The exact cleanup receipt settles only this precheck's stale
+            // pending attention, never a newer pause or another firing.
+            automation_notifications::suppress_precheck(&tx, automation.id, firing.id)?;
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(None);
         }
@@ -1360,6 +1485,20 @@ impl Registry {
         automation.updated_ms = now_ms;
         write_firing(&tx, &firing)?;
         write_automation(&tx, &automation)?;
+        if firing.state == FiringState::Interrupted {
+            automation_audit::record(
+                &tx,
+                &automation,
+                LifecycleCause::PrecheckPaused,
+                Some(firing.id),
+            )?;
+            automation_notifications::queue(
+                &tx,
+                &automation,
+                LifecycleCause::PrecheckPaused,
+                Some(firing.id),
+            )?;
+        }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(accepted)
     }
@@ -1388,6 +1527,7 @@ fn accept_firing(
         }
         Destination::New(spec)
     };
+    let creates_agent = matches!(&destination, Destination::New(_));
     let request = Submit {
         name: None,
         destination,
@@ -1407,7 +1547,8 @@ fn accept_firing(
     );
     match accepted {
         Ok(accepted) => {
-            if automation.channel.is_none()
+            if creates_agent
+                && automation.channel.is_none()
                 && let Some(channel) = accepted.agent.channel()
             {
                 // Naming is a user choice, independent of the execution prompt.
@@ -1422,13 +1563,16 @@ fn accept_firing(
                     ],
                 )
                 .map_err(|error| error.to_string())?;
+                super::channel_work::renamed_in(tx, channel)?;
             }
             tx.execute_batch("RELEASE automation_accept")
                 .map_err(|error| error.to_string())?;
             firing.agent = Some(accepted.agent.id);
             firing.run = Some(accepted.run.id);
             firing.state = FiringState::Accepted;
-            automation.channel = accepted.agent.channel();
+            if creates_agent {
+                automation.channel = accepted.agent.channel();
+            }
             if definition.session_mode == SessionMode::Reuse {
                 automation.reuse_agent = Some(accepted.agent.id);
             }
@@ -2204,6 +2348,26 @@ mod tests {
             )
             .unwrap();
         let accepted = claim.accepted.unwrap();
+        // Placement may advance after acceptance; cancellation must preserve
+        // the current record rather than copying the acceptance snapshot back.
+        let destination = crate::model::ChannelId::new();
+        registry
+            .apply(&ModelEdit::CreateChannel {
+                id: destination,
+                repository: accepted.agent.spec.target.repository.clone(),
+                title: "moved".into(),
+                title_source: Default::default(),
+            })
+            .unwrap();
+        let mut current = registry.agent(accepted.agent.id).unwrap();
+        current.placement = crate::agent_execution::Placement::Channel(destination);
+        registry
+            .db
+            .execute(
+                "UPDATE agents SET record=?2 WHERE id=?1",
+                params![current.id.to_string(), encode(&current).unwrap()],
+            )
+            .unwrap();
         registry
             .set_automation_enabled(automation.id, 1, None, false, 201)
             .unwrap();
@@ -2213,6 +2377,10 @@ mod tests {
             crate::agent_execution::State::Cancelled
         );
         assert!(registry.agent(accepted.agent.id).unwrap().closed);
+        assert_eq!(
+            registry.agent(accepted.agent.id).unwrap().placement,
+            current.placement
+        );
         assert!(
             registry
                 .automation(automation.id)
@@ -2615,10 +2783,42 @@ mod tests {
                 .blocked
                 .is_some()
         );
+        let blocked_audit = registry.automation_audit(automation.id, None, 100).unwrap();
+        let blocked_receipt = &blocked_audit.events[0];
+        assert_eq!(blocked_receipt.cause, LifecycleCause::ReleaseBlocked);
+        assert_eq!(
+            blocked_receipt.actor,
+            crate::automations::LifecycleActor::System
+        );
+        assert_eq!(blocked_receipt.firing, Some(done.id));
+        assert_eq!(
+            blocked_receipt.revision,
+            registry.automation(automation.id).unwrap().revision
+        );
+        assert!(blocked_receipt.blocked && !blocked_receipt.enabled);
+        assert!(
+            !serde_json::to_string(&blocked_audit)
+                .unwrap()
+                .contains("Provider cleanup")
+        );
+        registry
+            .block_automation_release(done.id, "Provider cleanup is still pending".into(), 277)
+            .unwrap();
+        assert_eq!(
+            registry.automation_audit(automation.id, None, 100).unwrap(),
+            blocked_audit
+        );
         let closed = registry.close_agent(&agent.origin, agent.id).unwrap();
         registry
             .finish_automation_release(done.id, &closed, 280)
             .unwrap();
+        let recovered_audit = registry.automation_audit(automation.id, None, 100).unwrap();
+        assert_eq!(
+            recovered_audit.events[0].cause,
+            LifecycleCause::ReleaseRecovered
+        );
+        assert_eq!(recovered_audit.events[0].firing, Some(done.id));
+        assert!(!recovered_audit.events[0].blocked);
         assert!(
             registry
                 .automation(automation.id)
@@ -2657,13 +2857,20 @@ mod tests {
             )
             .unwrap();
         let accepted = claim.accepted.unwrap();
-        let session = crate::chat::fresh_session(
+        let mut session = crate::chat::fresh_session(
             Provider::Claude,
             crate::model::TerminalId::new(),
             automation.definition.agent.target.directory.clone(),
             &crate::account::Account::system(Provider::Claude),
         )
         .unwrap();
+        // A completed hosted run has an authenticated live descriptor, unlike
+        // the pre-host recipe returned by fresh_session.
+        session.proof = Some(crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("automation-fixture"),
+            boot_id: crate::model::BootId::new("boot"),
+            host_incarnation: crate::model::HostIncarnation::new("host"),
+        });
         let agent = registry
             .bind_agent(accepted.agent.id, None, HostedSession::Chat(session))
             .unwrap();
@@ -2793,9 +3000,32 @@ mod tests {
         let model = registry.model().unwrap();
         let channel = model.channel(accepted.agent.channel().unwrap()).unwrap();
         assert_eq!(channel.title, "Current standup name");
+        let work_title: String = registry
+            .db
+            .query_row(
+                "SELECT title FROM channel_work_homes WHERE channel=?1 AND incarnation=?2",
+                params![channel.id.to_string(), channel.ordinal],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(work_title, channel.title);
         assert_eq!(
             channel.title_source,
             crate::model::ChannelTitleSource::Manual
+        );
+        let home = crate::channel_work::Home {
+            registry: model.identity,
+            channel: channel.id,
+            creation_ordinal: channel.ordinal,
+        };
+        registry
+            .apply(&ModelEdit::CloseProject {
+                repository: channel.repository.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            registry.read_channel_work_home(&home).unwrap().lifecycle,
+            crate::channel_work::HomeLifecycle::Deleted
         );
     }
 
@@ -2900,6 +3130,143 @@ mod tests {
                 assert_eq!(channel.title, expected_title);
                 assert_eq!(channel.title_source, ChannelTitleSource::Manual);
             }
+        }
+    }
+
+    #[test]
+    fn moving_a_reused_agent_keeps_the_automations_channel_for_future_agents() {
+        use crate::{
+            agent_execution::{HostedSession, Placement, State, Update},
+            model::{CardId, CardKind, ChannelId},
+            workspace_model::views::{Change, Pane},
+        };
+        for move_to_worktree in [false, true] {
+            let (mut registry, directory, definition) = fixture();
+            let (automation, firing, agent) = completed_reusable_run(&mut registry, definition);
+            let owned_channel = agent.channel().unwrap();
+            let destination = if move_to_worktree {
+                Placement::Worktree {
+                    repository: directory.path().into(),
+                    path: directory.path().into(),
+                }
+            } else {
+                let id = ChannelId::new();
+                registry
+                    .apply(&ModelEdit::CreateChannel {
+                        id,
+                        repository: directory.path().into(),
+                        title: "User channel".into(),
+                        title_source: Default::default(),
+                    })
+                    .unwrap();
+                Placement::Channel(id)
+            };
+            registry
+                .apply(&ModelEdit::SeedView {
+                    scope: destination.clone(),
+                    panes: vec![],
+                    closed: vec![],
+                })
+                .unwrap();
+            let pane = Pane {
+                id: CardId::from_uuid(agent.id.as_uuid()),
+                title: "Reusable agent".into(),
+                user_title: None,
+                pending_terminal_start: false,
+                width_fraction: 0.5,
+                scope: None,
+                kind: CardKind::Chat(match agent.session.clone().unwrap() {
+                    HostedSession::Chat(session) => session,
+                    _ => unreachable!(),
+                }),
+            };
+            registry
+                .apply(&ModelEdit::SeedView {
+                    scope: agent.placement.clone(),
+                    panes: vec![pane.clone()],
+                    closed: vec![],
+                })
+                .unwrap();
+            registry
+                .apply(&ModelEdit::ChangeView {
+                    expected_revision: registry.view_revision(&agent.placement).unwrap(),
+                    scope: agent.placement.clone(),
+                    operation: Uuid::new_v4(),
+                    change: Change::Transfer {
+                        id: pane.id,
+                        destination: destination.clone(),
+                        before: None,
+                    },
+                })
+                .unwrap();
+            // A user move may race the scheduler's idle proof. Only placement
+            // differs from that exact session proof; release must retain it.
+            registry
+                .finish_automation_release(firing.id, &agent, 230)
+                .unwrap();
+            let claim = |registry: &mut Registry, now| {
+                registry
+                    .claim_automation(
+                        automation.id,
+                        automation.execution_revision,
+                        None,
+                        crate::automations::Trigger::Manual {
+                            request: Uuid::new_v4(),
+                        },
+                        None,
+                        true,
+                        now,
+                    )
+                    .unwrap()
+            };
+            let next = claim(&mut registry, 300).accepted.unwrap();
+            assert_eq!(next.agent.id, agent.id);
+            assert_eq!(next.agent.placement, destination);
+            assert_eq!(
+                registry.automation(automation.id).unwrap().channel,
+                Some(owned_channel)
+            );
+            let started = registry
+                .update_agent_run(
+                    next.run.id,
+                    next.run.revision,
+                    Update::Started {
+                        provider_key: "second-turn".into(),
+                    },
+                    305,
+                )
+                .unwrap();
+            registry
+                .update_agent_run(
+                    next.run.id,
+                    started.revision,
+                    Update::Finished {
+                        state: State::Succeeded,
+                        result: Default::default(),
+                    },
+                    310,
+                )
+                .unwrap();
+            let firing = registry
+                .reconcile_automation_run(next.run.id, 320)
+                .unwrap()
+                .unwrap();
+            let closed = registry.close_agent(&agent.origin, agent.id).unwrap();
+            registry
+                .finish_automation_release(firing.id, &closed, 330)
+                .unwrap();
+            let fresh = claim(&mut registry, 400).accepted.unwrap();
+            assert_ne!(fresh.agent.id, agent.id);
+            assert_eq!(fresh.agent.channel(), Some(owned_channel));
+            assert_eq!(
+                registry
+                    .model()
+                    .unwrap()
+                    .channel(owned_channel)
+                    .unwrap()
+                    .title,
+                "Review daily"
+            );
         }
     }
 
@@ -3032,5 +3399,919 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+    #[test]
+    fn automation_lifecycle_audit_is_atomic_revision_fenced_private_and_read_only() {
+        use crate::automations::{LifecycleActor, LifecycleCause};
+        let (mut registry, _directory, mut definition) = fixture();
+        definition.prompt = "PRIVATE_PROMPT_SHOULD_NOT_ENTER_AUDIT".into();
+        let created = registry
+            .create_automation(definition.clone(), 100, test_identity())
+            .unwrap();
+        let page = registry.automation_audit(created.id, None, 100).unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].cause, LifecycleCause::Created);
+        assert!(!page.earlier_events_unavailable);
+        let enabled = registry
+            .set_automation_enabled(
+                created.id,
+                1,
+                Some(Occurrence {
+                    due_ms: 1_000,
+                    local: "next".into(),
+                }),
+                true,
+                200,
+            )
+            .unwrap();
+        let mut other = registry.execution_connection().unwrap();
+        assert!(
+            other
+                .set_automation_enabled(created.id, 1, None, false, 201)
+                .is_err()
+        );
+        let page = registry.automation_audit(created.id, None, 100).unwrap();
+        assert_eq!(
+            page.events.len(),
+            2,
+            "stale writer must not fabricate an audit row"
+        );
+        assert_eq!(page.events[0].revision, enabled.revision);
+        assert_eq!(page.events[0].actor, LifecycleActor::UserManagement);
+        assert!(page.events[0].enabled);
+        assert!(
+            !serde_json::to_string(&page)
+                .unwrap()
+                .contains("PRIVATE_PROMPT")
+        );
+        registry.db.execute_batch("CREATE TEMP TRIGGER reject_audit BEFORE INSERT ON automation_lifecycle BEGIN SELECT RAISE(ABORT,'audit fixture failure'); END;").unwrap();
+        assert!(
+            registry
+                .set_automation_enabled(created.id, 2, None, false, 202)
+                .is_err()
+        );
+        assert_eq!(
+            registry.automation(created.id).unwrap(),
+            enabled,
+            "state rolls back if receipt cannot commit"
+        );
+        assert_eq!(
+            registry.automation_audit(created.id, None, 100).unwrap(),
+            page
+        );
+        registry
+            .db
+            .execute_batch("DROP TRIGGER reject_audit;")
+            .unwrap();
+        let sequence: u64 = registry
+            .db
+            .query_row("SELECT sequence FROM metadata WHERE key=0", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                registry.automation_audit(created.id, None, 100).unwrap(),
+                page
+            );
+        }
+        assert_eq!(
+            registry
+                .db
+                .query_row("SELECT sequence FROM metadata WHERE key=0", [], |r| r
+                    .get::<_, u64>(0))
+                .unwrap(),
+            sequence
+        );
+        assert_eq!(
+            registry
+                .db
+                .query_row("SELECT count(*) FROM agent_runs", [], |r| r
+                    .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn automation_lifecycle_audit_retains_bounded_pages_with_equal_and_reversed_clocks() {
+        use crate::automations::MAX_LIFECYCLE_EVENTS;
+        let (mut registry, _directory, definition) = fixture();
+        let created = registry
+            .create_automation(definition, 100, test_identity())
+            .unwrap();
+        let unrelated = registry
+            .create_automation(created.definition.clone(), 100, test_identity())
+            .unwrap();
+        let mut revision = 1;
+        for index in 0..(MAX_LIFECYCLE_EVENTS + 17) {
+            revision = registry
+                .set_automation_enabled(
+                    created.id,
+                    revision,
+                    None,
+                    false,
+                    if index % 2 == 0 { 100 } else { 50 },
+                )
+                .unwrap()
+                .revision;
+        }
+        let first = registry
+            .automation_audit(created.id, None, usize::MAX)
+            .unwrap();
+        assert_eq!(first.events.len(), crate::automations::MAX_HISTORY_PAGE);
+        assert!(first.earlier_events_unavailable);
+        let mut all = first.events;
+        let mut cursor = first.next;
+        while let Some(before) = cursor {
+            let page = registry
+                .automation_audit(created.id, Some(before), 37)
+                .unwrap();
+            all.extend(page.events);
+            cursor = page.next;
+        }
+        assert_eq!(all.len(), MAX_LIFECYCLE_EVENTS);
+        assert!(
+            all.windows(2)
+                .all(|pair| pair[0].sequence > pair[1].sequence)
+        );
+        assert!(all.iter().all(|event| event.automation == created.id));
+        assert_eq!(
+            registry
+                .automation_audit(unrelated.id, None, 100)
+                .unwrap()
+                .events
+                .len(),
+            1
+        );
+        assert!(
+            registry
+                .automation_audit(created.id, Some(u64::MAX), 100)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn automation_lifecycle_audit_material_edit_project_close_and_removal_have_exact_receipts() {
+        use crate::automations::{LifecycleActor, LifecycleCause};
+        let (mut registry, _directory, definition) = fixture();
+        let created = registry
+            .create_automation(definition.clone(), 100, test_identity())
+            .unwrap();
+        let mut edited = definition.clone();
+        edited.prompt.push_str(" changed");
+        let updated = registry
+            .edit_automation(created.id, 1, edited, 200, test_identity())
+            .unwrap();
+        let page = registry.automation_audit(created.id, None, 1).unwrap();
+        assert_eq!(
+            (
+                page.events[0].cause,
+                page.events[0].revision,
+                page.events[0].enabled
+            ),
+            (LifecycleCause::Edited, updated.revision, false)
+        );
+        let tx = registry.db.transaction().unwrap();
+        close_project(
+            &tx,
+            definition.agent.target.repository.to_str().unwrap(),
+            300,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let closed = registry.automation(created.id).unwrap();
+        let page = registry.automation_audit(created.id, None, 1).unwrap();
+        assert_eq!(
+            (
+                page.events[0].cause,
+                page.events[0].revision,
+                page.events[0].actor
+            ),
+            (
+                LifecycleCause::ProjectClosed,
+                closed.revision,
+                LifecycleActor::System
+            )
+        );
+        registry
+            .remove_automation(created.id, closed.revision, 400)
+            .unwrap();
+        assert!(registry.automation(created.id).is_err());
+        let page = registry.automation_audit(created.id, None, 1).unwrap();
+        assert_eq!(
+            (
+                page.events[0].cause,
+                page.events[0].revision,
+                page.events[0].enabled
+            ),
+            (LifecycleCause::Removed, closed.revision + 1, false)
+        );
+        assert_eq!(
+            registry.automation_audit_repository(created.id).unwrap(),
+            definition.agent.target.repository
+        );
+    }
+
+    #[test]
+    fn automation_lifecycle_audit_upgrade_does_not_attribute_missing_legacy_events() {
+        let (mut registry, directory, definition) = fixture();
+        let created = registry
+            .create_automation(definition, 100, test_identity())
+            .unwrap();
+        registry
+            .db
+            .execute_batch(
+                "DROP TABLE automation_notifications;
+                 DROP TABLE channel_work_placement_epochs;
+                DROP TABLE channel_work_placement_clock;
+                DROP TABLE channel_work_operations;
+                DROP TABLE channel_work_entries;
+                DROP TABLE channel_work_homes;
+                DROP TABLE automation_lifecycle; PRAGMA user_version=15;",
+            )
+            .unwrap();
+        drop(registry);
+        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let legacy = registry.automation_audit(created.id, None, 100).unwrap();
+        assert!(legacy.events.is_empty() && legacy.earlier_events_unavailable);
+        registry
+            .set_automation_enabled(created.id, 1, None, false, 200)
+            .unwrap();
+        let current = registry.automation_audit(created.id, None, 100).unwrap();
+        assert!(current.earlier_events_unavailable);
+        assert_eq!(current.events.len(), 1);
+        assert_eq!(current.events[0].cause, LifecycleCause::Disabled);
+        drop(registry);
+        let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert_eq!(
+            registry.automation_audit(created.id, None, 100).unwrap(),
+            current
+        );
+    }
+    #[test]
+    fn automation_lifecycle_audit_keeps_immutable_event_scope_after_cross_project_edit() {
+        let (mut registry, directory, definition) = fixture();
+        let source = definition.agent.target.repository.clone();
+        let target = directory.path().join("destination");
+        std::fs::create_dir(&target).unwrap();
+        registry
+            .apply(&ModelEdit::OpenProject {
+                repository: target.clone(),
+                name: "Destination".into(),
+                kind: ProjectKind::Folder,
+            })
+            .unwrap();
+        let created = registry
+            .create_automation(definition.clone(), 100, test_identity())
+            .unwrap();
+        let source_page = registry
+            .project_automation_audit(&source, created.id, None, 100)
+            .unwrap();
+        assert!(
+            registry
+                .project_automation_audit(&target, created.id, None, 100)
+                .is_err()
+        );
+        let mut moved = definition;
+        moved.agent.target.repository = target.clone();
+        moved.agent.target.directory = target.clone();
+        registry
+            .edit_automation(created.id, 1, moved, 200, test_identity())
+            .unwrap();
+        assert_eq!(
+            registry
+                .project_automation_audit(&source, created.id, None, 100)
+                .unwrap(),
+            source_page
+        );
+        let target_page = registry
+            .project_automation_audit(&target, created.id, None, 100)
+            .unwrap();
+        assert_eq!(target_page.events.len(), 1);
+        assert_eq!(target_page.events[0].cause, LifecycleCause::Edited);
+        assert!(target_page.earlier_events_unavailable);
+        assert!(
+            registry
+                .project_automation_audit(
+                    &target,
+                    created.id,
+                    Some(target_page.events[0].sequence),
+                    100
+                )
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        assert_eq!(
+            registry
+                .automation_audit(created.id, None, 100)
+                .unwrap()
+                .events
+                .len(),
+            2,
+            "management reads retain the full receipt chain"
+        );
+    }
+    #[test]
+    fn automation_lifecycle_precheck_cleanup_recovery_is_atomic_and_does_not_reenable() {
+        let (mut registry, _directory, mut definition) = fixture();
+        definition.precheck = Some(crate::automations::Precheck {
+            command: "true".into(),
+            timeout_seconds: 1,
+        });
+        let created = registry
+            .create_automation(definition, 100, test_identity())
+            .unwrap();
+        let claim = registry
+            .claim_automation(
+                created.id,
+                1,
+                None,
+                crate::automations::Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                200,
+            )
+            .unwrap();
+        registry
+            .interrupt_automation_precheck(claim.firing.id, "uncertain private cleanup".into(), 300)
+            .unwrap();
+        let blocked = registry.automation_audit(created.id, None, 100).unwrap();
+        assert_eq!(blocked.events[0].cause, LifecycleCause::PrecheckInterrupted);
+        assert!(blocked.events[0].blocked);
+        assert!(
+            registry
+                .finish_automation_precheck(
+                    claim.firing.id,
+                    crate::host::automations::precheck::Outcome::Passed,
+                    400
+                )
+                .unwrap()
+                .is_none()
+        );
+        let page = registry.automation_audit(created.id, None, 100).unwrap();
+        let recovered = &page.events[0];
+        assert_eq!(recovered.cause, LifecycleCause::PrecheckRecovered);
+        assert_eq!(recovered.firing, Some(claim.firing.id));
+        assert_eq!(recovered.occurred_ms, 400);
+        assert!(!recovered.blocked && !recovered.enabled);
+        let current = registry.automation(created.id).unwrap();
+        assert!(!current.enabled && current.blocked.is_none() && current.active_firing.is_none());
+        assert_eq!(recovered.revision, current.revision);
+    }
+
+    #[test]
+    fn closing_more_than_1024_enabled_automations_commits_pauses_and_no_run_attention() {
+        use std::collections::BTreeSet;
+        let (mut registry, directory, definition) = fixture();
+        let disabled = registry
+            .create_automation(definition.clone(), 100, test_identity())
+            .unwrap();
+        let mut enabled_ids = BTreeSet::new();
+        for index in 0..1025 {
+            let mut next = definition.clone();
+            next.name = format!("Paused fixture {index}");
+            let created = registry
+                .create_automation(next, 100, test_identity())
+                .unwrap();
+            registry
+                .set_automation_enabled(
+                    created.id,
+                    created.revision,
+                    Some(Occurrence {
+                        due_ms: 60_000,
+                        local: "next fixture minute".into(),
+                    }),
+                    true,
+                    200,
+                )
+                .unwrap();
+            enabled_ids.insert(created.id);
+        }
+        assert!(
+            registry
+                .pending_automation_notifications(100)
+                .unwrap()
+                .is_empty(),
+            "creation and explicit enable are not system pause attention"
+        );
+        registry
+            .apply(&ModelEdit::CloseProject {
+                repository: definition.agent.target.repository.clone(),
+            })
+            .unwrap();
+        assert!(registry.model().unwrap().projects.is_empty());
+        let still_enabled: u64 = registry
+            .db
+            .query_row(
+                "SELECT count(*) FROM automations WHERE enabled<>0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            still_enabled, 0,
+            "notification capacity cannot undo a safety pause"
+        );
+        let queued = registry
+            .db
+            .prepare("SELECT automation FROM automation_notifications")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|row| Uuid::parse_str(&row.unwrap()).unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(queued, enabled_ids);
+        assert!(
+            !queued.contains(&disabled.id),
+            "already disabled definitions stay quiet"
+        );
+        assert!(
+            registry
+                .automation_history(None, None, 100)
+                .unwrap()
+                .firings
+                .is_empty()
+        );
+        let page = registry.pending_automation_notifications(100).unwrap();
+        assert_eq!(page.len(), 100, "delivery remains a bounded read");
+        let event = page[0].event().clone();
+        assert_eq!(event.cause, LifecycleCause::ProjectClosed);
+        assert!(event.firing.is_none() && !event.enabled);
+        assert_eq!(
+            registry
+                .automation_audit(event.automation, None, 1)
+                .unwrap()
+                .events[0],
+            event,
+            "attention identity comes from the exact committed lifecycle receipt"
+        );
+        drop(registry);
+        let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert_eq!(
+            registry.pending_automation_notifications(100).unwrap()[0].event(),
+            &event
+        );
+        assert!(!registry.automation(event.automation).unwrap().enabled);
+        assert!(
+            registry
+                .automation_history(None, None, 100)
+                .unwrap()
+                .firings
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn precheck_block_and_exact_cleanup_attention_roll_back_with_their_lifecycle_writes() {
+        use crate::host::automations::precheck::Outcome;
+        let (mut registry, _directory, mut definition) = fixture();
+        definition.precheck = Some(crate::automations::Precheck {
+            command: "true".into(),
+            timeout_seconds: 1,
+        });
+        let created = registry
+            .create_automation(definition, 100, test_identity())
+            .unwrap();
+        let claim = registry
+            .claim_automation(
+                created.id,
+                created.execution_revision,
+                None,
+                crate::automations::Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                200,
+            )
+            .unwrap();
+        assert!(claim.accepted.is_none() && claim.firing.run.is_none());
+        let owner = registry.automation(created.id).unwrap();
+        let audit = registry.automation_audit(created.id, None, 100).unwrap();
+        registry.db.execute_batch(
+            "CREATE TEMP TRIGGER refuse_attention_insert BEFORE INSERT ON main.automation_notifications
+             BEGIN SELECT RAISE(ABORT, 'fixture attention publication failure'); END;",
+        ).unwrap();
+        let error = registry
+            .interrupt_automation_precheck(claim.firing.id, "private shell diagnostic".into(), 300)
+            .unwrap_err();
+        assert!(error.contains("fixture attention publication failure"));
+        assert_eq!(registry.automation(created.id).unwrap(), owner);
+        assert_eq!(
+            registry.automation_firing(claim.firing.id).unwrap(),
+            claim.firing
+        );
+        assert_eq!(
+            registry.automation_audit(created.id, None, 100).unwrap(),
+            audit
+        );
+        assert!(
+            registry
+                .pending_automation_notifications(100)
+                .unwrap()
+                .is_empty()
+        );
+        registry
+            .db
+            .execute_batch("DROP TRIGGER temp.refuse_attention_insert;")
+            .unwrap();
+        registry
+            .interrupt_automation_precheck(claim.firing.id, "private shell diagnostic".into(), 300)
+            .unwrap();
+        let first = registry.pending_automation_notifications(100).unwrap()[0]
+            .event()
+            .clone();
+        assert_eq!(first.cause, LifecycleCause::PrecheckInterrupted);
+        assert_eq!(first.firing, Some(claim.firing.id));
+        assert!(first.blocked && !first.enabled);
+        registry
+            .interrupt_automation_precheck(claim.firing.id, "newer private diagnostic".into(), 301)
+            .unwrap();
+        let pending = registry.pending_automation_notifications(100).unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "newer causal state replaces only current actionable attention"
+        );
+        let latest = pending[0].event().clone();
+        assert!(latest.sequence > first.sequence);
+        let blocked = registry.automation(created.id).unwrap();
+        let audit = registry.automation_audit(created.id, None, 100).unwrap();
+        registry.db.execute_batch(
+            "CREATE TEMP TRIGGER refuse_attention_retirement BEFORE DELETE ON main.automation_notifications
+             BEGIN SELECT RAISE(ABORT, 'fixture exact retirement failure'); END;",
+        ).unwrap();
+        let error = registry
+            .finish_automation_precheck(claim.firing.id, Outcome::Passed, 400)
+            .unwrap_err();
+        assert!(error.contains("fixture exact retirement failure"));
+        assert_eq!(registry.automation(created.id).unwrap(), blocked);
+        assert_eq!(
+            registry.automation_audit(created.id, None, 100).unwrap(),
+            audit
+        );
+        assert_eq!(
+            registry.pending_automation_notifications(100).unwrap()[0].event(),
+            &latest
+        );
+        registry
+            .db
+            .execute_batch("DROP TRIGGER temp.refuse_attention_retirement;")
+            .unwrap();
+        assert!(
+            registry
+                .finish_automation_precheck(claim.firing.id, Outcome::Passed, 400)
+                .unwrap()
+                .is_none()
+        );
+        let recovered = registry.automation(created.id).unwrap();
+        assert!(
+            recovered.active_firing.is_none() && recovered.blocked.is_none() && !recovered.enabled
+        );
+        assert_eq!(
+            registry
+                .automation_audit(created.id, None, 1)
+                .unwrap()
+                .events[0]
+                .cause,
+            LifecycleCause::PrecheckRecovered
+        );
+        assert!(
+            registry
+                .pending_automation_notifications(100)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            registry
+                .automation_firing(claim.firing.id)
+                .unwrap()
+                .run
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn completed_interrupted_precheck_pauses_without_accepting_or_inventing_an_agent_run() {
+        use crate::host::automations::precheck::Outcome;
+        let (mut registry, _directory, mut definition) = fixture();
+        definition.precheck = Some(crate::automations::Precheck {
+            command: "true".into(),
+            timeout_seconds: 1,
+        });
+        let created = registry
+            .create_automation(definition, 100, test_identity())
+            .unwrap();
+        let enabled = registry
+            .set_automation_enabled(
+                created.id,
+                created.revision,
+                Some(Occurrence {
+                    due_ms: 60_000,
+                    local: "first fixture minute".into(),
+                }),
+                true,
+                200,
+            )
+            .unwrap();
+        let first = enabled.next.clone().unwrap();
+        let claim = registry
+            .claim_automation(
+                created.id,
+                enabled.execution_revision,
+                Some(&first),
+                crate::automations::Trigger::Scheduled {
+                    occurrence: first.clone(),
+                },
+                Some(Occurrence {
+                    due_ms: 120_000,
+                    local: "second fixture minute".into(),
+                }),
+                false,
+                60_000,
+            )
+            .unwrap();
+        assert!(
+            registry
+                .finish_automation_precheck(
+                    claim.firing.id,
+                    Outcome::Stopped {
+                        state: FiringState::Interrupted,
+                        skip: None,
+                        diagnostic: "Previous-boot command effects are uncertain".into(),
+                    },
+                    60_001,
+                )
+                .unwrap()
+                .is_none()
+        );
+        let current = registry.automation(created.id).unwrap();
+        assert!(!current.enabled && current.next.is_none() && current.active_firing.is_none());
+        let firing = registry.automation_firing(claim.firing.id).unwrap();
+        assert_eq!(firing.state, FiringState::Interrupted);
+        assert!(firing.run.is_none() && firing.agent.is_none());
+        let pending = registry.pending_automation_notifications(100).unwrap();
+        assert_eq!(pending.len(), 1);
+        let event = pending[0].event();
+        assert_eq!(event.cause, LifecycleCause::PrecheckPaused);
+        assert_eq!(event.firing, Some(firing.id));
+        assert_eq!(
+            &registry
+                .automation_audit(created.id, None, 1)
+                .unwrap()
+                .events[0],
+            event
+        );
+        assert!(!event.enabled);
+    }
+
+    #[test]
+    fn failed_project_pause_attention_keeps_project_definition_and_audit_at_one_commit() {
+        let (mut registry, _directory, definition) = fixture();
+        let created = registry
+            .create_automation(definition.clone(), 100, test_identity())
+            .unwrap();
+        let enabled = registry
+            .set_automation_enabled(
+                created.id,
+                created.revision,
+                Some(Occurrence {
+                    due_ms: 60_000,
+                    local: "future fixture minute".into(),
+                }),
+                true,
+                200,
+            )
+            .unwrap();
+        let before = registry.model().unwrap();
+        let audit = registry.automation_audit(created.id, None, 100).unwrap();
+        registry.db.execute_batch(
+            "CREATE TEMP TRIGGER refuse_project_attention BEFORE INSERT ON main.automation_notifications
+             BEGIN SELECT RAISE(ABORT, 'fixture project attention failure'); END;",
+        ).unwrap();
+        let error = registry
+            .apply(&ModelEdit::CloseProject {
+                repository: definition.agent.target.repository.clone(),
+            })
+            .unwrap_err();
+        assert!(error.contains("fixture project attention failure"));
+        let after = registry.model().unwrap();
+        assert_eq!(after.projects, before.projects);
+        assert_eq!(after.sequence, before.sequence);
+        assert_eq!(registry.automation(created.id).unwrap(), enabled);
+        assert_eq!(
+            registry.automation_audit(created.id, None, 100).unwrap(),
+            audit
+        );
+        assert!(
+            registry
+                .pending_automation_notifications(100)
+                .unwrap()
+                .is_empty()
+        );
+        registry
+            .db
+            .execute_batch("DROP TRIGGER temp.refuse_project_attention;")
+            .unwrap();
+        registry
+            .apply(&ModelEdit::CloseProject {
+                repository: definition.agent.target.repository,
+            })
+            .unwrap();
+        assert!(registry.model().unwrap().projects.is_empty());
+        assert!(!registry.automation(created.id).unwrap().enabled);
+        assert_eq!(
+            registry
+                .pending_automation_notifications(100)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn accepted_run_interruption_keeps_execution_attention_without_a_second_automation_notice() {
+        use crate::agent_execution::{State, Update};
+        let (mut registry, _directory, definition) = fixture();
+        let created = registry
+            .create_automation(definition.clone(), 100, test_identity())
+            .unwrap();
+        let enabled = registry
+            .set_automation_enabled(
+                created.id,
+                created.revision,
+                Some(Occurrence {
+                    due_ms: 60_000,
+                    local: "future fixture minute".into(),
+                }),
+                true,
+                200,
+            )
+            .unwrap();
+        let claimed = registry
+            .claim_automation(
+                created.id,
+                enabled.execution_revision,
+                None,
+                crate::automations::Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                300,
+            )
+            .unwrap();
+        let accepted = claimed.accepted.unwrap();
+        assert_eq!(claimed.firing.run, Some(accepted.run.id));
+        registry
+            .apply(&ModelEdit::CloseProject {
+                repository: definition.agent.target.repository,
+            })
+            .unwrap();
+        assert!(
+            registry
+                .pending_automation_notifications(100)
+                .unwrap()
+                .is_empty(),
+            "the accepted run remains the single attention owner even when project closure pauses its schedule"
+        );
+        registry
+            .update_agent_run(
+                accepted.run.id,
+                accepted.run.revision,
+                Update::Finished {
+                    state: State::Interrupted,
+                    result: Default::default(),
+                },
+                400,
+            )
+            .unwrap();
+        registry
+            .reconcile_automation_run(accepted.run.id, 401)
+            .unwrap();
+        let firing = registry.automation_firing(claimed.firing.id).unwrap();
+        assert_eq!(firing.run, Some(accepted.run.id));
+        assert_eq!(firing.agent, Some(accepted.agent.id));
+        assert_eq!(firing.state, FiringState::Interrupted);
+        assert_eq!(
+            registry.agent_run(accepted.run.id).unwrap().state,
+            State::Interrupted
+        );
+        assert_eq!(
+            registry
+                .automation_audit(created.id, None, 1)
+                .unwrap()
+                .events[0]
+                .cause,
+            LifecycleCause::RunInterrupted
+        );
+        assert!(
+            registry
+                .pending_automation_notifications(100)
+                .unwrap()
+                .is_empty(),
+            "run_attention keeps the existing AgentRun route; no system no-run duplicate is queued"
+        );
+    }
+
+    #[test]
+    fn prelaunch_failure_and_unavailable_project_queue_only_actual_no_run_pause_receipts() {
+        for pause in [false, true] {
+            let (mut registry, _directory, mut definition) = fixture();
+            definition.precheck = Some(crate::automations::Precheck {
+                command: "true".into(),
+                timeout_seconds: 1,
+            });
+            let created = registry
+                .create_automation(definition, 100, test_identity())
+                .unwrap();
+            let claim = registry
+                .claim_automation(
+                    created.id,
+                    created.execution_revision,
+                    None,
+                    crate::automations::Trigger::Manual {
+                        request: Uuid::new_v4(),
+                    },
+                    None,
+                    true,
+                    200,
+                )
+                .unwrap();
+            assert!(claim.accepted.is_none() && claim.firing.run.is_none());
+            registry
+                .fail_automation_start(
+                    claim.firing.id,
+                    "private authority diagnostic".into(),
+                    300,
+                    pause,
+                )
+                .unwrap();
+            let pending = registry.pending_automation_notifications(100).unwrap();
+            assert_eq!(pending.len(), usize::from(pause));
+            let firing = registry.automation_firing(claim.firing.id).unwrap();
+            assert_eq!(firing.state, FiringState::Failed);
+            assert!(firing.run.is_none() && firing.agent.is_none());
+            if pause {
+                let event = pending[0].event();
+                assert_eq!(event.cause, LifecycleCause::StartPaused);
+                assert_eq!(event.firing, Some(firing.id));
+                assert_eq!(
+                    &registry
+                        .automation_audit(created.id, None, 1)
+                        .unwrap()
+                        .events[0],
+                    event
+                );
+            }
+        }
+        let (mut registry, _directory, definition) = fixture();
+        let created = registry
+            .create_automation(definition.clone(), 100, test_identity())
+            .unwrap();
+        registry
+            .apply(&ModelEdit::CloseProject {
+                repository: definition.agent.target.repository,
+            })
+            .unwrap();
+        assert!(
+            registry
+                .pending_automation_notifications(100)
+                .unwrap()
+                .is_empty()
+        );
+        let current = registry.automation(created.id).unwrap();
+        let claim = registry
+            .claim_automation(
+                created.id,
+                current.execution_revision,
+                None,
+                crate::automations::Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                300,
+            )
+            .unwrap();
+        assert!(claim.accepted.is_none() && claim.firing.run.is_none());
+        assert_eq!(claim.firing.state, FiringState::Failed);
+        let pending = registry.pending_automation_notifications(100).unwrap();
+        assert_eq!(pending.len(), 1);
+        let event = pending[0].event();
+        assert_eq!(event.cause, LifecycleCause::ProjectUnavailable);
+        assert_eq!(event.firing, Some(claim.firing.id));
+        assert_eq!(
+            &registry
+                .automation_audit(created.id, None, 1)
+                .unwrap()
+                .events[0],
+            event
+        );
+        assert!(!registry.automation(created.id).unwrap().enabled);
     }
 }

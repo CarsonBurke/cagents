@@ -9,7 +9,11 @@ pub(in crate::host) fn inspect(
     policy: Policy,
     fence_actors: bool,
 ) -> Result<DaemonImpact, ProtocolError> {
-    let (registry, handles) = {
+    // A refused close can leave an authenticated cleanup-only attachment.
+    // Reinstall its actual running owner before previewing checkpointability;
+    // never waive a pending handoff or pretend a failed close completed.
+    let cleanup_failures = super::super::chat::retained_actor::recover_cleanup_attachments(host);
+    let (registry, handles, migrations) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         (
             state.execution_registry.clone(),
@@ -20,9 +24,32 @@ pub(in crate::host) fn inspect(
                 .filter(|(_, record)| record.handle.owns_work() && !record.handle.is_completed())
                 .map(|(&id, record)| (id, record.handle.clone()))
                 .collect::<Vec<_>>(),
+            state
+                .chats
+                .iter()
+                .filter_map(|(id, record)| {
+                    if !record.handle.owns_work() || record.handle.is_completed() {
+                        return None;
+                    }
+                    let mut source = record.session.clone();
+                    source.native_continuity = record.handle.native_continuity();
+                    if source.native_continuity.retains_provider() {
+                        source.launch.session_id = record.handle.confirmed_session_id();
+                    }
+                    let mut launch = source.launch.clone();
+                    launch.session_id = record.handle.confirmed_session_id();
+                    crate::chat::protocol::align_resume_identity(&mut launch).ok()?;
+                    crate::upgrade::handoff::validate_chat_source(&source, &launch).ok()?;
+                    Some(crate::upgrade::handoff::Chat {
+                        source,
+                        launch,
+                        previous_sources: state.upgrade_chats.get(id).cloned().unwrap_or_default(),
+                    })
+                })
+                .collect::<Vec<_>>(),
         )
     };
-    let mut blockers = Vec::new();
+    let mut blockers = cleanup_failures;
     if let Some(registry) = registry {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         blockers.extend(registry.agent_update_blockers().map_err(upgrade_error)?);
@@ -31,6 +58,13 @@ pub(in crate::host) fn inspect(
                 .automation_update_blockers()
                 .map_err(upgrade_error)?,
         );
+    }
+    if let Some(store) = crate::upgrade::handoff::Store::existing().map_err(upgrade_error)?
+        && let Err(reason) = store.preflight_recovered(&migrations)
+    {
+        blockers.push(format!(
+            "Upgrade recovery evidence cannot be retained: {reason}"
+        ));
     }
     if fence_actors {
         for (id, handle) in handles {
@@ -47,7 +81,7 @@ pub(in crate::host) fn inspect(
                 )),
                 crate::chat::runtime::UpdateReadiness::Busy
                     if policy == Policy::WhenIdle
-                        && !matches!(handle.native_continuity(), crate::chat::NativeContinuity::Durable { .. }) => {
+                        && !handle.native_continuity().retains_provider() => {
                     blockers.push(format!("Conversation {id} has accepted work; wait for it to finish."));
                 }
                 _ => {}
@@ -182,10 +216,12 @@ impl HostState {
             let mut launch = record.session.launch.clone();
             launch.session_id = confirmed.clone();
             let aligned = crate::chat::protocol::align_resume_identity(&mut launch).is_ok();
-            let durable = matches!(
-                record.handle.native_continuity(),
-                crate::chat::NativeContinuity::Durable { .. }
-            );
+            let continuity = record.handle.native_continuity();
+            let durable = continuity.retains_provider();
+            let retained_claude = matches!(
+                continuity,
+                crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+            ) && record.handle.actor_identity().is_some();
             let hosted_source = !super::super::chat::owns_codex_listener(&record.session)
                 && self
                     .terminals
@@ -196,6 +232,15 @@ impl HostState {
                 hosted_source,
                 &record.handle,
             );
+            // Preview the same issued source that preparation checkpoints.
+            // A lagging presentation capability is not the installed helper's
+            // ownership; obtain that capability from this exact live handle.
+            let mut source = record.session.clone();
+            source.native_continuity = continuity;
+            if source.native_continuity.retains_provider() {
+                source.launch.session_id = confirmed.clone();
+            }
+            let migration = crate::upgrade::handoff::validate_chat_source(&source, &launch);
             let (disposition, reason) = if record.returning_terminal {
                 (
                     Disposition::Blocked,
@@ -211,6 +256,8 @@ impl HostState {
                     Disposition::Blocked,
                     "Its provider stopped but may still hold unfinished work. Close this conversation to release it.",
                 )
+            } else if let Err(reason) = &migration {
+                (Disposition::Blocked, reason.as_str())
             } else if let Err(reason) = &environment {
                 (Disposition::Blocked, reason.as_str())
             } else if !ready {
@@ -218,7 +265,7 @@ impl HostState {
                     Disposition::Blocked,
                     "Its provider is not ready yet. This clears on its own once it finishes starting; close the conversation if it does not.",
                 )
-            } else if !aligned || launch.terminal_recipe().is_none() {
+            } else if (!aligned || launch.terminal_recipe().is_none()) && !retained_claude {
                 (
                     Disposition::Blocked,
                     "Its provider has not reported which conversation it is running, so it cannot be resumed after the update. Send it a message or close it.",

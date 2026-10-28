@@ -19,6 +19,7 @@ use std::{
 
 mod account_info;
 mod directory;
+pub(super) use directory::{live_sessions, named};
 pub(super) mod mailbox;
 mod ownership;
 pub(super) mod terminals;
@@ -254,6 +255,14 @@ fn launch_options(spec: &crate::agent_execution::Spec) -> Vec<String> {
     arguments
 }
 
+/// An unavailable remote snapshot proves neither provider exit nor safe retry.
+fn provider_launch_snapshot(
+    handle: &chat::runtime::Handle,
+) -> Result<chat::Snapshot, (State, String)> {
+    handle.snapshot(None).ok_or_else(|| (State::Interrupted,
+        "The exact provider could not confirm startup; its ownership was preserved and the prompt was not resent".into()))
+}
+
 fn dispatch(
     host: &SharedHost,
     accepted: &Accepted,
@@ -459,7 +468,7 @@ fn dispatch(
     drop(_dispatch);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let snapshot = handle.snapshot(None).expect("unconditional snapshot");
+        let snapshot = provider_launch_snapshot(&handle)?;
         if snapshot.exited || handle.is_completed() {
             return Err(before("Provider exited before accepting the prompt".into()));
         }
@@ -642,7 +651,7 @@ fn now() -> u64 {
     chat::now_ms().unwrap_or(0)
 }
 
-fn announce(host: &SharedHost, registry: &SharedRegistry) {
+pub(super) fn announce(host: &SharedHost, registry: &SharedRegistry) {
     let sequence = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -674,13 +683,40 @@ pub(super) fn retired(host: &SharedHost, session: &chat::Session) -> Result<(), 
     Ok(())
 }
 
-fn agent_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<()>> {
-    host.lock()
+/// Reads only the managed presentation. No registry means ordinary interactive
+/// conversations still close without the optional managed-agent subsystem.
+pub(super) fn preflight_retirement(
+    host: &SharedHost,
+    session: &chat::Session,
+) -> Result<(), String> {
+    let Ok(registry) = registry(host) else {
+        return Ok(());
+    };
+    let result = registry
+        .lock()
         .unwrap_or_else(|p| p.into_inner())
+        .preflight_agent_retirement(&HostedSession::Chat(session.clone()));
+    result
+}
+
+fn agent_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<()>> {
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    // A holder or waiter keeps its Arc alive, so pruning cannot split an
+    // active agent's serialization. Failed and repeated closes need no
+    // special cleanup, and unused entries survive only until the next lookup.
+    state
         .execution_gates
-        .entry(id)
-        .or_default()
-        .clone()
+        .retain(|_, gate| gate.strong_count() > 0);
+    if let Some(gate) = state
+        .execution_gates
+        .get(&id)
+        .and_then(std::sync::Weak::upgrade)
+    {
+        return gate;
+    }
+    let gate = Arc::new(Mutex::new(()));
+    state.execution_gates.insert(id, Arc::downgrade(&gate));
+    gate
 }
 
 fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent, String> {
@@ -691,11 +727,16 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
     let agent = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .agent(id)?;
-    if agent.origin != origin {
-        return Err("This caller does not own the agent".into());
-    }
+        .preflight_agent_close(&origin, id)?;
     if agent.closed {
+        // Older daemons closed the worker without retiring its shared pane.
+        // Repeating close repairs only that retained presentation; it does not
+        // start or contact a provider, and keeps the completed run history.
+        let agent = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .close_agent(&origin, id)?;
+        announce(host, &registry);
         return Ok(agent);
     }
     let pending = registry
@@ -710,22 +751,14 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
                     state
                         .chats
                         .get(&session.id)
-                        .map(|record| record.session.clone())
+                        .map(|record| {
+                            super::chat::CloseTarget::for_execution(&state, record, session)
+                        })
+                        .transpose()
+                        .map_err(|error| error.message)?
                 };
-                if let Some(current) = hosted {
-                    if current.proof != session.proof
-                        || current.launch.recipe != session.launch.recipe
-                    {
-                        return Err("The agent ownership changed before close; its successor was not stopped".into());
-                    }
-                    super::chat::process(
-                        host,
-                        EXECUTION_CLIENT,
-                        ClientRequest::ChatClose {
-                            chat_id: session.id,
-                        },
-                    )
-                    .map_err(|error| error.message)?;
+                if let Some(target) = hosted {
+                    super::chat::close_captured(host, target).map_err(|error| error.message)?;
                 } else {
                     let startup = host
                         .lock()
@@ -800,11 +833,22 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
         .execution_startups
         .remove(&id);
     announce(host, &registry);
-    host.lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .execution_gates
-        .remove(&id);
     Ok(result)
+}
+
+/// Preserve typed mailbox backpressure at the service boundary. Existing
+/// operations retain their original validation and String-returning API.
+pub(super) fn process_request(
+    host: &SharedHost,
+    authority: Authority,
+    operation: crate::agent_execution::Operation,
+) -> Result<crate::agent_execution::Reply, crate::agent_execution::AcceptanceError> {
+    match operation {
+        crate::agent_execution::Operation::SendMessage(outgoing) => {
+            mailbox::send(host, &authority, outgoing).map(crate::agent_execution::Reply::Sent)
+        }
+        other => process(host, authority, other).map_err(Into::into),
+    }
 }
 
 pub(super) fn process(
@@ -862,9 +906,9 @@ pub(super) fn process(
         Operation::Control { agent, command } => {
             control(host, &authority, agent, command).map(Reply::Requests)
         }
-        Operation::SendMessage(outgoing) => {
-            mailbox::send(host, &authority, outgoing).map(Reply::Sent)
-        }
+        Operation::SendMessage(outgoing) => mailbox::send(host, &authority, outgoing)
+            .map(Reply::Sent)
+            .map_err(|error| error.to_string()),
         Operation::Inbox(query) => mailbox::inbox(host, &authority, query).map(Reply::Inbox),
         Operation::PeekInbox(query) => mailbox::peek(host, &authority, query).map(Reply::Inbox),
         Operation::AcknowledgeInbox(receipt) => {
@@ -948,8 +992,7 @@ fn control(
     {
         return Err("A person took this agent over; its controls are theirs".into());
     }
-    let declines = matches!(&command, Control::Answer { action, .. } if chat::declines(action));
-    if run.state.is_terminal() && !declines {
+    if run.state.is_terminal() && !matches!(&command, Control::Answer { .. }) {
         return Err(format!(
             "The agent has no active run; its latest is {:?}",
             run.state
@@ -988,11 +1031,22 @@ fn control(
                     answer.field
                 ));
             }
-            handle.command(Command::Answer {
+            let command = Command::Answer {
                 request_id: request_id.clone(),
                 action,
                 answers,
-            })?;
+            };
+            let synchronization = super::chat::retained_actor::AnswerSync::capture(host, &handle)?;
+            if run.state.is_terminal() {
+                handle.decline_answer(command)?;
+            } else {
+                handle.command(command)?;
+            }
+            if let Some(synchronization) = synchronization {
+                synchronization.complete(host).map_err(|error| format!(
+                    "The answer was accepted, but its durable run state is unconfirmed: {error}. Do not repeat the answer."
+                ))?;
+            }
             Some(request_id)
         }
     };
@@ -1374,4 +1428,4 @@ fn console(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

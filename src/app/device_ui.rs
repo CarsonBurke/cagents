@@ -23,6 +23,7 @@ pub(super) fn supports_sidebar_action(action: &SidebarAction) -> bool {
             }
             | SidebarAction::SearchChanged(_)
             | SidebarAction::SetFilter(_)
+            | SidebarAction::HideReadAttention
             | SidebarAction::ToggleControls
             | SidebarAction::OpenFirstSearchResult
             | SidebarAction::FocusFirstSearchResult
@@ -85,6 +86,10 @@ pub enum Action {
         generation: u64,
         result: Result<Reply, String>,
     },
+    ImageLoaded {
+        generation: u64,
+        result: Result<iced::widget::image::Handle, String>,
+    },
     Device(usize),
     OpenDeviceWindow(usize),
     DeviceOpened {
@@ -134,11 +139,19 @@ pub(super) struct State {
     busy: bool,
     generation: u64,
     pending: Option<Operation>,
+    image: Option<ImageRequest>,
     linked_file: Option<PathBuf>,
     linked_fragment: Option<String>,
     notice: Option<String>,
     pub devices: Vec<String>,
     device_hosts: BTreeMap<String, String>,
+}
+struct ImageRequest {
+    path: PathBuf,
+    device: Option<String>,
+    // Abort queued/waiting work when the dialog closes. Blocking work retains
+    // its worker permit until it actually finishes, even after cancellation.
+    task: iced::task::Handle,
 }
 impl Default for State {
     fn default() -> Self {
@@ -167,6 +180,7 @@ impl Default for State {
             busy: false,
             generation: 0,
             pending: None,
+            image: None,
             linked_file: None,
             linked_fragment: None,
             notice: None,
@@ -320,11 +334,13 @@ impl Cagents {
             && !matches!(
                 &action,
                 Action::Loaded { .. }
+                    | Action::ImageLoaded { .. }
                     | Action::Device(_)
                     | Action::OpenDeviceWindow(_)
                     | Action::DeviceOpened { .. }
                     | Action::ConfigSaved(_)
             )
+            && !(matches!(&action, Action::Close) && self.device_ui.image.is_some())
         {
             return Task::none();
         }
@@ -485,6 +501,12 @@ impl Cagents {
                     ));
                     return Task::none();
                 };
+                if crate::chat::is_image_path(&path) {
+                    if self.refuse_in_deleting_worktree(&path) {
+                        return Task::none();
+                    }
+                    return self.open_device_image(path);
+                }
                 self.device_ui.panel = Panel::Files;
                 self.device_ui.linked_file = Some(file.into());
                 self.device_ui.linked_fragment = fragment;
@@ -547,6 +569,12 @@ impl Cagents {
                 return Task::none();
             }
             Action::Close => {
+                if let Some(image) = self.device_ui.image.take() {
+                    image.task.abort();
+                    self.device_ui.generation = self.device_ui.generation.wrapping_add(1);
+                    self.device_ui.pending = None;
+                    self.device_ui.busy = false;
+                }
                 if !self.device_ui.busy {
                     self.device_ui.open = false;
                 }
@@ -583,10 +611,19 @@ impl Cagents {
                 path: self.device_ui.path.clone().into(),
             }),
             Action::Visit(path) => Some(Operation::List { path }),
-            Action::Read(path) => Some(Operation::Read {
-                root: self.device_ui.directory.clone(),
-                path,
-            }),
+            Action::Read(path) => {
+                if crate::chat::is_image_path(&path) {
+                    let path = self.device_ui.directory.join(path);
+                    if self.refuse_in_deleting_worktree(&path) {
+                        return Task::none();
+                    }
+                    return self.open_device_image(path);
+                }
+                Some(Operation::Read {
+                    root: self.device_ui.directory.clone(),
+                    path,
+                })
+            }
             Action::Save => self.device_ui.file.as_ref().map(|path| Operation::Write {
                 root: self.device_ui.directory.clone(),
                 path: path.clone(),
@@ -601,7 +638,7 @@ impl Cagents {
                 path: self.device_ui.path.clone().into(),
             }),
             Action::Loaded { generation, result } => {
-                if generation != self.device_ui.generation {
+                if generation != self.device_ui.generation || self.device_ui.image.is_some() {
                     return Task::none();
                 }
                 self.device_ui.busy = false;
@@ -712,6 +749,28 @@ impl Cagents {
                 }
                 return Task::none();
             }
+            Action::ImageLoaded { generation, result } => {
+                if generation != self.device_ui.generation {
+                    return Task::none();
+                }
+                let Some(image) = self.device_ui.image.take() else {
+                    return Task::none();
+                };
+                self.device_ui.busy = false;
+                self.device_ui.pending = None;
+                match result {
+                    Ok(handle) => {
+                        self.device_ui.open = false;
+                        self.chat_ui.image_viewer = Some(chat_ui::images::Gallery::file(
+                            image.path,
+                            image.device.as_deref(),
+                            handle,
+                        ));
+                    }
+                    Err(error) => self.device_ui.notice = Some(error),
+                }
+                return Task::none();
+            }
         };
         let Some(operation) = operation else {
             return Task::none();
@@ -742,6 +801,42 @@ impl Cagents {
                 cosmic::Action::App(Message::Device(Action::Loaded { generation, result }))
             },
         )
+    }
+    fn open_device_image(&mut self, path: PathBuf) -> Task<Message> {
+        if !path.is_absolute() {
+            self.status = Some(TransientNotice::error(
+                "The image needs an absolute device path.",
+            ));
+            return Task::none();
+        }
+        let device = crate::device::selected().map(|device| device.name.clone());
+        self.device_ui.open = true;
+        self.device_ui.configure = false;
+        self.device_ui.notice = None;
+        self.device_ui.linked_file = None;
+        self.device_ui.linked_fragment = None;
+        self.device_ui.generation = self.device_ui.generation.wrapping_add(1);
+        let generation = self.device_ui.generation;
+        self.device_ui.pending = Some(Operation::ReadImage {
+            root: "/".into(),
+            path: path.clone(),
+        });
+        self.device_ui.busy = true;
+        let preview_path = path.clone();
+        let preview_device = device.clone();
+        let (task, handle) = Task::perform(
+            chat_ui::images::file_preview(preview_path, preview_device),
+            move |result| {
+                cosmic::Action::App(Message::Device(Action::ImageLoaded { generation, result }))
+            },
+        )
+        .abortable();
+        self.device_ui.image = Some(ImageRequest {
+            path,
+            device,
+            task: handle.abort_on_drop(),
+        });
+        task
     }
     pub(super) fn device_status_control(&self) -> Element<'_, Message> {
         let selected = crate::device::selected()
@@ -905,6 +1000,20 @@ impl Cagents {
 
     fn device_dialog_layout(&self, size: iced::Size) -> Element<'_, Message> {
         let state = &self.device_ui;
+        if let Some(image) = &state.image {
+            return dialog_ui::surface(
+                widget::column::with_children(vec![
+                    design::heading("Opening image").into(),
+                    design::body(image.path.display().to_string()).into(),
+                    design::caption(image.device.as_deref().unwrap_or("This device")).into(),
+                    crate::ui_controls::button::secondary("Cancel")
+                        .on_press(Message::Device(Action::Close))
+                        .into(),
+                ])
+                .spacing(space::M),
+                600.0,
+            );
+        }
         let narrow = size.width < 900.0;
         let action = |action| Message::Device(action);
         let button = |label: &str, value: Action| {
@@ -915,7 +1024,7 @@ impl Cagents {
             Element::from(button)
         };
         if state.configure {
-            let mut rows=vec![design::title("Connect to a device").into(),design::body("Use an SSH host alias already configured on this computer. Install matching cagents and cagentsd on the device.").into(),crate::ui_controls::field::text("Device name",&state.config_name).on_input(|value|Message::Device(Action::ConfigName(value))).into(),crate::ui_controls::field::text("SSH host alias (for example fw16)",&state.config_host).on_input(|value|Message::Device(Action::ConfigHost(value))).into(),crate::ui_controls::field::text("Remote cagents executable",&state.config_executable).on_input(|value|Message::Device(Action::ConfigExecutable(value))).into(),widget::row::with_children(vec![button("Close",Action::Close),button("Save and switch device",Action::ConfigSave)]).spacing(space::S).into()];
+            let mut rows=vec![design::title("Connect to a device").into(),design::body("Use an SSH host alias already configured on this computer. Install matching cagents and cagentsd on the device.").into(),crate::ui_controls::field::text("Device name",&state.config_name).on_input(|value|Message::Device(Action::ConfigName(value))).into(),crate::ui_controls::field::text("SSH host alias (for example build-host)",&state.config_host).on_input(|value|Message::Device(Action::ConfigHost(value))).into(),crate::ui_controls::field::text("Remote cagents executable",&state.config_executable).on_input(|value|Message::Device(Action::ConfigExecutable(value))).into(),widget::row::with_children(vec![button("Close",Action::Close),button("Save and switch device",Action::ConfigSave)]).spacing(space::S).into()];
             if let Some(notice) = &state.notice {
                 rows.push(design::body(notice).into());
             }
@@ -1310,6 +1419,9 @@ impl State {
     pub(super) fn busy(&self) -> bool {
         self.busy
     }
+    pub(super) fn can_close(&self) -> bool {
+        !self.busy || self.image.is_some()
+    }
 }
 
 #[cfg(test)]
@@ -1368,7 +1480,7 @@ mod tests {
         }
         crate::device::save(crate::device::Device {
             name: "navigation-test".into(),
-            host: "fw16".into(),
+            host: "build-host".into(),
             executable: "cagents".into(),
         })
         .unwrap();
@@ -1614,11 +1726,147 @@ mod tests {
     }
 
     #[test]
+    fn linked_image_reads_the_exact_device_file_without_listing_its_parent() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let path = PathBuf::from("/remote/worktree/docs/界 #% literal-*.PNG");
+        let task = app.update_device(Action::OpenFile {
+            path: path.clone(),
+            fragment: None,
+        });
+        assert!(app.device_ui.open && app.device_ui.busy && app.device_ui.can_close());
+        assert!(
+            matches!(&app.device_ui.pending, Some(Operation::ReadImage { root, path: sent })
+            if root == Path::new("/") && *sent == path)
+        );
+        assert_eq!(app.device_ui.image.as_ref().unwrap().path, path);
+        assert!(app.device_ui.linked_file.is_none());
+        let handle = iced::widget::image::Handle::from_rgba(1, 1, vec![3, 240, 3, 255]);
+        drop(app.update_device(Action::ImageLoaded {
+            generation: app.device_ui.generation,
+            result: Ok(handle),
+        }));
+        assert!(!app.device_ui.open && !app.device_ui.busy);
+        assert!(app.device_ui.pending.is_none() && app.device_ui.image.is_none());
+        assert!(app.chat_ui.image_viewer.is_some());
+        assert!(
+            app.device_ui.file.is_none(),
+            "an image never becomes editable text"
+        );
+        drop(task);
+    }
+
+    #[test]
+    fn cancelled_device_image_cannot_reopen_or_replace_a_newer_request() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let old = app.update_device(Action::OpenFile {
+            path: "/remote/old.png".into(),
+            fragment: None,
+        });
+        let old_generation = app.device_ui.generation;
+        let aborted = app.device_ui.image.as_ref().unwrap().task.clone();
+        drop(app.update_device(Action::Close));
+        assert!(
+            aborted.is_aborted(),
+            "cancellation also removes queued work from the image workers"
+        );
+        assert!(!app.device_ui.open && !app.device_ui.busy);
+        assert!(app.device_ui.pending.is_none() && app.device_ui.image.is_none());
+        let handle = || iced::widget::image::Handle::from_rgba(1, 1, vec![3, 240, 3, 255]);
+        drop(app.update_device(Action::ImageLoaded {
+            generation: old_generation,
+            result: Ok(handle()),
+        }));
+        assert!(app.chat_ui.image_viewer.is_none());
+        let new = app.update_device(Action::OpenFile {
+            path: "/remote/new.png".into(),
+            fragment: None,
+        });
+        let new_generation = app.device_ui.generation;
+        drop(app.update_device(Action::ImageLoaded {
+            generation: old_generation,
+            result: Err("old failure".into()),
+        }));
+        assert!(app.device_ui.busy && app.device_ui.notice.is_none());
+        assert_eq!(
+            app.device_ui.image.as_ref().unwrap().path,
+            Path::new("/remote/new.png")
+        );
+        drop(app.update_device(Action::ImageLoaded {
+            generation: new_generation,
+            result: Err("Cannot preview /remote/new.png on FW16: missing".into()),
+        }));
+        assert!(!app.device_ui.busy && app.device_ui.open && app.device_ui.can_close());
+        assert!(
+            app.device_ui
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains("/remote/new.png on FW16")
+        );
+        assert!(app.chat_ui.image_viewer.is_none());
+        drop((old, new));
+    }
+
+    #[test]
+    fn browsing_an_image_uses_its_device_directory_and_the_same_read_only_gallery() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.device_ui.directory = "/remote/selected-worktree/docs".into();
+        let task = app.update_device(Action::Read("image #%.png".into()));
+        assert!(
+            matches!(&app.device_ui.pending, Some(Operation::ReadImage { path, .. })
+            if path == Path::new("/remote/selected-worktree/docs/image #%.png"))
+        );
+        assert!(app.device_ui.file.is_none());
+        drop(app.update_device(Action::Close));
+        drop(task);
+    }
+
+    #[test]
+    fn linked_image_preserves_unsaved_device_text_and_busy_operation_guards() {
+        let mut app = loaded_file();
+        let generation = app.device_ui.generation;
+        drop(app.update_device(Action::OpenFile {
+            path: "/remote/image.png".into(),
+            fragment: None,
+        }));
+        assert!(app.device_ui.dirty() && app.device_ui.image.is_none());
+        assert_eq!(app.device_ui.content.text(), "unsaved draft");
+        assert_eq!(app.device_ui.generation, generation);
+        assert!(
+            app.device_ui
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains("Unsaved changes")
+        );
+
+        drop(app.update_device(Action::DiscardChanges));
+        drop(app.update_device(Action::Browse));
+        let generation = app.device_ui.generation;
+        drop(app.update_device(Action::OpenFile {
+            path: "/remote/image.png".into(),
+            fragment: None,
+        }));
+        assert_eq!(app.device_ui.generation, generation);
+        assert!(app.device_ui.image.is_none());
+        assert!(matches!(
+            app.device_ui.pending,
+            Some(Operation::List { .. })
+        ));
+        drop(app.update_device(Action::Close));
+        assert!(
+            app.device_ui.busy,
+            "normal mutations cannot be cancelled using the image path"
+        );
+    }
+
+    #[test]
     fn remote_sidebar_presentation_stays_in_the_sidebar() {
         for action in [
             SidebarAction::SearchChanged("project".into()),
             SidebarAction::SearchChanged(String::new()),
             SidebarAction::SetFilter(sidebar::SidebarFilter::Attention),
+            SidebarAction::HideReadAttention,
             SidebarAction::ToggleControls,
             SidebarAction::FocusFirstSearchResult,
             SidebarAction::OpenFirstSearchResult,

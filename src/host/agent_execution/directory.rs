@@ -17,13 +17,13 @@ use std::{
 };
 
 /// What the host lock yields; everything slower happens after releasing it.
-pub(super) struct Live {
-    pub(super) id: TerminalId,
+pub(in crate::host) struct Live {
+    pub(in crate::host) id: TerminalId,
     pub(super) surface: Surface,
-    pub(super) provider: Option<Provider>,
-    pub(super) title: Option<String>,
-    state: ActivityState,
-    directory: PathBuf,
+    pub(in crate::host) provider: Option<Provider>,
+    pub(in crate::host) title: Option<String>,
+    pub(in crate::host) state: ActivityState,
+    pub(in crate::host) directory: PathBuf,
 }
 
 pub(super) fn read(
@@ -198,11 +198,12 @@ pub(super) fn read(
     })
 }
 
-/// Live provider conversations and terminals; the caller decides which
-/// plain shells matter.
 /// The open project called `name`, ignoring case. Names are not unique, so a
 /// name two projects share is refused with their paths.
-fn named(model: &crate::workspace_model::WorkspaceModel, name: &Path) -> Result<PathBuf, String> {
+pub(in crate::host) fn named(
+    model: &crate::workspace_model::WorkspaceModel,
+    name: &Path,
+) -> Result<PathBuf, String> {
     let wanted = name.to_string_lossy();
     let matches: Vec<_> = model
         .projects
@@ -224,7 +225,9 @@ fn named(model: &crate::workspace_model::WorkspaceModel, name: &Path) -> Result<
     }
 }
 
-pub(super) fn live_sessions(host: &SharedHost) -> Vec<Live> {
+/// Live provider conversations and terminals; the caller decides which
+/// plain shells matter.
+pub(in crate::host) fn live_sessions(host: &SharedHost) -> Vec<Live> {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     let mut live = Vec::new();
     for (id, record) in &state.chats {

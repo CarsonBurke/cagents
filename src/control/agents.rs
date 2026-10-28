@@ -13,7 +13,10 @@ use crate::{
 pub enum AgentCommand {
     /// The terminal presentation of an already hosted execution agent.
     #[command(hide = true)]
-    Console { agent_id: AgentId },
+    Console {
+        #[arg(help = "The hosted agent ID.")]
+        agent_id: AgentId,
+    },
     /// Start a provider session on one prompt, accepted durably.
     ///
     /// The provider defaults to the calling session's, the directory to the
@@ -41,12 +44,19 @@ pub enum AgentCommand {
         #[arg(long)]
         channel: Option<ChannelId>,
         #[arg(long)]
+        #[arg(help = "Stable account ID (provider/system or provider/UUID).")]
         account: Option<AccountId>,
         #[arg(long, default_value = "chat", value_parser = ["chat", "terminal"])]
+        #[arg(help = "Presentation surface for the provider session.")]
         surface: String,
         #[arg(long)]
+        #[arg(
+            help = "Provider model ID (Claude: haiku/sonnet/opus; Codex: exact provider catalog ID; OMP: provider/model). Omit to use the provider default; the native chat model picker lists available IDs."
+        )]
         model: Option<String>,
         #[arg(long)]
+        #[arg(help = "Permission policy (Claude: default/manual/auto/acceptEdits/plan/dontAsk/bypassPermissions; Codex: untrusted/on-failure/on-request/never; OMP: always-ask/write/yolo).",
+            value_parser = ["default", "manual", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions", "untrusted", "on-failure", "on-request", "never", "always-ask", "write", "yolo"])]
         permission_mode: Option<String>,
         /// The provider's effort name, such as low or high; omit for its default.
         #[arg(long)]
@@ -73,6 +83,7 @@ pub enum AgentCommand {
     },
     /// Read an owned agent and its latest run.
     Status {
+        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
         agent: String,
         #[command(flatten)]
         show: ShowArgs,
@@ -89,19 +100,25 @@ pub enum AgentCommand {
     /// the first ready run; otherwise failure outranks input, then timeout.
     Wait {
         #[arg(required = true, value_name = "AGENT_OR_RUN")]
+        #[arg(help = "Agent or run handles to wait for.")]
         handles: Vec<String>,
         /// Return as soon as any of them is ready, rather than all.
         #[arg(long)]
         any: bool,
         #[arg(long, default_value = "60", value_parser = parse_positive_seconds)]
+        #[arg(help = "Maximum time to wait, in seconds.")]
         timeout: f64,
         #[command(flatten)]
         show: ShowArgs,
     },
     /// List the questions and approvals an owned agent is waiting on.
-    Requests { agent: String },
+    Requests {
+        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
+        agent: String,
+    },
     /// Answer one of an owned agent's requests with one of its actions.
     Answer {
+        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
         agent: String,
         /// The request ID `requests` lists.
         request: String,
@@ -113,13 +130,17 @@ pub enum AgentCommand {
     },
     /// Interrupt an owned agent's active run.
     Interrupt {
+        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
         agent: String,
         /// Permit the interrupt to stop the provider's running background subagents.
         #[arg(long)]
         including_subagents: bool,
     },
     /// Stop and close an agent, including its background subagents.
-    Close { agent: String },
+    Close {
+        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
+        agent: String,
+    },
 }
 
 /// A prompt given as an argument, in a file, or on standard input.
@@ -132,6 +153,7 @@ pub struct PromptArgs {
     /// Read the prompt from this file.
     #[arg(long, value_name = "FILE", conflicts_with = "text")]
     pub(super) prompt_file: Option<PathBuf>,
+    /// Legacy named prompt; prefer the positional prompt or --prompt-file.
     #[arg(long = "prompt", hide = true, conflicts_with_all = ["text", "prompt_file"])]
     pub(super) flag: Option<String>,
 }
@@ -168,7 +190,7 @@ pub struct ShowArgs {
 pub(super) fn parse_provider(value: &str) -> Result<Provider, String> {
     Provider::ALL
         .into_iter()
-        .find(|provider| provider.executable() == value)
+        .find(|provider| provider.executable().eq_ignore_ascii_case(value))
         .ok_or_else(|| "Choose omp, claude, or codex".into())
 }
 
@@ -279,6 +301,38 @@ fn checkout(project: &Path) -> PathBuf {
         }
         _ => project.to_owned(),
     }
+}
+
+pub(super) fn state_label(state: crate::agent_execution::State) -> &'static str {
+    match state {
+        crate::agent_execution::State::Accepted => "Queued",
+        crate::agent_execution::State::Running => "Running",
+        crate::agent_execution::State::Waiting => "Waiting for input",
+        crate::agent_execution::State::Succeeded => "Succeeded",
+        crate::agent_execution::State::Failed => "Failed",
+        crate::agent_execution::State::Cancelled => "Cancelled",
+        crate::agent_execution::State::Interrupted => "Outcome uncertain",
+    }
+}
+
+fn list_human(summaries: &[Summary]) -> String {
+    super::format::table(
+        ["AGENT", "PROVIDER", "STATE", "RUN", "DIRECTORY", "NAME"],
+        summaries
+            .iter()
+            .map(|summary| {
+                [
+                    short(summary.agent.id),
+                    summary.agent.spec.provider.executable().into(),
+                    state_label(summary.state).into(),
+                    short(summary.run),
+                    summary.agent.spec.target.directory.display().to_string(),
+                    summary.agent.name.clone().unwrap_or_default(),
+                ]
+            })
+            .collect(),
+        "No open agents",
+    )
 }
 
 /// The part of an ID people type and read: unique among one caller's agents
@@ -657,8 +711,7 @@ impl Session {
     /// Connects on first use, starting the daemon if it is not running.
     fn client(&mut self) -> Result<&mut ControlClient, AppError> {
         if self.connection.is_none() {
-            let socket =
-                terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e))?;
+            let socket = control_daemon_socket()?;
             let client = ControlClient::connect(&socket)
                 .map_err(|e| AppError::new("daemon_connection", e))?;
             self.connection = Some((client, socket));
@@ -975,30 +1028,7 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
         }
         AgentCommand::List => {
             let summaries = session.summaries()?.to_vec();
-            let human = if summaries.is_empty() {
-                "No open agents".to_owned()
-            } else {
-                summaries
-                    .iter()
-                    .map(|summary| {
-                        format!(
-                            "{}  {:<6} {:<11} run {}  {}{}",
-                            short(summary.agent.id),
-                            summary.agent.spec.provider.executable(),
-                            format!("{:?}", summary.state),
-                            short(summary.run),
-                            summary.agent.spec.target.directory.display(),
-                            summary
-                                .agent
-                                .name
-                                .as_ref()
-                                .map(|name| format!("  {name}"))
-                                .unwrap_or_default()
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
+            let human = list_human(&summaries);
             Ok(CommandOutput {
                 command: "agent.list",
                 data: json!({"agents": summaries}),
@@ -1429,6 +1459,24 @@ fn answers(fields: &[String]) -> Result<Vec<crate::chat::Answer>, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readable_provider_flags_accept_cli_and_legacy_json_casing() {
+        for (name, expected) in [
+            ("claude", Provider::Claude),
+            ("Claude", Provider::Claude),
+            ("CLAUDE", Provider::Claude),
+            ("CoDeX", Provider::Codex),
+            ("Omp", Provider::Omp),
+        ] {
+            let parsed =
+                Cli::try_parse_from(["cagents", "account", "list", "--provider", name]).unwrap();
+            assert!(matches!(parsed.command, TopCommand::Account {
+                command: crate::control::AccountCommand::List { provider: Some(provider) }
+            } if provider == expected));
+        }
+        assert!(parse_provider("unknown").is_err());
+    }
 
     #[test]
     fn wait_contract_has_one_shape_and_outcome_exit_codes() {
@@ -2259,6 +2307,33 @@ mod tests {
             run: run.parse().unwrap(),
             state: crate::agent_execution::State::Running,
         }
+    }
+
+    #[test]
+    fn readable_agent_list_labels_waiting_and_uncertain_results_with_an_empty_state() {
+        assert_eq!(list_human(&[]), "No open agents");
+        let mut entry = summary(
+            "abcdef00-0000-4000-8000-000000000001",
+            "12345678-0000-4000-8000-000000000001",
+        );
+        entry.agent.name = Some("reviewer\nnext".into());
+        entry.state = crate::agent_execution::State::Waiting;
+        let human = list_human(&[entry.clone()]);
+        assert_eq!(human.lines().count(), 2);
+        assert_eq!(
+            human
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["AGENT", "PROVIDER", "STATE", "RUN", "DIRECTORY", "NAME"]
+        );
+        assert!(human.contains("abcdef00"));
+        assert!(human.contains("Waiting for input"));
+        assert!(human.ends_with("reviewer next"));
+        entry.state = crate::agent_execution::State::Interrupted;
+        assert!(list_human(&[entry]).contains("Outcome uncertain"));
     }
 
     #[test]

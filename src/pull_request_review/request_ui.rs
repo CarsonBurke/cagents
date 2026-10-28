@@ -90,17 +90,24 @@ impl super::State {
         self.source.as_ref().map(|source| &source.repository)
     }
 
-    pub fn clear_external_review_requests(&mut self) {
-        self.requests.reset();
-    }
-
-    pub fn apply_review_requests(&mut self, repository: &GitHubRepoKey, snapshot: &Arc<Snapshot>) {
-        if self
-            .source
-            .as_ref()
-            .is_some_and(|source| source.repository.same_repository(repository))
-        {
-            self.requests.snapshot = Some(Arc::clone(snapshot));
+    /// Shows the monitor's snapshot for this pane's repository. A pane whose
+    /// source just changed has none until the next pass installs it, so this
+    /// runs on every pass, and it replaces nothing that is already current.
+    pub fn sync_review_requests<'a>(
+        &mut self,
+        snapshots: impl IntoIterator<Item = (&'a GitHubRepoKey, &'a Arc<Snapshot>)>,
+    ) {
+        let snapshot = self.source.as_ref().and_then(|source| {
+            snapshots.into_iter().find_map(|(key, snapshot)| {
+                key.same_repository(&source.repository).then_some(snapshot)
+            })
+        });
+        let current = match (&self.requests.snapshot, snapshot) {
+            (Some(shown), Some(snapshot)) => Arc::ptr_eq(shown, snapshot),
+            (shown, snapshot) => shown.is_none() && snapshot.is_none(),
+        };
+        if !current {
+            self.requests.snapshot = snapshot.cloned();
         }
     }
 }

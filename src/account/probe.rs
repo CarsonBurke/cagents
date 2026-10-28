@@ -68,6 +68,7 @@ const SCRUBBED_ENVIRONMENT: &[&str] = &[
     "CLAUDE_CODE_ENTRYPOINT",
     "CLAUDE_CODE_SSE_PORT",
     crate::instance::UI_LAUNCH_HANDSHAKE_ENV,
+    crate::instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV,
 ];
 
 /// What the reader's shell is asked to run: print its `PATH`, and nothing
