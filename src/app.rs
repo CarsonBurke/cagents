@@ -12747,6 +12747,7 @@ impl Cagents {
         let snapshot = self.persistent_workspace();
         let writer = self.session.as_ref().map(SessionRuntime::operation_store);
         let save = self.capture_workspace_save();
+        self.refresh_settings_feedback();
         self.window_close_generation = self.window_close_generation.wrapping_add(1);
         let generation = self.window_close_generation;
         self.status = Some(
@@ -12801,6 +12802,9 @@ impl Cagents {
         if pending.updater.is_some() {
             self.update_flush_pending = false;
         }
+        // Settings retain their normal acknowledgement/error and same-value
+        // retry behavior even when the final window barrier owns their save.
+        self.receive_settings_save(pending.settings_generation, saved);
         let current_writer = self.session.as_ref().map(SessionRuntime::operation_store);
         let same_writer = matches!((&pending.writer, &current_writer),
             (Some(original), Some(current)) if Arc::ptr_eq(original, current));
@@ -12838,9 +12842,6 @@ impl Cagents {
             return cosmic::task::message(Message::ChromeUi(
                 chrome_ui::Action::RevealWindowCloseFailure { window, generation },
             ));
-        }
-        if let Ok(saved) = saved {
-            self.acknowledge_settings_save(saved);
         }
         self.resolve_notice(NoticeKey::WindowClose(window));
         if let Some((_, response)) = pending.updater {
@@ -13424,6 +13425,25 @@ impl Cagents {
         let saved = self.capture_settings_save()?.run()?;
         self.acknowledge_settings_save(saved);
         Ok(())
+    }
+
+    fn receive_settings_save(&mut self, generation: u64, result: Result<SettingsSaved, String>) {
+        match result {
+            Ok(saved) => {
+                if saved.generation >= self.settings_ack_generation {
+                    self.settings_save_error = None;
+                }
+                self.acknowledge_settings_save(saved);
+            }
+            Err(error) if generation >= self.settings_ack_generation => {
+                self.status = Some(TransientNotice::warning(format!(
+                    "Could not save settings: {error}"
+                )));
+                self.settings_save_error = Some(error);
+            }
+            Err(_) => {}
+        }
+        self.refresh_settings_feedback();
     }
 
     fn save_settings_task(&mut self, reset: bool) -> Task<Message> {
@@ -16151,22 +16171,7 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::SettingsSaved { generation, result } => {
-                match result {
-                    Ok(saved) => {
-                        if saved.generation >= self.settings_ack_generation {
-                            self.settings_save_error = None;
-                        }
-                        self.acknowledge_settings_save(saved);
-                    }
-                    Err(error) if generation >= self.settings_ack_generation => {
-                        self.status = Some(TransientNotice::warning(format!(
-                            "Could not save settings: {error}"
-                        )));
-                        self.settings_save_error = Some(error);
-                    }
-                    Err(_) => {}
-                }
-                self.refresh_settings_feedback();
+                self.receive_settings_save(generation, result);
                 Task::none()
             }
             Message::UiUpdate(request) if self.pending_window_close.is_some()
