@@ -7557,7 +7557,7 @@ fn context_controls<'a>(
             if git {
                 commands.push(("Copy branch".into(), None, ProjectCommand::CopyBranch));
                 commands.push((
-                    "New worktree from this branch…".into(),
+                    "New worktree from branch…".into(),
                     None,
                     ProjectCommand::NewWorktreeFromBranch,
                 ));
