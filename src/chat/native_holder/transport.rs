@@ -1682,14 +1682,17 @@ mod tests {
             // The intermediate shell exits, adopting both tools into this
             // holder. The actual provider leader stays alive. Only the short
             // tool reads the test-owned pipe; no duration determines its exit.
+            // dash redirects asynchronous stdin before <&0; pin the original
+            // pipe on FD 3 and close that extra descriptor in both tools.
             let script = r#"
 while IFS=: read -r field value; do
     if [ "$field" = SigBlk ]; then printf '%s\n' "$value" > "$1/provider-mask"; fi
 done < "/proc/$$/status"
 /bin/sh -c '
-    /bin/sleep 60 </dev/null &
+    exec 3<&0
+    /bin/sleep 60 3<&- </dev/null &
     echo $! > "$1/live"
-    /bin/sh -c "read -r token" <&0 &
+    /bin/sh -c "read -r token" <&3 3<&- &
     echo $! > "$1/tool"
 ' fixture "$1"
 echo ready > "$1/ready"
@@ -1730,6 +1733,7 @@ exec /bin/sleep 60
             };
             let tool = Process::read(read_pid("tool")).unwrap();
             let live = Process::read(read_pid("live")).unwrap();
+            assert_child_waits_for_gate(tool.pid);
             for process in [&tool, &live] {
                 let stat = std::fs::read_to_string(format!("/proc/{}/stat", process.pid)).unwrap();
                 let parent = stat
@@ -1825,6 +1829,26 @@ exec /bin/sleep 60
         }
     }
 
+    fn assert_child_waits_for_gate(pid: i32) {
+        let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as u32,
+                    &mut status,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            unsafe { status.si_pid() },
+            0,
+            "the short tool must stay alive until its original pipe is released"
+        );
+    }
+
     #[test]
     fn post_child_census_failure_preserves_live_ownership_and_services_control() {
         const STAGE: &str = "CAGENTS_NATIVE_HOLDER_CENSUS_FAILURE_TEST";
@@ -1857,13 +1881,15 @@ exec /bin/sleep 60
         let child_events = ChildEvents::new().unwrap();
         for orphan in [false, true] {
             let directory = tempfile::tempdir().unwrap();
+            // Match the explicit pipe gate in the live-provider fixture above.
             let spawn = Spawn {
                 program: "/bin/sh".into(),
                 arguments: vec![
                     "-c".into(),
                     r#"/bin/sh -c '
-                        /bin/sleep 60 </dev/null & echo $! > "$1/live"
-                        /bin/sh -c "read -r token" <&0 & echo $! > "$1/tool"
+                        exec 3<&0
+                        /bin/sleep 60 3<&- </dev/null & echo $! > "$1/live"
+                        /bin/sh -c "read -r token" <&3 3<&- & echo $! > "$1/tool"
                     ' fixture "$1"
                     echo ready > "$1/ready"
                     exec /bin/sleep 60"#
@@ -1896,6 +1922,7 @@ exec /bin/sleep 60
             };
             let tool = identity("tool");
             let live = identity("live");
+            assert_child_waits_for_gate(tool.pid);
             // Clear setup notifications before inducing the exact child-exit
             // boundary. The short tool still waits for this original pipe.
             child_events.drain().unwrap();

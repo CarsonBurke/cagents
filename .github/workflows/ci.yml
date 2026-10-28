@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: 2
+  RUSTUP_TOOLCHAIN: 1.93.0
+
+jobs:
+  format:
+    name: Rust formatting
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Select the pinned Python for script contracts
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12.3'
+      - name: Install the pinned formatter
+        run: rustup toolchain install 1.93.0 --profile minimal --component rustfmt
+      - name: Check development script contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c "import sys, tomllib; assert sys.version_info[:3] == (3, 12, 3), sys.version; print(sys.version)"
+          python3 tests/run-development-zig.py -v
+          PYTHONDONTWRITEBYTECODE=1 CHECK_FORMAT_CARGO_FIXTURE=1 python3 tests/check_format.py -v
+          sh -n scripts/run-development
+          sh -n scripts/check-format
+      - name: Check repository formatting
+        run: scripts/check-format
+
+  validate:
+    name: Rust ${{ matrix.lane }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [CLI, HOST, UI]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Set up the pinned Linux build environment
+        uses: ./.github/actions/setup-linux-build
+      - name: Prepare short private fixture paths
+        run: |
+          set -euo pipefail
+          fixture_root=$(mktemp -d /tmp/caXXXXXX)
+          install -d -m 700 "$fixture_root/runtime"
+          printf '%s\n' "TMPDIR=$fixture_root" \
+            "XDG_RUNTIME_DIR=$fixture_root/runtime" >> "$GITHUB_ENV"
+      - name: Check the isolated CLI
+        if: matrix.lane == 'CLI'
+        run: cargo check --locked --no-default-features --bin cagents
+      - name: Test the isolated CLI
+        if: matrix.lane == 'CLI'
+        run: cargo test --locked --no-default-features --all-targets -- --test-threads=2
+      - name: Check the isolated host
+        if: matrix.lane == 'HOST'
+        run: cargo check --locked --no-default-features --features host --bin cagentsd
+      - name: Build the matched host helper and test the isolated host
+        if: matrix.lane == 'HOST'
+        run: |
+          set -euo pipefail
+          retained_actor_helper=$(python3 scripts/build-ceditor-product cagentsd \
+            --locked --no-default-features --features host --bin cagentsd)
+          # Run the retained 100-chat workload serially after the ordinary suite.
+          CAGENTS_TEST_RETAINED_ACTOR_HELPER="$retained_actor_helper" \
+            cargo test --locked --no-default-features --features host --all-targets -- --test-threads=2 \
+              --skip user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt
+          CAGENTS_TEST_RETAINED_ACTOR_HELPER="$retained_actor_helper" \
+            cargo test --locked --no-default-features --features host --test agent_console_contract \
+              user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt -- --exact --test-threads=1
+      - name: Check the isolated browserless UI
+        if: matrix.lane == 'UI'
+        run: cargo check --locked --no-default-features --features ui --bin cagents-ui
+      - name: Test the isolated browserless UI
+        if: matrix.lane == 'UI'
+        run: cargo test --locked --no-default-features --features ui --all-targets -- --test-threads=2

@@ -2,6 +2,7 @@
 //! replace local rows, and filesystem events never schedule a GitHub process.
 use super::*;
 use crate::{git_watch, model::WorktreeId, repository::HeadState};
+use std::collections::BTreeSet;
 
 const LOCAL_WORKERS: usize = 2;
 const FALLBACK_INTERVAL: Duration = Duration::from_secs(60);
@@ -586,17 +587,26 @@ fn read_local_with_plan(
     });
     let plan = (change.membership || change.topology || !vanished.is_empty())
         .then(|| {
+            let records = snapshot
+                .worktrees
+                .iter()
+                .map(|(record, _)| record.clone())
+                .collect::<Vec<_>>();
+            // A topology edge may name only the shared metadata owner. Every
+            // surviving checkout's index may have changed while it was absent.
+            let all_changed = change.topology.then(|| {
+                records
+                    .iter()
+                    .map(|record| record.id)
+                    .collect::<BTreeSet<_>>()
+            });
             git_watch::Project::read_changed(
                 project,
                 snapshot.repository.common_dir.clone(),
-                &snapshot
-                    .worktrees
-                    .iter()
-                    .map(|(record, _)| record.clone())
-                    .collect::<Vec<_>>(),
+                &records,
                 &cancellation,
                 previous_plan,
-                &change.worktrees,
+                all_changed.as_ref().unwrap_or(&change.worktrees),
             )
         })
         .transpose()?;
@@ -785,6 +795,131 @@ mod tests {
             repository,
             worktrees,
             heads: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn topology_revalidates_linked_inventory_after_shared_metadata_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().canonicalize().unwrap();
+        let root = base.join("repo");
+        let linked = base.join("linked");
+        let initial = fixture(&root);
+        git(
+            &root,
+            &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+        );
+        let project = ProjectId::new();
+        let (initial, old_plan) = read_local(
+            project,
+            initial,
+            git_watch::Change {
+                topology: true,
+                ..Default::default()
+            },
+            CancellationToken::default(),
+        )
+        .unwrap();
+        let old_plan = Arc::new(old_plan.unwrap());
+        let primary = initial
+            .worktrees
+            .iter()
+            .find(|(record, _)| record.path == root)
+            .unwrap()
+            .0
+            .id;
+        let linked_id = initial
+            .worktrees
+            .iter()
+            .find(|(record, _)| record.path == linked)
+            .unwrap()
+            .0
+            .id;
+        let old_linked = old_plan
+            .worktrees
+            .iter()
+            .find(|row| row.id == linked_id)
+            .unwrap();
+        assert!(
+            !initial
+                .worktrees
+                .iter()
+                .find(|(record, _)| record.id == linked_id)
+                .unwrap()
+                .1
+                .as_ref()
+                .unwrap()
+                .dirty
+                .is_dirty()
+        );
+        // End the covered native epoch before replacing metadata and adding
+        // the nested directory, so no index callback can enrich this operand.
+        drop(git_watch::test_support::covered_monitor(old_plan.clone()));
+        let change = git_watch::test_support::replace_linked_metadata(&old_plan);
+        assert!(change.topology && change.membership);
+        assert_eq!(change.worktrees, BTreeSet::from([primary]));
+        let nested = linked.join("new-watch-scope/nested");
+        fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("tracked.rs");
+        fs::write(&file, "new tracked file while coverage is absent\n").unwrap();
+        git(&linked, &["add", "new-watch-scope/nested/tracked.rs"]);
+        let read = |change| {
+            read_local_with_plan(
+                project,
+                initial.clone(),
+                change,
+                CancellationToken::default(),
+                Some(&old_plan),
+            )
+            .unwrap()
+        };
+        let (_, selective) = read(git_watch::Change {
+            worktrees: BTreeSet::from([primary]),
+            membership: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            selective
+                .unwrap()
+                .worktrees
+                .iter()
+                .find(|row| row.id == linked_id)
+                .unwrap(),
+            old_linked,
+            "ordinary primary-only membership keeps the linked cache"
+        );
+        // Reset to the same old snapshot and plan for each operand. The empty
+        // ID case is the reader contract, not a claim about today's fallback.
+        for empty_ids in [false, true] {
+            let mut topology = change.clone();
+            if empty_ids {
+                topology.worktrees.clear();
+            }
+            let (fresh, recovered) = read(topology);
+            let recovered = Arc::new(recovered.unwrap());
+            let fresh_linked = fresh
+                .worktrees
+                .iter()
+                .find(|(record, _)| record.id == linked_id)
+                .unwrap();
+            assert_eq!(fresh_linked.0.path, linked);
+            assert!(fresh_linked.1.as_ref().unwrap().dirty.staged > 0);
+            let current = recovered
+                .worktrees
+                .iter()
+                .find(|row| row.id == linked_id)
+                .unwrap();
+            assert_eq!(current.root, old_linked.root);
+            assert_ne!(
+                current, old_linked,
+                "topology must read the linked census, not just fresh status"
+            );
+            git_watch::test_support::reconfigure_then_observe(
+                old_plan.clone(),
+                recovered,
+                linked_id,
+                &file,
+            );
         }
     }
 

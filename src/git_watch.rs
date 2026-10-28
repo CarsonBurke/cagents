@@ -411,6 +411,8 @@ struct Pending {
     roots: BTreeMap<PathBuf, BTreeSet<ProjectId>>,
     changes: BTreeMap<ProjectId, Change>,
     faulted: bool,
+    registrations: BTreeMap<PathBuf, BTreeSet<ProjectId>>,
+    retired: BTreeSet<PathBuf>,
 }
 
 #[derive(Default)]
@@ -424,8 +426,35 @@ impl Pending {
         if event.as_ref().is_ok_and(access_only) {
             return false;
         }
-        self.faulted |= event.is_err();
-        let affected = match &event {
+        self.faulted |= event.as_ref().map_or(true, Event::need_rescan);
+        let mut retired_owners = BTreeSet::new();
+        if let Ok(event) = &event
+            && matches!(
+                event.kind,
+                EventKind::Any
+                    | EventKind::Other
+                    | EventKind::Create(_)
+                    | EventKind::Remove(_)
+                    | EventKind::Modify(notify::event::ModifyKind::Any)
+                    | EventKind::Modify(notify::event::ModifyKind::Name(_))
+            )
+        {
+            for path in &event.paths {
+                // Native backends can discard a watch on removal or rename.
+                // The recreated directory may immediately reuse its inode.
+                // Keep this bounded by registered paths, not event traffic;
+                // ordinary file saves and ignored trees add no retirements.
+                for (registered, owners) in self
+                    .registrations
+                    .range(path.clone()..)
+                    .take_while(|(registered, _)| registered.starts_with(path))
+                {
+                    self.retired.insert(registered.clone());
+                    retired_owners.extend(owners.iter().copied());
+                }
+            }
+        }
+        let mut affected = match &event {
             Ok(event) if !event.need_rescan() => event
                 .paths
                 .iter()
@@ -436,13 +465,23 @@ impl Pending {
                 .collect::<BTreeSet<_>>(),
             _ => self.projects.keys().copied().collect(),
         };
+        affected.extend(retired_owners.iter().copied());
         let mut changed = false;
         for id in affected {
             let Some(project) = self.projects.get(&id) else {
                 continue;
             };
             let change = match &event {
-                Ok(event) if !event.need_rescan() => project.change(event),
+                Ok(event) if !event.need_rescan() => project.change(event).or_else(|| {
+                    // A watched parent can be outside the worktree/common
+                    // roots. Losing it still needs owner-visible recovery.
+                    retired_owners.contains(&id).then(|| Change {
+                        worktrees: project.worktrees.iter().map(|row| row.id).collect(),
+                        topology: true,
+                        membership: true,
+                        ..Change::default()
+                    })
+                }),
                 Ok(_) => Some(Change {
                     worktrees: project.worktrees.iter().map(|row| row.id).collect(),
                     topology: true,
@@ -477,6 +516,35 @@ struct Registrations {
 }
 
 impl Registrations {
+    /// A recursive registration owns the lifetime and failures of every path
+    /// it covers. Transfer owners to the outermost surviving watch before
+    /// removing overlaps; a nearer recursive ancestor may itself be covered.
+    fn coalesce_recursive(&mut self) {
+        let recursive = self
+            .desired
+            .iter()
+            .filter(|(_, mode)| **mode == RecursiveMode::Recursive)
+            .map(|(path, _)| path.clone())
+            .collect::<BTreeSet<_>>();
+        let covered = self
+            .desired
+            .keys()
+            .filter_map(|path| {
+                path.ancestors()
+                    .skip(1)
+                    .filter(|ancestor| recursive.contains(*ancestor))
+                    .last()
+                    .map(|ancestor| (path.clone(), ancestor.to_owned()))
+            })
+            .collect::<Vec<_>>();
+        for (path, covering) in covered {
+            if let Some(mut owners) = self.owners.remove(&path) {
+                self.owners.entry(covering).or_default().append(&mut owners);
+            }
+            self.desired.remove(&path);
+        }
+    }
+
     /// Metadata gets first claim on the watch and filesystem-work budgets.
     /// Content traversal also has a candidate budget: missing or symlinked
     /// directories cannot make a large census an unbounded planning job.
@@ -527,6 +595,27 @@ impl Registrations {
                         .entry(path.clone())
                         .or_default()
                         .insert(id);
+                }
+            }
+        }
+        for (&id, project) in projects {
+            for root in std::iter::once(&project.common_dir)
+                .filter(|common| {
+                    !project.worktrees.iter().any(|worktree| {
+                        **common == worktree.root
+                            || common.parent() == Some(worktree.root.as_path())
+                    })
+                })
+                .chain(project.worktrees.iter().map(|worktree| &worktree.root))
+            {
+                if !registrations.desired.contains_key(root)
+                    && !root
+                        .parent()
+                        .is_some_and(|parent| registrations.desired.contains_key(parent))
+                {
+                    registrations.failures.entry(id).or_insert_with(|| {
+                        "directory and its parent are unavailable for native watching".into()
+                    });
                 }
             }
         }
@@ -696,37 +785,47 @@ impl Monitor {
                         }
                         std::mem::replace(&mut pending.projects, projects.clone())
                     };
-                    let Registrations {
-                        mut desired,
-                        owners,
-                        mut failures,
-                    } = Registrations::within(&projects, MAX_DIRECTORIES);
                     // A recursive metadata watch already owns its descendants.
                     // Avoid overlapping registrations, whose removal can also
                     // remove a descendant's native watch on some backends.
-                    let recursive = desired
-                        .iter()
-                        .filter(|(_, mode)| **mode == RecursiveMode::Recursive)
-                        .map(|(path, _)| path.clone())
-                        .collect::<BTreeSet<_>>();
-                    desired.retain(|path, _| {
-                        !path
-                            .ancestors()
-                            .skip(1)
-                            .any(|ancestor| recursive.contains(ancestor))
-                    });
+                    let mut registrations = Registrations::within(&projects, MAX_DIRECTORIES);
+                    registrations.coalesce_recursive();
+                    let Registrations {
+                        desired,
+                        owners,
+                        mut failures,
+                    } = registrations;
+                    // Build and retire the owner index off the mutex shared
+                    // with the owner's drain and native event callbacks.
+                    let next_registrations = desired
+                        .keys()
+                        .map(|path| (path.clone(), owners.get(path).cloned().unwrap_or_default()))
+                        .collect();
+                    let (faulted, retired, previous_registrations) = {
+                        let mut pending = state.lock().unwrap_or_else(|p| p.into_inner());
+                        (
+                            std::mem::take(&mut pending.faulted),
+                            std::mem::take(&mut pending.retired),
+                            std::mem::replace(&mut pending.registrations, next_registrations),
+                        )
+                    };
+                    drop(previous_registrations);
                     let rearmed = match &mut watcher {
                         Ok(watcher) => {
-                            let faulted = std::mem::take(
-                                &mut state.lock().unwrap_or_else(|p| p.into_inner()).faulted,
-                            );
                             if faulted {
                                 for path in registered.keys() {
                                     let _ = watcher.unwatch(path);
                                 }
                                 registered.clear();
                             }
-                            reconcile(watcher, &mut registered, &desired, &owners, &mut failures)
+                            reconcile(
+                                watcher,
+                                &mut registered,
+                                &desired,
+                                &owners,
+                                &retired,
+                                &mut failures,
+                            )
                         }
                         Err(error) => {
                             failures.extend(projects.keys().map(|id| (*id, error.to_string())));
@@ -801,11 +900,13 @@ fn reconcile(
     registered: &mut BTreeMap<PathBuf, (RecursiveMode, u64, u64)>,
     desired: &BTreeMap<PathBuf, RecursiveMode>,
     owners: &BTreeMap<PathBuf, BTreeSet<ProjectId>>,
+    retired: &BTreeSet<PathBuf>,
     failures: &mut BTreeMap<ProjectId, String>,
 ) -> BTreeSet<ProjectId> {
     let mut rearmed = BTreeSet::new();
     registered.retain(|path, (mode, device, inode)| {
-        if desired.get(path) == Some(&*mode)
+        if !retired.contains(path)
+            && desired.get(path) == Some(&*mode)
             && std::fs::symlink_metadata(path)
                 .is_ok_and(|metadata| metadata.dev() == *device && metadata.ino() == *inode)
         {
@@ -1228,6 +1329,10 @@ mod tests {
         pending.changes.clear();
         let rescan = Event::new(EventKind::Access(AccessKind::Any)).set_flag(Flag::Rescan);
         assert!(pending.event(Ok(rescan)));
+        assert!(
+            pending.faulted,
+            "lost events must retire the native registration cache"
+        );
         assert!(pending.changes[&project.id].topology);
         assert!(pending.changes[&project.id].membership);
         assert_eq!(pending.changes[&project.id].worktrees.len(), 2);
@@ -1359,6 +1464,224 @@ mod tests {
     }
 
     #[test]
+    fn recursive_overlap_transfers_every_owner_to_the_outermost_surviving_watch() {
+        let outer = PathBuf::from("/admin/A.git/worktrees");
+        let nested = outer.join("B/custom.git/refs");
+        let leaf = nested.join("heads");
+        let unrelated = PathBuf::from("/admin/unrelated.git/refs");
+        let ids = [
+            ProjectId::new(),
+            ProjectId::new(),
+            ProjectId::new(),
+            ProjectId::new(),
+        ];
+        let mut registrations = Registrations {
+            desired: BTreeMap::from([
+                (outer.clone(), RecursiveMode::Recursive),
+                (nested.clone(), RecursiveMode::Recursive),
+                (leaf.clone(), RecursiveMode::NonRecursive),
+                (unrelated.clone(), RecursiveMode::Recursive),
+            ]),
+            owners: BTreeMap::from([
+                (outer.clone(), BTreeSet::from([ids[0]])),
+                (nested, BTreeSet::from([ids[1]])),
+                (leaf, BTreeSet::from([ids[2]])),
+                (unrelated.clone(), BTreeSet::from([ids[3]])),
+            ]),
+            ..Registrations::default()
+        };
+        registrations.coalesce_recursive();
+        assert_eq!(
+            registrations.desired,
+            BTreeMap::from([
+                (outer.clone(), RecursiveMode::Recursive),
+                (unrelated.clone(), RecursiveMode::Recursive),
+            ])
+        );
+        assert_eq!(
+            registrations.owners,
+            BTreeMap::from([
+                (outer, BTreeSet::from([ids[0], ids[1], ids[2]])),
+                (unrelated, BTreeSet::from([ids[3]])),
+            ])
+        );
+    }
+
+    #[test]
+    fn native_shared_recursive_retirement_recovers_the_nested_repository_owner() {
+        use notify::event::RemoveKind;
+        let directory = tempfile::tempdir().unwrap();
+        // Git's identity APIs return canonical paths, including with aliased TMPDIR.
+        let base = directory.path().canonicalize().unwrap();
+        let common_a = base.join("admin/A.git");
+        let covering = common_a.join("worktrees");
+        let common_b = covering.join("B/custom.git");
+        let checkout_a = base.join("checkout/A");
+        let checkout_b = base.join("checkout/B");
+        std::fs::create_dir_all(common_a.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&checkout_a).unwrap();
+        std::fs::create_dir_all(&checkout_b).unwrap();
+        git(
+            &checkout_a,
+            &["init", "--separate-git-dir", common_a.to_str().unwrap()],
+        );
+        std::fs::create_dir_all(common_b.parent().unwrap()).unwrap();
+        git(
+            &checkout_b,
+            &["init", "--separate-git-dir", common_b.to_str().unwrap()],
+        );
+        let repository = RepositoryService::system("git");
+        let cancellation = CancellationToken::new();
+        assert_eq!(
+            repository.common_dir(&checkout_a, &cancellation).unwrap(),
+            common_a
+        );
+        assert_eq!(
+            repository.common_dir(&checkout_b, &cancellation).unwrap(),
+            common_b
+        );
+        let mut a = project(&base);
+        a.worktrees.truncate(1);
+        a.common_dir = common_a.clone();
+        a.worktrees[0].root = checkout_a;
+        a.worktrees[0].git_dir = common_a;
+        a.worktrees[0].census = census(&[]);
+        let mut b = a.clone();
+        b.id = ProjectId::new();
+        b.common_dir = common_b.clone();
+        b.worktrees[0].id = WorktreeId::new();
+        b.worktrees[0].root = checkout_b;
+        b.worktrees[0].git_dir = common_b.clone();
+        let ids = BTreeSet::from([a.id, b.id]);
+        let b_id = b.id;
+        let b_worktree = b.worktrees[0].id;
+        let projects = BTreeMap::from([(a.id, Arc::new(a)), (b.id, Arc::new(b))]);
+        let mut registrations = Registrations::within(&projects, MAX_DIRECTORIES);
+        assert!(registrations.failures.is_empty());
+        assert_eq!(registrations.owners[&covering].len(), 1);
+        assert!(registrations.owners[&common_b].contains(&b_id));
+        registrations.coalesce_recursive();
+        assert_eq!(registrations.owners[&covering], ids);
+        assert!(!registrations.desired.contains_key(&common_b));
+        assert!(
+            !registrations
+                .desired
+                .contains_key(common_b.parent().unwrap())
+        );
+        let mut pending = Pending {
+            projects: projects.clone(),
+            registrations: registrations.owners.clone(),
+            ..Pending::default()
+        };
+        for (&id, project) in &projects {
+            pending
+                .roots
+                .entry(project.common_dir.clone())
+                .or_default()
+                .insert(id);
+            pending
+                .roots
+                .entry(project.worktrees[0].root.clone())
+                .or_default()
+                .insert(id);
+        }
+        let file = common_b.join("HEAD");
+        let (sender, receiver) = mpsc::channel();
+        let mut watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
+            if let Ok(event) = event
+                && !access_only(&event)
+            {
+                sender.send(event).unwrap();
+            }
+        })
+        .unwrap();
+        let mut registered = BTreeMap::new();
+        let mut failures = BTreeMap::new();
+        assert!(
+            reconcile(
+                &mut watcher,
+                &mut registered,
+                &registrations.desired,
+                &registrations.owners,
+                &BTreeSet::new(),
+                &mut failures
+            )
+            .contains(&b_id)
+        );
+        let identity = registered[&covering];
+        watcher.unwatch(&covering).unwrap();
+        while receiver.try_recv().is_ok() {}
+        std::fs::write(&file, "ref: refs/heads/while-watch-absent\n").unwrap();
+        let absent_deadline = Instant::now() + Duration::from_millis(50);
+        while let Ok(event) =
+            receiver.recv_timeout(absent_deadline.saturating_duration_since(Instant::now()))
+        {
+            assert!(
+                !event.paths.contains(&file)
+                    || !matches!(event.kind, EventKind::Modify(ModifyKind::Data(_))),
+                "the nested repository must actually lose native coverage for this fixture"
+            );
+        }
+        let metadata = std::fs::symlink_metadata(&covering).unwrap();
+        assert_eq!(
+            identity,
+            (RecursiveMode::Recursive, metadata.dev(), metadata.ino())
+        );
+        // This ancestor is outside B's common/root paths. Its surviving watch
+        // must carry B's owner before any later B edit can rescue its routing.
+        assert!(pending.event(Ok(
+            Event::new(EventKind::Remove(RemoveKind::Folder)).add_path(covering.clone())
+        )));
+        let recovery = &pending.changes[&b_id];
+        assert!(recovery.topology && recovery.membership);
+        assert_eq!(recovery.worktrees, BTreeSet::from([b_worktree]));
+        assert_eq!(
+            reconcile(
+                &mut watcher,
+                &mut registered,
+                &registrations.desired,
+                &registrations.owners,
+                &pending.retired,
+                &mut failures
+            ),
+            ids
+        );
+        assert!(failures.is_empty());
+        pending.changes.clear();
+        while receiver.try_recv().is_ok() {}
+        std::fs::write(&file, "ref: refs/heads/after-owner-recovery\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let event = receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("nested repository metadata edit after shared watch recovery");
+            if event.paths.contains(&file)
+                && matches!(event.kind, EventKind::Modify(ModifyKind::Data(_)))
+            {
+                assert!(pending.event(Ok(event)));
+                assert!(pending.changes[&b_id].worktrees.contains(&b_worktree));
+                break;
+            }
+        }
+        let unavailable = covering.with_file_name("worktrees-unavailable");
+        std::fs::rename(&covering, &unavailable).unwrap();
+        failures.clear();
+        reconcile(
+            &mut watcher,
+            &mut registered,
+            &registrations.desired,
+            &registrations.owners,
+            &BTreeSet::from([covering]),
+            &mut failures,
+        );
+        assert_eq!(
+            failures.keys().copied().collect::<BTreeSet<_>>(),
+            ids,
+            "a failed surviving recursive watch must report every covered owner"
+        );
+    }
+
+    #[test]
     fn symlink_and_missing_ancestors_are_not_followed_and_can_be_recreated() {
         let directory = tempfile::tempdir().unwrap();
         let mut project = project(directory.path());
@@ -1404,16 +1727,218 @@ mod tests {
     fn wait_for(
         (monitor, woken): &(Monitor, mpsc::Receiver<()>),
         project: ProjectId,
+        phase: &str,
         predicate: impl Fn(&Change) -> bool,
     ) {
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last = None;
         loop {
-            if woken.try_recv().is_ok() && monitor.drain().get(&project).is_some_and(&predicate) {
-                return;
+            if woken.try_recv().is_ok()
+                && let Some(change) = monitor.drain().remove(&project)
+            {
+                if predicate(&change) {
+                    return;
+                }
+                last = Some(change);
             }
-            assert!(Instant::now() < deadline, "watch event did not arrive");
+            if Instant::now() >= deadline {
+                let pending = monitor.pending.lock().unwrap();
+                panic!(
+                    "watch event did not arrive during {phase}; last change: {last:?}; registrations: {}; retired: {:?}; faulted: {}",
+                    pending.registrations.len(),
+                    pending.retired,
+                    pending.faulted,
+                );
+            }
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn retirement_is_bounded_to_watch_paths_and_routes_a_lost_parent_to_its_owners() {
+        use notify::event::{CreateKind, RemoveKind, RenameMode};
+        let mut project = project(Path::new("/repo"));
+        project.worktrees.truncate(1);
+        let id = project.id;
+        let source = project.worktrees[0].root.join("src");
+        let parent = project.worktrees[0].root.parent().unwrap().to_owned();
+        let watches = [
+            parent.clone(),
+            source.clone(),
+            source.join("nested"),
+            source.with_file_name("src-other"),
+        ];
+        let mut pending = Pending::default();
+        pending.projects.insert(id, Arc::new(project.clone()));
+        pending
+            .roots
+            .insert(project.worktrees[0].root.clone(), BTreeSet::from([id]));
+        pending.registrations = watches
+            .iter()
+            .cloned()
+            .map(|path| (path, BTreeSet::from([id])))
+            .collect();
+        for index in 0..10_000 {
+            assert!(
+                !pending.event(Ok(Event::new(EventKind::Create(CreateKind::File))
+                    .add_path(source.join(format!("ignored-{index}")))))
+            );
+        }
+        pending.event(Ok(Event::new(EventKind::Modify(ModifyKind::Name(
+            RenameMode::Both,
+        )))
+        .add_path(source.join(".save"))
+        .add_path(source.join("main.rs"))));
+        assert!(
+            pending.retired.is_empty(),
+            "file saves retain directory watches"
+        );
+        pending.changes.clear();
+        for kind in [
+            EventKind::Remove(RemoveKind::Folder),
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+            EventKind::Modify(ModifyKind::Any),
+        ] {
+            pending.retired.clear();
+            assert!(pending.event(Ok(Event::new(kind).add_path(source.clone()))));
+            assert_eq!(
+                pending.retired,
+                BTreeSet::from([source.clone(), source.join("nested")])
+            );
+            assert!(pending.retired.len() <= pending.registrations.len());
+        }
+        pending.retired.clear();
+        pending.changes.clear();
+        assert!(pending.event(Ok(
+            Event::new(EventKind::Remove(RemoveKind::Folder)).add_path(parent)
+        )));
+        let change = &pending.changes[&id];
+        assert!(change.topology && change.membership);
+        assert_eq!(change.worktrees, BTreeSet::from([project.worktrees[0].id]));
+        assert_eq!(pending.retired, BTreeSet::from(watches));
+    }
+
+    #[test]
+    fn native_retired_registration_rearms_even_when_directory_identity_is_unchanged() {
+        use notify::event::RemoveKind;
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("src");
+        std::fs::create_dir(&source).unwrap();
+        let file = source.join("main.rs");
+        std::fs::write(&file, "initial").unwrap();
+        let first = ProjectId::new();
+        let second = ProjectId::new();
+        let owners = BTreeMap::from([(source.clone(), BTreeSet::from([first, second]))]);
+        let desired = BTreeMap::from([(source.clone(), RecursiveMode::NonRecursive)]);
+        let mut registered = BTreeMap::new();
+        let mut failures = BTreeMap::new();
+        let (sender, receiver) = mpsc::channel();
+        let mut watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
+            if let Ok(event) = event
+                && !access_only(&event)
+            {
+                sender.send(event).unwrap();
+            }
+        })
+        .unwrap();
+        let await_edit = |phase: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let event = receiver
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap_or_else(|error| panic!("{phase}: no native file edit: {error}"));
+                if event.paths.contains(&file)
+                    && matches!(event.kind, EventKind::Modify(ModifyKind::Data(_)))
+                {
+                    break;
+                }
+            }
+        };
+        assert_eq!(
+            reconcile(
+                &mut watcher,
+                &mut registered,
+                &desired,
+                &owners,
+                &BTreeSet::new(),
+                &mut failures
+            ),
+            BTreeSet::from([first, second])
+        );
+        std::fs::write(&file, "positive control").unwrap();
+        await_edit("initial live watch");
+        watcher.unwatch(&source).unwrap();
+        // Explicit native watch loss models DELETE/MOVED_FROM retirement.
+        // Keeping this directory in place supplies identical cached metadata
+        // without depending on the runner filesystem's inode allocator.
+        let metadata = std::fs::symlink_metadata(&source).unwrap();
+        assert_eq!(
+            registered[&source],
+            (RecursiveMode::NonRecursive, metadata.dev(), metadata.ino())
+        );
+        let mut pending = Pending {
+            registrations: owners.clone(),
+            ..Pending::default()
+        };
+        pending.event(Ok(
+            Event::new(EventKind::Remove(RemoveKind::Folder)).add_path(source.clone())
+        ));
+        assert_eq!(pending.retired, BTreeSet::from([source.clone()]));
+        assert_eq!(
+            reconcile(
+                &mut watcher,
+                &mut registered,
+                &desired,
+                &owners,
+                &pending.retired,
+                &mut failures
+            ),
+            BTreeSet::from([first, second])
+        );
+        while receiver.try_recv().is_ok() {}
+        std::fs::write(&file, "edit after native rearm").unwrap();
+        await_edit("same-identity rearmed watch");
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn missing_watch_root_and_parent_retain_polling_until_a_recovery_anchor_exists() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("missing-parent");
+        let mut project = project(&parent);
+        project.worktrees.truncate(1);
+        let id = project.id;
+        let projects = BTreeMap::from([(id, Arc::new(project))]);
+        let absent = Registrations::within(&projects, MAX_DIRECTORIES);
+        assert!(absent.failures.contains_key(&id));
+        assert!(!absent.desired.contains_key(&parent));
+        std::fs::create_dir(&parent).unwrap();
+        let recoverable = Registrations::within(&projects, MAX_DIRECTORIES);
+        assert!(recoverable.desired.contains_key(&parent));
+        assert!(
+            recoverable.failures.is_empty(),
+            "watching the parent can observe root recreation"
+        );
+        let root = parent.join("first");
+        std::fs::create_dir(&root).unwrap();
+        let mut separated = projects[&id].as_ref().clone();
+        separated.common_dir = root.join("untracked-admin/nested/git");
+        separated.worktrees[0].git_dir = separated.common_dir.clone();
+        let projects = BTreeMap::from([(id, Arc::new(separated.clone()))]);
+        let unavailable = Registrations::within(&projects, MAX_DIRECTORIES);
+        assert!(unavailable.desired.contains_key(&root));
+        assert!(
+            unavailable.failures.contains_key(&id),
+            "a root watch cannot observe recreation below an untracked intermediate directory"
+        );
+        std::fs::create_dir_all(separated.common_dir.parent().unwrap()).unwrap();
+        let anchored = Registrations::within(&projects, MAX_DIRECTORIES);
+        assert!(
+            anchored
+                .desired
+                .contains_key(separated.common_dir.parent().unwrap())
+        );
+        assert!(anchored.failures.is_empty());
     }
 
     #[test]
@@ -1436,28 +1961,44 @@ mod tests {
             woken,
         );
         monitor.0.configure(vec![Arc::new(project.clone())]);
-        wait_for(&monitor, project.id, |change| change.error.is_none());
+        wait_for(&monitor, project.id, "initial registration", |change| {
+            change.coverage == Some(true) && change.error.is_none()
+        });
         let replacement = source.join(".save");
         std::fs::write(&replacement, "second").unwrap();
         std::fs::rename(&replacement, &file).unwrap();
-        wait_for(&monitor, project.id, |change| {
+        wait_for(&monitor, project.id, "atomic file replacement", |change| {
             change.worktrees.contains(&worktree.id)
         });
         std::fs::remove_dir_all(&source).unwrap();
         std::fs::create_dir(&source).unwrap();
         std::fs::write(&file, "third").unwrap();
-        wait_for(&monitor, project.id, |change| change.membership);
-        // The path set is unchanged, but the directory inode changed. Rearm
-        // it instead of trusting a stale native registration for that path.
+        wait_for(
+            &monitor,
+            project.id,
+            "directory removal/recreation",
+            |change| change.membership,
+        );
+        // The path set is unchanged and the inode can be reused. Rearm after
+        // retirement instead of trusting a stale registration for that path.
         monitor.0.configure(vec![Arc::new(project.clone())]);
         // Configure completion must be acknowledged even when paths compare
         // equal, so edits cannot race the re-registration barrier.
-        wait_for(&monitor, project.id, |change| {
-            change.worktrees.contains(&worktree.id)
-        });
+        wait_for(
+            &monitor,
+            project.id,
+            "re-registration acknowledgement",
+            |change| change.coverage == Some(true) && change.worktrees.contains(&worktree.id),
+        );
         std::fs::write(&file, "fourth").unwrap();
-        wait_for(&monitor, project.id, |change| {
-            change.worktrees.contains(&worktree.id)
-        });
+        wait_for(
+            &monitor,
+            project.id,
+            "edit after re-registration",
+            |change| change.worktrees.contains(&worktree.id),
+        );
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_support;

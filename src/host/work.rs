@@ -996,26 +996,34 @@ impl Handle {
 
     fn scan_worker(&self) {
         while let Some(job) = self.0.jobs.next() {
-            let started = Instant::now();
-            let result = super::service::attempt("Work board scan", || {
-                scan::scan(scan::Input {
-                    id: job.id,
-                    repository: &job.repository,
-                    previous: job.previous.as_deref(),
-                    change: &job.change,
-                    hints: &job.hints,
-                    now_unix_ms: now_unix_ms(),
-                    cancellation: &self.0.cancellation,
-                })
-            });
-            tracing::debug!(
-                repository = %job.repository.display(),
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                ok = result.is_ok(),
-                "Work board scan"
-            );
-            self.publish(job, result);
+            self.scan_job(job, scan::scan);
         }
+    }
+
+    fn scan_job(
+        &self,
+        job: Job,
+        read: impl for<'a> FnOnce(scan::Input<'a>) -> Result<scan::Local, String>,
+    ) {
+        let started = Instant::now();
+        let result = super::service::attempt("Work board scan", || {
+            read(scan::Input {
+                id: job.id,
+                repository: &job.repository,
+                previous: job.previous.as_deref(),
+                change: &job.change,
+                hints: &job.hints,
+                now_unix_ms: now_unix_ms(),
+                cancellation: &self.0.cancellation,
+            })
+        });
+        tracing::debug!(
+            repository = %job.repository.display(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            ok = result.is_ok(),
+            "Work board scan"
+        );
+        self.publish(job, result);
     }
 
     /// Makes a scan's result the project's, then forgets the pins of cards it
@@ -1036,7 +1044,15 @@ impl Handle {
         tracked.last_scan = Some(Instant::now());
         match result {
             Ok(local) => {
-                tracked.scan_error = None;
+                tracked.scan_error = local.plan_error.clone();
+                if tracked.scan_error.is_some() {
+                    // Fresh status does not settle a failed watch inventory.
+                    // Keep its retirement delta for the bounded worker retry.
+                    tracked.covered = false;
+                    let pending = tracked.pending.get_or_insert_with(Default::default);
+                    pending.merge(job.change);
+                    pending.membership = true;
+                }
                 tracked.local = Some(Arc::new(local));
             }
             Err(error) => {
@@ -1378,7 +1394,12 @@ impl Scanner {
                 continue;
             };
             if let Some(covered) = change.coverage {
-                tracked.covered = covered;
+                // An older ACK cannot cover an inventory still awaiting retry.
+                tracked.covered = covered
+                    && tracked
+                        .local
+                        .as_ref()
+                        .is_none_or(|local| local.plan_error.is_none());
             }
             if let Some(error) = &change.error {
                 tracing::debug!(%error, project = %tracked.name, "the Work board polls this project");
@@ -1552,7 +1573,9 @@ impl Scanner {
             if tracked.pending.is_some() && !tracked.scanning {
                 next = next.min(tracked.spacing().saturating_sub(since));
             }
-            if !tracked.scanning {
+            // Pending work already has a spacing deadline. An overdue poll
+            // must not spin while a failed scan waits for its retry.
+            if !tracked.scanning && tracked.pending.is_none() {
                 next = next.min(shared.poll_interval(tracked).saturating_sub(since));
             }
         }
@@ -1563,6 +1586,275 @@ impl Scanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_watch_inventory_retries_on_the_worker_deadline_then_rearms() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().canonicalize().unwrap();
+        let root = base.join("repo");
+        let linked = base.join("linked");
+        let source = root.join("src");
+        std::fs::create_dir_all(&source).unwrap();
+        let file = source.join("main.rs");
+        std::fs::write(&file, "initial\n").unwrap();
+        let git = |arguments: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+                .args([
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(arguments)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {arguments:?}: {output:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["add", "."]);
+        git(&["commit", "-qm", "initial"]);
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ]);
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "other",
+            linked.to_str().unwrap(),
+        ]);
+        let repository = root.join(".git").canonicalize().unwrap();
+        let handle = Handle(Arc::new(Inner {
+            host: Weak::new(),
+            shared: Mutex::new(Shared {
+                projects: BTreeMap::from([(repository.clone(), Tracked::new("repo".into()))]),
+                pins: BTreeMap::new(),
+                session_activity: HashMap::new(),
+                tickets: BTreeMap::new(),
+                linear_unavailable: None,
+                stale_after_days: 7,
+                read_at: None,
+                restored: BTreeMap::new(),
+            }),
+            updated: Condvar::new(),
+            scanner: Signal::default(),
+            forge: Signal::default(),
+            publisher: Signal::default(),
+            publication: Mutex::new(Publication::default()),
+            jobs: Jobs::default(),
+            store: Mutex::new(None),
+            cancellation: CancellationToken::new(),
+        }));
+        let mut scanner = Scanner {
+            monitor: Some(git_watch::Monitor::start(|| {}).unwrap()),
+            configured: BTreeMap::new(),
+            stamped: HashMap::new(),
+            sampled: Some(Instant::now()),
+            refreshed: Some(Instant::now()),
+        };
+        let take_job = || {
+            handle
+                .0
+                .jobs
+                .state
+                .lock()
+                .unwrap()
+                .queue
+                .pop_front()
+                .expect("the real dispatcher queued a scan")
+        };
+        let wait_for =
+            |scanner: &mut Scanner, phase: &str, predicate: &dyn Fn(&Tracked) -> bool| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    scanner.drain(&handle);
+                    if predicate(&handle.shared().projects[&repository]) {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "{phase}");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            };
+        scanner.dispatch(&handle);
+        handle.scan_job(take_job(), scan::scan);
+        let (id, primary, all_worktrees, old_plan) = {
+            let shared = handle.shared();
+            let tracked = &shared.projects[&repository];
+            let local = tracked.local.as_ref().unwrap();
+            (
+                tracked.id,
+                local.worktrees.iter().find(|row| row.primary).unwrap().id,
+                local
+                    .worktrees
+                    .iter()
+                    .map(|row| row.id)
+                    .collect::<BTreeSet<_>>(),
+                local.plan.clone().unwrap(),
+            )
+        };
+        assert_eq!(all_worktrees.len(), 2);
+        scanner.configure(&handle);
+        wait_for(&mut scanner, "initial native coverage", &|tracked| {
+            tracked.covered
+        });
+        let stale_pin = (repository.clone(), "branch:gone".to_owned());
+        {
+            let mut shared = handle.shared();
+            let tracked = shared.projects.get_mut(&repository).unwrap();
+            tracked.pending = None;
+            tracked.forge = Forge::NotGitHub;
+            assert!(!tracked.live_pin(&stale_pin.1));
+            shared.pins.insert(stale_pin.clone(), Column::Stale);
+        }
+
+        std::fs::remove_dir_all(&source).unwrap();
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(&file, "recreated\n").unwrap();
+        wait_for(&mut scanner, "native directory retirement", &|tracked| {
+            tracked
+                .pending
+                .as_ref()
+                .is_some_and(|change| change.membership)
+        });
+        let nested = source.join("new");
+        let new_file = nested.join("tracked.rs");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(&new_file, "new tracked file\n").unwrap();
+        git(&["add", "src/new/tracked.rs"]);
+        handle
+            .shared()
+            .projects
+            .get_mut(&repository)
+            .unwrap()
+            .last_scan = Some(Instant::now() - SCAN_SPACING);
+        scanner.dispatch(&handle);
+        let job = take_job();
+        let retirement = job.change.clone();
+        assert!(retirement.membership && retirement.worktrees.contains(&primary));
+        // A shared-ref change arriving while this job is in flight must also
+        // survive publication of its inner planning failure.
+        git(&["update-ref", "refs/heads/concurrent", "HEAD"]);
+        wait_for(&mut scanner, "concurrent reference delta", &|tracked| {
+            tracked
+                .pending
+                .as_ref()
+                .is_some_and(|change| change.references)
+        });
+        handle.scan_job(job, |input| {
+            scan::scan_with_plan(
+                input,
+                |_, _| Err("temporary watch inventory failure".into()),
+            )
+        });
+        {
+            let mut shared = handle.shared();
+            let tracked = shared.projects.get_mut(&repository).unwrap();
+            let local = tracked.local.as_ref().unwrap();
+            assert_eq!(
+                tracked.scan_error.as_deref(),
+                Some("temporary watch inventory failure")
+            );
+            assert!(local.plan_error.is_some());
+            assert!(Arc::ptr_eq(local.plan.as_ref().unwrap(), &old_plan));
+            let primary_status = local
+                .worktrees
+                .iter()
+                .find(|row| row.id == primary)
+                .unwrap();
+            assert!(primary_status.error.is_none());
+            assert!(primary_status.dirty.as_ref().unwrap().paths > 0);
+            assert!(!tracked.covered);
+            let pending = tracked.pending.as_ref().unwrap();
+            assert!(pending.membership && pending.references);
+            assert!(retirement.worktrees.is_subset(&pending.worktrees));
+            tracked.last_scan = Some(Instant::now() - Duration::from_secs(20));
+            let tracked = &shared.projects[&repository];
+            assert_eq!(shared.poll_interval(tracked), ACTIVE_POLL);
+            assert!(shared.pins.contains_key(&stale_pin));
+        }
+        // No further native event is drained to trigger the retry. A due poll
+        // must still enrich the pending subset, without bypassing its deadline.
+        scanner.dispatch(&handle);
+        assert!(handle.0.jobs.state.lock().unwrap().queue.is_empty());
+        assert_eq!(
+            handle.shared().projects[&repository]
+                .pending
+                .as_ref()
+                .unwrap()
+                .worktrees,
+            all_worktrees
+        );
+        scanner.sampled = Some(Instant::now());
+        scanner.refreshed = Some(Instant::now());
+        assert!(
+            scanner.next(&handle) > Duration::from_secs(1),
+            "an overdue poll must not spin before the retry"
+        );
+        handle
+            .shared()
+            .projects
+            .get_mut(&repository)
+            .unwrap()
+            .last_scan = Some(Instant::now() - SCAN_RETRY - Duration::from_millis(1));
+        scanner.dispatch(&handle);
+        handle.scan_job(take_job(), scan::scan);
+        {
+            let shared = handle.shared();
+            let tracked = &shared.projects[&repository];
+            assert!(tracked.scan_error.is_none());
+            let local = tracked.local.as_ref().unwrap();
+            assert!(local.plan_error.is_none());
+            assert!(!Arc::ptr_eq(local.plan.as_ref().unwrap(), &old_plan));
+            assert!(
+                !tracked.covered,
+                "inventory success still needs a native ACK"
+            );
+            assert!(Arc::ptr_eq(&scanner.configured[&id], &old_plan));
+            assert!(
+                !shared.pins.contains_key(&stale_pin),
+                "successful settled recovery can retire the stale pin"
+            );
+        }
+        scanner.configure(&handle);
+        wait_for(
+            &mut scanner,
+            "native rearm after autonomous inventory retry",
+            &|tracked| {
+                tracked.covered
+                    && tracked
+                        .pending
+                        .as_ref()
+                        .is_some_and(|change| change.worktrees.contains(&primary))
+            },
+        );
+        handle
+            .shared()
+            .projects
+            .get_mut(&repository)
+            .unwrap()
+            .pending = None;
+        std::fs::write(&new_file, "edit in newly tracked directory after retry\n").unwrap();
+        wait_for(&mut scanner, "native edit after recovery", &|tracked| {
+            tracked.covered
+                && tracked.scan_error.is_none()
+                && tracked
+                    .pending
+                    .as_ref()
+                    .is_some_and(|change| change.worktrees.contains(&primary) && !change.topology)
+        });
+    }
 
     #[test]
     fn signals_keep_a_notification_sent_before_the_wait() {
