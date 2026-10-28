@@ -6981,8 +6981,7 @@ impl Cagents {
         let context =
             super::channel_ui::SessionCloseContext::capture(self.workspace_model.identity);
         if !pending
-            && ((session.proof.is_some()
-                && (session.owns_codex_listener() || session.native_continuity.retains_provider()))
+            && (session.requires_native_close_confirmation()
                 || (context.scoped()
                     && (handle.is_some()
                         || session.proof.is_some()

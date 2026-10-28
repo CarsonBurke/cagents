@@ -566,7 +566,9 @@ fn chat_close_message(task: Task<Message>) -> Message {
             while let Some(action) = stream.next().await {
                 if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
                     message @ Message::ChatUi(
-                        ChatAction::ScopedParkedCloseFinished(..) | ChatAction::CloseFinished(..),
+                        ChatAction::ScopedParkedCloseFinished(..)
+                        | ChatAction::CloseFinished(..)
+                        | ChatAction::RetainedCloseFinished(..),
                     ),
                 )) = action
                 {
@@ -575,6 +577,116 @@ fn chat_close_message(task: Task<Message>) -> Message {
             }
             panic!("chat close task produced no owning completion")
         })
+}
+
+fn canonical_direct_close(_role: &str) {
+    use crate::app::chat_ui::Action as ChatAction;
+    for has_proof in [false, true] {
+        for outcome in ["refused", "accepted", "replacement"] {
+            let (mut app, _, _, card) = tests::channel_with_a_conversation();
+            let registry = uuid::Uuid::new_v4();
+            app.workspace_model.identity = registry;
+            Arc::make_mut(&mut app.durable).workspace_model_identity = Some(registry);
+            let mut source = claude_close_session(crate::chat::NativeContinuity::ReconnectOnly);
+            if !has_proof {
+                source.proof = None;
+            }
+            assert!(!source.is_unstarted());
+            app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
+            // A real cold saved card has no mounted client. Its descriptor and
+            // unsent draft still need exact confirmation before local removal.
+            app.cards.remove(&card);
+            let drafts = HashMap::from([(card, "Keep this saved Claude draft 🦀\n".into())]);
+            app.chat_ui = crate::app::chat_ui::State::with_drafts(drafts.clone());
+            Arc::make_mut(&mut app.durable).chat_drafts = drafts.clone();
+            let saved = app.card_state(card).unwrap().clone();
+            let focus = app.workspace.focused();
+            let original = source.clone();
+            let peer = Peer::new(move |server| {
+                let mut connection = server
+                    .connect(&Authority::default(), Some(registry), false)
+                    .unwrap();
+                connection.terminals(vec![]);
+                connection.chats(vec![]);
+                let request = connection.next();
+                assert!(matches!(&request.request,
+                    ClientRequest::ChatCloseRetained { session } if session == &original));
+                if outcome == "refused" {
+                    connection.refuse(&request);
+                } else {
+                    connection.response(&request, ServerResponse::Accepted);
+                }
+                connection.eof();
+            });
+            let task = app.begin_chat_close(card);
+            assert!(app.chat_close_owned(card));
+            assert_eq!(app.card_state(card), Some(&saved));
+            assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+            let completion = chat_close_message(task);
+            peer.finished();
+            assert!(matches!(&completion,
+                Message::ChatUi(ChatAction::RetainedCloseFinished(_, session, result))
+                    if session == &source && result.is_err() == (outcome == "refused")));
+            let old_target = match &completion {
+                Message::ChatUi(ChatAction::RetainedCloseFinished(target, _, _)) => *target,
+                _ => unreachable!(),
+            };
+            let replacement = if outcome == "replacement" {
+                let mut replacement = source.clone();
+                replacement.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+                app.install_chat_session(card, replacement);
+                Some(app.card_state(card).unwrap().clone())
+            } else {
+                None
+            };
+            drop(app.update(completion));
+            assert!(!app.chat_close_owned(card));
+            if outcome == "accepted" {
+                assert!(!app.card_state(card).unwrap().existence.is_open());
+            } else {
+                assert_eq!(app.card_state(card), replacement.as_ref().or(Some(&saved)));
+                assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+                assert_eq!(app.workspace.focused(), focus);
+            }
+            if outcome == "refused" {
+                let original = source.clone();
+                let peer = Peer::new(move |server| {
+                    let mut connection = server
+                        .connect(&Authority::default(), Some(registry), false)
+                        .unwrap();
+                    connection.terminals(vec![]);
+                    connection.chats(vec![]);
+                    let request = connection.next();
+                    assert!(matches!(&request.request,
+                        ClientRequest::ChatCloseRetained { session } if session == &original));
+                    connection.response(&request, ServerResponse::Accepted);
+                    connection.eof();
+                });
+                let current = chat_close_message(app.begin_chat_close(card));
+                peer.finished();
+                // An old successful callback cannot settle the fresh explicit
+                // retry, even when the descriptor itself is still identical.
+                drop(
+                    app.update(Message::ChatUi(ChatAction::RetainedCloseFinished(
+                        old_target,
+                        source,
+                        Ok(()),
+                    ))),
+                );
+                assert!(app.chat_close_owned(card));
+                assert_eq!(app.card_state(card), Some(&saved));
+                assert_eq!(app.persistent_workspace().chat_drafts, drafts);
+                drop(app.update(current));
+                assert!(!app.chat_close_owned(card));
+                assert!(!app.card_state(card).unwrap().existence.is_open());
+            }
+        }
+    }
+}
+
+#[test]
+fn canonical_reconnect_only_direct_close_waits_for_its_receipt_and_preserves_replacements() {
+    isolated(&["user"], canonical_direct_close);
 }
 
 fn scoped_live_surface_close(role: &str) {
