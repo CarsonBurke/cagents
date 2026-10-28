@@ -177,7 +177,8 @@ fn durable_browser_urls_keep_navigation_authority_across_store_reopen() {
 
 #[test]
 fn durable_browser_same_location_navigation_rewrites_hidden_url_components() {
-    let original = "https://fixture-user:fixture-password@example.test:8443/path?fixture=first#first";
+    let original =
+        "https://fixture-user:fixture-password@example.test:8443/path?fixture=first#first";
     for changed in [
         "https://fixture-user:fixture-password@example.test:8443/path?fixture=second#first",
         "https://fixture-user:fixture-password@example.test:8443/path?fixture=first#second",
