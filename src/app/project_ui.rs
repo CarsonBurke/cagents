@@ -2516,7 +2516,9 @@ fn close_sessions_in_scope_with_context(
                     .map_err(|error| format!("Could not confirm retained chat {id}: {error}"))?;
             }
         }
-        project_sessions.record_chat_closed(session);
+        if super::channel_ui::may_have_retained_owner(&session) {
+            project_sessions.record_chat_closed(session);
+        }
     }
     for session in project_sessions.retained_chats.clone() {
         if !project_sessions.contains(session.id, &session.launch.recipe.working_directory, &scope)
