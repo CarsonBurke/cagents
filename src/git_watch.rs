@@ -1172,7 +1172,7 @@ impl Registrations {
             })
             .map(|(&id, _)| id)
             .collect::<BTreeSet<_>>();
-        for (&id, project) in &ordered {
+        for (&id, project) in ordered.iter().copied() {
             if let Some(reason) = project.polling_reason() {
                 registrations.failures.insert(id, reason.to_owned());
             }
@@ -1192,7 +1192,7 @@ impl Registrations {
             .iter()
             .filter(|id| seen.insert(**id))
             .filter_map(|selected| {
-                ordered.iter().find_map(|(&id, project)| {
+                ordered.iter().copied().find_map(|(&id, project)| {
                     let row = project.worktrees.iter().find(|row| row.id == *selected)?;
                     Some((id, row, row.directories(), BTreeSet::new()))
                 })
