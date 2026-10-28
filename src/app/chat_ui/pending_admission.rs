@@ -760,7 +760,7 @@ impl Cagents {
         let context = history.context.clone();
         let reader = history.reader.clone();
         let pending = history.pending;
-        if context.target != target || reader.is_none() {
+        if context.target != target {
             return Task::none();
         }
         if !self.retained_history_current(&context, pending)
@@ -774,7 +774,9 @@ impl Cagents {
         if let Err(error) = result {
             return self.retained_history_failed(&context, error);
         }
-        let (handle, witness) = reader.unwrap();
+        let Some((handle, witness)) = reader else {
+            return Task::none();
+        };
         if !handle.is_connected()
             || handle.session() != *witness.reader()
             || !chat::client::SavedHistoryAdmission::snapshot_matches(
