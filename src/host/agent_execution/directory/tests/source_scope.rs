@@ -20,7 +20,7 @@ use crate::{
     },
     workspace_model::{ModelEdit, views::Pane},
 };
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 struct MetadataOnly;
 impl Adapter for MetadataOnly {
@@ -373,6 +373,95 @@ fn terminal_directory_source_projects_current_proof_before_binding_saved_scope()
             scopes.get(&raw.id).cloned(),
             (case == "current").then_some(Some(scope.clone())),
             "{case}: only current proved terminal metadata can supply placement"
+        );
+    }
+}
+
+#[test]
+fn current_directory_reads_ignore_stale_agent_delegation_without_a_shared_pane() {
+    use crate::agent_execution::{Destination, Spec, Submit, Surface as AgentSurface, Target};
+
+    for matching in [true, false] {
+        let fixture = Fixture::new();
+        let initial = fixture.project(&fixture.physical);
+        assert_eq!(initial.sessions.len(), 1);
+        assert_eq!(initial.sessions[0].id, fixture.source.id);
+        let mut cached = fixture.source.clone();
+        if !matching {
+            cached.proof.as_mut().unwrap().host_incarnation = HostIncarnation::new("previous");
+        }
+        let placement = crate::agent_execution::Placement::Worktree {
+            repository: fixture.logical.clone(),
+            path: fixture.logical.clone(),
+        };
+        let (agent, run) = {
+            let registry = registry(&fixture.host).unwrap();
+            let mut registry = registry.lock().unwrap();
+            // Acceptance and descriptor binding are database-only. No dispatch,
+            // provider, capability or shared pane is needed to expose fallback.
+            let accepted = registry
+                .submit_agent(
+                    &Origin::User,
+                    &Submit {
+                        name: None,
+                        destination: Destination::New(Spec {
+                            provider: Provider::Omp,
+                            account: None,
+                            target: Target {
+                                repository: fixture.logical.clone(),
+                                directory: fixture.logical.clone(),
+                                placement: Some(placement.clone()),
+                            },
+                            surface: AgentSurface::Chat,
+                            model: None,
+                            permission_mode: None,
+                            reasoning_effort: None,
+                        }),
+                        prompt: "Directory metadata fixture; never dispatched".into(),
+                        idempotency_key: "directory-delegation-fixture".into(),
+                    },
+                    1,
+                )
+                .unwrap();
+            let bound = registry
+                .bind_agent(accepted.agent.id, None, HostedSession::Chat(cached.clone()))
+                .unwrap();
+            assert_eq!(bound.session, Some(HostedSession::Chat(cached)));
+            assert!(registry.model().unwrap().views.is_empty());
+            (accepted.agent.id, accepted.run.id)
+        };
+        let physical = fixture.project(&fixture.physical);
+        let logical = fixture.project(&fixture.logical);
+        if matching {
+            assert_eq!(logical.sessions.len(), 1);
+            let current = &logical.sessions[0];
+            assert_eq!(current.id, fixture.source.id);
+            assert_eq!(current.project.as_ref(), Some(&fixture.logical));
+            assert_eq!(current.view_scope.as_ref(), Some(&placement));
+            assert_eq!(current.relation, Relation::Child);
+            let delegation = current.delegation.as_ref().unwrap();
+            assert_eq!(delegation.agent, agent);
+            assert_eq!(delegation.run, Some(run));
+            assert_eq!(delegation.owner, Owner::User);
+        } else {
+            assert!(
+                logical.sessions.is_empty(),
+                "stale agent must not supply a logical scope"
+            );
+            assert_eq!(physical.sessions.len(), 1);
+            let current = &physical.sessions[0];
+            assert_eq!(current.id, fixture.source.id);
+            assert_eq!(current.project.as_ref(), Some(&fixture.physical));
+            assert!(current.view_scope.is_none());
+            assert!(current.delegation.is_none());
+            assert_eq!(current.relation, Relation::Peer);
+        }
+        assert!(
+            physical
+                .sessions
+                .iter()
+                .chain(&logical.sessions)
+                .all(|entry| { entry.directory.as_ref() == Some(&fixture.physical) })
         );
     }
 }
