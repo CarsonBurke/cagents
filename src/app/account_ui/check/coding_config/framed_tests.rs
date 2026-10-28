@@ -12,6 +12,7 @@ use crate::{
 };
 use std::{
     os::unix::net::{UnixListener, UnixStream},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -89,6 +90,7 @@ fn framed_actual_helper(authority: Authority, creating: bool, deny_auth: bool) {
     } else {
         Operation::AccountCodingConfigInspect(context.request.clone())
     };
+    let (finished, settled) = mpsc::channel();
     let peer = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut stream = loop {
@@ -180,6 +182,12 @@ fn framed_actual_helper(authority: Authority, creating: bool, deny_auth: bool) {
         // Refused authentication permits zero business requests. Accepted
         // authentication permits exactly one, with no resend or fallback.
         assert!(read_frame::<ClientEnvelope>(&mut stream).unwrap().is_none());
+        // Keep the listener alive until the synchronous helper returns. A
+        // fallback connection must remain observable, rather than failing only
+        // because this peer dropped its listener immediately after the EOF.
+        settled
+            .recv_timeout(Duration::from_secs(3))
+            .expect("coding helper did not settle after closing its connection");
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
         );
@@ -189,6 +197,7 @@ fn framed_actual_helper(authority: Authority, creating: bool, deny_auth: bool) {
     } else {
         inspect(context).map(|_| ())
     };
+    let _ = finished.send(());
     peer.join().unwrap();
     assert_eq!(result.is_ok(), !deny_auth);
 }
