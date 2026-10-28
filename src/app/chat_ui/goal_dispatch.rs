@@ -607,10 +607,11 @@ impl Cagents {
         let Some(pending) = runtime.goal_pending.as_ref() else {
             return Task::none();
         };
-        if pending
-            .binding
-            .as_ref()
-            .is_none_or(|binding| !binding.matches(runtime))
+        if !matches!(pending.stage, Stage::Waiting)
+            || pending
+                .binding
+                .as_ref()
+                .is_none_or(|binding| !binding.matches(runtime))
             || !pending.model_wait.as_ref().is_some_and(|(_, current)| {
                 witness
                     .upgrade()
@@ -670,7 +671,22 @@ impl Cagents {
             );
             return Task::none();
         }
-        if !matches!(pending.stage, Stage::Waiting) || runtime.pending.is_some() {
+        if !matches!(pending.stage, Stage::Waiting) {
+            runtime.goal_pending = Some(pending);
+            return Task::none();
+        }
+        // Once armed, this local model wait stays absolute even if readiness
+        // is lost or an unrelated physical command still owns its own slot.
+        if pending.model.is_some()
+            && pending
+                .model_wait
+                .as_ref()
+                .is_some_and(|(since, _)| since.elapsed() >= MODEL_PATIENCE)
+        {
+            runtime.error = Some("The selected model and reasoning were not confirmed in time. The goal was not sent; choose a model and submit again. Your input is kept.".into());
+            return Task::none();
+        }
+        if runtime.pending.is_some() {
             runtime.goal_pending = Some(pending);
             return Task::none();
         }
@@ -707,6 +723,8 @@ impl Cagents {
             }
             if latest.selected_model.as_ref() == Some(model) && &latest.reasoning == reasoning {
                 pending.model = None;
+                pending.model_wait = None;
+                pending.model_rechecking = false;
                 None
             } else if pending.model_sent {
                 let task = pending.look_again(target, MODEL_PATIENCE - waited);
@@ -731,6 +749,24 @@ impl Cagents {
         let (command, revision) = if let Some(command) = model_command {
             (command, None)
         } else {
+            // The chosen model may have been staged before a probe or another
+            // Goal finished. Another attached client can replace it meanwhile.
+            // Keep the original selection through the whole unsent preparation;
+            // an unspecified effort leaves the provider's choice unconstrained.
+            if matches!(
+                pending.operation,
+                Operation::SetObjective(_) | Operation::Resume
+            ) && pending
+                .selection
+                .as_ref()
+                .is_some_and(|(model, reasoning)| {
+                    latest.selected_model.as_ref() != Some(model)
+                        || (reasoning.is_some() && &latest.reasoning != reasoning)
+                })
+            {
+                runtime.error = Some("The selected model or reasoning changed before the goal was sent. Your input is kept; choose a model and submit again.".into());
+                return Task::none();
+            }
             let Some(goal) = current_goal(runtime, &handle) else {
                 runtime.goal_pending = Some(pending);
                 return Task::none();
@@ -948,6 +984,13 @@ mod tests {
     }
 
     fn deferred_model_goal(catalog: bool) -> (Cagents, CardId, Target) {
+        deferred_goal(catalog, Some("low"), "/goal set Keep selected model")
+    }
+    fn deferred_goal(
+        catalog: bool,
+        reasoning: Option<&str>,
+        input: &str,
+    ) -> (Cagents, CardId, Target) {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let (card, target) = draft(&mut app, Provider::Codex);
         // Model/effort actions use the visible picker publication. Mount the
@@ -960,10 +1003,10 @@ mod tests {
             app.workspace.visibility(card),
             Some(VisibilityClass::Visible)
         );
-        write(&mut app, target, "/goal set Keep selected model");
+        write(&mut app, target, input);
         let snapshot = Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot);
         snapshot.selected_model = Some("chosen-model".into());
-        snapshot.reasoning = Some("low".into());
+        snapshot.reasoning = reasoning.map(str::to_owned);
         drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
         let target = ready(
             &mut app,
@@ -992,10 +1035,45 @@ mod tests {
         (app, card, target)
     }
 
+    fn model_timer_output(task: Task<Message>) -> (Target, Weak<()>) {
+        use iced::futures::StreamExt;
+
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let message = executor.block_on(async {
+            let mut stream = iced::runtime::task::into_stream(task).unwrap();
+            tokio::time::timeout(MODEL_PATIENCE + Duration::from_secs(3), async {
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                        return message;
+                    }
+                }
+                panic!("the actual model timer must produce its owning action");
+            })
+            .await
+            .unwrap()
+        });
+        let Message::ChatUi(Action::GoalModelWake(target, witness)) = message else {
+            panic!("model timer must not dispatch provider work")
+        };
+        (target, witness)
+    }
+
     #[test]
     fn explicit_model_or_effort_replacement_retires_only_an_admitted_unsent_goal() {
         for effort in [false, true] {
             let (mut app, card, target) = deferred_model_goal(true);
+            let before = {
+                let rt = runtime(&app, card);
+                (
+                    rt.composer.text(),
+                    rt.composer.cursor(),
+                    rt.attachments.clone(),
+                    rt.revision,
+                )
+            };
             let physical = runtime(&app, card).pending.as_ref().unwrap().id;
             drop(app.handle_chat_ui(Action::Model(target, "replacement-model".into())));
             assert_eq!(runtime(&app, card).pending.as_ref().unwrap().id, physical);
@@ -1051,9 +1129,15 @@ mod tests {
                     .unwrap()
                     .contains("before the goal was sent")
             );
+            let rt = runtime(&app, card);
             assert_eq!(
-                runtime(&app, card).composer.text().trim(),
-                "/goal set Keep selected model"
+                (
+                    rt.composer.text(),
+                    rt.composer.cursor(),
+                    rt.attachments.clone(),
+                    rt.revision,
+                ),
+                before
             );
             acknowledge(&mut app, card, Ok(()));
             assert!(
@@ -1065,10 +1149,17 @@ mod tests {
 
     #[test]
     fn missing_goal_model_catalog_expires_from_its_actual_timer_without_a_provider_wake() {
-        use iced::futures::StreamExt;
-
         let (mut app, card, target) = deferred_model_goal(false);
         assert!(runtime(&app, card).pending.is_none());
+        let before = {
+            let rt = runtime(&app, card);
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision,
+            )
+        };
         // ready() drops returned tasks. Re-arm this same owning wait and drive
         // its real timer output, without provider traffic or a synthetic Wake.
         app.chat_runtime_mut(target)
@@ -1078,26 +1169,7 @@ mod tests {
             .unwrap()
             .model_rechecking = false;
         let task = app.dispatch_goal(target);
-        let executor = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let message = executor.block_on(async {
-            let mut stream = iced::runtime::task::into_stream(task).unwrap();
-            tokio::time::timeout(MODEL_PATIENCE + Duration::from_secs(3), async {
-                while let Some(action) = stream.next().await {
-                    if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
-                        return message;
-                    }
-                }
-                panic!("the actual model timer must produce its owning action");
-            })
-            .await
-            .unwrap()
-        });
-        let Message::ChatUi(Action::GoalModelWake(actual, witness)) = message else {
-            panic!("model timer must not dispatch provider work")
-        };
+        let (actual, witness) = model_timer_output(task);
         assert_eq!(actual, target);
         drop(app.handle_chat_ui(Action::GoalModelWake(target, witness.clone())));
         assert!(
@@ -1110,9 +1182,15 @@ mod tests {
                 .unwrap()
                 .contains("not confirmed in time")
         );
+        let rt = runtime(&app, card);
         assert_eq!(
-            runtime(&app, card).composer.text().trim(),
-            "/goal set Keep selected model"
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision,
+            ),
+            before
         );
         // A stale timer cannot inherit a successor with the same exact input.
         let mut checking = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
@@ -1124,6 +1202,188 @@ mod tests {
         assert!(runtime(&app, card).goal_pending.is_some());
         assert!(matches!(successor.stage, Stage::Waiting));
         assert!(runtime(&app, card).pending.is_none());
+    }
+
+    #[test]
+    fn armed_model_timer_expires_waiting_work_behind_readiness_or_another_command_only() {
+        for blocked in 0..4 {
+            let (mut app, card, target) = deferred_model_goal(false);
+            // Preserve the same absolute deadline but shorten this fixture's
+            // remaining wait. The parent above drives the full real ten seconds.
+            let pending = app
+                .chat_runtime_mut(target)
+                .unwrap()
+                .goal_pending
+                .as_mut()
+                .unwrap();
+            pending.model_wait.as_mut().unwrap().0 =
+                Instant::now() - (MODEL_PATIENCE - Duration::from_millis(250));
+            pending.model_rechecking = false;
+            let timer = app.dispatch_goal(target);
+            match blocked {
+                0 => {
+                    let mut unready = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+                    unready.ready = false;
+                    publish(&mut app, card, unready);
+                }
+                1 => drop(app.handle_chat_ui(Action::Command(target, Command::ListBranches))),
+                2 => {
+                    let mut listed = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+                    listed.models = vec![chat::Model {
+                        id: "chosen-model".into(),
+                        label: "Chosen".into(),
+                        reasoning: vec!["low".into()],
+                    }];
+                    publish(&mut app, card, listed);
+                    assert!(matches!(
+                        runtime(&app, card).goal_pending.as_ref().unwrap().stage,
+                        Stage::Model(_)
+                    ));
+                    // Even changed input cannot make a stale timer release an
+                    // in-flight model request before its actual callback.
+                    write(&mut app, target, "new unsent input");
+                }
+                3 => {
+                    let replacement = Arc::new(ClientHandle::fixture(
+                        runtime(&app, card).session.clone(),
+                        (*runtime(&app, card).handle().unwrap().snapshot()).clone(),
+                    ));
+                    app.chat_runtime_mut(target).unwrap().connection =
+                        Connection::Live(replacement);
+                }
+                _ => unreachable!(),
+            }
+            assert!(runtime(&app, card).goal_pending.is_some());
+            let physical = runtime(&app, card)
+                .pending
+                .as_ref()
+                .map(|pending| pending.id);
+            assert_eq!(physical.is_some(), matches!(blocked, 1 | 2));
+            let before = {
+                let rt = runtime(&app, card);
+                (
+                    rt.composer.text(),
+                    rt.composer.cursor(),
+                    rt.attachments.clone(),
+                    rt.revision,
+                )
+            };
+            let error = runtime(&app, card).error.clone();
+            let (actual, witness) = model_timer_output(timer);
+            assert_eq!(actual, target);
+            drop(app.handle_chat_ui(Action::GoalModelWake(target, witness)));
+            let rt = runtime(&app, card);
+            assert_eq!(rt.pending.as_ref().map(|pending| pending.id), physical);
+            assert_eq!(
+                (
+                    rt.composer.text(),
+                    rt.composer.cursor(),
+                    rt.attachments.clone(),
+                    rt.revision,
+                ),
+                before
+            );
+            if blocked < 2 {
+                assert!(rt.goal_pending.is_none());
+                assert!(
+                    rt.error
+                        .as_deref()
+                        .unwrap()
+                        .contains("not confirmed in time")
+                );
+                if physical.is_some() {
+                    acknowledge(&mut app, card, Ok(()));
+                    assert!(runtime(&app, card).goal_pending.is_none());
+                }
+            } else {
+                assert!(rt.goal_pending.is_some());
+                assert_eq!(rt.error, error);
+            }
+        }
+    }
+
+    #[test]
+    fn external_selection_drift_during_probe_refuses_unsent_goal_and_preserves_input() {
+        for input in ["/goal set Keep selected model", "/goal resume"] {
+            // Different model, different explicit effort, unchanged selection,
+            // and unspecified effort with a provider-retained effort value.
+            for changed in 0..4 {
+                let reasoning = (changed != 3).then_some("low");
+                let (mut app, card, target) = deferred_goal(true, reasoning, input);
+                acknowledge(&mut app, card, Ok(()));
+                let witness = Arc::downgrade(
+                    &runtime(&app, card)
+                        .goal_pending
+                        .as_ref()
+                        .unwrap()
+                        .model_wait
+                        .as_ref()
+                        .unwrap()
+                        .1,
+                );
+                let mut selected = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+                selected.selected_model = Some("chosen-model".into());
+                selected.reasoning = reasoning.map(str::to_owned);
+                selected.goal.as_mut().unwrap().pending = true;
+                publish(&mut app, card, selected);
+                let pending = runtime(&app, card).goal_pending.as_ref().unwrap();
+                assert!(matches!(pending.stage, Stage::Waiting));
+                assert!(pending.model.is_none() && pending.model_wait.is_none());
+                assert!(witness.upgrade().is_none());
+                let before = {
+                    let rt = runtime(&app, card);
+                    (
+                        rt.composer.text(),
+                        rt.composer.cursor(),
+                        rt.attachments.clone(),
+                        rt.revision,
+                    )
+                };
+                let next_command = runtime(&app, card).next_command;
+                let mut next = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+                next.goal.as_mut().unwrap().pending = false;
+                match changed {
+                    0 => next.selected_model = Some("replacement-model".into()),
+                    1 | 3 => next.reasoning = Some("high".into()),
+                    _ => {}
+                }
+                // This is the same Actor publication an attached client's
+                // SetModel produces; no local model-choice action runs here.
+                publish(&mut app, card, next);
+                let rt = runtime(&app, card);
+                assert_eq!(
+                    (
+                        rt.composer.text(),
+                        rt.composer.cursor(),
+                        rt.attachments.clone(),
+                        rt.revision,
+                    ),
+                    before
+                );
+                if changed < 2 {
+                    assert!(rt.goal_pending.is_none() && rt.pending.is_none());
+                    assert_eq!(rt.next_command, next_command);
+                    assert!(
+                        rt.error
+                            .as_deref()
+                            .unwrap()
+                            .contains("before the goal was sent")
+                    );
+                } else {
+                    assert_eq!(rt.next_command, next_command + 1);
+                    assert!(matches!(
+                        rt.goal_pending.as_ref().unwrap().stage,
+                        Stage::Native { .. }
+                    ));
+                }
+                // The retired model wait cannot mutate either disposition.
+                let physical = rt.pending.as_ref().map(|pending| pending.id);
+                let error = rt.error.clone();
+                drop(app.handle_chat_ui(Action::GoalModelWake(target, witness)));
+                assert_eq!(runtime(&app, card).pending.as_ref().map(|p| p.id), physical);
+                assert_eq!(runtime(&app, card).error, error);
+            }
+        }
     }
 
     #[test]
@@ -1150,15 +1410,15 @@ mod tests {
             Stage::Native { .. }
         ));
         assert!(!runtime(&app, card).goal_presentation().preparing);
-        app.chat_runtime_mut(target)
-            .unwrap()
-            .goal_pending
-            .as_mut()
-            .unwrap()
-            .model_wait
-            .as_mut()
-            .unwrap()
-            .0 = Instant::now() - MODEL_PATIENCE;
+        assert!(
+            runtime(&app, card)
+                .goal_pending
+                .as_ref()
+                .unwrap()
+                .model_wait
+                .is_none()
+        );
+        assert!(witness.upgrade().is_none());
         drop(app.handle_chat_ui(Action::GoalModelWake(target, witness.clone())));
         assert_eq!(runtime(&app, card).pending.as_ref().unwrap().id, native);
         acknowledge(&mut app, card, Ok(()));
