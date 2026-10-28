@@ -121,8 +121,13 @@ while IFS= read -r frame; do
                 jq -cn --arg session "$session" --arg model "$model" \
                     '{type:"system",subtype:"init",session_id:$session,claude_code_version:"2.1.286",model:$model}'
                 if [ "${CAGENTS_FIXTURE_VERBOSITY:-0}" = 1 ]; then verbosity_turn; fi
-                assistant=$(jq -cn --arg turn "$turn" \
-                    '{type:"assistant",uuid:("fixture-message-"+$turn),message:{id:("fixture-message-"+$turn),role:"assistant",content:[{type:"text",text:"I’m checking the submission logs and comparing the failed run with the last successful version."}],usage:{input_tokens:4200,output_tokens:180}}}')
+                # A Markdown file in the provider home can stand in for the
+                # answer, so rendering and long-transcript checks need no live
+                # provider. The daemon does not pass CAGENTS_* variables on.
+                reply="I’m checking the submission logs and comparing the failed run with the last successful version."
+                if [ -f "$config/fixture-reply.md" ]; then reply=$(cat "$config/fixture-reply.md"); fi
+                assistant=$(jq -cn --arg turn "$turn" --arg text "$reply" \
+                    '{type:"assistant",uuid:("fixture-message-"+$turn),message:{id:("fixture-message-"+$turn),role:"assistant",content:[{type:"text",text:$text}],usage:{input_tokens:4200,output_tokens:180}}}')
                 persist_record "$assistant"
                 printf '%s\n' "$assistant"
                 if [ "$turn" -eq 1 ]; then
