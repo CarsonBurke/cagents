@@ -16186,6 +16186,173 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn upward_reveal_keeps_the_channel_below_its_own_sticky_header_and_preserves_focus() {
+        use cosmic::iced::runtime::{Action, UserInterface, user_interface::Cache};
+        use cosmic::iced::{
+            Rectangle, Vector,
+            advanced::widget::{Operation, operation},
+            futures::StreamExt,
+        };
+        #[derive(Default)]
+        struct Probe {
+            offset: f32,
+            viewport: Rectangle,
+            focused: Option<Id>,
+        }
+        impl Operation for Probe {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&Id>,
+                _: Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if state.is_focused() {
+                    self.focused = id.cloned();
+                }
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&Id>,
+                bounds: Rectangle,
+                _: Rectangle,
+                translation: Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                if id == Some(&stable_id("projects.scroll")) {
+                    self.offset = translation.y;
+                    self.viewport = bounds;
+                }
+            }
+        }
+        let mut project = project();
+        let owner = project.id;
+        let header_label = project.chrome.open_name.clone();
+        project.worktrees = (20..60)
+            .map(|id| worktree(id, &format!("branch-{id}"), false))
+            .collect();
+        project.pull_requests.clear();
+        let channel = ChannelId::new();
+        project.channels.push(SidebarChannel::new(
+            channel,
+            "Newest conversation".into(),
+            true,
+            None,
+            false,
+            0,
+            true,
+            1,
+        ));
+        let label = project.channels[0].accessible_name.clone();
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![project]);
+        let state = SidebarState::default();
+        let composer = Id::new("upward-reveal-composer");
+        let content = widget::column::with_children(vec![
+            widget::container(project_list(&model, &state, false, false))
+                .height(180)
+                .into(),
+            widget::text_input("Draft", "Keep editing here")
+                .id(composer.clone())
+                .on_input(SidebarAction::SearchChanged)
+                .into(),
+        ]);
+        let mut renderer = headless_renderer();
+        let mut ui = UserInterface::build(
+            content,
+            Size::new(280.0, 240.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        let target = selection_row_focus_id(SelectionRow::Channel(channel));
+        for focus in [false, true] {
+            ui.operate(
+                &renderer,
+                &mut operation::scrollable::scroll_to::<()>(
+                    stable_id("projects.scroll"),
+                    operation::scrollable::AbsoluteOffset {
+                        x: None,
+                        y: Some(640.0),
+                    },
+                ),
+            );
+            ui.operate(
+                &renderer,
+                &mut operation::focusable::focus::<()>(composer.clone()),
+            );
+            let mut before = Probe::default();
+            ui.operate(&renderer, &mut before);
+            assert!(before.offset > 0.0);
+            let task = if focus {
+                focus_and_reveal::<()>(target.clone())
+            } else {
+                reveal::<()>(target.clone())
+            };
+            let mut stream = cosmic::iced::runtime::task::into_stream(task).unwrap();
+            cosmic::iced::futures::executor::block_on(async {
+                while let Some(action) = stream.next().await {
+                    let Action::Widget(mut operation) = action else {
+                        panic!("widget operation only")
+                    };
+                    loop {
+                        ui.operate(&renderer, operation.as_mut());
+                        match operation.finish() {
+                            operation::Outcome::Chain(next) => operation = next,
+                            operation::Outcome::None => break,
+                            _ => panic!("no app or provider effect"),
+                        }
+                    }
+                }
+            });
+            let mut after = Probe::default();
+            ui.operate(&renderer, &mut after);
+            assert!(after.offset < before.offset);
+            assert_eq!(
+                after.focused,
+                Some(if focus {
+                    target.clone()
+                } else {
+                    composer.clone()
+                })
+            );
+            let nodes = ui.a11y_nodes(cosmic::iced::mouse::Cursor::Unavailable);
+            let bounds = |label: &str| {
+                nodes
+                    .root()
+                    .iter()
+                    .chain(nodes.children())
+                    .find(|node| {
+                        node.node().role() == iced_accessibility::accesskit::Role::Button
+                            && node.node().label() == Some(label)
+                    })
+                    .unwrap()
+                    .node()
+                    .bounds()
+                    .unwrap()
+            };
+            let header = bounds(header_label.as_ref());
+            let row = bounds(label.as_ref());
+            assert!(header.y1 > header.y0);
+            assert!(
+                row.y0 >= header.y1 - 0.01,
+                "the sticky header must not cover the revealed channel: {header:?} {row:?}"
+            );
+            assert!(row.y1 <= f64::from(after.viewport.y + after.viewport.height) + 0.01);
+        }
+        // Project headers themselves need no member inset and keep their
+        // displayed sticky position when explicitly focused.
+        let header_target = selection_row_focus_id(SelectionRow::Project(owner));
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(header_target.clone()),
+        );
+        let mut focused = Probe::default();
+        ui.operate(&renderer, &mut focused);
+        assert_eq!(focused.focused, Some(header_target));
+    }
+
+    #[test]
     fn manual_navigation_interleaves_channels_and_worktrees_for_keyboard_navigation() {
         use crate::workspace_model::NavigationItem;
         let mut entry = project();
