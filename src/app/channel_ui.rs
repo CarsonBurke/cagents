@@ -1237,6 +1237,8 @@ fn default_channel_title(project: Option<&SidebarProject>) -> Cow<'static, str> 
 
 #[cfg(test)]
 mod tests {
+    mod retained_claude_close;
+
     use super::*;
     use crate::sidebar::RowDeletion;
 
