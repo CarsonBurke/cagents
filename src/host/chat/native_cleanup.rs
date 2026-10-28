@@ -11,6 +11,10 @@ pub(in crate::host) struct NativeClose {
 }
 
 impl NativeClose {
+    pub(super) fn source(&self) -> &Session {
+        &self.source
+    }
+
     pub(in crate::host) fn working_directory(&self) -> &std::path::Path {
         &self.source.launch.recipe.working_directory
     }

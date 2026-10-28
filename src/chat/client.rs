@@ -2940,13 +2940,18 @@ mod tests {
             );
             return;
         }
-        for case in [
+        // The saved-recovery control and live picker share framing, but must
+        // retain distinct admission intents. Neither retries an uncertain ACK.
+        for (case, idle_generation, explicit) in [
             "busy",
             "unavailable",
             "wrong-request",
             "wrong-proof",
             "wrong-version",
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|case| [(case, Some(41), true), (case, None, false)])
+        {
             let proof = host_proof("account-switch-framing");
             let mut source = omp_card(
                 Some("12345678-1234-4234-8234-123456789abc"),
@@ -2997,8 +3002,9 @@ mod tests {
                 assert_eq!(asked.version, PROTOCOL_VERSION);
                 assert_eq!(asked.proof, Some(proof.clone()));
                 assert!(matches!(asked.request, ClientRequest::ChatRecoverAccount {
-                    source, replacement, idle_generation: Some(41), explicit: true, ..
-                } if source == expected_source && replacement == expected_replacement));
+                    source, replacement, idle_generation: actual_generation, explicit: actual_explicit, ..
+                } if source == expected_source && replacement == expected_replacement
+                    && actual_generation == idle_generation && actual_explicit == explicit));
                 let code = if case == "unavailable" {
                     ipc::ProtocolErrorCode::AccountSwitchUnavailable
                 } else {
@@ -3039,7 +3045,7 @@ mod tests {
                 None,
                 false,
                 None,
-                Some((source, Some(41), true)),
+                Some((source, idle_generation, explicit)),
                 None,
                 |_| {},
             )

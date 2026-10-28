@@ -216,6 +216,27 @@ impl Registry {
             .collect()
     }
 
+    /// Read the exact predecessor family before an explicit stopped recovery.
+    /// Unlike `succeed`, this grants no fork when another member still runs.
+    pub(in crate::host) fn recovery_lineage_members(
+        &self,
+        predecessor: TerminalId,
+        root: Option<TerminalId>,
+    ) -> Result<Vec<TerminalId>, String> {
+        let lineage = match (self.session_lineage(predecessor)?, root) {
+            (Some(lineage), _) => lineage,
+            (None, Some(root)) => self.session_lineage(root)?.unwrap_or(Lineage(root)),
+            (None, None) => Lineage(predecessor),
+        };
+        let mut members = self.lineage_members(lineage)?;
+        for id in [predecessor, lineage.0] {
+            if !members.contains(&id) {
+                members.push(id);
+            }
+        }
+        Ok(members)
+    }
+
     /// Records `successor` in `predecessor`'s lineage before it starts, unless
     /// `live` reports that a member of that lineage still runs: ownership
     /// passes only to a session that replaces every other. A successor that

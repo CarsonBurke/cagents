@@ -493,6 +493,61 @@ pub(crate) fn observed(kind: Kind) -> io::Result<Vec<Record>> {
     Ok(records)
 }
 
+/// Strict, read-only ownership census. Unlike recovery intake, an unreadable,
+/// unsupported or unproved current-boot row cannot disappear from the answer.
+/// Callers still authenticate each returned holder before using its source.
+pub(crate) fn recovery_census(
+    directory: &Path,
+    boot: &BootId,
+    kind: Kind,
+) -> Result<Vec<Record>, String> {
+    crate::secure_file::reject_symlink_components(directory).map_err(|error| error.to_string())?;
+    let metadata = match fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if !metadata.is_dir()
+        || metadata.uid() != crate::daemon::current_uid()
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err("Unsafe holder census directory".into());
+    }
+    let mut records = Vec::new();
+    for (index, entry) in fs::read_dir(directory)
+        .map_err(|error| error.to_string())?
+        .enumerate()
+    {
+        if index >= 8192 {
+            return Err("Holder census exceeds its directory bound".into());
+        }
+        let path = entry.map_err(|error| error.to_string())?.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let record = read(&path)
+            .map_err(|error| format!("Holder census has unreadable ownership: {error}"))?;
+        if &record.boot != boot {
+            // Authenticated private records from a prior kernel boot cannot
+            // own a current process; their durable source provenance is separate.
+            continue;
+        }
+        if !record.supported_version()
+            || record.kind != kind
+            || (record.application != crate::instance::APPLICATION_ID
+                && !recovery_role(&record.application))
+            || record.path(directory) != path
+        {
+            return Err("Holder census has unsupported or inconsistent ownership".into());
+        }
+        records.push(record);
+        if records.len() > 4096 {
+            return Err("Holder census exceeds its session bound".into());
+        }
+    }
+    Ok(records)
+}
+
 pub(crate) fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Vec<Record>, String> {
     discover_inner(directory, boot, kind, false)
 }
@@ -561,6 +616,39 @@ fn discover_inner(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn strict_recovery_census_preserves_dead_and_malformed_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let boot = crate::daemon::read_boot_id().unwrap();
+        let mut dead = Process::read(std::process::id() as i32).unwrap();
+        dead.start += 1;
+        let record = Record {
+            version: 4,
+            build: None,
+            kind: Kind::Native,
+            application: crate::instance::APPLICATION_ID.into(),
+            boot: boot.clone(),
+            terminal: TerminalId::new(),
+            holder: dead.clone(),
+            root: dead,
+        };
+        let path = record.path(directory.path());
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            recovery_census(directory.path(), &boot, Kind::Native).unwrap(),
+            vec![record]
+        );
+        assert!(
+            path.exists(),
+            "census never consumes dead discovery evidence"
+        );
+        fs::write(&path, b"malformed ownership").unwrap();
+        assert!(recovery_census(directory.path(), &boot, Kind::Native).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"malformed ownership");
+    }
 
     #[test]
     fn retained_claude_family_visibility_keeps_original_record_and_codex_isolation() {

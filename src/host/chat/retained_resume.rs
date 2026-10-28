@@ -35,6 +35,21 @@ fn validate_evidence(
     retirement: &NativeActorRetirement,
     evidence: &Evidence<'_>,
 ) -> Result<(), String> {
+    validate_stopped_evidence(source, ownership, retirement, evidence)?;
+    if evidence.confirmed != source.launch.session_id.as_deref() || evidence.confirmed.is_none() {
+        return Err("The retired original did not confirm the saved conversation".into());
+    }
+    Ok(())
+}
+
+// A failed candidate can be positively stopped without ever confirming the
+// requested thread. That proves cleanup, but never original resume authority.
+fn validate_stopped_evidence(
+    source: &Session,
+    ownership: &NativeActorOwnership,
+    retirement: &NativeActorRetirement,
+    evidence: &Evidence<'_>,
+) -> Result<(), String> {
     if ownership.is_pending() || retirement.is_pending() {
         return Err("Pending cleanup intent never grants disk resume authority".into());
     }
@@ -49,8 +64,6 @@ fn validate_evidence(
         || !owns_alias(ownership.source())
         || !owns_alias(retirement.source())
         || retirement.confirmed_session() != evidence.confirmed
-        || evidence.confirmed != source.launch.session_id.as_deref()
-        || evidence.confirmed.is_none()
         || evidence.owner.root.is_current()
     {
         return Err(
@@ -167,6 +180,127 @@ pub(super) fn inspect_resume_retirement(
             }
         }
     }
+}
+
+/// A saved account recovery changes the selected home, not the old actor's
+/// retirement evidence. Check the whole relevant durable roster without
+/// reopening the original home, which may have been explicitly removed.
+/// Returned IDs have positive stopped-owner evidence; discovery alone never
+/// supplies it. Previous-boot proof is accepted only from this durable roster.
+pub(super) fn account_recovery_census(
+    host: &SharedHost,
+    source: &Session,
+    members: &[crate::model::TerminalId],
+) -> Result<std::collections::BTreeMap<crate::model::TerminalId, Record>, String> {
+    let proof = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .clone();
+    let registry = super::super::agent_execution::registry(host)?;
+    let mut stopped = std::collections::BTreeMap::new();
+    let mut matched_source = false;
+    let mut after = None;
+    loop {
+        let page = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .native_actor_ownerships(after, 128)?;
+        if page.is_empty() {
+            break;
+        }
+        for ownership in page {
+            after = Some(ownership.actor());
+            let issued = ownership.source();
+            if !members.contains(&issued.id)
+                && !super::same_conversation(&issued.launch, &source.launch)
+            {
+                continue;
+            }
+            if ownership.is_pending() {
+                return Err("A relevant native actor still has pending startup or cleanup".into());
+            }
+            if ownership.owner().boot != proof.boot_id {
+                // The stored issued source binds the caller's boot claim. An
+                // invented BootId plus an empty inventory cannot enter here.
+                if issued
+                    .proof
+                    .as_ref()
+                    .is_none_or(|old| !old.is_complete() || old.boot_id != ownership.owner().boot)
+                {
+                    return Err("Previous-boot ownership has no exact issued proof".into());
+                }
+                if issued.id == source.id && issued != source {
+                    return Err("The saved source differs from its previous-boot owner".into());
+                }
+            } else {
+                let retirement = registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .native_actor_retirement(ownership.actor())?
+                    .ok_or("A relevant native actor has no committed retirement")?;
+                if retirement.is_pending() {
+                    return Err("A relevant native actor retirement remains pending".into());
+                }
+                let verified = match Handle::inspect_retained_retirement(ownership.owner(), &proof)?
+                {
+                    crate::chat::runtime::RetirementInspection::Verified(receipt) => receipt,
+                    _ => {
+                        return Err(
+                            "A relevant native actor is live or its retirement is unproved".into(),
+                        );
+                    }
+                };
+                let receipt = verified.receipt();
+                let evidence = Evidence {
+                    actor: receipt.identity.instance,
+                    owner: &receipt.identity.record,
+                    proof: &receipt.proof,
+                    source: &receipt.source,
+                    aliases: &receipt.previous_sources,
+                    scope: receipt
+                        .launch_account_scope
+                        .as_ref()
+                        .map_err(String::as_str),
+                    confirmed: receipt.confirmed_session.as_deref(),
+                    paired_holder: receipt.paired_holder.as_ref(),
+                };
+                if issued.id == source.id {
+                    validate_evidence(source, &ownership, &retirement, &evidence)?;
+                } else {
+                    validate_stopped_evidence(issued, &ownership, &retirement, &evidence)?;
+                }
+                match (&evidence.source.terminal, evidence.paired_holder) {
+                    (None, None) => {}
+                    (Some(terminal), Some(pair))
+                        if terminal.id == pair.terminal && pair.terminal == issued.id =>
+                    {
+                        let role = OriginalRole::authenticated(pair, evidence.proof, &proof)?;
+                        if !crate::terminal::holder::cleanup::confirmed_owner_with_role(
+                            pair,
+                            &proof,
+                            role.as_ref(),
+                        )? {
+                            return Err(
+                                "A relevant retired actor has an unconfirmed paired terminal"
+                                    .into(),
+                            );
+                        }
+                    }
+                    _ => {
+                        return Err(
+                            "A relevant retired actor lost its paired-terminal evidence".into()
+                        );
+                    }
+                }
+            }
+            if issued.id == source.id && std::mem::replace(&mut matched_source, true) {
+                return Err("The saved source has ambiguous retired native actors".into());
+            }
+            stopped.insert(issued.id, ownership.owner().clone());
+        }
+    }
+    Ok(stopped)
 }
 
 /// Called only for explicit resume, before the separate Codex close reader.

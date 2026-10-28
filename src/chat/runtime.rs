@@ -60,7 +60,7 @@ pub(crate) struct AccountSwitchOptions {
     pub permissions: Option<super::PermissionSettings>,
 }
 impl AccountSwitchOptions {
-    fn capture(state: &Snapshot) -> Self {
+    pub(crate) fn capture(state: &Snapshot) -> Self {
         Self {
             model: state.selected_model.clone(),
             reasoning: state.reasoning.clone(),

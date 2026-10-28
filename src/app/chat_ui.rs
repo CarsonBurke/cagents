@@ -516,6 +516,13 @@ impl Action {
     }
 }
 
+#[derive(Clone, Copy)]
+enum AccountChange {
+    SavedRecovery,
+    ExplicitSwitch(Option<u64>),
+    AutomaticSwitch(u64),
+}
+
 struct AccountRecovery {
     source: chat::Session,
     committed: bool,
@@ -5572,7 +5579,12 @@ impl Cagents {
             let generation = (!runtime.snapshot.exited).then_some(runtime.snapshot.generation);
             // Local busy/idle is only a hint. Only the actor's typed pre-effect Busy
             // answer below may create a queued intent.
-            return self.change_chat_account(target.card, id, generation, None, true);
+            return self.change_chat_account(
+                target.card,
+                id,
+                None,
+                AccountChange::ExplicitSwitch(generation),
+            );
         }
         if !runtime.choosing() {
             return Task::none();
@@ -5610,7 +5622,7 @@ impl Cagents {
     }
 
     fn recover_chat_account(&mut self, card: CardId, id: AccountId) -> Task<Message> {
-        self.change_chat_account(card, id, None, None, true)
+        self.change_chat_account(card, id, None, AccountChange::SavedRecovery)
     }
 
     fn automatic_chat_account(
@@ -5670,11 +5682,11 @@ impl Cagents {
         &mut self,
         card: CardId,
         id: AccountId,
-        generation: Option<u64>,
         submit: Option<(u64, PromptMode)>,
-        explicit: bool,
+        change: AccountChange,
     ) -> Task<Message> {
-        if (!explicit && generation.is_none() && !self.chat_ui.removed_accounts.contains(&card))
+        if (matches!(change, AccountChange::SavedRecovery)
+            && !self.chat_ui.removed_accounts.contains(&card))
             || self.chat_ui.phases.contains_key(&card)
         {
             return Task::none();
@@ -5743,7 +5755,7 @@ impl Cagents {
                 .environment
                 .insert(variable.into(), home.into());
         }
-        if explicit {
+        if !matches!(change, AccountChange::AutomaticSwitch(_)) {
             replacement
                 .launch
                 .recipe
@@ -5777,22 +5789,20 @@ impl Cagents {
                         let wake = move |wake| {
                             let _ = sender.try_send((target, wake));
                         };
-                        if explicit {
-                            ClientHandle::switch_account_explicit(
-                                source,
-                                replacement,
-                                generation,
-                                wake,
-                            )
-                        } else {
-                            match generation {
-                                Some(generation) => ClientHandle::switch_account(
+                        match change {
+                            AccountChange::ExplicitSwitch(generation) => {
+                                ClientHandle::switch_account_explicit(
                                     source,
                                     replacement,
                                     generation,
                                     wake,
-                                ),
-                                None => ClientHandle::recover_account(source, replacement, wake),
+                                )
+                            }
+                            AccountChange::AutomaticSwitch(generation) => {
+                                ClientHandle::switch_account(source, replacement, generation, wake)
+                            }
+                            AccountChange::SavedRecovery => {
+                                ClientHandle::recover_account(source, replacement, wake)
                             }
                         }
                         .map(Arc::new)
@@ -8448,7 +8458,12 @@ impl Cagents {
                 if let Some(runtime) = self.chat_ui.parked.remove(&target.card) {
                     self.cards.insert(target.card, CardRuntime::Chat(runtime));
                 }
-                return self.change_chat_account(target.card, id, Some(generation), None, true);
+                return self.change_chat_account(
+                    target.card,
+                    id,
+                    None,
+                    AccountChange::ExplicitSwitch(Some(generation)),
+                );
             }
             Action::ContinueOnAccount(target, id, choice) => {
                 if self
@@ -9875,7 +9890,7 @@ impl Cagents {
                 if let Some((account, generation, revision)) =
                     self.automatic_chat_account(target, mode)
                 {
-                    if generation.is_none() {
+                    let Some(generation) = generation else {
                         let task = self.choose_chat_account(target, account.id());
                         if let Some(runtime) = self.chat_runtime_mut(target) {
                             runtime
@@ -9891,13 +9906,12 @@ impl Cagents {
                             task,
                             self.handle_chat_ui(Action::Submit(target, mode)),
                         ]);
-                    }
+                    };
                     return self.change_chat_account(
                         target.card,
                         account.id(),
-                        generation,
                         Some((revision, mode)),
-                        false,
+                        AccountChange::AutomaticSwitch(generation),
                     );
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -22437,6 +22451,11 @@ mod tests {
                 .recipe
                 .environment
                 .insert("CODEX_HOME".into(), "/removed-account".into());
+            source
+                .launch
+                .recipe
+                .environment
+                .insert(account::routing::AUTOMATIC_MARKER.into(), "1".into());
             app.install_chat_session(card, source.clone());
             let directory = tempfile::tempdir().unwrap();
             let (writer, _) = crate::session::SessionRuntime::open(
@@ -22476,12 +22495,36 @@ mod tests {
                 CardKind::Chat(source.clone())
             );
             let system = Account::system(Provider::Codex).id();
+            // A stale recovery control cannot reinterpret an ordinary picker
+            // action as authority to reopen a saved conversation.
+            app.chat_ui.removed_accounts.remove(&card);
+            let _ = app.update(Message::ChatUi(Action::RecoverAccount(
+                card,
+                system.clone(),
+            )));
+            assert!(!app.chat_start_pending(card));
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(source.clone())
+            );
+            app.chat_ui.removed_accounts.insert(card);
             let _ = app.update(Message::ChatUi(Action::RecoverAccount(
                 card,
                 system.clone(),
             )));
             let target = chat_runtime_attempt(&app, card);
             assert_ne!(app.chat_ui.attempt(card).unwrap().session.id, source.id);
+            assert!(
+                !app.chat_ui
+                    .attempt(card)
+                    .unwrap()
+                    .session
+                    .launch
+                    .recipe
+                    .environment
+                    .contains_key(account::routing::AUTOMATIC_MARKER),
+                "a chosen recovery account stays pinned even for an automatic source"
+            );
             assert_eq!(
                 app.card_state(card).unwrap().kind,
                 CardKind::Chat(source.clone())
