@@ -6823,6 +6823,17 @@ for line in sys.stdin:
         )
         .unwrap();
         let restored = host.lock().unwrap().terminals[&source.id].handle.clone();
+        // Restored lineage is detached, so hidden workers do not publish grids.
+        // Use a real HOST observer while reading the marker, then detach it
+        // again before testing the next upgrade of this detached source.
+        {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(!state.subscriptions.attached(0, source.id));
+            state.attach(0, source.id).unwrap();
+            state
+                .set_visibility(0, source.id, TerminalVisibility::Visible)
+                .unwrap();
+        }
         // Read real parsed PTY output after the shell has consumed startup and
         // this input. Split arguments keep the marker out of the echoed command.
         let idle_deadline = Instant::now() + Duration::from_secs(10);
@@ -6851,6 +6862,15 @@ for line in sys.stdin:
                 "restored shell did not produce its parsed ready marker: {text}"
             );
             thread::sleep(Duration::from_millis(5));
+        }
+        {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            state.detach(0, source.id).unwrap();
+            assert!(!state.subscriptions.attached(0, source.id));
+            assert_eq!(
+                state.subscriptions.visibility(source.id),
+                TerminalVisibility::Hidden
+            );
         }
         // Dropping an idle probe thaws the shell, so it cannot authorize a
         // later census. Retry the actual reversible transaction only for this
