@@ -348,6 +348,19 @@ struct Fixture {
 
 impl Fixture {
     fn new(root: std::path::PathBuf) -> Self {
+        Self::with_account_and_result(
+            root,
+            &crate::account::Account::system(Provider::Claude),
+            State::Succeeded,
+        )
+    }
+
+    fn with_account_and_result(
+        root: std::path::PathBuf,
+        account: &crate::account::Account,
+        result: State,
+    ) -> Self {
+        assert!(matches!(result, State::Succeeded | State::Failed));
         install_provider(&root.join("bin/claude"));
         let proof = HostSessionProof {
             host_session_id: "archived-history-runtime".into(),
@@ -358,13 +371,18 @@ impl Fixture {
         let lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
         let mut state = HostState::new(proof.clone());
         state.register_client(17);
-        state.install_model(Registry::at(&root.join("registry.sqlite3")).unwrap());
+        let database = if result == State::Failed {
+            "failed-registry.sqlite3"
+        } else {
+            "registry.sqlite3"
+        };
+        state.install_model(Registry::at(&root.join(database)).unwrap());
         let host = Arc::new(HostLock::new(state));
         let mut source = chat::fresh_session(
             Provider::Claude,
             TerminalId::new(),
             root.join("project"),
-            &crate::account::Account::system(Provider::Claude),
+            account,
         )
         .unwrap();
         source.proof = Some(proof.clone());
@@ -391,7 +409,7 @@ impl Fixture {
                         name: None,
                         destination: Destination::New(Spec {
                             provider: Provider::Claude,
-                            account: None,
+                            account: account.registry_key().map(|_| account.id()),
                             target: Target {
                                 repository: root.join("project"),
                                 directory: root.join("project"),
@@ -433,7 +451,7 @@ impl Fixture {
                     started.id,
                     started.revision,
                     crate::agent_execution::Update::Finished {
-                        state: State::Succeeded,
+                        state: result,
                         result: crate::agent_execution::ResultSummary {
                             text: "Preserve historical result".into(),
                             ..Default::default()
@@ -927,6 +945,214 @@ fn authenticated_retirement_reconciliation_preserves_a_newer_authority() {
 }
 
 #[test]
+fn original_old_boot_visual_restores_named_account_history_then_starts_twice_over_real_wire() {
+    let Some(root) = isolated() else { return };
+    install_provider(&root.join("bin/claude"));
+    let home = root.join("named-account");
+    fs::create_dir(&home).unwrap();
+    let key = uuid::Uuid::new_v4();
+    let account =
+        crate::account::Account::linked(Provider::Claude, key, home.canonicalize().unwrap());
+    let accounts = crate::account::registry::Store::installation().unwrap();
+    accounts
+        .update(|registry| {
+            registry.register(
+                crate::account::registry::Registered {
+                    key,
+                    provider: Provider::Claude,
+                    linked_home: Some(home.clone()),
+                    label: Some("Named archived fixture".into()),
+                    email: Some("archived-fixture@example.invalid".into()),
+                    organization: None,
+                    added_at: 1,
+                },
+                &[],
+            )
+        })
+        .unwrap()
+        .1
+        .unwrap();
+    assert_eq!(
+        accounts.load().unwrap().find(key).unwrap().label.as_deref(),
+        Some("Named archived fixture")
+    );
+    // Exercise the ordinary account probe against an offline CLI, rather than
+    // assigning a fabricated Ok status or changing inherited delegation.
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let probed = runtime.block_on(crate::account::probe::run(account.clone(), None, true));
+    let crate::account::probe::Outcome::Answered {
+        identity, snapshot, ..
+    } = probed
+    else {
+        panic!("named account fixture did not answer its ordinary probe: {probed:?}")
+    };
+    assert_eq!(snapshot.status, crate::account::UsageStatus::Ok);
+    assert_eq!(
+        identity.unwrap().email.as_deref(),
+        Some("archived-fixture@example.invalid")
+    );
+    drop(runtime);
+    let launches = || {
+        fs::read_to_string(root.join("launches"))
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    };
+    for outcome in [State::Succeeded, State::Failed] {
+        let before = launches();
+        let fixture = Fixture::with_account_and_result(root.clone(), &account, outcome);
+        assert_eq!(fixture.run.state, outcome);
+        let inspection = inspect!(fixture);
+        let scope = inspection.launch_account_scope.unwrap();
+        assert_eq!(scope.registered_id, Some(account.id()));
+        assert_eq!(scope.canonical_home, home);
+        let Some(HostedSession::Chat(mut visual)) = fixture.historical.session.clone() else {
+            panic!("canonical old-boot Claude source required")
+        };
+        // The original visual is named but still old-boot ReconnectOnly. It
+        // was never helper-issued; canonical remains unnamed and unchanged.
+        assert!(visual.launch.session_id.is_none());
+        visual.launch.session_id = fixture.source.launch.session_id.clone();
+        assert!(visual.is_saved_claude_history());
+        assert_ne!(visual.proof, fixture.source.proof);
+        assert_eq!(
+            visual.native_continuity,
+            chat::NativeContinuity::ReconnectOnly
+        );
+        assert_ne!(visual, inspection.source);
+        assert!(!inspection.previous_sources.contains(&visual));
+        fixture.handle.close().unwrap();
+        reconcile_previous_boot_history(&fixture.host).unwrap();
+        let registry = fixture.registry();
+        {
+            let registry = registry.lock().unwrap();
+            let mut archived = fixture.historical.clone();
+            archived.closed = true;
+            assert_eq!(registry.agent(archived.id).unwrap(), archived);
+            assert_eq!(registry.agent_run(fixture.run.id).unwrap(), fixture.run);
+            assert!(
+                registry
+                    .retained_agent_sources(visual.id)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let host = fixture.host.clone();
+        let server = thread::spawn(move || crate::host::client::serve(server, 61, host));
+        let reader = chat::client::ClientHandle::fixture_restore(client, visual.clone()).unwrap();
+        wait(
+            || {
+                let snapshot = reader.snapshot();
+                !snapshot.history_loading && !snapshot.items.is_empty()
+            },
+            "original old-boot visual did not load real read-only history",
+        );
+        let restored = reader.session();
+        let mut expected = visual.clone();
+        expected.proof = Some(fixture.host.lock().unwrap().proof().clone());
+        assert_eq!(restored, expected);
+        let witness = reader
+            .authenticated_upgrade_recovery()
+            .expect("actual client Resolve/Attach witness");
+        assert!(witness.validate());
+        assert_eq!(witness.source(), &visual);
+        assert_eq!(witness.replacement(), &expected);
+        let snapshot = reader.snapshot();
+        assert!(snapshot.exited && snapshot.read_only_reason.is_some() && snapshot.error.is_none());
+        assert_eq!(
+            snapshot.native_continuity,
+            chat::NativeContinuity::ReconnectOnly
+        );
+        assert!(snapshot.items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text.contains("Saved fixture answer"))));
+        assert!(
+            fixture.host.lock().unwrap().chats[&visual.id]
+                .handle
+                .is_read_only_history()
+        );
+        assert_eq!(
+            launches(),
+            before + 1,
+            "restoring an original visual started a provider"
+        );
+        assert!(!root.join("prompts").exists());
+        drop(reader);
+        server.join().unwrap();
+
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let host = fixture.host.clone();
+        let server = thread::spawn(move || crate::host::client::serve(server, 62, host));
+        let mut client = crate::control::ControlClient::from_stream(client).unwrap();
+        client.authenticate(Default::default()).unwrap(); // Synthetic fixture User, never production authority.
+        let mut requested = restored;
+        for start_number in 1..=2 {
+            let ServerResponse::ChatResumePrepared { session: prepared } = client
+                .fixture_request(ClientRequest::ChatPrepareResume {
+                    source: requested.clone(),
+                })
+                .unwrap()
+            else {
+                panic!("explicit resume preparation returned no exact source")
+            };
+            assert_eq!(prepared.launch, visual.launch);
+            assert_eq!(
+                launches(),
+                before + start_number,
+                "Prepare started a provider"
+            );
+            let id = prepared.id;
+            let started = client
+                .fixture_request(ClientRequest::ChatStart {
+                    session: prepared,
+                    source: None,
+                    terminate_source: false,
+                    execution_environment: Default::default(),
+                })
+                .unwrap();
+            let writer = fixture.host.lock().unwrap().chats[&id].handle.clone();
+            let _cleanup = OwnedHelperGuard::capture(&root, &writer);
+            let identity = writer.actor_identity().unwrap();
+            assert!(matches!(started, ServerResponse::ChatAttached { .. }));
+            wait(
+                || {
+                    writer.attachment_snapshot().ready
+                        && writer.confirmed_session_id() == visual.launch.session_id
+                },
+                "explicit writer did not become ready on the original visual conversation",
+            );
+            assert_eq!(writer.launch_account_scope(), Ok(&scope));
+            assert_eq!(launches(), before + start_number + 1);
+            assert!(
+                !root.join("prompts").exists(),
+                "explicit resume submitted or replayed a prompt"
+            );
+            client
+                .fixture_request(ClientRequest::ChatClose { chat_id: id })
+                .unwrap();
+            requested = registry
+                .lock()
+                .unwrap()
+                .native_actor_retirement(identity.instance)
+                .unwrap()
+                .unwrap()
+                .source()
+                .clone();
+            let proof = fixture.host.lock().unwrap().proof().clone();
+            assert!(matches!(
+                Handle::inspect_retained_retirement(&identity.record, &proof).unwrap(),
+                RetirementInspection::Verified(_)
+            ));
+        }
+        drop(client);
+        server.join().unwrap();
+        assert_eq!(
+            registry.lock().unwrap().agent_run(fixture.run.id).unwrap(),
+            fixture.run
+        );
+        assert!(fixture.host.lock().unwrap().chats.is_empty());
+    }
+}
+
+#[test]
 fn authenticated_legacy_archive_preserves_active_and_unacknowledged_helpers() {
     let Some(root) = isolated() else { return };
     let fixture = Fixture::new(root);
@@ -1003,8 +1229,18 @@ fn install_provider(path: &Path) {
     fs::write(path, r#"#!/usr/bin/python3
 import json, os, pathlib, select, sys
 root=pathlib.Path(os.environ['HOME']).parent
-with (root/'launches').open('a') as log: log.write('launch\n')
 args=sys.argv[1:]
+if args == ['auth', 'status', '--json']:
+    print(json.dumps({'loggedIn':True,'email':'archived-fixture@example.invalid','subscriptionType':'max'}))
+    sys.exit(0)
+if '--no-session-persistence' in args:
+    for line in sys.stdin:
+        frame=json.loads(line)
+        response={'models':[]} if frame['request']['subtype']=='initialize' else {
+            'subscription_type':'max','rate_limits':{'limits':[{'kind':'session','group':'session','percent':25,'resets_at':None,'is_active':True}]}}
+        print(json.dumps({'type':'control_response','response':{'subtype':'success','request_id':frame['request_id'],'response':response}}),flush=True)
+    sys.exit(0)
+with (root/'launches').open('a') as log: log.write('launch\n')
 session=next((a.split('=',1)[1] for a in args if a.startswith(('--session-id=', '--resume='))), None)
 if session is None:
     raise ValueError('fixture requires an exact --session-id= or --resume= conversation')
