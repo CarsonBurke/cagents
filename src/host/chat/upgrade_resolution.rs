@@ -126,6 +126,39 @@ pub(in crate::host) fn resolve(
             .chat_resolutions
             .insert(client, Attempt::Spent(attempt));
     }
+    // Startup discovery can miss an unvisited retained owner. Resolve its
+    // exact issued source through ordinary authenticated adoption before
+    // asking for lineage. This route never executes a saved launch recipe,
+    // even if the holder disappears between discovery and authentication.
+    let (missing, cleanup) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            !state.chats.contains_key(&source.id),
+            state
+                .chats
+                .get(&source.id)
+                .is_some_and(|record| record.handle.is_close_only()),
+        )
+    };
+    if cleanup {
+        super::retained_actor::recover_cleanup_attachment(host, source).map_err(unavailable)?;
+    }
+    if missing {
+        // Client zero is the existing unattached startup-adoption mode.
+        // Resolve must not subscribe this connection before its Attach.
+        if let Err(native_error) = super::native_recovery::restore(host, 0, source) {
+            // A missing holder is not permission to execute its old recipe.
+            // The separate history constructor can only page saved data and
+            // repeats owner/managed-work fences under its admission guard.
+            if !source.is_saved_claude_history() {
+                return Err(unavailable(native_error));
+            }
+            super::capacity::recover_saved_history(host, source)?;
+        }
+    }
+    if source.is_saved_claude_history() {
+        super::capacity::register_saved_history_alias(host, source)?;
+    }
     let resolved = super::resolve_upgrade(host, source)?;
     let mut grant = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
