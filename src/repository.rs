@@ -8659,6 +8659,7 @@ mod tests {
 
     #[test]
     fn snapshot_cache_unchanged_reads_only_status_and_metadata_invalidation_rereads() {
+        let directory = tempfile::tempdir().unwrap();
         let mut outputs = cached_snapshot_outputs(b"", b"");
         outputs.push(success(&snapshot_status(b"")));
         let mut metadata_outputs = cached_snapshot_outputs(b"", b"");
@@ -8668,7 +8669,7 @@ mod tests {
         let git = RepositoryService::new("git", executor.clone());
         let mut cache = SnapshotCache::default();
         let cancel = CancellationToken::default();
-        let root = Path::new("/snapshot-cache-test");
+        let root = directory.path();
         assert!(
             git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
                 .unwrap()
@@ -14388,6 +14389,7 @@ mod tests {
     #[test]
     fn snapshot_unsupported_attribute_variables_keep_the_unchanged_status_shortcut() {
         let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("tracked"), b"base\n").unwrap();
         let status = snapshot_status(b"1 M. N... 100644 100644 100644 a b tracked\0");
         let executor = Arc::new(FakeExecutor::with_outputs(vec![
             exit(1, b""),
