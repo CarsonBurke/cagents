@@ -4146,18 +4146,26 @@ impl Application for Editor {
                             })
                         }
                         SidebarAction::Commit { message, amend, .. } => {
+                            let Some(authority) = tab.worktree_authority.clone() else {
+                                return self.refuse_git_mutation(id);
+                            };
                             let Some(worktree) = self.begin_mutation(id, MutationKind::Commit)
                             else {
                                 return Task::none();
                             };
+                            let cancellation = self
+                                .mutation_cancellation(id)
+                                .expect("admitted mutation has cancellation");
                             cosmic::task::future(async move {
                                 let submitted = message.clone();
                                 let result = tokio::task::spawn_blocking(move || {
-                                    RepositoryService::system("git").commit_with_amend(
-                                        &CommitRequest { worktree, message },
-                                        amend,
-                                        &CancellationToken::default(),
-                                    )
+                                    RepositoryService::system("git")
+                                        .with_worktree_authority(authority)?
+                                        .commit_with_amend(
+                                            &CommitRequest { worktree, message },
+                                            amend,
+                                            &cancellation,
+                                        )
                                 })
                                 .await
                                 .map_err(|error| error.to_string())
@@ -6259,6 +6267,152 @@ mod tests {
             git(remote.path(), &["rev-parse", "refs/heads/main"]),
             git(root, &["rev-parse", "HEAD"])
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn standalone_commit_and_amend_cancel_the_running_hook() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for amend in [false, true] {
+            let directory = git_fixture();
+            let root = directory.path();
+            std::fs::write(root.join("tracked.txt"), "staged change\n").unwrap();
+            git(root, &["add", "tracked.txt"]);
+            let before_head = git(root, &["rev-parse", "HEAD"]);
+            let before_index = git(root, &["diff", "--cached", "--binary"]);
+            let hooks = root.join("hooks");
+            std::fs::create_dir_all(&hooks).unwrap();
+            let hook = hooks.join("pre-commit");
+            std::fs::write(
+                &hook,
+                b"#!/bin/sh\n: > \"$0.started\"\nwhile [ ! -e \"$0.release\" ]; do sleep 0.01; done\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let started = hooks.join("pre-commit.started");
+            let release = hooks.join("pre-commit.release");
+            let mut app = editor();
+            let id = open_real_git(&mut app, root, None);
+            let key = app
+                .tab(id)
+                .unwrap()
+                .navigation
+                .active_worktree()
+                .unwrap()
+                .clone();
+            let message = "Keep cancelled commit draft";
+            sidebar_action(
+                &mut app,
+                SidebarAction::CommitMessageChanged {
+                    key: key.clone(),
+                    message: message.into(),
+                },
+            );
+            let task = app.update(Message::Sidebar(SidebarAction::Commit {
+                key: key.clone(),
+                message: message.into(),
+                amend,
+            }));
+            let cancellation = app.mutation_cancellation(id).expect("commit was admitted");
+            let worker = std::thread::spawn(move || task_messages(task));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !started.exists() && !worker.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let hook_started = started.exists();
+            drop(app.update(Message::Sidebar(SidebarAction::CancelGitMutation { key })));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !worker.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let settled_before_release = worker.is_finished();
+            // Release even a broken adapter's hook before asserting, so the
+            // regression cannot leave its worker or Git process waiting.
+            std::fs::write(release, b"release\n").unwrap();
+            let messages = worker.join().unwrap();
+            for message in messages {
+                let task = app.update(message);
+                run_tasks(&mut app, task);
+            }
+            assert!(hook_started, "the actual commit must reach its hook");
+            assert!(
+                cancellation.is_cancelled(),
+                "Cancel uses the admitted token"
+            );
+            assert!(
+                settled_before_release,
+                "Cancel must stop Git while its hook is blocked"
+            );
+            assert_eq!(git(root, &["rev-parse", "HEAD"]), before_head);
+            assert_eq!(git(root, &["diff", "--cached", "--binary"]), before_index);
+            assert_eq!(app.tab(id).unwrap().navigation.commit_message(), message);
+            assert!(app.tab(id).unwrap().mutation.is_none());
+            assert!(app.notice.is_some(), "the cancelled result remains visible");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn standalone_commit_and_amend_reject_a_replaced_root_before_worker_start() {
+        for amend in [false, true] {
+            let directory = git_fixture();
+            let replacement = git_fixture();
+            let root = directory.path();
+            std::fs::write(root.join("tracked.txt"), "original staged change\n").unwrap();
+            std::fs::write(
+                replacement.path().join("tracked.txt"),
+                "replacement staged change\n",
+            )
+            .unwrap();
+            git(root, &["add", "tracked.txt"]);
+            git(replacement.path(), &["add", "tracked.txt"]);
+            let original_head = git(root, &["rev-parse", "HEAD"]);
+            let original_index = git(root, &["diff", "--cached", "--binary"]);
+            let replacement_head = git(replacement.path(), &["rev-parse", "HEAD"]);
+            let replacement_index = git(replacement.path(), &["diff", "--cached", "--binary"]);
+            let mut app = editor();
+            let id = open_real_git(&mut app, root, None);
+            let key = app
+                .tab(id)
+                .unwrap()
+                .navigation
+                .active_worktree()
+                .unwrap()
+                .clone();
+            let message = "Keep replaced-root draft";
+            sidebar_action(
+                &mut app,
+                SidebarAction::CommitMessageChanged {
+                    key: key.clone(),
+                    message: message.into(),
+                },
+            );
+            let delayed = app.update(Message::Sidebar(SidebarAction::Commit {
+                key,
+                message: message.into(),
+                amend,
+            }));
+            assert!(app.tab(id).unwrap().mutation.is_some());
+            let parked = root.with_extension("commit-original");
+            std::fs::rename(root, &parked).unwrap();
+            std::fs::rename(replacement.path(), root).unwrap();
+            run_tasks(&mut app, delayed);
+            let replacement_after_head = git(root, &["rev-parse", "HEAD"]);
+            let replacement_after_index = git(root, &["diff", "--cached", "--binary"]);
+            std::fs::remove_dir_all(root).unwrap();
+            std::fs::rename(parked, root).unwrap();
+            assert_eq!(replacement_after_head, replacement_head);
+            assert_eq!(replacement_after_index, replacement_index);
+            assert_eq!(git(root, &["rev-parse", "HEAD"]), original_head);
+            assert_eq!(git(root, &["diff", "--cached", "--binary"]), original_index);
+            assert_eq!(app.tab(id).unwrap().navigation.commit_message(), message);
+            assert!(app.tab(id).unwrap().mutation.is_none());
+            assert!(
+                app.notice.is_some(),
+                "the replaced-root refusal remains visible"
+            );
+        }
     }
 
     #[test]
