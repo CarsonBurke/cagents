@@ -888,6 +888,7 @@ mod tests {
                 "/goal pause",
                 "/goal resume",
                 "/goal clear",
+                "\n  \u{2003}/GoAl pause",
             ] {
                 for keyboard in [false, true] {
                     let (mut app, card, target) = live();
@@ -991,7 +992,7 @@ mod tests {
                         runtime(&app, card).goal_pending.as_ref().unwrap().stage,
                         Stage::Native { .. }
                     ));
-                    assert_eq!(runtime(&app, card).composer.text().trim(), input);
+                    assert_eq!(runtime(&app, card).composer.text().trim(), input.trim());
                     assert!(runtime(&app, card).queued.is_none());
                     assert!(runtime(&app, card).followups.is_empty());
                 }

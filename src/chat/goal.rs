@@ -118,16 +118,24 @@ fn validate_thread(thread: &str) -> Result<(), Error> {
     }
 }
 
+/// Recognize only the reserved command token without parsing or copying its
+/// objective. Presentation can use the first nonempty composer line directly.
+pub fn is_command(input: &str) -> bool {
+    let input = input.trim_start();
+    input
+        .get(..5)
+        .is_some_and(|command| command.eq_ignore_ascii_case("/goal"))
+        && input[5..].chars().next().is_none_or(char::is_whitespace)
+}
+
 /// `None` is ordinary input. `Some(Err(_))` is a reserved goal command that
 /// must be shown as an error, never retried as a generic provider prompt.
 /// `set` disambiguates objectives equal to a command such as `pause`.
 pub fn parse(input: &str) -> Option<Result<Operation, Error>> {
-    let input = input.trim_start();
-    let (command, rest) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
-    if !command.eq_ignore_ascii_case("/goal") {
+    if !is_command(input) {
         return None;
     }
-    let rest = rest.trim();
+    let rest = input.trim_start()[5..].trim();
     if rest.is_empty() {
         return Some(Ok(Operation::Get));
     }
@@ -482,6 +490,32 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reserved_command_recognition_preserves_whitespace_case_and_token_boundaries() {
+        for (input, reserved) in [
+            ("/goal", true),
+            ("\n \u{2003}/GoAl\tset objective", true),
+            ("/goal\u{2003}pause", true),
+            ("/goal pause unexpected", true),
+            ("/goal set", true),
+            ("", false),
+            (" \n\t", false),
+            ("/goals", false),
+            ("/goal🦀", false),
+            ("/göal", false),
+            ("ordinary /goal pause", false),
+        ] {
+            assert_eq!(is_command(input), reserved, "{input:?}");
+            assert_eq!(parse(input).is_some(), reserved, "{input:?}");
+        }
+        let oversized = format!("/goal set {}", "x".repeat(MAX_OBJECTIVE_CHARS + 1));
+        assert!(
+            is_command(&oversized),
+            "invalid arguments still need the Send/error route"
+        );
+        assert_eq!(parse(&oversized), Some(Err(Error::InvalidObjective)));
+    }
 
     fn goal(thread: &str, objective: &str, status: Status) -> Goal {
         Goal {

@@ -2577,14 +2577,16 @@ impl Runtime {
             .height(Length::Fill)
             .into(),
         ];
-        let has_text = self
+        let first_text = self
             .composer
             .lines()
-            .any(|line| !line.text.trim().is_empty());
+            .find(|line| !line.text.trim().is_empty());
+        let has_text = first_text.is_some();
+        let goal_input = first_text.is_some_and(|line| chat::goal::is_command(&line.text));
         let has_draft = has_text || !self.attachments.is_empty();
         // The submit modes the send controls expose, in the order the keyboard
         // reaches them: the first is Ctrl+Enter, the second Ctrl+Shift+Enter.
-        let modes: &[PromptMode] = if chat::goal::parse(&self.composer.text()).is_some() {
+        let modes: &[PromptMode] = if goal_input {
             // Native Goal controls are independent of turn input. Even while
             // a turn is active they need Send, including the path that explains
             // unsupported providers or invalid reserved Goal syntax.
