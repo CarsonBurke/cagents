@@ -5,6 +5,7 @@ use crate::{
     chat::{Launch, NativeContinuity, Session},
     daemon::holder_registry::{self as registry, Kind},
     model::{HostIncarnation, HostSessionId, LaunchRecipe},
+    terminal_ipc::{ClientRequest, ServerResponse},
     upgrade::handoff::{Phase, Store},
 };
 use serde_json::{Value, json};
