@@ -3776,8 +3776,10 @@ mod tests {
                 unset_environment: Default::default(),
             },
         };
-        // Decode real protocol frames without creating a process or socket.
-        super::super::protocol::codex::create(&launch).unwrap().1
+        // Build an owned-listener spec without creating a process or socket.
+        super::super::protocol::codex::create_with_listener(&launch, directory.join("unused.sock"))
+            .unwrap()
+            .1
     }
 
     #[test]
