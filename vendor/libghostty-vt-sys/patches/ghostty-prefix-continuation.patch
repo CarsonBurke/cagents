@@ -441,3 +441,70 @@
      const next_serial = s.page_serial;
      while (s.page_serial == next_serial) _ = try s.grow();
      const continued = s.compress(.incremental);
+@@ -17514,3 +17615,66 @@
+         try testing.expectEqualStrings("https://example.com", link.uri.slice(second_page.memory));
+     }
+ }
++
++
++test "PageList fresh pass reclaims a read behind the verification cursor" {
++    const testing = std.testing;
++
++    var s = try init(testing.allocator, 80, 24, null);
++    defer s.deinit();
++    try s.growColdPagesForTest(16);
++    const first = s.pages.first.?;
++    first.page().getRowAndCell(0, 0).cell.* = .init('Q');
++    try testing.expectEqual(IncrementalCompressionResult.complete, s.compress(.full));
++    try testing.expectEqual(@as(usize, 16), s.memoryStats().compressed_pages);
++    const activity = s.page_compression.activity_serial;
++
++    var steps: usize = 0;
++    while (!s.page_compression.flags.verifying) {
++        try testing.expectEqual(IncrementalCompressionResult.pending, s.compress(.incremental));
++        steps += 1;
++        try testing.expect(steps <= 16);
++    }
++    try testing.expect(!s.page_compression.flags.did_compress);
++    try testing.expectEqual(IncrementalCompressionResult.pending, s.compress(.incremental));
++    var ninth = first;
++    for (0..8) |_| ninth = ninth.next.?;
++    try testing.expectEqual(ninth, s.page_compression.next_node.?);
++    try testing.expect(s.page_compression.flags.verifying);
++    try testing.expect(!s.page_compression.flags.did_compress);
++
++    // A bounded old-row read restores only the already-verified first page.
++    // The suffix stays cold and neither activity nor traversal is invalidated.
++    try testing.expectEqual(@as(u21, 'Q'), first.page().getRowAndCell(0, 0).cell.content.codepoint);
++    try testing.expect(!first.isCompressed());
++    try testing.expectEqual(activity, s.page_compression.activity_serial);
++    try testing.expectEqual(ninth, s.page_compression.next_node.?);
++    var suffix = first.next.?;
++    const active = s.getTopLeft(.active).node;
++    while (suffix != active) : (suffix = suffix.next.?) {
++        try testing.expect(suffix.isCompressed());
++    }
++    try testing.expectEqual(IncrementalCompressionResult.complete, s.compress(.incremental));
++    try testing.expect(!first.isCompressed());
++    try testing.expectEqual(@as(usize, 15), s.memoryStats().compressed_pages);
++    try testing.expect(s.page_compression.next_node == null);
++    try testing.expectEqual(activity, s.page_compression.activity_serial);
++
++    // Rust IdleCompression remembers the intervening read and schedules this
++    // fresh bounded pass after native Complete resets its cursor. No full scan
++    // or traversal reset on every read is required.
++    var result = s.compress(.incremental);
++    try testing.expectEqual(IncrementalCompressionResult.pending, result);
++    try testing.expect(first.isCompressed());
++    steps = 1;
++    while (result == .pending) {
++        result = s.compress(.incremental);
++        steps += 1;
++        try testing.expect(steps <= 64);
++        try testing.expect(s.compression_test_visits <= incremental_compression_max_inspected);
++    }
++    try testing.expectEqual(IncrementalCompressionResult.complete, result);
++    try testing.expectEqual(@as(usize, 16), s.memoryStats().compressed_pages);
++    try testing.expect(s.page_compression.next_node == null);
++    try testing.expectEqual(activity, s.page_compression.activity_serial);
++}

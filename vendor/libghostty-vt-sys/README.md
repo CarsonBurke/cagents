@@ -17,9 +17,8 @@ Raw FFI bindings for libghostty-vt.
   sandboxed package managers that cannot fetch during build scripts.
 - Set `LIBGHOSTTY_VT_SYS_OPTIMIZE` to `Debug`, `ReleaseSafe`, `ReleaseFast`, or
   `ReleaseSmall` to override the Zig optimize mode used by vendored builds.
-- If the `pkg-config` feature is enabled, the build will use an installed
-  `libghostty-vt` found through `pkg-config` only when `GHOSTTY_SOURCE_DIR` is
-  unset. With the default static link mode, it probes Ghostty's
-  `libghostty-vt-static` pkg-config module instead.
+- The `pkg-config` feature keeps using the tracked patched source and emits a
+  warning instead of selecting an unverified installed library. A supplied
+  `GHOSTTY_SOURCE_DIR` must already contain the tracked patch.
 - libghostty-vt is pre-1.0, so these bindings do not guarantee compatibility
   with arbitrary installed C API revisions.

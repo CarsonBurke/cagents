@@ -4163,7 +4163,7 @@ impl Worker {
         }
         match result {
             Ok(result) => {
-                self.scrollback_compression.finished(result, now);
+                self.scrollback_compression.finished(result, mode, now);
                 if result == CompressionResult::Unsupported {
                     tracing::debug!(terminal_id = %self.terminal_id,
                         "scrollback reclamation is unavailable on this target");
