@@ -1744,25 +1744,13 @@ fn start_with_execution(
             installed_handle.wake_retained_outcomes();
             retained_actor::wake(host, id);
             if let Some(expected) = expected_saved {
-                let confirmation = wait_saved_conversation_ready(
+                let confirmation = confirm_saved_conversation(
                     &installed_handle,
                     expected,
                     Instant::now() + Duration::from_secs(15),
                     || {
                         crate::daemon::termination_requested()
                             || host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down
-                    },
-                    || {
-                        let state = host.lock().unwrap_or_else(|p| p.into_inner());
-                        if state.proof() != &proof
-                            || state.chats.get(&id).is_none_or(|record| {
-                                record.execution_instance != execution_instance
-                                    || !record.handle.same_attachment(&installed_handle)
-                            })
-                        {
-                            return Err("The resumed conversation changed its owner".into());
-                        }
-                        Ok(())
                     },
                 )
                 .and_then(|()| {
