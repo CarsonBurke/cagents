@@ -368,15 +368,6 @@ impl Cagents {
                 retained: false,
             },
         );
-        self.project_ui.deletions.insert(
-            id,
-            Deletion {
-                target: target.clone(),
-                started_at,
-                failure: None,
-            },
-        );
-        self.sync_worktree_operation_rows();
         let reason = crate::worktree_cleanup::automatic_retention_reason(&request.path);
         cosmic::task::message(Message::ProjectUi(Action::AutomaticallyDeleted {
             target,
@@ -1326,54 +1317,48 @@ impl Cagents {
                 let Some(attempt) = self.project_ui.automatic_attempts.get(&id) else {
                     return Task::none();
                 };
-                let Some(pending) = self.project_ui.deletions.get(&id) else {
+                let Some(project) = self.sidebar_model.project(target.project) else {
                     return Task::none();
                 };
+                let current_row = project.worktrees.iter().any(|row| {
+                    row.id == id
+                        && row.path == request.path
+                        && row.branch.as_deref().is_some_and(|branch| {
+                            branch == request.branch
+                                || branch.strip_prefix("refs/heads/")
+                                    == Some(request.branch.as_str())
+                        })
+                        && row.head_repository.as_ref().is_some_and(|source| {
+                            source.same_repository(&request.source_repository)
+                        })
+                });
                 if attempt.generation != generation
                     || attempt.project != target.project
                     || attempt.request != request
                     || attempt.retained
-                    || pending.started_at != attempt.at
-                    || pending.failure.is_some()
-                    || pending.target.project != target.project
-                    || pending.target.worktree != Some(id)
-                    || pending.target.path != request.path
+                    || !current_row
+                    || self.project_ui.deletions.contains_key(&id)
                     || target.path != request.path
-                    || pending.target.repository != request.repository
+                    || project.repository != request.repository
                     || target.repository != request.repository
                 {
                     return Task::none();
                 }
-                if result.as_ref().is_ok_and(|removed| {
-                    removed
-                        .as_ref()
-                        .is_some_and(|receipt| receipt.path == target.path)
-                }) {
-                    return self.handle_project_action(Action::Deleted {
-                        target,
-                        result: Ok(()),
-                    });
-                }
-                if let Some(id) = target.worktree {
-                    if let Some(attempt) = self.project_ui.automatic_attempts.get_mut(&id)
-                        && attempt.project == target.project
-                        && attempt.request == request
-                    {
-                        // An unchanged retained checkout needs no repeated
-                        // GitHub query or warning on every sidebar refresh.
-                        attempt.retained = true;
-                    }
-                    self.project_ui.deletions.remove(&id);
-                }
+                // A local notification cannot certify removal. Even an
+                // unexpected success receipt must never tombstone its row.
+                self.project_ui
+                    .automatic_attempts
+                    .get_mut(&id)
+                    .unwrap()
+                    .retained = true;
                 // Automatic cleanup has no user confirmation to reuse. Keep
                 // this out of Deletion.failure: its RetryDelete action is an
                 // already-confirmed destructive operation.
                 self.status = Some(TransientNotice::warning(match result {
                     Err(reason) => format!("Worktree kept: {reason}"),
-                    Ok(_) => "Worktree kept: the daemon did not confirm removal. Review it, then choose Delete worktree to confirm deletion.".into(),
+                    Ok(_) => "Worktree kept: automatic checks keep files. Review it, then choose Delete worktree and confirm to discard its files.".into(),
                 }));
-                self.sync_worktree_operation_rows();
-                return self.lifecycle_sweep();
+                return Task::none();
             }
             Action::Deleted { target, result } => match result {
                 Err(failure) => {
@@ -2446,12 +2431,43 @@ mod tests {
         // Exercise the real eligibility path and its synchronous pending
         // state, without polling the future or contacting gh/the daemon.
         drop(app.cleanup_merged_worktree_task(project, &[(record.clone(), None)], &[pr.clone()]));
-        let target = app.project_ui.deletions[&linked.id].target.clone();
+        assert!(app.project_ui.deletions.is_empty());
+        assert_eq!(row(&app, linked.id).unwrap().deletion, None);
+        assert!(!app.project_ui.is_deleting(linked.id));
+        assert!(!app.project_ui.deletion_running());
+        assert!(!app.project_ui.deleting_directory(&linked.path));
+        let target = app.project_target(project, Some(linked.id)).unwrap();
         let request = app.project_ui.automatic_attempts[&linked.id]
             .request
             .clone();
         let generation = app.project_ui.automatic_attempts[&linked.id].generation;
         let reason = "Kept: external writes cannot be excluded; choose Delete worktree and confirm";
+        // A row replacement invalidates the queued notice even before a new
+        // eligibility pass has had a chance to replace its attempt identity.
+        let notice_before = app.status.as_ref().map(|notice| notice.message.clone());
+        app.sidebar_model.projects[0]
+            .worktrees
+            .iter_mut()
+            .find(|row| row.id == linked.id)
+            .unwrap()
+            .branch = Some("replacement".into());
+        drop(app.handle_project_action(Action::AutomaticallyDeleted {
+            target: target.clone(),
+            generation,
+            request: request.clone(),
+            result: Err("stale row".into()),
+        }));
+        assert!(!app.project_ui.automatic_attempts[&linked.id].retained);
+        assert_eq!(
+            app.status.as_ref().map(|notice| notice.message.clone()),
+            notice_before
+        );
+        app.sidebar_model.projects[0]
+            .worktrees
+            .iter_mut()
+            .find(|row| row.id == linked.id)
+            .unwrap()
+            .branch = Some("feature".into());
         drop(app.handle_project_action(Action::AutomaticallyDeleted {
             target: target.clone(),
             generation,
@@ -2498,10 +2514,12 @@ mod tests {
 
         // A retained candidate must not prevent a different unseen worktree
         // from reaching the same real scheduling path.
-        let mut other = linked.clone();
-        other.id = WorktreeId::new();
-        other.path = repository.join("worktrees/other");
-        other.branch = Some("other".into());
+        let mut other = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("worktrees/other"),
+            Some("other".into()),
+        );
+        other.head_repository = linked.head_repository.clone();
         app.sidebar_model.projects[0].worktrees.push(other.clone());
         let mut other_record = record.clone();
         other_record.id = other.id;
@@ -2516,7 +2534,9 @@ mod tests {
             &[pr.clone(), other_pr],
         ));
         assert!(!app.project_ui.deletions.contains_key(&linked.id));
-        let other_target = app.project_ui.deletions[&other.id].target.clone();
+        assert!(app.project_ui.deletions.is_empty());
+        assert_eq!(row(&app, other.id).unwrap().deletion, None);
+        let other_target = app.project_target(project, Some(other.id)).unwrap();
         let other_request = app.project_ui.automatic_attempts[&other.id].request.clone();
         let other_generation = app.project_ui.automatic_attempts[&other.id].generation;
         drop(app.handle_project_action(Action::AutomaticallyDeleted {
@@ -2553,13 +2573,14 @@ mod tests {
         record.head_oid = Some("b".repeat(40));
         pr.head_ref_oid = "b".repeat(40);
         drop(app.cleanup_merged_worktree_task(project, &[(record.clone(), None)], &[pr.clone()]));
-        assert!(app.project_ui.deletions.contains_key(&linked.id));
+        assert!(app.project_ui.deletions.is_empty());
+        assert_eq!(row(&app, linked.id).unwrap().deletion, None);
         let fresh = &app.project_ui.automatic_attempts[&linked.id];
         assert!(!fresh.retained);
         assert_eq!(fresh.request.head_oid, "b".repeat(40));
         let fresh_generation = fresh.generation;
         let fresh_request = fresh.request.clone();
-        let pending_at = app.project_ui.deletions[&linked.id].started_at;
+        let pending_at = fresh.at;
         let notice = app.status.as_ref().unwrap().message.clone();
         // Both a late retained result and a stale removal receipt from the
         // previous binding must leave the newer operation and row untouched.
@@ -2578,7 +2599,8 @@ mod tests {
                 request: request.clone(),
                 result,
             }));
-            assert_eq!(app.project_ui.deletions[&linked.id].started_at, pending_at);
+            assert!(app.project_ui.deletions.is_empty());
+            assert_eq!(app.project_ui.automatic_attempts[&linked.id].at, pending_at);
             assert_eq!(
                 app.project_ui.automatic_attempts[&linked.id].generation,
                 fresh_generation
