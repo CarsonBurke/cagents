@@ -4047,7 +4047,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     reason: "an unborn branch has nothing to compare".into(),
                 })?;
         let base = self
-            .resolve_optional_revision(worktree, base_ref.as_str(), cancellation)?
+            .resolve_optional_ref(worktree, base_ref.as_str(), cancellation)?
             .ok_or_else(|| RepositoryError::InvalidOutput {
                 field: "base_ref",
                 reason: format!("{base_ref} does not resolve to a commit"),
