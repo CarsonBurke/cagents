@@ -62,7 +62,8 @@ jobs:
           setup = '.github/actions/setup-linux-build/action.yml'
           assert git('rev-parse', 'HEAD:' + setup) == 'f24f0b0a90c31306518ff7253463a52b63a3c0e3'
           sources = [
-              'Cargo.toml', 'Cargo.lock', setup, workflow,
+              'Cargo.toml', 'Cargo.lock', 'build.rs', setup, workflow,
+              'src/host/chat.rs',
               'src/bin/cagentsd.rs', 'src/host/chat/retained_actor.rs',
               'src/host/chat/retained_archived_history_tests.rs',
               'src/host/chat/retained_admission_tests.rs',
@@ -75,6 +76,22 @@ jobs:
               'natural_authority_absent': True, 'environment_removed_or_replaced': False,
               'source_sha256': {p: hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() for p in sources},
               'scope': 'Supplementary exact P0 HOST qualification; not full CI, native UX or eight-record acceptance',
+          }, indent=2) + '\n')
+          (evidence / 'workflow-control.yml').write_bytes(pathlib.Path(workflow).read_bytes())
+          # Only this disposable hosted checkout changes revision. The workflow
+          # definition has already been archived; all builds use exact product65.
+          checkout = subprocess.run(['git', 'checkout', '--detach', product], check=True,
+                                    capture_output=True, text=True)
+          (evidence / 'product-checkout.stdout').write_text(checkout.stdout)
+          (evidence / 'product-checkout.stderr').write_text(checkout.stderr)
+          assert git('rev-parse', 'HEAD') == product
+          assert git('rev-parse', 'HEAD^{tree}') == tree
+          assert not git('status', '--porcelain')
+          (evidence / 'product-source.json').write_text(json.dumps({
+              'head': git('rev-parse', 'HEAD'), 'tree': git('rev-parse', 'HEAD^{tree}'),
+              'status': git('status', '--porcelain'),
+              'source_sha256': {p: hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+                                for p in sources if p != workflow},
           }, indent=2) + '\n')
           PY
 
@@ -96,6 +113,9 @@ jobs:
         timeout-minutes: 35
         run: |
           set -euo pipefail
+          test "$(git rev-parse HEAD)" = 65b83c897485b212bb5c244f29428797a6cc0bd2
+          test "$(git rev-parse 'HEAD^{tree}')" = d242557813be61eda65bf8f0533df1b821b250af
+          test -z "$(git status --porcelain)"
           set +e
           timeout --signal=TERM --kill-after=15s 1800s \
             cargo check --locked --no-default-features --features host --bin cagentsd \
@@ -104,12 +124,17 @@ jobs:
           result=$?
           set -e
           printf '%s\n' "$result" > "$P0_EVIDENCE_DIR/host-check.exit"
+          git status --porcelain > "$P0_EVIDENCE_DIR/host-check.source-status"
+          test ! -s "$P0_EVIDENCE_DIR/host-check.source-status"
           exit "$result"
 
       - name: Build and identify the matched HOST helper
         timeout-minutes: 35
         run: |
           set -euo pipefail
+          test "$(git rev-parse HEAD)" = 65b83c897485b212bb5c244f29428797a6cc0bd2
+          test "$(git rev-parse 'HEAD^{tree}')" = d242557813be61eda65bf8f0533df1b821b250af
+          test -z "$(git status --porcelain)"
           set +e
           timeout --signal=TERM --kill-after=15s 1800s \
             cargo build --locked --no-default-features --features host --bin cagentsd \
@@ -122,6 +147,11 @@ jobs:
           python3 - <<'PY'
           import hashlib, json, os, pathlib, subprocess
           evidence = pathlib.Path(os.environ['P0_EVIDENCE_DIR'])
+          source_head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          source_tree = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()
+          assert source_head == '65b83c897485b212bb5c244f29428797a6cc0bd2'
+          assert source_tree == 'd242557813be61eda65bf8f0533df1b821b250af'
+          assert not subprocess.check_output(['git', 'status', '--porcelain'], text=True).strip()
           rows = [json.loads(line) for line in (evidence / 'helper-build.jsonl').read_text().splitlines()]
           artifacts = [row for row in rows if row.get('reason') == 'compiler-artifact'
                        and row['target']['name'] == 'cagentsd' and row.get('executable')]
@@ -134,7 +164,8 @@ jobs:
                                    text=True, timeout=15)
           (evidence / 'helper.json').write_text(json.dumps({
               'path': str(helper), 'sha256': hashlib.sha256(helper.read_bytes()).hexdigest(),
-              'source_head': os.environ['P0_CONTROL_HEAD'],
+              'control_head': os.environ['P0_CONTROL_HEAD'],
+              'source_head': source_head, 'source_tree': source_tree,
               'product_head': '65b83c897485b212bb5c244f29428797a6cc0bd2',
               'version_stdout': version.stdout, 'version_stderr': version.stderr,
               'rustc_version': subprocess.check_output(['rustc', '--version'], text=True),
@@ -150,6 +181,9 @@ jobs:
         timeout-minutes: 35
         run: |
           set -euo pipefail
+          test "$(git rev-parse HEAD)" = 65b83c897485b212bb5c244f29428797a6cc0bd2
+          test "$(git rev-parse 'HEAD^{tree}')" = d242557813be61eda65bf8f0533df1b821b250af
+          test -z "$(git status --porcelain)"
           set +e
           timeout --signal=TERM --kill-after=15s 1800s \
             cargo test --locked --no-default-features --features host --lib --no-run \
@@ -160,8 +194,13 @@ jobs:
           printf '%s\n' "$result" > "$P0_EVIDENCE_DIR/test-build.exit"
           test "$result" -eq 0
           python3 - <<'PY'
-          import hashlib, json, os, pathlib
+          import hashlib, json, os, pathlib, subprocess
           evidence = pathlib.Path(os.environ['P0_EVIDENCE_DIR'])
+          source_head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          source_tree = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()
+          assert source_head == '65b83c897485b212bb5c244f29428797a6cc0bd2'
+          assert source_tree == 'd242557813be61eda65bf8f0533df1b821b250af'
+          assert not subprocess.check_output(['git', 'status', '--porcelain'], text=True).strip()
           rows = [json.loads(line) for line in (evidence / 'test-build.jsonl').read_text().splitlines()]
           artifacts = [row for row in rows if row.get('reason') == 'compiler-artifact'
                        and row['target']['name'] == 'cagents' and 'lib' in row['target']['kind']
@@ -173,7 +212,8 @@ jobs:
           executable = pathlib.Path(artifact['executable']).resolve(strict=True)
           (evidence / 'test-artifact.json').write_text(json.dumps({
               'path': str(executable), 'sha256': hashlib.sha256(executable.read_bytes()).hexdigest(),
-              'source_head': os.environ['P0_CONTROL_HEAD'],
+              'control_head': os.environ['P0_CONTROL_HEAD'],
+              'source_head': source_head, 'source_tree': source_tree,
               'product_head': '65b83c897485b212bb5c244f29428797a6cc0bd2',
               'compiler_artifact': artifact,
           }, indent=2) + '\n')
@@ -202,6 +242,15 @@ jobs:
           ]
           results = []
           fixture_roots = set()
+          def product_source():
+              def git(*args):
+                  return subprocess.check_output(['git', *args], text=True).strip()
+              source = {'head': git('rev-parse', 'HEAD'), 'tree': git('rev-parse', 'HEAD^{tree}'),
+                        'status': git('status', '--porcelain')}
+              assert source['head'] == '65b83c897485b212bb5c244f29428797a6cc0bd2'
+              assert source['tree'] == 'd242557813be61eda65bf8f0533df1b821b250af'
+              assert not source['status']
+              return source
           def remaining_fixture_processes():
               found = []
               for entry in pathlib.Path('/proc').iterdir():
@@ -225,12 +274,14 @@ jobs:
               assert 'CAGENTS_AGENT_AUTHORITY' not in os.environ
               assert hashlib.sha256(helper.read_bytes()).hexdigest() == helper_identity['sha256']
               assert hashlib.sha256(test_executable.read_bytes()).hexdigest() == test_identity['sha256']
+              source_before = product_source()
               phase = evidence / f'parent-{index}'
               phase.mkdir(mode=0o700)
               baseline = remaining_fixture_processes()
               (phase / 'preflight.json').write_text(json.dumps({
                   'natural_authority_absent': 'CAGENTS_AGENT_AUTHORITY' not in os.environ,
                   'preexisting_fixture_processes': baseline,
+                  'source': source_before,
               }, indent=2) + '\n')
               assert not baseline, 'Unexpected fixture process before exact parent'
               before = set(pathlib.Path('/tmp').glob('updater1513-*'))
@@ -291,6 +342,7 @@ jobs:
                                      'artifact': destination, 'sha256': hashlib.sha256(data).hexdigest(),
                                      **identity})
               remaining = remaining_fixture_processes()
+              source_after = product_source()
               passed = (status == 0 and stdout.count(f'test {root_name} ...') == 1
                         and len(re.findall(r'^test result: ok\. 1 passed; 0 failed; 0 ignored;', stdout, re.M)) == 1
                         and not remaining)
@@ -298,6 +350,7 @@ jobs:
                         'expected_selected_count': 1, 'outer_runtime_bound_seconds': 150,
                         'duration_seconds': time.monotonic() - started, 'child_logs': child_logs,
                         'test_executable': test_identity, 'helper': helper_identity,
+                        'source_before': source_before, 'source_after': source_after,
                         'preexisting_fixture_processes': baseline,
                         'child_log_monitoring': {'complete': len(child_logs) == 2 and not capture_errors,
                                                  'errors': capture_errors,
