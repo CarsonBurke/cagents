@@ -6,10 +6,12 @@ use crate::{
     sidebar::ProjectCommand,
 };
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct AutomaticAttempt {
     project: ProjectId,
     at: Instant,
+    request: crate::worktree_cleanup::RemovalRequest,
+    retained: bool,
 }
 
 #[derive(Debug, Default)]
@@ -199,6 +201,7 @@ pub enum Action {
     AwaitSessions(Target),
     AutomaticallyDeleted {
         target: Target,
+        request: crate::worktree_cleanup::RemovalRequest,
         result: Result<Option<RemovedWorktree>, String>,
     },
     Deleted {
@@ -308,11 +311,6 @@ impl Cagents {
                                 _ => true,
                             }
                     })
-                || self
-                    .project_ui
-                    .automatic_attempts
-                    .get(&record.id)
-                    .is_some_and(|attempt| attempt.at.elapsed() < Duration::from_secs(30))
             {
                 return None;
             }
@@ -325,9 +323,7 @@ impl Cagents {
                 .as_deref()?
                 .strip_prefix("refs/heads/")?
                 .to_owned();
-            Some((
-                target,
-                crate::worktree_cleanup::RemovalRequest {
+            let request = crate::worktree_cleanup::RemovalRequest {
                     repository: self.sidebar_model.project(project_id)?.repository.clone(),
                     path: record.path.clone(),
                     branch,
@@ -337,8 +333,14 @@ impl Cagents {
                         repository: repository.clone(),
                         number: pr.number,
                     },
-                },
-            ))
+                };
+            if self.project_ui.automatic_attempts.get(&record.id).is_some_and(|attempt| {
+                attempt.project == project_id && attempt.request == request
+                    && (attempt.retained || attempt.at.elapsed() < Duration::from_secs(30))
+            }) {
+                return None;
+            }
+            Some((target, request))
         })
         // A refused candidate must not monopolize every later refresh. Prefer
         // unseen candidates, then those whose last attempt is oldest.
@@ -352,6 +354,8 @@ impl Cagents {
             AutomaticAttempt {
                 project: project_id,
                 at: Instant::now(),
+                request: request.clone(),
+                retained: false,
             },
         );
         self.project_ui.deletions.insert(
@@ -365,6 +369,7 @@ impl Cagents {
         self.sync_worktree_operation_rows();
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
         cosmic::task::future(async move {
+            let binding = request.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let reply = crate::device_service::request(crate::device_service::Operation::RemoveMergedWorktree { request })?;
                 let crate::device_service::Reply::MergedWorktreeRemoved(removed) = reply else {
@@ -377,7 +382,11 @@ impl Cagents {
                 }
                 Ok(Some(removed))
             }).await.map_err(|error| error.to_string()).and_then(|result| result);
-            Message::ProjectUi(Action::AutomaticallyDeleted { target, result })
+            Message::ProjectUi(Action::AutomaticallyDeleted {
+                target,
+                request: binding,
+                result,
+            })
         })
     }
 
@@ -1309,7 +1318,11 @@ impl Cagents {
                 }
                 return self.start_worktree_deletion(target);
             }
-            Action::AutomaticallyDeleted { target, result } => {
+            Action::AutomaticallyDeleted {
+                target,
+                request,
+                result,
+            } => {
                 if result.as_ref().is_ok_and(|removed| {
                     removed
                         .as_ref()
@@ -1321,6 +1334,14 @@ impl Cagents {
                     });
                 }
                 if let Some(id) = target.worktree {
+                    if let Some(attempt) = self.project_ui.automatic_attempts.get_mut(&id)
+                        && attempt.project == target.project
+                        && attempt.request == request
+                    {
+                        // An unchanged retained checkout needs no repeated
+                        // GitHub query or warning on every sidebar refresh.
+                        attempt.retained = true;
+                    }
                     self.project_ui.deletions.remove(&id);
                 }
                 // Automatic cleanup has no user confirmation to reuse. Keep
@@ -2354,18 +2375,40 @@ mod tests {
     #[test]
     fn automatic_retention_keeps_the_row_catalog_and_confirmation_boundary() {
         let repository = PathBuf::from("/repo");
-        let linked = SidebarWorktree::from_durable(
+        let mut linked = SidebarWorktree::from_durable(
             WorktreeId::new(),
             repository.join("worktrees/feature"),
             Some("feature".into()),
         );
+        let source =
+            crate::github::GitHubRepoKey::new("github.com", None, "fixture", "repo").unwrap();
+        linked.head_repository = Some(source.clone());
         let primary = SidebarWorktree::from_durable(
             WorktreeId::new(),
             repository.clone(),
             Some("main".into()),
         );
         let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
-        let target = app.project_target(project, Some(linked.id)).unwrap();
+        app.settings.auto_delete_merged_worktrees = true;
+        app.review_repositories.insert(project, source);
+        let mut record = WorktreeRecord {
+            id: linked.id,
+            path: linked.path.clone(),
+            created_at_unix_ms: None,
+            head_oid: Some("a".repeat(40)),
+            branch: Some("refs/heads/feature".into()),
+            detached: false,
+            bare: false,
+            lock: Default::default(),
+            prunable_reason: None,
+        };
+        let mut pr: crate::github::PullRequest = serde_json::from_value(serde_json::json!({
+            "number": 1, "title": "Fixture", "state": "MERGED",
+            "headRepository": {"name": "repo"}, "headRepositoryOwner": {"login": "fixture"},
+            "headRefName": "feature", "headRefOid": "a".repeat(40), "baseRefName": "main",
+            "updatedAt": "2026-10-28T00:00:00Z", "url": "https://github.com/fixture/repo/pull/1"
+        }))
+        .unwrap();
         app.session
             .as_ref()
             .unwrap()
@@ -2377,20 +2420,17 @@ mod tests {
                 branch: Some("feature".into()),
                 existence: Existence::Open,
             }]);
-        // The automatic task owns only this temporary pending state. It has
-        // never displayed or received the manual deletion confirmation.
-        app.project_ui.deletions.insert(
-            linked.id,
-            Deletion {
-                target: target.clone(),
-                started_at: Instant::now(),
-                failure: None,
-            },
-        );
-        app.sync_worktree_operation_rows();
+        // Exercise the real eligibility path and its synchronous pending
+        // state, without polling the future or contacting gh/the daemon.
+        drop(app.cleanup_merged_worktree_task(project, &[(record.clone(), None)], &[pr.clone()]));
+        let target = app.project_ui.deletions[&linked.id].target.clone();
+        let request = app.project_ui.automatic_attempts[&linked.id]
+            .request
+            .clone();
         let reason = "Kept: external writes cannot be excluded; choose Delete worktree and confirm";
         drop(app.handle_project_action(Action::AutomaticallyDeleted {
             target,
+            request,
             result: Err(reason.into()),
         }));
         assert_eq!(row(&app, linked.id).unwrap().path, linked.path);
@@ -2408,6 +2448,58 @@ mod tests {
         assert_eq!(retained.path, linked.path);
         assert_eq!(retained.branch.as_deref(), Some("feature"));
 
+        // Retention is tied to the exact binding, not a thirty-second backoff.
+        // Repeated eligible refreshes must not start work or churn the notice.
+        app.project_ui
+            .automatic_attempts
+            .get_mut(&linked.id)
+            .unwrap()
+            .at = Instant::now() - Duration::from_secs(60);
+        let attempted_at = app.project_ui.automatic_attempts[&linked.id].at;
+        let notice = app.status.as_ref().unwrap().message.clone();
+        for _ in 0..2 {
+            drop(app.cleanup_merged_worktree_task(
+                project,
+                &[(record.clone(), None)],
+                &[pr.clone()],
+            ));
+            assert!(app.project_ui.deletions.is_empty());
+            assert_eq!(
+                app.project_ui.automatic_attempts[&linked.id].at,
+                attempted_at
+            );
+            assert_eq!(app.status.as_ref().unwrap().message, notice);
+        }
+
+        // A retained candidate must not prevent a different unseen worktree
+        // from reaching the same real scheduling path.
+        let mut other = linked.clone();
+        other.id = WorktreeId::new();
+        other.path = repository.join("worktrees/other");
+        other.branch = Some("other".into());
+        app.sidebar_model.projects[0].worktrees.push(other.clone());
+        let mut other_record = record.clone();
+        other_record.id = other.id;
+        other_record.path = other.path.clone();
+        other_record.branch = Some("refs/heads/other".into());
+        let mut other_pr = pr.clone();
+        other_pr.number = 2;
+        other_pr.head_ref_name = "other".into();
+        drop(app.cleanup_merged_worktree_task(
+            project,
+            &[(record.clone(), None), (other_record, None)],
+            &[pr.clone(), other_pr],
+        ));
+        assert!(!app.project_ui.deletions.contains_key(&linked.id));
+        let other_target = app.project_ui.deletions[&other.id].target.clone();
+        let other_request = app.project_ui.automatic_attempts[&other.id].request.clone();
+        drop(app.handle_project_action(Action::AutomaticallyDeleted {
+            target: other_target,
+            request: other_request,
+            result: Err(reason.into()),
+        }));
+        assert!(app.project_ui.deletions.is_empty());
+
         // A stale RetryDelete message must not turn an automatic refusal into
         // an unconfirmed force removal. The ordinary row action still opens
         // its existing confirmation with no already-confirmed failure state.
@@ -2422,6 +2514,22 @@ mod tests {
         assert!(dialog.blocker.is_none());
         assert!(dialog.failure.is_none());
         assert!(app.project_ui.deletions.is_empty());
+        drop(app.handle_project_action(Action::Dismiss));
+
+        // A new exact merged head is a different binding and can be checked
+        // immediately, without waiting on the old candidate's backoff.
+        app.project_ui
+            .automatic_attempts
+            .get_mut(&linked.id)
+            .unwrap()
+            .at = Instant::now();
+        record.head_oid = Some("b".repeat(40));
+        pr.head_ref_oid = "b".repeat(40);
+        drop(app.cleanup_merged_worktree_task(project, &[(record, None)], &[pr]));
+        assert!(app.project_ui.deletions.contains_key(&linked.id));
+        let fresh = &app.project_ui.automatic_attempts[&linked.id];
+        assert!(!fresh.retained);
+        assert_eq!(fresh.request.head_oid, "b".repeat(40));
     }
 
     #[test]
