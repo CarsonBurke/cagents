@@ -6385,10 +6385,11 @@ impl Cagents {
                             self.chat_ui.fresh_offers.remove(&target.card);
                         }
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
-                            runtime.error = Some("Couldn’t reopen this conversation. Open application notices for details.".into());
+                            runtime.error = Some(failure.message.clone());
                             self.status = Some(
                                 TransientNotice::error("Couldn’t reopen this conversation")
                                     .key(format!("chat-resume:{}", target.card))
+                                    .targets([target.card])
                                     .details(failure.message),
                             );
                             runtime.disconnected = true;
@@ -6397,10 +6398,11 @@ impl Cagents {
                             self.card_state(target.card).map(|state| &state.kind),
                             Some(CardKind::Chat(_))
                         ) {
-                            self.fail_runtime(target.card, "Couldn’t reopen this conversation. Open application notices for details.".into());
+                            self.fail_runtime(target.card, failure.message.clone());
                             self.status = Some(
                                 TransientNotice::error("Couldn’t reopen this conversation")
                                     .key(format!("chat-resume:{}", target.card))
+                                    .targets([target.card])
                                     .details(failure.message),
                             );
                         } else {
@@ -6410,6 +6412,7 @@ impl Cagents {
                             self.status = Some(
                                 TransientNotice::error("Couldn’t reopen this conversation")
                                     .key(format!("chat-resume:{}", target.card))
+                                    .targets([target.card])
                                     .details(failure.message),
                             );
                         }

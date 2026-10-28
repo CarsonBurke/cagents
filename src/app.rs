@@ -330,9 +330,6 @@ impl NoticeLog {
     fn record_at(&mut self, notice: TransientNotice, now: Instant) {
         let expires_at =
             (notice.severity == NoticeSeverity::Success).then(|| now + Duration::from_secs(6));
-        if let Some(key) = notice.key.as_deref() {
-            self.resolve(key);
-        }
         // Scanning the whole log rather than only its tail is what makes
         // deduplication survive interleaving: a poll that raises two failures
         // in turn would otherwise alternate them forever and fill the log with
@@ -344,6 +341,9 @@ impl NoticeLog {
             entry.expires_at = expires_at;
             self.entries.push_back(entry);
             return;
+        }
+        if let Some(key) = notice.key.as_deref() {
+            self.resolve(key);
         }
         self.next_id = self.next_id.wrapping_add(1);
         self.entries.push_back(LoggedNotice {
@@ -19976,13 +19976,19 @@ mod tests {
         log.record_at(notice, now + Duration::from_secs(1));
         let repeated = log.recent().next().unwrap();
         assert_eq!(repeated.id, id, "a queued dismiss still names this report");
-        assert!(repeated.details_open, "a repeated poll must not close Details");
+        assert!(
+            repeated.details_open,
+            "a repeated poll must not close Details"
+        );
         assert_eq!(repeated.repeats, 2);
         assert_eq!(repeated.notice.targets, [target]);
         assert_eq!(log.len(), 2);
         log.dismiss(id);
         assert_eq!(log.len(), 1);
-        assert_eq!(log.recent().next().unwrap().notice.message, "Unrelated warning");
+        assert_eq!(
+            log.recent().next().unwrap().notice.message,
+            "Unrelated warning"
+        );
 
         log.record_at(
             TransientNotice::error("Different failure").key("chat-resume"),
@@ -19994,12 +20000,18 @@ mod tests {
             now + Duration::from_secs(2),
         );
         let recovered = log.recent().next().unwrap();
-        assert_ne!(recovered.id, replaced, "changed outcomes replace the report");
+        assert_ne!(
+            recovered.id, replaced,
+            "changed outcomes replace the report"
+        );
         assert_eq!(recovered.repeats, 1);
         assert!(!recovered.details_open);
         log.expire(now + Duration::from_secs(9));
         assert_eq!(log.len(), 1, "recovery confirmations still expire");
-        assert_eq!(log.recent().next().unwrap().notice.message, "Unrelated warning");
+        assert_eq!(
+            log.recent().next().unwrap().notice.message,
+            "Unrelated warning"
+        );
     }
 
     #[test]
