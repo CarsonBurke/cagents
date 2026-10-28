@@ -5340,7 +5340,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         // what keeps a name this application cannot spell out of a refspec.
         let local_ref = request.branch.full_ref();
         let Some(local_oid) =
-            self.resolve_optional_revision(&request.worktree, &local_ref, cancellation)?
+            self.resolve_optional_ref(&request.worktree, &local_ref, cancellation)?
         else {
             return Ok(PushOutcome::NotPushed {
                 failure: MutationFailure::Rejected {
@@ -5369,15 +5369,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 // This observes endpoints of the attempt; it does not prevent
                 // an external change or detect an A -> B -> A transition.
                 let observation = CancellationToken::new();
-                let reason = match self.resolve_optional_revision(
-                    &request.worktree,
-                    &local_ref,
-                    &observation,
-                ) {
-                    Ok(Some(after)) if after == local_oid => return Ok(pushed(local_oid)),
-                    Ok(_) => "The source branch changed during the push",
-                    Err(_) => "The source branch could not be verified after the push",
-                };
+                let reason =
+                    match self.resolve_optional_ref(&request.worktree, &local_ref, &observation) {
+                        Ok(Some(after)) if after == local_oid => return Ok(pushed(local_oid)),
+                        Ok(_) => "The source branch changed during the push",
+                        Err(_) => "The source branch could not be verified after the push",
+                    };
                 return Ok(PushOutcome::OutcomeUnknown {
                     failure: MutationFailure::Reconciliation {
                         reason: reason.into(),
@@ -9770,11 +9767,15 @@ mod tests {
     fn a_successful_push_reports_the_pushed_commit() {
         let service = fake_service(vec![
             success(b""),
+            success(b""),
+            success(format!("{}\n", oid(4)).as_bytes()),
             success(format!("{}\n", oid(4)).as_bytes()),
             success(b"/origin\0"),
             success(b""),
             success(b"/origin\n"),
             success(b"To /origin\n*\trefs/heads/feature:refs/heads/feature\t[new branch]\nDone\n"),
+            success(b""),
+            success(format!("{}\n", oid(4)).as_bytes()),
             success(format!("{}\n", oid(4)).as_bytes()),
         ]);
         let outcome = service
@@ -9795,6 +9796,8 @@ mod tests {
     fn a_rejected_push_is_definitively_not_pushed() {
         let service = fake_service(vec![
             success(b""),
+            success(b""),
+            success(format!("{}\n", oid(4)).as_bytes()),
             success(format!("{}\n", oid(4)).as_bytes()),
             success(b"/origin\0"),
             success(b""),
@@ -9810,13 +9813,15 @@ mod tests {
 
         assert!(matches!(outcome, PushOutcome::NotPushed { .. }));
         // No endpoint lookup follows rejection; only private preflight configuration reads run.
-        assert_eq!(service.executor.commands.lock().unwrap().len(), 6);
+        assert_eq!(service.executor.commands.lock().unwrap().len(), 8);
     }
 
     #[test]
     fn a_push_that_never_started_is_not_pushed() {
         let service = fake_service(vec![
             success(b""),
+            success(b""),
+            success(format!("{}\n", oid(4)).as_bytes()),
             success(format!("{}\n", oid(4)).as_bytes()),
             success(b"/origin\0"),
             success(b""),
@@ -9828,13 +9833,15 @@ mod tests {
             .unwrap();
 
         assert!(matches!(outcome, PushOutcome::NotPushed { .. }));
-        assert_eq!(service.executor.commands.lock().unwrap().len(), 6);
+        assert_eq!(service.executor.commands.lock().unwrap().len(), 8);
     }
 
     #[test]
     fn an_uncertain_push_whose_remote_matches_is_reconciled_as_pushed() {
         let service = fake_service(vec![
             success(b""),
+            success(b""),
+            success(format!("{}\n", oid(4)).as_bytes()),
             success(format!("{}\n", oid(4)).as_bytes()),
             success(b"/origin\0"),
             success(b""),
@@ -9858,19 +9865,20 @@ mod tests {
             }
         );
         let commands = service.executor.commands.lock().unwrap();
-        let count: u32 = commands[9].environment[OsStr::new("GIT_CONFIG_COUNT")]
+        let count: u32 = commands[11].environment[OsStr::new("GIT_CONFIG_COUNT")]
             .to_str()
             .unwrap()
             .parse()
             .unwrap();
-        let marker =
-            commands[9].environment[OsStr::new(&format!("GIT_CONFIG_VALUE_{}", count - 1))].clone();
+        let marker = commands[11].environment
+            [OsStr::new(&format!("GIT_CONFIG_VALUE_{}", count - 1))]
+        .clone();
         assert_eq!(
-            commands[9].environment[OsStr::new(&format!("GIT_CONFIG_KEY_{}", count - 1))],
+            commands[11].environment[OsStr::new(&format!("GIT_CONFIG_KEY_{}", count - 1))],
             OsString::from("url./origin.insteadOf")
         );
         assert_eq!(
-            commands[9].arguments,
+            commands[11].arguments,
             vec![
                 OsString::from("-C"),
                 OsString::from("/repo"),
@@ -9893,6 +9901,8 @@ mod tests {
     fn an_uncertain_push_whose_remote_differs_stays_unknown() {
         let service = fake_service(vec![
             success(b""),
+            success(b""),
+            success(format!("{}\n", oid(4)).as_bytes()),
             success(format!("{}\n", oid(4)).as_bytes()),
             success(b"/origin\0"),
             success(b""),
@@ -9911,6 +9921,8 @@ mod tests {
         // An absent remote ref is also not proof that the push landed.
         let service = fake_service(vec![
             success(b""),
+            success(b""),
+            success(format!("{}\n", oid(4)).as_bytes()),
             success(format!("{}\n", oid(4)).as_bytes()),
             success(b"/origin\0"),
             success(b""),
@@ -9929,6 +9941,8 @@ mod tests {
         // Neither is a failed reconciliation lookup.
         let service = fake_service(vec![
             success(b""),
+            success(b""),
+            success(format!("{}\n", oid(4)).as_bytes()),
             success(format!("{}\n", oid(4)).as_bytes()),
             success(b"/origin\0"),
             success(b""),
@@ -9957,12 +9971,18 @@ mod tests {
             };
             let mut responses = vec![
                 success(b""),
+                success(b""),
+                success(format!("{}\n", oid(4)).as_bytes()),
                 success(format!("{}\n", oid(4)).as_bytes()),
                 Err(unstarted_failure()),
                 result,
             ];
             if definite_success {
-                responses.push(success(format!("{}\n", oid(4)).as_bytes()));
+                responses.extend([
+                    success(b""),
+                    success(format!("{}\n", oid(4)).as_bytes()),
+                    success(format!("{}\n", oid(4)).as_bytes()),
+                ]);
             }
             let service = fake_service(responses);
             let outcome = service
@@ -9974,9 +9994,9 @@ mod tests {
                 matches!(outcome, PushOutcome::OutcomeUnknown { .. })
             });
             let commands = service.executor.commands.lock().unwrap();
-            assert_eq!(commands.len(), if definite_success { 5 } else { 4 });
+            assert_eq!(commands.len(), if definite_success { 9 } else { 6 });
             assert!(
-                commands[3]
+                commands[5]
                     .arguments
                     .iter()
                     .any(|argument| argument == "push")
@@ -9992,13 +10012,33 @@ mod tests {
 
     #[test]
     fn successful_push_requires_a_readable_unchanged_source_observation() {
-        for after in [
-            success(format!("{}\n", oid(5)).as_bytes()),
-            exit(1, b""),
-            Err(unstarted_failure()),
+        for (after, reads, peeled) in [
+            (
+                vec![
+                    success(b""),
+                    success(format!("{}\n", oid(5)).as_bytes()),
+                    success(format!("{}\n", oid(5)).as_bytes()),
+                ],
+                3,
+                Some(oid(5)),
+            ),
+            (vec![exit(1, b"")], 1, None),
+            (vec![Err(unstarted_failure())], 1, None),
+            (vec![success(b""), Err(unstarted_failure())], 2, None),
+            (
+                vec![
+                    success(b""),
+                    success(format!("{}\n", oid(4)).as_bytes()),
+                    Err(unstarted_failure()),
+                ],
+                3,
+                Some(oid(4)),
+            ),
         ] {
-            let service = fake_service(vec![
+            let mut responses = vec![
                 success(b""),
+                success(b""),
+                success(format!("{}\n", oid(4)).as_bytes()),
                 success(format!("{}\n", oid(4)).as_bytes()),
                 success(b"/origin\0"),
                 success(b""),
@@ -10006,8 +10046,9 @@ mod tests {
                 success(
                     b"To /origin\n*\trefs/heads/feature:refs/heads/feature\t[new branch]\nDone\n",
                 ),
-                after,
-            ]);
+            ];
+            responses.extend(after);
+            let service = fake_service(responses);
             let outcome = service
                 .push(&publish_request(), &CancellationToken::new())
                 .unwrap();
@@ -10018,18 +10059,40 @@ mod tests {
                 }
             ));
             let commands = service.executor.commands.lock().unwrap();
-            assert_eq!(commands.len(), 7);
+            assert_eq!(commands.len(), 8 + reads);
             assert!(
-                commands[6]
-                    .arguments
-                    .iter()
-                    .any(|argument| argument == "rev-parse")
+                commands[8].arguments.ends_with(
+                    &[
+                        "show-ref",
+                        "--verify",
+                        "--quiet",
+                        "--",
+                        "refs/heads/feature"
+                    ]
+                    .map(OsString::from)
+                )
             );
-            assert!(
-                commands[6]
-                    .arguments
-                    .contains(&OsString::from("refs/heads/feature^{commit}"))
-            );
+            if reads >= 2 {
+                assert!(
+                    commands[9].arguments.ends_with(
+                        &["show-ref", "--verify", "--hash", "--", "refs/heads/feature"]
+                            .map(OsString::from)
+                    )
+                );
+            }
+            if let Some(oid) = peeled {
+                assert!(
+                    commands[10]
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "rev-parse")
+                );
+                assert!(
+                    commands[10]
+                        .arguments
+                        .contains(&OsString::from(format!("{oid}^{{commit}}")))
+                );
+            }
         }
     }
 
