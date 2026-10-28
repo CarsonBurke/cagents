@@ -1779,6 +1779,46 @@ mod tests {
         assert_eq!(budget.encoded.available_permits(), bytes.len());
         assert_eq!(budget.pixels.available_permits(), 3);
     }
+    #[test]
+    fn oversized_pixel_product_is_unavailable_before_retained_capacity() {
+        use image::ImageDecoder;
+
+        // Keep a tiny encoded fixture while giving its valid IHDR a pixel
+        // product just over the bound. Each individual axis is still legal.
+        // A missing product check must reach retained pressure, rather than
+        // passing because the fixture happens to fail decoder construction.
+        for (width, height) in [(4096u32, 4097u32), (4097, 4096)] {
+            let mut bytes = png();
+            assert_eq!(&bytes[12..16], b"IHDR");
+            bytes[16..20].copy_from_slice(&width.to_be_bytes());
+            bytes[20..24].copy_from_slice(&height.to_be_bytes());
+            let mut crc = u32::MAX;
+            for byte in &bytes[12..29] {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+                }
+            }
+            bytes[29..33].copy_from_slice(&(!crc).to_be_bytes());
+            let decoder = image::ImageReader::new(std::io::Cursor::new(&bytes))
+                .with_guessed_format()
+                .unwrap()
+                .into_decoder()
+                .expect("the oversized fixture must reach the product check");
+            assert_eq!(decoder.dimensions(), (width, height));
+            drop(decoder);
+
+            let budget = Budget::new(bytes.len(), 4);
+            assert!(matches!(
+                bounded_handle(bytes.clone(), &budget),
+                Loaded::Unavailable
+            ));
+            assert_eq!(budget.encoded.available_permits(), bytes.len());
+            assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+            assert_eq!(budget.pixels.available_permits(), 4);
+        }
+    }
+
     fn ico_bytes(entries: &[(u8, u8, u16, &[u8])]) -> Vec<u8> {
         let mut bytes = b"\0\0\x01\0".to_vec();
         bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
