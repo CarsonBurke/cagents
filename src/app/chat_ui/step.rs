@@ -1145,6 +1145,164 @@ mod presentation_tests {
     }
 
     #[test]
+    fn read_headers_and_copy_use_the_tool_directory() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        use iced_accessibility::accesskit::{
+            Action as NativeAction, ActionRequest, NodeId, Role, TreeId,
+        };
+
+        let renderer = crate::app::tests::headless_renderer();
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(500.0, 500.0));
+        for ((directory, path, display, absolute), (status, suffix)) in [
+            (
+                "/repo/subdir",
+                "file.rs",
+                "subdir/file.rs",
+                "/repo/subdir/file.rs",
+            ),
+            (
+                "/outside",
+                "file.rs",
+                "/outside/file.rs",
+                "/outside/file.rs",
+            ),
+            (
+                "subdir",
+                "file.rs",
+                "subdir/file.rs",
+                "/repo/subdir/file.rs",
+            ),
+            ("", "file.rs", "file.rs", "/repo/file.rs"),
+            ("/outside", "/repo/src.rs", "src.rs", "/repo/src.rs"),
+            ("/repo/subdir", "a", "subdir/a", "/repo/subdir/a"),
+            ("/repo/subdir", "Read", "subdir/Read", "/repo/subdir/Read"),
+            ("/repo/subdir", "d", "subdir/d", "/repo/subdir/d"),
+        ]
+        .into_iter()
+        .flat_map(|case| {
+            [
+                (ToolStatus::Succeeded, ""),
+                (ToolStatus::Running, " · working"),
+            ]
+            .into_iter()
+            .map(move |state| (case, state))
+        }) {
+            let item = chat::Item {
+                id: "read".into(),
+                role: chat::Role::Assistant,
+                started_at: None,
+                at: None,
+                content: ItemContent::Command {
+                    label: path.into(),
+                    command: path.into(),
+                    working_directory: directory.into(),
+                    action: chat::CommandAction::Read,
+                    status,
+                    exit_code: Some(0),
+                    duration_ms: None,
+                    output: String::new(),
+                },
+            };
+            let session = fresh_chat_session(
+                Provider::Claude,
+                TerminalId::new(),
+                "/repo".into(),
+                &Account::system(Provider::Claude),
+                false,
+            )
+            .unwrap();
+            let handle = Arc::new(ClientHandle::fixture(
+                session.clone(),
+                Snapshot {
+                    ready: true,
+                    items: vec![Arc::new(item.clone())],
+                    ..Snapshot::default()
+                },
+            ));
+            let runtime = Runtime::new(
+                Target {
+                    card: CardId::new(),
+                    generation: 1,
+                },
+                session,
+                Connection::Live(handle),
+                true,
+                crate::settings::EditorSyntaxTheme::default(),
+            );
+            let name = format!("Read {display}");
+            let mut element = runtime.step_header(&item, &runtime.cache[&item.id], false);
+            let mut tree = Tree::new(element.as_widget());
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let nodes = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            assert!(
+                nodes
+                    .root()
+                    .iter()
+                    .chain(nodes.children())
+                    .any(|node| node.node().label() == Some(name.as_str()))
+            );
+            let copy = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|node| {
+                    node.node().role() == Role::Button
+                        && node.node().label() == Some("Copy full path")
+                })
+                .expect("the actual row advertises its full-path copy control");
+            let target_node: NodeId = copy.id().clone().into();
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &iced::Event::A11y(
+                    widget::Id::from(target_node.0),
+                    ActionRequest {
+                        action: NativeAction::Click,
+                        target_tree: TreeId::ROOT,
+                        target_node,
+                        data: None,
+                    },
+                ),
+                Layout::new(&node),
+                iced::mouse::Cursor::Unavailable,
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut iced::advanced::Shell::new(&mut messages),
+                &node.bounds(),
+            );
+            assert!(
+                matches!(messages.as_slice(),
+                [Message::ChatUi(Action::CopyLiteral(copied))] if copied == absolute),
+                "the actual copy action uses the recorded tool directory"
+            );
+
+            let mut group = runtime.step_strip(&runtime.turns[0], Vec::new);
+            let mut tree = Tree::new(group.as_widget());
+            let node = group.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let nodes = group.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            let summary = format!("{name}{suffix}");
+            assert!(
+                nodes
+                    .root()
+                    .iter()
+                    .chain(nodes.children())
+                    .any(|node| node.node().label() == Some(summary.as_str())),
+                "the single-step group names the same file and retains its status"
+            );
+        }
+    }
+
+    #[test]
     fn read_paths_use_tool_directory_and_stay_relative_to_the_session() {
         let session_cwd = std::path::Path::new("/repo");
         for (working_directory, target, display, absolute) in [
