@@ -60,6 +60,13 @@ pub(super) struct State {
     command_test_without_catalog: bool,
 }
 
+#[cfg(test)]
+impl State {
+    pub(super) fn cancel_for_test(&mut self) -> &mut Arc<AtomicBool> {
+        &mut self.cancel
+    }
+}
+
 /// A conversation as the picker lists it.
 struct Row {
     card: CardId,

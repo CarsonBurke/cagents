@@ -87,7 +87,7 @@ fn picker(app: &mut Cagents) {
     app.resume_ui.generation = app.resume_ui.generation.wrapping_add(1);
     app.resume_ui.loading = false;
     app.resume_ui.error = None;
-    app.resume_ui.cancel = Arc::default();
+    *app.resume_ui.cancel_for_test() = Arc::default();
 }
 
 fn prepared(app: &mut Cagents, saved: SavedConversation) -> Message {
@@ -233,7 +233,7 @@ fn set_modal(app: &mut Cagents, blocker: Blocker, enabled: bool) {
                 base: "main".into(),
                 head: "topic".into(),
                 title: "fixture".into(),
-                body: String::new(),
+                body: String::new().into(),
                 draft: true,
                 retry_confirmation: None,
             })
@@ -298,7 +298,7 @@ fn saving_fixture(app: &mut Cagents) -> (CardId, RepositoryAction) {
         .insert(card, CardRuntime::Repository(Box::new(runtime)));
     app.workspace
         .add_card(
-            WorkspaceCard::new(card, "Saving fixture".into(), CardWidth::Fraction(0.5)).unwrap(),
+            WorkspaceCard::new(card, "Saving fixture", CardWidth::Fraction(0.5)).unwrap(),
             app.workspace.cards().len(),
             true,
         )
@@ -420,7 +420,7 @@ fn app_retires_closed_picker_receipts_before_starting_the_reopened_picker_reques
         drop(f.app.resume_saved_conversation(fresh.clone()));
         f.app.resume_ui.error = Some("new picker's own error".into());
         let generation = f.app.resume_ui.generation;
-        let cancel = f.app.resume_ui.cancel.clone();
+        let cancel = f.app.resume_ui.cancel_for_test().clone();
         let retirement = if queued {
             closed
         } else {
@@ -444,7 +444,7 @@ fn app_retires_closed_picker_receipts_before_starting_the_reopened_picker_reques
             f.app.resume_ui.error.as_deref(),
             Some("new picker's own error")
         );
-        assert!(Arc::ptr_eq(&cancel, &f.app.resume_ui.cancel));
+        assert!(Arc::ptr_eq(&cancel, f.app.resume_ui.cancel_for_test()));
         assert!(!cancel.load(Ordering::Relaxed));
         assert_eq!(resumed(&f.app, &old), 0);
         assert_eq!(resumed(&f.app, &fresh), 0);
