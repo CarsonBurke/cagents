@@ -1105,10 +1105,63 @@ fn original_old_boot_visual_restores_named_account_history_then_starts_twice_ove
                 before + start_number,
                 "Prepare started a provider"
             );
+            if start_number == 1 {
+                assert_ne!(
+                    prepared.id, requested.id,
+                    "the retired Agent allocation must not be resurrected"
+                );
+                assert_eq!(
+                    prepared.proof, requested.proof,
+                    "the product-issued successor retains only current read-only presentation proof"
+                );
+                assert_eq!(
+                    prepared.native_continuity,
+                    chat::NativeContinuity::ReconnectOnly
+                );
+                // The app could have persisted B and crashed before Start.
+                // Reopening that exact product response must load History,
+                // without provider admission or any transient UI permission.
+                let (reopen, server) = std::os::unix::net::UnixStream::pair().unwrap();
+                let host = fixture.host.clone();
+                let server = thread::spawn(move || crate::host::client::serve(server, 63, host));
+                let history =
+                    chat::client::ClientHandle::fixture_restore(reopen, prepared.clone()).unwrap();
+                wait(
+                    || {
+                        let snapshot = history.snapshot();
+                        !snapshot.history_loading && !snapshot.items.is_empty()
+                    },
+                    "prepared successor could not reopen history before Start",
+                );
+                assert_eq!(history.session(), prepared);
+                let snapshot = history.snapshot();
+                assert!(
+                    snapshot.exited
+                        && snapshot.read_only_reason.is_some()
+                        && snapshot.error.is_none()
+                );
+                assert!(history.session().is_saved_claude_history());
+                assert_eq!(
+                    launches(),
+                    before + start_number,
+                    "crash/reopen started a provider"
+                );
+                drop(history);
+                server.join().unwrap();
+                let repeated = client
+                    .fixture_request(ClientRequest::ChatPrepareResume {
+                        source: prepared.clone(),
+                    })
+                    .unwrap();
+                assert!(
+                    matches!(repeated, ServerResponse::ChatResumePrepared { session } if session == prepared),
+                    "pre-Start retry must keep the already issued B"
+                );
+            }
             let id = prepared.id;
             let started = client
                 .fixture_request(ClientRequest::ChatStart {
-                    session: prepared,
+                    session: prepared.clone(),
                     source: None,
                     terminate_source: false,
                     execution_environment: Default::default(),
@@ -1131,6 +1184,27 @@ fn original_old_boot_visual_restores_named_account_history_then_starts_twice_ove
                 !root.join("prompts").exists(),
                 "explicit resume submitted or replayed a prompt"
             );
+            // Ignore the successful Start descriptor and retry from the exact
+            // pre-Start response, as after losing the first successful reply.
+            let (retry, server) = std::os::unix::net::UnixStream::pair().unwrap();
+            let host = fixture.host.clone();
+            let server = thread::spawn(move || crate::host::client::serve(server, 64, host));
+            let retry = chat::client::ClientHandle::fixture_retry_start(retry, prepared).unwrap();
+            assert_eq!(retry.session().id, id);
+            assert_eq!(
+                fixture.host.lock().unwrap().chats[&id]
+                    .handle
+                    .actor_identity(),
+                Some(identity.clone())
+            );
+            assert_eq!(
+                launches(),
+                before + start_number + 1,
+                "lost successful Start reply launched another provider"
+            );
+            assert!(retry.snapshot().ready);
+            drop(retry);
+            server.join().unwrap();
             client
                 .fixture_request(ClientRequest::ChatClose { chat_id: id })
                 .unwrap();

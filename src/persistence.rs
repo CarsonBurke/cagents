@@ -1403,6 +1403,41 @@ impl StateStore {
         self.rebind_chat_descriptor(card_id, source, replacement)
     }
 
+    /// Commit the prepared allocation and its associated unsent content in one
+    /// transaction. A refused snapshot cannot authorize provider admission.
+    pub fn save_chat_resume(
+        &self,
+        state: &WorkspaceState,
+        base: SnapshotBase<'_>,
+        card_id: CardId,
+        source: &crate::chat::Session,
+        replacement: &crate::chat::Session,
+    ) -> Result<WorkspaceCommit> {
+        if !crate::chat::is_prepared_history_resume(source, replacement)
+            || !state.cards.iter().any(|card| {
+                card.id == card_id
+                    && card.existence.is_open()
+                    && matches!(&card.kind, CardKind::Chat(session) if session == replacement)
+            })
+        {
+            return Err(StoreError::InvalidState(
+                "Resume preparation changed the saved conversation or account".into(),
+            ));
+        }
+        let mut inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let StoreInner {
+            connection,
+            refused_closures,
+            ..
+        } = &mut *inner;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        rebind_chat_descriptor_transaction(&transaction, card_id, source, replacement)?;
+        let commit = save_workspace_transaction(&transaction, state, base, refused_closures)?;
+        transaction.commit()?;
+        Ok(commit)
+    }
+
     /// Commit a provider-confirmed descriptor transition from authenticated daemon
     /// upgrade lineage. Ordinary snapshots cannot authorize this transition.
     pub fn rebind_chat_upgrade(
@@ -1457,39 +1492,7 @@ impl StateStore {
         let transaction = inner
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_current_descriptor_write(&transaction)?;
-        let (kind, content, existence): (String, Option<String>, String) = transaction.query_row(
-            "SELECT kind_tag, content_json, existence_json FROM cards WHERE card_id = ?1",
-            [card_id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-        if kind != PersistedCardKind::Chat.as_str()
-            || !from_json::<Existence>("card existence", &existence)?.is_open()
-        {
-            return Err(StoreError::InvalidState(
-                "The recovery card is no longer an open chat".into(),
-            ));
-        }
-        let stored: crate::chat::Session = from_json(
-            "chat card",
-            &content.ok_or_else(|| StoreError::CorruptRow {
-                field: "chat card".into(),
-                reason: "The recovery source has no payload".into(),
-            })?,
-        )?;
-        if &stored == replacement {
-            return Ok(());
-        }
-        if &stored != source {
-            return Err(StoreError::InvalidState(
-                "The saved conversation changed before recovery committed".into(),
-            ));
-        }
-        transaction.execute(
-            "UPDATE cards SET content_json = ?1, updated_at_unix_ms = ?2 WHERE card_id = ?3",
-            params![to_json(replacement)?, now_unix_ms(), card_id.to_string()],
-        )?;
-        transaction.execute(INVALIDATE_CARD_HASH, [card_id.to_string()])?;
+        rebind_chat_descriptor_transaction(&transaction, card_id, source, replacement)?;
         transaction.commit()?;
         Ok(())
     }
@@ -3871,6 +3874,48 @@ const BROWSER_PAYLOAD_IDENTITY: PayloadIdentity = PayloadIdentity {
     card_by_payload: "SELECT card_id FROM browser_restore WHERE browser_id = ?1",
     payload_by_card: "SELECT browser_id FROM browser_restore WHERE card_id = ?1",
 };
+
+fn rebind_chat_descriptor_transaction(
+    transaction: &Transaction<'_>,
+    card_id: CardId,
+    source: &crate::chat::Session,
+    replacement: &crate::chat::Session,
+) -> Result<()> {
+    require_current_descriptor_write(transaction)?;
+    let (kind, content, existence): (String, Option<String>, String) = transaction.query_row(
+        "SELECT kind_tag, content_json, existence_json FROM cards WHERE card_id = ?1",
+        [card_id.to_string()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if kind != PersistedCardKind::Chat.as_str()
+        || !from_json::<Existence>("card existence", &existence)?.is_open()
+    {
+        return Err(StoreError::InvalidState(
+            "The recovery card is no longer an open chat".into(),
+        ));
+    }
+    let stored: crate::chat::Session = from_json(
+        "chat card",
+        &content.ok_or_else(|| StoreError::CorruptRow {
+            field: "chat card".into(),
+            reason: "The recovery source has no payload".into(),
+        })?,
+    )?;
+    if &stored == replacement {
+        return Ok(());
+    }
+    if &stored != source {
+        return Err(StoreError::InvalidState(
+            "The saved conversation changed before recovery committed".into(),
+        ));
+    }
+    transaction.execute(
+        "UPDATE cards SET content_json = ?1, updated_at_unix_ms = ?2 WHERE card_id = ?3",
+        params![to_json(replacement)?, now_unix_ms(), card_id.to_string()],
+    )?;
+    transaction.execute(INVALIDATE_CARD_HASH, [card_id.to_string()])?;
+    Ok(())
+}
 
 fn save_workspace_transaction(
     transaction: &Transaction<'_>,
@@ -9304,6 +9349,92 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn prepared_history_resume_atomically_keeps_source_and_content_on_refusal() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("resume.sqlite3");
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let (mut workspace, mut source) = agent_workspace(crate::agent::Provider::Claude);
+        source.proof = source.terminal.as_ref().unwrap().continuity.live_proof();
+        source.terminal = None;
+        let card = workspace.cards[0].id;
+        workspace.cards[0].kind = CardKind::Chat(source.clone());
+        workspace
+            .chat_drafts
+            .insert(card, "Original unsent draft".into());
+        workspace
+            .chat_draft_attachments
+            .insert(card, vec![retained_image_fixture(1)]);
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let mut successor = source.clone();
+        successor.id = TerminalId::new();
+        let mut prepared = workspace.clone();
+        prepared.cards[0].kind = CardKind::Chat(successor.clone());
+        prepared
+            .chat_drafts
+            .insert(card, "Latest unsent draft".into());
+        prepared
+            .chat_draft_attachments
+            .insert(card, vec![retained_image_fixture(2)]);
+        for refusal in 0..4 {
+            let mut candidate = prepared.clone();
+            let mut expected = source.clone();
+            if refusal == 0 {
+                candidate.cards.push(candidate.cards[0].clone());
+            }
+            if refusal == 1 {
+                expected
+                    .launch
+                    .recipe
+                    .environment
+                    .insert("CLAUDE_CONFIG_DIR".into(), "/different-account".into());
+            }
+            if refusal == 3 {
+                expected.id = TerminalId::new();
+            }
+            let result = store.save_chat_resume(
+                &candidate,
+                SnapshotBase {
+                    workspace: if refusal == 2 { 0 } else { lane.workspace },
+                    cards: &lane.cards,
+                },
+                card,
+                &expected,
+                &successor,
+            );
+            assert!(result.is_err());
+            let stored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+            assert_eq!(stored.cards[0].kind, CardKind::Chat(source.clone()));
+            assert_eq!(stored.chat_drafts, workspace.chat_drafts);
+            assert_eq!(
+                stored.chat_draft_attachments,
+                workspace.chat_draft_attachments
+            );
+        }
+        store
+            .save_chat_resume(
+                &prepared,
+                SnapshotBase {
+                    workspace: lane.workspace,
+                    cards: &lane.cards,
+                },
+                card,
+                &source,
+                &successor,
+            )
+            .unwrap();
+        drop(store);
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let stored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(stored.cards[0].kind, CardKind::Chat(successor));
+        assert_eq!(stored.chat_drafts, prepared.chat_drafts);
+        assert_eq!(
+            stored.chat_draft_attachments,
+            prepared.chat_draft_attachments
+        );
     }
 
     #[test]

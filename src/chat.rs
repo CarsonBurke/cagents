@@ -626,6 +626,18 @@ pub fn is_account_recovery(source: &Session, replacement: &Session) -> bool {
     original == candidate
 }
 
+/// A daemon-prepared explicit resume keeps this exact conversation/account but
+/// allocates a new process identity. This is not proof of a running provider.
+pub(crate) fn is_prepared_history_resume(source: &Session, replacement: &Session) -> bool {
+    source.is_saved_claude_history()
+        && source.id != replacement.id
+        && source.launch == replacement.launch
+        && replacement.proof == source.proof
+        && replacement.terminal.is_none()
+        && replacement.owned_codex_listener.is_none()
+        && replacement.native_continuity == NativeContinuity::ReconnectOnly
+}
+
 /// The narrow descriptor change an authenticated daemon upgrade may commit.
 /// This predicate is not provenance: callers must also have resolved the exact
 /// source through ResolveUpgradeChat and attached its confirmed replacement.

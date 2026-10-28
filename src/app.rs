@@ -7446,6 +7446,7 @@ impl Cagents {
         card: CardId,
         session: crate::chat::Session,
     ) -> Option<bool> {
+        self.cancel_stale_history_resume(card, &session);
         let unchanged = self.card_state(card).is_some_and(
             |state| matches!(&state.kind, CardKind::Chat(current) if current == &session),
         );

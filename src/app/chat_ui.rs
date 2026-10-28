@@ -202,6 +202,8 @@ pub enum Action {
     /// Explicitly continue a settled saved-history reader in this same pane.
     /// Restoring a pane never acquires this launch permission.
     ResumeSaved(Target),
+    ResumePrepared(Target, Result<chat::Session, String>),
+    ResumeCommitted(Target, Result<(), String>),
     CopyClosedDraft(Target, u64),
     DiscardClosedDraft(Target, u64),
     SignIn(Target, Account),
@@ -420,6 +422,8 @@ impl Action {
                 | Self::AccountCommitted(..)
                 | Self::UpgradeCommitted(..)
                 | Self::RetainedCopyCommitted(..)
+                | Self::ResumePrepared(..)
+                | Self::ResumeCommitted(..)
                 | Self::Wake(..)
                 | Self::UpdatesAcknowledged(..)
                 | Self::CommandFinished(..)
@@ -542,12 +546,23 @@ struct LocalReturn {
     resumes: bool,
 }
 
+#[derive(Clone)]
+struct ResumePreparation {
+    target: Target,
+    runtime: Target,
+    source: chat::Session,
+    prepared: Option<chat::Session>,
+    writer: std::sync::Weak<()>,
+    window: Option<iced::window::Id>,
+}
+
 /// One operation owns an existing card at a time. A card absent from this map
 /// is ready for input; its runtime and durable descriptor describe its content.
 /// Detached actors have their own target-keyed retirement ledger, since an old
 /// actor can still be shutting down while this card starts another one.
 enum Phase {
     Starting(Attempt),
+    PreparingResume(ResumePreparation),
     Returning {
         target: Target,
         local: Option<LocalReturn>,
@@ -563,6 +578,7 @@ impl Phase {
     fn target(&self) -> Target {
         match self {
             Self::Starting(attempt) => attempt.target,
+            Self::PreparingResume(resume) => resume.target,
             Self::Returning { target, .. } | Self::Closing { target, .. } => *target,
         }
     }
@@ -6669,6 +6685,42 @@ impl Cagents {
         .then_some(CAPACITY_GUIDANCE)
     }
 
+    pub(super) fn cancel_stale_history_resume(
+        &mut self,
+        card: CardId,
+        replacement: &chat::Session,
+    ) {
+        if matches!(self.chat_ui.phases.get(&card), Some(Phase::PreparingResume(resume)) if &resume.source != replacement)
+        {
+            self.chat_ui.phases.remove(&card);
+        }
+    }
+
+    fn history_resume_current(&self, resume: &ResumePreparation) -> bool {
+        self.core.main_window_id() == resume.window
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|writer| writer.same_writer(&resume.writer))
+            && self.card_state(resume.target.card).is_some_and(|card| {
+                card.existence.is_open()
+                    && matches!(&card.kind, CardKind::Chat(source) if source == &resume.source)
+            })
+            && matches!(self.cards.get(&resume.target.card), Some(CardRuntime::Chat(runtime))
+                if runtime.target == resume.runtime && runtime.session == resume.source)
+    }
+
+    fn history_resume_failed(&mut self, resume: ResumePreparation, error: String) -> Task<Message> {
+        self.chat_ui.finish(resume.target, |phase| {
+            matches!(phase, Phase::PreparingResume(_))
+        });
+        if let Some(runtime) = self.chat_runtime_mut(resume.runtime) {
+            runtime.disconnected = true;
+            runtime.error = Some(format!("The saved conversation was not started: {error}"));
+        }
+        Task::none()
+    }
+
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
         self.chat_ui.phases.contains_key(&card)
     }
@@ -6766,6 +6818,9 @@ impl Cagents {
         }
         if let Some(phase) = self.chat_ui.phases.get(&card) {
             return Some(Cow::Borrowed(match phase {
+                Phase::PreparingResume(_) => {
+                    "Preparing the saved conversation. Wait for it to finish."
+                }
                 Phase::Starting(_) => {
                     "Connecting to native chat. Wait for the connection to finish."
                 }
@@ -9386,13 +9441,143 @@ impl Cagents {
                 {
                     return Task::none();
                 }
-                // Normal authenticated Start already supports replacing this
-                // exact closed reader. Its account, owner, conversation and
-                // admission fences run before any provider starts. Keep the
-                // issued allocation/proof and the Runtime's unsent content;
-                // this action neither sends the draft nor creates a new chat.
-                let session = runtime.session.clone();
-                return self.start_chat(target.card, session, chat::Intent::Start, None, false);
+                let source = runtime.session.clone();
+                let Some(writer) = &self.session else {
+                    if let Some(runtime) = self.chat_runtime_mut(target) {
+                        runtime.error = Some(
+                            "Session storage is unavailable; the conversation was not started."
+                                .into(),
+                        );
+                    }
+                    return Task::none();
+                };
+                let writer = writer.writer_token();
+                let operation = self.chat_ui.next_target(target.card);
+                self.chat_ui.phases.insert(
+                    target.card,
+                    Phase::PreparingResume(ResumePreparation {
+                        target: operation,
+                        runtime: target,
+                        source: source.clone(),
+                        prepared: None,
+                        writer,
+                        window: self.core.main_window_id(),
+                    }),
+                );
+                return cosmic::task::future(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        let socket = crate::terminal::ipc::daemon_socket_path()
+                            .map_err(|error| error.to_string())?;
+                        crate::control::ControlClient::connect(&socket)
+                            .map_err(|error| error.to_string())?
+                            .prepare_chat_resume(source)
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(error.to_string()));
+                    action(Action::ResumePrepared(operation, result))
+                });
+            }
+            Action::ResumePrepared(target, result) => {
+                let Some(Phase::PreparingResume(resume)) = self.chat_ui.phases.get(&target.card)
+                else {
+                    return Task::none();
+                };
+                let resume = resume.clone();
+                if resume.target != target || resume.prepared.is_some() {
+                    return Task::none();
+                }
+                if !self.history_resume_current(&resume) {
+                    self.chat_ui
+                        .finish(target, |phase| matches!(phase, Phase::PreparingResume(_)));
+                    return Task::none();
+                }
+                let prepared = match result {
+                    Ok(prepared) if prepared == resume.source => {
+                        self.chat_ui
+                            .finish(target, |phase| matches!(phase, Phase::PreparingResume(_)));
+                        return self.start_chat(
+                            target.card,
+                            prepared,
+                            chat::Intent::Start,
+                            None,
+                            false,
+                        );
+                    }
+                    Ok(prepared) if chat::is_prepared_history_resume(&resume.source, &prepared) => {
+                        prepared
+                    }
+                    Ok(_) => {
+                        return self.history_resume_failed(
+                            resume,
+                            "Resume preparation changed the saved conversation or account".into(),
+                        );
+                    }
+                    Err(error) => return self.history_resume_failed(resume, error),
+                };
+                // Snapshot includes the same pane's current draft and attachments.
+                // Only storage sees B until the exact atomic checkpoint succeeds.
+                let mut snapshot = self.persistent_workspace();
+                let Some(card) = Arc::make_mut(&mut snapshot)
+                    .cards
+                    .iter_mut()
+                    .find(|card| card.id == target.card)
+                else {
+                    return Task::none();
+                };
+                card.kind = CardKind::Chat(prepared.clone());
+                let receipt = self.session.as_ref().unwrap().save_chat_resume(
+                    snapshot,
+                    target.card,
+                    resume.source.clone(),
+                    prepared.clone(),
+                );
+                if let Some(Phase::PreparingResume(resume)) =
+                    self.chat_ui.phases.get_mut(&target.card)
+                {
+                    resume.prepared = Some(prepared);
+                }
+                return cosmic::task::future(async move {
+                    let result = match receipt {
+                        Ok(receipt) => tokio::task::spawn_blocking(move || {
+                            receipt.recv().unwrap_or_else(|_| {
+                                Err("Session writer did not acknowledge resume preparation".into())
+                            })
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(error.to_string())),
+                        Err(error) => Err(error),
+                    };
+                    action(Action::ResumeCommitted(target, result))
+                });
+            }
+            Action::ResumeCommitted(target, result) => {
+                let Some(Phase::PreparingResume(resume)) = self.chat_ui.phases.get(&target.card)
+                else {
+                    return Task::none();
+                };
+                let resume = resume.clone();
+                if resume.target != target || resume.prepared.is_none() {
+                    return Task::none();
+                }
+                if !self.history_resume_current(&resume) {
+                    self.chat_ui
+                        .finish(target, |phase| matches!(phase, Phase::PreparingResume(_)));
+                    return Task::none();
+                }
+                if let Err(error) = result {
+                    return self.history_resume_failed(resume, error);
+                }
+                let prepared = resume.prepared.unwrap();
+                self.chat_ui
+                    .finish(target, |phase| matches!(phase, Phase::PreparingResume(_)));
+                let runtime = self.chat_runtime_mut(resume.runtime).unwrap();
+                runtime.session = prepared.clone();
+                runtime.disconnected = true;
+                runtime.error = None;
+                self.install_chat_session(target.card, prepared.clone());
+                self.persist();
+                return self.start_chat(target.card, prepared, chat::Intent::Start, None, false);
             }
             Action::StartFresh(card) => {
                 let Some(CardKind::Chat(session)) = self.card_state(card).map(|state| &state.kind)
@@ -18546,7 +18731,9 @@ mod tests {
                     while let Some(action) = stream.next().await {
                         if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
                             message @ Message::ChatUi(
-                                Action::AccountCommitted(..) | Action::UpgradeCommitted(..),
+                                Action::AccountCommitted(..)
+                                | Action::UpgradeCommitted(..)
+                                | Action::ResumeCommitted(..),
                             ),
                         )) = action
                         {
@@ -19567,12 +19754,59 @@ mod tests {
                     .has_connected_saved_history(&chat_runtime(&app, card).snapshot)
             );
 
+            let directory = tempfile::tempdir().unwrap();
+            let (writer, _) = crate::session::SessionRuntime::open(
+                directory.path().join("resume.sqlite3"),
+                crate::model::BootId::new("resume-pane"),
+            )
+            .unwrap();
+            app.session = Some(writer);
+            app.persist();
+            app.session
+                .as_ref()
+                .unwrap()
+                .flush(Duration::from_secs(10))
+                .unwrap();
+            let store = app.session.as_ref().unwrap().operation_store();
             drop(app.handle_chat_ui(Action::ResumeSaved(target)));
+            let Phase::PreparingResume(preparation) = &app.chat_ui.phases[&card] else {
+                panic!("explicit preparation");
+            };
+            let operation = preparation.target;
+            assert!(
+                app.chat_ui.attempt(card).is_none(),
+                "preparation cannot start a provider"
+            );
+            let mut prepared = source.clone();
+            prepared.id = TerminalId::new();
+            let checkpoint =
+                app.handle_chat_ui(Action::ResumePrepared(operation, Ok(prepared.clone())));
+            assert!(
+                app.chat_ui.attempt(card).is_none(),
+                "enqueueing storage is not an acknowledgement"
+            );
+            app.card_state_mut(card).unwrap().title = "Edited during resume save".into();
+            app.persist();
+            let receipt = account_commit_reply(checkpoint);
+            assert!(matches!(
+                &receipt,
+                Message::ChatUi(Action::ResumeCommitted(_, Ok(())))
+            ));
+            assert_eq!(
+                store.load_card(card, None).unwrap().unwrap().kind,
+                CardKind::Chat(prepared.clone())
+            );
+            assert_eq!(
+                chat_runtime(&app, card).session,
+                source,
+                "no UI publication before ACK"
+            );
+            drop(app.update(receipt));
             let attempt = app.chat_ui.attempt(card).unwrap();
             assert_eq!(attempt.intent, chat::Intent::Start);
             assert_eq!(
-                attempt.session, source,
-                "use the exact authenticated reader descriptor"
+                attempt.session, prepared,
+                "use the product-issued durable successor descriptor"
             );
             let failed = attempt.target;
             drop(app.handle_chat_ui(Action::ResumeSaved(target)));
@@ -19597,8 +19831,8 @@ mod tests {
                 app.chat_ui.attempt(card).unwrap().intent,
                 chat::Intent::RetryStart
             );
-            assert_eq!(app.chat_ui.attempt(card).unwrap().session, source);
-            let mut confirmed = source.clone();
+            assert_eq!(app.chat_ui.attempt(card).unwrap().session, prepared);
+            let mut confirmed = prepared.clone();
             confirmed.native_continuity =
                 chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
             answer_start(
@@ -19618,7 +19852,7 @@ mod tests {
             );
             let runtime = chat_runtime(&app, card);
             assert_eq!(runtime as *const Runtime as usize, allocation);
-            assert_eq!(runtime.session.id, source.id);
+            assert_eq!(runtime.session.id, prepared.id);
             assert_eq!(runtime.session.launch, source.launch);
             assert_eq!(runtime.composer.text(), "Keep this draft unsent");
             assert_eq!(runtime.composer.cursor(), cursor);
@@ -19627,6 +19861,99 @@ mod tests {
             assert!(!runtime.disconnected);
             assert!(runtime.handle().unwrap().snapshot().ready);
         });
+    }
+
+    #[test]
+    fn saved_history_resume_late_receipt_cannot_start_closed_replaced_or_aba_pane() {
+        for changed in ["closed", "writer", "aba", "failed"] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+            let mut source = chat_runtime(&app, card).session.clone();
+            source.native_continuity = chat::NativeContinuity::ReconnectOnly;
+            source.launch.session_id = Some(KNOWN_THREAD.into());
+            app.install_chat_session(card, source.clone());
+            let target = chat_runtime(&app, card).target;
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.session = source.clone();
+            let snapshot = Snapshot {
+                session_id: source.launch.session_id.clone(),
+                exited: true,
+                read_only_reason: Some("Saved history; no provider was started".into()),
+                ..Default::default()
+            };
+            runtime.snapshot = Arc::new(snapshot.clone());
+            runtime.connection =
+                Connection::Live(Arc::new(ClientHandle::fixture(source.clone(), snapshot)));
+            runtime.replace_draft(text_editor::Content::with_text(
+                "Keep even when resume is refused",
+            ));
+            let directory = tempfile::tempdir().unwrap();
+            let (writer, _) = crate::session::SessionRuntime::open(
+                directory.path().join("original.sqlite3"),
+                crate::model::BootId::new("resume-pane"),
+            )
+            .unwrap();
+            app.session = Some(writer);
+            app.persist();
+            app.session
+                .as_ref()
+                .unwrap()
+                .flush(Duration::from_secs(10))
+                .unwrap();
+            drop(app.handle_chat_ui(Action::ResumeSaved(target)));
+            let Phase::PreparingResume(preparation) = &app.chat_ui.phases[&card] else {
+                panic!("explicit preparation");
+            };
+            let operation = preparation.target;
+            let mut prepared = source.clone();
+            prepared.id = TerminalId::new();
+            let checkpoint =
+                app.handle_chat_ui(Action::ResumePrepared(operation, Ok(prepared.clone())));
+            assert!(app.chat_ui.attempt(card).is_none());
+            let receipt = account_commit_reply(checkpoint);
+            assert!(matches!(
+                &receipt,
+                Message::ChatUi(Action::ResumeCommitted(_, Ok(())))
+            ));
+            match changed {
+                "closed" => {
+                    app.notices.entries.clear();
+                    close_chat(&mut app, card);
+                }
+                "writer" => {
+                    let (writer, _) = crate::session::SessionRuntime::open(
+                        directory.path().join("replacement.sqlite3"),
+                        crate::model::BootId::new("resume-pane"),
+                    )
+                    .unwrap();
+                    app.session = Some(writer);
+                }
+                "aba" => {
+                    let mut other = source.clone();
+                    other.id = TerminalId::new();
+                    app.install_chat_session(card, other);
+                    app.install_chat_session(card, source.clone());
+                }
+                "failed" => {
+                    drop(app.handle_chat_ui(Action::ResumeCommitted(
+                        operation,
+                        Err("disk full".into()),
+                    )));
+                }
+                _ => unreachable!(),
+            }
+            drop(app.update(receipt));
+            assert!(
+                app.chat_ui.attempt(card).is_none(),
+                "a stale or failed ACK cannot admit a provider: {changed}"
+            );
+            assert!(app.chat_ui.explicit_starts.get(&card).is_none());
+            if changed != "closed" {
+                let runtime = chat_runtime(&app, card);
+                assert_eq!(runtime.session, source);
+                assert_eq!(runtime.composer.text(), "Keep even when resume is refused");
+            }
+        }
     }
 
     #[test]

@@ -1773,6 +1773,26 @@ impl ClientHandle {
         )
     }
 
+    /// Replay an explicit Start whose successful response was lost, over the
+    /// real client protocol without discovering or launching a public daemon.
+    #[cfg(all(test, feature = "host"))]
+    pub(crate) fn fixture_retry_start(
+        stream: UnixStream,
+        session: Session,
+    ) -> Result<Self, StartFailure> {
+        Self::connect_on(
+            stream,
+            session,
+            Intent::RetryStart,
+            None,
+            false,
+            None,
+            None,
+            None,
+            |_| {},
+        )
+    }
+
     fn connect_on(
         mut stream: UnixStream,
         session: Session,

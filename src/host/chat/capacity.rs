@@ -1943,9 +1943,10 @@ pub(super) fn recover_saved_history(
     register_saved_history_alias(host, source)
 }
 
-/// Classify an already authenticated paging reader for an explicit Retry.
-/// This returns its unchanged descriptor, never retirement or launch authority;
-/// normal Start repeats the execution/account/admission checks if requested.
+/// Classify an authenticated paging reader for explicit resume. A retired
+/// Agent allocation must be succeeded after independent retirement admission;
+/// ordinary unmanaged readers keep their exact descriptor. Neither starts a
+/// provider. Normal Start still repeats execution/account/admission checks.
 pub(super) fn prepare_saved_history(
     host: &SharedHost,
     source: &Session,
@@ -1989,7 +1990,11 @@ pub(super) fn prepare_saved_history(
     // normal reservation/close path. This frees its slot without resurrecting
     // the canonical Agent or starting a provider, even at capacity one.
     super::close_captured(host, target)?;
-    Ok(Some(super::prepare_resume_successor(host, source.clone())?))
+    let mut successor = super::prepare_resume_successor(host, source.clone())?;
+    // Presentation proof permits a crash before Start to reopen B as forced
+    // read-only history. It grants no retained actor or execution authority.
+    successor.proof = source.proof.clone();
+    Ok(Some(successor))
 }
 
 /// An inactive window may retain a different former proof for this same

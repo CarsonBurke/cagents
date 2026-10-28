@@ -373,6 +373,13 @@ enum ConversionCheckpoint {
     },
     IdentityReplacement(IdentityReplacement),
     ChatRecovery(ChatRecoveryWrite),
+    ChatResume {
+        snapshot: Arc<WorkspaceState>,
+        card: CardId,
+        source: crate::chat::Session,
+        replacement: crate::chat::Session,
+        reply: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
+    },
     RetainedChatCopy {
         copy: crate::persistence::RetainedChatCopy,
         // The first failure is reported once. Data-only retries retain their
@@ -441,6 +448,7 @@ struct QueueState {
 }
 
 pub struct SessionRuntime {
+    identity: Arc<()>,
     queue: Arc<(Mutex<QueueState>, Condvar)>,
     last_error: Arc<Mutex<Option<String>>>,
     health: async_channel::Receiver<SessionSaveHealthEvent>,
@@ -556,6 +564,7 @@ impl SessionRuntime {
                 queue,
                 last_error,
                 health: health_rx,
+                identity: Arc::new(()),
                 worker: Some(worker),
                 database_path,
                 restored_projects: projects,
@@ -764,6 +773,56 @@ impl SessionRuntime {
     ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String>
     {
         self.rebind_chat(ChatRecoveryKind::Account, card_id, source, replacement)
+    }
+
+    /// Queue an atomic prepared allocation and associated-content checkpoint.
+    pub fn save_chat_resume(
+        &self,
+        snapshot: Arc<WorkspaceState>,
+        card: CardId,
+        source: crate::chat::Session,
+        replacement: crate::chat::Session,
+    ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String>
+    {
+        let (reply, receiver) = std::sync::mpsc::sync_channel(1);
+        let (lock, changed) = &*self.queue;
+        let mut queue = lock.lock().map_err(|_| "Session writer is unavailable")?;
+        if queue.shutdown {
+            return Err("Session writer is shutting down".into());
+        }
+        queue.ordered_identities = true;
+        for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
+            queue
+                .conversions
+                .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
+        }
+        if let Some(previous) = queue.latest.take() {
+            queue
+                .conversions
+                .push_back(ConversionCheckpoint::Snapshot(previous));
+        }
+        queue
+            .conversions
+            .push_back(ConversionCheckpoint::ChatResume {
+                snapshot,
+                card,
+                source,
+                replacement,
+                reply,
+            });
+        changed.notify_one();
+        Ok(receiver)
+    }
+
+    /// Stable lifetime token for callbacks bound to this exact writer.
+    pub(crate) fn same_writer(&self, token: &std::sync::Weak<()>) -> bool {
+        token
+            .upgrade()
+            .is_some_and(|token| Arc::ptr_eq(&self.identity, &token))
+    }
+
+    pub(crate) fn writer_token(&self) -> std::sync::Weak<()> {
+        Arc::downgrade(&self.identity)
     }
 
     /// Commit authenticated daemon-upgrade lineage before activating the chat.
@@ -1075,6 +1134,9 @@ struct PendingWrites {
     /// queued while the UI awaited acknowledgment. Other card fields, including
     /// tombstones, remain exactly as submitted.
     chat_rebindings: HashMap<CardId, (crate::chat::Session, crate::chat::Session)>,
+    // Bridges only snapshots queued before the exact resume receipt returns.
+    // First observed replacement/other source retires the bridge permanently.
+    resume_rebindings: HashMap<CardId, (crate::chat::Session, crate::chat::Session)>,
     retained_chat_copies: HashMap<CardId, crate::persistence::RetainedChatCopy>,
 }
 
@@ -1443,6 +1505,18 @@ trait SessionStore {
             "This store does not support account recovery".into(),
         ))
     }
+    fn save_chat_resume(
+        &self,
+        _snapshot: &WorkspaceState,
+        _base: SnapshotBase<'_>,
+        _card: CardId,
+        _source: &crate::chat::Session,
+        _replacement: &crate::chat::Session,
+    ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+        Err(StoreError::InvalidState(
+            "This store does not support resume preparation".into(),
+        ))
+    }
     fn replace_terminal_identity(
         &self,
         card_id: CardId,
@@ -1542,6 +1616,16 @@ impl SessionStore for StateStore {
         replacement: &crate::chat::Session,
     ) -> Result<(), StoreError> {
         StateStore::rebind_chat_account(self, card_id, source, replacement)
+    }
+    fn save_chat_resume(
+        &self,
+        snapshot: &WorkspaceState,
+        base: SnapshotBase<'_>,
+        card: CardId,
+        source: &crate::chat::Session,
+        replacement: &crate::chat::Session,
+    ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+        StateStore::save_chat_resume(self, snapshot, base, card, source, replacement)
     }
     fn replace_terminal_identity(
         &self,
@@ -1655,6 +1739,16 @@ impl SessionStore for Arc<StateStore> {
     ) -> Result<(), StoreError> {
         StateStore::rebind_chat_account(self, card_id, source, replacement)
     }
+    fn save_chat_resume(
+        &self,
+        snapshot: &WorkspaceState,
+        base: SnapshotBase<'_>,
+        card: CardId,
+        source: &crate::chat::Session,
+        replacement: &crate::chat::Session,
+    ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+        StateStore::save_chat_resume(self, snapshot, base, card, source, replacement)
+    }
     fn replace_terminal_identity(
         &self,
         card_id: CardId,
@@ -1747,6 +1841,7 @@ impl PendingWrites {
             worktree_generations,
             quarantine: Quarantine::default(),
             chat_rebindings: HashMap::new(),
+            resume_rebindings: HashMap::new(),
             retained_chat_copies: HashMap::new(),
         }
     }
@@ -1827,9 +1922,8 @@ impl PendingWrites {
             .find_map(|checkpoint| match checkpoint {
                 ConversionCheckpoint::Snapshot(snapshot)
                 | ConversionCheckpoint::PaneAdoptions { snapshot, .. }
-                | ConversionCheckpoint::TerminalOwnershipRecovery { snapshot, .. } => {
-                    Some(snapshot.id)
-                }
+                | ConversionCheckpoint::TerminalOwnershipRecovery { snapshot, .. }
+                | ConversionCheckpoint::ChatResume { snapshot, .. } => Some(snapshot.id),
                 ConversionCheckpoint::RetainedChatCopy { copy, .. } => Some(copy.workspace),
                 ConversionCheckpoint::IdentityReplacement(_)
                 | ConversionCheckpoint::ChatRecovery(_) => None,
@@ -1907,7 +2001,22 @@ impl PendingWrites {
         Ok(())
     }
 
-    fn translate_chat_rebindings(&self, snapshot: &mut Arc<WorkspaceState>) {
+    fn translate_chat_rebindings(&mut self, snapshot: &mut Arc<WorkspaceState>) {
+        self.resume_rebindings.retain(|id, (source, replacement)| {
+            let Some(card) = snapshot.cards.iter().find(|card| card.id == *id) else {
+                return false;
+            };
+            if !matches!(&card.kind, CardKind::Chat(session) if session == source) {
+                return false;
+            }
+            Arc::make_mut(snapshot)
+                .cards
+                .iter_mut()
+                .find(|card| card.id == *id)
+                .unwrap()
+                .kind = CardKind::Chat(replacement.clone());
+            true
+        });
         let needs_translation = |state: &crate::model::CardState| {
             self.chat_rebindings.get(&state.id).is_some_and(
                 |(source, _)| matches!(&state.kind, CardKind::Chat(session) if session == source),
@@ -2060,6 +2169,38 @@ impl PendingWrites {
                         }
                     }
                 }
+                ConversionCheckpoint::ChatResume {
+                    snapshot,
+                    card,
+                    source,
+                    replacement,
+                    reply,
+                } => {
+                    let result = store.save_chat_resume(
+                        &snapshot,
+                        SnapshotBase {
+                            workspace: self.workspace_generation,
+                            cards: &self.card_generations,
+                        },
+                        card,
+                        &source,
+                        &replacement,
+                    );
+                    match result {
+                        Ok(commit) => {
+                            self.workspace_generation = commit.generation;
+                            self.card_generations = commit.card_generations;
+                            self.quarantine.snapshot_landed(&snapshot);
+                            self.acknowledge_retained_copy_closures(&snapshot);
+                            self.resume_rebindings.insert(card, (source, replacement));
+                            let _ = reply.send(Ok(()));
+                        }
+                        Err(error) => {
+                            let _ = reply.send(Err(error.to_string()));
+                        }
+                    }
+                    // Explicit admission is one-shot, including I/O failures.
+                }
                 ConversionCheckpoint::ChatRecovery(recovery) => {
                     let result = match recovery.kind {
                         ChatRecoveryKind::Account => store.rebind_chat_account(
@@ -2159,16 +2300,24 @@ impl PendingWrites {
     }
 
     fn reject_queued_terminal_recoveries(&mut self, error: &StoreError) {
-        self.conversions = std::mem::take(&mut self.conversions).into_iter().map(|checkpoint| {
-            match checkpoint {
+        self.conversions = std::mem::take(&mut self.conversions).into_iter().filter_map(|checkpoint| {
+            Some(match checkpoint {
                 ConversionCheckpoint::TerminalOwnershipRecovery { snapshot, reply, .. } => {
                     let _ = reply.send(Err(format!(
                         "Recovery could not begin because an earlier session write failed: {error}. Retry save, then review recovery again."
                     )));
                     ConversionCheckpoint::Snapshot(snapshot)
                 }
+                ConversionCheckpoint::ChatResume { reply, .. } => {
+                    let _ = reply.send(Err(format!(
+                        "Resume could not begin because an earlier session write failed: {error}. Retry save, then resume explicitly."
+                    )));
+                    // This B snapshot has no admitted descriptor transaction;
+                    // never replay it as an ordinary save after refusal.
+                    return None;
+                }
                 other => other,
-            }
+            })
         }).collect();
     }
 
@@ -2958,6 +3107,25 @@ mod tests {
             Ok(crate::persistence::WorkspaceCommit {
                 generation: 1,
                 card_generations: BTreeMap::from([(copy.source_card, 1), (copy.copy.id, 1)]),
+            })
+        }
+
+        fn save_chat_resume(
+            &self,
+            snapshot: &WorkspaceState,
+            base: SnapshotBase<'_>,
+            _card: CardId,
+            _source: &crate::chat::Session,
+            _replacement: &crate::chat::Session,
+        ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+            self.write()?;
+            Ok(crate::persistence::WorkspaceCommit {
+                generation: base.workspace + 1,
+                card_generations: snapshot
+                    .cards
+                    .iter()
+                    .map(|card| (card.id, base.cards.get(&card.id).copied().unwrap_or(0) + 1))
+                    .collect(),
             })
         }
 
@@ -4589,6 +4757,108 @@ mod tests {
 
     fn empty_writes() -> PendingWrites {
         PendingWrites::restored(0, BTreeMap::new(), HashMap::new(), HashMap::new())
+    }
+
+    #[test]
+    fn prepared_resume_io_failure_is_one_shot_and_does_not_translate_source() {
+        let store = FakeStore::new([FakeWrite::FailDiskFull, FakeWrite::Succeed]);
+        let snapshot = Arc::new(workspace());
+        let card = snapshot.cards[0].id;
+        let source = crate::chat::Session {
+            id: TerminalId::new(),
+            proof: None,
+            terminal: None,
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                session_id: Some("saved".into()),
+                recipe: LaunchRecipe {
+                    program: "claude".into(),
+                    arguments: Vec::new(),
+                    working_directory: "/project".into(),
+                    environment: BTreeMap::new(),
+                    unset_environment: Default::default(),
+                },
+            },
+        };
+        let mut replacement = source.clone();
+        replacement.id = TerminalId::new();
+        let (reply, receipt) = std::sync::mpsc::sync_channel(1);
+        let mut writes = empty_writes();
+        writes
+            .conversions
+            .push_back(ConversionCheckpoint::ChatResume {
+                snapshot,
+                card,
+                source,
+                replacement,
+                reply,
+            });
+        assert!(writes.flush(&store).is_empty());
+        assert!(receipt.recv().unwrap().is_err());
+        assert!(writes.resume_rebindings.is_empty());
+        assert_eq!(writes.workspace_generation, 0);
+        assert!(writes.flush(&store).is_empty());
+        assert_eq!(
+            store.attempts.load(Ordering::Relaxed),
+            1,
+            "failed explicit admission cannot retry in the background"
+        );
+    }
+
+    #[test]
+    fn prepared_resume_snapshot_bridge_retires_before_a_later_source_aba() {
+        let mut snapshot = workspace();
+        let card = snapshot.cards[0].id;
+        let source = crate::chat::Session {
+            id: TerminalId::new(),
+            proof: None,
+            terminal: None,
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                session_id: Some("saved".into()),
+                recipe: LaunchRecipe {
+                    program: "claude".into(),
+                    arguments: Vec::new(),
+                    working_directory: "/project".into(),
+                    environment: BTreeMap::new(),
+                    unset_environment: Default::default(),
+                },
+            },
+        };
+        snapshot.cards[0].kind = CardKind::Chat(source.clone());
+        snapshot
+            .chat_drafts
+            .insert(card, "Late draft stays unsent".into());
+        let mut replacement = source.clone();
+        replacement.id = TerminalId::new();
+        for other_before_source in [false, true] {
+            let mut writes = empty_writes();
+            writes
+                .resume_rebindings
+                .insert(card, (source.clone(), replacement.clone()));
+            let mut pending = Arc::new(snapshot.clone());
+            writes.translate_chat_rebindings(&mut pending);
+            assert_eq!(pending.cards[0].kind, CardKind::Chat(replacement.clone()));
+            assert_eq!(pending.chat_drafts, snapshot.chat_drafts);
+            if other_before_source {
+                let mut other = replacement.clone();
+                other.id = TerminalId::new();
+                Arc::make_mut(&mut pending).cards[0].kind = CardKind::Chat(other);
+            }
+            writes.translate_chat_rebindings(&mut pending);
+            assert!(writes.resume_rebindings.is_empty());
+            let mut returned = Arc::new(snapshot.clone());
+            writes.translate_chat_rebindings(&mut returned);
+            assert_eq!(
+                returned.cards[0].kind,
+                CardKind::Chat(source.clone()),
+                "a later deliberate A must not become B"
+            );
+        }
     }
 
     #[test]
