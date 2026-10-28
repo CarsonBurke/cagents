@@ -6092,9 +6092,9 @@ mod tests {
     }
 
     fn parent_question_after_child_error() -> Value {
-        // The actor/store helper needs a genuine parent attention callback.
-        // This independent question leaves its parent turn running; a child
-        // error must neither supply that callback nor settle the parent.
+        // Supply an independently fingerprinted parent question while its
+        // turn stays running. A waiting child can already produce aggregate
+        // Waiting attention; a child error must not supply a parent outcome.
         json!({"id":71,"method":"item/tool/requestUserInput","params":{"threadId":"thread-exact","turnId":"parent-turn","questions":[{"id":"parent-choice","header":"Parent choice","question":"Continue parent work?","options":[{"label":"Keep","description":"Keep parent work"},{"label":"Replace","description":"Replace parent work"}]}]}})
     }
 
@@ -6177,8 +6177,40 @@ mod tests {
             frames,
             false,
         );
-        assert_eq!(receipts.len(), 1);
-        assert_eq!(receipts[0].0.kind, crate::notifications::Kind::Waiting);
+        let [
+            (child_waiting, child_context),
+            (parent_question, parent_context),
+        ] = receipts.as_slice()
+        else {
+            panic!("only the real child wait and parent question notify: {receipts:?}");
+        };
+        assert_eq!(child_waiting.kind, crate::notifications::Kind::Waiting);
+        assert_eq!(parent_question.kind, crate::notifications::Kind::Waiting);
+        assert_eq!(
+            child_context,
+            &crate::notifications::Content {
+                conversation: "Parent conversation".into(),
+                preview: "Parent work remains here".into(),
+                request: None,
+            },
+            "child waiting announces aggregate activity before a parent request exists"
+        );
+        assert_eq!(
+            parent_context,
+            &crate::notifications::Content {
+                conversation: "Parent conversation".into(),
+                preview: "Parent choice · Continue parent work?".into(),
+                request: Some(crate::notifications::RequestType::Question),
+            },
+            "only the genuine parent question changes actionable request metadata"
+        );
+        let (child_owner, child_generation) = child_waiting.key.rsplit_once(":waiting:").unwrap();
+        let (parent_owner, parent_generation) =
+            parent_question.key.rsplit_once(":waiting:").unwrap();
+        assert_eq!(child_owner, parent_owner);
+        assert!(
+            child_generation.parse::<u64>().unwrap() < parent_generation.parse::<u64>().unwrap()
+        );
         assert_child_error_parent_and_sibling(&state);
         let child = state
             .subagents

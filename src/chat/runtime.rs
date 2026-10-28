@@ -3681,6 +3681,7 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
     struct Frame {
         adapter: Box<dyn Adapter>,
         frames: std::collections::VecDeque<serde_json::Value>,
+        interrupted: Arc<AtomicBool>,
     }
     impl Adapter for Frame {
         fn initialize(&mut self) -> Result<Step, String> {
@@ -3689,9 +3690,26 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
                 ..Default::default()
             })
         }
-        fn command(&mut self, _: Command) -> Result<Step, String> {
-            self.adapter
-                .receive(self.frames.pop_front().ok_or("fixture frames consumed")?)
+        fn command(&mut self, command: Command) -> Result<Step, String> {
+            match command {
+                Command::Refresh => self
+                    .adapter
+                    .receive(self.frames.pop_front().ok_or("fixture frames consumed")?),
+                Command::Interrupt if self.frames.is_empty() => {
+                    // The script has no live provider work. A busy captured
+                    // snapshot still needs an explicit fixture teardown ACK;
+                    // never consume another provider frame or emit an outcome.
+                    self.interrupted.store(true, Ordering::Release);
+                    Ok(Step {
+                        events: vec![Event::Status {
+                            busy: false,
+                            detail: "Fixture interruption acknowledged".into(),
+                        }],
+                        ..Step::default()
+                    })
+                }
+                _ => Err("fixture accepts scripted Refresh and final Interrupt only".into()),
+            }
         }
         fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
             Ok(Step::default())
@@ -3708,9 +3726,11 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
         working_directory: directory.path().into(),
         environment: BTreeMap::new(),
     };
+    let interrupted = Arc::new(AtomicBool::new(false));
     let mut adapter: Box<dyn Adapter> = Box::new(Frame {
         adapter,
         frames: frames.into(),
+        interrupted: interrupted.clone(),
     });
     let mut initial = adapter.initialize().unwrap();
     let store = preflight(&spec, &mut initial).unwrap();
@@ -3750,6 +3770,22 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
         }
     }
     closed.unwrap();
+    if snapshot.busy && !snapshot.exited && snapshot.error.is_none() && !fail_store {
+        assert!(
+            interrupted.load(Ordering::Acquire),
+            "a healthy busy fixture must acknowledge teardown explicitly"
+        );
+        assert!(
+            handle.failure().is_none(),
+            "fixture teardown must not wait for an interruption timeout: {:?}",
+            handle.failure()
+        );
+        let teardown_receipts: Vec<_> = receive.try_iter().collect();
+        assert!(
+            teardown_receipts.is_empty(),
+            "fixture teardown cannot invent provider attention: {teardown_receipts:?}"
+        );
+    }
     assert!(
         handle.is_completed(),
         "real fixture process teardown must still be proved"
@@ -3761,6 +3797,39 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn notification_frame_fixture_preserves_busy_capture_and_acknowledges_teardown() {
+        struct Waiting;
+        impl Adapter for Waiting {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("fixture commands must not reach the decoder".into())
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![Event::Waiting(true)],
+                    ..Step::default()
+                })
+            }
+        }
+        let (receipts, snapshot) = notification_frames_with_snapshot_for_test(
+            Box::new(Waiting),
+            vec![serde_json::Value::Null],
+            false,
+        );
+        assert!(snapshot.busy && snapshot.waiting && !snapshot.exited);
+        assert!(snapshot.error.is_none());
+        assert_eq!(
+            receipts.len(),
+            1,
+            "teardown must not publish a turn outcome"
+        );
+        assert_eq!(receipts[0].0.kind, crate::notifications::Kind::Waiting);
+        assert_eq!(receipts[0].1.request, None);
+    }
+
     #[test]
     fn typed_provider_error_items_keep_full_provenance_and_ids_through_store_hydration() {
         let mut store = Store::new().unwrap();
