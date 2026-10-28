@@ -20,11 +20,11 @@ use thiserror::Error;
 mod accounts;
 pub use accounts::AccountCommand;
 mod agents;
+#[cfg(test)]
+mod automation_work_authority_tests;
 mod channel_work;
 mod channels;
 mod chat;
-#[cfg(test)]
-mod automation_work_authority_tests;
 #[cfg(test)]
 mod project_channel_authority_tests;
 pub use chat::ChatCommand;
@@ -2352,8 +2352,24 @@ where
         emit_error(cli.json, &error);
         return ExitCode::FAILURE;
     }
+    // Preserve the original caller before operational recovery or delegation
+    // to a staged CLI whose Automation/Work transport may predate this policy.
+    let service_context = matches!(
+        &cli.command,
+        TopCommand::Automation { .. } | TopCommand::Work { .. }
+    )
+    .then(ServiceRequestContext::capture);
+    if let Some(context) = &service_context
+        && let Err(error) = context.admit_remote()
+    {
+        emit_error(cli.json, &error);
+        return ExitCode::FAILURE;
+    }
     if !crate::device::is_remote()
         && routes_to_staged_owner_as(&cli.command, project_channel_context.as_ref())
+        && !service_context
+            .as_ref()
+            .is_some_and(|context| context.scoped())
     {
         let recover = !no_start && staged_command_requires_daemon(&cli.command);
         match staged_lookup(&std::env::current_exe().unwrap_or_default(), recover) {
@@ -2412,7 +2428,7 @@ where
             return ExitCode::FAILURE;
         }
     }
-    match execute_with_model_context(cli.command, project_channel_context) {
+    match execute_with_model_context(cli.command, project_channel_context, service_context) {
         Ok(output) => {
             let code = output.exit_code();
             emit_success(cli.json, output);
@@ -2475,12 +2491,13 @@ pub fn staged_ui_executable() -> io::Result<Option<PathBuf>> {
 }
 
 fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
-    execute_with_model_context(command, None)
+    execute_with_model_context(command, None, None)
 }
 
 fn execute_with_model_context(
     command: TopCommand,
     project_channel_context: Option<ProjectChannelContext>,
+    service_context: Option<ServiceRequestContext>,
 ) -> Result<CommandOutput, AppError> {
     match command {
         TopCommand::Completions { shell } => Ok(completions::execute(shell)),
@@ -2504,8 +2521,14 @@ fn execute_with_model_context(
             })
         }
         TopCommand::Linear(command) => linear::execute(command),
-        TopCommand::Automation { command } => automations::execute(command),
-        TopCommand::Work { command } => work::execute(command),
+        TopCommand::Automation { command } => match service_context {
+            Some(context) => automations::execute_with_context(command, &context),
+            None => automations::execute(command),
+        },
+        TopCommand::Work { command } => match service_context {
+            Some(context) => work::execute_with_context(command, &context),
+            None => work::execute(command),
+        },
         TopCommand::Agent { command } => agents::execute(command),
         TopCommand::Whoami => sessions::whoami(),
         TopCommand::Account { command } => accounts::execute(command),
@@ -3491,6 +3514,46 @@ fn protocol_error(error: ControlError) -> AppError {
         kind,
         message: error.to_string(),
         details,
+    }
+}
+
+/// Automation and Work share endpoint selection, while retaining their
+/// distinct business-envelope and connection-authentication contracts.
+struct ServiceRequestContext {
+    authority: Authority,
+    remote: bool,
+}
+
+impl ServiceRequestContext {
+    fn capture() -> Self {
+        Self {
+            authority: Authority::from_environment(),
+            remote: crate::device::is_remote(),
+        }
+    }
+
+    fn scoped(&self) -> bool {
+        self.authority.token().is_some()
+    }
+
+    fn admit_remote(&self) -> Result<(), AppError> {
+        if self.scoped() && self.remote {
+            return Err(AppError::new(
+                "permission_denied",
+                "Automation and Work commands from an agent session require your own terminal on the remote device",
+            ));
+        }
+        Ok(())
+    }
+
+    fn connect(&self) -> Result<ControlClient, AppError> {
+        self.admit_remote()?;
+        let socket = if self.scoped() {
+            daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?
+        } else {
+            control_daemon_socket()?
+        };
+        ControlClient::connect(&socket).map_err(|error| AppError::new("daemon_connection", error))
     }
 }
 
