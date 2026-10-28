@@ -189,7 +189,7 @@ mod tests {
         let opening = app.begin_sidebar_group_delete();
         assert_eq!(
             super::super::tests::focused_element(app.sidebar_selection_dialog().unwrap(), opening),
-            Some(close_focus_id())
+            app.sidebar_selection_dialog_focus_target()
         );
         let dialog = app.sidebar_selection_ui.dialog.as_ref().unwrap();
         assert_eq!(dialog.targets.len(), 2);
@@ -213,6 +213,136 @@ mod tests {
         assert_eq!(app.durable.active_channel, Some(ids[2]));
         assert_eq!(app.workspace.focused(), focused);
         assert!(!app.modal_is_open(), "no per-member confirmation");
+    }
+
+    #[test]
+    fn group_channel_delete_rejects_panes_added_after_confirmation_without_deleting_a_subset() {
+        let (mut app, _, ids) = fixture();
+        select(&mut app, &ids[..2]);
+        drop(app.begin_sidebar_group_delete());
+        let card = app.durable.cards[0].id;
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|row| row.id == ids[1])
+            .unwrap()
+            .cards
+            .push(card);
+        drop(app.update_sidebar_selection(Action::Confirm));
+        assert!(
+            app.sidebar_selection_ui
+                .dialog
+                .as_ref()
+                .unwrap()
+                .error
+                .is_some()
+        );
+        assert!(
+            ids.iter()
+                .all(|id| app.durable.channels.iter().any(|row| row.id == *id))
+        );
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.channel_ui.deletion_running());
+    }
+
+    #[test]
+    fn group_channel_delete_rechecks_dirty_and_recovery_editor_barriers() {
+        for warning in [false, true] {
+            let (mut app, _, ids) = fixture();
+            let editor = app.durable.cards[0].id;
+            let (clean, _) =
+                repository_widget::RepositoryRuntime::open_fixture(editor, "notes.txt", "saved\n");
+            app.card_state_mut(editor).unwrap().kind =
+                CardKind::Repository(clean.descriptor.clone());
+            app.cards
+                .insert(editor, CardRuntime::Repository(Box::new(clean)));
+            Arc::make_mut(&mut app.durable)
+                .channels
+                .iter_mut()
+                .find(|row| row.id == ids[1])
+                .unwrap()
+                .cards
+                .push(editor);
+            select(&mut app, &ids[..2]);
+            drop(app.begin_sidebar_group_delete());
+            let blocked = if warning {
+                let mut runtime =
+                    repository_widget::RepositoryRuntime::post_persist_warning_fixture(editor);
+                for action in [
+                    iced::widget::text_editor::Action::SelectAll,
+                    iced::widget::text_editor::Action::Edit(
+                        iced::widget::text_editor::Edit::Paste(Arc::new("B\n".into())),
+                    ),
+                ] {
+                    drop(
+                        runtime.update(repository_widget::RepositoryAction::EditorAction {
+                            card: editor,
+                            action,
+                        }),
+                    );
+                }
+                assert!(!runtime.is_dirty());
+                runtime
+            } else {
+                repository_widget::RepositoryRuntime::dirty_fixture(editor)
+            };
+            assert!(blocked.blocks_navigation());
+            app.cards
+                .insert(editor, CardRuntime::Repository(Box::new(blocked)));
+            drop(app.update_sidebar_selection(Action::Confirm));
+            assert_eq!(
+                app.sidebar_selection_ui.dialog.as_ref().unwrap().blocked(),
+                1
+            );
+            assert!(
+                ids.iter()
+                    .all(|id| app.durable.channels.iter().any(|row| row.id == *id))
+            );
+            assert!(app.card_state(editor).unwrap().existence.is_open());
+            assert!(!app.channel_ui.deletion_running());
+        }
+    }
+
+    #[test]
+    fn channel_group_and_project_delete_survive_other_targets_closed_member_cleanup() {
+        for project_scope in [false, true] {
+            let (mut app, _, ids) = fixture();
+            // Newest selected channel is first in visible/execution order.
+            drop(app.select_channel(ids[1]));
+            assert!(app.active_workspace.is_some());
+            let mut closed = app.durable.cards[0].clone();
+            closed.id = CardId::new();
+            closed.existence =
+                super::super::project_ui::removed_existence("closed before selection");
+            let durable = Arc::make_mut(&mut app.durable);
+            durable
+                .channels
+                .iter_mut()
+                .find(|row| row.id == ids[0])
+                .unwrap()
+                .cards
+                .push(closed.id);
+            durable.cards.push(closed);
+            if project_scope {
+                drop(app.delete_channels(vec![ids[1], ids[0]]));
+            } else {
+                select(&mut app, &ids[..2]);
+                drop(app.begin_sidebar_group_delete());
+                assert_eq!(
+                    app.sidebar_selection_ui.dialog.as_ref().unwrap().targets[0].row,
+                    SelectionRow::Channel(ids[1])
+                );
+                drop(app.update_sidebar_selection(Action::Confirm));
+            }
+            assert!(
+                ids[..2]
+                    .iter()
+                    .all(|id| !app.durable.channels.iter().any(|row| row.id == *id)),
+                "own scope cleanup must not silently delete only part of the confirmed group"
+            );
+            assert!(app.durable.channels.iter().any(|row| row.id == ids[2]));
+            assert!(!app.channel_ui.deletion_running());
+        }
     }
 
     #[test]
@@ -370,15 +500,136 @@ mod tests {
             vec![SelectionRow::Channel(ids[1])]
         );
     }
+    #[test]
+    fn group_primary_and_escape_restore_actual_invoker_not_first_selected_row() {
+        let (mut app, _, ids) = fixture();
+        app.context_inspector_open = false;
+        select(&mut app, &ids[..2]);
+        let invoker = SelectionRow::Channel(ids[1]);
+        let opening = app.update(Message::Sidebar(SidebarAction::DeleteSelectedRowsFrom(
+            invoker,
+        )));
+        let primary = app
+            .sidebar_selection_ui
+            .dialog
+            .as_ref()
+            .unwrap()
+            .control_id(true, true);
+        assert_eq!(
+            super::super::tests::focused_element(app.sidebar_selection_dialog().unwrap(), opening),
+            Some(primary)
+        );
+        let closing = app.update(Message::KeyEvent {
+            event: super::super::dialog_ui::tests::key_press(keyboard::key::Named::Escape),
+            captured: false,
+        });
+        assert!(app.sidebar_selection_ui.dialog.is_none());
+        assert_eq!(
+            super::super::tests::focused(&app, closing),
+            Some(sidebar::selection_row_focus_id(invoker))
+        );
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .any(|channel| channel.id == ids[0])
+        );
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .any(|channel| channel.id == ids[1])
+        );
+    }
+
+    #[test]
+    fn group_live_target_eligibility_matches_cancel_and_reopening_retires_old_answers() {
+        let (mut app, _, ids) = fixture();
+        select(&mut app, &ids[..2]);
+        drop(app.begin_sidebar_group_delete_from(SelectionRow::Channel(ids[1])));
+        let dialog = app.sidebar_selection_ui.dialog.as_ref().unwrap();
+        let old_presentation = dialog.presentation;
+        let old_backdrop = app.sidebar_selection_dialog_dismiss_message().unwrap();
+        let primary = dialog.control_id(true, true);
+        let cancel = dialog.control_id(false, true);
+        assert_eq!(
+            app.sidebar_selection_dialog_focus_target(),
+            Some(primary.clone())
+        );
+        let extra = app.durable.cards[0].id;
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|row| row.id == ids[1])
+            .unwrap()
+            .cards
+            .push(extra);
+        assert_eq!(
+            app.sidebar_selection_dialog_focus_target(),
+            Some(cancel.clone())
+        );
+        let (messages, _) = super::super::dialog_ui::tests::key_control(
+            app.sidebar_selection_dialog().unwrap(),
+            primary,
+            super::super::dialog_ui::tests::key_press(keyboard::key::Named::Enter),
+        );
+        assert!(messages.is_empty());
+        let focus = app.update_sidebar_selection(Action::Confirm);
+        assert_eq!(
+            super::super::tests::focused_element(app.sidebar_selection_dialog().unwrap(), focus),
+            Some(cancel)
+        );
+        assert!(!app.channel_ui.deletion_running());
+        drop(app.update_sidebar_selection(Action::Dismiss));
+        drop(app.begin_sidebar_group_delete_from(SelectionRow::Channel(ids[1])));
+        let current = app
+            .sidebar_selection_ui
+            .dialog
+            .as_ref()
+            .unwrap()
+            .presentation;
+        assert_ne!(old_presentation, current);
+        assert_eq!(
+            app.update_sidebar_selection(Action::Answer {
+                presentation: old_presentation,
+                confirm: true
+            })
+            .units(),
+            0
+        );
+        assert_eq!(
+            app.sidebar_selection_ui
+                .dialog
+                .as_ref()
+                .unwrap()
+                .presentation,
+            current
+        );
+        drop(app.update(old_backdrop));
+        assert_eq!(
+            app.sidebar_selection_ui
+                .dialog
+                .as_ref()
+                .unwrap()
+                .presentation,
+            current,
+            "a queued backdrop dismissal cannot close a replacement group"
+        );
+        assert!(!app.channel_ui.deletion_running());
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum Action {
     Confirm,
     Dismiss,
+    Answer {
+        presentation: uuid::Uuid,
+        confirm: bool,
+    },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct Target {
     row: SelectionRow,
     directory: PathBuf,
@@ -389,10 +640,13 @@ struct Target {
     /// Why this member cannot go yet. Any blocker holds the whole group, so
     /// the confirmation never deletes a subset the user did not choose.
     blocker: Option<String>,
+    channel: Option<channel_ui::ChannelDeletionTarget>,
 }
 
 #[derive(Debug)]
 pub(super) struct Dialog {
+    presentation: uuid::Uuid,
+    invoker: SelectionRow,
     targets: Vec<Target>,
     error: Option<String>,
 }
@@ -402,9 +656,13 @@ impl Dialog {
         self.targets[0].row
     }
 
-    /// Every group deletion opens on its non-destructive dismissal.
-    pub(super) fn focus_target(&self) -> widget::Id {
-        close_focus_id()
+    fn control_id(&self, confirm: bool, enabled: bool) -> widget::Id {
+        let role = if confirm { "confirm" } else { "cancel" };
+        let eligibility = if enabled { "enabled" } else { "disabled" };
+        widget::Id::new(format!(
+            "dialog.sidebar-selection.{}.{role}.{eligibility}",
+            self.presentation
+        ))
     }
 
     fn blocked(&self) -> usize {
@@ -415,15 +673,42 @@ impl Dialog {
     }
 }
 
-pub(super) fn focus_id() -> widget::Id {
-    widget::Id::new("dialog.sidebar-selection.confirm")
-}
-
-fn close_focus_id() -> widget::Id {
-    widget::Id::new("dialog.sidebar-selection.close")
-}
-
 impl Cagents {
+    fn sidebar_selection_can_confirm(&self, dialog: &Dialog) -> bool {
+        dialog.error.is_none()
+            && dialog.targets.iter().all(|target| {
+                self.selected_row_target(target.row).is_ok_and(|current| {
+                    current.directory == target.directory
+                        && current.blocker.is_none()
+                        && target
+                            .channel
+                            .as_ref()
+                            .is_none_or(|consent| match target.row {
+                                SelectionRow::Channel(id) => {
+                                    self.channel_deletion_target_current(id, consent)
+                                }
+                                _ => false,
+                            })
+                })
+            })
+    }
+
+    pub(super) fn sidebar_selection_dialog_focus_target(&self) -> Option<widget::Id> {
+        self.sidebar_selection_ui
+            .dialog
+            .as_ref()
+            .map(|dialog| dialog.control_id(self.sidebar_selection_can_confirm(dialog), true))
+    }
+
+    pub(super) fn sidebar_selection_dialog_dismiss_message(&self) -> Option<Message> {
+        self.sidebar_selection_ui.dialog.as_ref().map(|dialog| {
+            Message::SidebarSelection(Action::Answer {
+                presentation: dialog.presentation,
+                confirm: false,
+            })
+        })
+    }
+
     pub(super) fn visible_sidebar_rows(&self) -> Vec<SelectionRow> {
         sidebar::visible_selection_rows(
             &self.sidebar_model,
@@ -510,6 +795,7 @@ impl Cagents {
                     label: project.name.clone(),
                     detail: project.repository.display().to_string(),
                     blocker: self.selected_project_removal_blocker(id),
+                    channel: None,
                 })
             }
             SelectionRow::Worktree(project, id) => {
@@ -524,6 +810,7 @@ impl Cagents {
                     label: worktree.label().to_owned(),
                     detail: worktree.path.display().to_string(),
                     blocker: self.selected_worktree_deletion_blocker(project, id),
+                    channel: None,
                 })
             }
             SelectionRow::Channel(id) => {
@@ -539,10 +826,8 @@ impl Cagents {
                     .ok_or("The selected channel's project is no longer open.")?;
                 let blocker = if self.channel_ui.is_deleting(id) {
                     Some("Channel deletion is already in progress.".into())
-                } else if channel.cards.iter().any(|card| matches!(self.cards.get(card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())) {
-                    Some("Save or close this channel's unsaved editor buffers first.".into())
                 } else {
-                    None
+                    self.channel_deletion_blocker(id)
                 };
                 Ok(Target {
                     row,
@@ -554,6 +839,7 @@ impl Cagents {
                     .into_owned(),
                     detail: project.name.clone(),
                     blocker,
+                    channel: self.channel_deletion_target(id),
                 })
             }
         }
@@ -563,9 +849,23 @@ impl Cagents {
     /// gets that row's own confirmation; several get one group confirmation
     /// that names every member and what goes with them.
     pub(super) fn begin_sidebar_group_delete(&mut self) -> Task<Message> {
+        self.open_sidebar_group_delete(None)
+    }
+
+    pub(super) fn begin_sidebar_group_delete_from(
+        &mut self,
+        invoker: SelectionRow,
+    ) -> Task<Message> {
+        self.open_sidebar_group_delete(Some(invoker))
+    }
+
+    fn open_sidebar_group_delete(&mut self, invoker: Option<SelectionRow>) -> Task<Message> {
         let visible = self.visible_sidebar_rows();
         self.sidebar_state.prune_row_selection(&visible);
         let selected = self.sidebar_state.selected_rows(&visible);
+        if invoker.is_some_and(|row| !selected.contains(&row)) {
+            return Task::none();
+        }
         let first = match selected.as_slice() {
             [] => return Task::none(),
             [only] => return self.delete_sidebar_row(*only),
@@ -587,12 +887,14 @@ impl Cagents {
         {
             Ok(targets) => {
                 let dialog = Dialog {
+                    presentation: uuid::Uuid::new_v4(),
+                    invoker: invoker.unwrap_or(first),
                     targets,
                     error: None,
                 };
-                let focus = dialog.focus_target();
+                let focus = dialog.control_id(self.sidebar_selection_can_confirm(&dialog), true);
                 self.sidebar_selection_ui.dialog = Some(dialog);
-                iced::widget::operation::focus(focus).map(cosmic::Action::App)
+                super::dialog_ui::focus_target_task(focus)
             }
             Err(error) => {
                 self.status = Some(TransientNotice::warning(error));
@@ -602,45 +904,96 @@ impl Cagents {
     }
 
     pub(super) fn update_sidebar_selection(&mut self, action: Action) -> Task<Message> {
+        let action = match action {
+            Action::Answer {
+                presentation,
+                confirm,
+            } => {
+                if self
+                    .sidebar_selection_ui
+                    .dialog
+                    .as_ref()
+                    .map(|dialog| dialog.presentation)
+                    != Some(presentation)
+                {
+                    return Task::none();
+                }
+                if confirm {
+                    Action::Confirm
+                } else {
+                    Action::Dismiss
+                }
+            }
+            other => other,
+        };
+        let Some(current) = self.sidebar_selection_ui.dialog.as_ref() else {
+            return Task::none();
+        };
+        if self.exposed_dialog_focus()
+            != super::dialog_ui::DialogFocus::Focus(
+                current.control_id(self.sidebar_selection_can_confirm(current), true),
+            )
+        {
+            return Task::none();
+        }
         let Some(mut dialog) = self.sidebar_selection_ui.dialog.take() else {
             return Task::none();
         };
         if matches!(action, Action::Dismiss) {
-            return dialog
-                .targets
-                .first()
-                .filter(|target| self.visible_sidebar_rows().contains(&target.row))
-                .map_or_else(Task::none, |target| {
-                    iced::widget::operation::focus(sidebar::selection_row_focus_id(target.row))
-                        .map(cosmic::Action::App)
-                });
+            return self.restore_dialog_focus(|| {
+                self.visible_sidebar_rows()
+                    .contains(&dialog.invoker)
+                    .then(|| {
+                        super::dialog_ui::focus_target_task(sidebar::selection_row_focus_id(
+                            dialog.invoker,
+                        ))
+                    })
+                    .unwrap_or_else(Task::none)
+            });
         }
         // Revalidate every target before starting any operation. A reload may
         // have changed a path, removed a row, or dirtied a worktree while
         // confirmation was open.
-        dialog.error = None;
+        if dialog.error.is_some() {
+            let focus = dialog.control_id(self.sidebar_selection_can_confirm(&dialog), true);
+            self.sidebar_selection_ui.dialog = Some(dialog);
+            return super::dialog_ui::focus_target_task(focus);
+        }
         for target in &mut dialog.targets {
             match self.selected_row_target(target.row) {
-                Ok(current) if current.directory == target.directory => {
+                Ok(current)
+                    if current.directory == target.directory
+                        && target
+                            .channel
+                            .as_ref()
+                            .is_none_or(|consent| match target.row {
+                                SelectionRow::Channel(id) => {
+                                    self.channel_deletion_target_current(id, consent)
+                                }
+                                _ => false,
+                            }) =>
+                {
                     target.blocker = current.blocker;
                 }
                 Ok(_) => {
                     dialog.error = Some(
-                        "A selected row changed location. Cancel and select it again.".to_owned(),
+                        "A selected row or its panes changed. Cancel and review the selection again.".to_owned(),
                     );
                 }
                 Err(error) => dialog.error = Some(error),
             }
         }
         if dialog.error.is_some() || dialog.blocked() > 0 {
-            let focus = dialog.focus_target();
+            let focus = dialog.control_id(self.sidebar_selection_can_confirm(&dialog), true);
             self.sidebar_selection_ui.dialog = Some(dialog);
-            return iced::widget::operation::focus(focus).map(cosmic::Action::App);
+            return super::dialog_ui::focus_target_task(focus);
         }
         let mut tasks = Vec::new();
         for target in dialog.targets {
             tasks.push(match target.row {
-                SelectionRow::Channel(id) => self.delete_channel(id),
+                SelectionRow::Channel(id) => {
+                    self.delete_confirmed_channel(id, target.channel.unwrap())
+                }
                 SelectionRow::Worktree(project, id) => self.delete_selected_worktree(project, id),
                 SelectionRow::Project(project_id) => {
                     // Prepare the same project removal used by its row, then
@@ -801,15 +1154,35 @@ impl Cagents {
         if let Some(error) = &dialog.error {
             rows.push(super::notice_body(error.as_str()));
         }
+        let confirm_enabled = self.sidebar_selection_can_confirm(dialog);
+        if !confirm_enabled && blocked == 0 && dialog.error.is_none() {
+            rows.push(super::notice_body(
+                "A selected row or its panes changed. Cancel and review the selection again.",
+            ));
+        }
+        let cancel_id = dialog.control_id(false, true);
+        let confirm_id = dialog.control_id(true, confirm_enabled);
         rows.push(super::dialog_ui::confirmation_actions(
-            crate::ui_controls::button::secondary("Cancel")
-                .id(close_focus_id())
-                .on_press(Message::SidebarSelection(Action::Dismiss)),
-            crate::ui_controls::button::destructive(kind.deletion_label(count))
-                .id(focus_id())
-                .on_press_maybe(
-                    (blocked == 0).then_some(Message::SidebarSelection(Action::Confirm)),
-                ),
+            crate::ui_controls::owned(
+                cancel_id.clone(),
+                crate::ui_controls::button::secondary("Cancel")
+                    .id(cancel_id)
+                    .on_press(Message::SidebarSelection(Action::Answer {
+                        presentation: dialog.presentation,
+                        confirm: false,
+                    })),
+            ),
+            crate::ui_controls::owned(
+                confirm_id.clone(),
+                crate::ui_controls::button::destructive(kind.deletion_label(count))
+                    .id(confirm_id)
+                    .on_press_maybe(confirm_enabled.then_some(Message::SidebarSelection(
+                        Action::Answer {
+                            presentation: dialog.presentation,
+                            confirm: true,
+                        },
+                    ))),
+            ),
         ));
         Some(dialog_ui::surface(
             widget::column::with_children(rows).spacing(space::M),
