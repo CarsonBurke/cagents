@@ -1243,6 +1243,24 @@ fn ui_activation_stream(
     ))
 }
 
+fn ui_activation_message(activation: instance::UiActivation) -> Message {
+    match activation.update {
+        Some(request) => Message::UiUpdate(request),
+        None => match activation.tray {
+            Some(intent) => Message::NotificationUi(notification_ui::Action::TrayActivated(intent)),
+            None => match activation.session {
+                Some(session) => Message::ActivateSession {
+                    session,
+                    token: activation.token,
+                },
+                None => Message::ActivateUi {
+                    token: activation.token,
+                },
+            },
+        },
+    }
+}
+
 fn session_health_stream(
     source: &SessionHealthSource,
 ) -> Pin<Box<dyn cosmic::iced::futures::Stream<Item = SessionSaveHealthEvent> + Send + 'static>> {
@@ -17801,18 +17819,7 @@ impl Application for Cagents {
                 UiActivationSource(self.activation_rx.clone()),
                 ui_activation_stream,
             )
-            .map(|activation| match activation.update {
-                Some(request) => Message::UiUpdate(request),
-                None => match activation.session {
-                    Some(session) => Message::ActivateSession {
-                        session,
-                        token: activation.token,
-                    },
-                    None => Message::ActivateUi {
-                        token: activation.token,
-                    },
-                },
-            }),
+            .map(ui_activation_message),
             event::listen_with(|event, status, event_window| match event {
                 iced::Event::Keyboard(event) => Some(Message::KeyEvent {
                     event,
@@ -20425,6 +20432,7 @@ mod tests {
                 .send_blocking(instance::UiActivation {
                     token: None,
                     session: None,
+                    tray: None,
                     update: None,
                 })
                 .is_err()

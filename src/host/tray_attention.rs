@@ -1,7 +1,7 @@
 //! Resident tray observations never read transcripts or hold Host across actor
 //! sampling, window sockets or child launch. A menu ID is a navigation hint;
 //! activation must resolve its current, unambiguous resident owner again.
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 
 use super::state::{HostState, SharedHost};
 use crate::{
@@ -285,36 +285,98 @@ impl Source {
 }
 
 fn focus(host: &SharedHost, id: TerminalId) -> Result<String, String> {
-    let source = {
+    let (source, registry, proof) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        Source::capture(&state, id)?
+        (
+            Source::capture(&state, id)?,
+            state
+                .execution_registry
+                .clone()
+                .ok_or("The workspace registry is unavailable")?,
+            state.proof().clone(),
+        )
     };
     if !source.waiting() {
         return Err("This agent no longer needs attention".into());
     }
-    let destination = {
+    // Read only the immutable registry identity, outside the global Host lock.
+    let identity = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .identity()?;
+    let mut sources = Vec::new();
+    if let Some((session, _)) = &source.chat {
+        sources.push(
+            crate::instance::tray_source_fingerprint(&crate::agent_execution::HostedSession::Chat(
+                session.clone(),
+            ))
+            .map_err(|error| error.to_string())?,
+        );
+    }
+    if (source.chat.is_none() || source.paired)
+        && let Some((session, _)) = &source.terminal
+    {
+        sources.push(
+            crate::instance::tray_source_fingerprint(
+                &crate::agent_execution::HostedSession::Terminal(session.clone()),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+    }
+    let (destination, intent) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if !source.matches(&state, id) {
+        if !source.matches(&state, id)
+            || state.proof() != &proof
+            || !state
+                .execution_registry
+                .as_ref()
+                .is_some_and(|now| Arc::ptr_eq(now, &registry))
+        {
             return Err("The waiting agent changed; reopen the tray menu".into());
         }
         let destination = state.tray_destination(id);
-        state.queue_tray_session(destination.clone(), id)?;
-        destination
+        let intent = crate::instance::TrayActivation {
+            request: uuid::Uuid::new_v4(),
+            registry: identity,
+            host: proof,
+            window: destination.window.clone(),
+            session: id,
+            sources,
+        };
+        state.queue_tray_session(destination.clone(), intent.clone())?;
+        (destination, intent)
     };
-    navigate(host, &destination, id)
+    navigate(host, &destination, &intent, &source, &registry)
 }
 
 fn navigate(
     host: &SharedHost,
     destination: &Destination,
-    id: TerminalId,
+    intent: &crate::instance::TrayActivation,
+    source: &Source,
+    registry: &Arc<std::sync::Mutex<super::model::Registry>>,
 ) -> Result<String, String> {
     navigate_with(
         host,
         destination,
-        id,
+        intent,
         || {
-            crate::instance::activate_window_session(&destination.window, id, None)
+            if !source.waiting() {
+                return Err("This agent no longer needs attention".into());
+            }
+            {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                if !source.matches(&state, intent.session)
+                    || state.proof() != &intent.host
+                    || !state
+                        .execution_registry
+                        .as_ref()
+                        .is_some_and(|now| Arc::ptr_eq(now, registry))
+                {
+                    return Err("The waiting agent changed; reopen the tray menu".into());
+                }
+            }
+            crate::instance::activate_window_tray(intent)
                 .map_err(|error| format!("Window navigation was not confirmed: {error}"))
         },
         || {
@@ -322,27 +384,55 @@ fn navigate(
                 format!("The navigation request is queued, but the window could not open: {error}")
             })
         },
+        || std::thread::sleep(Duration::from_millis(100)),
     )
 }
 
 fn navigate_with(
     host: &SharedHost,
     destination: &Destination,
-    id: TerminalId,
+    intent: &crate::instance::TrayActivation,
     mut activate: impl FnMut() -> Result<bool, String>,
     launch: impl FnOnce() -> Result<(), String>,
+    mut wait: impl FnMut(),
 ) -> Result<String, String> {
+    let current = || {
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pending_tray_session(destination)
+            == Some(intent)
+    };
+    if !current() {
+        return Err("The waiting-agent request was replaced".into());
+    }
+    let started = std::time::Instant::now();
     if !activate()? {
         launch()?;
-        if !activate()? {
-            return Err(
-                "The navigation request is queued; window navigation is not yet confirmed".into(),
-            );
+        // This is the existing tray-action worker, never the UI or Host lock.
+        // A cold window may not have bound its listener at launch completion.
+        let mut admitted = false;
+        for attempt in 0..150 {
+            if !current() {
+                return Err("The waiting-agent request was replaced".into());
+            }
+            if started.elapsed() >= Duration::from_secs(15) {
+                break;
+            }
+            if activate()? {
+                admitted = true;
+                break;
+            }
+            if attempt != 149 {
+                wait();
+            }
+        }
+        if !admitted {
+            return Err("The window did not accept the waiting-agent request. Open the app and try again; the exact request remains queued.".into());
         }
     }
     host.lock()
         .unwrap_or_else(|p| p.into_inner())
-        .acknowledge_tray_session(destination, id);
+        .acknowledge_tray_session(destination, intent);
     Ok("Requested waiting agent".into())
 }
 

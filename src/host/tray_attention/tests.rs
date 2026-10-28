@@ -100,9 +100,26 @@ fn presence(destination: &Destination, session: Option<TerminalId>, focused: boo
 }
 
 fn drain(host: &SharedHost, destination: &Destination) -> Option<Target> {
-    host.lock()
-        .unwrap()
-        .watch_notifications(100, presence(destination, None, false))
+    let mut state = host.lock().unwrap();
+    assert_eq!(
+        state.watch_notifications(100, presence(destination, None, false)),
+        None,
+        "a generic watch cannot strip provenance from private tray intent"
+    );
+    let intent = state.pending_tray_session(destination)?.clone();
+    state.acknowledge_tray_session(destination, &intent);
+    Some(Target::Session(intent.session))
+}
+
+fn request(session: TerminalId, window: &str) -> crate::instance::TrayActivation {
+    crate::instance::TrayActivation {
+        request: uuid::Uuid::new_v4(),
+        registry: uuid::Uuid::new_v4(),
+        host: empty_host().lock().unwrap().proof().clone(),
+        window: window.into(),
+        session,
+        sources: vec![[1; 32]],
+    }
 }
 
 #[test]
@@ -360,22 +377,23 @@ fn navigation_errors_retain_queue_and_callbacks_can_acquire_host() {
         let host = empty_host();
         let destination = destination("tray-owner");
         let id = TerminalId::new();
+        let intent = request(id, &destination.window);
         host.lock()
             .unwrap()
-            .queue_tray_session(destination.clone(), id)
+            .queue_tray_session(destination.clone(), intent.clone())
             .unwrap();
         let activates = Cell::new(0);
         let launches = Cell::new(0);
         let result = navigate_with(
             &host,
             &destination,
-            id,
+            &intent,
             || {
                 host.lock().unwrap().register_client(10);
                 activates.set(activates.get() + 1);
                 match case {
                     0 => Err("session socket failed".into()),
-                    3 if activates.get() == 2 => Ok(true),
+                    3 if activates.get() == 4 => Ok(true),
                     _ => Ok(false),
                 }
             },
@@ -388,6 +406,9 @@ fn navigation_errors_retain_queue_and_callbacks_can_acquire_host() {
                     Ok(())
                 }
             },
+            || {
+                host.lock().unwrap().register_client(12);
+            },
         );
         match case {
             0 => {
@@ -398,10 +419,13 @@ fn navigation_errors_retain_queue_and_callbacks_can_acquire_host() {
                 assert_eq!(result.unwrap_err(), "matched launcher failed");
                 assert_eq!(activates.get(), 1);
             }
-            2 => assert!(result.unwrap_err().contains("not yet confirmed")),
+            2 => {
+                assert!(result.unwrap_err().contains("did not accept"));
+                assert_eq!(activates.get(), 151, "the cold delivery bound is finite");
+            }
             3 => {
                 assert!(result.is_ok());
-                assert_eq!(activates.get(), 2);
+                assert_eq!(activates.get(), 4);
                 assert_eq!(launches.get(), 1);
             }
             _ => unreachable!(),
@@ -418,31 +442,120 @@ fn navigation_errors_retain_queue_and_callbacks_can_acquire_host() {
 }
 
 #[test]
+fn superseded_cold_request_cannot_send_again_after_backoff() {
+    let host = empty_host();
+    let destination = destination("tray-owner");
+    let intent = request(TerminalId::new(), &destination.window);
+    let replacement = request(intent.session, &destination.window);
+    host.lock()
+        .unwrap()
+        .queue_tray_session(destination.clone(), intent.clone())
+        .unwrap();
+    let sends = Cell::new(0);
+    let launches = Cell::new(0);
+    let waits = Cell::new(0);
+    let result = navigate_with(
+        &host,
+        &destination,
+        &intent,
+        || {
+            sends.set(sends.get() + 1);
+            Ok(false)
+        },
+        || {
+            launches.set(launches.get() + 1);
+            Ok(())
+        },
+        || {
+            waits.set(waits.get() + 1);
+            host.lock()
+                .unwrap()
+                .queue_tray_session(destination.clone(), replacement.clone())
+                .unwrap();
+        },
+    );
+    assert!(result.unwrap_err().contains("replaced"));
+    assert_eq!(
+        sends.get(),
+        2,
+        "the superseded request cannot make its next socket write"
+    );
+    assert_eq!(launches.get(), 1);
+    assert_eq!(waits.get(), 1);
+    assert_eq!(
+        host.lock().unwrap().pending_tray_session(&destination),
+        Some(&replacement)
+    );
+}
+
+#[test]
 fn old_navigation_ack_cannot_remove_newer_destination_intent() {
     let host = empty_host();
     let destination = destination("tray-owner");
     let old = TerminalId::new();
-    let current = TerminalId::new();
+    let current = old;
+    let old_request = request(old, &destination.window);
+    let current_request = request(current, &destination.window);
     host.lock()
         .unwrap()
-        .queue_tray_session(destination.clone(), old)
+        .queue_tray_session(destination.clone(), old_request.clone())
         .unwrap();
     let result = navigate_with(
         &host,
         &destination,
-        old,
+        &old_request,
         || {
             host.lock()
                 .unwrap()
-                .queue_tray_session(destination.clone(), current)
+                .queue_tray_session(destination.clone(), current_request.clone())
                 .unwrap();
             Ok(true)
         },
         || panic!("an acknowledged existing window must not launch a child"),
+        || panic!("an admitted existing window must not back off"),
     );
     assert!(result.is_ok());
+    assert_eq!(
+        host.lock().unwrap().pending_tray_session(&destination),
+        Some(&current_request),
+        "an old ACK cannot consume a newer nonce even for the identical session"
+    );
     assert_eq!(drain(&host, &destination), Some(Target::Session(current)));
     assert_eq!(drain(&host, &destination), None);
+}
+
+#[test]
+fn newer_tray_choice_retires_old_generic_watch_and_new_desktop_choice_retires_tray() {
+    let host = empty_host();
+    let destination = destination(crate::instance::PRIMARY_WINDOW);
+    let old = TerminalId::new();
+    let intent = request(TerminalId::new(), &destination.window);
+    {
+        let mut state = host.lock().unwrap();
+        state.activate_notification(Target::Session(old), Some(old), None);
+        state
+            .queue_tray_session(destination.clone(), intent.clone())
+            .unwrap();
+        assert_eq!(
+            state.watch_notifications(100, presence(&destination, None, false)),
+            None
+        );
+        assert_eq!(state.pending_tray_session(&destination), Some(&intent));
+        state.activate_notification(Target::Session(old), Some(old), None);
+        assert!(state.pending_tray_session(&destination).is_none());
+    }
+    assert!(
+        navigate_with(
+            &host,
+            &destination,
+            &intent,
+            || panic!("superseded request cannot dispatch"),
+            || panic!("superseded request cannot launch"),
+            || panic!("superseded request cannot retry"),
+        )
+        .unwrap_err()
+        .contains("replaced")
+    );
 }
 
 #[test]
@@ -455,24 +568,31 @@ fn bounded_queue_validates_destination_and_drains_exact_current_intent() {
         application: Application::Ceditor,
         window: "editor".into(),
     };
-    assert!(state.queue_tray_session(editor, original).is_err());
     assert!(
         state
-            .queue_tray_session(destination("../invalid"), original)
+            .queue_tray_session(editor, request(original, "editor"))
+            .is_err()
+    );
+    assert!(
+        state
+            .queue_tray_session(destination("../invalid"), request(original, "../invalid"))
             .is_err()
     );
     for index in 0..32 {
         state
-            .queue_tray_session(destination(&format!("tray-{index}")), original)
+            .queue_tray_session(
+                destination(&format!("tray-{index}")),
+                request(original, &format!("tray-{index}")),
+            )
             .unwrap();
     }
     assert!(
         state
-            .queue_tray_session(destination("overflow"), original)
+            .queue_tray_session(destination("overflow"), request(original, "overflow"))
             .is_err()
     );
     state
-        .queue_tray_session(destination("tray-0"), replacement)
+        .queue_tray_session(destination("tray-0"), request(replacement, "tray-0"))
         .unwrap();
     drop(state);
     for index in 0..32 {

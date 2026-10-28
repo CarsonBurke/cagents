@@ -97,6 +97,19 @@ impl Registry {
         Self::at(&self.path)
     }
 
+    /// The immutable store identity without loading the full agent inventory.
+    pub(crate) fn identity(&self) -> Result<Uuid, String> {
+        let identity: String = self
+            .db
+            .query_row("SELECT identity FROM metadata WHERE key = 0", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| error.to_string())?;
+        identity
+            .parse()
+            .map_err(|error| format!("Invalid registry identity: {error}"))
+    }
+
     /// The whole model, ordered by the ranks the registry assigned.
     pub(crate) fn model(&self) -> Result<WorkspaceModel, String> {
         let (identity, sequence) = self
