@@ -207,7 +207,19 @@ impl ExitDiagnostic {
         if !self.provider_exited {
             return None;
         }
-        let loss = String::from_utf8_lossy(&self.stderr);
+        // A bounded byte tail may start inside a credential-bearing line,
+        // after the label used to identify it has already been discarded.
+        // Keep the raw snapshot intact, but do not display a leading fragment
+        // whose original context is unknown.
+        let display = if self.observed_bytes > self.stderr.len() as u64 {
+            self.stderr
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(&[][..], |end| &self.stderr[end + 1..])
+        } else {
+            &self.stderr
+        };
+        let loss = String::from_utf8_lossy(display);
         let mut plain = String::new();
         let mut escape = 0;
         for ch in loss.chars() {
@@ -1770,6 +1782,78 @@ extern "C" fn serve_if_requested() {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn stderr_summary_refuses_credential_fragments_after_byte_tail_truncation() {
+        const CANARY: &str = "CAPACITY_CREDENTIAL_CANARY_7A2D";
+        let mut raw = b"Authorization: Bearer ".to_vec();
+        raw.extend(std::iter::repeat_n(b'q', STDERR_LIMIT));
+        raw.extend_from_slice(CANARY.as_bytes());
+        raw.extend_from_slice(b"\nmodel capacity exhausted\n");
+        let tail = raw[raw.len() - STDERR_LIMIT..].to_vec();
+        let mut diagnostic = ExitDiagnostic {
+            code: Some(7),
+            signal: None,
+            provider_exited: true,
+            stderr: tail.clone(),
+            observed_bytes: raw.len() as u64,
+            complete: true,
+            read_failed: false,
+        };
+        let summary = diagnostic.failure_summary().unwrap();
+        assert!(!summary.contains(CANARY));
+        assert!(summary.contains("model capacity exhausted"));
+        assert!(summary.contains("earlier bytes omitted"));
+        assert_eq!(diagnostic.stderr, tail, "raw private tail must stay intact");
+
+        diagnostic.stderr = CANARY.as_bytes().to_vec();
+        diagnostic.observed_bytes = diagnostic.stderr.len() as u64 + 1;
+        let summary = diagnostic.failure_summary().unwrap();
+        assert!(
+            !summary.contains(CANARY),
+            "an unterminated fragment is unsafe"
+        );
+        assert!(summary.contains("status 7"));
+        assert!(summary.contains("earlier bytes omitted"));
+
+        diagnostic.stderr =
+            format!("Authorization: Bearer {CANARY}\nmodel capacity exhausted\n").into_bytes();
+        diagnostic.observed_bytes = diagnostic.stderr.len() as u64;
+        let summary = diagnostic.failure_summary().unwrap();
+        assert!(!summary.contains(CANARY));
+        assert!(summary.contains("redacted credential-bearing stderr line"));
+        assert!(summary.contains("model capacity exhausted"));
+        assert!(!summary.contains("earlier bytes omitted"));
+
+        // A normal-length credential can lose its label too: raw carriage
+        // returns fill the byte tail, then disappear during display filtering.
+        let ending = b"\nmodel capacity exhausted\n";
+        let mut raw = b"Authorization: Bearer ".to_vec();
+        raw.extend_from_slice(CANARY.as_bytes());
+        raw.extend(std::iter::repeat_n(
+            b'\r',
+            STDERR_LIMIT - CANARY.len() - ending.len(),
+        ));
+        raw.extend_from_slice(ending);
+        let tail = raw[raw.len() - STDERR_LIMIT..].to_vec();
+        assert!(tail.starts_with(CANARY.as_bytes()));
+        diagnostic.stderr = tail.clone();
+        diagnostic.observed_bytes = raw.len() as u64;
+        let summary = diagnostic.failure_summary().unwrap();
+        assert!(!summary.contains(CANARY));
+        assert!(summary.contains("model capacity exhausted"));
+        assert!(summary.contains("earlier bytes omitted"));
+        assert_eq!(diagnostic.stderr, tail, "raw private tail must stay intact");
+
+        diagnostic.stderr = b"\nmodel capacity exhausted\n".to_vec();
+        diagnostic.observed_bytes = diagnostic.stderr.len() as u64 + 1;
+        assert!(
+            diagnostic
+                .failure_summary()
+                .unwrap()
+                .contains("model capacity exhausted")
+        );
+    }
     #[test]
     fn original_provider_stderr_survives_flood_and_adoption_without_blocking_close() {
         let name = std::thread::current().name().unwrap().to_owned();
