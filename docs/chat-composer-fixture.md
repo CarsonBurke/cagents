@@ -75,6 +75,13 @@ Store screenshots under `docs/screenshots/` for PR evidence. Stop the owned
 nested session, close its synthetic agent, and stop only its isolated daemon
 when finished. The fixture directory can then be removed.
 
+For provider failure checks, write a diagnostic such as `Failed to
+authenticate: OAuth session expired and could not be refreshed` to
+`$fixture_root/home/.claude/fixture-image-prompt-error`. The daemon starts
+providers with their own environment, so this switch is a file rather than a
+variable. Any prompt containing an image then settles with that error before any
+reply. One Send of text plus images must show one failure notice.
+
 For tool disclosure checks, set `CAGENTS_FIXTURE_VERBOSITY=1` in the same
 fixture environment before starting the runner and daemon. Each turn emits a
 streamed MCP call with a large prompt, a Skill call, a failed MCP call, and a

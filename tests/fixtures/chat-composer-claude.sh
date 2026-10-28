@@ -128,6 +128,15 @@ while IFS= read -r frame; do
                     '{type:"command_lifecycle",command_uuid:$uuid,state:"started"}'
                 jq -cn --arg session "$session" --arg model "$model" \
                     '{type:"system",subtype:"init",session_id:$session,claude_code_version:"2.1.286",model:$model}'
+                # Optional provider failure for a prompt with an image, settled
+                # before any reply as an expired login does. It is read from the
+                # config directory because providers get no fixture environment.
+                if [ -s "$config/fixture-image-prompt-error" ] &&
+                    printf '%s' "$frame" | jq -e '.message.content | arrays | any(.type == "image")' >/dev/null; then
+                    jq -cn --arg session "$session" --arg turn "$turn" --rawfile error "$config/fixture-image-prompt-error" \
+                        '{type:"result",uuid:("fixture-result-"+$turn),subtype:"error_during_execution",is_error:true,errors:[$error],session_id:$session}'
+                    continue
+                fi
                 if [ "${CAGENTS_FIXTURE_VERBOSITY:-0}" = 1 ]; then verbosity_turn; fi
                 if [ -f "$fixture_image" ]; then image_turn; fi
                 assistant=$(jq -cn --arg turn "$turn" \
