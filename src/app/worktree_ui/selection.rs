@@ -153,7 +153,7 @@ impl Inputs {
                 )
             })
             .collect();
-        let sidebar = app
+        let mut sidebar = app
             .sidebar_model
             .projects
             .iter()
@@ -166,10 +166,34 @@ impl Inputs {
                         .worktrees
                         .iter()
                         .map(|tree| (tree.id, tree.path.clone()))
-                        .collect(),
+                        .collect::<Vec<_>>(),
                 )
             })
-            .collect();
+            .collect::<Vec<_>>();
+        // Independent projects may be reordered for presentation. Keep exact
+        // order when shared roots or IDs can change a first/last-match owner.
+        // Nested worktree order always matters: its first entry opens a project.
+        let independent = {
+            let mut identities = HashSet::new();
+            let mut roots = HashSet::new();
+            sidebar.iter().all(|(id, _, repository, worktrees)| {
+                if !identities.insert(*id) {
+                    return false;
+                }
+                let mut project_roots = HashSet::new();
+                project_roots.insert(repository.as_path());
+                if repository.file_name().is_some_and(|name| name == ".git")
+                    && let Some(parent) = repository.parent()
+                {
+                    project_roots.insert(parent);
+                }
+                project_roots.extend(worktrees.iter().map(|(_, path)| path.as_path()));
+                project_roots.into_iter().all(|root| roots.insert(root))
+            })
+        };
+        if independent {
+            sidebar.sort_unstable();
+        }
         let mut protected = app.desired_worktree_protections();
         protected.sort();
         protected.dedup();
@@ -1773,6 +1797,7 @@ mod tests {
     #[test]
     fn blocked_multi_selection_prepares_only_active_and_latest_and_retires_before_dispatch() {
         let mut f = fixture();
+        assert!(f.app.shared_views.deferred_default.is_none());
         let (entered, release, starts) = blocked(&mut f.app);
         let first = open(&mut f.app, &f.next);
         let worker = std::thread::spawn(move || prepared(first));
@@ -1824,7 +1849,12 @@ mod tests {
         assert_eq!(starts.load(AtomicOrdering::SeqCst), 2);
         let retirement = commit(&mut f.app, next_receipt, &last);
         assert_eq!(f.app.active_workspace.as_ref(), Some(&last));
-        assert_eq!(f.app.durable.cards.len(), initial_cards + 1);
+        assert_eq!(
+            f.app.workspace_model.identity,
+            crate::workspace_model::NO_REGISTRY
+        );
+        assert_eq!(f.app.durable.cards.len(), initial_cards);
+        assert_eq!(f.app.shared_views.deferred_default.as_ref(), Some(&last));
         let done = retired(retirement);
         no_effect(f.app.update(done));
         assert!(f.app.worktree_selection.active.is_none());
@@ -1905,13 +1935,20 @@ mod tests {
         f.app.worktree_protections.expire_navigation_retry();
         let first = open(&mut f.app, &f.next);
         let message = prepared(first);
-        // This first receipt schedules actual shell/NSS preparation, not a UI
-        // LaunchRecipe::shell call and not a second navigation admission.
-        let message = prepared(f.app.update(message));
+        // The registry-free fixture follows the real deferred-default path:
+        // filesystem ownership commits now, while no terminal is constructed
+        // before the shared model can admit its creation.
+        assert_eq!(
+            f.app.workspace_model.identity,
+            crate::workspace_model::NO_REGISTRY
+        );
+        assert!(f.app.default_terminal_is_deferred(&f.next));
+        assert!(f.app.shared_views.deferred_default.is_none());
         let before = f.app.durable.cards.len();
         let retirement = f.app.update(message);
         assert_eq!(f.app.active_workspace.as_ref(), Some(&f.next));
-        assert_eq!(f.app.durable.cards.len(), before + 1);
+        assert_eq!(f.app.durable.cards.len(), before);
+        assert_eq!(f.app.shared_views.deferred_default.as_ref(), Some(&f.next));
         assert!(!reads.lock().unwrap().is_empty());
         assert!(reads.lock().unwrap().iter().all(|thread| *thread != ui));
         assert!(
@@ -1920,6 +1957,7 @@ mod tests {
         );
         let done = retired(retirement);
         no_effect(f.app.update(done));
+        assert!(!retired_on.lock().unwrap().is_empty());
         assert!(
             retired_on
                 .lock()
@@ -2272,6 +2310,215 @@ mod tests {
         matching(observer, |message| {
             matches!(message, Message::WorktreeSelectionCacheInvalidated)
         })
+    }
+
+    #[test]
+    fn project_order_is_not_membership_but_worktree_entry_order_and_identity_remain_fenced() {
+        fn capture(app: &mut Cagents) -> Inputs {
+            Inputs::capture(
+                app,
+                Request {
+                    generation: 0,
+                    path: None,
+                    create: false,
+                    origin: None,
+                    background: false,
+                    refresh_channel: None,
+                },
+            )
+        }
+
+        let mut f = fixture();
+        let project = current_folder(&f.app, &f.old);
+        let sibling = current_folder(&f.app, &f.next);
+        let paths = [f.old.join("first"), f.old.join("second")];
+        for path in &paths {
+            std::fs::create_dir(path).unwrap();
+        }
+        let row = f
+            .app
+            .sidebar_model
+            .projects
+            .iter_mut()
+            .find(|p| p.id == project)
+            .unwrap();
+        row.kind = ProjectKind::Git;
+        row.worktrees = paths
+            .into_iter()
+            .map(|path| {
+                SidebarWorktree::new(
+                    WorktreeId::new(),
+                    path,
+                    None,
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        let before = capture(&mut f.app);
+        let before_cache = CacheKey::capture(&mut f.app).unwrap();
+        f.app.sidebar_model.projects.reverse();
+        assert!(
+            before == capture(&mut f.app),
+            "presentation order is not membership"
+        );
+        assert!(before_cache == CacheKey::capture(&mut f.app).unwrap());
+        f.app
+            .sidebar_model
+            .projects
+            .iter_mut()
+            .find(|p| p.id == project)
+            .unwrap()
+            .worktrees
+            .reverse();
+        assert!(
+            before != capture(&mut f.app),
+            "the first worktree is the project-open destination"
+        );
+        f.app
+            .sidebar_model
+            .projects
+            .iter_mut()
+            .find(|p| p.id == project)
+            .unwrap()
+            .worktrees
+            .reverse();
+        assert!(before == capture(&mut f.app));
+
+        let index = f
+            .app
+            .sidebar_model
+            .projects
+            .iter()
+            .position(|p| p.id == project)
+            .unwrap();
+        let sibling_index = f
+            .app
+            .sidebar_model
+            .projects
+            .iter()
+            .position(|p| p.id == sibling)
+            .unwrap();
+        f.app.sidebar_model.projects[index].id = ProjectId::new();
+        assert!(
+            before.sidebar != capture(&mut f.app).sidebar,
+            "project identity must remain fenced"
+        );
+        f.app.sidebar_model.projects[index].id = project;
+        f.app.sidebar_model.projects[index].kind = ProjectKind::Folder;
+        assert!(
+            before.sidebar != capture(&mut f.app).sidebar,
+            "project kind must remain fenced"
+        );
+        f.app.sidebar_model.projects[index].kind = ProjectKind::Git;
+        f.app.sidebar_model.projects[index].repository = f.old.join("replacement");
+        assert!(
+            before.sidebar != capture(&mut f.app).sidebar,
+            "project path must remain fenced"
+        );
+        f.app.sidebar_model.projects[index].repository = f.old.clone();
+
+        let original = f.app.sidebar_model.projects[index].worktrees[0].clone();
+        f.app.sidebar_model.projects[index].worktrees[0].id = WorktreeId::new();
+        assert!(
+            before.sidebar != capture(&mut f.app).sidebar,
+            "worktree identity must remain fenced"
+        );
+        f.app.sidebar_model.projects[index].worktrees[0] = original.clone();
+        f.app.sidebar_model.projects[index].worktrees[0].path = f.old.join("replacement");
+        assert!(
+            before.sidebar != capture(&mut f.app).sidebar,
+            "worktree path must remain fenced"
+        );
+        f.app.sidebar_model.projects[index].worktrees[0] = original.clone();
+        f.app.sidebar_model.projects[index].worktrees.push(original);
+        assert!(
+            before.sidebar != capture(&mut f.app).sidebar,
+            "duplicate membership cannot disappear"
+        );
+        f.app.sidebar_model.projects[index].worktrees.pop();
+        let moved = f.app.sidebar_model.projects[index].worktrees.pop().unwrap();
+        assert!(
+            before.sidebar != capture(&mut f.app).sidebar,
+            "removed membership must invalidate"
+        );
+        f.app.sidebar_model.projects[sibling_index]
+            .worktrees
+            .push(moved);
+        assert!(
+            before.sidebar != capture(&mut f.app).sidebar,
+            "project association must remain fenced"
+        );
+        let moved = f.app.sidebar_model.projects[sibling_index]
+            .worktrees
+            .pop()
+            .unwrap();
+        f.app.sidebar_model.projects[index].worktrees.push(moved);
+        let removed = f.app.sidebar_model.projects.remove(sibling_index);
+        assert!(
+            before.sidebar != capture(&mut f.app).sidebar,
+            "removed project must invalidate"
+        );
+        f.app.sidebar_model.projects.insert(sibling_index, removed);
+        assert!(
+            before.sidebar == capture(&mut f.app).sidebar,
+            "restoring membership restores its snapshot"
+        );
+
+        // A project's primary checkout can repeat its own repository root.
+        // That is not a cross-project owner ambiguity.
+        let mut primary = f.app.sidebar_model.projects[index].worktrees[0].clone();
+        primary.id = WorktreeId::new();
+        primary.path = f.old.clone();
+        f.app.sidebar_model.projects[index].worktrees.push(primary);
+        let repeated_local_root = capture(&mut f.app);
+        f.app.sidebar_model.projects.reverse();
+        assert!(repeated_local_root == capture(&mut f.app));
+        f.app.sidebar_model.projects.reverse();
+        f.app.sidebar_model.projects[index].worktrees.pop();
+
+        // A checkout root and Git metadata root can both name the same view.
+        // Their first-match repository selection really changes on a reorder.
+        let sibling_row = f.app.sidebar_model.projects[sibling_index].clone();
+        f.app.sidebar_model.projects[sibling_index].repository = f.old.join(".git");
+        f.app.sidebar_model.projects[sibling_index].kind = ProjectKind::Git;
+        let overlapping = capture(&mut f.app);
+        let selected = f.app.worktree_view_scope(&f.old);
+        f.app.sidebar_model.projects.reverse();
+        assert!(
+            overlapping != capture(&mut f.app),
+            "Git parent alias must preserve order"
+        );
+        assert!(selected != f.app.worktree_view_scope(&f.old));
+        f.app.sidebar_model.projects.reverse();
+        f.app.sidebar_model.projects[sibling_index] = sibling_row.clone();
+
+        let shared_root = f.app.sidebar_model.projects[index].worktrees[0].clone();
+        f.app.sidebar_model.projects[sibling_index]
+            .worktrees
+            .push(shared_root);
+        let overlapping = capture(&mut f.app);
+        f.app.sidebar_model.projects.reverse();
+        assert!(
+            overlapping != capture(&mut f.app),
+            "shared worktree root must preserve order"
+        );
+        f.app.sidebar_model.projects.reverse();
+        f.app.sidebar_model.projects[sibling_index] = sibling_row.clone();
+
+        f.app.sidebar_model.projects[sibling_index].id = project;
+        let duplicate_identity = capture(&mut f.app);
+        f.app.sidebar_model.projects.reverse();
+        assert!(
+            duplicate_identity != capture(&mut f.app),
+            "duplicate project identity must preserve order"
+        );
+        f.app.sidebar_model.projects.reverse();
+        f.app.sidebar_model.projects[sibling_index] = sibling_row;
+        assert!(before.sidebar == capture(&mut f.app).sidebar);
     }
 
     #[test]
