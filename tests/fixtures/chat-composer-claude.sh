@@ -33,7 +33,10 @@ parent=null
 turn=0
 if [ -f "$history" ]; then
     parent=$(jq -sr 'last.uuid // null' "$history")
-    turn=$(jq -s '[.[] | select(.type == "assistant")] | length' "$history")
+    # Count the prompts handled, not assistant records: a failed turn
+    # writes none and a delivered one writes two.
+    turn=$(jq -s '[.[] | select(.type == "user" and (.origin.kind // "") != "task-notification"
+        and ((.message.content | type) == "string" or any(.message.content[]; .type != "tool_result")))] | length' "$history")
 fi
 persist_record() {
     record=$(printf '%s' "$1" | jq -c --arg session "$session" --arg parent "$parent" \

@@ -77,8 +77,9 @@ when finished. The fixture directory can then be removed.
 
 The daemon removes `CAGENTS_*` variables from a provider's environment, so
 optional fixture behaviors are switched on by files in
-`$fixture_root/home/.claude`, the fixture's Claude config directory. A file
-takes effect from the provider's next start.
+`$fixture_root/home/.claude`, the fixture's Claude config directory. The
+error files are read for every prompt; the others take effect from the
+provider's next start.
 
 For provider failure checks, write a diagnostic such as `Failed to
 authenticate: OAuth session expired and could not be refreshed` to
