@@ -13,14 +13,23 @@ cargo fmt --check || cargo_status=$?
 # crates/. Ordinary mod declarations below modules.rs are traversed by rustfmt,
 # including feature-gated modules, without building any feature lane or vendor.
 included_status=0
-rustfmt --edition 2024 --check \
+set -- --edition 2024 --check \
     src/modules.rs \
     src/app/chat_ui/retained_history_admission_tests.rs \
     src/control/handshake_deadline_tests.rs \
     src/terminal/worker/bounded_input_tests.rs \
     src/host/model/views/placement_tests.rs \
     tests/support/iced_tree.rs \
-    tests/support/repository_scale.rs || included_status=$?
+    tests/support/repository_scale.rs
+if [ "$cargo_status" -eq 0 ] && command -v python3 >/dev/null 2>&1; then
+    # A successful check of identical source and formatter inputs can be reused.
+    # The helper falls back to rustfmt whenever it cannot prove that identity.
+    python3 "$root/scripts/check-format-cache.py" "$@" || included_status=$?
+else
+    # Keep formatting available without Python, and report both diagnostics
+    # when the Cargo-root check fails.
+    rustfmt "$@" || included_status=$?
+fi
 
 # Report both sets of diagnostics even when Cargo's check fails.
 if [ "$cargo_status" -ne 0 ]; then
