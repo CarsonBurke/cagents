@@ -43,3 +43,13 @@ the new deadline arrived: one timed animation held the UI thread busy for most
 of every interval between its frames. An elapsed deadline is no longer pending
 and now yields to the requested one; pending deadlines keep their precedence.
 Remove this backport when the pinned dependency merges control flow the same way.
+
+The client-side resize border no longer covers edges that the compositor reports
+as tiled. xdg-shell describes a tiled edge as adjoining another part of the
+compositor's layout, so a client should not offer resizing there. Without this
+check, the border took presses from content at those edges, such as the
+scrollbar of a pane at the window's right edge, in tiled niri and COSMIC
+windows. Maximized and fullscreen windows still have no border, and floating
+windows keep it on every edge. The edge is checked again on press, because the
+window state can change while the pointer stays still. Remove this backport when
+the pinned dependency honors tiled edges.

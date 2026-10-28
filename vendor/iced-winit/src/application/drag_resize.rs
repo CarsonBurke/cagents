@@ -38,6 +38,7 @@ pub fn event_func(
     if DRAG_RESIZE_SUPPORTED {
         // Keep track of cursor when it is within a resizeable border.
         let mut cursor_prev_resize_direction = None;
+        let mut cursor_position = None;
 
         Some(Box::new(
             move |window: &dyn winit::window::Window,
@@ -49,23 +50,15 @@ pub fn event_func(
                         position,
                         ..
                     } => {
-                        let resizable = !window.is_decorated()
-                            && !window.is_maximized()
-                            && window.fullscreen().is_none();
-                        if resizable {
-                            let location = cursor_resize_direction(
-                                window.surface_size(),
-                                *position,
-                                border_size,
+                        cursor_position = Some(*position);
+                        let location =
+                            resize_direction(window, *position, border_size);
+                        if location != cursor_prev_resize_direction {
+                            window.set_cursor(
+                                resize_direction_cursor_icon(location).into(),
                             );
-                            if location != cursor_prev_resize_direction {
-                                window.set_cursor(
-                                    resize_direction_cursor_icon(location)
-                                        .into(),
-                                );
-                                cursor_prev_resize_direction = location;
-                                return true;
-                            }
+                            cursor_prev_resize_direction = location;
+                            return true;
                         }
                     }
                     winit::event::WindowEvent::PointerButton {
@@ -80,7 +73,14 @@ pub fn event_func(
                         primary: true,
                         ..
                     } => {
-                        if let Some(direction) = cursor_prev_resize_direction {
+                        // The window state can change between the last motion
+                        // and this press, as when it is tiled or maximized
+                        // under a still pointer, so the edge is checked again.
+                        if let Some(direction) =
+                            cursor_position.and_then(|position| {
+                                resize_direction(window, position, border_size)
+                            })
+                        {
                             let _res = window.drag_resize_window(direction);
                             return true;
                         }
@@ -94,6 +94,81 @@ pub fn event_func(
     } else {
         None
     }
+}
+
+/// The window edges the application may resize from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Edges {
+    left: bool,
+    right: bool,
+    top: bool,
+    bottom: bool,
+}
+
+impl Edges {
+    const ALL: Self = Self {
+        left: true,
+        right: true,
+        top: true,
+        bottom: true,
+    };
+}
+
+/// The resize direction under `position`, if that point lies on an edge the
+/// application may resize from.
+fn resize_direction(
+    window: &dyn winit::window::Window,
+    position: winit::dpi::PhysicalPosition<f64>,
+    border_size: f64,
+) -> Option<ResizeDirection> {
+    cursor_resize_direction(
+        window.surface_size(),
+        position,
+        border_size,
+        resizable_edges(window)?,
+    )
+}
+
+/// A maximized or fullscreen window has no resizable edge. On Wayland, an
+/// edge the compositor reports as tiled borders another part of its layout:
+/// xdg-shell asks clients not to offer resizing there, and doing so would take
+/// presses from content that reaches that edge, such as a scrollbar.
+fn resizable_edges(window: &dyn winit::window::Window) -> Option<Edges> {
+    if window.is_decorated()
+        || window.is_maximized()
+        || window.fullscreen().is_some()
+    {
+        return None;
+    }
+
+    #[cfg(wayland_platform)]
+    {
+        use winit::platform::wayland::WindowExtWayland;
+
+        if let Some(state) = window.window_state() {
+            return wayland_edges(state);
+        }
+    }
+
+    Some(Edges::ALL)
+}
+
+#[cfg(wayland_platform)]
+fn wayland_edges(
+    state: cctk::sctk::reexports::csd_frame::WindowState,
+) -> Option<Edges> {
+    use cctk::sctk::reexports::csd_frame::WindowState;
+
+    if state.intersects(WindowState::MAXIMIZED | WindowState::FULLSCREEN) {
+        return None;
+    }
+    let edges = Edges {
+        left: !state.contains(WindowState::TILED_LEFT),
+        right: !state.contains(WindowState::TILED_RIGHT),
+        top: !state.contains(WindowState::TILED_TOP),
+        bottom: !state.contains(WindowState::TILED_BOTTOM),
+    };
+    (edges.left || edges.right || edges.top || edges.bottom).then_some(edges)
 }
 
 /// Get the cursor icon that corresponds to the resize direction.
@@ -115,12 +190,14 @@ fn resize_direction_cursor_icon(
     }
 }
 
-/// Identifies resize direction based on cursor position and window dimensions.
+/// Identifies resize direction based on cursor position, window dimensions
+/// and the edges that may be resized.
 #[allow(clippy::similar_names)]
 fn cursor_resize_direction(
     win_size: winit::dpi::PhysicalSize<u32>,
     position: winit::dpi::PhysicalPosition<f64>,
     border_size: f64,
+    edges: Edges,
 ) -> Option<ResizeDirection> {
     enum XDirection {
         West,
@@ -134,17 +211,20 @@ fn cursor_resize_direction(
         Default,
     }
 
-    let xdir = if position.x < border_size {
+    let xdir = if edges.left && position.x < border_size {
         XDirection::West
-    } else if position.x > (win_size.width as f64 - border_size) {
+    } else if edges.right && position.x > (win_size.width as f64 - border_size)
+    {
         XDirection::East
     } else {
         XDirection::Default
     };
 
-    let ydir = if position.y < border_size {
+    let ydir = if edges.top && position.y < border_size {
         YDirection::North
-    } else if position.y > (win_size.height as f64 - border_size) {
+    } else if edges.bottom
+        && position.y > (win_size.height as f64 - border_size)
+    {
         YDirection::South
     } else {
         YDirection::Default
@@ -169,4 +249,80 @@ fn cursor_resize_direction(
             YDirection::Default => return None,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winit::dpi::{PhysicalPosition, PhysicalSize};
+
+    const SIZE: PhysicalSize<u32> = PhysicalSize::new(1920, 1200);
+    const BORDER: f64 = 8.0;
+
+    fn at(x: f64, y: f64, edges: Edges) -> Option<ResizeDirection> {
+        cursor_resize_direction(
+            SIZE,
+            PhysicalPosition::new(x, y),
+            BORDER,
+            edges,
+        )
+    }
+
+    #[test]
+    fn a_floating_window_resizes_from_every_edge_and_corner() {
+        let edges = Edges::ALL;
+        assert_eq!(at(1915.0, 600.0, edges), Some(ResizeDirection::East));
+        assert_eq!(at(3.0, 600.0, edges), Some(ResizeDirection::West));
+        assert_eq!(at(900.0, 3.0, edges), Some(ResizeDirection::North));
+        assert_eq!(at(900.0, 1196.0, edges), Some(ResizeDirection::South));
+        assert_eq!(at(1915.0, 1196.0, edges), Some(ResizeDirection::SouthEast));
+        assert_eq!(at(3.0, 3.0, edges), Some(ResizeDirection::NorthWest));
+        assert_eq!(at(1900.0, 600.0, edges), None);
+    }
+
+    #[test]
+    fn a_tiled_edge_leaves_its_border_to_the_content() {
+        let right_tiled = Edges {
+            right: false,
+            ..Edges::ALL
+        };
+        // A scrollbar at the right edge keeps its presses.
+        assert_eq!(at(1915.0, 600.0, right_tiled), None);
+        // The corner falls back to the edge that is still free.
+        assert_eq!(
+            at(1915.0, 1196.0, right_tiled),
+            Some(ResizeDirection::South)
+        );
+        assert_eq!(at(3.0, 600.0, right_tiled), Some(ResizeDirection::West));
+
+        let tiled = Edges {
+            left: false,
+            right: false,
+            top: false,
+            bottom: false,
+        };
+        for (x, y) in [(1915.0, 600.0), (3.0, 3.0), (900.0, 1196.0)] {
+            assert_eq!(at(x, y, tiled), None);
+        }
+    }
+
+    #[cfg(wayland_platform)]
+    #[test]
+    fn wayland_states_map_to_resizable_edges() {
+        use cctk::sctk::reexports::csd_frame::WindowState;
+
+        assert_eq!(wayland_edges(WindowState::empty()), Some(Edges::ALL));
+        assert_eq!(wayland_edges(WindowState::ACTIVATED), Some(Edges::ALL));
+        assert_eq!(
+            wayland_edges(WindowState::TILED_RIGHT | WindowState::TILED_TOP),
+            Some(Edges {
+                right: false,
+                top: false,
+                ..Edges::ALL
+            })
+        );
+        assert_eq!(wayland_edges(WindowState::TILED), None);
+        assert_eq!(wayland_edges(WindowState::MAXIMIZED), None);
+        assert_eq!(wayland_edges(WindowState::FULLSCREEN), None);
+    }
 }
