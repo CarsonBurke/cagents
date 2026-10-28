@@ -195,10 +195,12 @@ use crate::{
 /// compatibility: replace the matched daemon before sending the new budgets.
 /// Version 127 combines both contracts in the matched set. Version 126 is
 /// reserved for the separate native Goal integration and is not adopted here.
-/// Version 139 preserves accepted version 127 and adds structured delegated-agent
+/// Version 139 builds on version 127 and adds structured delegated-agent
 /// capacity errors and origin-aware interrupted cleanup. ProtocolError now has
 /// appended details and the agent operation/reply enums append capacity/cleanup
 /// variants; all three executables require the matched positional wire layout.
+/// The source inspector separately qualifies the read-only protocol-127 subset;
+/// this is not general wire compatibility with an older matched set.
 /// Root allocated 139 specifically to this cumulative #1258/Main-a68 contract;
 /// unrelated private account/global experiments are not adopted here.
 pub const PROTOCOL_VERSION: u16 = 139;
