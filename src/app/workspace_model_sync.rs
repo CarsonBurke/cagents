@@ -1644,6 +1644,200 @@ mod tests {
     use super::*;
 
     #[test]
+    fn delayed_publisher_read_cannot_replace_connected_registry_or_delete_selected_channel() {
+        use crate::terminal::ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+            ServerResponse, read_frame, write_frame,
+        };
+        let (mut app, project, repository) = app_with_project();
+        app.sidebar_model.projects[0].worktrees =
+            vec![crate::sidebar::SidebarWorktree::from_durable(
+                crate::model::WorktreeId::new(),
+                "/repo".into(),
+                Some("main".into()),
+            )];
+        let mut old = registry(Vec::new());
+        old.sequence = 900;
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+                old.clone(),
+            ))),
+        );
+        // Obtain the actual publisher-produced Read from a framed reorder
+        // response. Hold delivery while the independent observer reconnects;
+        // this models a pause before the publisher sends its already-read model.
+        let edit = ModelEdit::ReorderNavigation {
+            repository: repository.clone(),
+            source: crate::workspace_model::NavigationItem::Worktree("/repo".into()),
+            before: None,
+            fallback: vec![crate::workspace_model::NavigationItem::Worktree(
+                "/repo".into(),
+            )],
+        };
+        let expected_edit = edit.clone();
+        let old_reply = old.clone();
+        let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let server = std::thread::spawn(move || {
+            let proof = crate::model::HostSessionProof {
+                host_session_id: "old-navigation".into(),
+                boot_id: "old-boot".into(),
+                host_incarnation: "old-host".into(),
+            };
+            let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            write_frame(
+                &mut peer,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(hello.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof: proof.clone(),
+                            resumed: Vec::new(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+            let request: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            assert_eq!(
+                request.request,
+                ClientRequest::EditWorkspaceModel {
+                    edit: expected_edit
+                }
+            );
+            write_frame(
+                &mut peer,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request.request_id),
+                    proof,
+                    message: ServerMessage::Response {
+                        response: ServerResponse::WorkspaceModel { model: old_reply },
+                    },
+                },
+            )
+            .unwrap();
+        });
+        let mut client = ControlClient::from_stream(stream).unwrap();
+        let (sender, updates) = async_channel::unbounded();
+        send(&mut client, edit, &sender).unwrap();
+        let delayed = updates.try_recv().unwrap();
+        assert!(matches!(&delayed, ModelUpdate::Read(model) if model == &old));
+        assert!(updates.try_recv().is_err());
+        drop(client);
+        server.join().unwrap();
+        let selected = ChannelId::new();
+        let mut current = registry(vec![shared(selected, &repository, "Current work", 7)]);
+        current.sequence = 1;
+        assert_ne!(current.identity, old.identity);
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+                current.clone(),
+            ))),
+        );
+        drop(
+            app.update(Message::ChannelUi(super::super::channel_ui::Action::Open(
+                selected,
+            ))),
+        );
+        let card = app
+            .workspace
+            .focused()
+            .expect("the admitted channel opens its composer");
+        let target = match app.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime.target,
+            _ => panic!("native draft expected"),
+        };
+        let draft = "Keep the replacement registry's draft  \nUnicode 🦀  ";
+        drop(
+            app.update(Message::ChatUi(super::super::chat_ui::Action::Composer(
+                target,
+                cosmic::widget::text_editor::Action::Edit(
+                    cosmic::widget::text_editor::Edit::Paste(Arc::new(draft.into())),
+                ),
+            ))),
+        );
+        assert_eq!(app.persistent_workspace().chat_drafts[&card], draft);
+        let durable = Arc::clone(&app.durable);
+        let canonical = app.workspace_model.clone();
+        let focused = app.workspace.focused();
+        let snapshot_sequence = app.shared_views.snapshot_sequence;
+        let published = intercept_publishes(&mut app);
+        drop(app.update(Message::WorkspaceModelObserved(delayed)));
+        assert_eq!(
+            app.workspace_model, canonical,
+            "foreign read cannot acquire registry admission"
+        );
+        assert_eq!(app.workspace_model.identity, current.identity);
+        assert_eq!(app.durable.workspace_model_identity, Some(current.identity));
+        assert_eq!(app.shared_views.snapshot_sequence, snapshot_sequence);
+        assert_eq!(app.durable, durable);
+        assert_eq!(app.durable.active_channel, Some(selected));
+        assert_eq!(app.workspace.focused(), focused);
+        assert_eq!(app.persistent_workspace().chat_drafts[&card], draft);
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .any(|channel| channel.id == selected
+                    && channel.project_id == project
+                    && channel.cards.contains(&card))
+        );
+        assert!(
+            !drain(&published)
+                .iter()
+                .any(|edit| matches!(edit, ModelEdit::DeleteChannel { .. })),
+            "an old registry cannot publish deletion into its replacement"
+        );
+        // Positive control: an authoritative absence from the admitted registry
+        // still retires the exact channel through the normal deletion path.
+        let mut removed = current;
+        removed.sequence = snapshot_sequence + 1;
+        removed.channels.clear();
+        drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(removed))));
+        assert!(
+            !app.durable
+                .channels
+                .iter()
+                .any(|channel| channel.id == selected)
+        );
+        assert!(app.channel_ui.was_deleted(selected));
+        assert!(
+            drain(&published)
+                .iter()
+                .any(|edit| matches!(edit, ModelEdit::DeleteChannel { id } if *id == selected))
+        );
+        assert_eq!(
+            app.persistent_workspace().chat_drafts[&card],
+            draft,
+            "passive deletion retains local unsent work"
+        );
+    }
+
+    #[test]
+    fn ordinary_reads_wait_for_connected_registry_admission() {
+        for unknown_model in [false, true] {
+            let (mut app, _, repository) = app_with_project();
+            assert_eq!(app.workspace_model.identity, NO_REGISTRY);
+            let mut model = registry(vec![shared(ChannelId::new(), &repository, "Unadmitted", 1)]);
+            if unknown_model {
+                model.identity = NO_REGISTRY;
+            }
+            let durable = Arc::clone(&app.durable);
+            let before = app.workspace_model.clone();
+            let published = intercept_publishes(&mut app);
+            let (task, project) = app.apply_workspace_model_update_effect(ModelUpdate::Read(model));
+            drop(task);
+            assert!(!project, "an ordinary read cannot bootstrap a registry");
+            assert_eq!(app.workspace_model, before);
+            assert_eq!(app.durable, durable);
+            assert!(drain(&published).is_empty());
+        }
+    }
+
+    #[test]
     fn create_publisher_keeps_the_complete_canonical_rank_response() {
         use crate::terminal::ipc::{
             ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
