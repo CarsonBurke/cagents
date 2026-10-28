@@ -434,6 +434,206 @@ impl Registry {
             .transpose()
     }
 
+    /// Archive a completed execution reference from a kernel boot that cannot
+    /// still own a process. The caller separately authenticates the current
+    /// cleanup actor; this never binds the historical source to that actor.
+    /// Keep visible conversations and every original session/run field intact.
+    pub(in crate::host) fn has_previous_boot_execution(
+        &self,
+        id: crate::model::TerminalId,
+        boot: &crate::model::BootId,
+    ) -> Result<bool, String> {
+        Ok(self.agent_for_session(id)?.is_some_and(|agent| {
+            agent.console.is_none() && matches!(agent.session, Some(HostedSession::Chat(source))
+                if source.proof.as_ref().is_some_and(|proof| proof.is_complete() && &proof.boot_id != boot))
+        }))
+    }
+
+    /// The caller has authenticated the helper's actual closed publication;
+    /// repeat all historical metadata predicates under the write transaction.
+    pub(in crate::host) fn archive_previous_boot_execution(
+        &mut self,
+        ownership: &super::NativeActorOwnership,
+        boot: &crate::model::BootId,
+        issued: &[crate::chat::Session],
+        retirement_source: &crate::chat::Session,
+    ) -> Result<bool, String> {
+        if !ownership.is_pending()
+            || &ownership.owner().boot != boot
+            || !ownership
+                .source()
+                .proof
+                .as_ref()
+                .is_some_and(|proof| proof.is_complete() && &proof.boot_id == boot)
+        {
+            return Ok(false);
+        }
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let encoded: Option<String> = tx
+            .query_row(
+                "SELECT ownership FROM native_actor_ownerships WHERE actor=?1",
+                [ownership.actor().to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if encoded
+            .as_deref()
+            .map(decode::<super::NativeActorOwnership>)
+            .transpose()?
+            .as_ref()
+            != Some(ownership)
+        {
+            return Err("Historical execution cleanup changed its exact actor registration".into());
+        }
+        // A reused allocation cannot let one helper retire a neighboring owner.
+        let mut owners = 0;
+        {
+            let mut statement = tx
+                .prepare("SELECT actor,ownership FROM native_actor_ownerships LIMIT 4097")
+                .map_err(|error| error.to_string())?;
+            let mut rows = statement.query([]).map_err(|error| error.to_string())?;
+            let (mut count, mut bytes) = (0, 0usize);
+            while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+                count += 1;
+                let actor: String = row.get(0).map_err(|error| error.to_string())?;
+                let encoded: String = row.get(1).map_err(|error| error.to_string())?;
+                bytes = bytes.saturating_add(encoded.len());
+                if count > 4096 || encoded.len() > 256 * 1024 || bytes > 64 * 1024 * 1024 {
+                    return Err(
+                        "Historical cleanup ownership census exceeds its metadata bound".into(),
+                    );
+                }
+                let entry: super::NativeActorOwnership = decode(&encoded)?;
+                if entry.actor().is_nil() || entry.actor().to_string() != actor {
+                    return Err("Historical cleanup census key changed its actor identity".into());
+                }
+                if entry.source().id == ownership.source().id && &entry.owner().boot == boot {
+                    owners += 1;
+                }
+            }
+        }
+        if owners != 1 {
+            return Ok(false);
+        }
+        let record: Option<String> = tx
+            .query_row(
+                "SELECT record FROM agents WHERE session_id=?1 AND closed=0",
+                [ownership.source().id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some(record) = record else {
+            return Ok(false);
+        };
+        let mut agent: Agent = decode(&record)?;
+        if agent.console.is_some() {
+            return Ok(false);
+        }
+        let Some(HostedSession::Chat(source)) = &agent.session else {
+            return Ok(false);
+        };
+        let current = ownership.source();
+        // An installation can ACK before canonical publication fails. Its
+        // immutable Pending intent then still carries ReconnectOnly, while
+        // the authenticated helper has actually issued retained continuity.
+        // That alias is cleanup evidence, never a new execution grant.
+        if !source
+            .proof
+            .as_ref()
+            .is_some_and(|proof| proof.is_complete() && &proof.boot_id != boot)
+            || source.id != current.id
+            || source.launch.provider != crate::agent::Provider::Claude
+            || source.launch.provider != current.launch.provider
+            || source.launch.recipe != current.launch.recipe
+            || source.launch.session_id.is_some()
+            || current.launch.session_id.is_none()
+            || !issued.contains(current)
+            || !issued.contains(retirement_source)
+            || retirement_source.id != current.id
+            || retirement_source.launch != current.launch
+            || !retirement_source
+                .proof
+                .as_ref()
+                .is_some_and(|proof| proof.is_complete() && &proof.boot_id == boot)
+            || retirement_source.terminal != current.terminal
+            || retirement_source.owned_codex_listener != current.owned_codex_listener
+            || source.native_continuity != retirement_source.native_continuity
+            || !matches!(
+                current.native_continuity,
+                crate::chat::NativeContinuity::ReconnectOnly
+                    | crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+            )
+            || !matches!(
+                retirement_source.native_continuity,
+                crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+            )
+            || !retirement_source.has_valid_native_continuity()
+            || !current.has_valid_native_continuity()
+            || current.terminal.is_some()
+            || current.owned_codex_listener.is_some()
+            || source.terminal != current.terminal
+            || source.owned_codex_listener != current.owned_codex_listener
+        {
+            return Ok(false);
+        }
+        let blocked: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE agent=?1 AND state IN ('accepted','running','waiting'))
+             OR EXISTS(SELECT 1 FROM agent_launches WHERE agent=?1 OR session_id=?2)
+             OR EXISTS(SELECT 1 FROM shared_view_panes WHERE id=?1)",
+            params![agent.id.to_string(), source.id.to_string()], |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if blocked {
+            return Ok(false);
+        }
+        if super::views::all(&tx)?.iter().any(|view| {
+            view.panes.iter().any(|pane| {
+            matches!(&pane.kind, crate::model::CardKind::Chat(chat) if chat.id == source.id)
+        })
+        }) {
+            return Ok(false);
+        }
+        // Revoke only the exact historical capability. A newer authority is
+        // still independently authenticated by ordinary retained cleanup.
+        let authority: Option<String> = tx
+            .query_row(
+                "SELECT source FROM agent_authorities WHERE session_id=?1",
+                [source.id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some(authority) = authority {
+            let retained: HostedSession = decode(&authority)?;
+            if retained == HostedSession::Chat(source.clone()) {
+                tx.execute(
+                    "DELETE FROM agent_authorities WHERE session_id=?1 AND source=?2",
+                    params![source.id.to_string(), authority],
+                )
+                .map_err(|error| error.to_string())?;
+            } else if !matches!(&retained, HostedSession::Chat(chat) if issued.contains(chat)
+                && issued.contains(retirement_source)
+                && crate::agent_execution::same_chat_process(chat, retirement_source))
+            {
+                return Ok(false);
+            }
+        }
+        agent.closed = true;
+        tx.execute(
+            "UPDATE agents SET closed=1,record=?2 WHERE id=?1 AND record=?3 AND closed=0",
+            params![agent.id.to_string(), encode(&agent)?, record],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
+            .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
     /// Durable descriptors that require exact holder-receipt validation before
     /// teardown can retire them, including a launch not yet publicly bound.
     pub(crate) fn retained_agent_sources(
@@ -939,6 +1139,7 @@ impl Registry {
                             "INSERT INTO channels(id, repository, title, ordinal, title_source) VALUES (?1, ?2, ?3, ?4, 0)",
                             params![channel.to_string(), repository, crate::workspace_model::channel_title_from_prompt(&request.prompt).unwrap_or_else(|| format!("{} agent", spec.provider.label())), ordinal],
                         ).map_err(|error| error.to_string())?;
+                        super::channel_work::created_in(tx, channel)?;
                         Placement::Channel(channel)
                     }
                 };
@@ -1687,6 +1888,444 @@ mod tests {
     }
 
     #[test]
+    fn removed_completed_previous_boot_execution_archives_without_borrowing_cleanup_authority() {
+        use crate::daemon::holder_registry::{Kind, Process, Record};
+        use crate::workspace_model::views::{Pane, Scope};
+        for case in 0..13 {
+            let (mut registry, directory, request) = fixture();
+            let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+            let HostedSession::Chat(mut current) = source() else {
+                unreachable!()
+            };
+            current.native_continuity =
+                crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            let boot = current.proof.as_ref().unwrap().boot_id.clone();
+            let mut historical = current.clone();
+            historical.proof.as_mut().unwrap().boot_id = "previous-kernel-boot".into();
+            historical.launch.session_id = None;
+            if case == 1 {
+                historical.proof.as_mut().unwrap().boot_id = boot.clone();
+            }
+            if case == 4 {
+                historical
+                    .launch
+                    .recipe
+                    .arguments
+                    .push("different-recipe".into());
+            }
+            let original = HostedSession::Chat(historical.clone());
+            registry
+                .bind_agent(accepted.agent.id, None, original.clone())
+                .unwrap();
+            registry.fresh_agent_authority(&original).unwrap();
+            if case != 2 {
+                let started = registry
+                    .update_agent_run(
+                        accepted.run.id,
+                        accepted.run.revision,
+                        Update::Started {
+                            provider_key: "unit-fixture-confirmed-turn".into(),
+                        },
+                        2,
+                    )
+                    .unwrap();
+                registry
+                    .update_agent_run(
+                        accepted.run.id,
+                        started.revision,
+                        Update::Finished {
+                            state: State::Succeeded,
+                            result: ResultSummary {
+                                text: "Preserve completed work".into(),
+                                ..Default::default()
+                            },
+                        },
+                        2,
+                    )
+                    .unwrap();
+            }
+            let actor = uuid::Uuid::new_v4();
+            let owner = Record {
+                version: 4,
+                build: None,
+                kind: Kind::Native,
+                application: crate::instance::APPLICATION_ID.into(),
+                boot: boot.clone(),
+                terminal: current.id,
+                holder: Process { pid: 42, start: 1 },
+                root: Process { pid: 43, start: 2 },
+            };
+            let mut pending = current.clone();
+            if case >= 11 {
+                pending.native_continuity = crate::chat::NativeContinuity::ReconnectOnly;
+            }
+            registry
+                .register_pending_native_actor_ownership(
+                    actor,
+                    &owner,
+                    &pending,
+                    Err("unit fixture has no account authority"),
+                )
+                .unwrap();
+            let ownership = registry.native_actor_ownership(actor).unwrap().unwrap();
+            if case == 3 {
+                registry
+                    .apply(&ModelEdit::SeedView {
+                        scope: Scope::Channel(accepted.agent.channel().unwrap()),
+                        panes: vec![Pane {
+                            id: crate::model::CardId::from_uuid(accepted.agent.id.as_uuid()),
+                            title: "Saved conversation".into(),
+                            user_title: None,
+                            pending_terminal_start: false,
+                            width_fraction: 0.5,
+                            kind: crate::model::CardKind::Chat(historical),
+                            scope: None,
+                        }],
+                        closed: vec![],
+                    })
+                    .unwrap();
+            }
+            if case == 5 {
+                let mut unrelated = current.clone();
+                unrelated
+                    .launch
+                    .recipe
+                    .arguments
+                    .push("unrelated-owner".into());
+                registry
+                    .fresh_agent_authority(&HostedSession::Chat(unrelated))
+                    .unwrap();
+            }
+            if case == 6 {
+                let mut other = owner.clone();
+                other.holder.start += 1;
+                registry
+                    .register_pending_native_actor_ownership(
+                        uuid::Uuid::new_v4(),
+                        &other,
+                        &current,
+                        Err("unit fixture has no account authority"),
+                    )
+                    .unwrap();
+            }
+            if case == 8 || case >= 11 {
+                registry
+                    .fresh_agent_authority(&HostedSession::Chat(pending.clone()))
+                    .unwrap();
+            }
+            if case == 9 {
+                let mut other = owner.clone();
+                other.terminal = crate::model::TerminalId::new();
+                let mut other_source = current.clone();
+                other_source.id = other.terminal;
+                let other_actor = uuid::Uuid::new_v4();
+                registry
+                    .register_pending_native_actor_ownership(
+                        other_actor,
+                        &other,
+                        &other_source,
+                        Err("unit fixture has no account authority"),
+                    )
+                    .unwrap();
+                registry
+                    .db
+                    .execute(
+                        "UPDATE native_actor_ownerships SET actor=?1 WHERE actor=?2",
+                        params![uuid::Uuid::new_v4().to_string(), other_actor.to_string()],
+                    )
+                    .unwrap();
+            }
+            if case == 7 {
+                registry.db.execute_batch("CREATE TRIGGER reject_history_archive BEFORE UPDATE OF closed ON agents BEGIN SELECT RAISE(FAIL, 'fixture archive failure'); END;").unwrap();
+            }
+            let mut issued = vec![current.clone()];
+            if case == 11 {
+                issued.push(pending);
+            }
+            if case == 10 {
+                let mut earlier = current.clone();
+                earlier.proof.as_mut().unwrap().host_incarnation =
+                    "earlier-current-boot-owner".into();
+                registry
+                    .fresh_agent_authority(&HostedSession::Chat(earlier.clone()))
+                    .unwrap();
+                issued.push(earlier);
+            }
+            let before = registry.agent(accepted.agent.id).unwrap();
+            let run = registry.agent_run(accepted.run.id).unwrap();
+            let authority = registry
+                .retained_agent_authority_source(current.id)
+                .unwrap();
+            let result =
+                registry.archive_previous_boot_execution(&ownership, &boot, &issued, &current);
+            match case {
+                7 => assert!(
+                    result.unwrap_err().contains("fixture archive failure"),
+                    "case {case}"
+                ),
+                9 => assert_eq!(
+                    result.unwrap_err(),
+                    "Historical cleanup census key changed its actor identity",
+                    "case {case}"
+                ),
+                _ => assert_eq!(
+                    result.unwrap_or_else(|error| panic!("case {case}: {error}")),
+                    case == 0 || case == 8 || case == 11,
+                    "case {case}"
+                ),
+            }
+            let mut expected = before.clone();
+            expected.closed = case == 0 || case == 8 || case == 11;
+            assert_eq!(
+                registry.agent(accepted.agent.id).unwrap(),
+                expected,
+                "original descriptor preserved, case {case}"
+            );
+            assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
+            assert_eq!(
+                registry
+                    .retained_agent_authority_source(current.id)
+                    .unwrap(),
+                if case == 0 { None } else { authority }
+            );
+            assert_eq!(
+                registry.native_actor_ownership(actor).unwrap().as_ref(),
+                Some(&ownership)
+            );
+            assert!(
+                registry.native_actor_retirement(actor).unwrap().is_none(),
+                "archival is not retirement proof"
+            );
+            if case == 8 || case == 11 {
+                // Production calls this only after verified helper retirement.
+                // Archival itself retained the current source capability.
+                registry
+                    .retire_agent_process(&HostedSession::Chat(current.clone()), 3)
+                    .unwrap();
+                assert!(
+                    registry
+                        .retained_agent_authority_source(current.id)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            if case == 7 {
+                // Remove only our injected fault after proving full rollback;
+                // the normal reopen must still enforce the published layout.
+                registry
+                    .db
+                    .execute_batch("DROP TRIGGER reject_history_archive;")
+                    .unwrap();
+            }
+            drop(registry);
+            let registry = Registry::at(&directory.path().join("model.sqlite3"))
+                .unwrap_or_else(|error| panic!("reopen case {case}: {error}"));
+            assert_eq!(registry.agent(accepted.agent.id).unwrap(), expected);
+            assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
+        }
+    }
+
+    #[test]
+    fn archived_history_resume_witness_rechecks_only_exact_retired_history() {
+        use crate::daemon::holder_registry::{Kind, Process, Record};
+        use crate::workspace_model::views::{Pane, Scope};
+        use std::os::unix::fs::MetadataExt;
+        // Typed durable-model qualification only. Runtime still requires the
+        // independently authenticated private VerifiedRetirement and account.
+        for pending_only in [false, true] {
+            for case in 0..9 {
+                let (mut registry, directory, request) = fixture();
+                let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+                let HostedSession::Chat(mut current) = source() else {
+                    unreachable!()
+                };
+                current.native_continuity =
+                    crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+                current.launch.recipe.working_directory = directory.path().into();
+                let boot = current.proof.as_ref().unwrap().boot_id.clone();
+                let mut historical = current.clone();
+                historical.proof.as_mut().unwrap().boot_id = "previous-kernel-boot".into();
+                historical.launch.session_id = None;
+                registry
+                    .bind_agent(accepted.agent.id, None, HostedSession::Chat(historical))
+                    .unwrap();
+                let started = registry
+                    .update_agent_run(
+                        accepted.run.id,
+                        accepted.run.revision,
+                        Update::Started {
+                            provider_key: "model-fixture-completed-turn".into(),
+                        },
+                        2,
+                    )
+                    .unwrap();
+                registry
+                    .update_agent_run(
+                        accepted.run.id,
+                        started.revision,
+                        Update::Finished {
+                            state: State::Succeeded,
+                            result: ResultSummary::default(),
+                        },
+                        3,
+                    )
+                    .unwrap();
+                let metadata = std::fs::metadata(directory.path()).unwrap();
+                let scope = crate::account::scope::LaunchAccountScope {
+                    provider: Provider::Claude,
+                    canonical_home: directory.path().canonicalize().unwrap(),
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                    registered_id: None,
+                    purge_ids: vec![],
+                };
+                let actor = uuid::Uuid::new_v4();
+                let owner = Record {
+                    version: 4,
+                    build: None,
+                    kind: Kind::Native,
+                    application: crate::instance::APPLICATION_ID.into(),
+                    boot: boot.clone(),
+                    terminal: current.id,
+                    holder: Process { pid: 42, start: 1 },
+                    root: Process { pid: 43, start: 2 },
+                };
+                let mut pending = current.clone();
+                if pending_only {
+                    pending.native_continuity = crate::chat::NativeContinuity::ReconnectOnly;
+                }
+                registry
+                    .register_pending_native_actor_ownership(actor, &owner, &pending, Ok(&scope))
+                    .unwrap();
+                registry
+                    .fresh_agent_authority(&HostedSession::Chat(pending.clone()))
+                    .unwrap();
+                let ownership = registry.native_actor_ownership(actor).unwrap().unwrap();
+                assert!(
+                    registry
+                        .archive_previous_boot_execution(
+                            &ownership,
+                            &boot,
+                            &[current.clone(), pending.clone()],
+                            &current
+                        )
+                        .unwrap()
+                );
+                registry
+                    .commit_native_actor_retirement(
+                        actor,
+                        &owner,
+                        &current,
+                        Ok(&scope),
+                        current.launch.session_id.as_deref(),
+                    )
+                    .unwrap();
+                let retirement = registry.native_actor_retirement(actor).unwrap().unwrap();
+                assert!(
+                    registry
+                        .archived_history(&current, &ownership, &retirement, &boot)
+                        .unwrap()
+                        .is_none(),
+                    "current authority must retire separately"
+                );
+                registry
+                    .retire_agent_process(&HostedSession::Chat(current.clone()), 4)
+                    .unwrap();
+                let witness = registry
+                    .archived_history(&current, &ownership, &retirement, &boot)
+                    .unwrap()
+                    .unwrap();
+                assert!(witness.matches(&current, &ownership, &retirement));
+                match case {
+                    0 => {}
+                    1 => {
+                        registry
+                            .fresh_agent_authority(&HostedSession::Chat(current.clone()))
+                            .unwrap();
+                    }
+                    2 => {
+                        let mut agent = registry.agent(accepted.agent.id).unwrap();
+                        agent.closed = false;
+                        registry
+                            .db
+                            .execute(
+                                "UPDATE agents SET closed=0,record=?1 WHERE id=?2",
+                                params![encode(&agent).unwrap(), agent.id.to_string()],
+                            )
+                            .unwrap();
+                    }
+                    3 => {
+                        let mut run = registry.agent_run(accepted.run.id).unwrap();
+                        run.state = State::Running;
+                        registry
+                            .db
+                            .execute(
+                                "UPDATE agent_runs SET state='running',record=?1 WHERE id=?2",
+                                params![encode(&run).unwrap(), run.id.to_string()],
+                            )
+                            .unwrap();
+                    }
+                    4 => {
+                        registry
+                            .apply(&ModelEdit::SeedView {
+                                scope: Scope::Channel(accepted.agent.channel().unwrap()),
+                                panes: vec![Pane {
+                                    id: crate::model::CardId::new(),
+                                    title: "Restored history".into(),
+                                    user_title: None,
+                                    pending_terminal_start: false,
+                                    width_fraction: 0.5,
+                                    kind: crate::model::CardKind::Chat(current.clone()),
+                                    scope: None,
+                                }],
+                                closed: vec![],
+                            })
+                            .unwrap();
+                    }
+                    5 => {
+                        registry
+                            .db
+                            .execute(
+                                "DELETE FROM native_actor_retirements WHERE actor=?1",
+                                [actor.to_string()],
+                            )
+                            .unwrap();
+                    }
+                    6 => {
+                        registry
+                            .db
+                            .execute("UPDATE metadata SET sequence=sequence+1", [])
+                            .unwrap();
+                    }
+                    7 | 8 => {
+                        let mut other = owner.clone();
+                        other.holder.start += 1;
+                        let mut other_source = pending.clone();
+                        if case == 8 {
+                            other.terminal = crate::model::TerminalId::new();
+                            other_source.id = other.terminal;
+                        }
+                        registry
+                            .register_pending_native_actor_ownership(
+                                uuid::Uuid::new_v4(),
+                                &other,
+                                &other_source,
+                                Ok(&scope),
+                            )
+                            .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    registry.recheck_archived_history(&witness).is_ok(),
+                    case == 0 || case == 6,
+                    "pending_only={pending_only} case={case}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn startup_preserves_only_exact_helper_proven_run_and_session_pairs() {
         for mismatch in 0..6 {
             let (mut registry, _directory, request) = fixture();
@@ -2016,7 +2655,14 @@ mod tests {
                 registry
                     .db
                     .execute_batch(
-                        "DROP TABLE native_actor_retirements;
+                        "DROP TABLE automation_notifications;
+                         DROP TABLE channel_work_placement_epochs;
+                         DROP TABLE channel_work_placement_clock;
+                         DROP TABLE channel_work_operations;
+                         DROP TABLE channel_work_entries;
+                         DROP TABLE channel_work_homes;
+                         DROP TABLE automation_lifecycle;
+                         DROP TABLE native_actor_retirements;
                          DROP TABLE native_actor_ownerships;
                          DROP TABLE native_actor_cursors;
                          DROP TABLE shared_view_terminal_sources;
@@ -2780,6 +3426,105 @@ mod tests {
     }
 
     #[test]
+    fn implicit_agent_channel_keeps_one_work_home_through_retry_and_project_close() {
+        use crate::channel_work::{Home, HomeLifecycle};
+
+        let (mut registry, directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let model = registry.model().unwrap();
+        let channel = model.channel(accepted.agent.channel().unwrap()).unwrap();
+        let home = Home {
+            registry: model.identity,
+            channel: channel.id,
+            creation_ordinal: channel.ordinal,
+        };
+        assert_eq!(
+            registry.read_channel_work_home(&home).unwrap().lifecycle,
+            HomeLifecycle::Active
+        );
+        let retried = registry.submit_agent(&Origin::User, &request, 2).unwrap();
+        assert!(!retried.created);
+        assert_eq!(retried.agent.id, accepted.agent.id);
+        assert_eq!(retried.run.id, accepted.run.id);
+        assert_eq!(
+            registry
+                .db
+                .query_row("SELECT count(*) FROM channel_work_homes", [], |row| row
+                    .get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+        registry
+            .apply(&ModelEdit::CloseProject {
+                repository: directory.path().into(),
+            })
+            .unwrap();
+        assert!(registry.model().unwrap().channels.is_empty());
+        assert_eq!(
+            registry.read_channel_work_home(&home).unwrap().lifecycle,
+            HomeLifecycle::Deleted
+        );
+        drop(registry);
+        let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert_eq!(
+            registry.read_channel_work_home(&home).unwrap().lifecycle,
+            HomeLifecycle::Deleted,
+            "reopening must retain the deleted incarnation without recreating its channel"
+        );
+        let retained: (String, String) = registry.db.query_row(
+            "SELECT repository,title FROM channel_work_homes WHERE channel=?1 AND incarnation=?2",
+            params![home.channel.to_string(), home.creation_ordinal],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(
+            retained,
+            (
+                directory.path().to_str().unwrap().into(),
+                channel.title.clone()
+            )
+        );
+    }
+
+    #[test]
+    fn failed_implicit_work_home_creation_rolls_back_agent_channel_and_run() {
+        let (mut registry, _directory, request) = fixture();
+        let before = registry.model().unwrap();
+        registry
+            .db
+            .execute_batch(
+                "CREATE TEMP TRIGGER refuse_implicit_home BEFORE INSERT ON main.channel_work_homes
+             BEGIN SELECT RAISE(ABORT, 'fixture work home failure'); END;",
+            )
+            .unwrap();
+        let error = registry
+            .submit_agent(&Origin::User, &request, 1)
+            .unwrap_err();
+        assert!(error.contains("fixture work home failure"));
+        let after = registry.model().unwrap();
+        assert_eq!(after.sequence, before.sequence);
+        assert!(after.channels.is_empty() && after.agents.is_empty());
+        for table in ["channel_work_homes", "agent_runs"] {
+            let count: u64 = registry
+                .db
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} must roll back with implicit creation");
+        }
+        registry
+            .db
+            .execute_batch("DROP TRIGGER temp.refuse_implicit_home;")
+            .unwrap();
+        assert!(
+            registry
+                .submit_agent(&Origin::User, &request, 2)
+                .unwrap()
+                .created
+        );
+    }
+
+    #[test]
     fn worktree_placement_requires_the_exact_open_view_without_creating_a_channel() {
         let (mut registry, directory, mut request) = fixture();
         let scope = Placement::Worktree {
@@ -2881,7 +3626,16 @@ mod tests {
             .unwrap();
         registry
             .db
-            .execute_batch("DROP INDEX agents_by_name; PRAGMA user_version=9;")
+            .execute_batch(
+                "DROP TABLE automation_notifications;
+                 DROP TABLE channel_work_placement_epochs;
+                 DROP TABLE channel_work_placement_clock;
+                 DROP TABLE channel_work_operations;
+                 DROP TABLE channel_work_entries;
+                 DROP TABLE channel_work_homes;
+                 DROP TABLE automation_lifecycle;
+                 DROP INDEX agents_by_name; PRAGMA user_version=9;",
+            )
             .unwrap();
         drop(registry);
         let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();

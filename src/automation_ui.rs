@@ -17,10 +17,19 @@ use cosmic::{
     iced::{Alignment, Length, widget::text_editor},
     widget,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
 
 const PAGE: usize = 50;
+/// Narrower than this, the header's primary command is drawn as an icon so
+/// the header keeps one row.
+const COMPACT_HEADER_WIDTH: f32 = 440.0;
+/// From this width the automation list sits beside the selection.
+const SIDE_BY_SIDE_WIDTH: f32 = 700.0;
+const LIST_WIDTH: f32 = 240.0;
+/// The most of a narrow pane's height the stacked list takes from the
+/// selection below it, including short split panes.
+const STACKED_LIST_SHARE: f32 = 0.4;
 const PROVIDERS: [&str; 3] = ["Claude", "Codex", "Omp"];
 const SCHEDULES: [&str; 5] = ["Hourly", "Daily", "Weekdays", "Weekly", "Cron"];
 const WEEKDAYS: [&str; 7] = [
@@ -74,6 +83,8 @@ pub enum Field {
 #[derive(Debug, Clone)]
 pub enum Action {
     Browse,
+    /// Leaves the open run for the automation or history it was opened from.
+    CloseRun,
     Tick,
     Refresh,
     More,
@@ -109,6 +120,8 @@ pub enum Action {
     History,
     AllHistory,
     MoreHistory,
+    Lifecycle,
+    MoreLifecycle,
     Run(Uuid),
     InspectRun(crate::model::RunId),
     CancelRun,
@@ -134,18 +147,35 @@ pub enum Effect {
     ReadRun(crate::model::RunId),
 }
 
+/// A request in flight. `Reload` rereads the open automation for Refresh,
+/// then replaces its history with the newest page.
 #[derive(Clone, Copy)]
 enum Pending {
-    List { append: bool },
+    List {
+        append: bool,
+    },
     Show,
+    Reload,
     Save,
     Mutate,
-    History { append: bool },
+    History {
+        append: bool,
+    },
+    Lifecycle {
+        id: Uuid,
+        append: bool,
+    },
     RefreshList,
+    RefreshLoadedList(LoadedListRefresh),
     RefreshAutomation,
-    RefreshHistory,
+    RefreshHistory {
+        scope: Option<Uuid>,
+    },
     RefreshRun,
-    HistoryRun { index: usize },
+    RefreshOlderHistory {
+        refresh: HistoryRefresh,
+        before: Option<HistoryKey>,
+    },
     Run,
     OpenRun,
 }
@@ -155,12 +185,59 @@ impl Pending {
         matches!(
             self,
             Self::RefreshList
+                | Self::RefreshLoadedList(_)
                 | Self::RefreshAutomation
-                | Self::RefreshHistory
+                | Self::RefreshHistory { .. }
                 | Self::RefreshRun
-                | Self::HistoryRun { .. }
+                | Self::RefreshOlderHistory { .. }
         )
     }
+}
+
+/// One bounded read through the UUID range the reader explicitly loaded.
+/// This is a cursor, not a snapshot or a promise about refresh latency.
+#[derive(Clone, Copy)]
+struct LoadedListRefresh {
+    after: Option<Uuid>,
+    through: Uuid,
+}
+
+type HistoryKey = (u64, Uuid);
+
+/// A finite read through the reader's loaded history, not a server snapshot.
+/// Both endpoints are actual firing keys; neither is a manual paging cursor.
+#[derive(Clone, Copy)]
+struct HistoryRefresh {
+    scope: Option<Uuid>,
+    before: HistoryKey,
+    through: HistoryKey,
+}
+
+fn history_key(firing: &Firing) -> HistoryKey {
+    (firing.created_ms, firing.id)
+}
+
+fn history_cursor(key: HistoryKey) -> HistoryCursor {
+    HistoryCursor {
+        created_ms: key.0,
+        id: key.1,
+    }
+}
+
+/// History's public cursor is a structured exclusive key, not a capability.
+/// Canonical UUID text order equals its unsigned 128-bit order. Derive the
+/// tight inclusive bound for a real loaded candidate, skipping unrequested
+/// newer history. None is the unbounded upper end for the maximal SQL key.
+fn including_history_key(key: HistoryKey) -> Result<Option<HistoryKey>, &'static str> {
+    i64::try_from(key.0)
+        .map_err(|_| "The loaded run history timestamp is outside the supported range")?;
+    Ok(if let Some(id) = key.1.as_u128().checked_add(1) {
+        Some((key.0, Uuid::from_u128(id)))
+    } else if key.0 < i64::MAX as u64 {
+        Some((key.0 + 1, Uuid::nil()))
+    } else {
+        None
+    })
 }
 
 struct Confirmation {
@@ -569,20 +646,84 @@ enum HistoryStatus {
     Unrequested,
     Loading,
     Loaded,
-    Failed,
+    /// Keeps its message, so the history states its own failure.
+    Failed(String),
+}
+
+/// Whether the automation list has been read. A failure keeps its message,
+/// so the list states its own failure and not a later one's.
+#[derive(Default, Debug, PartialEq, Eq)]
+enum ListStatus {
+    #[default]
+    Unread,
+    Loaded,
+    Failed(String),
+}
+
+/// The pane's two peer views. A run opened from one stays inside it, so
+/// leaving the run returns there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Section {
+    Automations,
+    RunHistory,
+}
+
+impl Section {
+    const ALL: [Self; 2] = [Self::Automations, Self::RunHistory];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Automations => "Automations",
+            Self::RunHistory => "Run history",
+        }
+    }
+
+    /// The tab's accessible name and tooltip.
+    fn description(self) -> &'static str {
+        match self {
+            Self::Automations => "Automations and their schedules",
+            Self::RunHistory => "Runs of every automation, including removed ones",
+        }
+    }
+
+    /// The current tab's accessible name and tooltip while something is open
+    /// beneath it, which choosing the tab leaves.
+    fn back(self) -> &'static str {
+        match self {
+            Self::Automations => "Back to the automation list",
+            Self::RunHistory => "Back to Run history",
+        }
+    }
+
+    fn enter(self) -> Action {
+        match self {
+            Self::Automations => Action::Browse,
+            Self::RunHistory => Action::AllHistory,
+        }
+    }
+}
+
+struct LifecycleNotice {
+    id: Uuid,
+    sequence: u64,
+    event: Option<crate::automations::LifecycleEvent>,
 }
 
 #[derive(Default)]
 pub struct State {
+    lifecycle_notice: Option<LifecycleNotice>,
     manual_requests: std::collections::BTreeMap<Uuid, (u64, Uuid)>,
     sequence: u64,
     pending: Option<(u64, Pending)>,
     rows: Vec<Summary>,
+    list_status: ListStatus,
     // The newest firing learned from an authoritative first history page.
     // Older pages and detail reads may update it, but cannot replace it.
     last_firings: BTreeMap<Uuid, (u64, Uuid)>,
     more: bool,
     after: Option<Uuid>,
+    loaded_list_refresh: Option<LoadedListRefresh>,
+    list_changed: bool,
     search: String,
     selected: Option<Automation>,
     draft: Option<Draft>,
@@ -590,9 +731,11 @@ pub struct State {
     discard_generation: u64,
     confirmation: Option<Confirmation>,
     history: Vec<Firing>,
+    lifecycle: Option<crate::automations::LifecyclePage>,
     history_status: HistoryStatus,
     history_next: Option<HistoryCursor>,
     history_newer: bool,
+    history_refresh: Option<HistoryRefresh>,
     all_history: bool,
     run: Option<RunDetail>,
     error: Option<String>,
@@ -676,6 +819,67 @@ impl State {
                 Some((_, Pending::Save | Pending::Mutate | Pending::OpenRun))
             )
     }
+    /// Notification reads may supersede background polling, never a draft,
+    /// confirmation or foreground request owned by the user.
+    pub fn can_open_lifecycle(&self) -> bool {
+        self.can_open_run()
+            && self
+                .pending
+                .is_none_or(|(_, pending)| pending.background_read())
+    }
+
+    /// Adopt only the exact authorized historical receipt. No definition or
+    /// latest-row fallback is needed, including for a removed automation.
+    pub fn show_lifecycle_receipt(
+        &mut self,
+        id: Uuid,
+        sequence: u64,
+        result: Result<crate::automations::LifecyclePage, ()>,
+    ) -> bool {
+        if !self.can_open_lifecycle() || id.is_nil() || sequence == 0 || sequence > i64::MAX as u64
+        {
+            return false;
+        }
+        let event = result.ok().and_then(|mut page| {
+            if page.events.len() != 1 || page.next.is_some_and(|next| next != sequence) {
+                return None;
+            }
+            let event = page.events.pop()?;
+            (event.automation == id
+                && event.sequence == sequence
+                && event.actor == crate::automations::LifecycleActor::System
+                && matches!(
+                    event.cause,
+                    crate::automations::LifecycleCause::ProjectClosed
+                        | crate::automations::LifecycleCause::ProjectUnavailable
+                        | crate::automations::LifecycleCause::StartPaused
+                        | crate::automations::LifecycleCause::PrecheckInterrupted
+                        | crate::automations::LifecycleCause::PrecheckPaused
+                )
+                && !event.enabled
+                && event.revision > 0
+                && event.revision <= i64::MAX as u64
+                && event.occurred_ms <= i64::MAX as u64
+                && !event.firing.is_some_and(|id| id.is_nil()))
+            .then_some(event)
+        });
+        self.sequence = self.sequence.wrapping_add(1);
+        self.pending = None;
+        self.history_refresh = None;
+        self.selected = None;
+        self.run = None;
+        self.lifecycle = None;
+        self.all_history = false;
+        self.error = None;
+        self.notice = None;
+        self.lifecycle_notice = Some(LifecycleNotice {
+            id,
+            sequence,
+            event,
+        });
+        true
+    }
+
     pub fn set_choices(
         &mut self,
         targets: Vec<TargetChoice>,
@@ -688,6 +892,9 @@ impl State {
     }
     fn request(&mut self, pending: Pending, request: Request) -> Option<Effect> {
         self.sequence = self.sequence.wrapping_add(1);
+        if !pending.background_read() {
+            self.history_refresh = None;
+        }
         self.pending = Some((self.sequence, pending));
         self.error = None;
         if matches!(pending, Pending::History { .. }) {
@@ -710,19 +917,236 @@ impl State {
         }
     }
 
-    fn refresh_history_runs(&mut self, from: usize) -> Option<Effect> {
-        let index = (from..self.history.len()).find(|&index| {
-            self.history[index].state.is_active() || self.history[index].release_pending
-        })?;
+    fn refresh_loaded_list(&mut self, refresh: LoadedListRefresh, rows: Vec<Summary>) {
+        // Validate the whole page before changing any row or advancing a
+        // cursor. Canonical UUID order is the daemon's immutable List order.
+        if rows.len() > PAGE
+            || rows
+                .first()
+                .is_some_and(|row| refresh.after.is_some_and(|after| row.id <= after))
+            || rows.windows(2).any(|pair| pair[0].id >= pair[1].id)
+        {
+            self.list_status =
+                ListStatus::Failed("The automation list reply was inconsistent".into());
+            self.error = Some("The automation list reply was inconsistent".into());
+            return;
+        }
+        let last = rows.last().map(|row| row.id);
+        let complete = rows.len() < PAGE || last.is_some_and(|last| last >= refresh.through);
+        let covered = if complete {
+            refresh.through
+        } else {
+            last.expect("a full page has a final UUID")
+        };
+        // Foreground Save/More can leave a non-prefix display order. Keep its
+        // slots: only the response is ordered, not necessarily our loaded Vec.
+        // Missing or new IDs request Refresh, never automatic removal/growth.
+        let covered_count = self
+            .rows
+            .iter()
+            .filter(|row| refresh.after.is_none_or(|after| row.id > after) && row.id <= covered)
+            .count();
+        let mut matched = 0;
+        for row in rows {
+            if row.id > refresh.through {
+                // A returned addition beyond the old tail still needs a
+                // refresh cue once the manual list was exhausted. Otherwise
+                // this can simply be an already-unloaded page.
+                self.list_changed |= !self.more;
+                continue;
+            }
+            if let Some(current) = self.rows.iter_mut().find(|loaded| loaded.id == row.id) {
+                self.last_firings.remove(&row.id);
+                *current = row;
+                matched += 1;
+            } else {
+                // A Show reply may have added a known non-prefix row. When
+                // more pages remain, unknown IDs beyond the manual cursor
+                // need not be new; they are not a membership census.
+                self.list_changed |= !self.more || self.after.is_some_and(|after| row.id <= after);
+            }
+        }
+        if matched != covered_count {
+            self.list_changed = true;
+        }
+        self.list_status = ListStatus::Loaded;
+        self.loaded_list_refresh = (!complete).then_some(LoadedListRefresh {
+            after: last,
+            through: refresh.through,
+        });
+    }
+
+    fn merge_history_rows(&mut self, rows: Vec<Firing>) {
+        // Build once per bounded page, rather than re-finding every loaded
+        // row for every full RunDetail response. No insertion or reordering.
+        let indices: HashMap<_, _> = self
+            .history
+            .iter()
+            .enumerate()
+            .map(|(index, firing)| (firing.id, index))
+            .collect();
+        let newest = self.history.iter().map(history_key).max();
+        for firing in rows {
+            if let Some(&index) = indices.get(&firing.id) {
+                self.history[index] = firing;
+            } else if newest.is_some_and(|newest| history_key(&firing) > newest) {
+                self.history_newer = true;
+            }
+        }
+    }
+
+    fn refresh_older_history(&mut self, newest: Option<HistoryKey>, more: bool) -> Option<Effect> {
+        let scope = self.selected.as_ref().map(|automation| automation.id);
+        if (!self.all_history && scope.is_none()) || !more {
+            self.history_refresh = None;
+            return None;
+        }
+        let Some(newest) = newest else {
+            self.history_refresh = None;
+            return None;
+        };
+        let through = self.history.iter().map(history_key).min()?;
+        let mut refresh = self
+            .history_refresh
+            .filter(|refresh| refresh.scope == scope)
+            .unwrap_or(HistoryRefresh {
+                scope,
+                before: newest,
+                through,
+            });
+        // Compaction can extend the newest page past our old resume point.
+        // Never reread the page whose metadata just arrived.
+        refresh.before = refresh.before.min(newest);
+        let next = self
+            .history
+            .iter()
+            .filter(|firing| firing.state.is_active() || firing.release_pending)
+            .map(history_key)
+            .filter(|key| *key < refresh.before && *key >= refresh.through)
+            .max();
+        let Some(next) = next else {
+            self.history_refresh = None;
+            return None;
+        };
+        let before = match including_history_key(next) {
+            Ok(before) => before,
+            Err(error) => {
+                self.history_status = HistoryStatus::Failed(error.into());
+                self.error = Some(error.into());
+                return None;
+            }
+        };
+        // Only one older page is issued per Tick. If it fails or foreground
+        // input supersedes it, resume below this actual loaded candidate on a
+        // later Tick. It stays visible/unconfirmed and is revisited on wrap;
+        // a persistently failing first row cannot starve every later row.
+        self.history_refresh = (next > refresh.through).then_some(HistoryRefresh {
+            before: next,
+            ..refresh
+        });
         self.request(
-            Pending::HistoryRun { index },
-            Request::ShowFiring {
-                id: self.history[index].id,
+            Pending::RefreshOlderHistory { refresh, before },
+            Request::History {
+                id: scope,
+                before: before.map(history_cursor),
+                limit: PAGE,
             },
         )
     }
 
+    fn valid_history_page(
+        &self,
+        scope: Option<Uuid>,
+        before: Option<HistoryKey>,
+        page: &crate::automations::HistoryPage,
+    ) -> bool {
+        let indices: HashMap<_, _> = self
+            .history
+            .iter()
+            .enumerate()
+            .map(|(index, firing)| (firing.id, index))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        page.firings.len() <= PAGE
+            && page.firings.iter().all(|firing| {
+                firing.created_ms <= i64::MAX as u64
+                    && before.is_none_or(|before| history_key(firing) < before)
+                    && scope.is_none_or(|id| firing.automation == id)
+                    && seen.insert(firing.id)
+                    && indices.get(&firing.id).is_none_or(|&index| {
+                        let previous = &self.history[index];
+                        previous.automation == firing.automation
+                            && previous.created_ms == firing.created_ms
+                    })
+            })
+            && page
+                .firings
+                .windows(2)
+                .all(|pair| history_key(&pair[0]) > history_key(&pair[1]))
+            && page.next.as_ref().is_none_or(|cursor| {
+                page.firings.len() == PAGE
+                    && page
+                        .firings
+                        .last()
+                        .is_some_and(|firing| history_key(firing) == (cursor.created_ms, cursor.id))
+            })
+    }
+
+    fn accept_older_history(
+        &mut self,
+        refresh: HistoryRefresh,
+        before: Option<HistoryKey>,
+        page: crate::automations::HistoryPage,
+    ) {
+        let current_scope = self.selected.as_ref().map(|automation| automation.id);
+        if current_scope != refresh.scope || (!self.all_history && current_scope.is_none()) {
+            return;
+        }
+        let valid = self.valid_history_page(refresh.scope, before, &page);
+        if !valid {
+            let error = "The older run history reply was inconsistent".to_owned();
+            self.history_status = HistoryStatus::Failed(error.clone());
+            self.error = Some(error);
+            return;
+        }
+        self.history_status = HistoryStatus::Loaded;
+        // A valid response replaces the failure fallback with its actual
+        // strict cursor. Empty/exhausted/past-horizon responses end this pass;
+        // absent loaded rows never become terminal or disappear.
+        self.history_refresh = page
+            .next
+            .as_ref()
+            .filter(|cursor| (cursor.created_ms, cursor.id) > refresh.through)
+            .map(|cursor| HistoryRefresh {
+                before: (cursor.created_ms, cursor.id),
+                ..refresh
+            });
+        for firing in &page.firings {
+            self.refresh_last_outcome(firing, false);
+        }
+        let indices: HashMap<_, _> = self
+            .history
+            .iter()
+            .enumerate()
+            .map(|(index, firing)| (firing.id, index))
+            .collect();
+        for firing in page.firings {
+            if let Some(&index) = indices.get(&firing.id) {
+                self.history[index] = firing;
+            }
+        }
+    }
+
     pub fn update(&mut self, action: Action) -> Option<Effect> {
+        if self.lifecycle_notice.is_some() {
+            // This surface is historical only. Retained callbacks from the
+            // previous editor cannot mutate or open a different run behind it.
+            if !matches!(action, Action::Browse | Action::InspectRun(_)) {
+                return None;
+            }
+            self.lifecycle_notice = None;
+        }
+
         if self.discard_draft.is_some() && !action.background() && !action.answers_draft_dialog() {
             return None;
         }
@@ -770,19 +1194,73 @@ impl State {
             self.pending = None;
             let result =
                 std::sync::Arc::try_unwrap(result).unwrap_or_else(|result| (*result).clone());
+            if let Pending::RefreshHistory { scope } = pending {
+                let current_scope = self.selected.as_ref().map(|automation| automation.id);
+                if scope != current_scope || (scope.is_none() && !self.all_history) {
+                    return None;
+                }
+                match &result {
+                    Ok(Response::History(page)) if self.valid_history_page(scope, None, page) => {}
+                    Err(_) => {}
+                    _ => {
+                        let error = "The newest run history reply was inconsistent".to_owned();
+                        self.history_status = HistoryStatus::Failed(error.clone());
+                        self.error = Some(error);
+                        return None;
+                    }
+                }
+            }
+            if let Pending::RefreshOlderHistory { refresh, before } = pending {
+                match result {
+                    Ok(Response::History(page)) => self.accept_older_history(refresh, before, page),
+                    result => {
+                        let error = result.err().unwrap_or_else(|| {
+                            "The older run history reply was inconsistent".into()
+                        });
+                        self.history_status = HistoryStatus::Failed(error.clone());
+                        self.error = Some(error);
+                    }
+                }
+                return None;
+            }
+            if let Pending::RefreshLoadedList(refresh) = pending {
+                match result {
+                    Ok(Response::Listed(rows)) => self.refresh_loaded_list(refresh, rows),
+                    result => {
+                        let error = result
+                            .err()
+                            .unwrap_or_else(|| "The automation list reply was inconsistent".into());
+                        self.list_status = ListStatus::Failed(error.clone());
+                        self.error = Some(error);
+                    }
+                }
+                return None;
+            }
             match result {
                 Err(error) => {
-                    if matches!(pending, Pending::History { .. } | Pending::RefreshHistory) {
-                        self.history_status = HistoryStatus::Failed;
+                    if matches!(
+                        pending,
+                        Pending::History { .. } | Pending::RefreshHistory { .. }
+                    ) {
+                        self.history_status = HistoryStatus::Failed(error.clone());
+                    }
+                    if matches!(
+                        pending,
+                        Pending::List { append: false } | Pending::RefreshList
+                    ) {
+                        self.list_status = ListStatus::Failed(error.clone());
                     }
                     self.error = Some(error);
                 }
                 Ok(Response::Listed(rows)) => {
+                    self.list_status = ListStatus::Loaded;
                     self.more = rows.len() == PAGE;
                     self.after = rows.last().map(|row| row.id);
                     if !matches!(pending, Pending::List { append: true }) {
                         self.rows.clear();
+                        self.list_changed = false;
                     }
+                    self.loaded_list_refresh = None;
                     for row in rows {
                         // The list is authoritative but does not carry the latest
                         // firing identity. Retire our earlier detail-read fence.
@@ -797,9 +1275,19 @@ impl State {
                     }
                     self.last_firings
                         .retain(|id, _| self.rows.iter().any(|row| row.id == *id));
+                    // Refreshing with an automation open also reads it and its
+                    // newest runs; its poll keeps a stable page instead.
+                    if matches!(pending, Pending::List { append: false })
+                        && let Some(id) = self.selected.as_ref().map(|selected| selected.id)
+                    {
+                        return self.request(Pending::Reload, Request::Show { id });
+                    }
                 }
                 Ok(Response::Automation(automation)) => {
                     let id = automation.id;
+                    if self.selected.as_ref().map(|selected| selected.id) != Some(id) {
+                        self.lifecycle = None;
+                    }
                     if let Some(row) = self.rows.iter_mut().find(|row| row.id == id) {
                         *row = automation.summary(row.last_state);
                     } else {
@@ -818,11 +1306,15 @@ impl State {
                             "Saved. Review the launch settings before enabling or running.".into(),
                         );
                     }
+                    // The loaded page stays until this read succeeds, so a
+                    // failed reload leaves the poll refreshing it in place.
                     return self.request(
-                        if self.history_status == HistoryStatus::Unrequested {
+                        if self.history_status == HistoryStatus::Unrequested
+                            || matches!(pending, Pending::Reload)
+                        {
                             Pending::History { append: false }
                         } else {
-                            Pending::RefreshHistory
+                            Pending::RefreshHistory { scope: Some(id) }
                         },
                         Request::History {
                             id: Some(id),
@@ -837,35 +1329,20 @@ impl State {
                         self.refresh_last_outcome(firing, newest_page);
                     }
                     self.history_status = HistoryStatus::Loaded;
-                    if matches!(pending, Pending::RefreshHistory) {
+                    if matches!(pending, Pending::RefreshHistory { .. }) {
                         // Keep the reader's paginated snapshot stable. Automatically
                         // inserting every new run would grow the mounted list forever
                         // and create gaps between its newest and older pages.
+                        let newest = page.firings.iter().map(history_key).min();
+                        let more = page.next.is_some();
                         if self.history.is_empty() {
                             self.history = page.firings;
                             self.history_next = page.next;
                             self.history_newer = false;
                         } else {
-                            let newest = self
-                                .history
-                                .iter()
-                                .map(|firing| (firing.created_ms, firing.id))
-                                .max();
-                            for firing in page.firings {
-                                if let Some(current) = self
-                                    .history
-                                    .iter_mut()
-                                    .find(|current| current.id == firing.id)
-                                {
-                                    *current = firing;
-                                } else if newest
-                                    .is_some_and(|latest| (firing.created_ms, firing.id) > latest)
-                                {
-                                    self.history_newer = true;
-                                }
-                            }
+                            self.merge_history_rows(page.firings);
                         }
-                        return self.refresh_history_runs(0);
+                        return self.refresh_older_history(newest, more);
                     }
                     if !matches!(pending, Pending::History { append: true }) {
                         self.history.clear();
@@ -887,18 +1364,35 @@ impl State {
                     });
                     self.history_next = page.next;
                 }
+                Ok(Response::Audit(mut page)) => {
+                    if let Pending::Lifecycle { id, append } = pending {
+                        if self
+                            .selected
+                            .as_ref()
+                            .is_some_and(|selected| selected.id == id)
+                            && page.events.iter().all(|event| event.automation == id)
+                        {
+                            if append {
+                                if let Some(previous) = self.lifecycle.take() {
+                                    let mut events = previous.events;
+                                    for event in page.events {
+                                        if !events
+                                            .iter()
+                                            .any(|existing| existing.sequence == event.sequence)
+                                        {
+                                            events.push(event);
+                                        }
+                                    }
+                                    events.truncate(crate::automations::MAX_LIFECYCLE_EVENTS);
+                                    page.events = events;
+                                }
+                            }
+                            self.lifecycle = Some(page);
+                        }
+                    }
+                }
                 Ok(Response::Detail(detail)) => {
                     self.refresh_last_outcome(&detail.firing, false);
-                    if let Pending::HistoryRun { index } = pending {
-                        if let Some(firing) = self
-                            .history
-                            .iter_mut()
-                            .find(|firing| firing.id == detail.firing.id)
-                        {
-                            *firing = detail.firing;
-                        }
-                        return self.refresh_history_runs(index + 1);
-                    }
                     if matches!(pending, Pending::OpenRun) {
                         self.run = Some(detail.clone());
                         return Some(Effect::OpenRun(detail));
@@ -922,6 +1416,7 @@ impl State {
                     self.history.insert(0, firing);
                 }
                 Ok(Response::Removed) => {
+                    self.lifecycle = None;
                     if let Some(selected) = self.selected.take() {
                         self.rows.retain(|row| row.id != selected.id);
                         self.last_firings.remove(&selected.id);
@@ -943,10 +1438,20 @@ impl State {
             if !self.can_open_run() {
                 return None;
             }
+            if self
+                .run
+                .as_ref()
+                .and_then(|detail| detail.run.as_ref())
+                .map(|current| current.id)
+                != Some(run)
+            {
+                self.notice = None;
+            }
             // Notification activation can race a restored card's initial list
             // read. Supersede reads using the request sequence; never discard
             // a user's draft, consent, or an in-flight mutation.
             self.selected = None;
+            self.lifecycle = None;
             self.all_history = false;
             self.run = None;
             self.history.clear();
@@ -980,7 +1485,7 @@ impl State {
             }
             if self.all_history {
                 return self.request(
-                    Pending::RefreshHistory,
+                    Pending::RefreshHistory { scope: None },
                     Request::History {
                         id: None,
                         before: None,
@@ -997,7 +1502,17 @@ impl State {
                     },
                 );
             }
-            return None;
+            let refresh = self.loaded_list_refresh.unwrap_or(LoadedListRefresh {
+                after: None,
+                through: self.rows.iter().map(|row| row.id).max()?,
+            });
+            return self.request(
+                Pending::RefreshLoadedList(refresh),
+                Request::List {
+                    after: refresh.after,
+                    limit: PAGE,
+                },
+            );
         }
         if let Action::Confirm(generation) = action {
             let Some(confirmation) = self.confirmation.take() else {
@@ -1031,8 +1546,12 @@ impl State {
         self.confirmation = None;
         match action {
             Action::Browse => {
+                if self.selected.is_some() || self.run.is_some() || self.all_history {
+                    self.notice = None;
+                }
                 self.run = None;
                 self.selected = None;
+                self.lifecycle = None;
                 self.all_history = false;
                 return self.request(
                     Pending::List { append: false },
@@ -1075,13 +1594,21 @@ impl State {
             }
             Action::Search(value) => self.search = value,
             Action::New => {
+                self.notice = None;
                 self.draft = Some(Draft::new(&self.targets, &self.accounts, None));
                 self.run = None;
             }
             Action::Select(id) => {
+                if self.selected.as_ref().map(|automation| automation.id) != Some(id)
+                    || self.run.is_some()
+                    || self.all_history
+                {
+                    self.notice = None;
+                }
                 self.draft = None;
                 self.all_history = false;
                 self.selected = None;
+                self.lifecycle = None;
                 self.history.clear();
                 self.history_newer = false;
                 self.history_status = HistoryStatus::Unrequested;
@@ -1099,7 +1626,10 @@ impl State {
                         accounts.push(saved.clone());
                     }
                     Draft::new(&self.targets, &accounts, Some(value))
-                })
+                });
+                if self.draft.is_some() {
+                    self.notice = None;
+                }
             }
             Action::CancelEdit => self.draft = None,
             Action::KeepDraft(_) | Action::DiscardDraft(_) => {}
@@ -1284,14 +1814,40 @@ impl State {
                     );
                 }
             }
+            Action::Lifecycle | Action::MoreLifecycle => {
+                if let Some(selected) = &self.selected {
+                    let id = selected.id;
+                    let append = matches!(action, Action::MoreLifecycle);
+                    let before = if append {
+                        self.lifecycle.as_ref().and_then(|page| page.next)
+                    } else {
+                        None
+                    };
+                    if append && before.is_none() {
+                        return None;
+                    }
+                    return self.request(
+                        Pending::Lifecycle { id, append },
+                        Request::Audit {
+                            id,
+                            before,
+                            limit: PAGE,
+                        },
+                    );
+                }
+            }
             Action::History | Action::MoreHistory | Action::AllHistory => {
                 if matches!(action, Action::AllHistory) {
+                    if !self.all_history || self.selected.is_some() || self.run.is_some() {
+                        self.notice = None;
+                    }
                     self.all_history = true;
                     self.history.clear();
                     self.history_newer = false;
                     self.history_next = None;
                     self.history_status = HistoryStatus::Unrequested;
                     self.selected = None;
+                    self.lifecycle = None;
                     self.run = None;
                 }
                 if self.all_history || self.selected.is_some() {
@@ -1310,7 +1866,18 @@ impl State {
                     );
                 }
             }
-            Action::Run(id) => return self.request(Pending::Run, Request::ShowFiring { id }),
+            Action::Run(id) => {
+                if self.run.as_ref().map(|detail| detail.firing.id) != Some(id) {
+                    self.notice = None;
+                }
+                return self.request(Pending::Run, Request::ShowFiring { id });
+            }
+            Action::CloseRun => {
+                if self.run.is_some() {
+                    self.notice = None;
+                }
+                self.run = None;
+            }
             Action::CancelRun => {
                 if let Some(run) = &self.run {
                     return self.request(
@@ -1334,45 +1901,325 @@ impl State {
     }
 
     pub fn view(&self) -> Element<'_, Action> {
-        crate::ui_controls::responsive(move |size| self.view_layout(size.width)).into()
+        crate::ui_controls::responsive(move |size| self.view_layout(size)).into()
     }
 
-    fn view_layout(&self, width: f32) -> Element<'_, Action> {
+    /// Which of the pane's two views is on screen. A run keeps the view it
+    /// was opened from.
+    fn section(&self) -> Section {
+        if self.all_history {
+            Section::RunHistory
+        } else {
+            Section::Automations
+        }
+    }
+
+    /// What returns the view on screen to its root, while something is open
+    /// beneath it: a run, or a selected automation.
+    fn section_root(&self) -> Option<Action> {
+        match self.section() {
+            Section::RunHistory => self.run.is_some().then_some(Action::CloseRun),
+            Section::Automations => {
+                (self.run.is_some() || self.selected.is_some()).then_some(Action::Browse)
+            }
+        }
+    }
+
+    /// The view switcher's tabs. The view on screen is selected, and choosing
+    /// it again returns from whatever is open beneath it; while a command is
+    /// in flight no tab publishes.
+    fn view_tabs(&self, busy: bool) -> Vec<crate::ui_controls::ViewTab<'static, Action>> {
+        let current = self.section();
+        let root = self.section_root();
+        Section::ALL
+            .into_iter()
+            .map(|section| {
+                let returns = section == current && root.is_some();
+                crate::ui_controls::ViewTab {
+                    label: section.label().into(),
+                    description: if returns {
+                        section.back()
+                    } else {
+                        section.description()
+                    }
+                    .into(),
+                    count: None,
+                    selected: section == current,
+                    id: None,
+                    on_press: if busy {
+                        None
+                    } else if section == current {
+                        root.clone()
+                    } else {
+                        Some(section.enter())
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// The levels above the open run: the view it was opened from, then its
+    /// automation. A level still loaded behind the run is returned to as it
+    /// was rather than read again.
+    ///
+    /// The name leads only to an automation that can be shown. Inside Run
+    /// history it stays plain: the run may outlive its automation, and
+    /// leaving for the other view would discard the loaded page. Opened from
+    /// an alert, only a listed automation is linked.
+    fn run_trail<'a>(&self, run: &'a RunDetail) -> [(&'a str, Option<Action>); 2] {
+        let section = self.section();
+        let automation = run.firing.automation;
+        let name = match section {
+            Section::RunHistory => None,
+            Section::Automations
+                if self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|selected| selected.id == automation) =>
+            {
+                Some(Action::CloseRun)
+            }
+            Section::Automations => self
+                .rows
+                .iter()
+                .any(|row| row.id == automation)
+                .then_some(Action::Select(automation)),
+        };
+        [
+            (
+                section.label(),
+                Some(match section {
+                    Section::RunHistory => Action::CloseRun,
+                    Section::Automations => Action::Browse,
+                }),
+            ),
+            (run.definition.name.as_str(), name),
+        ]
+    }
+
+    /// The pane's one header row, above every layout so its controls keep
+    /// their place at every width.
+    ///
+    /// The view switcher leads it: the tab strip already names the pane, and
+    /// a title beside an "Automations" tab would say it twice. A draft or a
+    /// confirmation takes the switcher's place with its own trail, since each
+    /// carries its own way out and its own primary action.
+    fn header(&self, busy: bool, width: f32) -> Element<'_, Action> {
+        let compact = width < COMPACT_HEADER_WIDTH;
+        let view = self.section().label();
+        let mut row = widget::row::with_capacity(4)
+            .spacing(space::S)
+            .align_y(Alignment::Center)
+            .height(Length::Fixed(crate::design::PRIMARY_CONTROL_SIZE));
+        let opened = |id: Uuid| {
+            self.selected
+                .as_ref()
+                .filter(|selected| selected.id == id)
+                .map(|selected| selected.definition.name.as_str())
+        };
+        let trail = if let Some(draft) = &self.draft {
+            // An edit returns to the automation it changes; a new draft to
+            // the view it was started from.
+            Some(match draft.base.and_then(|(id, _)| opened(id)) {
+                Some(name) => breadcrumb(
+                    [(view, None), (name, Some(Action::CancelEdit))],
+                    "Edit",
+                    Some(1),
+                    busy,
+                ),
+                None => breadcrumb(
+                    [(view, Some(Action::CancelEdit))],
+                    if draft.base.is_some() {
+                        "Edit automation"
+                    } else {
+                        "New automation"
+                    },
+                    None,
+                    busy,
+                ),
+            })
+        } else {
+            self.confirmation.as_ref().map(|confirmation| {
+                breadcrumb(
+                    [
+                        (view, None),
+                        (
+                            confirmation.automation.definition.name.as_str(),
+                            Some(Action::CancelConfirmation),
+                        ),
+                    ],
+                    match confirmation.request {
+                        Request::SetEnabled { .. } => "Enable",
+                        Request::RunNow { .. } => "Run now",
+                        _ => "Remove",
+                    },
+                    Some(1),
+                    busy,
+                )
+            })
+        };
+        let progress = self
+            .pending
+            .filter(|_| busy)
+            .map(|(_, pending)| progress_label(pending));
+        let Some(trail) = trail else {
+            row = row
+                .push(crate::ui_controls::nested_view_tabs(
+                    self.view_tabs(busy),
+                    compact,
+                ))
+                .push(self.refresh_control(progress));
+            let new = (!busy).then_some(Action::New);
+            // A narrow pane keeps one row by naming the command in its
+            // tooltip instead of its label.
+            let button: Element<'_, Action> = if compact {
+                crate::ui_controls::icon_button(crate::ui_controls::Icon::Plus, "New automation")
+                    .on_press_maybe(new)
+                    .into()
+            } else {
+                crate::ui_controls::button::primary("New automation")
+                    .on_press_maybe(new)
+                    .into()
+            };
+            return widget::container(row.push(button))
+                .padding([space::S, space::L])
+                .width(Length::Fill)
+                .into();
+        };
+        row = row.push(trail);
+        if let Some(progress) = progress {
+            row = row.push(crate::interaction::tooltip(
+                widget::container(crate::ui_controls::activity_spinner(
+                    14.0,
+                    crate::design::muted_color,
+                ))
+                .center(Length::Fixed(crate::design::PRIMARY_CONTROL_SIZE)),
+                progress,
+            ));
+        }
+        widget::container(row)
+            .padding([space::S, space::L])
+            .width(Length::Fill)
+            .into()
+    }
+
+    /// Refresh, which stays the same control while any foreground request
+    /// is in flight, whether Refresh started it or not ("Opening agent…"):
+    /// disabled, with progress in place of its glyph and the request as its
+    /// name, so a keyboard user's focus stays on it.
+    ///
+    /// Its tooltip belongs to the glyph rather than the button, so it can
+    /// still name the request while the button is disabled.
+    fn refresh_control(&self, progress: Option<&'static str>) -> Element<'_, Action> {
+        let label = progress.unwrap_or(if self.run.is_some() {
+            "Refresh run"
+        } else if self.all_history {
+            "Refresh run history"
+        } else if self.list_changed {
+            "Automation list changed; refresh to show additions or removals"
+        } else {
+            "Refresh automations"
+        });
+        let glyph: Element<'_, Action> = match progress {
+            Some(_) => crate::ui_controls::activity_spinner(14.0, crate::design::muted_color),
+            None => widget::icon(crate::ui_controls::Icon::Refresh.handle())
+                .size(crate::design::ROW_ICON_SIZE)
+                .into(),
+        };
+        widget::button::custom(crate::interaction::tooltip(
+            widget::container(glyph)
+                .class(crate::design::transparent())
+                .center(Length::Fill),
+            label,
+        ))
+        .id(refresh_id())
+        .name(label)
+        .class(crate::ui_controls::control_style(
+            self.list_changed && self.run.is_none() && !self.all_history,
+            None,
+        ))
+        .width(crate::design::PRIMARY_CONTROL_SIZE)
+        .height(crate::design::PRIMARY_CONTROL_SIZE)
+        .padding(0)
+        .on_press_maybe(progress.is_none().then_some(Action::Refresh))
+        .into()
+    }
+
+    fn view_layout(&self, size: cosmic::iced::Size) -> Element<'_, Action> {
+        if let Some(receipt) = &self.lifecycle_notice {
+            let mut content = widget::column::with_children(vec![
+                button("Back to automations", Action::Browse, true),
+                crate::design::title("Automation lifecycle receipt").into(),
+                crate::design::body(format!(
+                    "Automation {} · Receipt {}",
+                    receipt.id, receipt.sequence
+                ))
+                .into(),
+            ])
+            .spacing(space::M)
+            .width(Length::Fill);
+            if let Some(event) = &receipt.event {
+                content = content
+                    .push(crate::design::heading(event.cause.label()))
+                    .push(crate::design::body(format!("{} · {} · Revision {}",
+                        timestamp(event.occurred_ms), event.actor.label(), event.revision)))
+                    .push(crate::design::body("This records a past system event. It does not describe the automation's current status."));
+            } else {
+                content = content
+                    .push(crate::design::heading("This exact receipt is unavailable"))
+                    .push(crate::design::body("It may have expired from retained history or no longer be available on this backend. The original notice remains in Attention."));
+            }
+            return widget::scrollable(content.padding(space::L))
+                .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
+                    crate::design::scrollbar(),
+                ))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+        }
+
+        let width = size.width;
         let busy = self
             .pending
             .is_some_and(|(_, pending)| !pending.background_read());
         let mut listing: Vec<Element<'_, Action>> = Vec::new();
-        let mut content = widget::column::with_children(vec![
-            widget::row::with_children(vec![
-                crate::design::title("Automations")
-                    .width(Length::Fill)
-                    .into(),
-                crate::interaction::tooltip(
-                    widget::container(if self.pending.is_some() {
-                        crate::ui_controls::activity_spinner(14.0, crate::design::warning_color)
-                    } else {
-                        widget::Space::new().into()
-                    })
-                    .center(Length::Fixed(f32::from(crate::design::ROW_ICON_SIZE))),
-                    if self.pending.is_none() {
-                        "Automations"
-                    } else if self.history_status == HistoryStatus::Loading {
-                        "Loading run history…"
-                    } else {
-                        "Updating automations…"
-                    },
-                ),
-            ])
-            .align_y(Alignment::Center)
-            .into(),
-            crate::design::body("Recurring agent work continues while this window is closed.")
-                .into(),
-        ])
-        .spacing(space::M)
-        .padding(space::L)
-        .width(Length::Fill);
+        // A pane that only states it is empty centers that statement rather
+        // than scrolling it.
+        let mut scrolls = true;
+        let mut content = widget::column::with_capacity(8)
+            .spacing(space::M)
+            .width(Length::Fill);
+        // A failed read that left nothing to show is stated in place, beside
+        // its retry, rather than above it as well.
+        let browsing = self.draft.is_none() && self.confirmation.is_none() && self.run.is_none();
+        // The list's own failure, while it is the list's whole content.
+        let list_failure = match &self.list_status {
+            ListStatus::Failed(error)
+                if browsing
+                    && !self.all_history
+                    && self.selected.is_none()
+                    && self.rows.is_empty()
+                    && !busy =>
+            {
+                Some(error.as_str())
+            }
+            _ => None,
+        };
+        // The history's own failure, while it has nothing else to show.
+        let history_failure = match &self.history_status {
+            HistoryStatus::Failed(error)
+                if browsing
+                    && (self.all_history || self.selected.is_some())
+                    && self.history.is_empty() =>
+            {
+                Some(error.as_str())
+            }
+            _ => None,
+        };
         if let Some(error) = &self.error
             && self.draft.is_none()
+            && list_failure != Some(error.as_str())
+            && history_failure != Some(error.as_str())
         {
             content = content.push(
                 crate::design::body(error).class(cosmic::theme::Text::Custom(|theme| {
@@ -1418,30 +2265,8 @@ impl State {
         } else if let Some(draft) = &self.draft {
             content = content.push(draft.view(busy, &self.models, self.error.as_deref(), width));
         } else {
-            content = content.push(
-                widget::row::with_children(vec![
-                    button("New automation", Action::New, !busy),
-                    button(
-                        "Automations",
-                        Action::Browse,
-                        !busy && (self.run.is_some() || self.all_history),
-                    ),
-                    button("Refresh", Action::Refresh, !busy),
-                    button("All run history", Action::AllHistory, !busy),
-                ])
-                .spacing(space::S)
-                .wrap(),
-            );
             if self.run.is_none() {
                 if !self.all_history {
-                    listing.push(
-                        crate::ui_controls::field::search(
-                            "Search loaded automations",
-                            &self.search,
-                        )
-                        .on_input(Action::Search)
-                        .into(),
-                    );
                     let query = self.search.to_lowercase();
                     for row in self.rows.iter().filter(|row| {
                         row.name.to_lowercase().contains(&query)
@@ -1460,7 +2285,7 @@ impl State {
                             .selected
                             .as_ref()
                             .is_some_and(|selected| selected.id == row.id);
-                        listing.push(
+                        let mut row_content = widget::column::with_children(vec![
                             widget::button::custom(
                                 widget::column::with_children(vec![
                                     crate::design::heading(&row.name).into(),
@@ -1489,19 +2314,74 @@ impl State {
                             .width(Length::Fill)
                             .on_press_maybe((!busy).then_some(Action::Select(row.id)))
                             .into(),
-                        );
+                        ])
+                        .spacing(space::XS)
+                        .width(Length::Fill);
                         if let Some(blocked) = &row.blocked {
-                            listing.push(crate::design::caption(blocked).into());
+                            row_content = row_content.push(crate::design::caption(blocked));
                         }
+                        listing.push(crate::ui_controls::owned(row.id, row_content));
                     }
-                    if self.rows.is_empty() {
-                        content = content.push(crate::design::body(
-                            "Create an automation to schedule work in an open project.",
-                        ));
+                    if listing.is_empty() && !self.rows.is_empty() {
+                        listing.push(
+                            crate::design::caption(if self.more {
+                                "No loaded automations match."
+                            } else {
+                                "No automations match."
+                            })
+                            .into(),
+                        );
                     }
                     if self.more {
-                        content =
-                            content.push(button("Load more automations", Action::More, !busy));
+                        listing.push(button("Load more automations", Action::More, !busy));
+                    }
+                    // A read in flight is announced by the header's progress,
+                    // so no statement anticipates the list or selection it is
+                    // about to replace. Rows already on screen keep theirs.
+                    let empty = if self.selected.is_some()
+                        || matches!(self.pending, Some((_, Pending::Show | Pending::Reload)))
+                    {
+                        None
+                    } else if !self.rows.is_empty() {
+                        Some(
+                            crate::ui_controls::placeholder("Select an automation")
+                                .detail("Its schedule, launch settings and runs appear here."),
+                        )
+                    } else if busy {
+                        None
+                    } else if let Some(error) = list_failure {
+                        Some(
+                            crate::ui_controls::placeholder("Couldn't load automations")
+                                .icon(crate::ui_controls::Icon::Warning.handle())
+                                .detail(error)
+                                .action(
+                                    crate::ui_controls::button::secondary("Retry")
+                                        .on_press(Action::Refresh),
+                                ),
+                        )
+                    } else if self.list_status == ListStatus::Unread {
+                        // Another read, such as an alert's run, took the
+                        // list's place before it was read.
+                        Some(
+                            crate::ui_controls::placeholder("Automations aren't loaded")
+                                .icon(crate::ui_controls::Icon::Alarm.handle())
+                                .action(
+                                    crate::ui_controls::button::secondary("Load automations")
+                                        .on_press(Action::Refresh),
+                                ),
+                        )
+                    } else {
+                        Some(
+                            crate::ui_controls::placeholder("No automations yet")
+                                .icon(crate::ui_controls::Icon::Alarm.handle())
+                                .detail(
+                                    "Run an agent on a schedule in an open project. Automations keep running while this window is closed.",
+                                ),
+                        )
+                    };
+                    if let Some(empty) = empty {
+                        scrolls = false;
+                        content = content.push(empty);
                     }
                     if let Some(selected) = &self.selected {
                         content = content
@@ -1565,29 +2445,104 @@ impl State {
                         );
                     }
                 }
-                if self.selected.is_some() || self.all_history {
-                    content = content.push(button("Refresh history", Action::History, !busy));
-                    if self.history_newer {
+                if self.selected.is_some() {
+                    content = content.push(crate::design::title("Lifecycle")).push(button(
+                        "Refresh lifecycle",
+                        Action::Lifecycle,
+                        !busy,
+                    ));
+                    if let Some(page) = &self.lifecycle {
+                        if page.events.is_empty() {
+                            content =
+                                content.push(crate::design::body("No recorded lifecycle events."));
+                        }
+                        for event in &page.events {
+                            let actor = event.actor.label();
+                            content = content.push(crate::design::body(format!(
+                                "{} · {} · {} · Revision {}",
+                                timestamp(event.occurred_ms),
+                                event.cause.label(),
+                                actor,
+                                event.revision,
+                            )));
+                            if let Some(firing) = event.firing {
+                                content = content.push(button_owned(
+                                    format!("Inspect run {firing}"),
+                                    Action::Run(firing),
+                                    !busy,
+                                ));
+                            }
+                        }
+                        if page.earlier_events_unavailable {
+                            content = content.push(crate::design::body(
+                                "Earlier lifecycle events are unavailable. Their actor and cause are unknown.",
+                            ));
+                        }
+                        if page.next.is_some()
+                            && page.events.len() < crate::automations::MAX_LIFECYCLE_EVENTS
+                        {
+                            content = content.push(button(
+                                "Older lifecycle events",
+                                Action::MoreLifecycle,
+                                !busy,
+                            ));
+                        }
+                    } else {
                         content = content.push(crate::design::body(
-                            "Newer runs are available. Refresh history to show the latest page.",
+                            "Load lifecycle receipts to inspect changes to this automation.",
                         ));
                     }
-                    let history_notice = match self.history_status {
-                        HistoryStatus::Unrequested => Some("History has not been loaded."),
+                }
+                if self.selected.is_some() || self.all_history {
+                    if self.selected.is_some() {
+                        content = content.push(crate::design::title("Run history"));
+                    }
+                    if self.history_newer {
+                        content = content.push(crate::design::body(
+                            "Newer runs are available. Refresh to show the latest page.",
+                        ));
+                    }
+                    let empty = match &self.history_status {
                         HistoryStatus::Loading if self.history.is_empty() => {
-                            Some("Loading run history…")
+                            Some(crate::ui_controls::placeholder("Loading run history…"))
                         }
-                        HistoryStatus::Loading => None,
-                        HistoryStatus::Failed => {
-                            Some("Could not refresh history. Try Refresh history.")
+                        HistoryStatus::Failed(error) if self.history.is_empty() => Some(
+                            crate::ui_controls::placeholder("Couldn't load run history")
+                                .icon(crate::ui_controls::Icon::Warning.handle())
+                                .detail(error)
+                                .action(
+                                    crate::ui_controls::button::secondary("Retry")
+                                        .on_press_maybe((!busy).then_some(Action::History)),
+                                ),
+                        ),
+                        HistoryStatus::Failed(_) => {
+                            content = content.push(crate::design::caption(
+                                "Couldn't refresh run history. These runs may be out of date.",
+                            ));
+                            None
                         }
-                        HistoryStatus::Loaded if self.history.is_empty() => {
-                            Some("No runs in this history page.")
-                        }
-                        HistoryStatus::Loaded => None,
+                        HistoryStatus::Loaded if self.history.is_empty() => Some(
+                            crate::ui_controls::placeholder("No runs yet")
+                                .icon(crate::ui_controls::Icon::History.handle())
+                                .detail(if self.all_history {
+                                    "Runs of every automation appear here, newest first."
+                                } else {
+                                    "Runs appear here when the schedule fires or you choose Run now."
+                                }),
+                        ),
+                        HistoryStatus::Unrequested
+                        | HistoryStatus::Loading
+                        | HistoryStatus::Loaded => None,
                     };
-                    if let Some(notice) = history_notice {
-                        content = content.push(crate::design::body(notice));
+                    if let Some(empty) = empty {
+                        // History alone centers its state; under a selected
+                        // automation it follows the details.
+                        if self.all_history {
+                            scrolls = false;
+                            content = content.push(empty);
+                        } else {
+                            content = content.push(empty.height(Length::Shrink));
+                        }
                     }
                     for firing in &self.history {
                         let origin = match &firing.trigger {
@@ -1619,6 +2574,7 @@ impl State {
                 }
             }
             if let Some(run) = &self.run {
+                content = content.push(breadcrumb(self.run_trail(run), "Run", Some(1), busy));
                 content = content
                     .push(crate::design::title(format!(
                         "{} · {}",
@@ -1657,7 +2613,6 @@ impl State {
                 }
                 content = content.push(
                     widget::row::with_children(vec![
-                        button("Refresh run", Action::Run(run.firing.id), !busy),
                         button(
                             "Cancel run",
                             Action::CancelRun,
@@ -1678,35 +2633,86 @@ impl State {
                 );
             }
         }
-        let content: Element<'_, Action> = widget::scrollable(content)
+        let vertical =
+            || cosmic::iced::widget::scrollable::Direction::Vertical(crate::design::scrollbar());
+        let content: Element<'_, Action> = if scrolls {
+            widget::scrollable(content.padding(crate::design::with_vertical_rail(
+                cosmic::iced::Padding::from(space::L),
+            )))
+            .direction(vertical())
             .height(Length::Fill)
             .width(Length::Fill)
-            .into();
-        if listing.is_empty() {
-            return content;
-        }
-        let list = widget::scrollable(
-            widget::column::with_children(listing)
-                .spacing(space::XS)
-                .padding(space::S),
-        );
-        if width >= 700.0 {
-            widget::row::with_children(vec![
-                list.width(240).height(Length::Fill).into(),
-                crate::design::vertical_rule(),
-                content,
-            ])
-            .height(Length::Fill)
             .into()
         } else {
-            widget::column::with_children(vec![
-                list.width(Length::Fill).height(200).into(),
-                crate::design::horizontal_rule(),
-                content,
+            content.padding(space::L).height(Length::Fill).into()
+        };
+        let body = if listing.is_empty() {
+            content
+        } else {
+            let mut search = crate::ui_controls::field::search("Filter automations", &self.search)
+                .on_input(Action::Search)
+                .width(Length::Fill);
+            if !self.search.is_empty() {
+                search = search.trailing_icon(crate::ui_controls::field::clear(Action::Search(
+                    String::new(),
+                )));
+            }
+            let side_by_side = width >= SIDE_BY_SIDE_WIDTH;
+            // The field stays put while its rows scroll beneath it.
+            let list = widget::column::with_children(vec![
+                widget::container(search)
+                    .padding([space::S, space::S, 0.0, space::S])
+                    .into(),
+                widget::scrollable(
+                    widget::column::with_children(listing)
+                        .spacing(space::XS)
+                        .padding(crate::design::with_vertical_rail(
+                            cosmic::iced::Padding::from([0.0, space::S, space::S, space::S]),
+                        )),
+                )
+                .direction(vertical())
+                .height(if side_by_side {
+                    Length::Fill
+                } else {
+                    Length::Shrink
+                })
+                .into(),
             ])
-            .height(Length::Fill)
-            .into()
-        }
+            .spacing(space::XS);
+            if side_by_side {
+                widget::row::with_children(vec![
+                    widget::container(list)
+                        .width(LIST_WIDTH)
+                        .height(Length::Fill)
+                        .into(),
+                    crate::design::vertical_rule(),
+                    content,
+                ])
+                .height(Length::Fill)
+                .into()
+            } else {
+                // Stacked, the list takes the height of its rows up to a
+                // share of the pane, leaving the rest to the selection.
+                widget::column::with_children(vec![
+                    widget::container(list)
+                        .width(Length::Fill)
+                        .max_height(size.height * STACKED_LIST_SHARE)
+                        .into(),
+                    crate::design::horizontal_rule(),
+                    content,
+                ])
+                .height(Length::Fill)
+                .into()
+            }
+        };
+        widget::column::with_children(vec![
+            self.header(busy, width),
+            crate::design::horizontal_rule(),
+            body,
+        ])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
     }
 }
 
@@ -2125,6 +3131,129 @@ fn launch_description<'a>(
     }
     column.into()
 }
+/// What the header's progress says a command in flight is doing.
+fn progress_label(pending: Pending) -> &'static str {
+    match pending {
+        Pending::List { .. } => "Loading automations…",
+        Pending::Show => "Loading automation…",
+        Pending::Reload => "Refreshing automation…",
+        Pending::Save => "Saving automation…",
+        Pending::Mutate => "Updating automation…",
+        Pending::History { .. } => "Loading run history…",
+        Pending::Lifecycle { .. } => "Loading lifecycle…",
+        Pending::Run => "Loading run…",
+        Pending::OpenRun => "Opening agent…",
+        // Background reads draw no progress, but name themselves should one
+        // ever be shown.
+        Pending::RefreshList | Pending::RefreshLoadedList(_) => "Refreshing automations…",
+        Pending::RefreshAutomation => "Refreshing automation…",
+        Pending::RefreshHistory { .. } | Pending::RefreshOlderHistory { .. } => {
+            "Refreshing run history…"
+        }
+        Pending::RefreshRun => "Refreshing run…",
+    }
+}
+
+/// The levels above the current page on one line, then the page itself.
+///
+/// A level with a press message is a way back to it, drawn unavailable while
+/// `busy`; one without cannot be returned to and is plain text. The level at
+/// `name` names an automation. It alone gives up width, ending in an
+/// ellipsis with its full text in a tooltip, so the views and the current
+/// page around it always keep their whole labels.
+fn breadcrumb<'a>(
+    parents: impl IntoIterator<Item = (&'a str, Option<Action>)>,
+    current: &'a str,
+    name: Option<usize>,
+    busy: bool,
+) -> Element<'a, Action> {
+    let label = |text: &'a str| {
+        crate::design::body(text)
+            .wrapping(cosmic::iced::widget::text::Wrapping::None)
+            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+            ))
+    };
+    let mut trail = widget::row::with_capacity(5)
+        .spacing(space::XXS)
+        .align_y(Alignment::Center);
+    for (index, (text, action)) in parents.into_iter().enumerate() {
+        let named = name == Some(index);
+        let crumb: Element<'a, Action> = match action {
+            Some(action) => {
+                let back = format!("Back to {text}");
+                crate::interaction::tooltip(
+                    crate::interaction::hover(
+                        widget::button::custom(label(text))
+                            .name(back.clone())
+                            .class(crumb_style())
+                            .padding([space::XXS, space::XS])
+                            .on_press_maybe((!busy).then_some(action)),
+                    ),
+                    back,
+                )
+            }
+            None => {
+                let crumb = widget::container(
+                    label(text).class(cosmic::theme::Text::Custom(crate::design::muted_text)),
+                )
+                .padding([space::XXS, space::XS]);
+                if named {
+                    crate::interaction::tooltip(crumb, text)
+                } else {
+                    crumb.into()
+                }
+            }
+        };
+        trail = trail
+            .push(if named {
+                crate::ui_controls::shrinkable(crumb)
+            } else {
+                crumb
+            })
+            .push(crate::ui_controls::passive_icon(
+                crate::ui_controls::Icon::ChevronRight.handle(),
+                crate::design::COMPACT_ICON_SIZE,
+            ));
+    }
+    trail.push(label(current)).into()
+}
+
+/// A trail level that leads back: quiet until hovered, as a peer view tab
+/// is, and visibly unavailable while a command is in flight.
+fn crumb_style() -> cosmic::theme::Button {
+    use cosmic::iced::Background;
+    let appearance = |focused: bool, theme: &cosmic::Theme| {
+        let component = &theme.current_container().component;
+        widget::button::Style {
+            background: focused.then(|| Background::Color(component.selected_state_color().into())),
+            text_color: Some(crate::design::muted_color(theme)),
+            ..crate::design::button_style()
+        }
+    };
+    cosmic::theme::Button::Custom {
+        active: Box::new(appearance),
+        disabled: Box::new(move |theme| widget::button::Style {
+            text_color: Some(crate::design::disabled_color(theme)),
+            ..appearance(false, theme)
+        }),
+        hovered: Box::new(move |focused, theme| widget::button::Style {
+            background: Some(Background::Color(
+                theme.current_container().component.hover.into(),
+            )),
+            text_color: Some(theme.current_container().component.on.into()),
+            ..appearance(focused, theme)
+        }),
+        pressed: Box::new(move |focused, theme| widget::button::Style {
+            background: Some(Background::Color(
+                theme.current_container().component.pressed.into(),
+            )),
+            text_color: Some(theme.current_container().component.on.into()),
+            ..appearance(focused, theme)
+        }),
+    }
+}
+
 fn button(label: &'static str, action: Action, enabled: bool) -> Element<'static, Action> {
     let mut button = crate::ui_controls::button::secondary(label);
     if enabled {
@@ -2144,6 +3273,9 @@ fn button_owned(label: String, action: Action, enabled: bool) -> Element<'static
         button = button.on_press(action);
     }
     button.width(Length::Fill).into()
+}
+fn refresh_id() -> widget::Id {
+    widget::Id::new("automation.refresh")
 }
 pub fn draft_dialog_focus_id() -> widget::Id {
     widget::Id::new("dialog.automation-draft.keep")
@@ -2540,6 +3672,12 @@ mod tests {
         assert_eq!(state.rows[0].last_state, Some(FiringState::Succeeded));
     }
 
+    fn history_page(firings: Vec<Firing>, more: bool) -> crate::automations::HistoryPage {
+        let next = more
+            .then(|| history_cursor(history_key(firings.last().expect("nonempty cursor page"))));
+        crate::automations::HistoryPage { firings, next }
+    }
+
     #[test]
     fn newer_runs_update_last_outcome_without_replacing_paginated_history() {
         use crate::automations::{FiringState, HistoryPage};
@@ -2549,10 +3687,11 @@ mod tests {
         let mut newer = history_firing(100, FiringState::Running);
         newer.automation = selected.id;
         let mut state = State {
+            all_history: true,
             rows: vec![selected.summary(Some(loaded.state))],
             history: vec![loaded.clone()],
             history_status: HistoryStatus::Loaded,
-            pending: Some((1, Pending::RefreshHistory)),
+            pending: Some((1, Pending::RefreshHistory { scope: None })),
             ..Default::default()
         };
         state.update(Action::Received {
@@ -2566,14 +3705,12 @@ mod tests {
         assert!(state.history_newer);
         assert_eq!(state.rows[0].last_state, Some(FiringState::Running));
         newer.state = FiringState::Failed;
-        state.pending = Some((2, Pending::HistoryRun { index: 0 }));
+        state.pending = Some((2, Pending::RefreshHistory { scope: None }));
         state.update(Action::Received {
             sequence: 2,
-            result: std::sync::Arc::new(Ok(Response::Detail(RunDetail {
-                definition: selected.definition,
-                firing: newer,
-                agent: None,
-                run: None,
+            result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
+                firings: vec![newer],
+                next: None,
             }))),
         });
         assert_eq!(state.rows[0].last_state, Some(FiringState::Failed));
@@ -2685,11 +3822,903 @@ mod tests {
         assert_eq!(state.pending.unwrap().0, browse);
     }
 
+    /// Where the pane's text, its one text field and its scrolling regions
+    /// land, in the order the view builds them.
+    #[derive(Default)]
+    struct Outline {
+        texts: Vec<(String, cosmic::iced::Rectangle)>,
+        field: Option<cosmic::iced::Rectangle>,
+        /// Each scrolling region's viewport and the content it scrolls.
+        scrollables: Vec<(cosmic::iced::Rectangle, cosmic::iced::Rectangle)>,
+    }
+
+    impl cosmic::iced::advanced::widget::Operation for Outline {
+        fn traverse(
+            &mut self,
+            visit: &mut dyn FnMut(&mut dyn cosmic::iced::advanced::widget::Operation),
+        ) {
+            visit(self);
+        }
+        fn text(&mut self, _: Option<&widget::Id>, bounds: cosmic::iced::Rectangle, text: &str) {
+            self.texts.push((text.to_owned(), bounds));
+        }
+        fn text_input(
+            &mut self,
+            _: Option<&widget::Id>,
+            bounds: cosmic::iced::Rectangle,
+            _: &mut dyn cosmic::iced::advanced::widget::operation::TextInput,
+        ) {
+            self.field.get_or_insert(bounds);
+        }
+        fn scrollable(
+            &mut self,
+            _: Option<&widget::Id>,
+            bounds: cosmic::iced::Rectangle,
+            content: cosmic::iced::Rectangle,
+            _: cosmic::iced::Vector,
+            _: &mut dyn cosmic::iced::advanced::widget::operation::Scrollable,
+        ) {
+            self.scrollables.push((bounds, content));
+        }
+    }
+
+    impl Outline {
+        fn of(state: &State, width: f32, height: f32) -> Self {
+            use cosmic::iced::Size;
+            use cosmic::iced::advanced::{Layout, layout, widget::Tree};
+            let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let mut element = state.view();
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(width, height)),
+            );
+            let mut outline = Self::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut outline);
+            outline
+        }
+
+        /// The first text that reads `label`.
+        fn text(&self, label: &str) -> cosmic::iced::Rectangle {
+            self.texts
+                .iter()
+                .find(|(text, _)| text == label)
+                .unwrap_or_else(|| panic!("{label:?} is drawn"))
+                .1
+        }
+
+        /// The last text that reads `label`: below the header, when both
+        /// draw it.
+        fn last(&self, label: &str) -> cosmic::iced::Rectangle {
+            self.texts
+                .iter()
+                .rfind(|(text, _)| text == label)
+                .unwrap_or_else(|| panic!("{label:?} is drawn"))
+                .1
+        }
+    }
+
+    /// Completes a real Save action/reply rather than seeding a notice string.
+    fn saved_notice_state() -> State {
+        let (mut state, mut saved) = editing(None, None);
+        state.update(Action::Field(Field::Name, "Saved automation A".into()));
+        let Some(Effect::Request {
+            sequence,
+            request:
+                Request::Edit {
+                    id,
+                    revision,
+                    definition,
+                },
+        }) = state.update(Action::Save)
+        else {
+            panic!("the valid draft sends its explicit Save");
+        };
+        assert_eq!(id, saved.id);
+        assert_eq!(revision, saved.revision);
+        assert_eq!(definition.name, "Saved automation A");
+        // Navigation cannot replace a draft while that Save is in flight.
+        for action in [Action::New, Action::Edit] {
+            assert!(state.update(action).is_none());
+            assert!(matches!(state.pending, Some((pending, Pending::Save)) if pending == sequence));
+            assert_eq!(state.draft.as_ref().unwrap().name, "Saved automation A");
+        }
+        saved.revision += 1;
+        saved.definition = definition;
+        let id = saved.id;
+        let Some(Effect::Request {
+            sequence: history_sequence,
+            request: Request::History {
+                id: Some(observed), ..
+            },
+        }) = state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Automation(saved))),
+        })
+        else {
+            panic!("the saved detail requests its own history");
+        };
+        assert_eq!(observed, id);
+        state.update(Action::Received {
+            sequence: history_sequence,
+            result: std::sync::Arc::new(Ok(Response::History(crate::automations::HistoryPage {
+                firings: vec![],
+                next: None,
+            }))),
+        });
+        assert!(state.pending.is_none());
+        assert!(!state.has_draft());
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.starts_with("Saved."))
+        );
+        let outline = Outline::of(&state, 900.0, 700.0);
+        assert!(outline.texts.iter().any(
+            |(text, _)| text == "Saved. Review the launch settings before enabling or running."
+        ));
+        state
+    }
+
+    fn assert_unsaved_form(state: &State) {
+        let outline = Outline::of(state, 900.0, 700.0);
+        assert!(
+            !outline
+                .texts
+                .iter()
+                .any(|(text, _)| text
+                    == "Saved. Review the launch settings before enabling or running."),
+            "the previous success must not label this draft saved"
+        );
+        outline.text("Save automation");
+    }
+
+    #[test]
+    fn saved_confirmation_retires_when_new_opens_an_unsaved_blank_draft() {
+        let mut state = saved_notice_state();
+        assert!(
+            state.update(Action::New).is_none(),
+            "opening a form sends no mutation"
+        );
+        let draft = state.draft.as_ref().unwrap();
+        assert!(draft.base.is_none());
+        assert_eq!(draft.name, "");
+        assert!(draft.prompt.text().is_empty());
+        assert!(!state.draft_dirty());
+        assert!(state.notice.is_none());
+        assert_unsaved_form(&state);
+        state.update(Action::Field(Field::Name, "Unsaved automation B".into()));
+        assert!(state.draft_dirty());
+        assert_unsaved_form(&state);
+        state.update(Action::CancelEdit);
+        assert!(
+            state.draft_dialog_open(),
+            "closing still protects the new unsaved work"
+        );
+        state.update(state.keep_draft_action().unwrap());
+        assert_eq!(state.draft.as_ref().unwrap().name, "Unsaved automation B");
+        assert_unsaved_form(&state);
+    }
+
+    #[test]
+    fn saved_confirmation_retires_only_after_edit_enters_a_draft() {
+        let mut state = saved_notice_state();
+        // An Edit action without a selection cannot enter an editor and must
+        // not retire the completed operation's notice.
+        let selected = state.selected.take();
+        let notice = state.notice.clone();
+        assert!(state.update(Action::Edit).is_none());
+        assert!(!state.has_draft());
+        assert_eq!(state.notice, notice);
+        state.selected = selected;
+        assert!(state.update(Action::Edit).is_none());
+        assert!(state.draft.as_ref().unwrap().base.is_some());
+        assert!(!state.draft_dirty());
+        assert!(state.notice.is_none());
+        assert_unsaved_form(&state);
+        state.update(Action::Field(Field::Name, "Unsaved revision of A".into()));
+        assert!(state.draft_dirty());
+        assert_unsaved_form(&state);
+        // Rejected and canceled discard answers cannot replace the edit or
+        // revive a save confirmation from the previous revision.
+        state.update(Action::New);
+        let generation = state.discard_generation;
+        assert!(state.draft_dialog_open());
+        state.update(Action::DiscardDraft(generation.wrapping_add(1)));
+        assert!(state.draft_dialog_open());
+        assert_eq!(state.draft.as_ref().unwrap().name, "Unsaved revision of A");
+        state.update(Action::KeepDraft(generation));
+        assert!(!state.draft_dialog_open());
+        assert!(state.draft_dirty());
+        assert_eq!(state.draft.as_ref().unwrap().name, "Unsaved revision of A");
+        assert_unsaved_form(&state);
+    }
+
+    #[test]
+    fn automation_list_reads_views_then_search_then_rows_at_every_width() {
+        let state = State {
+            rows: vec![automation().summary(None)],
+            ..Default::default()
+        };
+        // Either side of the split between stacked and side-by-side lists.
+        for width in [480.0, 900.0] {
+            let outline = Outline::of(&state, width, 700.0);
+            let tab = outline.text("Automations");
+            let search = outline.field.expect("the list offers its search field");
+            let row = outline.text("Daily review");
+            assert!(
+                tab.y + tab.height <= search.y,
+                "at {width} px the view switcher precedes the search field: {tab:?} {search:?}"
+            );
+            assert!(
+                search.y + search.height <= row.y,
+                "at {width} px the search field sits above the rows it filters"
+            );
+            let views = outline.text("Run history");
+            assert!(
+                views.y + views.height <= search.y,
+                "at {width} px the view switcher belongs to the header, above the list"
+            );
+            if width < 700.0 {
+                // The stacked list takes the height of its rows, not a fixed
+                // band that leaves empty space between search and header.
+                let (list, rows) = outline.scrollables[0];
+                assert!(
+                    list.height <= rows.height + 0.5,
+                    "the stacked list is no taller than its rows: {list:?} {rows:?}"
+                );
+            }
+        }
+        // With nothing to filter, the pane offers no field and says so.
+        let empty = Outline::of(
+            &State {
+                list_status: ListStatus::Loaded,
+                ..Default::default()
+            },
+            480.0,
+            700.0,
+        );
+        assert!(empty.field.is_none());
+        assert!(empty.text("Automations").y < empty.text("No automations yet").y);
+    }
+
+    #[test]
+    fn a_short_stacked_pane_keeps_the_selected_automation_scrollable() {
+        let owner = automation();
+        let mut rows = vec![owner.summary(None)];
+        for index in 0..4 {
+            let mut other = automation();
+            other.definition.name = format!("Other automation {index}");
+            rows.push(other.summary(None));
+        }
+        let state = State {
+            rows,
+            selected: Some(owner),
+            list_status: ListStatus::Loaded,
+            history_status: HistoryStatus::Loaded,
+            ..Default::default()
+        };
+        for width in [300.0, 480.0] {
+            for height in [160.0, 240.0, 360.0] {
+                let outline = Outline::of(&state, width, height);
+                assert_eq!(
+                    outline.scrollables.len(),
+                    2,
+                    "list and selection scroll independently"
+                );
+                let list = outline.scrollables[0].0;
+                let details = outline.scrollables[1].0;
+                assert!(
+                    list.height <= height * STACKED_LIST_SHARE + 0.5,
+                    "at {width}x{height} the list must leave room below its header: {list:?}"
+                );
+                assert!(
+                    details.height > 0.0,
+                    "at {width}x{height} the selected automation must have a usable viewport: {details:?}"
+                );
+                assert!(
+                    details.y + details.height <= height + 0.5,
+                    "the selected viewport stays inside the pane: {details:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn automation_switcher_selects_the_view_on_screen_and_a_run_keeps_its_origin() {
+        use crate::automations::FiringState;
+        fn selected(state: &State, busy: bool) -> Section {
+            let tabs = state.view_tabs(busy);
+            let chosen = tabs.iter().filter(|tab| tab.selected).collect::<Vec<_>>();
+            assert_eq!(chosen.len(), 1, "exactly one view is current");
+            assert_eq!(
+                chosen[0].on_press.is_some(),
+                !busy && state.section_root().is_some(),
+                "the current view publishes only a return from what is open beneath it"
+            );
+            for tab in tabs.iter().filter(|tab| !tab.selected) {
+                assert_eq!(tab.on_press.is_some(), !busy, "{} is a way out", tab.label);
+            }
+            *Section::ALL
+                .iter()
+                .find(|section| section.label() == chosen[0].label)
+                .unwrap()
+        }
+        let mut state = State::default();
+        assert_eq!(selected(&state, false), Section::Automations);
+        assert_eq!(selected(&state, true), Section::Automations);
+        assert!(matches!(
+            state.update(Section::RunHistory.enter()),
+            Some(Effect::Request {
+                request: Request::History { id: None, .. },
+                ..
+            })
+        ));
+        state.pending = None;
+        assert_eq!(selected(&state, false), Section::RunHistory);
+
+        // A run opened from history stays inside it; its trail leads back to
+        // the loaded page rather than reading it again.
+        let firing = history_firing(100, FiringState::Succeeded);
+        state.history = vec![firing.clone()];
+        state.history_status = HistoryStatus::Loaded;
+        let detail = RunDetail {
+            definition: automation().definition,
+            firing: firing.clone(),
+            agent: None,
+            run: None,
+        };
+        state.run = Some(detail.clone());
+        assert_eq!(selected(&state, false), Section::RunHistory);
+        let [(root, back), (name, automation_link)] = state.run_trail(&detail);
+        assert_eq!((root, name), ("Run history", "Daily review"));
+        assert!(
+            automation_link.is_none(),
+            "the trail stays inside Run history"
+        );
+        assert!(matches!(back, Some(Action::CloseRun)));
+        assert!(
+            matches!(state.view_tabs(false)[1].on_press, Some(Action::CloseRun)),
+            "the current tab also returns to the page"
+        );
+        assert!(
+            state.update(Action::CloseRun).is_none(),
+            "closing a run reads nothing"
+        );
+        assert!(state.run.is_none());
+        assert_eq!(selected(&state, false), Section::RunHistory);
+        assert_eq!(state.history.len(), 1, "the history page is kept");
+
+        // From an automation's own history, its name leads back to it and
+        // the root leaves for the list.
+        let mut owner = automation();
+        owner.id = firing.automation;
+        state.all_history = false;
+        state.selected = Some(owner);
+        state.run = Some(detail.clone());
+        assert_eq!(selected(&state, false), Section::Automations);
+        let [(root, list), (_, back)] = state.run_trail(&detail);
+        assert_eq!(root, "Automations");
+        assert!(matches!(list, Some(Action::Browse)));
+        assert!(matches!(back, Some(Action::CloseRun)));
+        state.update(Action::CloseRun);
+        assert!(state.run.is_none() && state.selected.is_some());
+        assert!(matches!(
+            state.update(Section::RunHistory.enter()),
+            Some(Effect::Request { .. })
+        ));
+        assert!(state.selected.is_none() && state.all_history);
+    }
+
+    #[test]
+    fn refreshing_with_an_automation_open_reads_the_list_it_and_its_newest_runs() {
+        use crate::automations::FiringState;
+        let owner = automation();
+        let mut state = State {
+            rows: vec![owner.summary(None)],
+            selected: Some(owner.clone()),
+            history: vec![history_firing(100, FiringState::Succeeded)],
+            history_status: HistoryStatus::Loaded,
+            history_newer: true,
+            ..Default::default()
+        };
+        let Some(Effect::Request {
+            sequence,
+            request: Request::List { .. },
+        }) = state.update(Action::Refresh)
+        else {
+            panic!("the list is read first");
+        };
+        let Some(Effect::Request {
+            sequence,
+            request: Request::Show { id },
+        }) = state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Listed(vec![owner.summary(None)]))),
+        })
+        else {
+            panic!("then the open automation");
+        };
+        assert_eq!(id, owner.id);
+        assert!(matches!(
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::Automation(owner))),
+            }),
+            Some(Effect::Request {
+                request: Request::History { before: None, .. },
+                ..
+            })
+        ));
+        assert!(
+            matches!(state.pending, Some((_, Pending::History { append: false }))),
+            "the newest page replaces the kept one"
+        );
+    }
+
+    #[test]
+    fn a_failed_refresh_keeps_the_loaded_history_for_the_poll_to_refresh() {
+        use crate::automations::FiringState;
+        let owner = automation();
+        let kept = history_firing(100, FiringState::Succeeded);
+        let mut state = State {
+            rows: vec![owner.summary(None)],
+            selected: Some(owner.clone()),
+            history: vec![kept.clone()],
+            history_status: HistoryStatus::Loaded,
+            ..Default::default()
+        };
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Refresh) else {
+            panic!("the list is read first");
+        };
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Listed(vec![owner.summary(None)]))),
+        }) else {
+            panic!("then the open automation");
+        };
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Err("offline".into())),
+        });
+        assert_eq!(state.history_status, HistoryStatus::Loaded);
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Tick) else {
+            panic!("the poll resumes");
+        };
+        assert!(matches!(
+            state.pending,
+            Some((_, Pending::RefreshAutomation))
+        ));
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Automation(owner))),
+        });
+        assert!(
+            matches!(state.pending, Some((_, Pending::RefreshHistory { .. }))),
+            "the poll refreshes the loaded page in the background"
+        );
+        assert_eq!(state.history.len(), 1, "the loaded page stays on screen");
+    }
+
+    /// The buttons the pane announces, by accessible name, and whether each
+    /// can be pressed.
+    fn buttons(state: &State, width: f32) -> Vec<(String, bool)> {
+        use cosmic::iced::Size;
+        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut element = state.view();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(width, 700.0)),
+        );
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter(|node| node.node().role() == iced_accessibility::accesskit::Role::Button)
+            .map(|node| {
+                (
+                    node.node().label().unwrap_or_default().to_owned(),
+                    !node.node().is_disabled(),
+                )
+            })
+            .collect()
+    }
+
+    fn run_of(owner: &Automation) -> RunDetail {
+        let mut firing = history_firing(100, crate::automations::FiringState::Succeeded);
+        firing.automation = owner.id;
+        RunDetail {
+            definition: owner.definition.clone(),
+            firing,
+            agent: None,
+            run: None,
+        }
+    }
+
+    #[test]
+    fn a_run_trail_never_leaves_run_history_or_links_an_automation_it_cannot_show() {
+        let owner = automation();
+        let detail = run_of(&owner);
+        let links_name = |state: &State| {
+            buttons(state, 900.0)
+                .into_iter()
+                .any(|(name, enabled)| enabled && name.contains("Daily review"))
+        };
+        // Opened from Run history: the automation may have been removed, and
+        // the loaded page must survive, so the name is not a way out.
+        let mut state = State {
+            all_history: true,
+            history: vec![detail.firing.clone()],
+            history_status: HistoryStatus::Loaded,
+            run: Some(detail.clone()),
+            ..Default::default()
+        };
+        assert!(!links_name(&state), "{:?}", buttons(&state, 900.0));
+        assert!(
+            buttons(&state, 900.0).contains(&("Back to Run history".to_owned(), true)),
+            "the trail leads back to the loaded page: {:?}",
+            buttons(&state, 900.0)
+        );
+        // Opened from an alert with no list behind it: unknown, so unlinked.
+        state.all_history = false;
+        state.history.clear();
+        assert!(!links_name(&state), "{:?}", buttons(&state, 900.0));
+        // A listed automation can be shown.
+        state.rows = vec![owner.summary(None)];
+        assert!(links_name(&state), "{:?}", buttons(&state, 900.0));
+    }
+
+    #[test]
+    fn the_current_tab_returns_to_its_view_from_anything_open_beneath_it() {
+        let owner = automation();
+        let tab = |state: &State, name: &str| {
+            buttons(state, 900.0)
+                .into_iter()
+                .find(|(announced, _)| announced == name)
+                .unwrap_or_else(|| panic!("{name:?} in {:?}", buttons(state, 900.0)))
+                .1
+        };
+        let mut state = State {
+            rows: vec![owner.summary(None)],
+            ..Default::default()
+        };
+        assert!(
+            !tab(&state, "Automations and their schedules"),
+            "the list on screen is not chosen again"
+        );
+        // Where it leads back to is what the tab is named for.
+        state.selected = Some(owner.clone());
+        assert!(
+            tab(&state, "Back to the automation list"),
+            "a selection is left through its tab"
+        );
+        state.run = Some(run_of(&owner));
+        assert!(
+            tab(&state, "Back to the automation list"),
+            "a run is left through its tab"
+        );
+        state.all_history = true;
+        assert!(tab(&state, "Back to Run history"));
+    }
+
+    #[test]
+    fn an_empty_list_is_not_claimed_while_reading_or_after_a_failed_read() {
+        let texts = |state: &State| {
+            Outline::of(state, 900.0, 700.0)
+                .texts
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect::<Vec<_>>()
+        };
+        let says = |state: &State, text: &str| texts(state).iter().any(|drawn| drawn == text);
+        let fail = |state: &mut State, pending: Pending, error: &str| {
+            state.pending = Some((7, pending));
+            state.update(Action::Received {
+                sequence: 7,
+                result: std::sync::Arc::new(Err(error.into())),
+            });
+        };
+        let loaded = State {
+            list_status: ListStatus::Loaded,
+            ..Default::default()
+        };
+        assert!(says(&loaded, "No automations yet"));
+        // An alert opening its run before any list has been read.
+        let mut state = State {
+            pending: Some((1, Pending::Run)),
+            ..Default::default()
+        };
+        assert!(
+            !says(&state, "No automations yet"),
+            "a read in flight is not an empty list"
+        );
+
+        // The run's failure is its own: the list was never read, not empty
+        // and not failed.
+        fail(&mut state, Pending::Run, "Run unavailable");
+        assert!(says(&state, "Run unavailable"), "{:?}", texts(&state));
+        assert!(!says(&state, "No automations yet"));
+        assert!(!says(&state, "Couldn't load automations"));
+        assert!(
+            buttons(&state, 900.0).contains(&("Load automations".to_owned(), true)),
+            "{:?}",
+            buttons(&state, 900.0)
+        );
+
+        // The list's own failure is stated once, in place, with a retry.
+        fail(
+            &mut state,
+            Pending::List { append: false },
+            "Daemon unavailable",
+        );
+        assert!(says(&state, "Couldn't load automations"));
+        assert!(!says(&state, "No automations yet"));
+        assert_eq!(
+            texts(&state)
+                .iter()
+                .filter(|text| *text == "Daemon unavailable")
+                .count(),
+            1,
+            "{:?}",
+            texts(&state)
+        );
+        assert!(
+            buttons(&state, 900.0).contains(&("Retry".to_owned(), true)),
+            "{:?}",
+            buttons(&state, 900.0)
+        );
+
+        // A later failure elsewhere is not the list's.
+        let mut state = loaded;
+        fail(&mut state, Pending::Run, "Run unavailable");
+        assert!(says(&state, "Run unavailable"));
+        assert!(!says(&state, "Couldn't load automations"));
+    }
+
+    #[test]
+    fn a_long_name_gives_up_width_before_the_trail_around_it() {
+        let mut owner = automation();
+        owner.definition.name =
+            "Summarize every pull request opened against the release branch overnight".to_owned();
+        let state = State {
+            all_history: true,
+            run: Some(run_of(&owner)),
+            ..Default::default()
+        };
+        let wide = Outline::of(&state, 2000.0, 700.0);
+        let name = owner.definition.name.as_str();
+        for width in [300.0, 360.0, 480.0] {
+            let outline = Outline::of(&state, width, 700.0);
+            for level in ["Run history", "Run"] {
+                assert!(
+                    outline.last(level).width >= wide.last(level).width - 0.5,
+                    "at {width} px {level:?} keeps its whole label: {:?} of {:?}",
+                    outline.last(level),
+                    wide.last(level)
+                );
+            }
+            let run = outline.last("Run");
+            assert!(
+                run.x + run.width <= width,
+                "at {width} px the trail ends inside the pane: {run:?}"
+            );
+            assert!(
+                outline.text(name).width < wide.text(name).width,
+                "at {width} px the name is shortened instead"
+            );
+        }
+    }
+
+    #[test]
+    fn a_draft_trail_returns_to_the_view_it_was_started_from() {
+        let mut state = State::default();
+        state.update(Action::AllHistory);
+        state.pending = None;
+        state.update(Action::New);
+        let trail = buttons(&state, 900.0);
+        assert!(
+            trail.contains(&("Back to Run history".to_owned(), true)),
+            "{trail:?}"
+        );
+        assert!(!trail.iter().any(|(name, _)| name == "Back to Automations"));
+        state.update(Action::CancelEdit);
+        assert!(state.draft.is_none());
+        assert_eq!(state.section(), Section::RunHistory);
+
+        // An edit leads back to the automation it changes.
+        let owner = automation();
+        let mut state = State {
+            rows: vec![owner.summary(None)],
+            selected: Some(owner),
+            ..Default::default()
+        };
+        state.update(Action::Edit);
+        assert!(
+            buttons(&state, 900.0).contains(&("Back to Daily review".to_owned(), true)),
+            "{:?}",
+            buttons(&state, 900.0)
+        );
+    }
+
+    #[test]
+    fn a_narrow_header_draws_its_tabs_compact_ahead_of_its_commands() {
+        let state = State {
+            rows: vec![automation().summary(None)],
+            list_status: ListStatus::Loaded,
+            ..Default::default()
+        };
+        let wide = Outline::of(&state, 900.0, 700.0).text("Run history");
+        for width in [300.0, 360.0] {
+            let tab = Outline::of(&state, width, 700.0).text("Run history");
+            assert!(
+                tab.height < wide.height,
+                "at {width} px the tabs use caption text: {tab:?} {wide:?}"
+            );
+            // Refresh and New automation, each an icon, follow the tabs.
+            let commands = 2.0 * (crate::design::PRIMARY_CONTROL_SIZE + space::S);
+            assert!(
+                tab.x + tab.width <= width - space::L - commands,
+                "at {width} px the last tab ends before the header's commands: {tab:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_stays_in_place_while_its_work_is_in_flight() {
+        let state = |pending| State {
+            rows: vec![automation().summary(None)],
+            list_status: ListStatus::Loaded,
+            pending,
+            ..Default::default()
+        };
+        let idle = buttons(&state(None), 900.0);
+        let busy = buttons(&state(Some((1, Pending::List { append: false }))), 900.0);
+        let at = |buttons: &[(String, bool)], name: &str| {
+            buttons
+                .iter()
+                .position(|(label, _)| label == name)
+                .unwrap_or_else(|| panic!("{name:?} in {buttons:?}"))
+        };
+        let refresh = at(&idle, "Refresh automations");
+        assert!(idle[refresh].1);
+        assert_eq!(
+            at(&busy, "Loading automations…"),
+            refresh,
+            "the same control names the work: {busy:?}"
+        );
+        assert!(!busy[refresh].1, "and cannot start it again");
+    }
+
+    #[test]
+    fn refresh_keeps_keyboard_focus_through_a_failed_request_and_retry() {
+        use cosmic::iced::advanced::{
+            Layout, Shell, clipboard, layout, mouse,
+            widget::{Operation, Tree, operation},
+        };
+        use cosmic::iced::{Event, Rectangle, Size, keyboard};
+        #[derive(Default)]
+        struct Focused(Option<bool>);
+        impl Operation for Focused {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if id == Some(&refresh_id()) {
+                    self.0 = Some(state.is_focused());
+                }
+            }
+        }
+        fn enter(
+            state: &State,
+            tree: &mut Tree,
+            renderer: &cosmic::Renderer,
+            focus_once: bool,
+        ) -> Vec<Action> {
+            let mut element = state.view();
+            tree.diff(element.as_widget_mut());
+            let viewport = Rectangle::with_size(Size::new(900.0, 700.0));
+            let node = element.as_widget_mut().layout(
+                tree,
+                renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            if focus_once {
+                let mut focus = operation::focusable::focus::<()>(refresh_id());
+                element
+                    .as_widget_mut()
+                    .operate(tree, Layout::new(&node), renderer, &mut focus);
+            }
+            let mut focused = Focused::default();
+            element
+                .as_widget_mut()
+                .operate(tree, Layout::new(&node), renderer, &mut focused);
+            assert_eq!(
+                focused.0,
+                Some(true),
+                "the retained Refresh control keeps keyboard focus"
+            );
+            let event = Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            });
+            let mut actions = Vec::new();
+            element.as_widget_mut().update(
+                tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut actions),
+                &viewport,
+            );
+            actions
+        }
+        let owner = automation();
+        let mut state = State {
+            rows: vec![owner.summary(None)],
+            list_status: ListStatus::Loaded,
+            ..Default::default()
+        };
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut tree = Tree::new(state.view().as_widget());
+        let actions = enter(&state, &mut tree, &renderer, true);
+        assert!(matches!(actions.as_slice(), [Action::Refresh]));
+        let Some(Effect::Request { sequence, .. }) =
+            state.update(actions.into_iter().next().unwrap())
+        else {
+            panic!("the focused control starts its real list read");
+        };
+        assert!(
+            enter(&state, &mut tree, &renderer, false).is_empty(),
+            "Enter cannot duplicate an in-flight read"
+        );
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Err("offline list fixture".into())),
+        });
+        assert!(matches!(state.list_status, ListStatus::Failed(_)));
+        let actions = enter(&state, &mut tree, &renderer, false);
+        assert!(
+            matches!(actions.as_slice(), [Action::Refresh]),
+            "the same keyboard focus retries after failure"
+        );
+        assert!(matches!(
+            state.update(actions.into_iter().next().unwrap()),
+            Some(Effect::Request {
+                request: Request::List { after: None, .. },
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn user_navigation_supersedes_background_history_without_accepting_its_late_reply() {
-        use crate::automations::{FiringState, HistoryPage};
+        use crate::automations::FiringState;
         let selected = automation();
-        let old_run = history_firing(100, FiringState::Running);
+        let mut old_run = history_firing(100, FiringState::Running);
+        old_run.automation = selected.id;
         let mut state = State {
             selected: Some(selected.clone()),
             history: vec![old_run.clone()],
@@ -2718,14 +4747,19 @@ mod tests {
             HistoryStatus::Loaded,
             "cached history remains usable while polling"
         );
+        let fresh = (151..201)
+            .rev()
+            .map(|created| {
+                let mut firing = history_firing(created, FiringState::Running);
+                firing.automation = old_run.automation;
+                firing
+            })
+            .collect();
         let Some(Effect::Request {
             sequence: detail, ..
         }) = state.update(Action::Received {
             sequence: history,
-            result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
-                firings: vec![old_run.clone()],
-                next: None,
-            }))),
+            result: std::sync::Arc::new(Ok(Response::History(history_page(fresh, true)))),
         })
         else {
             panic!("active row poll");
@@ -2748,12 +4782,10 @@ mod tests {
             state
                 .update(Action::Received {
                     sequence: detail,
-                    result: std::sync::Arc::new(Ok(Response::Detail(RunDetail {
-                        definition: automation().definition,
-                        firing: old_run,
-                        agent: None,
-                        run: None
-                    })))
+                    result: std::sync::Arc::new(Ok(Response::History(history_page(
+                        vec![old_run],
+                        false
+                    ))))
                 })
                 .is_none()
         );
@@ -2781,7 +4813,7 @@ mod tests {
 
     #[test]
     fn background_history_refresh_preserves_older_pages_and_updates_active_rows() {
-        use crate::automations::{FiringState, HistoryPage};
+        use crate::automations::FiringState;
         for terminal_pending in [false, true] {
             let newest = history_firing(100, FiringState::Running);
             let mut older = history_firing(
@@ -2809,16 +4841,20 @@ mod tests {
             };
             let mut completed = newest.clone();
             completed.state = FiringState::Succeeded;
+            let mut newest_page = vec![completed];
+            newest_page
+                .extend((1..PAGE).map(|i| history_firing(100 - i as u64, FiringState::Succeeded)));
+            let expected_before =
+                history_cursor(including_history_key(history_key(&older)).unwrap().unwrap());
             let Some(Effect::Request { sequence, request }) = state.update(Action::Received {
                 sequence,
-                result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
-                    firings: vec![completed],
-                    next: None,
-                }))),
+                result: std::sync::Arc::new(Ok(Response::History(history_page(newest_page, true)))),
             }) else {
                 panic!("active older firing poll expected");
             };
-            assert!(matches!(request, Request::ShowFiring { id } if id == older.id));
+            assert!(
+                matches!(request, Request::History { id: None, before: Some(before), limit: PAGE } if before == expected_before)
+            );
             assert_eq!(state.history.len(), 2);
             assert_eq!(state.history_next, Some(cursor));
             let mut completed = older;
@@ -2830,12 +4866,10 @@ mod tests {
             completed.release_pending = false;
             state.update(Action::Received {
                 sequence,
-                result: std::sync::Arc::new(Ok(Response::Detail(RunDetail {
-                    definition: automation().definition,
-                    firing: completed,
-                    agent: None,
-                    run: None,
-                }))),
+                result: std::sync::Arc::new(Ok(Response::History(history_page(
+                    vec![completed],
+                    false,
+                )))),
             });
             assert_eq!(state.history[0].state, FiringState::Succeeded);
             assert_eq!(
@@ -2881,6 +4915,7 @@ mod tests {
                 panic!("history poll expected");
             };
             let firings = (0..PAGE)
+                .rev()
                 .map(|i| history_firing((1000 + poll * PAGE + i) as u64, FiringState::Succeeded))
                 .collect();
             state.update(Action::Received {
@@ -2997,7 +5032,10 @@ mod tests {
             sequence,
             result: std::sync::Arc::new(Err("offline".into())),
         });
-        assert_eq!(state.history_status, HistoryStatus::Failed);
+        assert_eq!(
+            state.history_status,
+            HistoryStatus::Failed("offline".into())
+        );
         let Some(Effect::Request { sequence, .. }) = state.update(Action::History) else {
             panic!("history retry expected");
         };
@@ -3407,6 +5445,1804 @@ mod tests {
         );
         state.update(Action::New);
         assert!(state.draft.as_ref().unwrap().accounts.is_empty());
+    }
+    #[test]
+    fn automation_lifecycle_pages_are_read_only_bounded_and_deduplicated() {
+        use crate::automations::{LifecycleActor, LifecycleCause, LifecycleEvent, LifecyclePage};
+        let automation = automation();
+        let id = automation.id;
+        let mut state = State {
+            selected: Some(automation),
+            ..Default::default()
+        };
+        let event = |sequence| LifecycleEvent {
+            sequence,
+            automation: id,
+            revision: sequence,
+            occurred_ms: 100,
+            cause: LifecycleCause::Disabled,
+            actor: LifecycleActor::UserManagement,
+            enabled: false,
+            blocked: false,
+            firing: None,
+        };
+        let Some(Effect::Request { sequence, request }) = state.update(Action::Lifecycle) else {
+            panic!("audit request");
+        };
+        assert_eq!(
+            request,
+            Request::Audit {
+                id,
+                before: None,
+                limit: PAGE
+            }
+        );
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Audit(LifecyclePage {
+                events: vec![event(3), event(2)],
+                next: Some(2),
+                earlier_events_unavailable: false,
+            }))),
+        });
+        let Some(Effect::Request { sequence, request }) = state.update(Action::MoreLifecycle)
+        else {
+            panic!("older audit request");
+        };
+        assert_eq!(
+            request,
+            Request::Audit {
+                id,
+                before: Some(2),
+                limit: PAGE
+            }
+        );
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Audit(LifecyclePage {
+                events: vec![event(2), event(1)],
+                next: None,
+                earlier_events_unavailable: true,
+            }))),
+        });
+        let page = state.lifecycle.as_ref().unwrap();
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+        assert!(page.earlier_events_unavailable);
+        assert!(state.update(Action::MoreLifecycle).is_none());
+        assert!(
+            state.history.is_empty(),
+            "lifecycle does not fabricate execution outcomes"
+        );
+    }
+
+    #[test]
+    fn automation_lifecycle_create_receipt_retires_the_previous_selection_audit() {
+        use crate::automations::LifecyclePage;
+        let mut first = automation();
+        first.id = Uuid::new_v4();
+        let mut created = first.clone();
+        created.id = Uuid::new_v4();
+        let mut state = State {
+            selected: Some(first),
+            lifecycle: Some(LifecyclePage {
+                events: vec![],
+                next: None,
+                earlier_events_unavailable: true,
+            }),
+            ..Default::default()
+        };
+        state.update(Action::New);
+        assert!(state.has_draft());
+        // Exercise the same saved-create callback as Action::Save. Definition
+        // editing/validation has its own tests; attribution belongs to this reducer.
+        let Some(Effect::Request { sequence, .. }) = state.request(
+            Pending::Save,
+            Request::Create {
+                definition: created.definition.clone(),
+            },
+        ) else {
+            panic!("create request");
+        };
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Automation(created.clone()))),
+        });
+        assert_eq!(state.selected.as_ref().unwrap().id, created.id);
+        assert!(
+            state.lifecycle.is_none(),
+            "the new definition must never inherit another audit"
+        );
+    }
+
+    #[test]
+    fn automation_lifecycle_old_context_and_wrong_automation_receipts_are_refused() {
+        use crate::automations::{LifecycleActor, LifecycleCause, LifecycleEvent, LifecyclePage};
+        let selected = automation();
+        let id = selected.id;
+        let mut state = State {
+            selected: Some(selected),
+            ..Default::default()
+        };
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Lifecycle) else {
+            panic!("audit request");
+        };
+        let bad = LifecyclePage {
+            events: vec![LifecycleEvent {
+                sequence: 1,
+                automation: Uuid::new_v4(),
+                revision: 1,
+                occurred_ms: 100,
+                cause: LifecycleCause::Created,
+                actor: LifecycleActor::UserManagement,
+                enabled: false,
+                blocked: false,
+                firing: None,
+            }],
+            next: None,
+            earlier_events_unavailable: false,
+        };
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Audit(bad))),
+        });
+        assert!(state.lifecycle.is_none());
+        assert_eq!(state.selected.as_ref().unwrap().id, id);
+        let other = Uuid::new_v4();
+        assert!(
+            matches!(state.update(Action::Select(other)), Some(Effect::Request { request: Request::Show { id }, .. }) if id == other)
+        );
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Audit(LifecyclePage {
+                events: vec![],
+                next: None,
+                earlier_events_unavailable: false,
+            }))),
+        });
+        assert!(state.lifecycle.is_none());
+    }
+    fn list_refresh_rows(count: usize) -> Vec<Summary> {
+        (1..=count)
+            .map(|index| {
+                let mut value = automation();
+                value.id = Uuid::from_u128(index as u128 * 2);
+                value.definition.name = format!("Job {index:04}");
+                value.enabled = true;
+                value.summary(Some(crate::automations::FiringState::Running))
+            })
+            .collect()
+    }
+
+    fn receive_list(state: &mut State, sequence: u64, rows: Vec<Summary>) {
+        assert!(
+            state
+                .update(Action::Received {
+                    sequence,
+                    result: std::sync::Arc::new(Ok(Response::Listed(rows))),
+                })
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn loaded_automation_pages_refresh_outcomes_without_moving_native_search_or_pagination() {
+        use cosmic::iced::advanced::widget::{Operation, operation};
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use cosmic::iced::{Event, Point, Rectangle, Size, keyboard, mouse};
+        type Ui<'a> = UserInterface<'a, Action, cosmic::Theme, cosmic::Renderer>;
+        fn frame<'a>(state: &'a State, cache: Cache, renderer: &mut cosmic::Renderer) -> Ui<'a> {
+            let mut ui =
+                UserInterface::build(state.view(), Size::new(900.0, 700.0), cache, renderer);
+            ui.draw(
+                renderer,
+                &cosmic::theme::active(),
+                &cosmic::iced::advanced::renderer::Style::default(),
+                mouse::Cursor::Unavailable,
+            );
+            ui
+        }
+        fn bounds(ui: &Ui<'_>, name: &str) -> Rectangle {
+            let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+            let rect = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|node| node.node().label() == Some(name))
+                .unwrap_or_else(|| panic!("mounted {name}"))
+                .node()
+                .bounds()
+                .unwrap();
+            Rectangle::new(
+                Point::new(rect.x0 as f32, rect.y0 as f32),
+                Size::new((rect.x1 - rect.x0) as f32, (rect.y1 - rect.y0) as f32),
+            )
+        }
+        #[derive(Default)]
+        struct Search(Option<widget::Id>);
+        impl Operation for Search {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text_input(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: Rectangle,
+                _: &mut dyn operation::TextInput,
+            ) {
+                assert!(self.0.is_none(), "one mounted list search");
+                self.0 = id.cloned();
+            }
+        }
+
+        let rows = list_refresh_rows(PAGE + 1);
+        let ids = rows.iter().map(|row| row.id).collect::<Vec<_>>();
+        let mut state = State::default();
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Refresh) else {
+            panic!()
+        };
+        receive_list(&mut state, sequence, rows[..PAGE].to_vec());
+        state.update(Action::Search("Job 0001".into()));
+        // Filtering leaves the real More control in this viewport, without
+        // faking an offscreen click or changing the loaded-row budget.
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut ui = frame(&state, Cache::new(), &mut renderer);
+        let point = bounds(&ui, "Load more automations").center();
+        assert!(Rectangle::with_size(Size::new(900.0, 700.0)).contains(point));
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ],
+            mouse::Cursor::Available(point),
+            &mut renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert!(
+            matches!(messages.as_slice(), [Action::More]),
+            "{messages:?}"
+        );
+        let cache = ui.into_cache();
+        let Some(Effect::Request { sequence, request }) = state.update(messages.remove(0)) else {
+            panic!()
+        };
+        assert_eq!(
+            request,
+            Request::List {
+                after: Some(rows[PAGE - 1].id),
+                limit: PAGE
+            }
+        );
+        receive_list(&mut state, sequence, vec![rows[PAGE].clone()]);
+        let manual_after = state.after;
+        assert!(!state.more);
+        let mut ui = frame(&state, cache, &mut renderer);
+        let refresh_bounds = bounds(&ui, "Refresh automations");
+        let search_bounds = bounds(&ui, "Filter automations");
+        let mut search = Search::default();
+        ui.operate(&renderer, &mut search);
+        let search_id = search.0.unwrap();
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(search_id.clone()),
+        );
+        ui.operate(
+            &renderer,
+            &mut operation::text_input::select_all::<()>(search_id),
+        );
+        let cache = ui.into_cache();
+
+        let old_firing = Uuid::from_u128(9000);
+        state.last_firings.insert(rows[0].id, (1, old_firing));
+        let Some(Effect::Request { sequence, request }) = state.update(Action::Tick) else {
+            panic!("a loaded second page must not stop status refresh");
+        };
+        assert_eq!(
+            request,
+            Request::List {
+                after: None,
+                limit: PAGE
+            }
+        );
+        let mut first = rows[..PAGE].to_vec();
+        first[0].enabled = false;
+        first[0].blocked = Some("Fixture cleanup needs inspection".into());
+        first[0].last_state = Some(crate::automations::FiringState::Failed);
+        receive_list(&mut state, sequence, first.clone());
+        assert!(!state.rows[0].enabled);
+        assert_eq!(
+            state.rows[0].last_state,
+            Some(crate::automations::FiringState::Failed)
+        );
+        assert!(!state.last_firings.contains_key(&rows[0].id));
+        let mut old_detail = history_firing(1, crate::automations::FiringState::Running);
+        old_detail.id = old_firing;
+        old_detail.automation = rows[0].id;
+        state.refresh_last_outcome(&old_detail, false);
+        assert_eq!(
+            state.rows[0].last_state,
+            Some(crate::automations::FiringState::Failed)
+        );
+        let outline = Outline::of(&state, 900.0, 700.0);
+        outline.text("Last: Failed");
+        outline.text("Fixture cleanup needs inspection");
+        let ui = frame(&state, cache, &mut renderer);
+        assert_eq!(bounds(&ui, "Filter automations"), search_bounds);
+        let cache = ui.into_cache();
+
+        let Some(Effect::Request { sequence, request }) = state.update(Action::Tick) else {
+            panic!()
+        };
+        assert_eq!(
+            request,
+            Request::List {
+                after: Some(rows[PAGE - 1].id),
+                limit: PAGE
+            }
+        );
+        let mut last = rows[PAGE].clone();
+        last.last_state = Some(crate::automations::FiringState::Succeeded);
+        // A genuinely observed new tail row requests Refresh but cannot
+        // extend this pass or grow the reader's loaded snapshot.
+        let beyond = list_refresh_rows(PAGE + 2).pop().unwrap();
+        receive_list(&mut state, sequence, vec![last, beyond]);
+        assert!(state.loaded_list_refresh.is_none());
+        assert_eq!(
+            state.rows[PAGE].last_state,
+            Some(crate::automations::FiringState::Succeeded)
+        );
+        assert!(state.list_changed);
+        let Some(Effect::Request { sequence, request }) = state.update(Action::Tick) else {
+            panic!()
+        };
+        assert_eq!(
+            request,
+            Request::List {
+                after: None,
+                limit: PAGE
+            },
+            "completed passes wrap"
+        );
+        let mut unknown = first[1].clone();
+        unknown.id = Uuid::from_u128(3);
+        first[1] = unknown;
+        receive_list(&mut state, sequence, first);
+        assert_eq!(state.rows.iter().map(|row| row.id).collect::<Vec<_>>(), ids);
+        assert_eq!(state.after, manual_after);
+        assert!(!state.more);
+        assert!(state.selected.is_none() && state.draft.is_none() && state.run.is_none());
+        let mut ui = frame(&state, cache, &mut renderer);
+        assert_eq!(
+            bounds(
+                &ui,
+                "Automation list changed; refresh to show additions or removals"
+            ),
+            refresh_bounds
+        );
+        assert_eq!(bounds(&ui, "Filter automations"), search_bounds);
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character("z".into()),
+                modified_key: keyboard::Key::Character("z".into()),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyZ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: Some("z".into()),
+                repeat: false,
+            })],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert!(
+            matches!(messages.as_slice(), [Action::Search(value)] if value == "z"),
+            "search focus and selection survived every cached reply: {messages:?}"
+        );
+        let _ = ui.into_cache();
+        state.update(messages.remove(0));
+        state.update(Action::Search("Job 0051".into()));
+        Outline::of(&state, 900.0, 700.0).text("Last: Succeeded");
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Refresh) else {
+            panic!()
+        };
+        receive_list(&mut state, sequence, rows[..PAGE].to_vec());
+        assert!(!state.list_changed);
+        assert_eq!(state.rows, rows[..PAGE]);
+        assert_eq!(state.after, Some(rows[PAGE - 1].id));
+        assert!(state.more);
+
+        // Adding an earlier row's warning must not move a later button's
+        // native focused state to its neighbour in the retained widget tree.
+        let mut state = State::default();
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Refresh) else {
+            panic!()
+        };
+        receive_list(&mut state, sequence, rows[..PAGE].to_vec());
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::More) else {
+            panic!()
+        };
+        receive_list(&mut state, sequence, rows[PAGE..].to_vec());
+        state.update(Action::Search("Job 000".into()));
+        let mut ui = frame(&state, Cache::new(), &mut renderer);
+        let third = bounds(&ui, "Select automation Job 0003");
+        assert!(Rectangle::with_size(Size::new(900.0, 700.0)).contains(third.center()));
+        struct ButtonAt {
+            bounds: Rectangle,
+            id: Option<widget::Id>,
+        }
+        impl Operation for ButtonAt {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn operation::Focusable,
+            ) {
+                if bounds == self.bounds {
+                    assert!(self.id.is_none(), "one native row target");
+                    self.id = id.cloned();
+                }
+            }
+        }
+        let mut target = ButtonAt {
+            bounds: third,
+            id: None,
+        };
+        ui.operate(&renderer, &mut target);
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(target.id.expect("actual third row button")),
+        );
+        let cache = ui.into_cache();
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Tick) else {
+            panic!()
+        };
+        let mut changed = rows[..PAGE].to_vec();
+        changed[0].blocked = Some("Earlier row now needs inspection".into());
+        receive_list(&mut state, sequence, changed);
+        let mut ui = frame(&state, cache, &mut renderer);
+        assert!(bounds(&ui, "Select automation Job 0003").y > third.y);
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            })],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert!(
+            matches!(messages.as_slice(), [Action::Select(id)] if *id == rows[2].id),
+            "the original third row retains focus through an earlier warning: {messages:?}"
+        );
+        let _ = ui.into_cache();
+        assert!(
+            matches!(state.update(messages.remove(0)), Some(Effect::Request { request: Request::Show { id }, .. }) if id == rows[2].id)
+        );
+
+        // A rename may remove an earlier row from an unchanged search. The
+        // held native press must not transfer to another UUID in its slot.
+        let mut state = State::default();
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Refresh) else {
+            panic!()
+        };
+        receive_list(&mut state, sequence, rows[..PAGE].to_vec());
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::More) else {
+            panic!()
+        };
+        receive_list(&mut state, sequence, rows[PAGE..].to_vec());
+        state.update(Action::Search("Job 000".into()));
+        let mut ui = frame(&state, Cache::new(), &mut renderer);
+        let point = bounds(&ui, "Select automation Job 0003").center();
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            ],
+            mouse::Cursor::Available(point),
+            &mut renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert!(
+            messages.is_empty(),
+            "a held row press has not selected yet: {messages:?}"
+        );
+        let cache = ui.into_cache();
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Tick) else {
+            panic!()
+        };
+        let mut changed = rows[..PAGE].to_vec();
+        changed[0].name = "Renamed outside current search".into();
+        receive_list(&mut state, sequence, changed);
+        let mut ui = frame(&state, cache, &mut renderer);
+        let replacement = bounds(&ui, "Select automation Job 0004").center();
+        assert_eq!(
+            replacement, point,
+            "the old held slot now belongs to another UUID"
+        );
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::CursorMoved {
+                    position: replacement,
+                }),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ],
+            mouse::Cursor::Available(replacement),
+            &mut renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert!(
+            messages.is_empty(),
+            "a filtered replacement cannot inherit the old row press: {messages:?}"
+        );
+        let point = bounds(&ui, "Select automation Job 0003").center();
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ],
+            mouse::Cursor::Available(point),
+            &mut renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert!(
+            matches!(messages.as_slice(), [Action::Select(id)] if *id == rows[2].id),
+            "a fresh press still selects the actual current UUID: {messages:?}"
+        );
+        let _ = ui.into_cache();
+        assert!(
+            matches!(state.update(messages.remove(0)), Some(Effect::Request { request: Request::Show { id }, .. }) if id == rows[2].id)
+        );
+    }
+
+    #[test]
+    fn paginated_list_refresh_rejects_bad_pages_and_yields_to_foreground_intent() {
+        use crate::automations::HistoryPage;
+
+        fn loaded() -> (State, Vec<Summary>) {
+            let rows = list_refresh_rows(PAGE * 2);
+            let mut state = State::default();
+            let Some(Effect::Request { sequence, .. }) = state.update(Action::Refresh) else {
+                panic!()
+            };
+            receive_list(&mut state, sequence, rows[..PAGE].to_vec());
+            let Some(Effect::Request { sequence, .. }) = state.update(Action::More) else {
+                panic!()
+            };
+            receive_list(&mut state, sequence, rows[PAGE..].to_vec());
+            (state, rows)
+        }
+        for bad in [
+            "duplicate",
+            "reversed",
+            "oversized",
+            "before",
+            "wrong response",
+            "error",
+        ] {
+            let (mut state, rows) = loaded();
+            let Some(Effect::Request { sequence, .. }) = state.update(Action::Tick) else {
+                panic!()
+            };
+            receive_list(&mut state, sequence, rows[..PAGE].to_vec());
+            let cursor = state
+                .loaded_list_refresh
+                .map(|value| (value.after, value.through));
+            let manual = (state.after, state.more);
+            let Some(Effect::Request { sequence, .. }) = state.update(Action::Tick) else {
+                panic!()
+            };
+            let mut changed = rows[PAGE].clone();
+            changed.enabled = false;
+            let result = match bad {
+                "duplicate" => Ok(Response::Listed(vec![changed.clone(), changed])),
+                "reversed" => Ok(Response::Listed(vec![rows[PAGE + 1].clone(), changed])),
+                "oversized" => Ok(Response::Listed(
+                    list_refresh_rows(PAGE * 2 + 1)[PAGE..].to_vec(),
+                )),
+                "before" => Ok(Response::Listed(vec![rows[0].clone()])),
+                "wrong response" => Ok(Response::Automation(automation())),
+                _ => Err("Fixture list read failed".into()),
+            };
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(result),
+            });
+            assert_eq!(
+                state.rows, rows,
+                "{bad} may not partly update a valid prefix"
+            );
+            assert_eq!((state.after, state.more), manual);
+            assert_eq!(
+                state
+                    .loaded_list_refresh
+                    .map(|value| (value.after, value.through)),
+                cursor
+            );
+            assert!(!state.list_changed);
+            assert!(state.selected.is_none() && state.history.is_empty());
+            assert!(matches!(state.list_status, ListStatus::Failed(_)));
+            assert!(
+                matches!(state.update(Action::Tick), Some(Effect::Request { request: Request::List { after: Some(after), limit: PAGE }, .. }) if after == rows[PAGE-1].id)
+            );
+        }
+        for intent in ["search", "more", "refresh", "new", "select"] {
+            let (mut state, rows) = loaded();
+            let manual = (state.after, state.more);
+            let Some(Effect::Request { sequence: old, .. }) = state.update(Action::Tick) else {
+                panic!()
+            };
+            let action = match intent {
+                "search" => Action::Search("Job 0099".into()),
+                "more" => Action::More,
+                "refresh" => Action::Refresh,
+                "new" => Action::New,
+                _ => Action::Select(rows[0].id),
+            };
+            let effect = state.update(action);
+            let accepted = state.pending.map(|(sequence, _)| sequence);
+            let mut stale = rows[..PAGE].to_vec();
+            stale[0].enabled = false;
+            receive_list(&mut state, old, stale);
+            assert_eq!(state.rows, rows, "{intent} retires the old read");
+            assert_eq!((state.after, state.more), manual);
+            assert_eq!(state.pending.map(|(sequence, _)| sequence), accepted);
+            assert!(!state.list_changed);
+            match intent {
+                "search" => {
+                    assert_eq!(state.search, "Job 0099");
+                    assert!(state.pending.is_none());
+                }
+                "new" => assert!(state.draft.is_some()),
+                "more" => assert!(
+                    matches!(effect, Some(Effect::Request { request: Request::List { after: Some(after), .. }, .. }) if after == rows.last().unwrap().id)
+                ),
+                "refresh" => assert!(matches!(
+                    effect,
+                    Some(Effect::Request {
+                        request: Request::List { after: None, .. },
+                        ..
+                    })
+                )),
+                _ => {
+                    let Some(Effect::Request {
+                        sequence,
+                        request: Request::Show { id },
+                    }) = effect
+                    else {
+                        panic!()
+                    };
+                    assert_eq!(id, rows[0].id);
+                    let mut selected = automation();
+                    selected.id = id;
+                    assert!(
+                        matches!(state.update(Action::Received { sequence, result: std::sync::Arc::new(Ok(Response::Automation(selected))) }), Some(Effect::Request { request: Request::History { id: Some(actual), .. }, .. }) if actual == id)
+                    );
+                    assert_eq!(state.selected.as_ref().unwrap().id, id);
+                }
+            }
+        }
+
+        // Save can insert a row outside the foreground UUID prefix. A failed
+        // Browse retains it; More appends its real next page after that row.
+        // Refresh must use UUID membership, without sorting the reader's slots.
+        let (mut state, mut saved) = editing(None, None);
+        state.update(Action::CancelEdit);
+        let rows = list_refresh_rows(PAGE * 3);
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Browse) else {
+            panic!()
+        };
+        receive_list(&mut state, sequence, rows[..PAGE].to_vec());
+        state.update(Action::New);
+        state.update(Action::Provider(1));
+        state.update(Action::Field(Field::Name, "Saved outlier".into()));
+        state.update(Action::Field(Field::Timezone, "UTC".into()));
+        state.update(Action::Prompt(text_editor::Action::Edit(
+            text_editor::Edit::Insert('x'),
+        )));
+        let Some(Effect::Request {
+            sequence,
+            request: Request::Create { definition },
+        }) = state.update(Action::Save)
+        else {
+            panic!("the ordinary new draft issues Create: {:?}", state.error);
+        };
+        saved.id = Uuid::from_u128(1000);
+        saved.definition = definition;
+        let Some(Effect::Request {
+            sequence: history,
+            request: Request::History { id: Some(id), .. },
+        }) = state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Automation(saved.clone()))),
+        })
+        else {
+            panic!()
+        };
+        assert_eq!(id, saved.id);
+        state.update(Action::Received {
+            sequence: history,
+            result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
+                firings: vec![],
+                next: None,
+            }))),
+        });
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Browse) else {
+            panic!()
+        };
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Err("Fixture transient list failure".into())),
+        });
+        assert!(state.selected.is_none());
+        let Some(Effect::Request { sequence, request }) = state.update(Action::More) else {
+            panic!()
+        };
+        assert_eq!(
+            request,
+            Request::List {
+                after: Some(rows[PAGE - 1].id),
+                limit: PAGE
+            }
+        );
+        receive_list(&mut state, sequence, rows[PAGE..PAGE * 2].to_vec());
+        assert_eq!(state.rows[PAGE].id, saved.id);
+        assert!(
+            state.rows[PAGE].id > state.rows[PAGE + 1].id,
+            "ordinary More leaves a non-sorted display snapshot"
+        );
+        let ids = state.rows.iter().map(|row| row.id).collect::<Vec<_>>();
+        let manual = (state.after, state.more);
+        for page in 0..3 {
+            let Some(Effect::Request { sequence, request }) = state.update(Action::Tick) else {
+                panic!()
+            };
+            assert_eq!(
+                request,
+                Request::List {
+                    after: (page > 0).then(|| rows[page * PAGE - 1].id),
+                    limit: PAGE
+                }
+            );
+            receive_list(
+                &mut state,
+                sequence,
+                rows[page * PAGE..(page + 1) * PAGE].to_vec(),
+            );
+            assert!(
+                !state.list_changed,
+                "unloaded rows beyond the manual cursor are not claimed new"
+            );
+        }
+        let Some(Effect::Request { sequence, request }) = state.update(Action::Tick) else {
+            panic!("the saved maximum UUID remains in this finite pass")
+        };
+        assert_eq!(
+            request,
+            Request::List {
+                after: Some(rows.last().unwrap().id),
+                limit: PAGE
+            }
+        );
+        let mut outlier = saved.summary(Some(crate::automations::FiringState::Failed));
+        outlier.enabled = false;
+        receive_list(&mut state, sequence, vec![outlier.clone()]);
+        assert_eq!(state.rows[PAGE], outlier);
+        assert_eq!(state.rows.iter().map(|row| row.id).collect::<Vec<_>>(), ids);
+        assert_eq!((state.after, state.more), manual);
+        assert!(state.loaded_list_refresh.is_none());
+        assert!(!state.list_changed);
+        assert!(state.selected.is_none() && state.draft.is_none() && state.history.is_empty());
+    }
+
+    fn budget_history_rows(count: usize) -> Vec<Firing> {
+        (1..=count)
+            .rev()
+            .map(|i| {
+                let mut firing = history_firing(i as u64, crate::automations::FiringState::Running);
+                firing.id = Uuid::from_u128(i as u128);
+                firing.automation = Uuid::from_u128(10_000 + i as u128);
+                firing
+            })
+            .collect()
+    }
+
+    fn load_budget_history(state: &mut State, backend: &[Firing], pages: usize) {
+        for page in 0..pages {
+            let Some(Effect::Request {
+                sequence,
+                request:
+                    Request::History {
+                        id: None,
+                        before,
+                        limit: PAGE,
+                    },
+            }) = state.update(if page == 0 {
+                Action::AllHistory
+            } else {
+                Action::MoreHistory
+            })
+            else {
+                panic!("ordinary manual history page")
+            };
+            assert_eq!(
+                before,
+                (page > 0).then(|| history_cursor(history_key(&backend[page * PAGE - 1])))
+            );
+            let end = (page + 1) * PAGE;
+            assert!(
+                state
+                    .update(Action::Received {
+                        sequence,
+                        result: std::sync::Arc::new(Ok(Response::History(history_page(
+                            backend[page * PAGE..end].to_vec(),
+                            end < backend.len()
+                        ))))
+                    })
+                    .is_none()
+            );
+        }
+    }
+
+    fn budget_poll(state: &mut State, backend: &[Firing]) -> Option<(u64, HistoryCursor)> {
+        let Some(Effect::Request {
+            sequence,
+            request:
+                Request::History {
+                    id: None,
+                    before: None,
+                    limit: PAGE,
+                },
+        }) = state.update(Action::Tick)
+        else {
+            panic!("one newest metadata page per Tick")
+        };
+        match state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::History(history_page(
+                backend[..backend.len().min(PAGE)].to_vec(),
+                backend.len() > PAGE,
+            )))),
+        }) {
+            Some(Effect::Request {
+                sequence,
+                request:
+                    Request::History {
+                        id: None,
+                        before: Some(before),
+                        limit: PAGE,
+                    },
+            }) => Some((sequence, before)),
+            None => None,
+            _ => panic!("never fan out full RunDetail reads"),
+        }
+    }
+
+    fn receive_budget_page(
+        state: &mut State,
+        sequence: u64,
+        before: &HistoryCursor,
+        backend: &[Firing],
+    ) {
+        let older = backend
+            .iter()
+            .filter(|firing| history_key(firing) < (before.created_ms, before.id))
+            .collect::<Vec<_>>();
+        let page = older
+            .iter()
+            .take(PAGE)
+            .map(|firing| (**firing).clone())
+            .collect();
+        assert!(
+            state
+                .update(Action::Received {
+                    sequence,
+                    result: std::sync::Arc::new(Ok(Response::History(history_page(
+                        page,
+                        older.len() > PAGE
+                    ))))
+                })
+                .is_none(),
+            "no immediate third read or detail chain"
+        );
+        assert!(state.pending.is_none());
+    }
+
+    #[test]
+    fn history_poll_batches_loaded_metadata_once_and_fairly_reaches_older_release() {
+        use crate::automations::FiringState;
+        let mut backend = budget_history_rows(PAGE * 4);
+        backend[PAGE * 3 - 1].state = FiringState::Failed;
+        backend[PAGE * 3 - 1].release_pending = true;
+        let mut state = State::default();
+        load_budget_history(&mut state, &backend, 3);
+        let ids = state
+            .history
+            .iter()
+            .map(|firing| firing.id)
+            .collect::<Vec<_>>();
+        let manual = state.history_next.clone();
+        backend[PAGE * 3 - 1].release_pending = false;
+        for tick in 0..4 {
+            let (sequence, before) = budget_poll(&mut state, &backend).expect("one older batch");
+            let expected = if tick % 2 == 0 { PAGE } else { PAGE * 2 };
+            assert_eq!(
+                before,
+                history_cursor(
+                    including_history_key(history_key(&backend[expected]))
+                        .unwrap()
+                        .unwrap()
+                )
+            );
+            assert!(
+                backend[..PAGE]
+                    .iter()
+                    .all(|fresh| history_key(fresh) >= (before.created_ms, before.id)),
+                "fresh newest rows are not requested twice"
+            );
+            receive_budget_page(&mut state, sequence, &before, &backend);
+            assert_eq!(
+                state
+                    .history
+                    .iter()
+                    .map(|firing| firing.id)
+                    .collect::<Vec<_>>(),
+                ids
+            );
+            assert_eq!(state.history_next, manual);
+            assert!(!state.history_newer);
+            assert!(state.run.is_none() && state.selected.is_none() && state.draft.is_none());
+            if tick >= 1 {
+                assert_eq!(state.history[PAGE * 3 - 1].state, FiringState::Failed);
+                assert!(
+                    !state.history[PAGE * 3 - 1].release_pending,
+                    "tail cleanup metadata refreshed without full details"
+                );
+            }
+        }
+        assert_eq!(
+            including_history_key((7, Uuid::from_u128(u128::MAX))).unwrap(),
+            Some((8, Uuid::nil()))
+        );
+        assert_eq!(
+            including_history_key((i64::MAX as u64, Uuid::from_u128(u128::MAX))).unwrap(),
+            None
+        );
+        assert!(including_history_key((u64::MAX, Uuid::nil())).is_err());
+        assert!(including_history_key((u64::MAX, Uuid::from_u128(u128::MAX))).is_err());
+    }
+
+    #[test]
+    fn history_batch_cursor_survives_new_arrivals_compaction_errors_and_foreground_supersession() {
+        use crate::automations::{FiringState, HistoryPage};
+        let original = budget_history_rows(PAGE * 4);
+        let mut state = State::default();
+        load_budget_history(&mut state, &original, 3);
+        let ids = state
+            .history
+            .iter()
+            .map(|firing| firing.id)
+            .collect::<Vec<_>>();
+        let manual = state.history_next.clone();
+        let mut burst = (0..PAGE)
+            .map(|i| {
+                let mut firing = history_firing(1_000_000 - i as u64, FiringState::Running);
+                firing.id = Uuid::from_u128(1_000_000 - i as u128);
+                firing
+            })
+            .collect::<Vec<_>>();
+        burst.extend(original.clone());
+        let (sequence, before) = budget_poll(&mut state, &burst).unwrap();
+        assert_eq!(
+            before,
+            history_cursor(
+                including_history_key(history_key(&original[0]))
+                    .unwrap()
+                    .unwrap()
+            ),
+            "skip the entire unrequested million-key gap in one bounded query"
+        );
+        receive_budget_page(&mut state, sequence, &before, &burst);
+        assert_eq!(state.history_next, manual);
+        // Start the independent compaction/new-arrival pass from the same
+        // ordinarily loaded snapshot.
+        let mut state = State::default();
+        load_budget_history(&mut state, &original, 3);
+        // New rows lie before a finite scan; a deleted loaded row must not
+        // become terminal or be dropped merely because no page returns it.
+        let missing = original[PAGE + 5].id;
+        for tick in 0..5 {
+            let mut backend = budget_history_rows(PAGE * (6 + tick));
+            backend.retain(|firing| firing.id != missing);
+            for firing in &mut backend {
+                if ids.contains(&firing.id) {
+                    firing.state = FiringState::Succeeded;
+                }
+            }
+            if let Some((sequence, before)) = budget_poll(&mut state, &backend) {
+                receive_budget_page(&mut state, sequence, &before, &backend);
+            }
+            assert_eq!(
+                state
+                    .history
+                    .iter()
+                    .map(|firing| firing.id)
+                    .collect::<Vec<_>>(),
+                ids
+            );
+            assert_eq!(state.history_next, manual);
+        }
+        assert!(state.history_newer);
+        assert_eq!(
+            state.history.last().unwrap().state,
+            FiringState::Succeeded,
+            "new arrivals cannot restart a finite old range forever"
+        );
+        assert_eq!(
+            state
+                .history
+                .iter()
+                .find(|firing| firing.id == missing)
+                .unwrap()
+                .state,
+            FiringState::Running
+        );
+
+        // A failed first batch advances only past an actually issued loaded
+        // candidate. Later rows get a turn before the failed row is retried.
+        let mut state = State::default();
+        load_budget_history(&mut state, &original, 3);
+        let (sequence, first) = budget_poll(&mut state, &original).unwrap();
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Err("bounded page failure".into())),
+        });
+        assert!(matches!(state.history_status, HistoryStatus::Failed(_)));
+        let (sequence, second) = budget_poll(&mut state, &original).unwrap();
+        assert!((second.created_ms, second.id) < (first.created_ms, first.id));
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Err("another bounded page failure".into())),
+        });
+        let (sequence, third) = budget_poll(&mut state, &original).unwrap();
+        assert!((third.created_ms, third.id) < (second.created_ms, second.id));
+        let mut completed = original.clone();
+        for firing in &mut completed {
+            firing.state = FiringState::Succeeded;
+        }
+        receive_budget_page(&mut state, sequence, &third, &completed);
+        assert_eq!(
+            state.history[PAGE].state,
+            FiringState::Running,
+            "failed candidate is not falsely settled"
+        );
+        assert_eq!(state.history[PAGE + 1].state, FiringState::Running);
+        assert_eq!(state.history[PAGE + 2].state, FiringState::Succeeded);
+        for _ in 0..3 {
+            if let Some((sequence, before)) = budget_poll(&mut state, &completed) {
+                receive_budget_page(&mut state, sequence, &before, &completed);
+            }
+        }
+        assert_eq!(
+            state.history[PAGE].state,
+            FiringState::Succeeded,
+            "wrap revisits the original failed candidate"
+        );
+
+        for next in [
+            Action::Search("new filter".into()),
+            Action::New,
+            Action::Select(original[0].automation),
+            Action::Refresh,
+        ] {
+            let mut state = State::default();
+            load_budget_history(&mut state, &original, 3);
+            let (sequence, before) = budget_poll(&mut state, &original).unwrap();
+            state.update(next);
+            let pending = state.pending.map(|(sequence, _)| sequence);
+            let snapshot = state.history.clone();
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::History(history_page(
+                    original[PAGE..PAGE * 2].to_vec(),
+                    true,
+                )))),
+            });
+            assert_eq!(
+                state.history, snapshot,
+                "late valid page cannot cross foreground context"
+            );
+            assert_eq!(state.pending.map(|(sequence, _)| sequence), pending);
+            assert!(before.created_ms > original.last().unwrap().created_ms);
+        }
+
+        for bad in ["foreign", "order", "cursor", "duplicate", "detail"] {
+            let mut state = State::default();
+            load_budget_history(&mut state, &original, 3);
+            let snapshot = state.history.clone();
+            let outcomes = state.last_firings.clone();
+            let Some(Effect::Request { sequence, .. }) = state.update(Action::Tick) else {
+                panic!("newest poll")
+            };
+            let mut page = history_page(original[..PAGE].to_vec(), true);
+            match bad {
+                "foreign" => page.firings[0].automation = Uuid::new_v4(),
+                "order" => page.firings.swap(0, 1),
+                "duplicate" => page.firings[1] = page.firings[0].clone(),
+                "cursor" => page.next = Some(history_cursor(history_key(&original[0]))),
+                _ => {}
+            }
+            let response = if bad == "detail" {
+                Response::Detail(RunDetail {
+                    definition: automation().definition,
+                    firing: original[0].clone(),
+                    agent: None,
+                    run: None,
+                })
+            } else {
+                Response::History(page)
+            };
+            assert!(
+                state
+                    .update(Action::Received {
+                        sequence,
+                        result: std::sync::Arc::new(Ok(response))
+                    })
+                    .is_none()
+            );
+            assert_eq!(
+                state.history, snapshot,
+                "newest malformed page cannot enter known rows: {bad}"
+            );
+            assert_eq!(
+                state.last_firings, outcomes,
+                "no outcome mutation before validation"
+            );
+            assert!(matches!(state.history_status, HistoryStatus::Failed(_)));
+            assert!(state.run.is_none() && state.history_refresh.is_none());
+        }
+
+        let owner = automation();
+        let mut scoped = original.clone();
+        for firing in &mut scoped {
+            firing.automation = owner.id;
+        }
+        let mut state = State::default();
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Select(owner.id)) else {
+            panic!("select exact owner")
+        };
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Automation(owner.clone()))),
+        }) else {
+            panic!("initial scoped history")
+        };
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::History(history_page(
+                scoped[..PAGE].to_vec(),
+                true,
+            )))),
+        });
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::MoreHistory) else {
+            panic!("older scoped page")
+        };
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::History(history_page(
+                scoped[PAGE..PAGE * 2].to_vec(),
+                true,
+            )))),
+        });
+        let Some(Effect::Request {
+            sequence,
+            request: Request::Show { id },
+        }) = state.update(Action::Tick)
+        else {
+            panic!("selected definition still uses its existing Show read")
+        };
+        assert_eq!(id, owner.id);
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Automation(owner))),
+        }) else {
+            panic!("scoped newest read")
+        };
+        let snapshot = state.history.clone();
+        let mut foreign = history_firing(999, FiringState::Succeeded);
+        foreign.automation = Uuid::new_v4();
+        assert!(
+            state
+                .update(Action::Received {
+                    sequence,
+                    result: std::sync::Arc::new(Ok(Response::History(history_page(
+                        vec![foreign],
+                        false
+                    ))))
+                })
+                .is_none()
+        );
+        assert_eq!(
+            state.history, snapshot,
+            "unseen foreign firing cannot change a selected scope"
+        );
+        assert!(matches!(state.history_status, HistoryStatus::Failed(_)));
+
+        // Typed pending rejects full-detail and malformed page shapes before
+        // any update, while an empty valid response keeps absent rows intact.
+        for bad in [
+            "foreign",
+            "order",
+            "cursor",
+            "oversized",
+            "identity",
+            "duplicate",
+            "detail",
+            "empty",
+        ] {
+            let mut state = State::default();
+            load_budget_history(&mut state, &original, 3);
+            let (sequence, _) = budget_poll(&mut state, &original).unwrap();
+            let snapshot = state.history.clone();
+            let mut page = history_page(original[PAGE..PAGE * 2].to_vec(), true);
+            match bad {
+                "foreign" => page.firings[0].automation = Uuid::new_v4(),
+                "order" => page.firings.swap(0, 1),
+                "duplicate" => page.firings[1] = page.firings[0].clone(),
+                "cursor" => page.next = Some(history_cursor(history_key(&original[0]))),
+                "oversized" => page = history_page(original[PAGE..PAGE * 2 + 1].to_vec(), false),
+                "identity" => page.firings[0].created_ms -= 1,
+                "empty" => {
+                    page = HistoryPage {
+                        firings: vec![],
+                        next: None,
+                    }
+                }
+                _ => {}
+            }
+            let response = if bad == "detail" {
+                Response::Detail(RunDetail {
+                    definition: automation().definition,
+                    firing: original[PAGE].clone(),
+                    agent: None,
+                    run: None,
+                })
+            } else {
+                Response::History(page)
+            };
+            assert!(
+                state
+                    .update(Action::Received {
+                        sequence,
+                        result: std::sync::Arc::new(Ok(response))
+                    })
+                    .is_none()
+            );
+            assert_eq!(
+                state.history, snapshot,
+                "atomic rejection/absence preserves loaded rows: {bad}"
+            );
+            assert_eq!(state.history_next, manual);
+            assert!(state.run.is_none());
+            if bad == "empty" {
+                assert!(state.history_refresh.is_none());
+            } else {
+                assert!(
+                    matches!(state.history_status, HistoryStatus::Failed(_)),
+                    "{bad}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn completed_run_notice_stays_with_its_automation_and_not_a_new_selection() {
+        use crate::automations::{FiringState, HistoryPage, Trigger};
+
+        fn receive_automation(state: &mut State, sequence: u64, value: Automation) {
+            let Some(Effect::Request {
+                sequence,
+                request: Request::History { id, .. },
+            }) = state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::Automation(value.clone()))),
+            })
+            else {
+                panic!("the selected definition reads its history")
+            };
+            assert_eq!(id, Some(value.id));
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
+                    firings: Vec::new(),
+                    next: None,
+                }))),
+            });
+        }
+        let a = automation();
+        let mut b = a.clone();
+        b.id = Uuid::new_v4();
+        b.definition.name = "Unrequested automation B".into();
+        let mut state = State {
+            rows: vec![a.summary(None), b.summary(None)],
+            selected: Some(a.clone()),
+            ..Default::default()
+        };
+        state.update(Action::RunNow);
+        let generation = state.confirmation.as_ref().unwrap().generation;
+        let Some(Effect::Request {
+            sequence,
+            request: Request::RunNow { id, request, .. },
+        }) = state.update(Action::Confirm(generation))
+        else {
+            panic!("explicit run A")
+        };
+        assert_eq!(id, a.id);
+        let mut firing = history_firing(100, FiringState::Accepted);
+        firing.automation = a.id;
+        firing.trigger = Trigger::Manual { request };
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Firing(firing))),
+        });
+        let message = "Run requested: Queued";
+        assert_eq!(state.notice.as_deref(), Some(message));
+        Outline::of(&state, 900.0, 700.0).text(message);
+
+        // Ordinary reads of A preserve its own confirmation, including an
+        // explicit same-subject selection and a list-based Refresh.
+        for action in [Action::Tick, Action::Select(a.id)] {
+            let Some(Effect::Request {
+                sequence,
+                request: Request::Show { id },
+            }) = state.update(action)
+            else {
+                panic!("same A read")
+            };
+            assert_eq!(id, a.id);
+            receive_automation(&mut state, sequence, a.clone());
+            assert_eq!(state.notice.as_deref(), Some(message));
+        }
+        let Some(Effect::Request {
+            sequence,
+            request: Request::List { .. },
+        }) = state.update(Action::Refresh)
+        else {
+            panic!("explicit Refresh")
+        };
+        let Some(Effect::Request {
+            sequence,
+            request: Request::Show { id },
+        }) = state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Listed(vec![
+                a.summary(None),
+                b.summary(None),
+            ]))),
+        })
+        else {
+            panic!("Refresh reloads A")
+        };
+        assert_eq!(id, a.id);
+        receive_automation(&mut state, sequence, a.clone());
+        assert_eq!(state.notice.as_deref(), Some(message));
+
+        // Refused navigation cannot consume the prior confirmation or an
+        // accepted/uncertain request's original UUID.
+        state.update(Action::RunNow);
+        let generation = state.confirmation.as_ref().unwrap().generation;
+        let Some(Effect::Request {
+            sequence,
+            request: Request::RunNow { request, .. },
+        }) = state.update(Action::Confirm(generation))
+        else {
+            panic!("second explicit run A")
+        };
+        assert!(state.update(Action::Select(b.id)).is_none());
+        assert_eq!(state.selected.as_ref().unwrap().id, a.id);
+        assert_eq!(state.notice.as_deref(), Some(message));
+        assert_eq!(
+            state.manual_requests.get(&a.id),
+            Some(&(a.execution_revision, request))
+        );
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Err("Unobserved fixture reply".into())),
+        });
+        let Some(Effect::Request {
+            sequence,
+            request: Request::Show { id },
+        }) = state.update(Action::Select(b.id))
+        else {
+            panic!("accepted selection B")
+        };
+        assert_eq!(id, b.id);
+        receive_automation(&mut state, sequence, b.clone());
+        assert_eq!(state.selected.as_ref().unwrap().id, b.id);
+        assert!(state.notice.is_none());
+        assert_eq!(
+            state.manual_requests.get(&a.id),
+            Some(&(a.execution_revision, request))
+        );
+        for width in [900.0, 360.0] {
+            assert!(
+                !Outline::of(&state, width, 700.0)
+                    .texts
+                    .iter()
+                    .any(|(text, _)| text == message)
+            );
+        }
+
+        // A removal already returned to the list has no selected subject to
+        // leave: refreshing that list should retain its useful confirmation.
+        state.update(Action::Remove);
+        let generation = state.confirmation.as_ref().unwrap().generation;
+        let Some(Effect::Request {
+            sequence,
+            request: Request::Remove { id, .. },
+        }) = state.update(Action::Confirm(generation))
+        else {
+            panic!("explicit remove B")
+        };
+        assert_eq!(id, b.id);
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Removed)),
+        });
+        let removed = "Automation removed. Past runs remain in history.";
+        assert_eq!(state.notice.as_deref(), Some(removed));
+        Outline::of(&state, 900.0, 700.0).text(removed);
+        assert!(state.selected.is_none());
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Browse) else {
+            panic!("already-list Browse")
+        };
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Listed(vec![a.summary(None)]))),
+        });
+        assert_eq!(state.notice.as_deref(), Some(removed));
+        Outline::of(&state, 900.0, 700.0).text(removed);
+    }
+
+    #[test]
+    fn cancellation_notice_retires_only_when_accepted_navigation_leaves_its_run() {
+        fn detail(owner: &Automation) -> RunDetail {
+            let mut value = run_of(owner);
+            let run = crate::model::RunId::new();
+            value.firing.state = crate::automations::FiringState::Running;
+            value.firing.run = Some(run);
+            value.run = Some(crate::agent_execution::Run {
+                id: run,
+                agent: crate::model::AgentId::new(),
+                state: crate::agent_execution::State::Running,
+                revision: 1,
+                accepted_ms: 100,
+                started_ms: Some(100),
+                finished_ms: None,
+                provider_key: None,
+                result: Default::default(),
+            });
+            value
+        }
+        fn canceled(owner: &Automation, firing: &RunDetail) -> State {
+            let mut state = State {
+                selected: Some(owner.clone()),
+                ..Default::default()
+            };
+            let Some(Effect::Request {
+                sequence,
+                request: Request::ShowFiring { id },
+            }) = state.update(Action::Run(firing.firing.id))
+            else {
+                panic!("open actual firing")
+            };
+            assert_eq!(id, firing.firing.id);
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::Detail(firing.clone()))),
+            });
+            let Some(Effect::Request {
+                sequence,
+                request:
+                    Request::Cancel {
+                        id,
+                        firing: requested,
+                    },
+            }) = state.update(Action::CancelRun)
+            else {
+                panic!("explicit cancel")
+            };
+            assert_eq!((id, requested), (owner.id, firing.firing.id));
+            assert!(
+                state
+                    .update(Action::InspectRun(crate::model::RunId::new()))
+                    .is_none()
+            );
+            assert_eq!(state.run.as_ref().unwrap().firing.id, firing.firing.id);
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::CancellationRequested)),
+            });
+            state
+        }
+        let owner = automation();
+        let first = detail(&owner);
+        let other = detail(&owner);
+        let message = "Cancellation requested. Refresh the run for its confirmed outcome.";
+        let mut state = canceled(&owner, &first);
+        assert_eq!(state.notice.as_deref(), Some(message));
+        Outline::of(&state, 900.0, 700.0).text(message);
+        // Same firing read through normal tick, Refresh, row selection and
+        // notification activation is not a new subject or completion.
+        for action in [
+            Action::Tick,
+            Action::Refresh,
+            Action::Run(first.firing.id),
+            Action::InspectRun(first.run.as_ref().unwrap().id),
+        ] {
+            let Some(Effect::Request { sequence, .. }) = state.update(action) else {
+                panic!("read the same run")
+            };
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::Detail(first.clone()))),
+            });
+            assert_eq!(state.notice.as_deref(), Some(message));
+            assert_eq!(
+                state.run.as_ref().unwrap().firing.state,
+                crate::automations::FiringState::Running
+            );
+        }
+        for action in [
+            Action::Run(other.firing.id),
+            Action::InspectRun(other.run.as_ref().unwrap().id),
+        ] {
+            let mut state = canceled(&owner, &first);
+            let Some(Effect::Request { sequence, request }) = state.update(action) else {
+                panic!("accepted other run read")
+            };
+            assert!(
+                matches!(request, Request::ShowFiring { id } if id == other.firing.id)
+                    || matches!(request, Request::ShowRun { run } if run == other.run.as_ref().unwrap().id)
+            );
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::Detail(other.clone()))),
+            });
+            assert_eq!(state.run.as_ref().unwrap().firing.id, other.firing.id);
+            assert!(state.notice.is_none());
+            assert!(
+                !Outline::of(&state, 360.0, 700.0)
+                    .texts
+                    .iter()
+                    .any(|(text, _)| text == message)
+            );
+        }
+        for action in [Action::CloseRun, Action::Browse, Action::AllHistory] {
+            let mut state = canceled(&owner, &first);
+            state.update(action);
+            assert!(state.run.is_none());
+            assert!(state.notice.is_none());
+        }
+    }
+    fn notice_page(id: Uuid, sequence: u64) -> crate::automations::LifecyclePage {
+        crate::automations::LifecyclePage {
+            events: vec![crate::automations::LifecycleEvent {
+                automation: id,
+                sequence,
+                revision: 4,
+                occurred_ms: 600,
+                cause: crate::automations::LifecycleCause::PrecheckInterrupted,
+                actor: crate::automations::LifecycleActor::System,
+                enabled: false,
+                blocked: true,
+                firing: None,
+            }],
+            next: None,
+            earlier_events_unavailable: false,
+        }
+    }
+
+    #[test]
+    fn exact_no_run_receipt_is_read_only_even_without_a_current_definition_and_at_narrow_width() {
+        let id = Uuid::new_v4();
+        let mut state = State::default();
+        state.pending = Some((7, Pending::RefreshList));
+        assert!(state.show_lifecycle_receipt(id, 42, Ok(notice_page(id, 42))));
+        assert_eq!(
+            state
+                .lifecycle_notice
+                .as_ref()
+                .unwrap()
+                .event
+                .as_ref()
+                .unwrap()
+                .sequence,
+            42
+        );
+        assert!(state.selected.is_none() && state.run.is_none() && state.rows.is_empty());
+        for action in [
+            Action::Tick,
+            Action::Refresh,
+            Action::Enable,
+            Action::RunNow,
+            Action::Remove,
+            Action::OpenSession,
+            Action::Run(Uuid::new_v4()),
+            Action::New,
+        ] {
+            assert!(state.update(action).is_none());
+        }
+        assert!(
+            state
+                .update(Action::Received {
+                    sequence: 7,
+                    result: std::sync::Arc::new(Ok(Response::Listed(vec![
+                        automation().summary(None)
+                    ])))
+                })
+                .is_none()
+        );
+        assert!(state.rows.is_empty() && state.manual_requests.is_empty());
+        for width in [280.0, 900.0] {
+            let outline = Outline::of(&state, width, 600.0);
+            assert!(
+                outline
+                    .texts
+                    .iter()
+                    .any(|(text, _)| text == "Precheck interrupted")
+            );
+            assert!(
+                outline
+                    .texts
+                    .iter()
+                    .any(|(text, _)| text.contains("past system event"))
+            );
+            assert!(
+                !outline
+                    .texts
+                    .iter()
+                    .any(|(text, _)| text.contains("Run now")
+                        || text == "Enable"
+                        || text.contains("Inspect run"))
+            );
+            assert!(outline.field.is_none());
+        }
+        assert!(matches!(
+            state.update(Action::Browse),
+            Some(Effect::Request {
+                request: Request::List { after: None, .. },
+                ..
+            })
+        ));
+        assert!(state.lifecycle_notice.is_none());
+    }
+
+    #[test]
+    fn expired_foreign_or_malformed_lifecycle_reply_never_substitutes_a_latest_row() {
+        let id = Uuid::new_v4();
+        let mut wrong_actor = notice_page(id, 42);
+        wrong_actor.events[0].actor = crate::automations::LifecycleActor::UserManagement;
+        let mut wrong_cause = notice_page(id, 42);
+        wrong_cause.events[0].cause = crate::automations::LifecycleCause::Enabled;
+        let mut long = notice_page(id, 42);
+        long.events.push(long.events[0].clone());
+        let mut cursor = notice_page(id, 42);
+        cursor.next = Some(41);
+        let mut invalid = notice_page(id, 42);
+        invalid.events[0].revision = 0;
+        for reply in [
+            Err(()),
+            Ok(crate::automations::LifecyclePage {
+                events: vec![],
+                next: None,
+                earlier_events_unavailable: true,
+            }),
+            Ok(notice_page(Uuid::new_v4(), 42)),
+            Ok(notice_page(id, 43)),
+            Ok(wrong_actor),
+            Ok(wrong_cause),
+            Ok(long),
+            Ok(cursor),
+            Ok(invalid),
+        ] {
+            let mut state = State {
+                selected: Some(automation()),
+                ..Default::default()
+            };
+            assert!(state.show_lifecycle_receipt(id, 42, reply));
+            let selected = state.lifecycle_notice.as_ref().unwrap();
+            assert_eq!((selected.id, selected.sequence), (id, 42));
+            assert!(selected.event.is_none());
+            assert!(state.selected.is_none() && state.run.is_none());
+            assert!(
+                Outline::of(&state, 280.0, 600.0)
+                    .texts
+                    .iter()
+                    .any(|(text, _)| text == "This exact receipt is unavailable")
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_activation_preserves_edits_consent_and_foreground_request_ownership() {
+        let id = Uuid::new_v4();
+        let owner = automation();
+        let mut draft = State {
+            selected: Some(owner.clone()),
+            ..Default::default()
+        };
+        draft.update(Action::Edit);
+        draft.update(Action::Field(Field::Name, "Keep this draft".into()));
+        assert!(!draft.show_lifecycle_receipt(id, 42, Ok(notice_page(id, 42))));
+        assert_eq!(draft.draft.as_ref().unwrap().name, "Keep this draft");
+        assert!(draft.lifecycle_notice.is_none());
+        let mut selecting = State::default();
+        let Some(Effect::Request { sequence, .. }) = selecting.update(Action::Select(owner.id))
+        else {
+            panic!("foreground selection")
+        };
+        assert!(!selecting.show_lifecycle_receipt(id, 42, Ok(notice_page(id, 42))));
+        assert_eq!(selecting.pending.unwrap().0, sequence);
+        let owner_id = owner.id;
+        let Some(Effect::Request { sequence, request }) = selecting.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Automation(owner))),
+        }) else {
+            panic!("selection must finish its foreground history request");
+        };
+        assert!(matches!(request, Request::History {
+            id: Some(actual), before: None, limit: PAGE,
+        } if actual == owner_id));
+        assert!(!selecting.show_lifecycle_receipt(id, 42, Ok(notice_page(id, 42))));
+        assert!(
+            matches!(selecting.pending, Some((actual, Pending::History { append: false })) if actual == sequence)
+        );
+        assert!(
+            selecting
+                .update(Action::Received {
+                    sequence,
+                    result: std::sync::Arc::new(Ok(Response::History(
+                        crate::automations::HistoryPage {
+                            firings: Vec::new(),
+                            next: None,
+                        }
+                    ))),
+                })
+                .is_none()
+        );
+        assert!(selecting.pending.is_none());
+        assert!(selecting.show_lifecycle_receipt(id, 42, Ok(notice_page(id, 42))));
+        // Existing AgentRun navigation still leaves the historical-only panel.
+        let run = crate::model::RunId::new();
+        assert!(
+            matches!(selecting.update(Action::InspectRun(run)),Some(Effect::Request{request:Request::ShowRun{run:actual},..}) if actual==run)
+        );
+        assert!(selecting.lifecycle_notice.is_none());
     }
 }
 pub fn state_label(state: crate::automations::FiringState) -> &'static str {

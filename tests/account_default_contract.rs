@@ -1,13 +1,23 @@
 #![cfg(all(feature = "host", target_os = "linux"))]
 
-//! Real CLI preference writes against one private daemon/profile, no providers.
+//! Private-daemon preference persistence and real CLI authority behavior, no providers.
+//!
+//! With inherited delegation the real CLI must refuse this unrelated daemon.
+//! A distinct explicit fixture User protocol client then tests persistence. Real
+//! CLI User success/output is exercised only with a genuinely nondelegated caller;
+//! the delegated lane never claims those CLI writes ran or substitutes authority.
 use cagents::{
-    account::registry::{Registry, Store},
+    account::{
+        preferences::DefaultSelection,
+        registry::{Registry, Store},
+    },
     agent::Provider,
     agent_execution::Authority,
     control::ControlClient,
     device_service::{Operation, Reply},
-    process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor},
+    process::{
+        CancellationToken, CommandSpec, ProcessExecutor, ProcessOutput, SystemProcessExecutor,
+    },
 };
 use std::{
     fs,
@@ -61,7 +71,10 @@ fn registry(client: &mut ControlClient) -> Result<Registry, String> {
 }
 
 #[test]
-fn cli_default_writes_are_persisted_and_visible_to_the_original_private_observer() {
+fn private_default_preferences_persist_and_cli_respects_inherited_authority() {
+    // Public equality selects the expected contract before any operation. Never
+    // catch an authentication failure and retry it with a different authority.
+    let delegated = Authority::from_environment() != Authority::default();
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
     let environment = private_environment(root);
@@ -107,12 +120,23 @@ fn cli_default_writes_are_persisted_and_visible_to_the_original_private_observer
             }
             thread::sleep(Duration::from_millis(10));
         };
+        // This client is an explicit synthetic fixture User, not the delegated
+        // CLI caller. No environment variable or issued capability is changed.
         observer
-            .authenticate(Authority::from_environment())
+            .authenticate(Authority::default())
             .map_err(|error| error.to_string())?;
         let original_proof = observer.proof().clone();
         let before = registry(&mut observer)?;
-        let cli = |choice: &str| -> Result<serde_json::Value, String> {
+        let store_path = root.join("config").join(cagents::instance::STORAGE_NAME);
+        let store = Store::at(store_path.clone());
+        let disk_bytes = || -> Result<Option<Vec<u8>>, String> {
+            match fs::read(store_path.join("accounts.toml")) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error.to_string()),
+            }
+        };
+        let cli = |choice: &str| -> Result<ProcessOutput, String> {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err("private CLI deadline expired".into());
@@ -136,26 +160,118 @@ fn cli_default_writes_are_persisted_and_visible_to_the_original_private_observer
             for (name, path) in &environment {
                 spec = spec.env(*name, path);
             }
-            let output = SystemProcessExecutor
+            SystemProcessExecutor
                 .execute(&spec, &CancellationToken::new())
-                .and_then(|output| output.require_success(executable))
-                .map_err(|error| error.to_string())?;
-            serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())
         };
-        let explicit_reply = cli("claude/system")?;
-        let explicit = registry(&mut observer)?;
-        let store = Store::at(root.join("config").join(cagents::instance::STORAGE_NAME));
-        let explicit_disk = store.load().map_err(|error| error.to_string())?;
-        let automatic_reply = cli("automatic")?;
-        let automatic = registry(&mut observer)?;
-        let automatic_disk = store.load().map_err(|error| error.to_string())?;
+        if delegated {
+            let original_disk_bytes = disk_bytes()?;
+            for choice in ["claude/system", "automatic"] {
+                let output = cli(choice)?;
+                if output.success
+                    || output.exit_code != Some(1)
+                    || output.signal.is_some()
+                    || !output.stdout.is_empty()
+                {
+                    return Err("delegated CLI did not exit with its expected refusal".into());
+                }
+                let error: serde_json::Value = serde_json::from_slice(&output.stderr)
+                    .map_err(|_| "delegated CLI did not return structured error JSON")?;
+                let expected_message = "daemon rejected the request (PermissionDenied): This agent session authority is no longer registered";
+                if error["ok"] != false
+                    || error["error"]["kind"] != "protocol"
+                    || error["error"]["details"]
+                        != serde_json::json!({"code":"permission_denied", "retryable":false})
+                    || error["error"]["message"] != expected_message
+                {
+                    return Err(
+                        "delegated CLI did not report the precise foreign-authority denial".into(),
+                    );
+                }
+                // Check after EACH refused invocation, before any fixture User
+                // write. Matching logical state alone would miss a disk rewrite.
+                if registry(&mut observer)? != before
+                    || store.load().map_err(|error| error.to_string())? != before
+                    || disk_bytes()? != original_disk_bytes
+                    || observer.proof() != &original_proof
+                {
+                    return Err(
+                        "delegated CLI refusal changed the private registry or proof".into(),
+                    );
+                }
+            }
+            eprintln!(
+                "coverage: both inherited CLI writes denied unchanged; real CLI User success UNEXECUTED; explicit fixture User RPC persistence follows"
+            );
+        } else {
+            eprintln!(
+                "coverage lane: genuinely nondelegated real CLI User writes and output checks"
+            );
+        }
+        // A separate fixture User connection is used only in the declared RPC
+        // lane. It never authenticates the CLI or registers its inherited token.
+        let mut fixture_user = if delegated {
+            let mut client = ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+            client
+                .authenticate(Authority::default())
+                .map_err(|error| error.to_string())?;
+            if client.proof() != &original_proof {
+                return Err("fixture User connected to a different private daemon".into());
+            }
+            Some(client)
+        } else {
+            None
+        };
+        let mut cli_replies = Vec::new();
+        let mut saved = Vec::new();
+        let mut expected_revision = before.revision();
+        for choice in ["claude/system", "automatic"] {
+            let rpc_saved = if let Some(client) = fixture_user.as_mut() {
+                let selection: DefaultSelection = choice.parse()?;
+                let Reply::AccountRegistry(value) = client
+                    .device_operation(Operation::AccountDefault {
+                        expected_revision,
+                        provider: Provider::Claude,
+                        selection,
+                    })
+                    .map_err(|error| error.to_string())?
+                else {
+                    return Err("unexpected fixture User preference response".into());
+                };
+                Some(serde_json::from_value::<Registry>(value).map_err(|error| error.to_string())?)
+            } else {
+                let output = cli(choice)?
+                    .require_success(Path::new(env!("CARGO_BIN_EXE_cagents")))
+                    .map_err(|error| error.to_string())?;
+                cli_replies.push(
+                    serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                        .map_err(|error| error.to_string())?,
+                );
+                None
+            };
+            let observed = registry(&mut observer)?;
+            let disk = store.load().map_err(|error| error.to_string())?;
+            if expected_revision.checked_add(1) != Some(observed.revision())
+                || observed != disk
+                || rpc_saved.as_ref().is_some_and(|reply| reply != &observed)
+                || observer.proof() != &original_proof
+                || fixture_user
+                    .as_ref()
+                    .is_some_and(|client| client.proof() != &original_proof)
+            {
+                return Err("private preference write lost its exact revision, persistence or original proof".into());
+            }
+            expected_revision = observed.revision();
+            saved.push((observed, disk));
+        }
+        let (automatic, automatic_disk) = saved.pop().unwrap();
+        let (explicit, explicit_disk) = saved.pop().unwrap();
         let proof_unchanged = observer.proof() == &original_proof;
         Ok((
             before,
-            explicit_reply,
+            cli_replies,
             explicit,
             explicit_disk,
-            automatic_reply,
             automatic,
             automatic_disk,
             proof_unchanged,
@@ -164,16 +280,8 @@ fn cli_default_writes_are_persisted_and_visible_to_the_original_private_observer
     // Close the original observer and reap the original daemon before asserting.
     // The outer queue guardian separately verifies full descendant settlement.
     drop(daemon);
-    let (
-        before,
-        explicit_reply,
-        explicit,
-        explicit_disk,
-        automatic_reply,
-        automatic,
-        automatic_disk,
-        proof_unchanged,
-    ) = observations.unwrap();
+    let (before, cli_replies, explicit, explicit_disk, automatic, automatic_disk, proof_unchanged) =
+        observations.unwrap();
     assert!(before.automatic(Provider::Claude));
     assert!(!explicit.automatic(Provider::Claude));
     assert_eq!(
@@ -190,10 +298,14 @@ fn cli_default_writes_are_persisted_and_visible_to_the_original_private_observer
     assert_eq!(automatic, automatic_disk);
     assert!(automatic.registered().is_empty());
     assert!(proof_unchanged);
-    for (reply, choice, revision) in [
-        (explicit_reply, "claude/system", explicit.revision()),
-        (automatic_reply, "automatic", automatic.revision()),
-    ] {
+    assert_eq!(cli_replies.len(), if delegated { 0 } else { 2 });
+    // Only actual successful CLI stdout enters this vector; RPC replies are
+    // checked as Registry values above and never dressed up as CLI JSON.
+    for (reply, (choice, revision)) in cli_replies.into_iter().zip([
+        ("claude/system", explicit.revision()),
+        ("automatic", automatic.revision()),
+    ]) {
+        assert_eq!(reply["ok"], true);
         assert_eq!(reply["command"], "account.default");
         assert_eq!(
             reply["data"],

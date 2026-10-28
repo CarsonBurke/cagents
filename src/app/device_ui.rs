@@ -23,6 +23,7 @@ pub(super) fn supports_sidebar_action(action: &SidebarAction) -> bool {
             }
             | SidebarAction::SearchChanged(_)
             | SidebarAction::SetFilter(_)
+            | SidebarAction::HideReadAttention
             | SidebarAction::ToggleControls
             | SidebarAction::OpenFirstSearchResult
             | SidebarAction::FocusFirstSearchResult
@@ -1865,6 +1866,7 @@ mod tests {
             SidebarAction::SearchChanged("project".into()),
             SidebarAction::SearchChanged(String::new()),
             SidebarAction::SetFilter(sidebar::SidebarFilter::Attention),
+            SidebarAction::HideReadAttention,
             SidebarAction::ToggleControls,
             SidebarAction::FocusFirstSearchResult,
             SidebarAction::OpenFirstSearchResult,

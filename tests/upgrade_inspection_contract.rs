@@ -1,8 +1,11 @@
 #![cfg(all(feature = "host", target_os = "linux"))]
 //! Actual matched source inspection and daemon handoff in one private profile.
+//! The upgrade is driven by an explicit synthetic fixture User protocol client,
+//! not a CLI User execution. Inherited delegation is separately proved refused
+//! by the unrelated private daemon before the fixture User starts any terminal.
 use cagents::{
     agent_execution::Authority,
-    control::ControlClient,
+    control::{ControlClient, ControlError},
     model::{
         CardId, CardKind, CardState, Existence, Exposure, LaunchRecipe, Residency, TerminalId,
         WorkspaceState,
@@ -10,7 +13,7 @@ use cagents::{
     persistence::{SnapshotBase, StateStore},
     process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor},
     terminal::TerminalSpawnOptions,
-    terminal_ipc::TerminalDescriptor,
+    terminal_ipc::{ProtocolErrorCode, TerminalDescriptor},
 };
 use std::{
     collections::BTreeMap,
@@ -66,10 +69,7 @@ fn connected(
     deadline: Instant,
 ) -> Result<ControlClient, String> {
     loop {
-        if let Ok(mut client) = ControlClient::connect(socket) {
-            client
-                .authenticate(Authority::from_environment())
-                .map_err(|e| e.to_string())?;
+        if let Ok(client) = ControlClient::connect(socket) {
             return Ok(client);
         }
         if daemon.0.try_wait().map_err(|e| e.to_string())?.is_some() {
@@ -80,6 +80,19 @@ fn connected(
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+fn fixture_user_connected(
+    socket: &Path,
+    daemon: &mut ChildOwner,
+    deadline: Instant,
+) -> Result<ControlClient, String> {
+    // A distinct, explicitly declared fixture User connection. This never
+    // changes the environment or retries a refused delegated connection.
+    let mut client = connected(socket, daemon, deadline)?;
+    client
+        .authenticate(Authority::default())
+        .map_err(|e| e.to_string())?;
+    Ok(client)
 }
 fn inspect(
     root: &Path,
@@ -172,10 +185,14 @@ fn live(fd: &OwnedFd) -> bool {
 #[test]
 fn actual_same_generation_inspection_and_upgrade_keep_the_original_saved_pty() {
     const CHILD: &str = "CAGENTS_UPGRADE_INSPECTION_FIXTURE";
+    const SCOPE: &str = "CAGENTS_UPGRADE_INSPECTION_AUTHORITY_PRESENCE";
+    // Select the contract before operations, using only public equality. Never
+    // print, copy, remove or replace an inherited session capability.
+    let delegated = Authority::from_environment() != Authority::default();
     if std::env::var(CHILD).as_deref() != Ok("private-child") {
         let root = tempfile::Builder::new()
-            .prefix("upgrade-inspect-")
-            .tempdir_in("/var/tmp")
+            .prefix("up-")
+            .tempdir()
             .unwrap()
             .keep();
         let mut spec = CommandSpec::new(std::env::current_exe().unwrap())
@@ -186,6 +203,7 @@ fn actual_same_generation_inspection_and_upgrade_keep_the_original_saved_pty() {
                 "--test-threads=1",
             ])
             .env(CHILD, "private-child")
+            .env(SCOPE, if delegated { "present" } else { "absent" })
             .env("CAGENTS_UPGRADE_INSPECTION_ROOT", &root)
             .env("PATH", "/usr/bin:/bin")
             .env("SHELL", "/bin/sh")
@@ -206,16 +224,30 @@ fn actual_same_generation_inspection_and_upgrade_keep_the_original_saved_pty() {
             spec = spec.env(key, path);
         }
         // Inherited delegation stays intact; only this child receives the private profile.
-        let output = SystemProcessExecutor
-            .execute(&spec, &CancellationToken::new())
-            .unwrap();
-        fs::write(root.join("stdout.log"), &output.stdout).unwrap();
-        fs::write(root.join("stderr.log"), &output.stderr).unwrap();
+        let result = SystemProcessExecutor.execute(&spec, &CancellationToken::new());
+        let (stdout, stderr) = match &result {
+            Ok(output) => (&output.stdout, &output.stderr),
+            Err(failure) => (&failure.stdout, &failure.stderr),
+        };
+        // Preserve bounded raw child output even on timeout/spawn failure,
+        // before either executor or nonzero-exit assertion can unwind.
+        fs::write(root.join("stdout.log"), stdout).unwrap();
+        fs::write(root.join("stderr.log"), stderr).unwrap();
+        let output = result.unwrap();
         let output = output.require_success(&spec.program).unwrap();
         let text = String::from_utf8_lossy(&output.stdout);
         assert!(text.contains("running 1 test") && text.contains("1 passed; 0 failed; 0 ignored"));
         return;
     }
+    let expected_scope = match std::env::var(SCOPE).as_deref() {
+        Ok("present") => true,
+        Ok("absent") => false,
+        _ => panic!("missing or invalid inherited authority presence marker"),
+    };
+    assert_eq!(
+        delegated, expected_scope,
+        "private fixture child changed inherited authority scope"
+    );
     let root = PathBuf::from(std::env::var_os("CAGENTS_UPGRADE_INSPECTION_ROOT").unwrap());
     let deadline = Instant::now() + Duration::from_secs(65);
     let socket = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap())
@@ -224,7 +256,41 @@ fn actual_same_generation_inspection_and_upgrade_keep_the_original_saved_pty() {
     let mut source = daemon(&root, "source.log").unwrap();
     let mut successor = None;
     let outcome = (|| -> Result<_, String> {
-        let mut client = connected(&socket, &mut source, deadline)?;
+        // Observe the empty private daemon independently of the inherited
+        // caller. No terminal or saved workspace exists before this check.
+        let mut observer = fixture_user_connected(&socket, &mut source, deadline)?;
+        let before = observer.list().map_err(|e| e.to_string())?;
+        assert!(before.is_empty());
+        let observer_proof = observer.proof().clone();
+        if delegated {
+            let mut inherited = connected(&socket, &mut source, deadline)?;
+            let refusal = inherited.authenticate(Authority::from_environment());
+            assert!(
+                matches!(
+                    refusal,
+                    Err(ControlError::Remote {
+                        code: ProtocolErrorCode::PermissionDenied,
+                        ref message,
+                        retryable: false,
+                    }) if message == "This agent session authority is no longer registered"
+                ),
+                "unrelated private daemon must precisely refuse inherited delegation"
+            );
+            drop(inherited); // Never retry this connection as User.
+            assert_eq!(observer.list().map_err(|e| e.to_string())?, before);
+            assert_eq!(observer.proof(), &observer_proof);
+            assert!(!root.join("shell.pid").exists());
+            eprintln!(
+                "coverage: inherited authority precisely refused with unchanged empty terminal inventory/proof; subsequent upgrade uses separate explicit fixture User RPC, not CLI User execution"
+            );
+        } else {
+            eprintln!(
+                "coverage: genuinely nondelegated environment; upgrade still uses explicit fixture User RPC, not CLI execution"
+            );
+        }
+        drop(observer);
+        let mut client = fixture_user_connected(&socket, &mut source, deadline)?;
+        assert_eq!(client.proof(), &observer_proof);
         let original_proof = client.proof().clone();
         let pid_path = root.join("shell.pid");
         let recipe=LaunchRecipe {
@@ -244,7 +310,7 @@ fn actual_same_generation_inspection_and_upgrade_keep_the_original_saved_pty() {
             .map_err(|e| e.to_string())?
             .session;
         drop(client); // Inventory uses a fresh connection, not the spawn subscriber.
-        let mut client = connected(&socket, &mut source, deadline)?;
+        let mut client = fixture_user_connected(&socket, &mut source, deadline)?;
         while !pid_path.exists() {
             if Instant::now() >= deadline {
                 return Err("shell PID evidence missing".into());
@@ -387,7 +453,7 @@ fn actual_same_generation_inspection_and_upgrade_keep_the_original_saved_pty() {
             )
             .map_err(|e| e.to_string())?;
         drop(client);
-        let mut client = connected(&socket, &mut source, deadline)?;
+        let mut client = fixture_user_connected(&socket, &mut source, deadline)?;
         let capability = client
             .shutdown_preflight()
             .map_err(|e| e.to_string())?
@@ -403,7 +469,7 @@ fn actual_same_generation_inspection_and_upgrade_keep_the_original_saved_pty() {
             return Err("original shell exited during upgrade".into());
         }
         successor = Some(daemon(&root, "successor.log")?);
-        let mut client = connected(&socket, successor.as_mut().unwrap(), deadline)?;
+        let mut client = fixture_user_connected(&socket, successor.as_mut().unwrap(), deadline)?;
         let new_proof = client.proof().clone();
         let inventory = client.list().map_err(|e| e.to_string())?;
         let restored = inventory

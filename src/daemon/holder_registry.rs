@@ -319,7 +319,7 @@ impl Record {
 
     fn supported_version(&self) -> bool {
         match self.kind {
-            Kind::Terminal => matches!(self.version, 3 | 4),
+            Kind::Terminal => matches!(self.version, 3 | 4 | 5),
             Kind::Native => matches!(self.version, 2 | 3 | 4),
         }
     }
@@ -933,6 +933,37 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn terminal_directory_pin_protocol_is_discovered_but_future_evidence_is_preserved() {
+        let directory = tempfile::tempdir().unwrap();
+        for version in [3, 4, 5] {
+            let mut terminal = record();
+            terminal.version = version;
+            terminal.create(directory.path()).unwrap();
+            assert_eq!(
+                evidence(&socket(directory.path(), terminal.terminal), Kind::Terminal).unwrap(),
+                Some(terminal.clone())
+            );
+            assert_eq!(
+                discover(directory.path(), &terminal.boot, Kind::Terminal).unwrap(),
+                vec![terminal.clone()]
+            );
+            terminal.remove(directory.path());
+        }
+
+        let mut future = record();
+        future.version = 6;
+        future.create(directory.path()).unwrap();
+        let before = fs::read(future.path(directory.path())).unwrap();
+        assert!(evidence(&socket(directory.path(), future.terminal), Kind::Terminal).is_err());
+        assert!(
+            discover(directory.path(), &future.boot, Kind::Terminal)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read(future.path(directory.path())).unwrap(), before);
     }
 
     #[test]

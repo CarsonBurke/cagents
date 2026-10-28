@@ -92,6 +92,7 @@ icons! {
         ExpandAll => "expand-all",
         ExpandDown => "expand-down",
         ExpandUp => "expand-up",
+        Hide => "hide",
         History => "history",
         Info => "info",
         InsertText => "insert-text",

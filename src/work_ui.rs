@@ -19,8 +19,7 @@ use crate::{
     model::TerminalId,
     ui_controls::{Icon, badge, icon_button, placeholder, popover, popover_item},
     work::{
-        ActivitySource, Board, CheckOutcome, Column, Forge, Item, ItemKey, PullRequestState,
-        Review,
+        ActivitySource, Board, CheckOutcome, Column, Forge, Item, ItemKey, PullRequestState, Review,
     },
 };
 
@@ -324,7 +323,11 @@ impl State {
         self.board
             .iter()
             .flat_map(|board| board.items.iter().zip(&self.search))
-            .filter(move |(item, _)| self.scope.as_ref().is_none_or(|scope| item.project == *scope))
+            .filter(move |(item, _)| {
+                self.scope
+                    .as_ref()
+                    .is_none_or(|scope| item.project == *scope)
+            })
             .filter(move |(_, text)| text.contains(query.as_str()))
             .map(|(item, _)| item)
     }
@@ -339,7 +342,9 @@ impl State {
             None => self.waiting(),
             Some(board) if board.projects.is_empty() => placeholder("No Git projects are open")
                 .icon(Icon::Branch.handle())
-                .detail("Open a Git project and its worktrees, branches and pull requests appear here.")
+                .detail(
+                    "Open a Git project and its worktrees, branches and pull requests appear here.",
+                )
                 .into(),
             Some(_) => match self.layout {
                 Layout::Board => self.board_view(width),
@@ -409,7 +414,10 @@ impl State {
         let toolbar = widget::row::with_children(vec![
             design::title("Work").into(),
             self.scope_picker(),
-            widget::container(search).max_width(360).width(Length::Fill).into(),
+            widget::container(search)
+                .max_width(360)
+                .width(Length::Fill)
+                .into(),
             widget::Space::new().width(Length::Fill).into(),
             layout,
             refresh,
@@ -512,17 +520,24 @@ impl State {
         if let Some(error) = &self.error {
             parts.push(warning(error.clone()));
         }
-        let projects = board
-            .projects
-            .iter()
-            .filter(|project| self.scope.as_ref().is_none_or(|scope| project.repository == *scope));
+        let projects = board.projects.iter().filter(|project| {
+            self.scope
+                .as_ref()
+                .is_none_or(|scope| project.repository == *scope)
+        });
         for project in projects {
             if let Some(error) = &project.scan_error {
-                parts.push(warning(format!("{} could not be read: {error}", project.name)));
+                parts.push(warning(format!(
+                    "{} could not be read: {error}",
+                    project.name
+                )));
             }
             match &project.forge {
                 Forge::Unavailable { reason } => {
-                    parts.push(warning(format!("{}: GitHub unavailable: {reason}", project.name)));
+                    parts.push(warning(format!(
+                        "{}: GitHub unavailable: {reason}",
+                        project.name
+                    )));
                 }
                 Forge::Synced {
                     error: Some(error), ..
@@ -534,7 +549,9 @@ impl State {
             }
         }
         if let Some(reason) = &board.linear_unavailable {
-            parts.push(warning(format!("Linear tickets could not be looked up: {reason}")));
+            parts.push(warning(format!(
+                "Linear tickets could not be looked up: {reason}"
+            )));
         }
         Some(
             widget::row::with_children(parts)
@@ -580,7 +597,12 @@ impl State {
         }
     }
 
-    fn lane<'a>(&'a self, column: Column, items: Vec<&'a Item>, width: Length) -> Element<'a, Action> {
+    fn lane<'a>(
+        &'a self,
+        column: Column,
+        items: Vec<&'a Item>,
+        width: Length,
+    ) -> Element<'a, Action> {
         let header = widget::row::with_children(vec![
             widget::container(widget::Space::new().width(8).height(8))
                 .class(dot(column_tone(column)))
@@ -604,12 +626,17 @@ impl State {
         } else {
             widget::scrollable(
                 widget::column::with_children(
-                    items.into_iter().map(|item| self.card(item)).collect::<Vec<_>>(),
+                    items
+                        .into_iter()
+                        .map(|item| self.card(item))
+                        .collect::<Vec<_>>(),
                 )
                 .spacing(space::S)
                 .padding(design::with_vertical_rail(Padding::from([0.0, space::XS]))),
             )
-            .direction(iced::widget::scrollable::Direction::Vertical(design::scrollbar()))
+            .direction(iced::widget::scrollable::Direction::Vertical(
+                design::scrollbar(),
+            ))
             .height(Length::Fill)
             .into()
         };
@@ -621,21 +648,33 @@ impl State {
         .padding(Padding::from([space::XS, 0.0, space::XS, space::XS]))
         .width(width)
         .height(Length::Fill)
-        .class(design::surface(Some(lane_fill), [design::RADIUS_M; 4], false))
+        .class(design::surface(
+            Some(lane_fill),
+            [design::RADIUS_M; 4],
+            false,
+        ))
         .into()
     }
 
     fn list_view(&self) -> Element<'_, Action> {
-        let rows = self.visible().map(|item| self.row(item)).collect::<Vec<_>>();
+        let rows = self
+            .visible()
+            .map(|item| self.row(item))
+            .collect::<Vec<_>>();
         if rows.is_empty() {
             return self.no_match();
         }
         widget::scrollable(
             widget::column::with_children(rows)
                 .spacing(space::XS)
-                .padding(design::with_vertical_rail(Padding::from([space::M, space::L]))),
+                .padding(design::with_vertical_rail(Padding::from([
+                    space::M,
+                    space::L,
+                ]))),
         )
-        .direction(iced::widget::scrollable::Direction::Vertical(design::scrollbar()))
+        .direction(iced::widget::scrollable::Direction::Vertical(
+            design::scrollbar(),
+        ))
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
@@ -650,7 +689,10 @@ impl State {
         } else {
             placeholder("No cards match")
                 .icon(Icon::Search.handle())
-                .detail(format!("Nothing in scope mentions “{}”.", self.query.trim()))
+                .detail(format!(
+                    "Nothing in scope mentions “{}”.",
+                    self.query.trim()
+                ))
                 .into()
         }
     }
@@ -669,12 +711,10 @@ impl State {
                 .into(),
         ];
         if item.pinned {
-            top.push(
-                crate::interaction::tooltip(
-                    widget::icon(Icon::Lock.handle()).size(design::COMPACT_ICON_SIZE),
-                    format!("Pinned; its state says {}", item.derived.label()),
-                ),
-            );
+            top.push(crate::interaction::tooltip(
+                widget::icon(Icon::Lock.handle()).size(design::COMPACT_ICON_SIZE),
+                format!("Pinned; its state says {}", item.derived.label()),
+            ));
         }
         top.push(self.card_menu(item, &card));
         let mut lines = vec![
@@ -742,7 +782,10 @@ impl State {
         } else {
             title.push(widget::Space::new().width(Length::Fill).into());
         }
-        title.push(badge(item.column.label(), Tone::Themed(column_tone(item.column))));
+        title.push(badge(
+            item.column.label(),
+            Tone::Themed(column_tone(item.column)),
+        ));
         title.push(
             widget::container(
                 design::caption(age(self.now_unix_ms, activity_at(item), false))
@@ -784,12 +827,13 @@ impl State {
             );
         }
         let selected = self.menu.as_ref() == Some(&card);
-        let button = widget::button::custom(widget::column::with_children(lines).spacing(space::XS))
-            .name(format!("Open {}", item.label()))
-            .class(card_style(selected))
-            .padding([space::XS + space::XXS, space::S])
-            .width(Length::Fill)
-            .on_press(Action::Open(card.clone()));
+        let button =
+            widget::button::custom(widget::column::with_children(lines).spacing(space::XS))
+                .name(format!("Open {}", item.label()))
+                .class(card_style(selected))
+                .padding([space::XS + space::XXS, space::S])
+                .width(Length::Fill)
+                .on_press(Action::Open(card.clone()));
         widget::mouse_area(crate::interaction::hover(button))
             .on_right_press(Action::Menu(Some(card)))
             .into()
@@ -799,7 +843,10 @@ impl State {
     fn facts<'a>(&'a self, item: &'a Item) -> Vec<Element<'a, Action>> {
         let mut facts = Vec::new();
         if self.scope.is_none() {
-            facts.push(badge(item.project_name.as_str(), Tone::Themed(design::muted_color)));
+            facts.push(badge(
+                item.project_name.as_str(),
+                Tone::Themed(design::muted_color),
+            ));
         }
         if let Some(pull_request) = &item.pull_request {
             let (label, tone): (&str, Toned) = match (pull_request.state, pull_request.draft) {
@@ -813,15 +860,17 @@ impl State {
                 if let Some((label, tone)) = pull_request.checks.and_then(|checks| {
                     checks.outcome().map(|outcome| -> (String, Toned) {
                         match outcome {
-                        CheckOutcome::Passing => {
-                            (format!("✓ {}", checks.passed), design::success_color)
-                        }
-                        CheckOutcome::Pending => {
-                            (format!("● {} running", checks.pending), design::warning_color)
-                        }
-                        CheckOutcome::Failing => {
-                            (format!("✕ {} failing", checks.failed), design::destructive_color)
-                        }
+                            CheckOutcome::Passing => {
+                                (format!("✓ {}", checks.passed), design::success_color)
+                            }
+                            CheckOutcome::Pending => (
+                                format!("● {} running", checks.pending),
+                                design::warning_color,
+                            ),
+                            CheckOutcome::Failing => (
+                                format!("✕ {} failing", checks.failed),
+                                design::destructive_color,
+                            ),
                         }
                     })
                 }) {
@@ -830,7 +879,9 @@ impl State {
                 if let Some(review) = pull_request.review {
                     let (label, tone): (&str, Toned) = match review {
                         Review::Approved => ("Approved", design::success_color),
-                        Review::ChangesRequested => ("Changes requested", design::destructive_color),
+                        Review::ChangesRequested => {
+                            ("Changes requested", design::destructive_color)
+                        }
                         Review::Required => ("Review required", design::muted_color),
                     };
                     facts.push(badge(label, Tone::Themed(tone)));
@@ -881,7 +932,10 @@ impl State {
             }
             if dirty.paths > 0 {
                 facts.push(crate::interaction::tooltip(
-                    badge(format!("{} changed", dirty.paths), Tone::Themed(design::warning_color)),
+                    badge(
+                        format!("{} changed", dirty.paths),
+                        Tone::Themed(design::warning_color),
+                    ),
                     "Uncommitted changes in the worktree",
                 ));
             }
@@ -915,9 +969,10 @@ impl State {
                     }
                 };
                 let label = session.title.clone().unwrap_or_else(|| {
-                    session
-                        .provider
-                        .map_or_else(|| "Terminal".to_owned(), |provider| provider.label().to_owned())
+                    session.provider.map_or_else(
+                        || "Terminal".to_owned(),
+                        |provider| provider.label().to_owned(),
+                    )
                 });
                 let state = match session.state {
                     ActivityState::Working => "working",
@@ -936,18 +991,16 @@ impl State {
             .collect::<Vec<_>>();
         parts.push(widget::Space::new().width(Length::Fill).into());
         if let Some(activity) = &item.last_activity {
-            parts.push(
-                crate::interaction::tooltip(
-                    design::caption(format!(
-                        "{} {}",
-                        activity_label(activity.source),
-                        age(self.now_unix_ms, activity.at_unix_ms, true)
-                    ))
-                    .class(cosmic::theme::Text::Custom(design::muted_text))
-                    .wrapping(iced::widget::text::Wrapping::None),
-                    local_time(activity.at_unix_ms),
-                ),
-            );
+            parts.push(crate::interaction::tooltip(
+                design::caption(format!(
+                    "{} {}",
+                    activity_label(activity.source),
+                    age(self.now_unix_ms, activity.at_unix_ms, true)
+                ))
+                .class(cosmic::theme::Text::Custom(design::muted_text))
+                .wrapping(iced::widget::text::Wrapping::None),
+                local_time(activity.at_unix_ms),
+            ));
         }
         widget::row::with_children(parts)
             .spacing(space::XXS)
@@ -1022,7 +1075,11 @@ impl State {
                 };
                 items.push(
                     popover_item(
-                        if current { Icon::Check.handle() } else { Icon::Board.handle() },
+                        if current {
+                            Icon::Check.handle()
+                        } else {
+                            Icon::Board.handle()
+                        },
                         column.label(),
                         description,
                         Action::Pin(card.clone(), Some(column)),
@@ -1097,7 +1154,11 @@ fn column_tone(column: Column) -> Toned {
 
 /// Merged work reads as done, apart from work under review.
 fn merged_color(theme: &Theme) -> iced::Color {
-    design::mix(design::accent_color(theme), design::success_color(theme), 0.5)
+    design::mix(
+        design::accent_color(theme),
+        design::success_color(theme),
+        0.5,
+    )
 }
 
 fn empty_lane(column: Column) -> &'static str {
@@ -1133,9 +1194,12 @@ fn status_glyph<'a>(item: &Item) -> Element<'a, Action> {
         .iter()
         .any(|session| session.state == ActivityState::Working)
     {
-        return widget::container(crate::ui_controls::activity_spinner(12.0, design::accent_color))
-            .center(Length::Fixed(f32::from(design::ROW_ICON_SIZE)))
-            .into();
+        return widget::container(crate::ui_controls::activity_spinner(
+            12.0,
+            design::accent_color,
+        ))
+        .center(Length::Fixed(f32::from(design::ROW_ICON_SIZE)))
+        .into();
     }
     if item
         .sessions
@@ -1256,7 +1320,13 @@ pub fn age(now_unix_ms: u64, at_unix_ms: u64, suffix: bool) -> String {
     }
     let seconds = now_unix_ms.saturating_sub(at_unix_ms) / 1000;
     let compact = match seconds {
-        0..60 => return if suffix { "just now".to_owned() } else { "now".to_owned() },
+        0..60 => {
+            return if suffix {
+                "just now".to_owned()
+            } else {
+                "now".to_owned()
+            };
+        }
         60..3_600 => format!("{}m", seconds / 60),
         3_600..86_400 => format!("{}h", seconds / 3_600),
         86_400..1_209_600 => format!("{}d", seconds / 86_400),
@@ -1363,7 +1433,10 @@ mod tests {
         let mut state = State::default();
         connected(&mut state, 2, board(vec![item("new", "cagents")]));
         watched(&mut state, 1, board(vec![item("old", "cagents")]));
-        assert_eq!(state.visible().map(Item::label).collect::<Vec<_>>(), ["new"]);
+        assert_eq!(
+            state.visible().map(Item::label).collect::<Vec<_>>(),
+            ["new"]
+        );
         // A new daemon starts its revisions over, whether or not this pane
         // saw the old connection fail.
         connected(&mut state, 1, board(vec![item("restarted", "cagents")]));
@@ -1395,12 +1468,18 @@ mod tests {
             board(vec![item("feat/board", "cagents"), reviewed]),
         );
         state.update(Action::Query("REDIRECT".into()));
-        assert_eq!(state.visible().map(Item::label).collect::<Vec<_>>(), ["fix/login"]);
+        assert_eq!(
+            state.visible().map(Item::label).collect::<Vec<_>>(),
+            ["fix/login"]
+        );
         state.update(Action::Query("#42".into()));
         assert_eq!(state.visible().count(), 1);
         state.update(Action::Query(String::new()));
         state.update(Action::Scope(Some(PathBuf::from("/repos/cagents/.git"))));
-        assert_eq!(state.visible().map(Item::label).collect::<Vec<_>>(), ["feat/board"]);
+        assert_eq!(
+            state.visible().map(Item::label).collect::<Vec<_>>(),
+            ["feat/board"]
+        );
         watched(&mut state, 2, board(vec![item("fix/login", "redact")]));
         assert_eq!(state.scope, None);
     }
@@ -1428,7 +1507,9 @@ mod tests {
         watched(&mut state, 1, board(vec![item("feat/board", "cagents")]));
         let card = CardRef::of(&state.board.as_ref().unwrap().items[0]);
         state.update(Action::Pin(card.clone(), Some(Column::Stale)));
-        state.update(Action::Pinned(Err("the Work board store is unavailable".into())));
+        state.update(Action::Pinned(Err(
+            "the Work board store is unavailable".into()
+        )));
         let shown = state.item(&card).unwrap();
         assert_eq!((shown.column, shown.pinned), (Column::InProgress, false));
         assert!(state.error.is_some());
@@ -1455,6 +1536,9 @@ mod tests {
         assert_eq!(age(10 * minute, 10 * minute - 1_000, false), "now");
         assert_eq!(age(10 * minute, 5 * minute, true), "5m ago");
         assert_eq!(age(3 * 60 * minute, 0, false), "—");
-        assert_eq!(age(30 * 24 * 60 * minute, 27 * 24 * 60 * minute, false), "3d");
+        assert_eq!(
+            age(30 * 24 * 60 * minute, 27 * 24 * 60 * minute, false),
+            "3d"
+        );
     }
 }

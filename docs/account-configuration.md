@@ -148,6 +148,43 @@ Provider references checked against the installed CLI versions:
 - [Claude user-scoped MCP configuration](https://code.claude.com/docs/en/mcp)
 - [Codex 0.157.1 keyring storage implementation](https://github.com/openai/codex/blob/rust-v0.157.1/codex-rs/login/src/auth/storage.rs)
 
+## Registering an existing account home from the CLI
+
+Link one existing Claude or Codex home on the selected device:
+
+```sh
+cagents --device local account link codex '/absolute/path/to/selected-codex-home'
+cagents --device fw16 account link codex '~/account-homes/selected-codex'
+```
+
+The path belongs to the selected device. Quote `~/...` for remote homes so
+your local shell does not expand it. The daemon validates that the directory
+belongs to its user and reserves it against conflicting live activity. This
+registers the existing home without copying files, modifying configuration,
+changing defaults or replacing another account. Omp manages its own logins.
+Hosted agent credentials cannot authorize account lifecycle changes.
+
+The result reports **registered**. Authentication and execution readiness are
+explicitly **not checked**, including for a credential-only home with no
+`config.toml`. Use the returned account ID on the same device to ask its
+official provider CLI for its current identity and usage:
+
+```sh
+cagents --device fw16 account info --account codex/ACCOUNT-UUID --refresh
+```
+
+Check that the observed provider identity matches the intended account before
+selecting it for work. A successful identity/usage probe does not establish
+workspace write access, network access, or GitHub/cagents availability. Keep
+the intended execution configuration separate from authentication and verify
+those capabilities in the actual coding session; linking never grants them.
+
+This command links a home already present at the destination. Cross-device
+credential transfer and browser-session import are not implemented by this
+command. Use the provider's supported sign-in flow on the destination when
+needed. If a reply is lost or unclear, inspect `account list` on the same
+device before retrying; linking does not automatically retry.
+
 ## Removing a linked account registration
 
 Use the stable account ID from `cagents account list` on the selected device:

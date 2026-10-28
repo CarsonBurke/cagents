@@ -408,6 +408,43 @@ a proven **NotCreated** outcome permits a fresh attempt; **OutcomeUnknown**
 requires manual inspection. The Git ownership lock is held through the durable
 Created commit, and a failure to release it is reported rather than hidden.
 
+## Channel work
+
+Open a channel and choose **Work** beside **Conversations** to see the PRs
+tracked in that channel. Return to **Conversations** to use its terminals and
+chats. Changing this view keeps those sessions running.
+
+Use **Track PR…** to enter the forge host, repository and PR number, or type or
+paste a full PR URL into **Repository**. The URL stays editable while the host
+and number update. Editing the host or number switches to separate identity
+fields. Review the identity and choose the channel's role before submitting:
+
+| Role | Meaning |
+| --- | --- |
+| **Contributing** | Declared implementation work |
+| **Stewarding** | Responsibility for progressing the work |
+| **Review only** | Reviewing without claiming implementation |
+| **Reference** | Related context without claiming ownership |
+
+**Working on** groups contributions and stewardship. **Reviews and references**
+keeps related PRs separate. A channel can track several PRs, including PRs in
+different repositories or forks. Checking out a branch does not declare a
+contribution, and switching branches or removing a checkout does not move the
+channel's tracked work.
+
+PR observations show when they were last read. **Refresh** checks tracked PRs;
+an unavailable forge preserves the previous observation. Closed, merged and
+ended work remains in **History**. Confirm a fresh work role before an earlier
+contribution to a reopened PR counts as ongoing work again. A new review alone
+does not restart that contribution. Page counts describe only the loaded
+pages; use the current-page and history controls to browse further.
+
+**Change role** corrects a relation, and **End tracking** moves it to history.
+Leaving an edited tracking form offers **Keep editing** or **Discard draft**.
+Submitted changes continue independently of the view. If a result is
+unconfirmed, use **Check result** or **Retry original change**; retry preserves
+the original target, role and operation.
+
 ## Work board
 
 The Work board answers "what was I working on?" across every open project. The
@@ -589,12 +626,13 @@ stop until ownership is resolved. Removing the chosen account or replacing the
 target directory cannot silently redirect a future run to another account or
 directory. Closing a project pauses its schedules.
 
-**All run history** includes runs from removed definitions. It pages through
+**Run history** includes runs from removed definitions. It pages through
 their original names, times, outcomes, and bounded results. Opening history does
 not start or attach a provider. **Open agent** explicitly opens a still-live
-session; completed fresh sessions remain readable in history. Completion alerts
-open this exact run history and survive provider cleanup. Removing a definition
-prevents future runs and retains its past runs.
+session; completed fresh sessions remain readable in history. A completion alert
+opens its run under **Automations**, with a trail back to the list, and
+survives provider cleanup. Removing a definition prevents future runs and
+retains its past runs.
 
 The same operations are available without a window:
 
@@ -605,8 +643,24 @@ cagents automation enable AUTOMATION_ID --revision REVISION --confirm
 cagents automation run-now AUTOMATION_ID --execution-revision EXECUTION_REVISION --request-id REQUEST_UUID --confirm
 cagents automation history
 cagents automation history AUTOMATION_ID --limit 50
+cagents automation audit AUTOMATION_ID --limit 50
 cagents automation run FIRING_ID
 ```
+
+**Lifecycle** in the native automation details, or `automation audit`, lists
+committed management changes and system pause, block and recovery receipts.
+Each receipt identifies its exact revision, time, cause and actor class; these
+classes describe an admitted user management request or a system operation,
+not a person's identity. Run outcomes remain in **Run history**. Audit reads do
+not launch providers or change a schedule. The last 256 lifecycle receipts per
+automation are retained, including after removal; pages contain at most 100.
+Use the audit page's `next` value as `--before SEQUENCE` for an older page.
+Earlier unrecorded or expired events remain explicitly unavailable: their actor
+and cause cannot be recovered from the current enabled state. Prompt bodies,
+launch environment and provider diagnostics are excluded from these receipts.
+Hosted conversations can read only receipts committed in their own project.
+Moving a definition does not move its earlier audit receipts into the new
+project; management inspection retains the complete retained chain.
 
 Read both revisions from `show`. Reuse the same request UUID when retrying a
 manual request whose response was lost; a new UUID means a new run. History
@@ -756,11 +810,24 @@ or repeat an alert: desktop delivery and local persistence are not one transacti
   logical pixels; a terminal font size you already saved is kept.
 - Editor settings can override the terminal font family and size. **Ctrl+=**,
   **Ctrl+-**, and **Ctrl+0** zoom or reset the focused editor or terminal.
-- **Ctrl+F** finds in the open file, highlighting all matches. **Enter** and
-  **Shift+Enter** move forward and backward; replacement controls offer one
-  match or all matches.
+- **Ctrl+F** opens Find and focuses its query. Click the buffer to keep editing,
+  undoing and redoing with Find open; the match count updates without moving
+  your caret. **Enter** / **Shift+Enter** in the query and **F3** / **Shift+F3**
+  in the buffer move between matches. **Escape** closes Find and focuses the buffer.
+- Find offers **Aa** (match case), **Word** (whole words), and `.*` (regular
+  expressions). Invalid expressions show an inline error. **Selection** searches
+  only the selection captured when enabled. Matching preferences persist for
+  the user; the selection scope lasts only for this open strip. Editing or
+  undoing pauses a scoped search so it cannot replace text in a different
+  region. Select the new range and turn **Selection** off and on to resume.
+- Replace or Replace all uses the same matching options. Regular expressions
+  expand captures such as `$1`; plain replacements can **Preserve case** for
+  upper, lower and title case matches. Replace all is one undo step.
 - With a language server running, diagnostics appear in the gutter and under
-  the affected text. **Ctrl+Space** requests completion; arrow keys choose a
+  the affected text. They stay visible while you edit and follow inserted or
+  removed lines until the server publishes a new set. **F8** / **Shift+F8**
+  move to the next or previous diagnostic and show its message; the command
+  palette offers the same actions. **Ctrl+Space** requests completion; arrow keys choose a
   result and **Tab** or **Enter** applies it. Hover over a symbol for details,
   use **Ctrl+click** or **F12** for its definition, and **Shift+F12** for references.
 - Images open as previews. File, view, edit, and diff controls sit in a toolbar

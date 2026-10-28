@@ -1641,6 +1641,10 @@ impl Cagents {
                         if !same_session {
                             self.cards.remove(&pane.id);
                             self.lifecycle.remove(pane.id);
+                            // Card identity survives a session replacement, but
+                            // the previous actor's attention does not. This is
+                            // retirement, not evidence that its news was read.
+                            self.sidebar_state.forget_card_attention(pane.id);
                         }
                     }
                     let mut kind = pane.kind.clone();
@@ -2011,6 +2015,35 @@ mod tests {
     use crate::model::{
         BrowserId, BrowserRestoreFidelity, BrowserSession, ChannelId, ProjectChannel, ProjectId,
     };
+    /// A report that a pane's conversation could not be reopened goes with
+    /// the pane, whichever path removes it; here, another client closing it.
+    #[test]
+    fn a_pane_closed_elsewhere_takes_its_reopen_failure_with_it() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let report = |card: CardId| {
+            TransientNotice::error("Could not reopen a conversation.")
+                .with_details(format!("{card:?}"))
+                .with_key(NoticeKey::ChatAttach(card))
+        };
+        app.notices.record(report(card));
+        app.notices.record(report(CardId::new()));
+        // Any message will do: every update ends by checking.
+        let _ = app.update(Message::DismissNotice(u64::MAX));
+        assert_eq!(
+            app.notices
+                .recent()
+                .map(|entry| entry.notice.key)
+                .collect::<Vec<_>>(),
+            [Some(NoticeKey::ChatAttach(card))],
+            "an open pane keeps its report; one that is gone has none"
+        );
+
+        app.detach_shared_pane(card);
+        let _ = app.update(Message::DismissNotice(u64::MAX));
+        assert!(app.notices.is_empty());
+    }
+
     fn fixture() -> (Cagents, ChannelId, ChannelId, Pane) {
         let mut app = super::super::tests::context_inspector_test_app(false);
         let a = ChannelId::new();
@@ -3321,6 +3354,53 @@ mod tests {
     }
 
     #[test]
+    fn move_palette_keeps_selected_destination_across_live_ranking_changes() {
+        for query in [false, true] {
+            let (mut app, source, destination, pane) = channel_move_fixture();
+            app.workspace_model
+                .channels
+                .iter_mut()
+                .find(|channel| channel.id == destination)
+                .unwrap()
+                .title = "Other needle destination".into();
+            let (tx, rx) = async_channel::unbounded();
+            app.workspace_model_tx = tx;
+            drop(app.update_palette(super::super::palette_ui::Action::MovePane(pane.id)));
+            if query {
+                drop(app.update_palette(super::super::palette_ui::Action::Query("needle".into())));
+            }
+            let mut stronger = app.workspace_model.channel(destination).unwrap().clone();
+            stronger.id = ChannelId::new();
+            stronger.title = "needle first".into();
+            stronger.ordinal += 1;
+            app.workspace_model.channels.push(stronger);
+            drop(app.update_palette(super::super::palette_ui::Action::Submit));
+            assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
+                scope: Scope::Channel(from), change: Change::Transfer { id, destination: Scope::Channel(to), .. }, ..
+            } if from == source && id == pane.id && to == destination));
+            assert!(app.pane_transfer_pending(pane.id));
+        }
+    }
+
+    #[test]
+    fn move_palette_does_not_substitute_another_live_destination_when_selected_one_disappears() {
+        let (mut app, _, destination, pane) = channel_move_fixture();
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.update_palette(super::super::palette_ui::Action::MovePane(pane.id)));
+        let mut replacement = app.workspace_model.channel(destination).unwrap().clone();
+        replacement.id = ChannelId::new();
+        app.workspace_model
+            .channels
+            .retain(|channel| channel.id != destination);
+        app.workspace_model.channels.push(replacement);
+        drop(app.update_palette(super::super::palette_ui::Action::Submit));
+        assert!(rx.try_recv().is_err());
+        assert!(!app.pane_transfer_pending(pane.id));
+        assert!(app.palette.is_open());
+    }
+
+    #[test]
     fn a_queued_channel_drop_from_an_old_workspace_is_ignored() {
         let (mut app, _, destination, pane) = channel_move_fixture();
         let (tx, rx) = async_channel::unbounded();
@@ -4311,6 +4391,142 @@ mod tests {
         drop(app.update_notifications(notification_ui::Action::Snapshot(snapshot)));
         assert!(!app.sidebar_state.has_card_update(card));
         assert!(!app.notification_ui.acknowledged_for_test(id));
+    }
+
+    #[test]
+    fn same_card_session_replacement_retires_old_attention_without_reading_its_notice() {
+        use crate::agent::{Activity, ActivityState, Provider};
+
+        let (mut app, channel, _, mut original) = fixture();
+        app.refresh_ui.focused = false;
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        let old_session = attention_terminal_source();
+        original.kind = CardKind::Terminal(old_session.clone());
+        let mut unrelated = original.clone();
+        unrelated.id = CardId::new();
+        unrelated.kind = CardKind::Terminal(attention_terminal_source());
+        let mut view = View::empty(channel);
+        view.panes = vec![original.clone(), unrelated.clone()];
+        app.workspace_model.views = vec![view.clone()];
+        drop(app.project_shared_view(&view, &HashSet::from([original.id, unrelated.id])));
+        assert!(app.terminal_start_in_flight(original.id));
+        assert!(matches!(
+            app.cards.get(&original.id),
+            Some(CardRuntime::Loading)
+        ));
+
+        let notice = uuid::Uuid::new_v4();
+        let snapshot = crate::notifications::Snapshot {
+            diagnostic: None,
+            notices: vec![crate::notifications::Notice {
+                id: notice,
+                delivered: true,
+                acknowledged: false,
+                window: None,
+                event: crate::notifications::Event {
+                    content: None,
+                    target: crate::notifications::Target::Session(old_session.id),
+                    source_session: Some(old_session.id),
+                    provider: Some(Provider::Codex),
+                    directory: Some(old_session.launch.working_directory.clone()),
+                    destination: None,
+                    evidence: crate::notifications::Evidence {
+                        key: "unseen-before-same-card-replacement".into(),
+                        kind: crate::notifications::Kind::Succeeded,
+                    },
+                },
+            }],
+        };
+        drop(app.update_notifications(notification_ui::Action::Snapshot(snapshot.clone())));
+        let waiting = Activity {
+            provider: Provider::Codex,
+            state: ActivityState::Waiting,
+        };
+        app.observe_agent_activity_for_card(original.id, Some(waiting));
+        app.observe_agent_update_for_card(unrelated.id);
+        assert_eq!(app.sidebar_state.card_activity(original.id), Some(waiting));
+        assert!(app.sidebar_state.has_card_update(original.id));
+        assert!(app.sidebar_state.has_card_update(unrelated.id));
+        app.shared_views.pending.clear();
+
+        // A genuine presentation-only view update must preserve the source's
+        // existing attention while the attachment task is still outstanding.
+        let mut metadata = original.clone();
+        metadata.title = "same terminal, renamed".into();
+        view.apply(&Change::Update {
+            before: original.clone(),
+            pane: metadata.clone(),
+        })
+        .unwrap();
+        app.workspace_model.views = vec![view.clone()];
+        drop(app.reconcile_shared_views());
+        assert_eq!(app.sidebar_state.card_activity(original.id), Some(waiting));
+        assert!(app.sidebar_state.has_card_update(original.id));
+
+        // The same pane ID may subsequently name an entirely new terminal.
+        // Its real Loading/error projection must not borrow its predecessor's
+        // activity or unread state, even before the new start can settle.
+        let replacement_session = attention_terminal_source();
+        assert_ne!(replacement_session.id, old_session.id);
+        let mut replacement = metadata.clone();
+        replacement.kind = CardKind::Terminal(replacement_session.clone());
+        view.apply(&Change::Update {
+            before: metadata,
+            pane: replacement.clone(),
+        })
+        .unwrap();
+        app.workspace_model.views = vec![view];
+        drop(app.reconcile_shared_views());
+        assert_eq!(app.card_state(original.id).unwrap().kind, replacement.kind);
+        assert!(matches!(
+            app.cards.get(&original.id),
+            Some(CardRuntime::Loading)
+        ));
+        assert!(app.terminal_start_in_flight(original.id));
+        assert_eq!(app.sidebar_state.card_activity(original.id), None);
+        assert!(!app.sidebar_state.has_card_update(original.id));
+        assert!(app.sidebar_state.has_card_update(unrelated.id));
+        assert!(!app.notification_ui.acknowledged_for_test(notice));
+        assert!(!app.notification_ui.snapshot.notices[0].acknowledged);
+
+        // Neither a delayed old attachment failure nor its still-unread
+        // journal snapshot can assign old-session news to the replacement.
+        drop(app.update(Message::TerminalStarted {
+            card: original.id,
+            terminal: old_session.id,
+            result: Err("old attachment failed after session replacement".into()),
+        }));
+        assert!(matches!(
+            app.cards.get(&original.id),
+            Some(CardRuntime::Loading)
+        ));
+        drop(app.update_notifications(notification_ui::Action::Snapshot(snapshot)));
+        assert_eq!(app.sidebar_state.card_activity(original.id), None);
+        assert!(!app.sidebar_state.has_card_update(original.id));
+        assert!(!app.notification_ui.acknowledged_for_test(notice));
+
+        // Fresh source observations remain usable. This invokes the App's
+        // observer contract; no fixture start task or real host is executed.
+        app.observe_agent_activity_for_card(original.id, Some(waiting));
+        assert_eq!(app.sidebar_state.card_activity(original.id), Some(waiting));
+        assert!(app.sidebar_state.has_card_update(original.id));
+        drop(app.update(Message::TerminalStarted {
+            card: original.id,
+            terminal: replacement_session.id,
+            result: Err("replacement attachment unavailable".into()),
+        }));
+        assert!(matches!(
+            app.cards.get(&original.id),
+            Some(CardRuntime::Failed(_))
+        ));
+        assert_eq!(app.sidebar_state.card_activity(original.id), None);
+        assert!(
+            app.sidebar_state.has_card_update(original.id),
+            "fresh unread is not read by a runtime failure"
+        );
+        assert!(app.sidebar_state.has_card_update(unrelated.id));
+        assert!(!app.notification_ui.acknowledged_for_test(notice));
     }
 
     #[test]

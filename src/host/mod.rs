@@ -3,16 +3,21 @@ pub(crate) use account_lifecycle::Reservation as AccountReservation;
 mod activity;
 mod agent_execution;
 mod automations;
+mod channel_work;
 mod chat;
 mod client;
 mod delivery;
 pub(crate) mod descriptor_limit;
+#[cfg(all(test, target_os = "linux"))]
+mod exit_drain_tests;
 mod lock;
 mod model;
 mod notifications;
 #[cfg(all(test, target_os = "linux"))]
 mod provider_shutdown_tests;
 mod service;
+#[cfg(all(test, target_os = "linux"))]
+mod shutdown_tests;
 mod state;
 mod work;
 mod worktree_removal;
@@ -212,6 +217,20 @@ pub unsafe fn prepare_daemon_admission() -> Result<DaemonAdmission, HostError> {
     Ok(DaemonAdmission { _guard: admission })
 }
 
+/// Reserve and configure the serving socket before restore can take ownership
+/// of an original holder. The caller still holds HostLease and admission, and
+/// does not accept clients or publish readiness until restoration finishes.
+fn listener_before_restore(
+    paths: &RuntimePaths,
+    restore: impl FnOnce() -> Result<(), HostError>,
+) -> Result<UnixListener, HostError> {
+    let listener = UnixListener::bind(&paths.socket)?;
+    fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
+    listener.set_nonblocking(true)?;
+    restore()?;
+    Ok(listener)
+}
+
 pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     daemon::install_signal_handlers()?;
     descriptor_limit::raise();
@@ -261,28 +280,63 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     if let Err(error) = crate::transcript_cache::sweep(&paths.directory) {
         tracing::warn!(%error, "transcript cache cleanup was refused; evidence preserved");
     }
-    let unattached = state::restore_upgrade(&host).map_err(io::Error::other)?;
-    state::restore_orphaned_holders(&host).map_err(io::Error::other)?;
-    chat::restore_orphaned_native(&host, &unattached).map_err(io::Error::other)?;
-    chat::retained_actor::reconcile_retired_actors(&host).map_err(io::Error::other)?;
-    chat::retained_actor::reconcile_startup_losses(&host).map_err(io::Error::other)?;
-    let retained_runs = chat::retained_actor::retained_runs(&host);
-    // A committed acceptance is not proof of provider delivery. Until a
-    // restored actor supplies exact run evidence, never authorize a resend.
-    if let Ok(registry) = agent_execution::registry(&host) {
-        registry
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .interrupt_unproven_agent_runs_except(
-                crate::chat::now_ms().unwrap_or(0),
-                &retained_runs,
-            )
-            .map_err(io::Error::other)?;
-    }
+    // This mandatory thread service must be available before any adoption
+    // can discard the holder's replay copy. It observes no process until the
+    // same HostState publishes one; it initiates no execution.
     let _agent_activity = activity::Monitor::start(&host)?;
-    let listener = UnixListener::bind(&paths.socket)?;
-    fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
-    listener.set_nonblocking(true)?;
+    let listener = listener_before_restore(&paths, || {
+        let restored = (|| -> io::Result<()> {
+            chat::retained_actor::reconcile_previous_boot_history(&host)
+                .map_err(io::Error::other)?;
+            let unattached = state::restore_upgrade(&host).map_err(io::Error::other)?;
+            state::restore_orphaned_holders(&host).map_err(io::Error::other)?;
+            if let Some(detail) = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .startup_recovery()
+            {
+                return Err(io::Error::other(detail.to_owned()));
+            }
+            chat::restore_orphaned_native(&host, &unattached).map_err(io::Error::other)?;
+            chat::retained_actor::reconcile_retired_actors(&host).map_err(io::Error::other)?;
+            chat::retained_actor::reconcile_startup_losses(&host).map_err(io::Error::other)?;
+            let retained_runs = chat::retained_actor::retained_runs(&host);
+            // A committed acceptance is not proof of provider delivery. Until a
+            // restored actor supplies exact run evidence, never authorize a resend.
+            if let Ok(registry) = agent_execution::registry(&host) {
+                registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .interrupt_unproven_agent_runs_except(
+                        crate::chat::now_ms().unwrap_or(0),
+                        &retained_runs,
+                    )
+                    .map_err(io::Error::other)?;
+            }
+            Ok(())
+        })();
+        match restored {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                if state
+                    .terminals
+                    .values()
+                    .any(|record| !record.handle.is_completed())
+                    || state.chats.values().any(|record| record.handle.owns_work())
+                {
+                    // Keep the real listener, lease and original owners. A
+                    // failed restore is not permission to destroy accepted
+                    // replay or start an empty replacement daemon.
+                    state.retain_startup_recovery(error.to_string());
+                    tracing::error!(%error, "startup retained original ownership; recovery-only listener remains available");
+                    Ok(())
+                } else {
+                    Err(error.into())
+                }
+            }
+        }
+    })?;
     drop(admission);
     crate::diagnostics::record(crate::diagnostics::Event::Ready);
     let tally_host = Arc::downgrade(&host);
@@ -292,34 +346,51 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         Some(state.agent_tally())
     });
 
-    let automation_broker = match automations::start(&host) {
-        Ok(broker) => Some(broker),
-        Err(error) => {
-            tracing::warn!(%error, "scheduled automations are unavailable");
-            None
+    let recovery_only = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .startup_recovery()
+        .is_some();
+    let mut automation_broker = if recovery_only {
+        None
+    } else {
+        match automations::start(&host) {
+            Ok(broker) => Some(broker),
+            Err(error) => {
+                tracing::warn!(%error, "scheduled automations are unavailable");
+                None
+            }
         }
     };
-    let work_board = match work::Service::start(&host) {
-        Ok(service) => {
-            host.lock().unwrap_or_else(|p| p.into_inner()).work = Some(service.handle());
-            Some(service)
-        }
-        Err(error) => {
-            tracing::warn!(%error, "the Work board is unavailable");
-            None
+    let mut work_board = if recovery_only {
+        None
+    } else {
+        match work::Service::start(&host) {
+            Ok(service) => {
+                host.lock().unwrap_or_else(|p| p.into_inner()).work = Some(service.handle());
+                Some(service)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "the Work board is unavailable");
+                None
+            }
         }
     };
-    let courier = match agent_execution::mailbox::Courier::start(&host) {
-        Ok(courier) => Some(courier),
-        Err(error) => {
-            tracing::warn!(%error, "messages between sessions are unavailable");
-            None
+    let mut courier = if recovery_only {
+        None
+    } else {
+        match agent_execution::mailbox::Courier::start(&host) {
+            Ok(courier) => Some(courier),
+            Err(error) => {
+                tracing::warn!(%error, "messages between sessions are unavailable");
+                None
+            }
         }
     };
 
     // Restoring a checkpoint above may hold the host for as long as its
     // inventory takes; from here on a hold that long is a deadlock.
-    let stall_watch = match host.watch(lock::STALL_LIMIT) {
+    let mut stall_watch = match host.watch(lock::STALL_LIMIT) {
         Ok(watch) => Some(watch),
         Err(error) => {
             tracing::warn!(%error, "a wedged host mutex will not be detected");
@@ -331,12 +402,17 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     let client_capacity = ClientCapacity::new(MAX_ACTIVE_CLIENTS);
     let mut clients = Vec::new();
     let mut runtime_error = None;
+    let mut ordinary_exit_drain: Option<crate::daemon::child_reaper::ExitDrain> = None;
+    let mut ordinary_cleanup_started = false;
+    let mut sealed_deliveries = None;
     tracing::info!(
         instance = crate::instance::NAME,
         socket = %paths.socket.display(),
         "cagents daemon is ready"
     );
 
+    #[cfg(all(test, target_os = "linux"))]
+    exit_drain_tests::observe_ready(&host);
     loop {
         reap_finished(&mut clients);
         if daemon::termination_requested() {
@@ -344,12 +420,50 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .request_shutdown();
         }
-        if host
+        // Read the epoch BEFORE checking absence. A final ticket release
+        // between this check and a fatal-listener wait must not be lost.
+        let progress_epoch = ordinary_exit_drain
+            .as_ref()
+            .map(|drain| drain.progress_epoch());
+        if let Some(drain) = &ordinary_exit_drain {
+            if !ordinary_cleanup_started {
+                ordinary_cleanup_started = finish_shutdown_owners(&host, &mut runtime_error, false);
+            }
+            // Restored originals can lack a local reaper credit. Their
+            // independent parent/startup proof must settle before either
+            // ordinary teardown or the terminal-child absence seal authorizes
+            // returning from the daemon.
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if ordinary_cleanup_started
+                && !state.ordinary_exit_cleanup_blocked()
+                && drain.try_seal_absence()
+            {
+                // The startup/reply guard, core seal and registration/reply
+                // acquisition fence share this one HostMutex transaction.
+                sealed_deliveries = Some(state.close_ordinary_exit_registration());
+                break;
+            }
+        } else if host
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|p| p.into_inner())
             .is_shutting_down()
         {
-            break;
+            let Some(drain) = begin_ordinary_exit(&host) else {
+                break; // saved committed-successor decision, before teardown
+            };
+            ordinary_exit_drain = Some(drain);
+
+            // Stop autonomous producers once, then use the original ordinary
+            // cleanup paths. No producer/reaper waits while holding control.
+            drop(stall_watch.take());
+            drop(automation_broker.take());
+            drop(courier.take());
+            host.lock().unwrap_or_else(|p| p.into_inner()).work = None;
+            drop(work_board.take());
+            ordinary_cleanup_started = finish_shutdown_owners(&host, &mut runtime_error, false);
+            tracing::info!(pending = %ordinary_exit_drain.as_ref().unwrap().pending_description(),
+                "ordinary daemon exit retains its listener and lease until exact child absence is sealed");
+            continue;
         }
 
         let fatal = match listener.accept() {
@@ -398,55 +512,51 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
             Err(error) => Some(error),
         };
         if let Some(error) = fatal {
+            if host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .ordinary_exit_cleanup_blocked()
+            {
+                // Preserve 1204's same-listener recovery on a broken socket.
+                // A restored owner may have no reaper epoch to wait for.
+                tracing::error!(%error, "recovery listener failed while original ownership remains retained");
+                runtime_error = Some(error);
+                thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+            if let Some(drain) = &ordinary_exit_drain {
+                tracing::error!(%error, pending = %drain.pending_description(),
+                    "listener unavailable while original child custody remains; retaining daemon and lease");
+                runtime_error = Some(error);
+                drain.wait_for_progress(progress_epoch.expect("active ordinary exit epoch"));
+                continue;
+            }
             host.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .request_shutdown();
             runtime_error = Some(error);
-            break;
+            // Arm ordinary absence before any return/drop; a committed
+            // successor transfer still takes the saved bypass above.
+            continue;
         }
     }
 
     tracing::info!("cagents daemon is shutting down");
-    // Shutdown waits on providers and holders by design.
-    drop(stall_watch);
-    // Stop deadline acceptance before snapshotting/tearing down provider
-    // ownership. Dedicated prechecks keep their own bounded cleanup deadline.
-    drop(automation_broker);
-    drop(courier);
-    host.lock().unwrap_or_else(|p| p.into_inner()).work = None;
-    drop(work_board);
-    let proof = host
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .proof()
-        .clone();
-    let (handles, deliveries) = host
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .graceful_shutdown();
-    if let Err(error) = finish_chat_shutdown(&host) {
-        tracing::error!(%error, "daemon shutdown left unconfirmed ownership; recovery evidence retained");
-        runtime_error = Some(io::Error::other(error));
-    }
-    for delivery in &deliveries {
-        let _ = delivery.push(ServerEnvelope {
-            version: PROTOCOL_VERSION,
-            request_id: None,
-            proof: proof.clone(),
-            message: ServerMessage::HostShuttingDown,
-        });
-        delivery.close_after_drain();
-    }
-    for handle in &handles {
-        handle.request_shutdown();
-    }
-    for handle in handles {
-        if let Err(error) = handle.shutdown() {
-            tracing::error!(%error, "daemon terminal shutdown left unconfirmed ownership; recovery evidence retained");
-            runtime_error = Some(io::Error::other(format!(
-                "terminal shutdown left unconfirmed ownership: {error}"
-            )));
-        }
+    if ordinary_exit_drain.is_some() {
+        // Already fenced atomically with the final startup/core absence check.
+        // Late accepted threads receive an already-closed queue, while the
+        // original writer drains every correlated checked-Close reply first.
+        let deliveries = sealed_deliveries.expect("ordinary exit sealed its delivery fence");
+        close_shutdown_deliveries(&host, &deliveries);
+    } else {
+        // The committed-successor path keeps its existing intentional transfer
+        // behavior and never seals absence or closes reaper admission.
+        drop(stall_watch);
+        drop(automation_broker);
+        drop(courier);
+        host.lock().unwrap_or_else(|p| p.into_inner()).work = None;
+        drop(work_board);
+        finish_shutdown_owners(&host, &mut runtime_error, true);
     }
     for client in clients {
         let _ = client.join();
@@ -461,6 +571,93 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         Some(error) => Err(error.into()),
         None => Ok(()),
     }
+}
+
+/// The ordinary exit caller owns the permit. Keep reservation closure and
+/// public quiescence under the existing writer, then release both locks before
+/// invoking any producer Drop, provider cleanup, child wait or client work.
+fn begin_ordinary_exit(host: &SharedHost) -> Option<crate::daemon::child_reaper::ExitDrain> {
+    let gate = Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate);
+    let _control = gate.write().unwrap_or_else(|p| p.into_inner());
+    // Save intentional successor transfer BEFORE finish_upgrade takes its
+    // state. Such a handoff is not a claim of original-child absence.
+    if host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .has_committed_upgrade()
+    {
+        return None;
+    }
+    let drain = crate::daemon::child_reaper::begin_exit_drain();
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .begin_ordinary_exit_cleanup();
+    Some(drain)
+}
+
+fn close_shutdown_deliveries(host: &SharedHost, deliveries: &[Arc<delivery::DeliveryQueue>]) {
+    let proof = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .clone();
+    for delivery in deliveries {
+        let _ = delivery.push(ServerEnvelope {
+            version: PROTOCOL_VERSION,
+            request_id: None,
+            proof: proof.clone(),
+            message: ServerMessage::HostShuttingDown,
+        });
+        delivery.close_after_drain();
+    }
+}
+
+/// Ordinary cleanup runs exactly once before waiting for original tickets.
+/// Successor cleanup preserves the original notification-before-terminal order.
+fn finish_shutdown_owners(
+    host: &SharedHost,
+    runtime_error: &mut Option<io::Error>,
+    close_deliveries: bool,
+) -> bool {
+    let (handles, deliveries) = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if !close_deliveries && state.ordinary_exit_cleanup_blocked() {
+            return false;
+        }
+        state.graceful_shutdown()
+    };
+    if let Err(error) = finish_chat_shutdown(host) {
+        tracing::error!(%error, "daemon shutdown left unconfirmed ownership; recovery evidence retained");
+        *runtime_error = Some(io::Error::other(error));
+    }
+    if close_deliveries {
+        close_shutdown_deliveries(host, &deliveries);
+    }
+    for result in finish_terminal_shutdown(&handles) {
+        if let Err(error) = result {
+            tracing::error!(%error, "daemon terminal shutdown left unconfirmed ownership; recovery evidence retained");
+            *runtime_error = Some(io::Error::other(format!(
+                "terminal shutdown left unconfirmed ownership: {error}"
+            )));
+        }
+    }
+    true
+}
+
+fn finish_terminal_shutdown(
+    handles: &[crate::terminal::TerminalHandle],
+) -> Vec<Result<(), crate::terminal::TerminalSendError>> {
+    // Request and register every original before waiting on any one worker.
+    // One absolute deadline bounds the whole batch, including pending joins;
+    // an unfinished owner cannot consume another five seconds per sibling.
+    let deadline = std::time::Instant::now() + crate::terminal::TerminalHandle::SHUTDOWN_TIMEOUT;
+    for handle in handles {
+        handle.request_shutdown();
+    }
+    handles
+        .iter()
+        .map(|handle| handle.shutdown_until(deadline))
+        .collect()
 }
 
 fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
@@ -483,7 +680,17 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
         let closed = if upgrading && chat.native_continuity().retains_provider() {
             chat.preserve_for_restart()
         } else {
-            chat.close()
+            chat.close().and_then(|()| {
+                if !upgrading {
+                    // Closing the provider leaves its retained helper alive
+                    // until final outcomes are durably committed and ACKed.
+                    // Preserve that ownership on failure, before retiring the
+                    // delegated session record below.
+                    chat::retained_actor::finish_close(host, &chat, &session)
+                } else {
+                    Ok(())
+                }
+            })
         };
         match closed {
             Ok(()) if !upgrading => {

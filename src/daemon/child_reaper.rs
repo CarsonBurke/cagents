@@ -7,7 +7,7 @@ use std::{
     io,
     os::fd::{AsRawFd, FromRawFd},
     process::Child,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Condvar, Mutex, OnceLock},
     thread::{self, JoinHandle},
 };
 
@@ -15,7 +15,141 @@ use std::{
 pub(crate) use tests::TestService;
 
 const CAPACITY: usize = 4096;
-static SERVICE: OnceLock<Result<Arc<Service>, String>> = OnceLock::new();
+static SERVICE: ServiceInitializer = ServiceInitializer::new();
+
+/// Only a successfully started service is process-owned. Transient startup
+/// failure refuses this admission without poisoning later attempts. An already
+/// installed service keeps its own failure/custody policy; it is never replaced.
+struct ServiceInitializer {
+    owner: OnceLock<Arc<Service>>,
+    // Monotonic even when no service has ever started.
+    initialize: Mutex<bool>,
+}
+impl ServiceInitializer {
+    const fn new() -> Self {
+        Self {
+            owner: OnceLock::new(),
+            initialize: Mutex::new(false),
+        }
+    }
+    fn get(&self) -> Option<&Arc<Service>> {
+        self.owner.get()
+    }
+    fn get_or_start(
+        &self,
+        start: impl FnOnce() -> io::Result<Arc<Service>>,
+    ) -> io::Result<Arc<Service>> {
+        if let Some(service) = self.get() {
+            return Ok(service.clone());
+        }
+        let closed = self.initialize.lock().unwrap_or_else(|p| p.into_inner());
+        if *closed {
+            return Err(io::Error::other(
+                "Exact-child spawn admission is closed for daemon exit",
+            ));
+        }
+        if let Some(service) = self.get() {
+            return Ok(service.clone());
+        }
+        let service = start()?;
+        // The sole setter is serialized. In particular, a failed factory
+        // installs nothing and cannot race a second successful worker start.
+        assert!(self.owner.set(service.clone()).is_ok());
+        Ok(service)
+    }
+
+    fn begin_exit_drain(&self) -> ExitDrain {
+        // Serialize closure with the sole installer, including its first-start
+        // path. A closed, never-initialized service cannot later mint a credit.
+        let mut closed = self.initialize.lock().unwrap_or_else(|p| p.into_inner());
+        *closed = true;
+        let service = self.get().cloned();
+        if let Some(service) = &service {
+            service.close_admission();
+        }
+        ExitDrain { service }
+    }
+}
+
+/// Ordinary-exit permit. Existing original-child owners keep their credits and
+/// may still publish late custody; only new spawn admission is closed. Dropping
+/// or cloning this observer never reopens admission or discards an owner.
+#[derive(Clone)]
+pub(crate) struct ExitDrain {
+    service: Option<Arc<Service>>,
+}
+
+pub(crate) fn begin_exit_drain() -> ExitDrain {
+    SERVICE.begin_exit_drain()
+}
+
+impl ExitDrain {
+    pub(crate) fn try_seal_absence(&self) -> bool {
+        let Some(service) = &self.service else {
+            return true;
+        };
+        let mut state = service.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.admission_closed
+            && state.free.len() == state.entries.len()
+            && state.entries.iter().all(Option::is_none)
+            && state.quarantined.iter().all(Option::is_none)
+        {
+            state.exit_sealed = true;
+        }
+        state.exit_sealed
+    }
+
+    pub(crate) fn pending_description(&self) -> String {
+        let Some(service) = &self.service else {
+            return "Exact-child spawn admission closed; no service ownership".into();
+        };
+        let state = service.state.lock().unwrap_or_else(|p| p.into_inner());
+        let outstanding = state.entries.len() - state.free.len();
+        let retained = state.entries.iter().flatten().count();
+        let suspended = state
+            .entries
+            .iter()
+            .flatten()
+            .filter(|e| e.suspended)
+            .count();
+        let quarantined = state.quarantined.iter().flatten().count();
+        format!(
+            "Waiting for {outstanding} exact-child ownership ticket(s): {retained} retained, {quarantined} quarantined, {suspended} suspended{}",
+            state
+                .failure
+                .as_ref()
+                .map(|e| format!("; {e}"))
+                .unwrap_or_default()
+        )
+    }
+
+    /// Read BEFORE checking absence. Used only if the host listener is unusable;
+    /// normal drain progress uses the existing daemon wake/listener path.
+    pub(crate) fn progress_epoch(&self) -> u64 {
+        self.service.as_ref().map_or(0, |service| {
+            service
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .progress_epoch
+        })
+    }
+
+    /// Lost-wake safe: a settlement between the caller's absence check and this
+    /// wait changes the epoch under the SAME mutex. No retry timer or new worker.
+    pub(crate) fn wait_for_progress(&self, observed: u64) {
+        let Some(service) = &self.service else {
+            return;
+        };
+        let mut state = service.state.lock().unwrap_or_else(|p| p.into_inner());
+        while state.progress_epoch == observed && state.free.len() != state.entries.len() {
+            state = service
+                .progress
+                .wait(state)
+                .unwrap_or_else(|p| p.into_inner());
+        }
+    }
+}
 
 /// A spawn-time credit. Hold this alongside the original Child until normal
 /// reaping or transfer. Dropping an unused reservation returns its credit.
@@ -34,14 +168,8 @@ impl std::fmt::Debug for Reservation {
 }
 
 pub(crate) fn reserve() -> io::Result<Reservation> {
-    let service = SERVICE
-        .get_or_init(|| {
-            Service::start(CAPACITY)
-                .map(|(service, _worker)| service)
-                .map_err(|error| error.to_string())
-        })
-        .as_ref()
-        .map_err(|error| io::Error::other(error.clone()))?;
+    let service =
+        SERVICE.get_or_start(|| Service::start(CAPACITY).map(|(service, _worker)| service))?;
     service.reserve()
 }
 
@@ -58,8 +186,7 @@ pub(crate) fn retry_preserved() -> io::Result<RetryReport> {
             rearmed: 0,
             retained: 0,
         }),
-        Some(Ok(service)) => service.retry_preserved(),
-        Some(Err(error)) => Err(io::Error::other(error.clone())),
+        Some(service) => service.retry_preserved(),
     }
 }
 
@@ -68,9 +195,9 @@ pub(crate) fn retry_preserved() -> io::Result<RetryReport> {
 /// not discard them just because filesystem discovery found no helper.
 pub(crate) fn has_outstanding_ownership() -> bool {
     match SERVICE.get() {
-        Some(Ok(service)) => service.has_outstanding_ownership(),
+        Some(service) => service.has_outstanding_ownership(),
         // Initialization failure cannot have handed out a spawn credit.
-        None | Some(Err(_)) => false,
+        None => false,
     }
 }
 
@@ -79,8 +206,8 @@ pub(crate) fn has_outstanding_ownership() -> bool {
 /// terminal inventory and its explicit shutdown confirmation contract.
 pub(crate) fn has_retained_ownership() -> bool {
     match SERVICE.get() {
-        Some(Ok(service)) => service.has_retained_ownership(),
-        None | Some(Err(_)) => false,
+        Some(service) => service.has_retained_ownership(),
+        None => false,
     }
 }
 
@@ -89,8 +216,8 @@ pub(crate) fn has_retained_ownership() -> bool {
 /// shutdown errors, and this query never initializes, retries or waits.
 pub(crate) fn retained_custody_error() -> Option<String> {
     match SERVICE.get() {
-        Some(Ok(service)) => service.retained_custody_error(),
-        None | Some(Err(_)) => None,
+        Some(service) => service.retained_custody_error(),
+        None => None,
     }
 }
 
@@ -104,6 +231,7 @@ impl Reservation {
         let mut state = self.service.state.lock().unwrap_or_else(|p| p.into_inner());
         debug_assert!(state.quarantined[slot].is_none_or(|ticket| ticket == self.ticket));
         state.quarantined[slot] = Some(self.ticket);
+        self.service.progress(&mut state);
     }
 
     /// Failure returns every ownership object intact. Insertion and wakeup are
@@ -149,6 +277,7 @@ impl Reservation {
             ));
         }
         self.slot = None;
+        service.progress(&mut state);
         Ok(())
     }
 
@@ -175,6 +304,9 @@ impl Reservation {
         if state.failure.is_none() {
             state.failure = Some(format!("Exact child {pid} remains suspended: {reason}"));
         }
+        service.progress(&mut state);
+        drop(state);
+        crate::daemon::wake();
         tracing::error!(pid, %reason, "Preserved original child and admission credit without reaping authority; new helper admission is unavailable");
     }
 }
@@ -187,6 +319,7 @@ impl Drop for Reservation {
                     state.quarantined[slot] = None;
                 }
                 state.free.push(slot);
+                self.service.progress(&mut state);
                 state.free.len() == state.entries.len()
             };
             // No timer retries the idle census. Publish eligibility before
@@ -213,14 +346,29 @@ struct State {
     fatal: bool,
     worker_alive: bool,
     stopping: bool,
+    admission_closed: bool,
+    exit_sealed: bool,
+    progress_epoch: u64,
 }
 struct Service {
     event: File,
     state: Mutex<State>,
+    progress: Condvar,
     #[cfg(test)]
     fail_wake: std::sync::atomic::AtomicBool,
 }
 impl Service {
+    fn progress(&self, state: &mut State) {
+        state.progress_epoch = state.progress_epoch.wrapping_add(1);
+        self.progress.notify_all();
+    }
+
+    fn close_admission(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.admission_closed = true;
+        self.progress(&mut state);
+    }
+
     fn has_outstanding_ownership(&self) -> bool {
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.free.len() != state.entries.len()
@@ -283,7 +431,11 @@ impl Service {
                 fatal: false,
                 worker_alive: true,
                 stopping: false,
+                admission_closed: false,
+                exit_sealed: false,
+                progress_epoch: 0,
             }),
+            progress: Condvar::new(),
             #[cfg(test)]
             fail_wake: std::sync::atomic::AtomicBool::new(false),
         });
@@ -300,6 +452,11 @@ impl Service {
         }
         if state.stopping {
             return Err(io::Error::other("Exact-child reaper is stopping"));
+        }
+        if state.admission_closed {
+            return Err(io::Error::other(
+                "Exact-child spawn admission is closed for daemon exit",
+            ));
         }
         let ticket = state.next_ticket;
         let next = ticket
@@ -347,6 +504,9 @@ impl Service {
                         .suspended = true;
                 }
                 state.failure = Some(format!("Exact-child recovery wake failed: {error}"));
+                self.progress(&mut state);
+                drop(state);
+                crate::daemon::wake();
                 return Err(error);
             }
         }
@@ -363,6 +523,9 @@ impl Service {
                 "{retained} original helper child owner(s) remain suspended without validated reaping authority"
             ));
         }
+        self.progress(&mut state);
+        drop(state);
+        crate::daemon::wake();
         Ok(RetryReport {
             rearmed: rearmed.len(),
             retained,
@@ -425,6 +588,9 @@ impl Service {
         state.failure = Some(error);
         state.fatal = true;
         state.worker_alive = false;
+        self.progress(&mut state);
+        drop(state);
+        crate::daemon::wake();
     }
     fn run(&self) {
         // Includes an unexpected worker panic: retained originals remain in
@@ -440,6 +606,9 @@ impl Service {
                         .failure
                         .get_or_insert_with(|| "Exact-child reaper worker stopped".into());
                 }
+                self.0.progress(&mut state);
+                drop(state);
+                crate::daemon::wake();
             }
         }
         let _lifetime = WorkerLifetime(self);
@@ -523,8 +692,9 @@ impl Service {
                     }
                 };
                 let empty = reaped && state.free.len() == state.entries.len();
+                self.progress(&mut state);
                 drop(state);
-                if empty {
+                if empty || !reaped {
                     crate::daemon::wake();
                 }
             }
@@ -733,6 +903,481 @@ mod tests {
                 let _ = child.wait();
             }
         }
+    }
+
+    /// Only new drain tests use this owner: successful natural EOF/reaping does
+    /// not send a cleanup signal. A failing test still owns the exact pidfd.
+    struct DrainChild {
+        child: Option<Child>,
+        stdin: Option<std::process::ChildStdin>,
+        pidfd: File,
+        armed: bool,
+    }
+    impl DrainChild {
+        fn spawn() -> Self {
+            let mut child = std::process::Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) as i32 };
+            if fd < 0 {
+                let error = io::Error::last_os_error();
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("fixture original pidfd capture failed: {error}");
+            }
+            let stdin = child.stdin.take();
+            Self {
+                child: Some(child),
+                stdin,
+                pidfd: unsafe { File::from_raw_fd(fd) },
+                armed: true,
+            }
+        }
+        fn assert_original_reaped(&self) {
+            let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PIDFD,
+                    self.pidfd.as_raw_fd() as libc::id_t,
+                    &mut status,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            assert_eq!(result, -1);
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+        }
+    }
+    impl Drop for DrainChild {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            self.stdin.take();
+            let mut poll = libc::pollfd {
+                fd: self.pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut poll, 1, 0) };
+            if ready <= 0 || poll.revents == 0 {
+                // Failure-only cleanup by the original capability, never a
+                // remembered PID. Normal test completion has already reaped.
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        self.pidfd.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    );
+                }
+            }
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[test]
+    fn exit_drain_before_initialization_permanently_refuses_a_new_worker() {
+        let initializer = ServiceInitializer::new();
+        let drain = initializer.begin_exit_drain();
+        assert!(drain.try_seal_absence());
+        assert!(
+            initializer
+                .get_or_start(|| panic!("closed initializer must not start a worker"))
+                .is_err()
+        );
+        drop(drain.clone());
+        assert!(initializer.begin_exit_drain().try_seal_absence());
+        assert!(
+            initializer
+                .get_or_start(|| panic!("dropping drain cannot reopen admission"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn exit_drain_serializes_with_inflight_first_initialization_and_fastpath_reserve() {
+        use std::sync::mpsc;
+        let initializer = ServiceInitializer::new();
+        let (entered, entered_rx) = mpsc::channel();
+        let (continue_start, continue_rx) = mpsc::channel();
+        let (reaper, drain) = thread::scope(|scope| {
+            let initializer_ref = &initializer;
+            let startup = scope.spawn(move || {
+                let mut cleanup = None;
+                initializer_ref
+                    .get_or_start(|| {
+                        entered.send(()).unwrap();
+                        continue_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        let reaper = TestService::new(1);
+                        let service = reaper.service.clone();
+                        cleanup = Some(reaper);
+                        Ok(service)
+                    })
+                    .unwrap();
+                cleanup.unwrap()
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let closer = scope.spawn(|| initializer.begin_exit_drain());
+            continue_start.send(()).unwrap();
+            (startup.join().unwrap(), closer.join().unwrap())
+        });
+        assert!(drain.try_seal_absence());
+        let installed = initializer
+            .get_or_start(|| panic!("installed service is never replaced"))
+            .unwrap();
+        assert!(Arc::ptr_eq(&installed, &reaper.service));
+        assert!(
+            installed
+                .reserve()
+                .unwrap_err()
+                .to_string()
+                .contains("closed")
+        );
+        assert_eq!(reaper.free(), 1);
+    }
+
+    #[test]
+    fn exit_drain_counts_unpublished_original_until_late_transfer_and_actual_reap() {
+        use std::sync::mpsc;
+        let reaper = TestService::new(1);
+        let reservation = reaper.reserve().unwrap();
+        let mut original = DrainChild::spawn();
+        let pid = original.child.as_ref().unwrap().id();
+        assert!(!reaper.service.has_retained_ownership());
+        assert!(reaper.service.has_outstanding_ownership());
+        let (publish, publish_rx) = mpsc::channel();
+        let pidfd = original.pidfd.try_clone().unwrap();
+        let mut late_original = DrainChild {
+            child: original.child.take(),
+            stdin: None,
+            pidfd,
+            armed: true,
+        };
+        let drain = thread::scope(|scope| {
+            let late_owner = scope.spawn(move || -> io::Result<()> {
+                if let Err(error) = publish_rx.recv_timeout(Duration::from_secs(5)) {
+                    drop(late_original);
+                    drop(reservation);
+                    return Err(io::Error::other(error));
+                }
+                reservation.quarantine();
+                let pidfd = match late_original.pidfd.try_clone() {
+                    Ok(pidfd) => pidfd,
+                    Err(error) => {
+                        drop(late_original);
+                        drop(reservation);
+                        return Err(error);
+                    }
+                };
+                let child = late_original.child.take().unwrap();
+                match reservation.retain(child, pidfd) {
+                    Ok(()) => {
+                        late_original.armed = false;
+                        Ok(())
+                    }
+                    Err((error, child, _, reservation)) => {
+                        late_original.child = Some(child);
+                        // Reap via the original cleanup owner before returning
+                        // its credit, including assertion/channel failures.
+                        drop(late_original);
+                        drop(reservation);
+                        Err(error)
+                    }
+                }
+            });
+            reaper.service.close_admission();
+            let drain = ExitDrain {
+                service: Some(reaper.service.clone()),
+            };
+            assert!(
+                !drain.try_seal_absence(),
+                "unpublished original credit must fence exit"
+            );
+            assert!(
+                drain
+                    .pending_description()
+                    .contains("1 exact-child ownership")
+            );
+            assert!(reaper.reserve().is_err());
+            publish.send(()).unwrap();
+            late_owner
+                .join()
+                .unwrap()
+                .expect("preexisting original must remain transferable after admission closure");
+            drain
+        });
+        {
+            let state = reaper.service.state.lock().unwrap();
+            assert_eq!(
+                state.entries.iter().flatten().next().unwrap().child.id(),
+                pid
+            );
+        }
+        assert!(!drain.try_seal_absence());
+        original.stdin.take(); // Actual child exits naturally on EOF.
+        reaper.await_free(1);
+        original.assert_original_reaped();
+        assert!(drain.try_seal_absence());
+        assert!(drain.clone().try_seal_absence());
+        assert!(reaper.reserve().is_err());
+    }
+
+    #[test]
+    fn exit_drain_keeps_exited_suspended_original_until_explicit_exact_recovery() {
+        let reaper = TestService::new(1);
+        let reservation = reaper.reserve().unwrap();
+        let mut original = DrainChild::spawn();
+        let pidfd = original.pidfd.try_clone().unwrap();
+        reaper.service.close_admission();
+        let drain = ExitDrain {
+            service: Some(reaper.service.clone()),
+        };
+        let observed = drain.progress_epoch();
+        reservation.preserve_suspended(
+            original.child.take().unwrap(),
+            Some(pidfd),
+            "fixture suspended original",
+        );
+        drain.wait_for_progress(observed);
+        assert!(!drain.try_seal_absence());
+        assert!(drain.pending_description().contains("1 suspended"));
+        original.stdin.take();
+        let mut poll = libc::pollfd {
+            fd: original.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 5000) }, 1);
+        assert_ne!(poll.revents & libc::POLLIN, 0);
+        assert!(
+            !drain.try_seal_absence(),
+            "observed death is not original-child reaping"
+        );
+        assert_eq!(reaper.free(), 0);
+        let report = reaper.retry_preserved().unwrap();
+        assert_eq!(
+            report,
+            RetryReport {
+                rearmed: 1,
+                retained: 0
+            }
+        );
+        reaper.await_free(1);
+        original.assert_original_reaped();
+        assert!(drain.try_seal_absence());
+        assert!(
+            reaper.reserve().is_err(),
+            "recovery cannot reopen spawn admission"
+        );
+    }
+
+    #[test]
+    fn exit_drain_progress_wait_cannot_lose_final_credit_release_or_custody_fault() {
+        use std::sync::mpsc;
+        let reaper = TestService::new(1);
+        let reservation = reaper.reserve().unwrap();
+        reaper.service.close_admission();
+        let drain = ExitDrain {
+            service: Some(reaper.service.clone()),
+        };
+        let observed = drain.progress_epoch();
+        assert!(!drain.try_seal_absence());
+        drop(reservation); // Release BEFORE entering wait: must not sleep forever.
+        drain.wait_for_progress(observed);
+        assert!(drain.try_seal_absence());
+
+        let reaper = TestService::new(1);
+        let reservation = reaper.reserve().unwrap();
+        reaper.service.close_admission();
+        let drain = ExitDrain {
+            service: Some(reaper.service.clone()),
+        };
+        let observed = drain.progress_epoch();
+        let (finished, finished_rx) = mpsc::channel();
+        thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                drain.wait_for_progress(observed);
+                finished.send(()).unwrap();
+            });
+            reaper
+                .service
+                .fail("fixture fatal worker with caller-held original credit");
+            let result = finished_rx.recv_timeout(Duration::from_secs(5));
+            // Even if the tested fault notification regresses, release wakes
+            // the waiter before asserting, so this control cannot strand it.
+            drop(reservation);
+            waiter.join().unwrap();
+            result.expect("custody failure must wake the pending-exit observer");
+        });
+        assert!(
+            drain.try_seal_absence(),
+            "a failed worker with no remaining owner is absent"
+        );
+    }
+
+    #[test]
+    fn initialization_failure_can_retry_and_the_real_worker_reaps_its_original_child() {
+        use std::sync::atomic::AtomicUsize;
+
+        let initializer = ServiceInitializer::new();
+        let attempts = AtomicUsize::new(0);
+        let failure = initializer
+            .get_or_start(|| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::from_raw_os_error(libc::EAGAIN))
+            })
+            .err()
+            .expect("the failed admission must remain a failure");
+        assert_eq!(failure.raw_os_error(), Some(libc::EAGAIN));
+        assert!(initializer.get().is_none());
+
+        let mut cleanup = None;
+        let service = initializer
+            .get_or_start(|| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                let reaper = TestService::new(1);
+                let service = reaper.service.clone();
+                cleanup = Some(reaper);
+                Ok(service)
+            })
+            .unwrap();
+        let reaper = cleanup.unwrap();
+        let same = initializer
+            .get_or_start(|| panic!("a successful service must not be restarted"))
+            .unwrap();
+        assert!(Arc::ptr_eq(&service, &same));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        let reservation = same.reserve().unwrap();
+        let mut child = Probe::spawn(&["-c", "exit 23"]);
+        child.handoff(reservation);
+        reaper.await_free(1);
+        assert!(child.child.is_none());
+        let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // WNOWAIT never consumes a status, and this fd cannot name a reused
+        // PID. ECHILD proves the service already reaped its exact original.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                child.pidfd.as_raw_fd() as libc::id_t,
+                &mut status,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(result, -1);
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert!(!service.has_outstanding_ownership());
+        assert!(!service.has_retained_ownership());
+    }
+
+    #[test]
+    fn concurrent_initialization_installs_one_worker_and_shares_its_admission_budget() {
+        use std::sync::{Barrier, atomic::AtomicUsize};
+
+        const CALLERS: usize = 8;
+        let initializer = ServiceInitializer::new();
+        let attempts = AtomicUsize::new(0);
+        let cleanup = Mutex::new(None);
+        let start = Barrier::new(CALLERS + 1);
+        let owners = thread::scope(|scope| {
+            let mut callers = Vec::new();
+            for _ in 0..CALLERS {
+                callers.push(scope.spawn(|| {
+                    start.wait();
+                    let owner = initializer
+                        .get_or_start(|| {
+                            attempts.fetch_add(1, Ordering::SeqCst);
+                            let reaper = TestService::new(CALLERS);
+                            let service = reaper.service.clone();
+                            *cleanup.lock().unwrap() = Some(reaper);
+                            Ok(service)
+                        })
+                        .unwrap();
+                    let reservation = owner.reserve().unwrap();
+                    (owner, reservation)
+                }));
+            }
+            start.wait();
+            callers
+                .into_iter()
+                .map(|caller| caller.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let reaper = cleanup.into_inner().unwrap().unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        let installed = initializer.get().unwrap();
+        assert!(
+            owners
+                .iter()
+                .all(|(owner, _)| Arc::ptr_eq(owner, installed))
+        );
+        assert_eq!(reaper.free(), 0);
+        assert_eq!(
+            installed.reserve().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(owners);
+        reaper.await_free(CALLERS);
+        assert!(!installed.has_outstanding_ownership());
+    }
+
+    #[test]
+    fn installed_service_failure_is_not_replaced_and_keeps_original_child_custody() {
+        let initializer = ServiceInitializer::new();
+        let mut cleanup = None;
+        let service = initializer
+            .get_or_start(|| {
+                let reaper = TestService::new(1);
+                let service = reaper.service.clone();
+                cleanup = Some(reaper);
+                Ok(service)
+            })
+            .unwrap();
+        let reaper = cleanup.unwrap();
+        let reservation = service.reserve().unwrap();
+        let mut child = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
+        let original_pid = child.child.as_ref().unwrap().id();
+        child.handoff(reservation);
+        service.fail("fixture installed worker failed with retained custody");
+
+        let same = initializer
+            .get_or_start(|| panic!("installed failure must not start a replacement worker"))
+            .unwrap();
+        assert!(Arc::ptr_eq(&service, &same));
+        assert!(same.has_retained_ownership());
+        assert!(same.has_outstanding_ownership());
+        assert!(
+            same.reserve()
+                .unwrap_err()
+                .to_string()
+                .contains("fixture installed")
+        );
+        assert!(same.retry_preserved().is_err());
+        assert_eq!(reaper.free(), 0);
+        assert_eq!(
+            service.state.lock().unwrap().entries[0]
+                .as_ref()
+                .unwrap()
+                .child
+                .id(),
+            original_pid,
+            "failed installed service must retain the SAME original child"
+        );
+        assert!(child.child.is_none());
+        // Existing Probe/TestService owners retain failure-only exact child
+        // cleanup and actual worker join; production never signals here.
     }
 
     #[test]
