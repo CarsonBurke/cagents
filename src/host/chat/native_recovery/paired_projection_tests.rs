@@ -453,6 +453,99 @@ fn refused_source_update_ack_preserves_exact_holder_thread_and_provider() {
 }
 
 #[test]
+fn final_retirement_reservation_defers_adoption_without_releasing_original_provider() {
+    if isolated("final_retirement_reservation_defers_adoption_without_releasing_original_provider")
+    {
+        return;
+    }
+    let fixture = Fixture::new();
+    let raw = fixture.raw();
+    let id = fixture.source.id;
+    let reserved_worker = fixture.worker.clone();
+    let ticket = std::sync::Arc::new(std::sync::Mutex::new(None));
+    struct ReservationCleanup<'a> {
+        fixture: &'a Fixture,
+        ticket: std::sync::Arc<std::sync::Mutex<Option<uuid::Uuid>>>,
+    }
+    impl Drop for ReservationCleanup<'_> {
+        fn drop(&mut self) {
+            let ticket = *self.ticket.lock().unwrap_or_else(|p| p.into_inner());
+            let mut state = self.fixture.host.lock().unwrap_or_else(|p| p.into_inner());
+            let id = self.fixture.source.id;
+            if state.terminal_retirements.get(&id).is_some_and(|entry| {
+                Some(entry.ticket) == ticket && entry.handle.same_worker(&self.fixture.worker)
+            }) {
+                state.terminal_retirements.remove(&id);
+            }
+        }
+    }
+    let _reservation_cleanup = ReservationCleanup {
+        fixture: &fixture,
+        ticket: ticket.clone(),
+    };
+    let hook_ticket = ticket.clone();
+    let _hook = before_publication_for_test(move |host| {
+        // Enter the real exact-worker reservation after the holder acknowledged
+        // its projected source, while the native attachment is uncommitted.
+        let mut state = host.lock().unwrap();
+        assert!(state.terminals[&id].handle.same_worker(&reserved_worker));
+        assert!(!state.terminal_retirements.contains_key(&id));
+        let reservation = crate::host::state::Retirement::submitting(reserved_worker);
+        *hook_ticket.lock().unwrap() = Some(reservation.ticket);
+        assert!(state.terminal_retirements.insert(id, reservation).is_none());
+    });
+    let refusal = restore(&fixture.host, CLIENT, &fixture.source).unwrap_err();
+    assert_eq!(
+        refusal,
+        "Native adoption changed before attachment publication"
+    );
+    fixture.assert_unpublished_and_preserved();
+    assert_eq!(fixture.raw(), raw, "refusal must not rewrite raw custody");
+    let (acknowledged, exited) =
+        crate::chat::native_holder::inspect(&fixture.native, &fixture.proof).unwrap();
+    assert!(!exited);
+    assert_eq!(acknowledged.source.proof.as_ref(), Some(&fixture.proof));
+    assert_eq!(
+        acknowledged.source.terminal.as_ref(),
+        Some(
+            &fixture
+                .host
+                .lock()
+                .unwrap()
+                .native_terminal_projection(id)
+                .unwrap()
+        )
+    );
+    assert_eq!(
+        acknowledged.paired_holder.as_ref(),
+        fixture.worker.holder_identity()
+    );
+    {
+        let mut state = fixture.host.lock().unwrap();
+        assert!(state.ensure_retention_available(&[id]).is_err());
+        let reservation = &state.terminal_retirements[&id];
+        assert_eq!(Some(reservation.ticket), *ticket.lock().unwrap());
+        assert!(reservation.handle.same_worker(&fixture.worker));
+        let reservation = state.terminal_retirements.remove(&id).unwrap();
+        assert!(reservation.handle.same_worker(&fixture.worker));
+        assert!(state.ensure_retention_available(&[id]).is_ok());
+    }
+    // Clearing that exact reservation permits the same issued source to attach;
+    // no replacement provider, new thread, or invented ownership is needed.
+    restore(&fixture.host, CLIENT, &fixture.source).unwrap();
+    crate::host::chat::process(
+        &fixture.host,
+        CLIENT,
+        crate::terminal::ipc::ClientRequest::ChatClose { chat_id: id },
+    )
+    .unwrap();
+    wait_until(
+        || !fixture.native.root.is_current(),
+        "ordinary close after deferred adoption did not retire original provider",
+    );
+}
+
+#[test]
 fn final_projected_field_change_refuses_without_releasing_original_provider() {
     if isolated("final_projected_field_change_refuses_without_releasing_original_provider") {
         return;

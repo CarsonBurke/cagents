@@ -273,6 +273,7 @@ impl Registry {
                 params![run_id.to_string(), run.revision, encode(&run)?],
             )
             .map_err(|e| e.to_string())?;
+            super::automation_attention::stage(&tx, &run)?;
             let mut agent: crate::agent_execution::Agent = decode(
                 &tx.query_row(
                     "SELECT record FROM agents WHERE id=?1",
@@ -627,6 +628,7 @@ impl Registry {
                 params![run.id.to_string(), run.revision, encode(&run)?],
             )
             .map_err(|error| error.to_string())?;
+            super::automation_attention::stage(tx, &run)?;
             if current_agent.session.is_none() {
                 let mut agent = current_agent.clone();
                 agent.closed = true;
@@ -2372,6 +2374,13 @@ mod tests {
             .set_automation_enabled(automation.id, 1, None, false, 201)
             .unwrap();
         assert!(!registry.claim_agent_dispatch(&accepted, 202).unwrap());
+        let pending = registry.pending_automation_attention(100).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].receipt.run, accepted.run.id);
+        assert_eq!(
+            pending[0].event.evidence.kind,
+            crate::notifications::Kind::Cancelled
+        );
         assert_eq!(
             registry.agent_run(accepted.run.id).unwrap().state,
             crate::agent_execution::State::Cancelled
@@ -2519,6 +2528,13 @@ mod tests {
         registry
             .fail_automation_start(claim.firing.id, "Target was replaced".into(), 201, true)
             .unwrap();
+        let pending = registry.pending_automation_attention(100).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].receipt.run, accepted.run.id);
+        assert_eq!(
+            pending[0].event.evidence.kind,
+            crate::notifications::Kind::Failed
+        );
         assert_eq!(
             registry.agent_run(accepted.run.id).unwrap().state,
             crate::agent_execution::State::Failed
@@ -2554,6 +2570,11 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
+            registry.pending_automation_attention(100).unwrap()[0].receipt,
+            pending[0].receipt
+        );
+        assert_eq!(registry.pending_automation_attention(100).unwrap().len(), 1);
+        assert_eq!(
             registry.agent_run(accepted.run.id).unwrap().state,
             crate::agent_execution::State::Accepted
         );
@@ -2561,6 +2582,91 @@ mod tests {
             registry.automation(automation.id).unwrap().active_firing,
             Some(second.firing.id)
         );
+    }
+
+    #[test]
+    fn attention_staging_failure_rolls_back_direct_start_failure_and_dispatch_cancellation() {
+        for dispatch_cancellation in [false, true] {
+            let (mut registry, _directory, definition) = fixture();
+            let automation = registry
+                .create_automation(definition, 100, test_identity())
+                .unwrap();
+            let claim = registry
+                .claim_automation(
+                    automation.id,
+                    1,
+                    None,
+                    crate::automations::Trigger::Manual {
+                        request: Uuid::new_v4(),
+                    },
+                    None,
+                    true,
+                    200,
+                )
+                .unwrap();
+            let accepted = claim.accepted.unwrap();
+            if dispatch_cancellation {
+                registry
+                    .set_automation_enabled(automation.id, 1, None, false, 201)
+                    .unwrap();
+            }
+            let before_model = registry.model().unwrap();
+            let before_definition = registry.automation(automation.id).unwrap();
+            let before_firing = registry.automation_firing(claim.firing.id).unwrap();
+            registry
+                .db
+                .execute_batch(
+                    "CREATE TEMP TRIGGER fail_attention BEFORE INSERT ON automation_run_attention
+                BEGIN SELECT RAISE(ABORT, 'fixture attention staging failure'); END;",
+                )
+                .unwrap();
+            if dispatch_cancellation {
+                assert!(registry.claim_agent_dispatch(&accepted, 202).is_err());
+            } else {
+                assert!(
+                    registry
+                        .fail_automation_start(claim.firing.id, "Rejected".into(), 202, true)
+                        .is_err()
+                );
+            }
+            assert_eq!(registry.agent_run(accepted.run.id).unwrap(), accepted.run);
+            assert_eq!(registry.agent(accepted.agent.id).unwrap(), accepted.agent);
+            assert_eq!(
+                registry.automation(automation.id).unwrap(),
+                before_definition
+            );
+            assert_eq!(
+                registry.automation_firing(claim.firing.id).unwrap(),
+                before_firing
+            );
+            assert_eq!(registry.model().unwrap(), before_model);
+            assert!(
+                registry
+                    .pending_automation_attention(100)
+                    .unwrap()
+                    .is_empty()
+            );
+            registry
+                .db
+                .execute_batch("DROP TRIGGER fail_attention")
+                .unwrap();
+            let expected = if dispatch_cancellation {
+                assert!(!registry.claim_agent_dispatch(&accepted, 202).unwrap());
+                crate::notifications::Kind::Cancelled
+            } else {
+                registry
+                    .fail_automation_start(claim.firing.id, "Rejected".into(), 202, true)
+                    .unwrap();
+                crate::notifications::Kind::Failed
+            };
+            assert_eq!(
+                registry.pending_automation_attention(100).unwrap()[0]
+                    .event
+                    .evidence
+                    .kind,
+                expected
+            );
+        }
     }
 
     #[test]
@@ -3615,24 +3721,14 @@ mod tests {
 
     #[test]
     fn automation_lifecycle_audit_upgrade_does_not_attribute_missing_legacy_events() {
-        let (mut registry, directory, definition) = fixture();
+        let (mut registry, _directory, definition) = fixture();
         let created = registry
             .create_automation(definition, 100, test_identity())
             .unwrap();
-        registry
-            .db
-            .execute_batch(
-                "DROP TABLE automation_notifications;
-                 DROP TABLE channel_work_placement_epochs;
-                DROP TABLE channel_work_placement_clock;
-                DROP TABLE channel_work_operations;
-                DROP TABLE channel_work_entries;
-                DROP TABLE channel_work_homes;
-                DROP TABLE automation_lifecycle; PRAGMA user_version=15;",
-            )
-            .unwrap();
+        let legacy_path =
+            super::super::automation_proposals::published_fixture_from_rows(&registry, 15);
         drop(registry);
-        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let mut registry = Registry::at(&legacy_path).unwrap();
         let legacy = registry.automation_audit(created.id, None, 100).unwrap();
         assert!(legacy.events.is_empty() && legacy.earlier_events_unavailable);
         registry
@@ -3643,7 +3739,7 @@ mod tests {
         assert_eq!(current.events.len(), 1);
         assert_eq!(current.events[0].cause, LifecycleCause::Disabled);
         drop(registry);
-        let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let registry = Registry::at(&legacy_path).unwrap();
         assert_eq!(
             registry.automation_audit(created.id, None, 100).unwrap(),
             current
