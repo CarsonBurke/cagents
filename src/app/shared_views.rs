@@ -1738,6 +1738,12 @@ impl Cagents {
             }
         }
         let members = visible.iter().copied().collect::<HashSet<_>>();
+        let existing = self
+            .durable
+            .cards
+            .iter()
+            .map(|card| card.id)
+            .collect::<HashSet<_>>();
         let ordered = self
             .durable
             .cards
@@ -1747,7 +1753,7 @@ impl Cagents {
             .eq(visible
                 .iter()
                 .copied()
-                .filter(|id| self.card_state(*id).is_some()));
+                .filter(|id| existing.contains(id)));
         if !ordered {
             let states = self
                 .durable
