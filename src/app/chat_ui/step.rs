@@ -167,12 +167,27 @@ pub(super) fn code_frame<'a>(
         .width(Length::Fill)
         .into();
     let block = widget::column::with_children(vec![
-        widget::container(design::caption(caption))
-            .padding(iced::Padding::ZERO.right(24))
-            .width(Length::Fill)
-            .height(24)
+        // The caption owns its line box. The spacer keeps the ordinary
+        // header compact without clipping larger interface typography.
+        widget::container(
+            widget::row::with_children(vec![
+                iced::widget::Space::new().width(0).height(24).into(),
+                crate::interaction::tooltip(
+                    design::caption(caption.clone())
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .ellipsize(iced::widget::text::Ellipsize::End(
+                            iced::widget::text::EllipsizeHeightLimit::Lines(1),
+                        ))
+                        .width(Length::Fill),
+                    caption,
+                ),
+            ])
             .align_y(Alignment::Center)
-            .into(),
+            .width(Length::Fill),
+        )
+        .padding(iced::Padding::ZERO.right(24))
+        .width(Length::Fill)
+        .into(),
         body,
     ])
     .spacing(GAP_XS)
@@ -670,3 +685,6 @@ impl Runtime {
             .into()
     }
 }
+
+#[cfg(test)]
+mod tests;
