@@ -21,6 +21,9 @@ thread_local! {
     static PROTECTIONS: Cell<usize> = const { Cell::new(0) };
     static OWNER_RESOLUTIONS: Cell<usize> = const { Cell::new(0) };
     static FOLDER_ROOT_REFRESHES: Cell<usize> = const { Cell::new(0) };
+    static CHROME_SYNCS: Cell<usize> = const { Cell::new(0) };
+    static CARD_INDEXES: Cell<usize> = const { Cell::new(0) };
+    static PERSISTS: Cell<usize> = const { Cell::new(0) };
 }
 pub(super) fn record_projection() {
     PROJECTIONS.set(PROJECTIONS.get() + 1);
@@ -34,6 +37,15 @@ pub(super) fn record_owner_resolution() {
 pub(super) fn record_folder_root_refresh() {
     FOLDER_ROOT_REFRESHES.set(FOLDER_ROOT_REFRESHES.get() + 1);
 }
+pub(super) fn record_chrome() {
+    CHROME_SYNCS.set(CHROME_SYNCS.get() + 1);
+}
+pub(super) fn record_card_index() {
+    CARD_INDEXES.set(CARD_INDEXES.get() + 1);
+}
+pub(super) fn record_persist() {
+    PERSISTS.set(PERSISTS.get() + 1);
+}
 fn counts() -> (usize, usize) {
     (PROJECTIONS.get(), PROTECTIONS.get())
 }
@@ -41,6 +53,9 @@ fn reset() {
     PROJECTIONS.set(0);
     PROTECTIONS.set(0);
     OWNER_RESOLUTIONS.set(0);
+    CHROME_SYNCS.set(0);
+    CARD_INDEXES.set(0);
+    PERSISTS.set(0);
 }
 
 #[derive(Debug)]
@@ -318,9 +333,6 @@ fn grid_output_keeps_workspace_and_protection_preparation_idle() {
 fn semantic_terminal_changes_invalidate_but_identical_reports_do_not() {
     let (mut app, card, mut peer) = fixture();
     let events = [
-        WireTerminalEvent::TitleChanged {
-            title: "output agent".into(),
-        },
         WireTerminalEvent::WorkingDirectoryChanged {
             path: "/output-fixture/new".into(),
         },
@@ -360,6 +372,166 @@ fn semantic_terminal_changes_invalidate_but_identical_reports_do_not() {
     );
     assert_eq!(counts(), (1, 1));
     assert!(ended_terminal(app.card_state(card)).is_some());
+}
+
+fn title(text: &str) -> Option<WireTerminalEvent> {
+    Some(WireTerminalEvent::TitleChanged { title: text.into() })
+}
+
+/// An animated OSC title (a spinner, a step counter) changes the durable card
+/// on every frame. Each one reaches the tab and the window title at once, but
+/// it rebuilds no sidebar or protection state and the burst is saved once.
+#[test]
+fn reported_title_churn_updates_chrome_and_saves_once_per_window() {
+    let (mut app, card, mut peer) = fixture();
+    let window = app.core.window.header_title.clone();
+    for step in 0..20 {
+        let text = format!("build step {step}");
+        apply(&mut app, card, &mut peer, title(&text));
+        assert_eq!(app.card_state(card).unwrap().title, text);
+        assert!(app.card_chrome[&card].title.starts_with(&text));
+        assert_eq!(
+            app.workspace.card(card).unwrap().accessible_name,
+            text,
+            "the pane's accessible name follows the report"
+        );
+    }
+    assert_ne!(app.core.window.header_title, window);
+    assert!(app.core.window.header_title.starts_with("build step 19"));
+    assert_eq!(
+        counts(),
+        (0, 0),
+        "a title needs no sidebar or protection pass"
+    );
+    assert_eq!(CHROME_SYNCS.get(), 20);
+    assert_eq!(PERSISTS.get(), 0, "the burst is saved after it, once");
+    assert!(!app.reported_title_save.cards.is_empty() && app.reported_title_save.scheduled);
+
+    // An identical report changes nothing at all.
+    reset();
+    apply(&mut app, card, &mut peer, title("build step 19"));
+    assert_eq!((counts(), CHROME_SYNCS.get()), ((0, 0), 0));
+
+    drop(app.update(Message::ReportedTitleSaveDue));
+    assert_eq!(PERSISTS.get(), 1);
+    assert!(app.reported_title_save.cards.is_empty() && !app.reported_title_save.scheduled);
+    drop(app.update(Message::ReportedTitleSaveDue));
+    assert_eq!(PERSISTS.get(), 1, "a stale timer has nothing left to save");
+
+    // Another save during a burst carries the title; the burst still arms
+    // only its one timer, which saves only what changed after that save.
+    reset();
+    apply(&mut app, card, &mut peer, title("build step 20"));
+    assert!(app.reported_title_save.scheduled);
+    app.persist();
+    assert!(app.reported_title_save.cards.is_empty());
+    drop(app.update(Message::ReportedTitleSaveDue));
+    assert_eq!(PERSISTS.get(), 1, "the earlier save already carried it");
+    apply(&mut app, card, &mut peer, title("build step 21"));
+    apply(&mut app, card, &mut peer, title("build step 22"));
+    assert!(!app.reported_title_save.cards.is_empty() && app.reported_title_save.scheduled);
+    drop(app.update(Message::ReportedTitleSaveDue));
+    assert_eq!(PERSISTS.get(), 2);
+
+    // The timer itself leaves `update`: the first title of a burst returns
+    // one more task than the next.
+    let mut wake = |text: &str| {
+        let generation = peer.publish(title(text));
+        app.update(Message::TerminalWake { card, generation })
+            .units()
+    };
+    let (arming, armed) = (wake("build step 23"), wake("build step 24"));
+    assert_eq!(arming, armed + 1);
+}
+
+/// A title arriving with any other change takes the full projection, and a
+/// change that is saved at once saves the title with it.
+#[test]
+fn a_title_with_a_semantic_change_still_projects_and_saves_everything() {
+    let (mut app, card, mut peer) = fixture();
+    peer.publish(title("waiting for input"));
+    apply(&mut app, card, &mut peer, Some(WireTerminalEvent::Bell));
+    assert_eq!(counts(), (1, 1));
+    assert_eq!(app.card_state(card).unwrap().title, "waiting for input");
+    assert!(
+        app.card_chrome[&card]
+            .title
+            .starts_with("waiting for input")
+    );
+    assert_eq!(PERSISTS.get(), 0, "a bell is not durable; the title waits");
+    assert!(!app.reported_title_save.cards.is_empty());
+
+    reset();
+    peer.publish(title("finished"));
+    apply(
+        &mut app,
+        card,
+        &mut peer,
+        Some(WireTerminalEvent::Completed {
+            exit_code: 1,
+            signal: None,
+            intentional: false,
+        }),
+    );
+    assert_eq!(counts(), (1, 1));
+    assert_eq!(PERSISTS.get(), 1, "the completion is saved with the title");
+    assert!(app.reported_title_save.cards.is_empty());
+    assert_eq!(app.card_state(card).unwrap().title, "finished");
+    assert!(ended_terminal(app.card_state(card)).is_some());
+}
+
+/// Timers that only repaint elapsed time or progress change nothing the
+/// workspace projection reads.
+#[test]
+fn repaint_ticks_skip_the_projection_tail() {
+    let (mut app, _card, _peer) = fixture();
+    let durable = Arc::clone(&app.durable);
+    for _ in 0..8 {
+        drop(app.update(Message::ChatUi(super::chat_ui::Action::Tick)));
+    }
+    assert_eq!((counts(), CHROME_SYNCS.get()), ((0, 0), 0));
+    assert!(Arc::ptr_eq(&durable, &app.durable));
+    // Any other message still projects.
+    drop(app.update(Message::FocusSaveDue));
+    assert_eq!((counts(), CHROME_SYNCS.get()), ((1, 1), 1));
+}
+
+/// `card_indices` is a function of the durable card order alone, so it is
+/// rebuilt only for a workspace it was not built from.
+#[test]
+fn card_indices_rebuild_only_for_a_changed_workspace() {
+    let (mut app, card, _peer) = fixture();
+    drop(app.sync_chrome());
+    reset();
+    drop(app.sync_chrome());
+    drop(app.update(Message::FocusSaveDue));
+    assert_eq!(CHROME_SYNCS.get(), 2);
+    assert_eq!(
+        CARD_INDEXES.get(),
+        0,
+        "an unchanged workspace keeps its index"
+    );
+
+    let mut first = app.card_state(card).unwrap().clone();
+    first.id = CardId::new();
+    Arc::make_mut(&mut app.durable)
+        .cards
+        .insert(0, first.clone());
+    drop(app.sync_chrome());
+    assert_eq!(CARD_INDEXES.get(), 1, "copy-on-write moved the workspace");
+    assert_eq!(app.card_indices.get(&first.id), Some(&0));
+    assert_eq!(app.card_indices.get(&card), Some(&1));
+    assert_eq!(app.card_index(card), Some(1));
+
+    // A replacement workspace is reindexed even with identical contents.
+    app.durable = Arc::new((*app.durable).clone());
+    drop(app.sync_chrome());
+    assert_eq!(CARD_INDEXES.get(), 2);
+    Arc::make_mut(&mut app.durable).cards.remove(0);
+    drop(app.sync_chrome());
+    assert_eq!(CARD_INDEXES.get(), 3);
+    assert_eq!(app.card_indices.get(&card), Some(&0));
+    assert!(!app.card_indices.contains_key(&first.id));
 }
 
 #[test]
@@ -436,7 +608,16 @@ fn root_exit_keeps_the_live_descendant_surface_and_controls() {
             title: "descendant still alive".into(),
         }),
     );
-    assert_eq!(counts(), (1, 1));
+    assert_eq!(
+        app.card_state(card).unwrap().title,
+        "descendant still alive"
+    );
+    assert!(
+        app.card_chrome[&card]
+            .title
+            .starts_with("descendant still alive")
+    );
+    assert_eq!((counts(), CHROME_SYNCS.get()), ((0, 0), 1));
 }
 
 #[test]
