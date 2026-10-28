@@ -368,6 +368,91 @@ print('ready', flush=True)
 }
 
 #[test]
+fn staged_replacement_keeps_recovery_presentation_and_original_scope_through_exec() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let script = root.path().join("staged-ui");
+    std::fs::write(
+        &script,
+        r#"#!/usr/bin/python3
+import json, os, pathlib, sys
+expected = os.environ['FIXTURE_EXPECT_OWNED'] == '1'
+assert (os.environ.get('CAGENTS_UI_FAILURE_SCREEN_OWNED') == '1') == expected
+assert os.environ.get('CAGENTS_UI_LAUNCH_HANDSHAKE') == '1'
+assert os.environ.get('CAGENTS_UI_LAUNCH_RECOVERY_PROGRESS') == '1'
+for key in [b'CAGENTS_AGENT_AUTHORITY', b'CAGENTS_AGENT_TOKEN', b'CAGENTS_SESSION_TOKEN']:
+    assert os.environb[key].hex() == os.environ['FIXTURE_EXPECT_ORIGIN_HEX']
+output = pathlib.Path(os.environ['FIXTURE_OUTPUT'])
+if 'FIXTURE_REPLACED_PID' not in os.environ:
+    os.environ['FIXTURE_REPLACED_PID'] = str(os.getpid())
+    os.execv(sys.executable, [sys.executable, __file__, *sys.argv[1:]])
+assert int(os.environ['FIXTURE_REPLACED_PID']) == os.getpid()
+output.write_text(json.dumps({'arguments': sys.argv[1:], 'owned': expected,
+    'same_process': True, 'origin_preserved': True}))
+print('error: fixture staged startup refused', flush=True)
+sys.exit(1)
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let request = Request::new(
+        false,
+        Some("device-0123456789abcdef".into()),
+        Some("device-fedcba9876543210".into()),
+        Some("build-host".into()),
+        true,
+    )
+    .unwrap();
+    let expected = request.arguments();
+    for owned in [false, true] {
+        for (index, (origin, hex)) in [
+            (
+                std::ffi::OsString::from("fixture-scope"),
+                "666978747572652d73636f7065",
+            ),
+            (std::ffi::OsString::new(), ""),
+            (std::ffi::OsString::from_vec(vec![0xff]), "ff"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let output = root.path().join(format!("staged-{owned}-{index}.json"));
+            // This is the exact staged replacement builder called by UI entry,
+            // after its original presentation flag has been consumed. The
+            // replacement keeps normal readiness and rejects startup below.
+            let mut command = super::super::staged_ui_command(
+                &script,
+                expected.iter().map(std::ffi::OsString::from),
+                owned,
+            );
+            command
+                .env("FIXTURE_EXPECT_OWNED", if owned { "1" } else { "0" })
+                .env("FIXTURE_EXPECT_ORIGIN_HEX", hex)
+                .env("FIXTURE_OUTPUT", &output)
+                .env_remove("FIXTURE_REPLACED_PID");
+            for key in [
+                crate::agent_execution::AUTHORITY_ENV,
+                "CAGENTS_AGENT_TOKEN",
+                "CAGENTS_SESSION_TOKEN",
+            ] {
+                // An explicit inert scope in the disposable process also
+                // exercises present empty/non-Unicode values. No parent
+                // credential is read, removed or converted to User authority.
+                command.env(key, &origin);
+            }
+            assert!(wait_for_reopen(&mut command).is_err());
+            let receipt: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+            assert_eq!(receipt["arguments"], serde_json::json!(expected));
+            assert_eq!(receipt["owned"], owned);
+            assert_eq!(receipt["same_process"], true);
+            assert_eq!(receipt["origin_preserved"], true);
+        }
+    }
+}
+
+#[test]
 fn exact_open_intent_never_substitutes_another_window_after_missing_target() {
     let request = Request::new(
         false,

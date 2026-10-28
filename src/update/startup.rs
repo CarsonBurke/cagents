@@ -12,6 +12,24 @@ pub fn failure_screen_owned() -> bool {
         && std::env::var_os(FAILURE_SCREEN_OWNED_ENV).as_deref() == Some("1".as_ref())
 }
 
+/// Replace this UI entry point without losing the waiting recovery screen.
+/// Startup consumes the presentation flag before ordinary children can inherit
+/// it; only a staged replacement of that same launch receives it again.
+pub fn staged_ui_command(
+    executable: &Path,
+    arguments: impl IntoIterator<Item = std::ffi::OsString>,
+    failure_screen_owned: bool,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(executable);
+    command.args(arguments);
+    if failure_screen_owned {
+        command.env(FAILURE_SCREEN_OWNED_ENV, "1");
+    } else {
+        command.env_remove(FAILURE_SCREEN_OWNED_ENV);
+    }
+    command
+}
+
 use super::{UpdateJob, UpdatePhase, impact::Disposition};
 use std::{
     fs,

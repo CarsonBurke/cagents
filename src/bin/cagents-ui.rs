@@ -116,7 +116,7 @@ pub(crate) fn main_with_before_start(
         Ok(request) => request,
         Err(error) => return report(Err(error.into())),
     };
-    let result = run(options);
+    let result = run(options, failure_screen_owned);
     match &result {
         Err(error) if cagents::instance::is_update_in_progress(error.as_ref()) => {
             // Expected coordinator ownership is not a crash. Preserve the
@@ -315,7 +315,7 @@ fn parse<'a>(arguments: &'a [String]) -> Result<Option<Options<'a>>, Box<dyn std
     Ok(Some(options))
 }
 
-fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
+fn run(options: Options<'_>, failure_screen_owned: bool) -> Result<(), Box<dyn std::error::Error>> {
     let Options {
         new_window,
         slot,
@@ -329,8 +329,11 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
     if !cagents::device::is_remote() {
         if let Some(executable) = cagents::control::staged_ui_executable()? {
             // exec preserves the launcher handshake pipe and window arguments.
-            let mut command = std::process::Command::new(executable);
-            command.args(std::env::args_os().skip(1));
+            let mut command = cagents::update::startup::staged_ui_command(
+                &executable,
+                std::env::args_os().skip(1),
+                failure_screen_owned,
+            );
             return Err(command.exec().into());
         }
     }
