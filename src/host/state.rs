@@ -6859,6 +6859,10 @@ for line in sys.stdin:
             upgrade_blockers_message(&[describe_upgrade_blocker(&descriptor.session)], false);
         let mut attempts = 0;
         loop {
+            assert!(
+                Instant::now() < idle_deadline,
+                "restored shell exhausted its ready/prepare deadline after {attempts} attempts"
+            );
             attempts += 1;
             let capability = host
                 .lock()
@@ -6883,7 +6887,12 @@ for line in sys.stdin:
                         assert!(!state.shutting_down);
                         assert!(state.upgrade.is_none());
                         assert_eq!(state.terminals.len(), 1);
-                        assert!(state.terminals.contains_key(&source.id));
+                        assert!(state.terminals[&source.id].handle.same_worker(&restored));
+                        assert!(!restored.is_completed());
+                        assert_eq!(
+                            state.descriptor(0, source.id).unwrap().session.launch,
+                            source.launch
+                        );
                     }
                     assert!(
                         Store::open(directory.path())
