@@ -236,6 +236,44 @@ struct State {
     aliased: Vec<usize>,
 }
 
+// Read-only observations of the actual retained layout, never a second
+// implementation of its measurement or prefix calculations.
+#[cfg(test)]
+#[derive(Debug)]
+pub(super) struct MeasuredGeometry {
+    pub keys: Vec<u64>,
+    pub offsets: Vec<f32>,
+    pub measured: Vec<usize>,
+    pub mounted: Vec<usize>,
+}
+#[cfg(test)]
+pub(super) fn measured_geometry(tree: &Tree, rows: usize) -> Option<MeasuredGeometry> {
+    if tree.tag == tree::Tag::of::<State>() {
+        let state = tree.state.downcast_ref::<State>();
+        if matches!(state.axis, Axis::Vertical) && state.positions.len() == rows {
+            let mut keys = vec![0; rows];
+            for (&key, &index) in &state.positions {
+                keys[index] = key;
+            }
+            return Some(MeasuredGeometry {
+                measured: keys
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, key)| state.heights.contains_key(key).then_some(index))
+                    .collect(),
+                keys,
+                offsets: (0..=rows)
+                    .map(|index| state.offsets.prefix(index))
+                    .collect(),
+                mounted: state.mounted.iter().map(|&(index, _)| index).collect(),
+            });
+        }
+    }
+    tree.children
+        .iter()
+        .find_map(|child| measured_geometry(child, rows))
+}
+
 /// Mutable measured heights with logarithmic corrections and prefix lookup.
 /// Ordinary wheel/layout passes never rebuild an all-history offset vector.
 #[derive(Default)]

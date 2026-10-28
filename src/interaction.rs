@@ -1282,11 +1282,14 @@ impl<'a, Message: 'a> Tip<'a, Message> {
             // beside something else, so it takes the body role;
             // `design::caption` also mutes its color, which an overlay with
             // its own background must not do.
-            cosmic::widget::container(crate::design::body(self.label.clone()))
-                .class(crate::design::transparent())
-                .padding([space::XS, space::S])
-                .max_width(TIP_MAX_WIDTH)
-                .into()
+            cosmic::widget::container(
+                crate::design::body(self.label.clone())
+                    .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph),
+            )
+            .class(crate::design::transparent())
+            .padding([space::XS, space::S])
+            .max_width(TIP_MAX_WIDTH)
+            .into()
         })
     }
 }

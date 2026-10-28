@@ -150,8 +150,9 @@ pub(super) struct State {
     last_workspace: Weak<WorkspaceState>,
     /// What the last published presence was derived from, past the durable
     /// workspace: the focused card, window focus, whether the card's pane is
-    /// active, and which review a focused pull request pane has open.
-    last_focus: Option<(Option<CardId>, bool, bool, Option<u64>)>,
+    /// active, whether its latest result is visible, and which review a
+    /// focused pull request pane has open.
+    last_focus: Option<(Option<CardId>, bool, bool, bool, Option<u64>)>,
     visible_focus: Option<CardId>,
     visible_notices: BTreeSet<uuid::Uuid>,
     visible_acknowledged: bool,
@@ -423,6 +424,7 @@ impl Cagents {
             .preferences(self.settings.notifications);
     }
 
+    /// Explicit reads acknowledge the durable journal as well as local badges.
     pub(super) fn acknowledge_card_notices(&mut self, card: CardId) {
         let session = self.card_state(card).and_then(card_session);
         let ids: Vec<_> = self
@@ -442,7 +444,7 @@ impl Cagents {
         let visible = self
             .workspace
             .focused()
-            .filter(|card| self.pane_is_active(*card));
+            .filter(|card| self.pane_reads_latest_update(*card));
         if self.notification_ui.visible_focus == visible {
             return Task::none();
         }
@@ -488,13 +490,20 @@ impl Cagents {
     pub(super) fn sync_notification_presence(&mut self) {
         let focused_card = self.workspace.focused();
         let qualified = focused_card.is_some_and(|card| self.pane_is_active(card));
+        let reading = focused_card.is_some_and(|card| self.pane_reads_latest_update(card));
         // A pane can open another review without the durable workspace
         // changing, and the review it shows names the alert it focuses.
         let review = focused_card.and_then(|card| match self.cards.get(&card) {
             Some(CardRuntime::PullRequests(pane)) => Some(pane.review.selection_generation()),
             _ => None,
         });
-        let focus = (focused_card, self.refresh_ui.focused, qualified, review);
+        let focus = (
+            focused_card,
+            self.refresh_ui.focused,
+            qualified,
+            reading,
+            review,
+        );
         if self.notification_ui.last_focus == Some(focus)
             && self.notification_ui.last_workspace.as_ptr() == Arc::as_ptr(&self.durable)
         {
@@ -555,14 +564,14 @@ impl Cagents {
         let session_read = crate::notifications::focused_notice_ids(
             &self.notification_ui.snapshot,
             None,
-            focused,
+            reading.then_some(focused).flatten(),
             focus_changed,
             self.settings.notifications.while_focused,
         );
         // Delivery presence changes immediately, but implicit Session reads on
         // a visibility return share the sidebar's qualified dwell. Preserve
         // the existing policy for fresh alerts while the parent stays visible.
-        if focused_card == self.notification_ui.visible_focus {
+        if reading && focused_card == self.notification_ui.visible_focus {
             read.extend(session_read.into_iter().filter(|id| {
                 self.notification_ui.visible_acknowledged
                     || (!focus_changed && !self.notification_ui.visible_notices.contains(id))
@@ -1745,6 +1754,63 @@ mod tests {
         drop(app.update_review_requests(crate::app::review_request_ui::Action::Tick));
         assert_eq!(app.workspace.focused(), focused);
         assert_eq!(app.durable.cards, cards);
+    }
+
+    #[test]
+    fn marking_a_channel_read_acknowledges_the_journal_before_the_next_snapshot() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.refresh_ui.focused = false;
+        let card = app.workspace.focused().unwrap();
+        let session = card_session(&app.durable.cards[0]).unwrap();
+        let channel = crate::model::ChannelId::new();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(crate::model::ProjectChannel {
+                title_source: Default::default(),
+                id: channel,
+                project_id: ProjectId::new(),
+                title: "Read fixture".into(),
+                ordinal: 0,
+                shared: false,
+                cards: vec![card],
+                focused: Some(card),
+            });
+        let id = uuid::Uuid::new_v4();
+        let snapshot = Snapshot {
+            notices: vec![crate::notifications::Notice {
+                id,
+                event: crate::notifications::Event {
+                    target: Target::Session(session),
+                    source_session: Some(session),
+                    provider: Some(Provider::Claude),
+                    directory: Some("/tmp".into()),
+                    destination: None,
+                    evidence: crate::notifications::Evidence {
+                        key: "channel-complete".into(),
+                        kind: crate::notifications::Kind::Succeeded,
+                    },
+                    content: None,
+                },
+                delivered: true,
+                acknowledged: false,
+                window: None,
+            }],
+            diagnostic: None,
+        };
+        drop(app.update_notifications(Action::Snapshot(snapshot.clone())));
+        assert!(app.sidebar_state.has_card_update(card));
+        drop(app.update(Message::Sidebar(SidebarAction::MarkChannelRead(channel))));
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert!(
+            app.notification_ui
+                .pending
+                .lock()
+                .unwrap()
+                .acknowledged
+                .contains(&id)
+        );
+        drop(app.update_notifications(Action::Snapshot(snapshot)));
+        assert!(!app.sidebar_state.has_card_update(card));
     }
 
     #[test]

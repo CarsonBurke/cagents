@@ -55,6 +55,7 @@ impl Input {
 #[derive(Clone)]
 struct Request {
     input: Input,
+    copy_receipt: Option<chat::client::rendered_copy::Receipt>,
     provider: Provider,
     growing: bool,
     version: u64,
@@ -532,6 +533,7 @@ impl State {
                 shared: Arc::new(Shared::new(SharedData {
                     latest: Mutex::new(Request {
                         input: Input::Local(source.clone()),
+                        copy_receipt: None,
                         provider: Provider::Claude,
                         growing: false,
                         version: 1,
@@ -737,6 +739,17 @@ impl State {
         theme: crate::settings::EditorSyntaxTheme,
         append: impl Fn(&Arc<chat::Item>, &Arc<chat::Item>) -> bool,
     ) -> bool {
+        self.stage_with_copy(item, None, growing, theme, append)
+    }
+
+    pub(super) fn stage_with_copy(
+        &mut self,
+        item: &Arc<chat::Item>,
+        copy_receipt: Option<chat::client::rendered_copy::Receipt>,
+        growing: bool,
+        theme: crate::settings::EditorSyntaxTheme,
+        append: impl Fn(&Arc<chat::Item>, &Arc<chat::Item>) -> bool,
+    ) -> bool {
         self.last_deferred = false;
         let Some(bytes) = source_bytes(&item.content) else {
             return false;
@@ -787,6 +800,7 @@ impl State {
                 if entry.shared.lease.resize(bytes) {
                     *latest = Request {
                         input: Input::Transcript(item.clone()),
+                        copy_receipt: copy_receipt.clone(),
                         provider: self.provider.unwrap_or(Provider::Claude),
                         growing,
                         version: latest.version.wrapping_add(1),
@@ -824,6 +838,7 @@ impl State {
                 shared: Arc::new(Shared::new(SharedData {
                     latest: Mutex::new(Request {
                         input: Input::Transcript(item.clone()),
+                        copy_receipt: copy_receipt.clone(),
                         provider: self.provider.unwrap_or(Provider::Claude),
                         growing,
                         version: 1,
@@ -1113,6 +1128,7 @@ impl Prepared {
             _owner: self._owner,
             _permit: self._permit,
         };
+        cached.copy_receipt = self.request.copy_receipt;
         cached.token = ChangeToken::of(
             &self
                 .request

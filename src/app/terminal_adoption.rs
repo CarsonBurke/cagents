@@ -361,7 +361,7 @@ impl Cagents {
                 .file_name()
                 .and_then(|name| normalize_card_name(&name.to_string_lossy()))
                 .unwrap_or_else(|| "Terminal".into()),
-            width_fraction: self.settings.default_column_fraction,
+            width_fraction: self.new_pane_fraction(self.settings.default_column_fraction),
             existence: Existence::Open,
             // Adoption is not a user action, so it claims no camera and no
             // focus. The card enters offscreen - cold, or hibernated for an

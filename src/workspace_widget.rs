@@ -68,8 +68,12 @@ pub enum GlobalShortcut {
     FocusPane7,
     FocusPane8,
     FocusPane9,
+    /// Focus the last pane in the current strip, independent of MRU history.
+    FocusLastPane,
     NewTerminal,
     NewChannel,
+    NextAttention,
+    PreviousAttention,
     ClonePane,
     CloseFocusedCard,
     FocusProjectSearch,
@@ -280,6 +284,12 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         scope: ShortcutScope::Workspace,
     },
     ShortcutDescriptor {
+        action: GlobalShortcut::FocusLastPane,
+        label: "Focus last pane",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
         action: GlobalShortcut::NewTerminal,
         label: "New terminal",
         repeatable: false,
@@ -342,6 +352,18 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor {
         action: GlobalShortcut::CycleWorkspace(FocusDirection::Right),
         label: "Next workspace",
+        repeatable: true,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::NextAttention,
+        label: "Next pane needing attention",
+        repeatable: true,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::PreviousAttention,
+        label: "Previous pane needing attention",
         repeatable: true,
         scope: ShortcutScope::Workspace,
     },
@@ -414,6 +436,7 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::FocusPane7 => &shortcuts.focus_pane_7,
         GlobalShortcut::FocusPane8 => &shortcuts.focus_pane_8,
         GlobalShortcut::FocusPane9 => &shortcuts.focus_pane_9,
+        GlobalShortcut::FocusLastPane => &shortcuts.focus_last_pane,
         GlobalShortcut::NewTerminal => &shortcuts.new_terminal,
         GlobalShortcut::NewChannel => &shortcuts.new_channel,
         GlobalShortcut::ClonePane => &shortcuts.clone_pane,
@@ -425,6 +448,8 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::CyclePaneWidth => &shortcuts.cycle_pane_width,
         GlobalShortcut::CycleWorkspace(FocusDirection::Left) => &shortcuts.previous_workspace,
         GlobalShortcut::CycleWorkspace(FocusDirection::Right) => &shortcuts.next_workspace,
+        GlobalShortcut::NextAttention => &shortcuts.next_attention,
+        GlobalShortcut::PreviousAttention => &shortcuts.previous_attention,
         GlobalShortcut::ReviewToggleViewed => &shortcuts.review_toggle_viewed,
         GlobalShortcut::ReviewNextFile => &shortcuts.review_next_file,
         GlobalShortcut::ReviewPreviousFile => &shortcuts.review_previous_file,
@@ -4800,5 +4825,122 @@ mod tests {
         let mut moved = projection;
         moved.offset = moved_offset;
         assert_eq!(positions, expected_overlay_positions(&moved, VIEWPORT));
+    }
+    #[test]
+    fn attention_shortcuts_preserve_physical_keys_and_allow_rebinding_and_unbinding() {
+        use keyboard::key::Code;
+        let mut shortcuts = KeyboardShortcuts::default();
+        for focused in [FocusedPane::Terminal, FocusedPane::Chat, FocusedPane::Other] {
+            for (modifiers, expected) in [
+                (keyboard::Modifiers::ALT, GlobalShortcut::NextAttention),
+                (
+                    keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT,
+                    GlobalShortcut::PreviousAttention,
+                ),
+            ] {
+                assert_eq!(
+                    global_shortcut(
+                        &key_press("ф", Code::KeyA, modifiers, false),
+                        &shortcuts,
+                        focused,
+                    ),
+                    Some(expected)
+                );
+            }
+        }
+        shortcuts.next_attention = vec!["Alt+N".into()];
+        assert_eq!(
+            global_shortcut(
+                &key_press("a", Code::KeyA, keyboard::Modifiers::ALT, false),
+                &shortcuts,
+                FocusedPane::Terminal,
+            ),
+            None
+        );
+        assert_eq!(
+            global_shortcut(
+                &key_press("n", Code::KeyN, keyboard::Modifiers::ALT, false),
+                &shortcuts,
+                FocusedPane::Terminal,
+            ),
+            Some(GlobalShortcut::NextAttention)
+        );
+        shortcuts.next_attention.clear();
+        shortcuts.previous_attention.clear();
+        assert_eq!(
+            global_shortcut(
+                &key_press("n", Code::KeyN, keyboard::Modifiers::ALT, false),
+                &shortcuts,
+                FocusedPane::Terminal,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn focus_last_pane_uses_physical_zero_and_respects_rebinding_unbinding_and_repeat() {
+        use keyboard::key::Code;
+        let mut shortcuts = KeyboardShortcuts::default();
+        for character in ["0", "à", "ы"] {
+            for focused in [FocusedPane::Terminal, FocusedPane::Chat, FocusedPane::Other] {
+                assert_eq!(
+                    global_shortcut(
+                        &key_press(character, Code::Digit0, keyboard::Modifiers::ALT, false),
+                        &shortcuts,
+                        focused
+                    ),
+                    Some(GlobalShortcut::FocusLastPane)
+                );
+                assert_eq!(
+                    global_shortcut(
+                        &key_press(character, Code::Digit0, keyboard::Modifiers::ALT, true),
+                        &shortcuts,
+                        focused
+                    ),
+                    None
+                );
+            }
+        }
+        assert_eq!(
+            global_shortcut(
+                &key_press("0", Code::Digit0, keyboard::Modifiers::empty(), false),
+                &shortcuts,
+                FocusedPane::Terminal
+            ),
+            None
+        );
+        assert!(!is_global_shortcut_chord(
+            &keyboard::Key::Character("0".into()),
+            keyboard::key::Physical::Code(Code::Digit0),
+            keyboard::Modifiers::empty(),
+            &shortcuts,
+            FocusedPane::Terminal
+        ));
+        shortcuts.focus_last_pane = vec!["Alt+L".into()];
+        assert_eq!(
+            global_shortcut(
+                &key_press("0", Code::Digit0, keyboard::Modifiers::ALT, false),
+                &shortcuts,
+                FocusedPane::Terminal
+            ),
+            None
+        );
+        assert_eq!(
+            global_shortcut(
+                &key_press("l", Code::KeyL, keyboard::Modifiers::ALT, false),
+                &shortcuts,
+                FocusedPane::Terminal
+            ),
+            Some(GlobalShortcut::FocusLastPane)
+        );
+        shortcuts.focus_last_pane.clear();
+        assert_eq!(
+            global_shortcut(
+                &key_press("l", Code::KeyL, keyboard::Modifiers::ALT, false),
+                &shortcuts,
+                FocusedPane::Terminal
+            ),
+            None
+        );
     }
 }

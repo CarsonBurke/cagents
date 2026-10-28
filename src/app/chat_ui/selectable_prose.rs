@@ -103,6 +103,11 @@ impl Shape {
 
 impl State {
     #[cfg(test)]
+    pub(super) fn typography_for_test(&self) -> (iced::Font, iced::Pixels) {
+        let paragraph = self.paragraph();
+        (paragraph.font(), paragraph.size())
+    }
+    #[cfg(test)]
     pub(super) fn flow_readiness(&self) -> Option<bool> {
         self.flow.as_ref().map(|_| self.flow_ready.is_some())
     }

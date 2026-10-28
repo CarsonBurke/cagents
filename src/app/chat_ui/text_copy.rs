@@ -242,6 +242,17 @@ impl Cagents {
     }
 }
 
+/// An admitted rendered Copy shares the existing global clipboard intent and
+/// rechecks its weak source at the actual effect boundary.
+pub(super) fn write_rendered(
+    text: String,
+    authority_is_current: impl Fn() -> bool + Send + 'static,
+) -> Task<Message> {
+    let context = current_context();
+    let intent = context.advance();
+    clipboard_write(context, intent, text, authority_is_current)
+}
+
 /// A native code button retains immutable raw bytes, never a view-time String.
 /// It supersedes older logical reads and checks newer clipboard intent at the
 /// actual effect boundary before materializing bytes exactly once.
@@ -341,6 +352,100 @@ mod tests {
             effects.is_empty(),
             "the gate must run when the clipboard task is polled"
         );
+
+        // Use the actual palette/native input wrapper which records every
+        // consumed key, rather than manufacturing an untracked App chord.
+        use cosmic::iced::runtime::core::keyboard::input::{self, PressCycle, Source, Transition};
+        use iced::advanced::{clipboard, widget::operation::focusable};
+        for (character, code) in [
+            ("c", keyboard::key::Code::KeyC),
+            ("x", keyboard::key::Code::KeyX),
+        ] {
+            let old_intent = context.advance();
+            let old = clipboard_write(context.clone(), old_intent, "older message".into(), || true);
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.window_width = 1600.0;
+            app.window_height = 1000.0;
+            app.refresh_ui.focused = true;
+            app.context_inspector_open = false;
+            drop(app.update_palette(palette_ui::Action::Open));
+            let event = keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character(character.into()),
+                modified_key: keyboard::Key::Character(character.into()),
+                physical_key: keyboard::key::Physical::Code(code),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::CTRL,
+                text: None,
+                repeat: false,
+            };
+            let source = Source::tracked(
+                PressCycle::new(keyboard::key::Physical::Code(code)),
+                Transition::Press,
+            );
+            let mut renderer = crate::app::tests::headless_renderer();
+            let mut ui = iced::runtime::UserInterface::build(
+                app.view(),
+                iced::Size::new(1600.0, 1000.0),
+                iced::runtime::user_interface::Cache::default(),
+                &mut renderer,
+            );
+            ui.operate(
+                &renderer,
+                &mut focusable::focus::<()>(widget::Id::new("palette.query")),
+            );
+            let mut messages = Vec::new();
+            let (_, statuses) = ui.update_with_sources(
+                &[iced::Event::Keyboard(event.clone())],
+                &[source.clone()],
+                iced::mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert_eq!(statuses, [iced::event::Status::Captured]);
+            drop(ui);
+            {
+                let _native = input::scope(source.clone());
+                assert!(
+                    app.terminal_review_input
+                        .owns_keyboard(&iced::Event::Keyboard(event.clone()))
+                );
+            }
+            for message in messages {
+                drop(app.update(message));
+            }
+            drop(app.update(Message::TaggedKeyEvent {
+                event: event.clone(),
+                captured: true,
+                source: source.clone(),
+            }));
+            assert!(
+                !context.is_current(old_intent),
+                "consumed native Copy/Cut supersedes the older message intent"
+            );
+            let old_effects = iced::futures::executor::block_on(async {
+                iced::runtime::task::into_stream(old)
+                    .unwrap()
+                    .collect::<Vec<_>>()
+                    .await
+            });
+            assert!(
+                old_effects.is_empty(),
+                "the real delayed clipboard write must be cancelled"
+            );
+
+            let current = write_shared_literal(Arc::from("newer native selection"));
+            let current_effects = iced::futures::executor::block_on(async {
+                iced::runtime::task::into_stream(current)
+                    .unwrap()
+                    .collect::<Vec<_>>()
+                    .await
+            });
+            assert!(current_effects.iter().any(|effect| matches!(effect,
+                iced::runtime::Action::Clipboard(iced::runtime::clipboard::Action::Write { contents, .. })
+                    if contents == "newer native selection"
+            )), "the newer clipboard intent remains emittable");
+        }
     }
     #[test]
     fn isolated_contexts_do_not_cancel_each_other_and_captured_context_survives_thread_change() {

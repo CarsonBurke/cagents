@@ -21,7 +21,8 @@ pub(super) fn capture_document_link(
 
 pub(super) fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
     widget::selectable_text(text)
-        .size(design::TEXT_BODY)
+        .font(design::chat_font())
+        .size(design::chat_size())
         .width(Length::Fill)
         .into()
 }
@@ -29,8 +30,8 @@ pub(super) fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Messag
 fn transcript_body(text: impl Into<String>, target: Target) -> Element<'static, Message> {
     widget::container(selectable_prose::plain(
         text,
-        design::TEXT_BODY,
-        iced::Font::default(),
+        design::chat_size(),
+        design::chat_font(),
         target,
     ))
     .width(Length::Fill)
@@ -166,7 +167,7 @@ pub(super) fn message_actions<'a>(
     actions: Element<'a, Message>,
     alignment: Alignment,
 ) -> Element<'a, Message> {
-    iced::widget::hover(
+    hover::overlay(
         widget::column::with_children(vec![
             message,
             widget::Space::new().height(MESSAGE_ACTION_HEIGHT).into(),
@@ -471,8 +472,8 @@ fn notice_entry(message: &str, target: Target, identity: u64) -> Element<'static
                         .color(design::warning_color(&cosmic::theme::active())),
                 ]
                 .into(),
-                design::TEXT_CAPTION.into(),
-                iced::Font::default(),
+                (design::interface_size() * design::TEXT_CAPTION / design::TEXT_BODY).into(),
+                design::interface_font(),
                 target,
                 None,
                 selectable_prose::Logical { identity, start: 0 },
@@ -1688,7 +1689,7 @@ impl Runtime {
                         .width(Length::Fill)
                         .into(),
                     design::heading(Self::native_child_status(agent))
-                        .size(design::TEXT_CAPTION)
+                        .size(design::scaled_interface_size(design::TEXT_CAPTION))
                         .into(),
                 ])
                 .spacing(step::GAP_S)
@@ -2559,7 +2560,9 @@ impl Runtime {
         // which counting newlines could not see. The ceiling keeps a very
         // long paste from squeezing the transcript out, past which the editor
         // scrolls as before.
-        let composer_ceiling = 12.0 * COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_PADDING;
+        let composer_ceiling = 12.0 * COMPOSER_LINE_HEIGHT * design::chat_size()
+            / design::TEXT_PROSE
+            + 2.0 * COMPOSER_PADDING;
         let suggestion = if available && !transitioning {
             self.prompt_suggestion()
         } else {
@@ -2569,7 +2572,7 @@ impl Runtime {
         let placeholder = suggestion.map_or(placeholder, |suggestion| suggestion.text.as_str());
         let suggestion_hint: Element<'_, Message> = if suggestion.is_some() {
             widget::text("Tab to use suggestion")
-                .size(design::TEXT_CAPTION)
+                .size(design::scaled_interface_size(design::TEXT_CAPTION))
                 .into()
         } else {
             iced::widget::Space::new().height(0).into()
@@ -2604,7 +2607,8 @@ impl Runtime {
             crate::ui_controls::field::editor("Message", &self.composer)
                 .id(card_control_id(target.card, "chat-composer"))
                 .placeholder(placeholder)
-                .size(design::TEXT_PROSE)
+                .size(design::chat_size())
+                .font(design::chat_font())
                 .height(Length::Shrink)
                 .max_height(composer_ceiling)
                 // The editor scrolls once the draft passes the ceiling, and
@@ -2897,7 +2901,7 @@ impl Runtime {
                 } else {
                     state.to_owned()
                 })
-                .size(design::TEXT_CAPTION)
+                .size(design::scaled_interface_size(design::TEXT_CAPTION))
                 .class(
                     if glyph == Some(Icon::Warning) && !transitioning && self.pending.is_none() {
                         cosmic::theme::Text::Custom(design::warning_text)
@@ -3807,6 +3811,7 @@ impl Runtime {
             dark,
             self.syntax_theme as u8,
             self.failure_ui.revision,
+            design::typography_revision(),
         )
             .hash(&mut hasher);
         for incident in &self.failure_ui.incidents {
@@ -4299,7 +4304,7 @@ impl Runtime {
     }
 
     pub(super) fn message_copy(&self, item: &chat::Item) -> Element<'static, Message> {
-        let mut controls = vec![small_icon(
+        let mut controls = vec![rendered_copy::icon(
             if self.copied.as_ref().is_some_and(|(id, _)| *id == item.id) {
                 Icon::Check
             } else {
@@ -4315,8 +4320,14 @@ impl Runtime {
             {
                 Action::CopyMessage(self.target, item.id.clone(), self.message_copy_source(item))
             } else {
-                Action::Copy(self.target, item.id.clone(), CopyPart::Text)
+                Action::Copy(
+                    self.target,
+                    item.id.clone(),
+                    CopyPart::Text,
+                    self.rendered_copy_source(item, CopyPart::Text),
+                )
             },
+            rendered_copy::Role::Message,
         )];
         if let Some((at, stamp, full)) = self
             .presentation_cache()
@@ -4365,7 +4376,7 @@ impl Runtime {
         let body: Element<'a, Message> = if let Some(prepared) = &queued.presentation.prepared {
             let mut settings =
                 design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
-            settings.style.font = iced::Font::default();
+            settings.style.font = design::chat_font();
             if prepared.full.len() > 2048 {
                 let flow = queued.presentation.flow.markdown_entry(
                     logical.identity,
@@ -4546,7 +4557,7 @@ impl Runtime {
                 let text = prompt.shown(expanded);
                 let mut settings =
                     design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
-                settings.style.font = iced::Font::default();
+                settings.style.font = design::chat_font();
                 if text.len() > 2048 {
                     let flow = self.presentation_cache()[&item.id]
                         .flow_cache
@@ -4572,7 +4583,10 @@ impl Runtime {
             } else {
                 // This bounded nonselectable preview cannot certify a full
                 // source/catalog before preparation accepts the current Item.
-                widget::text(fallback).size(design::TEXT_PROSE).into()
+                widget::text(fallback)
+                    .font(design::chat_font())
+                    .size(design::chat_size())
+                    .into()
             };
             if long {
                 widget::column::with_children(vec![
@@ -4680,14 +4694,22 @@ impl Runtime {
             ))
             .class(crate::ui_controls::control_style(false, None))
             .on_press(action(Action::Toggle(self.target, item.id.clone())));
-            let copy = widget::button::custom(design::caption("Copy report"))
-                .name(format!("Copy original report: {heading}"))
-                .class(crate::ui_controls::control_style(false, None))
-                .on_press(action(Action::Copy(
-                    self.target,
-                    item.id.clone(),
-                    CopyPart::Text,
-                )));
+            let copy_action = Action::Copy(
+                self.target,
+                item.id.clone(),
+                CopyPart::Text,
+                self.rendered_copy_source(item, CopyPart::Text),
+            );
+            let copy = rendered_copy::owned(
+                &copy_action,
+                rendered_copy::Role::Report,
+                widget::button::custom(design::caption("Copy report"))
+                    .name(format!("Copy original report: {heading}"))
+                    .class(crate::ui_controls::control_style(false, None))
+                    .on_press_maybe(
+                        rendered_copy::enabled(&copy_action).then(|| action(copy_action.clone())),
+                    ),
+            );
             let mut rows = vec![
                 widget::row::with_children(vec![
                     glyph(Icon::Chat),
@@ -5258,7 +5280,7 @@ fn field_view<'a>(
         )))
         .name(field.label.as_str())
         .secure(field.secret)
-        .size(design::TEXT_BODY)
+        .size(design::interface_size())
         .on_input_maybe(available.then_some(move |value| {
             action(Action::Field(
                 target,
@@ -6155,7 +6177,7 @@ mod tests {
             }
             assert_eq!(messages.len(), 1);
             assert!(
-                matches!(&messages[0], Message::ChatUi(Action::Copy(target, id, CopyPart::Text) | Action::CopyMessage(target, id, _)) if *target == runtime.target && id == &item.id)
+                matches!(&messages[0], Message::ChatUi(Action::Copy(target, id, CopyPart::Text, _) | Action::CopyMessage(target, id, _)) if *target == runtime.target && id == &item.id)
             );
             drop(footer);
             if child_selected {
@@ -6372,6 +6394,7 @@ mod tests {
             },
         };
         let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+        let item = runtime.active_item(&item.id).unwrap().clone();
         let renderer = crate::app::tests::headless_renderer();
         for width in [160.0, 240.0, 600.0] {
             let mut element = runtime.step_header(&item, &runtime.cache[&item.id], false);
@@ -6450,7 +6473,7 @@ mod tests {
             }
             assert_eq!(messages.len(), 1);
             assert!(
-                matches!(&messages[0], Message::ChatUi(Action::Copy(target, id, CopyPart::Text) | Action::CopyMessage(target, id, _)) if *target == runtime.target && id == &item.id)
+                matches!(&messages[0], Message::ChatUi(Action::Copy(target, id, CopyPart::Text, _) | Action::CopyMessage(target, id, _)) if *target == runtime.target && id == &item.id)
             );
             let after = element
                 .as_widget_mut()
@@ -9976,6 +9999,138 @@ mod tests {
                 !expanded
             );
         }
+        // The actual message overlay exposes both its base disclosure and its
+        // footer action. Targeting either one cannot activate the other.
+        use iced_accessibility::{
+            A11yId,
+            accesskit::{Action as A11yAction, ActionRequest, Role, TreeId},
+        };
+        let event = |id: A11yId, action| {
+            let A11yId::Widget(widget) = id.clone() else {
+                panic!("native thinking control")
+            };
+            iced::Event::A11y(
+                widget,
+                ActionRequest {
+                    action,
+                    target_tree: TreeId::ROOT,
+                    target_node: id.into(),
+                    data: None,
+                },
+            )
+        };
+        let mut element = view(&app);
+        tree.diff(element.as_widget_mut());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+        );
+        let nodes = element.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            iced::mouse::Cursor::Unavailable,
+        );
+        let control = |label| {
+            nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|node| {
+                    node.node().role() == Role::Button && node.node().label() == Some(label)
+                })
+                .expect("the actual thinking control is accessible")
+                .id()
+                .clone()
+        };
+        let disclosure_id = control("Thinking…");
+        let copy_id = control("Copy this message");
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &event(disclosure_id, A11yAction::Click),
+            Layout::new(&node),
+            iced::mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &viewport,
+        );
+        assert!(
+            matches!(messages.as_slice(), [Message::ChatUi(Action::Toggle(actual, id))] if *actual == target && id == "keyboard-thought")
+        );
+        drop(element);
+        drop(app.handle_chat_ui(Action::Toggle(target, "keyboard-thought".into())));
+        let mut element = view(&app);
+        tree.diff(element.as_widget_mut());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+        );
+        let nodes = element.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            iced::mouse::Cursor::Unavailable,
+        );
+        assert!(
+            nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .any(|node| node.node().role() == Role::Label
+                    && node.node().value() == Some("Keyboard reasoning body")),
+            "expanded real reasoning body is exposed with its Copy footer"
+        );
+        let mut dispatch = |event| {
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                iced::mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            messages
+        };
+        let messages = dispatch(event(copy_id.clone(), A11yAction::Click));
+        assert!(
+            matches!(messages.as_slice(), [Message::ChatUi(Action::CopyMessage(actual, id, _))] if *actual == target && id == "keyboard-thought"),
+            "footer Copy never toggles the base disclosure"
+        );
+        assert!(runtime(&app, target).expanded.contains("keyboard-thought"));
+        // This verifies actual targeted control dispatch, not a full-message
+        // read or clipboard delivery from this fixture's source catalog.
+        assert!(dispatch(event(copy_id, A11yAction::Focus)).is_empty());
+        drop(dispatch);
+        tree.diff(element.as_widget_mut());
+        let enter = iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+            modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+            physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Enter),
+            location: iced::keyboard::Location::Standard,
+            modifiers: iced::keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        });
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &enter,
+            Layout::new(&node),
+            iced::mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &viewport,
+        );
+        assert!(
+            matches!(messages.as_slice(), [Message::ChatUi(Action::CopyMessage(actual, id, _))] if *actual == target && id == "keyboard-thought"),
+            "AT focus stays on the footer through diff, instead of toggling the disclosure"
+        );
     }
 
     #[test]
@@ -10012,6 +10167,7 @@ mod tests {
                 at: None,
             };
             let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+            let item = runtime.active_item(&item.id).unwrap().clone();
             assert_eq!(runtime.cache[&item.id].preview.text, target);
             assert_eq!(runtime.turns[0].summary, name);
             for open in [false, true] {
@@ -10107,7 +10263,7 @@ mod tests {
                 let copied = dispatch(event(copy.clone(), A11yAction::Click));
                 assert_eq!(copied.len(), 1);
                 assert!(
-                    matches!(&copied[0], Message::ChatUi(Action::Copy(actual, id, CopyPart::Text) | Action::CopyMessage(actual, id, _))
+                    matches!(&copied[0], Message::ChatUi(Action::Copy(actual, id, CopyPart::Text, _) | Action::CopyMessage(actual, id, _))
                     if *actual == runtime.target && id == &item.id)
                 );
                 assert!(dispatch(event(copy.clone(), A11yAction::Focus)).is_empty());
@@ -10144,7 +10300,7 @@ mod tests {
                 let copied = dispatch(enter.clone());
                 assert_eq!(copied.len(), 1);
                 assert!(
-                    matches!(&copied[0], Message::ChatUi(Action::Copy(actual, id, CopyPart::Text) | Action::CopyMessage(actual, id, _))
+                    matches!(&copied[0], Message::ChatUi(Action::Copy(actual, id, CopyPart::Text, _) | Action::CopyMessage(actual, id, _))
                     if *actual == runtime.target && id == &item.id)
                 );
                 assert!(dispatch(event(copy, A11yAction::Blur)).is_empty());

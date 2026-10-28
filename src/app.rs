@@ -706,7 +706,8 @@ fn notice_surface<'a>(
 /// foreground and the detail lines in the ambient one.
 fn notice_body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
     widget::selectable_text(text)
-        .size(design::TEXT_BODY)
+        .font(design::interface_font())
+        .size(design::interface_size())
         .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
         .width(Length::Fill)
         .into()
@@ -717,7 +718,8 @@ fn notice_body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
 /// `notice_surface_detail`.
 fn notice_detail<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
     widget::selectable_text(text)
-        .size(design::TEXT_CAPTION)
+        .font(design::interface_font())
+        .size(design::scaled_interface_size(design::TEXT_CAPTION))
         .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
         .width(Length::Fill)
         .class(cosmic::theme::Text::Custom(design::muted_text))
@@ -757,7 +759,8 @@ fn notice_detail_text<'a>(
     text: impl Into<Cow<'a, str>> + 'a,
 ) -> widget::SelectableText<'a> {
     widget::selectable_text(text)
-        .size(design::TEXT_CAPTION)
+        .font(design::interface_font())
+        .size(design::scaled_interface_size(design::TEXT_CAPTION))
         .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
         .width(Length::Fill)
         .class(cosmic::theme::Text::Color(severity.detail_color()))
@@ -2681,6 +2684,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::NewTerminal
         | Message::OpenRepository
         | Message::FocusCard(_)
+        | Message::FocusAttention(_)
         | Message::MovePaneToChannel { .. }
         | Message::PaneDropToChannel { .. }
         | Message::TerminalReviewMode { .. }
@@ -2711,6 +2715,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::SettingsSearchChanged(_)
         | Message::SettingsChanged { .. }
         | Message::SettingsDraftChanged { .. }
+        | Message::SettingsNumberDraftChanged { .. }
         | Message::ResetSettings
         | Message::DismissStatus => true,
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
@@ -2778,6 +2783,7 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::SettingsSearchChanged(_)
                 | Message::SettingsChanged { .. }
                 | Message::SettingsDraftChanged { .. }
+                | Message::SettingsNumberDraftChanged { .. }
                 | Message::ResetSettings
                 | Message::ConfirmResetSettings
                 | Message::CancelResetSettings
@@ -2836,6 +2842,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::MovePaneToChannel { .. }
             | Message::PaneDropToChannel { .. }
             | Message::FocusCard(_)
+            | Message::FocusAttention(_)
             | Message::TerminalReviewMode { .. }
             | Message::FocusAdjacent(_)
             | Message::Viewport {
@@ -2941,6 +2948,10 @@ pub enum SettingsField {
     Notifications(crate::notifications::Field),
     AppTheme,
     UiScale,
+    InterfaceFontFamily,
+    InterfaceFontSize,
+    ChatFontFamily,
+    ChatFontSize,
     TerminalLineHeight,
     TerminalPadding,
     TerminalScrollSize,
@@ -2991,6 +3002,8 @@ pub enum SettingsField {
     ShortcutCyclePaneWidth,
     ShortcutPreviousWorkspace,
     ShortcutNextWorkspace,
+    ShortcutNextAttention,
+    ShortcutPreviousAttention,
     ShortcutReviewToggleViewed,
     ShortcutReviewNextFile,
     ShortcutReviewPreviousFile,
@@ -3016,13 +3029,14 @@ pub enum SettingsField {
     ShortcutFocusPane7,
     ShortcutFocusPane8,
     ShortcutFocusPane9,
+    ShortcutFocusLastPane,
     ShortcutToggleProjects,
     ShortcutRenamePane,
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 38] = [
+    const SHORTCUTS: [Self; 41] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -3034,6 +3048,8 @@ impl SettingsField {
         Self::ShortcutCyclePaneWidth,
         Self::ShortcutPreviousWorkspace,
         Self::ShortcutNextWorkspace,
+        Self::ShortcutNextAttention,
+        Self::ShortcutPreviousAttention,
         Self::ShortcutReviewToggleViewed,
         Self::ShortcutReviewNextFile,
         Self::ShortcutReviewPreviousFile,
@@ -3059,6 +3075,7 @@ impl SettingsField {
         Self::ShortcutFocusPane7,
         Self::ShortcutFocusPane8,
         Self::ShortcutFocusPane9,
+        Self::ShortcutFocusLastPane,
         Self::ShortcutToggleProjects,
         Self::ShortcutRenamePane,
     ];
@@ -3076,6 +3093,10 @@ impl SettingsField {
             Self::Notifications(Field::WhileFocused) => "Notify while focused",
             Self::Notifications(Field::MessagePreviews) => "Show message previews",
             Self::AppTheme => "App theme",
+            Self::InterfaceFontFamily => "Interface font family",
+            Self::InterfaceFontSize => "Interface font size",
+            Self::ChatFontFamily => "Chat font family",
+            Self::ChatFontSize => "Chat font size",
             Self::UiScale => "Interface scale",
             Self::TerminalLineHeight => "Line height",
             Self::TerminalPadding => "Inner padding",
@@ -3084,7 +3105,7 @@ impl SettingsField {
             Self::TerminalCursorStyle => "Cursor shape",
             Self::TerminalTheme => "Color theme",
             Self::MaxHotCards => "Maximum hot panes",
-            Self::HibernationDelayMs => "Hibernation delay (ms)",
+            Self::HibernationDelayMs => "Hibernation delay",
             Self::WorkStaleAfterDays => "Stale after (days)",
             Self::TerminalFontSize => "Font size",
             Self::TerminalFontFamily => "Font family",
@@ -3123,6 +3144,7 @@ impl SettingsField {
             Self::ShortcutFocusPane7 => "Focus pane 7",
             Self::ShortcutFocusPane8 => "Focus pane 8",
             Self::ShortcutFocusPane9 => "Focus pane 9",
+            Self::ShortcutFocusLastPane => "Focus last pane",
             Self::ChatExpandToolGroups => "Expand tool groups by default",
             Self::ChatContentFraction => "Chat content width",
             Self::DefaultNativePaneFraction => "Native pane minimum width",
@@ -3148,6 +3170,8 @@ impl SettingsField {
             Self::ShortcutCyclePaneWidth => "Cycle pane width",
             Self::ShortcutPreviousWorkspace => "Previous workspace",
             Self::ShortcutNextWorkspace => "Next workspace",
+            Self::ShortcutNextAttention => "Next pane needing attention",
+            Self::ShortcutPreviousAttention => "Previous pane needing attention",
             Self::ShortcutReviewToggleViewed => "Mark reviewed file viewed",
             Self::ShortcutReviewNextFile => "Next reviewed file",
             Self::ShortcutReviewPreviousFile => "Previous reviewed file",
@@ -3163,6 +3187,8 @@ impl SettingsField {
             Self::Notifications(_) => SettingsCategory::Notifications,
             Self::AppTheme
             | Self::UiScale
+            | Self::InterfaceFontFamily
+            | Self::InterfaceFontSize
             | Self::ShowStatusBar
             | Self::ShowWorktreeChangesIcons
             | Self::AutoDeleteMergedWorktrees
@@ -3187,9 +3213,11 @@ impl SettingsField {
             | Self::DefaultWorktreePane
             | Self::DefaultChannelPane
             | Self::FocusFollowsMouse => SettingsCategory::General,
-            Self::ChatEnterSends | Self::ChatExpandToolGroups | Self::ChatContentFraction => {
-                SettingsCategory::NativeChat
-            }
+            Self::ChatFontFamily
+            | Self::ChatFontSize
+            | Self::ChatEnterSends
+            | Self::ChatExpandToolGroups
+            | Self::ChatContentFraction => SettingsCategory::NativeChat,
             Self::DefaultNativePaneFraction => SettingsCategory::Appearance,
             Self::EditorAutoSave
             | Self::EditorWrapLines
@@ -3224,6 +3252,7 @@ impl SettingsField {
             | Self::ShortcutFocusPane7
             | Self::ShortcutFocusPane8
             | Self::ShortcutFocusPane9
+            | Self::ShortcutFocusLastPane
             | Self::ShortcutNewChannel
             | Self::ShortcutClonePane
             | Self::ShortcutCloseFocusedColumn
@@ -3234,6 +3263,8 @@ impl SettingsField {
             | Self::ShortcutCyclePaneWidth
             | Self::ShortcutPreviousWorkspace
             | Self::ShortcutNextWorkspace
+            | Self::ShortcutNextAttention
+            | Self::ShortcutPreviousAttention
             | Self::ShortcutReviewToggleViewed
             | Self::ShortcutReviewNextFile
             | Self::ShortcutReviewPreviousFile
@@ -3282,6 +3313,7 @@ struct ShortcutDraft {
     focus_pane_7: String,
     focus_pane_8: String,
     focus_pane_9: String,
+    focus_last_pane: String,
     new_terminal: String,
     new_channel: String,
     clone_pane: String,
@@ -3293,6 +3325,8 @@ struct ShortcutDraft {
     cycle_pane_width: String,
     previous_workspace: String,
     next_workspace: String,
+    next_attention: String,
+    previous_attention: String,
     review_toggle_viewed: String,
     review_next_file: String,
     review_previous_file: String,
@@ -3325,6 +3359,7 @@ impl ShortcutDraft {
             focus_pane_7: settings::format_chords(&shortcuts.focus_pane_7),
             focus_pane_8: settings::format_chords(&shortcuts.focus_pane_8),
             focus_pane_9: settings::format_chords(&shortcuts.focus_pane_9),
+            focus_last_pane: settings::format_chords(&shortcuts.focus_last_pane),
             new_terminal: settings::format_chords(&shortcuts.new_terminal),
             new_channel: settings::format_chords(&shortcuts.new_channel),
             clone_pane: settings::format_chords(&shortcuts.clone_pane),
@@ -3336,6 +3371,8 @@ impl ShortcutDraft {
             cycle_pane_width: settings::format_chords(&shortcuts.cycle_pane_width),
             previous_workspace: settings::format_chords(&shortcuts.previous_workspace),
             next_workspace: settings::format_chords(&shortcuts.next_workspace),
+            next_attention: settings::format_chords(&shortcuts.next_attention),
+            previous_attention: settings::format_chords(&shortcuts.previous_attention),
             review_toggle_viewed: settings::format_chords(&shortcuts.review_toggle_viewed),
             review_next_file: settings::format_chords(&shortcuts.review_next_file),
             review_previous_file: settings::format_chords(&shortcuts.review_previous_file),
@@ -3348,9 +3385,15 @@ impl ShortcutDraft {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SettingsDraft {
+    /// Exact numeric text shown while editing, before unit conversion.
+    numeric_display: HashMap<SettingsField, String>,
     notifications: crate::notifications::Preferences,
     app_theme: String,
     ui_scale: String,
+    interface_font_family: String,
+    interface_font_size: String,
+    chat_font_family: String,
+    chat_font_size: String,
     terminal_line_height: String,
     terminal_padding: String,
     terminal_scroll_size: String,
@@ -3397,9 +3440,14 @@ struct SettingsDraft {
 impl SettingsDraft {
     fn from_settings(settings: &AppSettings) -> Self {
         Self {
+            numeric_display: HashMap::new(),
             notifications: settings.notifications,
             app_theme: settings.app_theme.key().into(),
             ui_scale: settings.ui_scale.to_string(),
+            interface_font_family: settings.interface_font_family.clone(),
+            interface_font_size: settings.interface_font_size.to_string(),
+            chat_font_family: settings.chat_font_family.clone(),
+            chat_font_size: settings.chat_font_size.to_string(),
             terminal_line_height: settings.terminal_line_height.to_string(),
             terminal_padding: settings.terminal_padding.to_string(),
             terminal_scroll_size: settings.terminal_scroll_size.to_string(),
@@ -3463,6 +3511,10 @@ impl SettingsDraft {
             SettingsField::Notifications(field) => self.notifications.set(field, value == "true"),
             SettingsField::AppTheme => self.app_theme = value,
             SettingsField::UiScale => self.ui_scale = value,
+            SettingsField::InterfaceFontFamily => self.interface_font_family = value,
+            SettingsField::InterfaceFontSize => self.interface_font_size = value,
+            SettingsField::ChatFontFamily => self.chat_font_family = value,
+            SettingsField::ChatFontSize => self.chat_font_size = value,
             SettingsField::TerminalLineHeight => self.terminal_line_height = value,
             SettingsField::TerminalPadding => self.terminal_padding = value,
             SettingsField::TerminalScrollSize => self.terminal_scroll_size = value,
@@ -3562,6 +3614,7 @@ impl SettingsDraft {
             SettingsField::ShortcutFocusPane7 => self.keyboard_shortcuts.focus_pane_7 = value,
             SettingsField::ShortcutFocusPane8 => self.keyboard_shortcuts.focus_pane_8 = value,
             SettingsField::ShortcutFocusPane9 => self.keyboard_shortcuts.focus_pane_9 = value,
+            SettingsField::ShortcutFocusLastPane => self.keyboard_shortcuts.focus_last_pane = value,
             SettingsField::ShortcutNewChannel => self.keyboard_shortcuts.new_channel = value,
             SettingsField::ShortcutClonePane => self.keyboard_shortcuts.clone_pane = value,
             SettingsField::ShortcutCloseFocusedColumn => {
@@ -3582,6 +3635,10 @@ impl SettingsDraft {
             }
             SettingsField::ShortcutPreviousWorkspace => {
                 self.keyboard_shortcuts.previous_workspace = value;
+            }
+            SettingsField::ShortcutNextAttention => self.keyboard_shortcuts.next_attention = value,
+            SettingsField::ShortcutPreviousAttention => {
+                self.keyboard_shortcuts.previous_attention = value
             }
             SettingsField::ShortcutNextWorkspace => {
                 self.keyboard_shortcuts.next_workspace = value;
@@ -3630,6 +3687,22 @@ fn settings_update(
     let value = raw_value.trim();
     let mut next = current.clone();
     let parsed = match field {
+        SettingsField::InterfaceFontFamily => {
+            next.interface_font_family = value.into();
+            Ok(())
+        }
+        SettingsField::InterfaceFontSize => value
+            .parse::<f32>()
+            .map(|size| next.interface_font_size = size)
+            .map_err(|_| "Enter a font size between 10 and 24.".into()),
+        SettingsField::ChatFontFamily => {
+            next.chat_font_family = value.into();
+            Ok(())
+        }
+        SettingsField::ChatFontSize => value
+            .parse::<f32>()
+            .map(|size| next.chat_font_size = size)
+            .map_err(|_| "Enter a font size between 8 and 40.".into()),
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
             Ok(())
@@ -3712,6 +3785,10 @@ fn settings_update(
         }
         SettingsField::ShortcutFocusPane9 => {
             next.keyboard_shortcuts.focus_pane_9 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusLastPane => {
+            next.keyboard_shortcuts.focus_last_pane = settings::parse_chords(value);
             Ok(())
         }
         SettingsField::Notifications(field) => value
@@ -3856,7 +3933,8 @@ fn settings_update(
                     Ok(())
                 }
                 None => Err(
-                    "Choose a preset or configure custom_terminal_theme in settings.toml.".into(),
+                    "Choose a preset, or configure a custom terminal palette in the settings file."
+                        .into(),
                 ),
             }
         }
@@ -3980,6 +4058,14 @@ fn settings_update(
             next.keyboard_shortcuts.previous_workspace = settings::parse_chords(value);
             Ok(())
         }
+        SettingsField::ShortcutNextAttention => {
+            next.keyboard_shortcuts.next_attention = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutPreviousAttention => {
+            next.keyboard_shortcuts.previous_attention = settings::parse_chords(value);
+            Ok(())
+        }
         SettingsField::ShortcutNextWorkspace => {
             next.keyboard_shortcuts.next_workspace = settings::parse_chords(value);
             Ok(())
@@ -4026,10 +4112,10 @@ fn settings_update(
     let attempted = next.clone();
     let next = match next.validate() {
         Ok(next) => next,
-        Err(error) => {
-            return SettingsDecision::Invalid(
-                refusal(field, &attempted).unwrap_or_else(|| error.to_string()),
-            );
+        Err(_) => {
+            return SettingsDecision::Invalid(refusal(field, &attempted).unwrap_or_else(|| {
+                format!("Choose a valid value for {}.", field.label().to_lowercase())
+            }));
         }
     };
     if next == *current {
@@ -4059,7 +4145,35 @@ fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
         ),
         SettingsField::MaxHotCards => format!("{label} must be a whole number, at least 1."),
         SettingsField::HibernationDelayMs => {
-            "Hibernation delay must be a whole number of milliseconds.".to_owned()
+            "Hibernation delay must be a non-negative number of seconds.".to_owned()
+        }
+        SettingsField::InterfaceFontSize => "Font size must be between 10 and 24.".to_owned(),
+        SettingsField::EditorFontSize
+        | SettingsField::ChatFontSize
+        | SettingsField::TerminalFontSize => "Font size must be between 8 and 40.".to_owned(),
+        SettingsField::EditorFontFamily
+        | SettingsField::InterfaceFontFamily
+        | SettingsField::ChatFontFamily => {
+            "Enter a font family name of at most 128 bytes, or leave it blank to use the default."
+                .to_owned()
+        }
+        SettingsField::BrowserSearchUrl => {
+            "Search URL must use HTTP or HTTPS and include {query}.".to_owned()
+        }
+        SettingsField::UiScale => "Interface scale must be between 80% and 150%.".to_owned(),
+        SettingsField::TerminalLineHeight => {
+            "Line height must be between 1 and 2 times the font size.".to_owned()
+        }
+        SettingsField::TerminalPadding => {
+            "Inner padding must be between 0 and 24 pixels.".to_owned()
+        }
+        SettingsField::TerminalScrollSpeed => {
+            "Scroll speed must be between 0.25 and 4 times the default.".to_owned()
+        }
+        SettingsField::ChatContentFraction
+        | SettingsField::DefaultNativePaneFraction
+        | SettingsField::DefaultColumnFraction => {
+            "Width must be a number between 25% and 100%.".to_owned()
         }
         SettingsField::WorkStaleAfterDays => format!(
             "{label} must be 1–{} days.",
@@ -4532,6 +4646,11 @@ pub enum Message {
         result: Result<PullRequestCreationOutcome, String>,
     },
     CancelDialog,
+    TaggedKeyEvent {
+        event: keyboard::Event,
+        captured: bool,
+        source: cosmic::iced::runtime::core::keyboard::input::Source,
+    },
     KeyEvent {
         event: keyboard::Event,
         /// Whether a widget already consumed this keystroke. The shell's
@@ -4558,6 +4677,10 @@ pub enum Message {
     },
     /// Retains the typed draft until its per-field debounce expires.
     SettingsDraftChanged {
+        field: SettingsField,
+        value: String,
+    },
+    SettingsNumberDraftChanged {
         field: SettingsField,
         value: String,
     },
@@ -4615,6 +4738,7 @@ pub enum Message {
     RetrySessionSave,
     SessionRecovery(session_recovery::Action),
     AcknowledgeSessionRecovery,
+    FocusAttention(CardId),
     DismissStatus,
     /// Dismisses exactly one logged notice; a stale id is a no-op.
     DismissNotice(u64),
@@ -4875,7 +4999,7 @@ impl TerminalTitleSource {
 /// Widget ids and accessible names for one card.
 ///
 /// Both embed the card id and title, so they are built when a card appears or
-/// is renamed instead of once per rendered frame. Reusing an id also keeps the
+/// is renamed or typography changes, instead of once per rendered frame. Reusing an id keeps the
 /// card's accessibility node stable across frames.
 struct CardChrome {
     tooltip: String,
@@ -4895,6 +5019,7 @@ struct CardChrome {
     type_label: &'static str,
     title: String,
     title_width: f32,
+    typography_revision: u64,
     compact_title: Option<String>,
     terminal_ordinal_suffix: Option<String>,
     terminal_title_source: Option<TerminalTitleSource>,
@@ -4929,6 +5054,7 @@ impl CardChrome {
             type_label,
             title: title.to_owned(),
             title_width: chrome_ui::measure_tab_title(title),
+            typography_revision: design::typography_revision(),
             compact_title: None,
             terminal_ordinal_suffix: None,
             terminal_title_source: None,
@@ -4941,7 +5067,10 @@ impl CardChrome {
     }
 
     fn describes(&self, type_label: &str, title: &str, caption: &str) -> bool {
-        self.type_label == type_label && self.title == title && self.caption == caption
+        self.type_label == type_label
+            && self.title == title
+            && self.caption == caption
+            && self.typography_revision == design::typography_revision()
     }
 
     fn accessible_name(&self, focused: bool) -> &str {
@@ -5213,6 +5342,7 @@ pub struct Cagents {
     chrome_ui: chrome_ui::State,
     pull_request_inspector: pull_request_ui::State,
     sidebar_state: SidebarState,
+    attention_navigation: Vec<CardId>,
     active_workspace: Option<PathBuf>,
     worktree_focus: HashMap<PathBuf, CardId>,
     worktree_offsets: HashMap<PathBuf, f32>,
@@ -5290,6 +5420,7 @@ pub struct Cagents {
     workspace_cycle_modifiers: keyboard::Modifiers,
     keyboard_modifiers: keyboard::Modifiers,
     settings_draft: SettingsDraft,
+    settings_font_choices: settings_ui::FontChoices,
     settings_feedback: Option<SettingsFeedback>,
     /// Whether the settings pane held focus after the last update, so the
     /// update that moves focus away can flush the drafts typed into it.
@@ -7061,8 +7192,11 @@ impl Cagents {
         main.push(design::horizontal_rule());
         if review.selected().is_some() {
             main.push(
-                repository_widget::view_with_review(id, &pane.runtime, Some(review))
-                    .map(Message::Repository),
+                repository_widget::guard_consumed_input(
+                    repository_widget::view_with_review(id, &pane.runtime, Some(review)),
+                    &self.terminal_review_input,
+                )
+                .map(Message::Repository),
             );
         } else {
             let prompt = if review.is_open() {
@@ -7635,8 +7769,20 @@ impl Cagents {
             && !matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime)) if !runtime.parent_transcript_selected())
     }
 
+    fn pane_reads_latest_update(&self, card: CardId) -> bool {
+        if !self.pane_is_active(card) {
+            return false;
+        }
+        match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime.latest_parent_update_visible(),
+            _ => !self
+                .card_state(card)
+                .is_some_and(|state| matches!(state.kind, CardKind::Chat(_))),
+        }
+    }
+
     pub(super) fn observe_agent_update_for_card(&mut self, card: CardId) {
-        if self.pane_is_active(card)
+        if self.pane_reads_latest_update(card)
             || !self
                 .card_state(card)
                 .is_some_and(|state| state.existence.is_open())
@@ -7728,12 +7874,21 @@ impl Cagents {
             .next()
             .map(|channel| channel.id);
         let scope = if let Some(channel) = channel {
+            if self.channel_directory(channel).is_none() {
+                return Task::none();
+            }
             self.select_channel(channel)
         } else {
             let directory = self.unchanneled_card_worktree(&card).map(Path::to_path_buf);
-            directory.map_or_else(Task::none, |directory| {
-                self.select_worktree(directory, false)
-            })
+            if let Some(directory) = directory {
+                let (selected, scope) = self.select_worktree_checked(directory, false);
+                if !selected {
+                    return scope;
+                }
+                scope
+            } else {
+                Task::none()
+            }
         };
         let focus = self.focus_workspace_card(id);
         // Attention belongs to the native parent. Reveal its transcript before
@@ -7746,11 +7901,126 @@ impl Cagents {
             let transcript = parent.map_or_else(Task::none, |target| {
                 self.handle_chat_ui(chat_ui::Action::SelectSubagent(target, None))
             });
-            (transcript, self.mark_cards_read(vec![id]))
+            let read = if self.pane_reads_latest_update(id) {
+                self.mark_cards_read(vec![id])
+            } else {
+                Task::none()
+            };
+            (transcript, read)
         } else {
             (Task::none(), Task::none())
         };
         Task::batch([scope, focus, transcript, read])
+    }
+
+    /// Keep cross-workspace attention navigation stable while one conversation
+    /// may be represented by more than one open pane. Only current waiting or
+    /// unread evidence qualifies; a disconnect or idle state is not a failure.
+    fn ranked_attention_cards(&self) -> Vec<CardId> {
+        let mut cards: Vec<_> = self
+            .sidebar_state
+            .attention_cards()
+            .filter_map(|id| {
+                let card = self
+                    .card_state(id)
+                    .filter(|card| card.existence.is_open())?;
+                let summary = self.sidebar_state.card_attention(id);
+                let rank = if summary.waiting != 0 {
+                    sidebar::AttentionState::Waiting
+                } else if summary.failed != 0 {
+                    sidebar::AttentionState::Failed
+                } else if summary.unread != 0 {
+                    sidebar::AttentionState::Unread
+                } else {
+                    return None;
+                };
+                let resource = match &card.kind {
+                    CardKind::Chat(session) => (0, session.id.as_uuid()),
+                    CardKind::Terminal(session) => (0, session.id.as_uuid()),
+                    _ => (1, card.id.as_uuid()),
+                };
+                Some((rank, id, resource))
+            })
+            .collect();
+        cards.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let mut seen = HashSet::new();
+        cards
+            .into_iter()
+            .filter_map(|(_, id, resource)| seen.insert(resource).then_some(id))
+            .collect()
+    }
+
+    fn cycle_attention(&mut self, backwards: bool) -> Task<Message> {
+        if self.exit.is_some()
+            || self.workspace_inputs_blocked()
+            || self.focused_repository_is_saving()
+            || self.update_prepared
+        {
+            return Task::none();
+        }
+        let cards = self.ranked_attention_cards();
+        let focused = self.workspace.focused();
+        let current = focused.and_then(|focused| {
+            let resource = self.attention_resource(focused)?;
+            cards
+                .iter()
+                .chain(&self.attention_navigation)
+                .copied()
+                .find(|card| self.attention_resource(*card) == Some(resource))
+                .or(Some(focused))
+        });
+        let next = if current.is_some_and(|current| !cards.contains(&current)) {
+            current
+                .and_then(|current| {
+                    self.attention_navigation
+                        .iter()
+                        .position(|card| *card == current)
+                })
+                .and_then(|index| {
+                    (1..=self.attention_navigation.len()).find_map(|step| {
+                        let len = self.attention_navigation.len();
+                        let offset = if backwards {
+                            (index + len - step) % len
+                        } else {
+                            (index + step) % len
+                        };
+                        let candidate = self.attention_navigation[offset];
+                        cards.contains(&candidate).then_some(candidate)
+                    })
+                })
+                .or_else(|| sidebar::cycle_attention(&cards, current, backwards))
+        } else {
+            sidebar::cycle_attention(&cards, current, backwards)
+        };
+        self.attention_navigation.clone_from(&cards);
+        let Some(start) = next.and_then(|next| cards.iter().position(|card| *card == next)) else {
+            return Task::none();
+        };
+        let mut tasks = Vec::new();
+        // An unavailable scope keeps its unread evidence, but cannot trap
+        // every shortcut at the highest-ranked candidate. Try each once.
+        for step in 0..cards.len() {
+            let index = if backwards {
+                (start + cards.len() - step) % cards.len()
+            } else {
+                (start + step) % cards.len()
+            };
+            let card = cards[index];
+            tasks.push(self.focus_attention_card(card));
+            if self.workspace.focused() == Some(card) {
+                break;
+            }
+        }
+        Task::batch(tasks)
+    }
+
+    fn attention_resource(&self, id: CardId) -> Option<(u8, uuid::Uuid)> {
+        let card = self.card_state(id)?;
+        Some(match &card.kind {
+            CardKind::Chat(session) => (0, session.id.as_uuid()),
+            CardKind::Terminal(session) => (0, session.id.as_uuid()),
+            _ => (1, card.id.as_uuid()),
+        })
     }
 
     /// The user has read `card`'s update.
@@ -7830,7 +8100,7 @@ impl Cagents {
         let Some(card) = self
             .workspace
             .focused()
-            .filter(|&card| self.pane_is_active(card))
+            .filter(|&card| self.pane_reads_latest_update(card))
         else {
             return Task::none();
         };
@@ -7913,6 +8183,13 @@ impl Cagents {
     /// Builds chrome for cards that appeared or were renamed, drops entries for
     /// cards the workspace no longer holds, and renames the window.
     fn sync_chrome(&mut self) -> Task<Message> {
+        // Configure before measuring caches, not only when view builds widgets.
+        design::configure_typography(
+            &self.settings.interface_font_family,
+            self.settings.interface_font_size,
+            &self.settings.chat_font_family,
+            self.settings.chat_font_size,
+        );
         self.terminal_working_directories
             .retain(|card, _| self.cards.contains_key(card));
         self.terminal_find
@@ -9838,7 +10115,7 @@ impl Cagents {
                         .width_settled(self.workspace.width_is_settled(id))
                         .on_context(move |point, selection, link| {
                             Message::TerminalFind(terminal_ui::Action::Context(
-                                id, point, selection, link,
+                                id, terminal, point, selection, link,
                             ))
                         })
                         .on_paste(move |text| {
@@ -9956,7 +10233,11 @@ impl Cagents {
                 })
                 .into(),
             Some(CardRuntime::Repository(runtime)) => {
-                repository_widget::view(id, runtime).map(Message::Repository)
+                repository_widget::guard_consumed_input(
+                    repository_widget::view(id, runtime),
+                    &self.terminal_review_input,
+                )
+                .map(Message::Repository)
             }
             Some(CardRuntime::PullRequests(pane)) => self.pull_request_card_view(id, pane),
             Some(CardRuntime::Settings) => settings_ui::settings_pane(
@@ -9966,6 +10247,8 @@ impl Cagents {
                 settings_ui::SettingsContext {
                     feedback: self.settings_feedback.as_ref(),
                     invalid: &self.settings_invalid,
+                    fonts: &self.settings_font_choices,
+                    terminal_font_size: self.settings.terminal_font_size,
                     accounts: self.default_account_choices(),
                     updates: self.update_summary(),
                     testing_notification: self.notification_ui.testing,
@@ -13403,6 +13686,12 @@ impl Cagents {
         };
     }
 
+    fn queue_number_setting_input(&mut self, field: SettingsField, value: String) -> Task<Message> {
+        let stored = settings_ui::number_setting_value(field, &value);
+        self.settings_draft.numeric_display.insert(field, value);
+        self.queue_setting_input(field, stored)
+    }
+
     fn queue_setting_input(&mut self, field: SettingsField, value: String) -> Task<Message> {
         self.settings_draft.set(field, value.clone());
         self.settings_generation = self.settings_generation.wrapping_add(1);
@@ -13947,6 +14236,7 @@ impl Application for Cagents {
             notices: NoticeLog::default(),
             sidebar_model: SidebarModel::ready(SidebarMode::Expanded, sidebar_projects),
             sidebar_state: SidebarState::default(),
+            attention_navigation: Vec::new(),
             project_ui: project_ui::State::default(),
             worktree_protections: Default::default(),
             channel_ui: channel_ui::State::default(),
@@ -14043,6 +14333,7 @@ impl Application for Cagents {
             workspace_cycle_modifiers: keyboard::Modifiers::empty(),
             keyboard_modifiers: keyboard::Modifiers::empty(),
             settings_draft,
+            settings_font_choices: settings_ui::FontChoices::new(),
             settings_feedback: None,
             settings_pane_focused: false,
             reopen_utility: None,
@@ -14179,6 +14470,18 @@ impl Application for Cagents {
             Message::UtilityPaneUi(message) => (*message, true),
             message => (message, false),
         };
+        // Explicit App Source; never install delayed App input in Native TLS.
+        let (message, key_source) = match message {
+            Message::TaggedKeyEvent {
+                event,
+                captured,
+                source,
+            } => (Message::KeyEvent { event, captured }, source),
+            message => (
+                message,
+                cosmic::iced::runtime::core::keyboard::input::Source::default(),
+            ),
+        };
         let notice_control = self.notice_control_severity();
         let attention_scope_changed = matches!(
             &message,
@@ -14191,6 +14494,22 @@ impl Application for Cagents {
         // through the lightweight visibility/presence postlude below.
         #[rustfmt::skip]
         let task = (|| {
+        // Native selection Copy/Cut supersedes pending logical message Copy,
+        // even when this key's owned cycle will stop command routing below.
+        if let Message::KeyEvent { event: keyboard::Event::KeyPressed { key: keyboard::Key::Character(key), modifiers, .. }, .. } = &message
+            && modifiers.command() && (key.eq_ignore_ascii_case("c") || key.eq_ignore_ascii_case("x"))
+        {
+            chat_ui::invalidate_copy_intent();
+        }
+        if let Message::KeyEvent { event, .. } = &message
+            // An already owned physical cycle may be reported repeat:false.
+            && (key_source.cycle().is_some()
+                || matches!(event, keyboard::Event::KeyReleased { .. } | keyboard::Event::KeyPressed { repeat: true, .. }))
+            && (self.terminal_review_input.consume_keyboard_with_source(event, &key_source)
+                || self.terminal_review_input.has_native_action(event, &key_source))
+        {
+            return Task::none();
+        }
         if pane_origin && self.channel_work_is_main() {
             return Task::none();
         }
@@ -14307,6 +14626,7 @@ impl Application for Cagents {
                 | Message::ChannelUi(_)
                 | Message::Sidebar(_)
                 | Message::FocusCard(_)
+                | Message::FocusAttention(_)
                 | Message::TerminalReviewMode { .. }
                 | Message::FocusAdjacent(_)
                 | Message::WindowResized(..)
@@ -15292,6 +15612,17 @@ impl Application for Cagents {
                             .map(|channel| channel.cards.clone()).unwrap_or_default();
                         self.mark_cards_read(cards)
                     }
+                    SidebarAction::MarkAllRead => {
+                        let cards = self.durable.cards.iter().filter(|card| card.existence.is_open())
+                            .map(|card| card.id).collect();
+                        self.mark_cards_read(cards)
+                    }
+                    SidebarAction::MarkWorktreeRead(project, worktree) => {
+                        let cards = self.durable.cards.iter().filter(|card| card.existence.is_open())
+                            .filter(|card| self.agent_worktree(card.id).is_some_and(|key| key.project_id == project && key.worktree_id == worktree))
+                            .map(|card| card.id).collect();
+                        self.mark_cards_read(cards)
+                    }
                     SidebarAction::ScrollProjects(y) => iced::widget::operation::scroll_by(
                         widget::Id::new("sidebar.projects.scroll"),
                         iced::widget::operation::AbsoluteOffset { x: 0.0, y },
@@ -15740,10 +16071,11 @@ impl Application for Cagents {
                 }
             }
             Message::AcknowledgeVisiblePane { card, epoch } => {
-                if epoch == self.attention_focus_epoch && self.pane_is_active(card) {
+                if epoch == self.attention_focus_epoch && self.pane_reads_latest_update(card) {
                     self.acknowledge_visible_pane()
                 } else { Task::none() }
             }
+            Message::FocusAttention(card) => self.focus_attention_card(card),
             Message::FocusCard(id) => {
                 // Explicit activation also cancels a pending entry on this same
                 // card, even if no view has observed its acknowledgment yet.
@@ -16861,12 +17193,8 @@ impl Application for Cagents {
                 }
             },
             Message::CancelDialog => self.cancel_form_dialog(),
+            Message::TaggedKeyEvent { .. } => unreachable!("normalized at update entry"),
             Message::KeyEvent { event, captured } => {
-                if let keyboard::Event::KeyPressed { key: keyboard::Key::Character(key), modifiers, .. } = &event
-                    && modifiers.command() && (key.eq_ignore_ascii_case("c") || key.eq_ignore_ascii_case("x"))
-                {
-                    chat_ui::invalidate_copy_intent();
-                }
                 if let Some(task) = self.automation_approval_key(&event, captured) {
                     return task;
                 }
@@ -16963,7 +17291,7 @@ impl Application for Cagents {
                     }
                     return Task::none();
                 }
-                if let Some(task) = self.palette_key_event(&event) {
+                if let Some(task) = self.palette_key_event_with_source(&event, &key_source) {
                     return task;
                 }
                 if let Some(task) = self.chrome_key_event(&event) {
@@ -17284,9 +17612,16 @@ impl Application for Cagents {
                 self.settings_search = query;
                 crate::settings_widgets::reveal_content_start()
             }
-            Message::SettingsChanged { field, value } => self.apply_setting_input(field, value),
+            Message::SettingsChanged { field, value } => {
+                self.settings_draft.numeric_display.remove(&field);
+                self.apply_setting_input(field, value)
+            }
             Message::SettingsDraftChanged { field, value } => {
+                self.settings_draft.numeric_display.remove(&field);
                 self.queue_setting_input(field, value)
+            }
+            Message::SettingsNumberDraftChanged { field, value } => {
+                self.queue_number_setting_input(field, value)
             }
             Message::SettingsAutosave { field, generation } => {
                 self.autosave_setting(field, generation)
@@ -17813,29 +18148,32 @@ impl Application for Cagents {
                     },
                 },
             }),
-            event::listen_with(|event, status, event_window| match event {
-                iced::Event::Keyboard(event) => Some(Message::KeyEvent {
-                    event,
-                    captured: matches!(status, event::Status::Captured),
-                }),
-                iced::Event::Window(window::Event::Rescaled(scale_factor)) => {
-                    Some(Message::WindowScaleFactorChanged(scale_factor))
-                }
-                iced::Event::Window(window::Event::CloseRequested) => {
-                    Some(Message::WindowCloseRequested(event_window))
-                }
-                iced::Event::Window(window::Event::Closed) => {
-                    Some(Message::WindowClosed(event_window))
-                }
-                iced::Event::Window(window::Event::Focused) => Some(Message::RefreshUi(
-                    refresh_ui::Action::Focused(event_window, true),
-                )),
-                iced::Event::Window(window::Event::Unfocused) => Some(Message::RefreshUi(
-                    refresh_ui::Action::Focused(event_window, false),
-                )),
-                iced::Event::Window(event) => window_geometry_message(&event),
-                _ => None,
-            }),
+            cosmic::iced::runtime::futures::event::listen_with_source(
+                |event, status, event_window, source| match event {
+                    iced::Event::Keyboard(event) => Some(Message::TaggedKeyEvent {
+                        source,
+                        event,
+                        captured: matches!(status, event::Status::Captured),
+                    }),
+                    iced::Event::Window(window::Event::Rescaled(scale_factor)) => {
+                        Some(Message::WindowScaleFactorChanged(scale_factor))
+                    }
+                    iced::Event::Window(window::Event::CloseRequested) => {
+                        Some(Message::WindowCloseRequested(event_window))
+                    }
+                    iced::Event::Window(window::Event::Closed) => {
+                        Some(Message::WindowClosed(event_window))
+                    }
+                    iced::Event::Window(window::Event::Focused) => Some(Message::RefreshUi(
+                        refresh_ui::Action::Focused(event_window, true),
+                    )),
+                    iced::Event::Window(window::Event::Unfocused) => Some(Message::RefreshUi(
+                        refresh_ui::Action::Focused(event_window, false),
+                    )),
+                    iced::Event::Window(event) => window_geometry_message(&event),
+                    _ => None,
+                },
+            ),
         ];
         if let Some(session) = &self.session {
             subscriptions.push(
@@ -18255,6 +18593,12 @@ impl Application for Cagents {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        design::configure_typography(
+            &self.settings.interface_font_family,
+            self.settings.interface_font_size,
+            &self.settings.chat_font_family,
+            self.settings.chat_font_size,
+        );
         let window_width = self.window_width;
         let sidebar_mode = self.projects_sidebar_mode();
         let sidebar = sidebar::view_cached(
@@ -28117,6 +28461,253 @@ mod tests {
     }
 
     #[test]
+    fn native_palette_held_enter_cannot_edit_a_freshly_focused_repository() {
+        use iced::runtime::core::keyboard::input::{PressCycle, Source, Transition};
+        use iced::{
+            Size,
+            advanced::{
+                clipboard,
+                widget::{Operation, operation},
+            },
+            keyboard::key::{Code, Named, Physical},
+            mouse,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let original = "fresh source\n";
+        std::fs::write(directory.path().join("notes.txt"), original).unwrap();
+        let (mut app, pane) = editing_repository_app();
+        app.context_inspector_open = false;
+        app.refresh_ui.focused = true;
+        app.window_width = 1900.0;
+        let view = RepositoryView {
+            project: ProjectId::new(),
+            repository: directory.path().into(),
+            worktree: directory.path().into(),
+            selected_file: None,
+        };
+        app.card_state_mut(pane).unwrap().kind = CardKind::Repository(view.clone());
+        let mut runtime = RepositoryRuntime::new_directory(view);
+        let load = runtime.update(RepositoryAction::OpenFile {
+            card: pane,
+            path: "notes.txt".into(),
+        });
+        app.cards
+            .insert(pane, CardRuntime::Repository(Box::new(runtime)));
+        let viewport = app.workspace.resize_viewport(1200.0);
+        drop(app.apply_viewport(viewport, false, false));
+        assert!(app.card_holds_keyboard(pane));
+        // Preserve the actual loading tree's header focus. Main's completed
+        // file-read focus operation must move it into the newly mounted editor.
+        let mut renderer = headless_renderer();
+        let mut loading = iced::runtime::UserInterface::build(
+            app.card_view(pane, true, false),
+            Size::new(1200.0, 800.0),
+            iced::runtime::user_interface::Cache::default(),
+            &mut renderer,
+        );
+        loading.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(app.card_header_widget_id(pane)),
+        );
+        let cache = loading.into_cache();
+
+        let worktree = directory.path().to_path_buf();
+        app.sidebar_model.projects = vec![SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "Held-key fixture".into(),
+            worktree.clone(),
+            vec![SidebarWorktree::new(
+                WorktreeId::new(),
+                worktree.clone(),
+                Some("fixture/held-enter".into()),
+                false,
+                false,
+                None,
+                None,
+                None,
+            )],
+            Vec::new(),
+        )];
+        app.sidebar_state
+            .sync_active_worktree(&app.sidebar_model, &SidebarFocus::Repository { worktree });
+        drop(app.update_palette(palette_ui::Action::Open));
+        drop(app.update_palette(palette_ui::Action::Query(">copy branch".into())));
+        let enter = |down, repeat| {
+            if down {
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(Named::Enter),
+                    modified_key: keyboard::Key::Named(Named::Enter),
+                    physical_key: Physical::Code(Code::Enter),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat,
+                }
+            } else {
+                keyboard::Event::KeyReleased {
+                    key: keyboard::Key::Named(Named::Enter),
+                    modified_key: keyboard::Key::Named(Named::Enter),
+                    physical_key: Physical::Code(Code::Enter),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                }
+            }
+        };
+        let held = PressCycle::new(Physical::Code(Code::Enter));
+        let held_press = Source::tracked(held.clone(), Transition::Press);
+        let held_release = Source::tracked(held.clone(), Transition::Release);
+        let mut palette = iced::runtime::UserInterface::build(
+            app.palette_surface().expect("open native palette"),
+            Size::new(880.0, 800.0),
+            iced::runtime::user_interface::Cache::default(),
+            &mut renderer,
+        );
+        palette.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(widget::Id::new("palette.query")),
+        );
+        let mut submitted = Vec::new();
+        let (_, statuses) = palette.update_with_sources(
+            &[iced::Event::Keyboard(enter(true, false))],
+            &[held_press.clone()],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut submitted,
+        );
+        assert_eq!(statuses, [iced::event::Status::Captured]);
+        assert!(
+            matches!(
+                submitted.as_slice(),
+                [Message::Palette(palette_ui::Action::SubmitFromNative(_))]
+            ),
+            "the actual palette must consume the activation before the load answers"
+        );
+        drop(palette);
+        for message in submitted {
+            drop(app.update(message));
+        }
+        assert!(!app.palette.is_open());
+
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut stream = iced::runtime::task::into_stream(load).unwrap();
+        let mut tasks = Vec::new();
+        let mut read_answered = false;
+        while let Some(action) = executor.block_on(stream.next()) {
+            if let iced::runtime::Action::Output(action) = action {
+                read_answered |= matches!(&action, RepositoryAction::FileLoadedAt { .. });
+                tasks.push(app.update(Message::Repository(action)));
+            }
+        }
+        assert!(
+            read_answered,
+            "use the real async file reader, not a loaded model substitute"
+        );
+        let mut editor = iced::runtime::UserInterface::build(
+            app.card_view(pane, true, false),
+            Size::new(1200.0, 800.0),
+            cache,
+            &mut renderer,
+        );
+        if let Some(mut effects) = iced::runtime::task::into_stream(Task::batch(tasks)) {
+            while let Some(effect) = executor.block_on(effects.next()) {
+                if let iced::runtime::Action::Widget(mut operation) = effect {
+                    loop {
+                        editor.operate(&renderer, operation.as_mut());
+                        match operation.finish() {
+                            operation::Outcome::Chain(next) => operation = next,
+                            _ => break,
+                        }
+                    }
+                }
+            }
+        }
+        let focused = Arc::new(std::sync::Mutex::new(None));
+        let sink = focused.clone();
+        let mut probe = operation::map(operation::focusable::find_focused(), move |id| {
+            *sink.lock().unwrap() = Some(id);
+        });
+        editor.operate(&renderer, &mut probe);
+        let _ = probe.finish();
+        assert_eq!(
+            *focused.lock().unwrap(),
+            Some(repository_widget::editor_focus_id(pane)),
+            "the production completed-load operation, not a test focus call, must focus the editor"
+        );
+
+        held.release(); // ingress can already have queued the release
+        let mut blocked = Vec::new();
+        let (_, statuses) = editor.update_with_sources(
+            &[
+                iced::Event::Keyboard(enter(true, true)),
+                iced::Event::Keyboard(enter(false, false)),
+            ],
+            &[held_press.clone(), held_release.clone()],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut blocked,
+        );
+        assert_eq!(statuses, [iced::event::Status::Captured; 2]);
+        assert!(
+            blocked.is_empty(),
+            "held palette input must emit neither editor Edit nor command"
+        );
+        // A genuinely new physical cycle is admitted even before the delayed
+        // App copy has retired the old key-up. Ownership is cycle-specific.
+        let fresh = PressCycle::new(Physical::Code(Code::Enter));
+        let mut accepted = Vec::new();
+        let (_, statuses) = editor.update_with_sources(
+            &[iced::Event::Keyboard(enter(true, false))],
+            &[Source::tracked(fresh, Transition::Press)],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut accepted,
+        );
+        assert_eq!(statuses, [iced::event::Status::Captured]);
+        assert!(
+            matches!(accepted.as_slice(), [Message::Repository(
+            RepositoryAction::EditorAction { card, action: repository_widget::EditorAction::Edit(
+                repository_widget::EditorEdit::Enter
+            ) }
+        )] if *card == pane),
+            "a new native press must emit exactly the ordinary editor Enter"
+        );
+        drop(editor);
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&pane) else {
+            panic!("repository")
+        };
+        assert_eq!(runtime.editor_text().as_deref(), Some(original));
+        for message in accepted {
+            drop(app.update(message));
+        }
+        drop(app.update(Message::TaggedKeyEvent {
+            event: enter(false, false),
+            source: held_release,
+            captured: true,
+        }));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&pane) else {
+            panic!("repository")
+        };
+        let edited = runtime.editor_text().unwrap();
+        assert_eq!(
+            edited.chars().filter(|c| *c == '\n').count(),
+            original.chars().filter(|c| *c == '\n').count() + 1
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("notes.txt")).unwrap(),
+            original,
+            "a native edit must not execute lazy save effects or write the fixture file"
+        );
+    }
+
+    #[test]
     fn restored_editor_focus_waits_for_a_viewport_after_loading() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("notes.txt"), "saved\n").unwrap();
@@ -28579,6 +29170,7 @@ mod tests {
             save_health: None,
             session_recovery: session_recovery::State::default(),
             settings_draft: SettingsDraft::from_settings(&settings),
+            settings_font_choices: settings_ui::FontChoices::new(),
             settings_base: settings.clone(),
             settings_save_generation: 0,
             settings_ack_generation: 0,
@@ -28620,6 +29212,7 @@ mod tests {
             notices: NoticeLog::default(),
             sidebar_model: SidebarModel::ready(SidebarMode::Expanded, Vec::new()),
             sidebar_state: SidebarState::default(),
+            attention_navigation: Vec::new(),
             project_ui: project_ui::State::default(),
             worktree_protections: Default::default(),
             channel_ui: channel_ui::State::default(),
@@ -28701,9 +29294,364 @@ mod tests {
     }
 
     #[test]
+    fn waiting_attention_preserves_current_window_title_and_visible_request_state() {
+        let mut app = context_inspector_test_app(true);
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        drop(app.sync_window_title());
+        let header = app.core.window.header_title.clone();
+        let window_title = app.title(window::Id::RESERVED).to_owned();
+        let card = app.workspace.focused().unwrap();
+        app.sidebar_state.set_card_activity(
+            card,
+            crate::agent::Activity {
+                provider: crate::agent::Provider::Claude,
+                state: crate::agent::ActivityState::Waiting,
+            },
+        );
+        drop(app.sync_chrome());
+        assert_eq!(app.sidebar_state.card_attention(card).waiting, 1);
+        assert_eq!(app.title(window::Id::RESERVED), window_title);
+        assert_eq!(app.core.window.header_title, header);
+        app.sidebar_state.clear_agent_activity(card);
+        drop(app.sync_window_title());
+        assert_eq!(app.title(window::Id::RESERVED), window_title);
+        assert_eq!(app.sidebar_state.card_attention(card).waiting, 0);
+    }
+
+    #[test]
+    fn stale_visible_acknowledgement_cannot_read_an_update_from_a_later_focus_cycle() {
+        let mut app = context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        app.refresh_ui.focused = false;
+        let card = app.workspace.focused().unwrap();
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::RESERVED,
+            true,
+        ))));
+        let stale_epoch = app.attention_focus_epoch;
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::RESERVED,
+            false,
+        ))));
+        app.observe_agent_update_for_card(card);
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::RESERVED,
+            true,
+        ))));
+        assert_ne!(stale_epoch, app.attention_focus_epoch);
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: stale_epoch,
+        }));
+        assert!(app.sidebar_state.has_card_update(card));
+        let epoch = app.attention_focus_epoch;
+        drop(app.update(Message::AcknowledgeVisiblePane { card, epoch }));
+        assert!(!app.sidebar_state.has_card_update(card));
+    }
+
+    #[test]
+    fn attention_navigation_uses_current_news_and_deduplicates_open_conversations() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        let mut app = context_inspector_test_app(false);
+        let mut cards: Vec<_> = (101..=106)
+            .map(|number| {
+                let mut card = terminal_card_state();
+                card.id = CardId::from_uuid(uuid::Uuid::from_u128(number));
+                card
+            })
+            .collect();
+        let [working, waiting, failed, alias, unknown, closing] =
+            std::array::from_fn::<_, 6, _>(|index| cards[index].id);
+        cards[3].kind = cards[1].kind.clone();
+        cards[5].existence = Existence::Closing {
+            operation_id: crate::model::OperationId::new(),
+        };
+        Arc::make_mut(&mut app.durable).cards = cards;
+        for (card, state) in [
+            (working, ActivityState::Working),
+            (waiting, ActivityState::Waiting),
+            (failed, ActivityState::Idle),
+            (alias, ActivityState::Waiting),
+            (unknown, ActivityState::Unknown),
+            (closing, ActivityState::Waiting),
+        ] {
+            app.sidebar_state.set_card_activity(
+                card,
+                Activity {
+                    provider: Provider::Claude,
+                    state,
+                },
+            );
+        }
+        app.sidebar_state.observe_card_update(working);
+        app.sidebar_state.observe_card_update(failed);
+        app.sidebar_state
+            .set_failed_updates(std::collections::BTreeSet::from([failed]));
+        assert_eq!(app.ranked_attention_cards(), [waiting, failed, working]);
+        assert_eq!(
+            sidebar::cycle_attention(&app.ranked_attention_cards(), Some(waiting), true),
+            Some(working)
+        );
+        assert_eq!(
+            sidebar::cycle_attention(&app.ranked_attention_cards(), Some(working), false),
+            Some(waiting)
+        );
+        // Reading failed news removes that historical fact. Current waiting
+        // and unread work survive; idle/unknown state invents no failed result.
+        app.read_card_update(failed);
+        assert_eq!(app.sidebar_state.card_attention(failed).failed, 0);
+        assert_eq!(app.ranked_attention_cards(), [waiting, working]);
+    }
+
+    #[test]
+    fn explicit_attention_reads_keep_worktree_scope_and_preserve_live_waiting() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        let project = app.sidebar_model.projects[0].id;
+        let roots = app.sidebar_model.projects[0]
+            .worktrees
+            .iter()
+            .take(2)
+            .map(|worktree| (worktree.id, worktree.path.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(roots.len(), 2);
+        let mut cards = Vec::new();
+        for (_, path) in &roots {
+            let mut card = terminal_card_state();
+            let CardKind::Terminal(session) = &mut card.kind else {
+                unreachable!()
+            };
+            session.launch.working_directory = path.clone();
+            app.worktree_owners.insert(card.id, path.clone());
+            app.sidebar_state.observe_card_update(card.id);
+            cards.push(card);
+        }
+        let first = cards[0].id;
+        let second = cards[1].id;
+        Arc::make_mut(&mut app.durable).cards = cards;
+        app.sidebar_state.set_card_activity(
+            first,
+            crate::agent::Activity {
+                provider: crate::agent::Provider::Claude,
+                state: crate::agent::ActivityState::Waiting,
+            },
+        );
+        drop(app.update(Message::Sidebar(SidebarAction::MarkWorktreeRead(
+            project, roots[0].0,
+        ))));
+        assert!(!app.sidebar_state.has_card_update(first));
+        assert!(app.sidebar_state.has_card_update(second));
+        assert_eq!(app.sidebar_state.card_attention(first).waiting, 1);
+        app.settings_reset_confirm = true;
+        drop(app.update(Message::Sidebar(SidebarAction::MarkAllRead)));
+        assert!(
+            app.sidebar_state.has_card_update(second),
+            "a covering form still owns input"
+        );
+        app.settings_reset_confirm = false;
+        drop(app.update(Message::Sidebar(SidebarAction::MarkAllRead)));
+        assert!(!app.sidebar_state.has_card_update(second));
+        assert_eq!(app.sidebar_state.card_attention(first).waiting, 1);
+    }
+
+    #[test]
+    fn attention_navigation_skips_unenterable_scopes_without_reading_their_news() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        let mut app = context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let waiting = terminal_card_state();
+        let waiting_id = waiting.id;
+        let reachable = terminal_card_state();
+        let reachable_id = reachable.id;
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .extend([waiting, reachable]);
+        let project = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "Reachable".into(),
+            "/tmp".into(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        let reachable_channel = crate::model::ChannelId::new();
+        for (card, project_id, id) in [
+            (waiting_id, ProjectId::new(), crate::model::ChannelId::new()),
+            (reachable_id, project, reachable_channel),
+        ] {
+            Arc::make_mut(&mut app.durable)
+                .channels
+                .push(crate::model::ProjectChannel {
+                    id,
+                    project_id,
+                    title: "Attention destination".into(),
+                    title_source: Default::default(),
+                    ordinal: 0,
+                    shared: false,
+                    cards: vec![card],
+                    focused: Some(card),
+                });
+        }
+        app.sidebar_state.set_card_activity(
+            waiting_id,
+            Activity {
+                provider: Provider::Claude,
+                state: ActivityState::Waiting,
+            },
+        );
+        app.sidebar_state.observe_card_update(waiting_id);
+        app.sidebar_state.observe_card_update(reachable_id);
+        assert_eq!(app.ranked_attention_cards()[0], waiting_id);
+        drop(app.update(Message::RunCommand(
+            workspace_widget::GlobalShortcut::NextAttention,
+        )));
+        assert_eq!(app.workspace.focused(), Some(reachable_id));
+        assert_eq!(app.durable.active_channel, Some(reachable_channel));
+        assert!(app.sidebar_state.has_card_update(waiting_id));
+        assert_eq!(app.sidebar_state.card_attention(waiting_id).waiting, 1);
+        assert!(!app.sidebar_state.has_card_update(reachable_id));
+
+        // A real protection refusal must not focus a still-mounted candidate
+        // or acknowledge it after the checked worktree selection was refused.
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path().join("runtime");
+        let blocked = directory.path().join("blocked");
+        std::fs::create_dir_all(&blocked).unwrap();
+        let _exclusive =
+            crate::worktree_cleanup::fixture_protection(&runtime, &blocked, true).unwrap();
+        let mut app = context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        app.worktree_protections.use_fixture_runtime(runtime);
+        let mut candidate = terminal_card_state();
+        let candidate_id = candidate.id;
+        let CardKind::Terminal(session) = &mut candidate.kind else {
+            unreachable!()
+        };
+        session.launch.working_directory = blocked.clone();
+        Arc::make_mut(&mut app.durable).cards.push(candidate);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(1600.0);
+        app.worktree_owners.insert(candidate_id, blocked);
+        app.sidebar_state.observe_card_update(candidate_id);
+        let focused = app.workspace.focused();
+        let scope = app.active_workspace.clone();
+        let channel = app.durable.active_channel;
+        drop(app.update(Message::RunCommand(
+            workspace_widget::GlobalShortcut::NextAttention,
+        )));
+        assert_eq!(app.workspace.focused(), focused);
+        assert_eq!(app.active_workspace, scope);
+        assert_eq!(app.durable.active_channel, channel);
+        assert!(app.sidebar_state.has_card_update(candidate_id));
+    }
+
+    #[test]
+    fn attention_shortcut_switches_projects_focuses_exact_pane_and_acknowledges_it() {
+        use crate::model::{ChannelId, ProjectChannel};
+        let mut app = context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        app.refresh_ui.focused = true;
+        let first = app.workspace.focused().unwrap();
+        let mut alias = app.card_state(first).unwrap().clone();
+        alias.id = CardId::from_uuid(uuid::Uuid::from_u128(u128::MAX));
+        let alias_id = alias.id;
+        let second = terminal_card_state();
+        let second_id = second.id;
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .extend([second, alias]);
+        let projects = [ProjectId::new(), ProjectId::new()];
+        let channels = [ChannelId::new(), ChannelId::new()];
+        for (index, card) in [first, second_id].into_iter().enumerate() {
+            app.sidebar_model.projects.push(SidebarProject::new(
+                projects[index],
+                RepositoryId::new(),
+                format!("Project{index}"),
+                "/tmp".into(),
+                Vec::new(),
+                Vec::new(),
+            ));
+            Arc::make_mut(&mut app.durable)
+                .channels
+                .push(ProjectChannel {
+                    title_source: Default::default(),
+                    id: channels[index],
+                    project_id: projects[index],
+                    title: format!("Channel{index}"),
+                    ordinal: index as u32,
+                    shared: false,
+                    cards: if index == 0 {
+                        vec![card, alias_id]
+                    } else {
+                        vec![card]
+                    },
+                    focused: Some(if index == 0 { alias_id } else { card }),
+                });
+        }
+        drop(app.select_channel(channels[0]));
+        assert_eq!(app.workspace.focused(), Some(alias_id));
+        for card in [first, alias_id] {
+            app.sidebar_state.set_card_activity(
+                card,
+                crate::agent::Activity {
+                    provider: crate::agent::Provider::Claude,
+                    state: crate::agent::ActivityState::Waiting,
+                },
+            );
+        }
+        app.sidebar_state.observe_card_update(first);
+        app.sidebar_state.observe_card_update(second_id);
+        drop(app.update(Message::RunCommand(
+            workspace_widget::GlobalShortcut::NextAttention,
+        )));
+        assert_eq!(app.durable.active_channel, Some(channels[1]));
+        assert_eq!(app.workspace.focused(), Some(second_id));
+        assert!(!app.sidebar_state.has_card_update(second_id));
+        assert!(app.sidebar_state.has_card_update(first));
+        drop(app.update(Message::RunCommand(
+            workspace_widget::GlobalShortcut::NextAttention,
+        )));
+        assert_eq!(app.durable.active_channel, Some(channels[0]));
+        assert_eq!(app.workspace.focused(), Some(first));
+        assert!(!app.sidebar_state.has_card_update(first));
+    }
+
+    #[test]
+    fn focused_pane_finishing_in_background_is_unread_until_visible_acknowledgement() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        let mut app = context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        app.refresh_ui.focused = false;
+        let card = app.workspace.focused().unwrap();
+        let activity = |state| {
+            Some(Activity {
+                provider: Provider::Omp,
+                state,
+            })
+        };
+        app.observe_agent_activity_for_card(card, activity(ActivityState::Working));
+        app.observe_agent_activity_for_card(card, activity(ActivityState::Idle));
+        assert!(app.sidebar_state.has_card_update(card));
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: app.attention_focus_epoch,
+        }));
+        assert!(app.sidebar_state.has_card_update(card));
+        app.refresh_ui.focused = true;
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: app.attention_focus_epoch,
+        }));
+        assert!(!app.sidebar_state.has_card_update(card));
+    }
+
+    #[test]
     fn pane_attention_tracks_semantic_events_and_a_rested_hover_acknowledges_only_its_pane() {
         use crate::agent::{Activity, ActivityState, Provider};
         let mut app = context_inspector_test_app(true);
+        app.refresh_ui.focused = true;
         app.context_inspector_open = false;
         let window = window::Id::RESERVED;
         app.core.set_main_window_id(Some(window));

@@ -253,6 +253,8 @@ pub struct KeyboardShortcuts {
     pub cycle_pane_width: Vec<String>,
     pub previous_workspace: Vec<String>,
     pub next_workspace: Vec<String>,
+    pub next_attention: Vec<String>,
+    pub previous_attention: Vec<String>,
     /// Flips the viewed mark on the file a review pane shows.
     pub review_toggle_viewed: Vec<String>,
     pub review_next_file: Vec<String>,
@@ -279,6 +281,7 @@ pub struct KeyboardShortcuts {
     pub focus_pane_7: Vec<String>,
     pub focus_pane_8: Vec<String>,
     pub focus_pane_9: Vec<String>,
+    pub focus_last_pane: Vec<String>,
     pub toggle_projects: Vec<String>,
     pub rename_pane: Vec<String>,
 }
@@ -297,6 +300,8 @@ impl Default for KeyboardShortcuts {
             cycle_pane_width: vec!["Alt+R".to_owned()],
             previous_workspace: vec!["Alt+Shift+Tab".to_owned(), "Ctrl+Alt+PageUp".to_owned()],
             next_workspace: vec!["Alt+Tab".to_owned(), "Ctrl+Alt+PageDown".to_owned()],
+            next_attention: vec!["Alt+A".to_owned()],
+            previous_attention: vec!["Alt+Shift+A".to_owned()],
             review_toggle_viewed: vec!["Alt+V".to_owned()],
             review_next_file: vec!["Alt+Down".to_owned()],
             review_previous_file: vec!["Alt+Up".to_owned()],
@@ -322,6 +327,7 @@ impl Default for KeyboardShortcuts {
             focus_pane_7: vec!["Alt+7".to_owned()],
             focus_pane_8: vec!["Alt+8".to_owned()],
             focus_pane_9: vec!["Alt+9".to_owned()],
+            focus_last_pane: vec!["Alt+0".to_owned()],
             toggle_projects: vec!["Ctrl+Shift+B".to_owned()],
             rename_pane: vec!["F2".to_owned()],
         }
@@ -337,7 +343,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 38] {
+    pub fn actions(&self) -> [&Vec<String>; 41] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -350,6 +356,8 @@ impl KeyboardShortcuts {
             &self.cycle_pane_width,
             &self.previous_workspace,
             &self.next_workspace,
+            &self.next_attention,
+            &self.previous_attention,
             &self.review_toggle_viewed,
             &self.review_next_file,
             &self.review_previous_file,
@@ -375,6 +383,7 @@ impl KeyboardShortcuts {
             &self.focus_pane_7,
             &self.focus_pane_8,
             &self.focus_pane_9,
+            &self.focus_last_pane,
             &self.toggle_projects,
             &self.rename_pane,
         ]
@@ -422,7 +431,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 38] = [
+const SHORTCUT_ACTIONS: [&str; 41] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -434,6 +443,8 @@ const SHORTCUT_ACTIONS: [&str; 38] = [
     "cycle_pane_width",
     "previous_workspace",
     "next_workspace",
+    "next_attention",
+    "previous_attention",
     "review_toggle_viewed",
     "review_next_file",
     "review_previous_file",
@@ -459,6 +470,7 @@ const SHORTCUT_ACTIONS: [&str; 38] = [
     "focus_pane_7",
     "focus_pane_8",
     "focus_pane_9",
+    "focus_last_pane",
     "toggle_projects",
     "rename_pane",
 ];
@@ -626,6 +638,13 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
         logo,
         key: key.ok_or("keyboard shortcut must contain a key")?,
     })
+}
+
+const fn default_interface_font_size() -> f32 {
+    13.0
+}
+const fn default_chat_font_size() -> f32 {
+    14.0
 }
 
 /// Approximate the old line preference at 1 KiB per requested line, rounded
@@ -829,6 +848,16 @@ pub struct AppSettings {
     pub app_theme: AppTheme,
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
+    /// Empty uses the desktop interface font.
+    #[serde(default)]
+    pub interface_font_family: String,
+    #[serde(default = "default_interface_font_size")]
+    pub interface_font_size: f32,
+    /// Empty follows the interface family; code remains monospace.
+    #[serde(default)]
+    pub chat_font_family: String,
+    #[serde(default = "default_chat_font_size")]
+    pub chat_font_size: f32,
     #[serde(default = "default_terminal_line_height")]
     pub terminal_line_height: f32,
     #[serde(default = "default_terminal_scroll_speed")]
@@ -980,6 +1009,10 @@ impl Default for AppSettings {
             app_theme: AppTheme::default(),
             terminal_scroll_speed: default_terminal_scroll_speed(),
             ui_scale: default_ui_scale(),
+            interface_font_family: String::new(),
+            interface_font_size: default_interface_font_size(),
+            chat_font_family: String::new(),
+            chat_font_size: default_chat_font_size(),
             terminal_line_height: default_terminal_line_height(),
             terminal_padding: default_terminal_padding(),
             terminal_scroll_size: default_terminal_scroll_size(),
@@ -1439,7 +1472,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 33] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 36] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -1462,11 +1495,14 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 33] = [
     "focus_pane_7",
     "focus_pane_8",
     "focus_pane_9",
+    "focus_last_pane",
     "cycle_pane_width",
     "new_channel",
     "clone_pane",
     "previous_workspace",
     "next_workspace",
+    "next_attention",
+    "previous_attention",
     "review_toggle_viewed",
     "review_next_file",
     "review_previous_file",
@@ -1657,6 +1693,33 @@ impl AppSettings {
         }
     }
     pub fn validate(mut self) -> Result<Self, SettingsError> {
+        for (family, reason) in [
+            (
+                &self.interface_font_family,
+                "interface_font_family must be a name of at most 128 bytes without control characters",
+            ),
+            (
+                &self.chat_font_family,
+                "chat_font_family must be a name of at most 128 bytes without control characters",
+            ),
+        ] {
+            if family.len() > MAX_TERMINAL_FONT_FAMILY_BYTES
+                || family.chars().any(char::is_control)
+                || (!family.is_empty() && family.trim().is_empty())
+            {
+                return Err(SettingsError::Invalid(reason));
+            }
+        }
+        if !(10.0..=24.0).contains(&self.interface_font_size) {
+            return Err(SettingsError::Invalid(
+                "Interface font size must be between 10 and 24",
+            ));
+        }
+        if !(8.0..=40.0).contains(&self.chat_font_size) {
+            return Err(SettingsError::Invalid(
+                "Chat font size must be between 8 and 40",
+            ));
+        }
         let mut seen = std::collections::HashSet::new();
         self.palette_recents
             .retain(|key| !key.is_empty() && key.len() <= 128 && seen.insert(key.clone()));
@@ -3328,6 +3391,10 @@ mod tests {
             hibernation_delay_ms: 1_234,
             app_theme: AppTheme::Light,
             ui_scale: 1.2,
+            interface_font_family: "DejaVu Sans".into(),
+            interface_font_size: 16.0,
+            chat_font_family: "DejaVu Serif".into(),
+            chat_font_size: 19.0,
             terminal_line_height: 1.5,
             terminal_padding: 12.0,
             terminal_scroll_size: 4,
@@ -5286,5 +5353,35 @@ new_thread = "Alt+Shift+G"
             Err(SettingsError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied
         ));
         assert!(!target.join("settings.toml").exists());
+    }
+    #[test]
+    fn focus_last_pane_migration_preserves_custom_zero_and_explicit_unbinding() {
+        for (custom_zero, explicit_unbind) in [(false, false), (true, false), (false, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = path_in(&directory);
+            let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
+            let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+            shortcuts.remove("focus_last_pane");
+            if custom_zero {
+                shortcuts.insert("new_terminal".into(), vec!["Alt+0"].into());
+            }
+            if explicit_unbind {
+                shortcuts.insert("focus_last_pane".into(), Vec::<String>::new().into());
+            }
+            fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+            let loaded = load(&path).unwrap();
+            assert_eq!(
+                loaded.keyboard_shortcuts.focus_last_pane,
+                if custom_zero || explicit_unbind {
+                    Vec::<String>::new()
+                } else {
+                    vec!["Alt+0".into()]
+                }
+            );
+            if custom_zero {
+                assert_eq!(loaded.keyboard_shortcuts.new_terminal, ["Alt+0"]);
+            }
+            assert!(loaded.keyboard_shortcuts.validate().is_ok());
+        }
     }
 }

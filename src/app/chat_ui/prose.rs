@@ -482,6 +482,22 @@ impl Renderer {
             start,
         }
     }
+    // Measurements belong to the rendered style as well as the source. Keep
+    // logical row keys independent so selection and scroll anchors survive.
+    fn layout_revision(&self, settings: markdown::Settings) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut revision = std::hash::DefaultHasher::new();
+        (
+            self.revision,
+            settings.text_size.0.to_bits(),
+            settings.style.font,
+            &self.find,
+            self.dark,
+        )
+            .hash(&mut revision);
+        revision.finish()
+    }
+
     fn items(
         &self,
         items: &[markdown::Item],
@@ -498,23 +514,13 @@ impl Renderer {
             .spacing(settings.spacing.0)
             .into();
         }
+        let revision = self.layout_revision(settings);
         let rows = items
             .iter()
             .enumerate()
             .map(|(index, item)| {
-                use std::hash::{Hash, Hasher};
                 let renderer = self.child(index as u32);
                 let key = selection::logical_identity(&renderer.item, &renderer.path);
-                let mut revision = std::hash::DefaultHasher::new();
-                (
-                    self.revision,
-                    settings.text_size.0.to_bits(),
-                    settings.style.font,
-                    &self.find,
-                    self.dark,
-                )
-                    .hash(&mut revision);
-                let revision = revision.finish();
                 let estimate = renderer.stats().estimate(settings)
                     + if index == 0 { 0.0 } else { settings.spacing.0 };
                 let logical_len = match item {
@@ -603,13 +609,7 @@ impl Renderer {
                 alt,
             } => {
                 let mut rows = Vec::new();
-                let image_settings = markdown::Settings {
-                    style: markdown::Style {
-                        font: iced::Font::default(),
-                        ..settings.style
-                    },
-                    ..settings
-                };
+                let image_settings = settings;
                 if alt.len() > 0 {
                     rows.push(paragraph(
                         image_settings,
@@ -623,7 +623,8 @@ impl Renderer {
                 if !title.is_empty() {
                     rows.push(paragraph(
                         markdown::Settings {
-                            text_size: design::TEXT_CAPTION.into(),
+                            text_size: settings.text_size
+                                * (design::TEXT_CAPTION / design::TEXT_PROSE),
                             ..image_settings
                         },
                         title_text,
@@ -665,6 +666,7 @@ impl Renderer {
                 .log10()
                 .ceil()
         });
+        let revision = self.layout_revision(settings);
         let rows = bullets
             .iter()
             .enumerate()
@@ -676,7 +678,7 @@ impl Renderer {
                 let key = selection::logical_identity(&self.item, &self.child(index as u32).path);
                 let mut descriptor = virtualized::Row::new(
                     key,
-                    self.revision,
+                    revision,
                     renderer.stats().estimate(nested) + settings.spacing.0 * 0.75,
                     None,
                     move || {
@@ -688,6 +690,7 @@ impl Renderer {
                             (markdown::Bullet::Point { items }, Some(start))
                             | (markdown::Bullet::Task { items, .. }, Some(start)) => (
                                 iced::widget::text(format!("{}.", index as u64 + start))
+                                    .font(settings.style.font)
                                     .size(settings.text_size)
                                     .align_x(iced::alignment::Horizontal::Right)
                                     .width(
@@ -698,7 +701,10 @@ impl Renderer {
                                 items,
                             ),
                             (markdown::Bullet::Point { items }, None) => (
-                                iced::widget::text("•").size(settings.text_size).into(),
+                                iced::widget::text("•")
+                                    .font(settings.style.font)
+                                    .size(settings.text_size)
+                                    .into(),
                                 items,
                             ),
                             (markdown::Bullet::Task { items, done }, None) => (
@@ -760,6 +766,7 @@ impl Renderer {
         // shaping every hidden cell to discover its natural width.
         let width = 240.0;
         let alignments: Arc<[_]> = columns.iter().map(alignment).collect::<Vec<_>>().into();
+        let revision = self.layout_revision(settings);
         let descriptors = (0..=rows.len())
             .map(|row| {
                 let renderer = self.child(row as u32);
@@ -768,7 +775,7 @@ impl Renderer {
                 let estimate = renderer.stats().estimate(settings) + settings.spacing.0;
                 let alignments = alignments.clone();
                 let mut descriptor =
-                    virtualized::Row::new(key, self.revision, estimate, None, move || {
+                    virtualized::Row::new(key, revision, estimate, None, move || {
                         let descriptors = alignments
                             .iter()
                             .enumerate()
@@ -781,12 +788,8 @@ impl Renderer {
                                     unreachable!("cell path")
                                 };
                                 let descendants = renderer.descendants(true);
-                                let mut descriptor = virtualized::Row::new(
-                                    key,
-                                    renderer.revision,
-                                    width,
-                                    None,
-                                    move || {
+                                let mut descriptor =
+                                    virtualized::Row::new(key, revision, width, None, move || {
                                         widget::container(selection::wrap(
                                             renderer.items_at(settings),
                                             selection::Kind::Cell { row, column },
@@ -795,8 +798,7 @@ impl Renderer {
                                         .align_x(alignment)
                                         .padding([settings.spacing.0 / 2.0, settings.spacing.0])
                                         .into()
-                                    },
-                                );
+                                    });
                                 descriptor.descendants = descendants;
                                 descriptor
                             })
@@ -2226,8 +2228,6 @@ mod tests {
             &renderer,
             &layout::Limits::new(Size::ZERO, viewport.size()),
         );
-        // iced::widget::hover forwards native operations to its two real
-        // children, but currently does not forward their accessibility nodes.
         // This isolated fence has exactly one focusable native control: Copy.
         // Obtain its actual layout bounds, then click that button through the
         // production event path rather than constructing its Action in a test.
@@ -2570,5 +2570,315 @@ mod tests {
             &reference(Some("rust"), &larger, theme),
             "and growing",
         );
+    }
+
+    #[test]
+    fn chat_size_refreshes_measured_unmounted_list_and_table_geometry() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Tree, operation, tree::Tag},
+        };
+        fn settle(
+            element: &mut Element<'_, Message>,
+            tree: &mut Tree,
+            renderer: &cosmic::Renderer,
+            limits: &layout::Limits,
+        ) -> layout::Node {
+            let mut node = element.as_widget_mut().layout(tree, renderer, limits);
+            for _ in 0..8 {
+                let mut viewport = virtualized::UpdateViewport::default();
+                element
+                    .as_widget_mut()
+                    .operate(tree, Layout::new(&node), renderer, &mut viewport);
+                if !viewport.changed {
+                    return node;
+                }
+                node = element.as_widget_mut().layout(tree, renderer, limits);
+            }
+            panic!("finite production prose viewport must converge");
+        }
+        fn paragraph_sizes(tree: &Tree, out: &mut Vec<f32>) {
+            if tree.tag == Tag::of::<selectable_prose::State>() {
+                let state = tree.state.downcast_ref::<selectable_prose::State>();
+                if state.plain.starts_with("row ") {
+                    out.push(state.typography_for_test().1.0);
+                }
+            }
+            for child in &tree.children {
+                paragraph_sizes(child, out);
+            }
+        }
+        let _typography = design::typography_test_guard();
+        let renderer = crate::app::tests::headless_renderer();
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(520.0, 320.0));
+        let sources = [
+            (0..128).map(|i| format!("- row {i}\n")).collect::<String>(),
+            format!(
+                "| Heading |\n| --- |\n{}",
+                (0..128)
+                    .map(|i| format!("| row {i} |\n"))
+                    .collect::<String>()
+            ),
+        ];
+        for (source, rows) in sources.into_iter().zip([128, 129]) {
+            design::configure_typography("", 13.0, "", 13.0);
+            // One immutable prepared source throughout; this is a geometry
+            // refresh, not replacement of the item or its logical anchors.
+            let cached = CachedItem::new(
+                &ItemContent::Text {
+                    text: source,
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                crate::settings::EditorSyntaxTheme::Auto,
+            );
+            let source_revision = cached.revision;
+            let document = cached.document.clone().expect("prepared source");
+            let target = Target {
+                card: CardId::new(),
+                generation: 37,
+            };
+            let scroll_id = iced::advanced::widget::Id::unique();
+            let render = || -> Element<'static, Message> {
+                iced::widget::scrollable(view(
+                    &cached,
+                    design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+                    target,
+                    None,
+                ))
+                .id(scroll_id.clone())
+                .height(iced::Length::Fill)
+                .into()
+            };
+            let mut element = render();
+            let mut tree = Tree::new(&element);
+            let mut node = settle(&mut element, &mut tree, &renderer, &limits);
+            // Visit multiple pages with the actual native scroll operation,
+            // then leave their measured rows outside the mounted window.
+            for y in [800.0, 1600.0, 2400.0, 3200.0, 0.0] {
+                let mut scroll = operation::scrollable::scroll_to::<()>(
+                    scroll_id.clone(),
+                    operation::scrollable::AbsoluteOffset {
+                        x: None,
+                        y: Some(y),
+                    },
+                );
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut scroll,
+                );
+                let mut viewport = virtualized::UpdateViewport::default();
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut viewport,
+                );
+                node = settle(&mut element, &mut tree, &renderer, &limits);
+            }
+            let before = virtualized::measured_geometry(&tree, rows).expect("production rows");
+            let offscreen = *before
+                .measured
+                .iter()
+                .find(|&&index| index > 50 && !before.mounted.contains(&index))
+                .expect("visited rows must really be measured and now unmounted");
+            let old_height = before.offsets[offscreen + 1] - before.offsets[offscreen];
+            let mut sizes = Vec::new();
+            paragraph_sizes(&tree, &mut sizes);
+            assert!(!sizes.is_empty());
+            assert!(sizes.iter().all(|&size| size == 13.0));
+
+            for size in [24.0, 13.0] {
+                design::configure_typography("", 13.0, "", size);
+                element = render();
+                element.as_widget_mut().diff(&mut tree);
+                let _ = settle(&mut element, &mut tree, &renderer, &limits);
+                let after = virtualized::measured_geometry(&tree, rows).expect("same row graph");
+                assert_eq!(
+                    after.keys, before.keys,
+                    "logical selection/scroll identities survive"
+                );
+                assert!(after.measured.contains(&offscreen));
+                assert!(
+                    !after.mounted.contains(&offscreen),
+                    "oracle must not remount its row"
+                );
+                let height = after.offsets[offscreen + 1] - after.offsets[offscreen];
+                if size == 24.0 {
+                    assert!(
+                        height > old_height,
+                        "offscreen measured extent follows the new estimate"
+                    );
+                    assert!(after.offsets[offscreen] > before.offsets[offscreen]);
+                    assert!(after.offsets[rows] > before.offsets[rows]);
+                } else {
+                    assert!(
+                        (height - old_height).abs() < 0.1,
+                        "restored size restores offscreen extent"
+                    );
+                }
+                sizes.clear();
+                paragraph_sizes(&tree, &mut sizes);
+                assert!(!sizes.is_empty());
+                assert!(
+                    sizes.iter().all(|&actual| actual == size),
+                    "mounted native paragraphs follow chat size"
+                );
+                assert_eq!(cached.revision, source_revision);
+                assert!(std::ptr::eq(
+                    cached.document.as_ref().unwrap().items().as_ptr(),
+                    document.items().as_ptr(),
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn settings_chat_list_markers_follow_font_and_size_on_the_retained_markdown_tree() {
+        use iced::advanced::{
+            layout,
+            text::Paragraph as _,
+            widget::{Tree, tree::Tag},
+        };
+        type Paragraph = <cosmic::Renderer as iced::advanced::text::Renderer>::Paragraph;
+        type TextState = iced::advanced::widget::text::State<Paragraph>;
+        fn markers(tree: &Tree, out: &mut Vec<(String, iced::Font, f32)>) {
+            if tree.tag == Tag::of::<TextState>() {
+                let state = tree.state.downcast_ref::<TextState>();
+                let content = state.paragraph.content();
+                if matches!(content, "•" | "1." | "2.") {
+                    out.push((
+                        content.to_owned(),
+                        state.paragraph.raw().font(),
+                        state.paragraph.raw().size().0,
+                    ));
+                }
+            }
+            for child in &tree.children {
+                markers(child, out);
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        // Use the actual renderer's installed inventory, including private XDG
+        // lanes where user-only family names may not exist. No skipped path.
+        let families = design::installed_font_families(false);
+        assert!(families.len() >= 2, "two installed families required");
+        let fonts = [
+            iced::Font::with_name(families[0].as_str()),
+            iced::Font::with_name(families[1].as_str()),
+        ];
+        assert_ne!(fonts[0].family, fonts[1].family);
+        let cached = CachedItem::new(
+            &ItemContent::Text {
+                text: "- alpha\n- beta\n\n1. gamma\n2. delta".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        let target = Target {
+            card: CardId::new(),
+            generation: 17,
+        };
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(520.0, 1000.0));
+        let mut tree = None;
+        for (font, size) in fonts.into_iter().zip([13.0, 24.0]) {
+            let mut settings =
+                design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+            settings.style.font = font;
+            settings.text_size = size.into();
+            let mut element = view(&cached, settings, target, None);
+            let tree = tree.get_or_insert_with(|| Tree::new(element.as_widget()));
+            element.as_widget_mut().diff(tree);
+            let _ = element.as_widget_mut().layout(tree, &renderer, &limits);
+            let mut actual = Vec::new();
+            markers(tree, &mut actual);
+            assert_eq!(
+                actual.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
+                ["•", "•", "1.", "2."]
+            );
+            for (marker, actual_font, actual_size) in actual {
+                assert_eq!(
+                    actual_font, font,
+                    "rendered list marker {marker} must follow chat prose family"
+                );
+                assert_eq!(
+                    actual_size, size,
+                    "rendered list marker {marker} must follow chat prose size"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn settings_chat_image_text_follows_prose_and_caption_scale_on_the_retained_tree() {
+        use iced::advanced::{
+            layout,
+            widget::{Tree, tree::Tag},
+        };
+        fn image_text(tree: &Tree, out: &mut Vec<(String, iced::Font, f32)>) {
+            if tree.tag == Tag::of::<selectable_prose::State>() {
+                let state = tree.state.downcast_ref::<selectable_prose::State>();
+                let (font, size) = state.typography_for_test();
+                out.push((state.plain.to_string(), font, size.0));
+            }
+            for child in &tree.children {
+                image_text(child, out);
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let families = design::installed_font_families(false);
+        assert!(families.len() >= 2, "two installed families required");
+        let fonts = [
+            iced::Font::with_name(families[0].as_str()),
+            iced::Font::with_name(families[1].as_str()),
+        ];
+        assert_ne!(fonts[0].family, fonts[1].family);
+        let cached = CachedItem::new(
+            &ItemContent::Text {
+                text: r#"![Diagram alt](docs/diagram.png "Image caption")"#.into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        assert!(matches!(
+            cached.markdown.items(),
+            [markdown::Item::Image { .. }]
+        ));
+        let target = Target {
+            card: CardId::new(),
+            generation: 17,
+        };
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(520.0, 1000.0));
+        let mut tree = None;
+        for (font, size) in fonts.into_iter().zip([13.0, 24.0]) {
+            let mut settings =
+                design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+            settings.style.font = font;
+            settings.text_size = size.into();
+            let mut element = view(&cached, settings, target, None);
+            let tree = tree.get_or_insert_with(|| Tree::new(element.as_widget()));
+            element.as_widget_mut().diff(tree);
+            let _ = element.as_widget_mut().layout(tree, &renderer, &limits);
+            let mut actual = Vec::new();
+            image_text(tree, &mut actual);
+            assert_eq!(
+                actual.len(),
+                2,
+                "actual selectable alternative and caption text"
+            );
+            assert_eq!(actual[0], ("Diagram alt".to_owned(), font, size));
+            assert_eq!(
+                actual[1],
+                (
+                    "Image caption".to_owned(),
+                    font,
+                    size * (design::TEXT_CAPTION / design::TEXT_PROSE)
+                )
+            );
+        }
     }
 }

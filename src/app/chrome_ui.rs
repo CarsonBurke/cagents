@@ -10,9 +10,9 @@ pub(super) fn measure_tab_title(title: &str) -> f32 {
     let paragraph = <cosmic::Renderer as text::Renderer>::Paragraph::with_text(text::Text {
         content: title,
         bounds: Size::new(f32::INFINITY, f32::INFINITY),
-        size: Pixels(design::TEXT_BODY),
-        line_height: text::LineHeight::Absolute(Pixels(design::LINE_BODY)),
-        font: cosmic::font::default(),
+        size: Pixels(design::interface_size()),
+        line_height: text::LineHeight::Absolute(Pixels(design::interface_size() + 5.0)),
+        font: design::interface_font(),
         align_x: text::Alignment::Left,
         align_y: iced::alignment::Vertical::Top,
         shaping: text::Shaping::default(),
@@ -67,6 +67,88 @@ pub(super) struct State {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plus_and_pane_list_stay_visible_when_thirty_tabs_overflow() {
+        let _typography = design::typography_test_guard();
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation::Focusable},
+        };
+        use iced::{Rectangle, Size};
+        struct Bounds(HashMap<String, Rectangle>, Option<Rectangle>);
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn container(&mut self, id: Option<&widget::Id>, bounds: Rectangle) {
+                if let Some(id) = id {
+                    self.0.insert(id.to_string(), bounds);
+                }
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: Rectangle,
+                _: iced::Vector,
+                _: &mut dyn iced::advanced::widget::operation::Scrollable,
+            ) {
+                if id == Some(&widget::Id::new("workspace.tabs")) {
+                    self.1 = Some(bounds);
+                }
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                if let Some(id) = id {
+                    self.0.insert(id.to_string(), bounds);
+                }
+            }
+        }
+        let renderer = super::super::tests::headless_renderer();
+        for width in [640.0, 900.0, 1600.0] {
+            let app = tab_fixture(30, width);
+            let mut element =
+                app.workspace_chrome(widget::Space::new().height(Length::Fill).into());
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::new(width, 600.0), Size::new(width, 600.0)),
+            );
+            let mut bounds = Bounds(HashMap::new(), None);
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+            if width <= 900.0 {
+                let viewport = bounds.1.expect("native tab viewport");
+                let visible = app
+                    .workspace
+                    .order()
+                    .filter(|id| {
+                        let tab = bounds.0[&card_control_id(*id, "tab").to_string()];
+                        tab.x >= viewport.x
+                            && tab.x + tab.width <= viewport.x + viewport.width + 0.1
+                    })
+                    .count();
+                assert!(
+                    visible >= 4,
+                    "only {visible} complete tabs fit in {viewport:?}"
+                );
+            }
+            for id in [TOOLBAR_FOCUS_ID, "workspace.pane-list"] {
+                let rect = bounds.0.get(id).unwrap_or_else(|| panic!("missing {id}"));
+                assert!(
+                    rect.width > 0.0 && rect.x >= 0.0 && rect.x + rect.width <= width + 0.1,
+                    "{id} outside {width}px header: {rect:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn attention_popup_pages_unique_incidents_and_survives_an_empty_project_list() {
         let mut app = super::super::tests::context_inspector_test_app(false);
@@ -206,6 +288,124 @@ mod tests {
         }
     }
 
+    #[test]
+    fn overflow_keeps_new_pane_and_named_pane_counter_outside_the_scrolling_strip() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation},
+        };
+        use iced::{Rectangle, Size, Vector};
+        #[derive(Default)]
+        struct Bounds {
+            controls: HashMap<String, Rectangle>,
+            strip: Option<(Rectangle, Vector)>,
+        }
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn operation::Focusable,
+            ) {
+                if let Some(id) = id {
+                    self.controls.insert(id.to_string(), bounds);
+                }
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: Rectangle,
+                offset: Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                if id == Some(&widget::Id::new("workspace.tabs")) {
+                    self.strip = Some((bounds, offset));
+                }
+            }
+        }
+        let _typography = design::typography_test_guard();
+        let renderer = super::super::tests::headless_renderer();
+        for size in [13.0, 24.0] {
+            for width in [640.0, 900.0, 1600.0] {
+                let mut app = tab_fixture(30, width);
+                app.settings.interface_font_size = size;
+                drop(app.sync_chrome());
+                let mut header =
+                    app.workspace_chrome(widget::Space::new().height(Length::Fill).into());
+                let mut tree = Tree::new(header.as_widget());
+                let extent = Size::new(width, 600.0);
+                let node = header.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(extent, extent),
+                );
+                let mut before = Bounds::default();
+                header.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut before,
+                );
+                let strip = before.strip.expect("actual horizontal tab viewport").0;
+                for id in [TOOLBAR_FOCUS_ID, "workspace.pane-list"] {
+                    let control = before.controls[id];
+                    assert!(
+                        control.x >= strip.x + strip.width - 0.1,
+                        "{id} is pinned outside {strip:?}"
+                    );
+                    assert!(
+                        control.x >= -0.1 && control.x + control.width <= width + 0.1,
+                        "{id} clipped at width{width}/size{size}: {control:?}"
+                    );
+                }
+                header.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut operation::scrollable::snap_to::<()>(
+                        widget::Id::new("workspace.tabs"),
+                        operation::scrollable::RelativeOffset {
+                            x: Some(1.0),
+                            y: None,
+                        },
+                    ),
+                );
+                let mut after = Bounds::default();
+                header.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut after,
+                );
+                assert!(
+                    after.strip.unwrap().1.x.abs() > 1.0,
+                    "exercise actual overflowing scroll state"
+                );
+                for id in [TOOLBAR_FOCUS_ID, "workspace.pane-list"] {
+                    assert_eq!(
+                        after.controls[id], before.controls[id],
+                        "scroll moved pinned {id}"
+                    );
+                }
+                let ax = header.as_widget().a11y_nodes(
+                    Layout::new(&node),
+                    &tree,
+                    iced::mouse::Cursor::Unavailable,
+                );
+                assert!(ax.root().iter().chain(ax.children()).any(|node| {
+                    node.node().label() == Some("Show open panes · 1 of 30")
+                        && node
+                            .node()
+                            .supports_action(iced_accessibility::accesskit::Action::Click)
+                }));
+            }
+        }
+    }
+
     fn tab_fixture(count: usize, width: f32) -> Cagents {
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.context_inspector_open = false;
@@ -219,6 +419,192 @@ mod tests {
         app.workspace.resize_viewport(width);
         drop(app.sync_chrome());
         app
+    }
+
+    #[test]
+    fn mounted_tab_width_tracks_interface_size_and_family_without_a_title_change() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        const TITLE: &str = "Native tab";
+        struct TitleBounds(Option<iced::Rectangle>);
+        impl Operation for TitleBounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                if text == TITLE {
+                    self.0 = Some(bounds);
+                }
+            }
+        }
+        let _typography = design::typography_test_guard();
+        let renderer = super::super::tests::headless_renderer();
+        let mut app = tab_fixture(1, 1600.0);
+        let id = app.durable.cards[0].id;
+        app.chrome_ui.user_titles.insert(id, TITLE.into());
+        app.settings.interface_font_family.clear();
+        app.settings.interface_font_size = 13.0;
+        drop(app.sync_chrome());
+        let initial_font = design::interface_font();
+        let initial_revision = app.card_chrome[&id].typography_revision;
+        let initial_width = app.card_chrome[&id].title_width;
+        let initial_tab_width = app.tab_strip_geometry().1;
+        // Lay out the actual body widget independently of the measurement
+        // helper, so a stale/default font in that helper cannot validate itself.
+        let body_size = |font| {
+            let mut body: Element<'_, Message> = design::body(TITLE)
+                .font(font)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into();
+            let mut tree = Tree::new(body.as_widget());
+            body.as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(
+                        iced::Size::ZERO,
+                        iced::Size::new(f32::INFINITY, f32::INFINITY),
+                    ),
+                )
+                .size()
+        };
+        let assert_mounted = |app: &Cagents| {
+            let width = app.tab_strip_geometry().1;
+            let mut header = app.column_header(id, true, width);
+            let mut tree = Tree::new(header.as_widget());
+            let size = iced::Size::new(width, design::PRIMARY_CONTROL_SIZE);
+            let node = header.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(size, size),
+            );
+            let mut title = TitleBounds(None);
+            header
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut title);
+            let bounds = title.0.expect("the actual mounted tab title");
+            let intrinsic = body_size(design::interface_font());
+            assert!(bounds.width + 0.1 >= intrinsic.width);
+            assert!(bounds.height + 0.1 >= intrinsic.height);
+            assert!((app.card_chrome[&id].title_width - intrinsic.width).abs() < 0.1);
+        };
+        assert_mounted(&app);
+
+        // sync_chrome must apply new settings before refreshing its cache;
+        // neither a label change nor an intervening view call is required.
+        app.settings.interface_font_size = 24.0;
+        drop(app.sync_chrome());
+        assert_eq!(design::interface_size(), 24.0);
+        assert!(app.card_chrome[&id].typography_revision > initial_revision);
+        assert!(app.card_chrome[&id].title_width > initial_width);
+        assert!(app.tab_strip_geometry().1 > initial_tab_width);
+        assert_mounted(&app);
+
+        let sized_revision = app.card_chrome[&id].typography_revision;
+        let sized_width = app.card_chrome[&id].title_width;
+        let family = design::installed_font_families(false)
+            .iter()
+            .find(|family| {
+                let font = iced::Font {
+                    family: iced::font::Family::Name(family.as_str()),
+                    ..initial_font
+                };
+                font.family != initial_font.family
+                    && (body_size(font).width - sized_width).abs() > 0.1
+            })
+            .expect("an installed family has different actual metrics for the fixture title");
+        app.settings.interface_font_family = family.clone();
+        drop(app.sync_chrome());
+        assert_eq!(
+            design::interface_font().family,
+            iced::font::Family::Name(family.as_str())
+        );
+        assert!(app.card_chrome[&id].typography_revision > sized_revision);
+        assert!((app.card_chrome[&id].title_width - sized_width).abs() > 0.1);
+        assert_mounted(&app);
+        let stable_revision = app.card_chrome[&id].typography_revision;
+        drop(app.sync_chrome());
+        assert_eq!(app.card_chrome[&id].typography_revision, stable_revision);
+    }
+
+    #[test]
+    fn numbered_terminal_caption_fits_the_retained_header_at_maximum_interface_size() {
+        use iced::advanced::{
+            Layout, layout,
+            text::Paragraph as _,
+            widget::{Operation, Tree, tree::Tag},
+        };
+        type Paragraph = <cosmic::Renderer as iced::advanced::text::Renderer>::Paragraph;
+        type TextState = iced::advanced::widget::text::State<Paragraph>;
+        fn caption_line(tree: &Tree, suffix: &str) -> Option<f32> {
+            if tree.tag == Tag::of::<TextState>() {
+                let text = &tree.state.downcast_ref::<TextState>().paragraph;
+                if text.content() == suffix {
+                    let paragraph = text.raw();
+                    return Some(paragraph.line_height().to_absolute(paragraph.size()).0);
+                }
+            }
+            tree.children
+                .iter()
+                .find_map(|child| caption_line(child, suffix))
+        }
+        struct CaptionBounds<'a>(&'a str, Option<iced::Rectangle>);
+        impl Operation for CaptionBounds<'_> {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                if text == self.0 {
+                    self.1 = Some(bounds);
+                }
+            }
+        }
+        let _typography = design::typography_test_guard();
+        let renderer = super::super::tests::headless_renderer();
+        let mut app = tab_fixture(1, 1600.0);
+        let card = app.durable.cards[0].id;
+        let mut tree = Tree::empty();
+        for size in [13.0, 24.0] {
+            app.settings.interface_font_size = size;
+            drop(app.sync_chrome());
+            let suffix = app.card_chrome[&card]
+                .terminal_ordinal_suffix
+                .as_deref()
+                .expect("natural terminal title keeps its number")
+                .trim();
+            let width = app.tab_strip_geometry().1;
+            assert!(
+                width >= design::TAB_MIN_WIDTH,
+                "exercise the actual separate ordinal caption"
+            );
+            let mut header = app.column_header(card, true, width);
+            tree.diff(header.as_widget_mut());
+            let bounds = iced::Size::new(width, design::PRIMARY_CONTROL_SIZE);
+            let node = header.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(bounds, bounds),
+            );
+            let line = caption_line(&tree, suffix).expect("actual mounted ordinal text paragraph");
+            let mut caption = CaptionBounds(suffix, None);
+            header
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut caption);
+            let actual = caption.1.expect("actual ordinal layout bounds");
+            assert!(
+                line <= actual.height + 0.1,
+                "caption line {line} clipped by {actual:?} at {size}px"
+            );
+            assert!(actual.y >= -0.1 && actual.y + actual.height <= bounds.height + 0.1);
+            assert!(
+                line <= size + 5.0 && line > design::scaled_interface_size(design::TEXT_CAPTION)
+            );
+            if size == 13.0 {
+                assert_eq!(line, 17.0, "default caption geometry stays unchanged");
+            }
+        }
     }
 
     #[test]
@@ -1626,7 +2012,7 @@ fn notice_dismiss_id(id: u64) -> String {
     format!("chrome.notices.dismiss.{id}")
 }
 
-fn command<'a>(
+pub(super) fn command<'a>(
     icon: impl Into<widget::icon::Handle>,
     label: impl Into<Cow<'a, str>>,
     id: widget::Id,
@@ -2616,9 +3002,39 @@ impl Cagents {
         .into()
     }
 
+    fn pane_counter_width(&self) -> f32 {
+        let total = self.workspace.cards().len();
+        let current = self
+            .workspace
+            .focused()
+            .and_then(|id| self.workspace.order().position(|candidate| candidate == id))
+            .map_or(0, |index| index + 1);
+        thread_local! {
+            // One bounded UI-thread cache: ordinary redraws never reshape the
+            // counter while unrelated agents update or a spinner animates.
+            static WIDTH: std::cell::Cell<Option<(u64, usize, usize, f32)>> = const { std::cell::Cell::new(None) };
+        }
+        WIDTH.with(|cache| {
+            let revision = design::typography_revision();
+            if let Some((old_revision, old_current, old_total, width)) = cache.get()
+                && (old_revision, old_current, old_total) == (revision, current, total)
+            {
+                return width;
+            }
+            // The count is an actual caption at the active interface scale.
+            let width = (measure_tab_title(&format!("{current} / {total}"))
+                * (design::TEXT_CAPTION / design::TEXT_BODY)
+                + 16.0)
+                .max(design::PANE_NAVIGATOR_MIN_WIDTH);
+            cache.set(Some((revision, current, total, width)));
+            width
+        })
+    }
+
     fn workspace_header_width(&self) -> f32 {
         let navigator = if should_show_card_navigator(self.workspace.cards().len()) {
             design::PANE_NAVIGATOR_RESERVED_WIDTH
+                + (self.pane_counter_width() - design::PANE_NAVIGATOR_MIN_WIDTH)
         } else {
             0.0
         };
@@ -2682,8 +3098,8 @@ impl Cagents {
         let width = if self.workspace.viewport_width() > 0.0
             && self.workspace.viewport_width() < design::NARROW_WORKSPACE_WIDTH
         {
-            // Keep four compact tabs visible in a tiled workspace. Full names
-            // remain available in each tab's tooltip.
+            // Four short titles remain reachable even beside the sidebar;
+            // the pinned pane list carries the complete title and status.
             let visible = self.workspace.order().count().clamp(1, 4) as f32;
             let fitting = (available / visible
                 - crate::tab_strip::SPACING
@@ -2718,12 +3134,10 @@ impl Cagents {
         if available <= 0.0 {
             return Task::none();
         }
-        // The trailing "new tab" control shares the scrollable row, so a tab
-        // revealed flush against the viewport edge would sit underneath it.
+        // New-pane and pane-list controls stay outside the scrolling strip.
         let pitch = width + crate::tab_strip::SPACING;
-        let content = self.workspace.order().count() as f32 * pitch
-            + design::PRIMARY_CONTROL_SIZE
-            + 2.0 * crate::tab_strip::EDGE_INSET;
+        let content =
+            self.workspace.order().count() as f32 * pitch + 2.0 * crate::tab_strip::EDGE_INSET;
         let max_offset = (content - available).max(0.0);
         if max_offset <= 0.0 {
             // Everything fits; any offset at all would be wrong.
@@ -2769,7 +3183,6 @@ impl Cagents {
                 .workspace
                 .order()
                 .map(|id| self.column_header(id, self.workspace.focused() == Some(id), tab_width))
-                .chain(std::iter::once(self.new_tab_control()))
                 .collect();
             let generation = self.workspace_view_generation;
             let tabs = crate::tab_strip::reorderable(
@@ -2794,6 +3207,13 @@ impl Cagents {
             let actions = widget::row::with_children(self.workflow_header())
                 .spacing(space::XXS)
                 .align_y(Alignment::Center);
+            let tabs = widget::row::with_children(vec![
+                widget::container(tabs).width(Length::Fill).into(),
+                self.new_tab_control(),
+            ])
+            .spacing(space::XXS)
+            .align_y(Alignment::Center)
+            .width(Length::Fill);
             self.native_header(
                 tabs.into(),
                 Some(actions.into()),
@@ -2912,12 +3332,16 @@ impl Cagents {
                 )),
             ));
             actions.push(
-                iced::widget::container(crate::design::caption(format!("{current} / {total}")))
-                    .center_y(ICON_CONTROL_SIZE)
-                    .align_x(Alignment::Center)
-                    .width(
-                        (format!("{current} / {total}").len() as f32 * 7.0 + 16.0)
-                            .max(design::PANE_NAVIGATOR_MIN_WIDTH),
+                widget::button::custom(crate::design::caption(format!("{current} / {total}")))
+                    .name(format!("Show open panes · {current} of {total}"))
+                    .id(widget::Id::new("workspace.pane-list"))
+                    .class(cosmic::theme::Button::Text)
+                    .padding([0, 8])
+                    .height(ICON_CONTROL_SIZE)
+                    .width(self.pane_counter_width())
+                    .on_press_maybe(
+                        (!self.workspace_inputs_blocked())
+                            .then_some(Message::Palette(palette_ui::Action::OpenPanes)),
                     )
                     .into(),
             );

@@ -14,6 +14,14 @@ const BATCH: usize = 512;
 const PAGE: usize = 100;
 const ROW_HEIGHT: f32 = 96.0;
 const ROW_SPACING: f32 = 8.0;
+const ROW_PADDING: f32 = 5.0;
+
+fn resume_row_height() -> f32 {
+    // Captions never exceed the interface body line box. Keep the compact
+    // default, but reserve all three lines when interface typography grows.
+    let line_pitch = design::interface_size() + 5.0;
+    ROW_HEIGHT.max(3.0 * line_pitch + 2.0 * space::XS + 2.0 * ROW_PADDING)
+}
 
 #[derive(Default)]
 pub(super) struct State {
@@ -329,8 +337,9 @@ impl iced::advanced::widget::Operation<Message> for RevealSelection {
     }
 }
 fn resume_selection_offset(selected: usize, viewport: f32, content: f32, current: f32) -> f32 {
-    let top = selected as f32 * (ROW_HEIGHT + ROW_SPACING);
-    let bottom = top + ROW_HEIGHT;
+    let row_height = resume_row_height();
+    let top = selected as f32 * (row_height + ROW_SPACING);
+    let bottom = top + row_height;
     let target = if top < current {
         top
     } else if bottom > current + viewport {
@@ -922,7 +931,8 @@ impl Cagents {
                 widget::button::custom(contents)
                     .name(format!("Resume {}", row.title))
                     .width(Length::Fill)
-                    .height(Length::Fixed(ROW_HEIGHT))
+                    .height(Length::Fixed(resume_row_height()))
+                    .padding(ROW_PADDING)
                     .class(cosmic::theme::Button::ListItem([8.0; 4]))
                     .selected(index == state.selected)
                     .on_press_maybe(
@@ -1260,7 +1270,283 @@ mod tests {
     }
 
     #[test]
+    fn retained_resume_rows_allocate_metadata_and_reveal_the_full_typographic_row() {
+        use iced::advanced::{
+            Layout, layout, mouse,
+            text::Paragraph as _,
+            widget::{Operation, Tree, operation, tree},
+        };
+        type Paragraph = <cosmic::Renderer as iced::advanced::text::Renderer>::Paragraph;
+        type TextState = iced::advanced::widget::text::State<Paragraph>;
+
+        #[derive(Default)]
+        struct Geometry {
+            list: Option<iced::Rectangle>,
+            translation: iced::Vector,
+            texts: Vec<(String, iced::Rectangle)>,
+        }
+        impl Operation for Geometry {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: iced::Rectangle,
+                translation: iced::Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                if id == Some(&widget::Id::new("conversation-resume.results")) {
+                    self.list = Some(bounds);
+                    self.translation = translation;
+                }
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                self.texts.push((text.to_owned(), bounds));
+            }
+        }
+        fn paragraphs(tree: &Tree, metrics: &mut HashMap<String, (f32, f32, usize)>) {
+            if tree.tag == tree::Tag::of::<TextState>() {
+                let paragraph = tree.state.downcast_ref::<TextState>().paragraph.raw();
+                let text = paragraph
+                    .buffer()
+                    .lines
+                    .iter()
+                    .map(|line| line.text())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let runs = paragraph
+                    .buffer()
+                    .layout_runs()
+                    .map(|run| run.line_height)
+                    .collect::<Vec<_>>();
+                metrics.insert(
+                    text,
+                    (paragraph.min_bounds().height, runs.iter().sum(), runs.len()),
+                );
+            }
+            for child in &tree.children {
+                paragraphs(child, metrics);
+            }
+        }
+        fn contains(outer: iced::Rectangle, inner: iced::Rectangle) -> bool {
+            inner.x + 0.05 >= outer.x
+                && inner.y + 0.05 >= outer.y
+                && inner.x + inner.width <= outer.x + outer.width + 0.05
+                && inner.y + inner.height <= outer.y + outer.height + 0.05
+        }
+        fn button_bounds(
+            element: &Element<'_, Message>,
+            tree: &Tree,
+            node: &layout::Node,
+            label: &str,
+        ) -> iced::Rectangle {
+            let nodes =
+                element
+                    .as_widget()
+                    .a11y_nodes(Layout::new(node), tree, mouse::Cursor::Unavailable);
+            let row = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|entry| {
+                    entry.node().role() == iced_accessibility::accesskit::Role::Button
+                        && entry.node().label() == Some(label)
+                })
+                .expect("actual labelled button");
+            let bounds = row.node().bounds().unwrap();
+            iced::Rectangle {
+                x: bounds.x0 as f32,
+                y: bounds.y0 as f32,
+                width: (bounds.x1 - bounds.x0) as f32,
+                height: (bounds.y1 - bounds.y0) as f32,
+            }
+        }
+        fn row_bounds(
+            element: &Element<'_, Message>,
+            tree: &Tree,
+            node: &layout::Node,
+            title: &str,
+        ) -> iced::Rectangle {
+            button_bounds(element, tree, node, &format!("Resume {title}"))
+        }
+
+        let _restore = design::typography_test_guard();
+        let renderer = crate::app::tests::headless_renderer();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let directory = tempfile::tempdir().unwrap();
+        let entries = (0..20)
+            .map(|index| {
+                let mut session = chat::fresh_session(
+                    Provider::Claude,
+                    TerminalId::new(),
+                    directory.path().join(format!("project-{index:02}")),
+                    &crate::account::Account::system(Provider::Claude),
+                )
+                .unwrap();
+                session.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+                SavedConversation {
+                    card: CardId::new(),
+                    title: format!("Review project {index:02}"),
+                    session,
+                    open: false,
+                    updated_at_unix_ms: 20 - index,
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.session.launch.session_id.as_ref().unwrap())
+                .collect::<HashSet<_>>()
+                .len(),
+            20
+        );
+        app.resume_ui.open = true;
+        app.resume_ui.limit = PAGE;
+        app.resume_ui.scope = Some(Scope {
+            provider: Provider::Claude,
+            roots: vec![directory.path().to_owned()],
+            label: "Claude · geometry project".into(),
+        });
+        // Typed saved progress populates the actual picker without starting an
+        // indexer, provider, or daemon. No conversation is resumed by this test.
+        let generation = app.resume_ui.generation;
+        list(&mut app, generation, entries);
+        assert_eq!(app.resume_ui.visible.len(), 20);
+        let mut tree = Tree::empty();
+        for size in [
+            iced::Size::new(1100.0, 900.0),
+            iced::Size::new(880.0, 480.0),
+        ] {
+            let mut default_bounds = None;
+            for interface in [13.0, 24.0, 13.0] {
+                design::configure_typography("", interface, "", 14.0);
+                let mut element = app.resume_dialog().unwrap();
+                tree.diff(element.as_widget_mut());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, size),
+                );
+                {
+                    let mut reveal = RevealSelection { selected: 0 };
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut operation::black_box(&mut reveal),
+                    );
+                }
+                let mut geometry = Geometry::default();
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut geometry,
+                );
+                assert_eq!(geometry.translation, iced::Vector::ZERO);
+                let mut metrics = HashMap::new();
+                paragraphs(&tree, &mut metrics);
+                let mut previous_bottom = None;
+                for &index in &app.resume_ui.visible {
+                    let row = &app.resume_ui.rows[index];
+                    let button = row_bounds(&element, &tree, &node, &row.title);
+                    let title_index = geometry
+                        .texts
+                        .iter()
+                        .position(|(text, _)| text == &row.title)
+                        .unwrap();
+                    for (text, bounds) in &geometry.texts[title_index..title_index + 3] {
+                        let (minimum, runs_height, runs) =
+                            metrics.get(text).expect("actual retained paragraph");
+                        assert_eq!(
+                            *runs, 1,
+                            "each essential metadata line has a real layout run"
+                        );
+                        assert!(*minimum > 0.0 && *runs_height > 0.0);
+                        assert!(
+                            bounds.height + 0.05 >= *minimum
+                                && bounds.height + 0.05 >= *runs_height,
+                            "every title/account/project line must fit its actual paragraph: interface={interface}, text={text}, bounds={bounds:?}, minimum={minimum}"
+                        );
+                        assert!(
+                            contains(button, *bounds),
+                            "all metadata stays inside its row"
+                        );
+                    }
+                    if let Some(bottom) = previous_bottom {
+                        assert!(button.y >= bottom, "adjacent rows cannot overlap");
+                    }
+                    previous_bottom = Some(button.y + button.height);
+                    if interface == 13.0 {
+                        assert_eq!(button.height, 96.0, "default rows stay compact");
+                    }
+                }
+                let first = row_bounds(&element, &tree, &node, &app.resume_ui.rows[0].title);
+                if interface == 13.0 {
+                    if let Some(previous) = default_bounds {
+                        assert_eq!(first, previous);
+                    }
+                    default_bounds = Some(first);
+                }
+                let last = app.resume_ui.visible.len() - 1;
+                {
+                    // Exercise the production scroll operation itself; this
+                    // does not stand in for native keyboard event routing.
+                    let mut reveal = RevealSelection { selected: last };
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut operation::black_box(&mut reveal),
+                    );
+                }
+                let mut revealed = Geometry::default();
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut revealed,
+                );
+                let viewport = revealed.list.unwrap();
+                assert!(
+                    revealed.translation.y > 0.0,
+                    "many rows must actually scroll"
+                );
+                let row = &app.resume_ui.rows[app.resume_ui.visible[last]];
+                let selected = row_bounds(&element, &tree, &node, &row.title);
+                assert!(
+                    contains(viewport, selected),
+                    "the full selected row must be visible"
+                );
+                let title_index = revealed
+                    .texts
+                    .iter()
+                    .position(|(text, _)| text == &row.title)
+                    .unwrap();
+                for (_, bounds) in &revealed.texts[title_index..title_index + 3] {
+                    let screen = *bounds - revealed.translation;
+                    assert!(
+                        contains(viewport, screen),
+                        "revealed project/account/title must be visible"
+                    );
+                }
+                let cancel = button_bounds(&element, &tree, &node, "Cancel");
+                assert!(viewport.y + viewport.height <= cancel.y);
+                assert!(
+                    contains(iced::Rectangle::with_size(size), cancel),
+                    "Cancel remains reachable"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn resume_selection_uses_the_actual_viewport_and_preserves_visible_rows() {
+        let _restore = design::typography_test_guard();
+        design::configure_typography("", 13.0, "", 14.0);
         assert_eq!(resume_selection_offset(3, 160.0, 1040.0, 0.0), 248.0);
         assert_eq!(resume_selection_offset(3, 420.0, 1040.0, 0.0), 0.0);
         assert_eq!(resume_selection_offset(0, 160.0, 1040.0, 248.0), 0.0);

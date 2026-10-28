@@ -167,24 +167,44 @@ pub(super) fn code_frame<'a>(
         .width(Length::Fill)
         .into();
     let block = widget::column::with_children(vec![
-        widget::container(design::caption(caption))
-            .padding(iced::Padding::ZERO.right(24))
-            .width(Length::Fill)
-            .height(24)
+        // The caption owns its line box. The spacer keeps the ordinary
+        // header compact without clipping larger interface typography.
+        widget::container(
+            widget::row::with_children(vec![
+                iced::widget::Space::new().width(0).height(24).into(),
+                crate::interaction::tooltip(
+                    design::caption(caption.clone())
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .ellipsize(iced::widget::text::Ellipsize::End(
+                            iced::widget::text::EllipsizeHeightLimit::Lines(1),
+                        ))
+                        .width(Length::Fill),
+                    caption,
+                ),
+            ])
             .align_y(Alignment::Center)
-            .into(),
+            .width(Length::Fill),
+        )
+        .padding(iced::Padding::ZERO.right(24))
+        .width(Length::Fill)
+        .into(),
         body,
     ])
     .spacing(GAP_XS)
     .width(Length::Fill);
     match copy {
-        Some(copy) => iced::widget::hover(
+        Some(copy) => hover::overlay(
             block,
-            widget::container(small_icon(Icon::Copy, "Copy this block", copy))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_x(Alignment::End)
-                .align_y(Alignment::Start),
+            widget::container(rendered_copy::icon(
+                Icon::Copy,
+                "Copy this block",
+                copy,
+                rendered_copy::Role::Code,
+            ))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::End)
+            .align_y(Alignment::Start),
         ),
         None => block.into(),
     }
@@ -240,7 +260,12 @@ impl Runtime {
         };
         let target = self.target;
         let id = item.id.clone();
-        let copy = Action::Copy(target, id.clone(), part.clone());
+        let copy = Action::Copy(
+            target,
+            id.clone(),
+            part.clone(),
+            self.rendered_copy_source(item, part.clone()),
+        );
         // What a command or a tool printed is followed from its end. A patch,
         // an input, and what a read or a search returned are read from the
         // top, whether or not the step is still running.
@@ -670,3 +695,6 @@ impl Runtime {
             .into()
     }
 }
+
+#[cfg(test)]
+mod tests;

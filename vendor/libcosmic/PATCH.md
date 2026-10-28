@@ -21,3 +21,30 @@ ordinary PartialEq.
 The application regression mounts unrelated buttons before an editable field,
 then dispatches numeric IDs from the emitted accessibility tree. It checks editing
 reaches the field and a targeted click reaches only the intended button.
+
+## Runtime interface typography defaults
+
+The text helper exposes a UI-thread default size, set by the application's
+accepted interface typography before building a view. Unsized toolkit text,
+including context-menu labels, receives that size explicitly instead of keeping
+the renderer's startup default. Explicit per-label sizes still take precedence.
+
+Toolkit text buttons use the same default size and grow their default line box
+and minimum height accordingly. Menu buttons retain their existing minimum
+height and grow when a larger selected font needs more room. Their height uses
+iced's actual default text line height plus the existing vertical padding, so it
+tracks the text renderer rather than assuming a separate relative multiplier.
+These changes do not write desktop preferences or change package features and
+dependencies.
+
+Application layout regressions exercise toolkit text, text buttons and an actual
+right-click context-menu overlay at small and large interface sizes. The menu
+fixture initializes the retained widget tree before dispatching native events.
+
+## Runtime typography for stock inputs
+
+`src/widget/text_input/input.rs` captures the current toolkit interface font and UI-thread default text size when constructing a stock text input. Explicit `.font()` and `.size()` overrides remain authoritative. This lets standalone editor fields follow accepted interface preferences without relying on the renderer defaults fixed at startup. The application owns native layout regression coverage.
+
+Retained text inputs refresh their cached caret/selection/hit-test paragraph when the resolved font, text size or line height changes, matching the current drawing attributes.
+
+The retained input metric key compares line heights in resolved pixels. Native paragraphs report absolute line heights even when a widget requests a relative factor; equivalent relative/absolute requests reuse the same cached paragraph instead of reshaping unchanged inputs. The application regression retains the previous paragraph allocation while asserting reuse.

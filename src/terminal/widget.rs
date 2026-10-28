@@ -189,7 +189,7 @@ impl CellMetrics {
         } else {
             1.0
         };
-        let family = intern_family(family);
+        let family = resolved_family(family);
         let key = (font_size.to_bits(), scale_factor.to_bits(), family);
         let mut measured = MEASURED
             .lock()
@@ -337,12 +337,35 @@ fn font(family: &'static str, key: Face) -> Font {
 /// nothing. The set of families a user types is bounded in practice.
 pub(crate) fn monospace_font(family: &str) -> Font {
     font(
-        intern_family(family),
+        resolved_family(family),
         Face {
             bold: false,
             italic: false,
         },
     )
+}
+
+/// A missing named face must resolve explicitly to generic monospace. A named
+/// family does not carry a fallback family in iced's shaping attributes.
+fn resolved_family(family: &str) -> &'static str {
+    static RESOLVED: LazyLock<Mutex<HashMap<String, &'static str>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let family = family.trim();
+    if family.is_empty() {
+        return "";
+    }
+    let mut resolved = RESOLVED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(&existing) = resolved.get(family) {
+        return existing;
+    }
+    let installed = crate::design::installed_font_families(false)
+        .iter()
+        .find(|name| name.eq_ignore_ascii_case(family));
+    let name = installed.map_or("", |name| intern_family(name));
+    resolved.insert(family.to_owned(), name);
+    name
 }
 
 fn intern_family(family: &str) -> &'static str {
@@ -985,6 +1008,13 @@ impl PtySize {
 }
 
 #[derive(Default)]
+struct ReviewViewport {
+    terminal: Option<crate::model::TerminalId>,
+    active: Option<bool>,
+    pending_frame: Option<(u64, u16, u16)>,
+}
+
+#[derive(Default)]
 struct WidgetState {
     a11y: RefCell<accessibility::State>,
     links: RefCell<links::Cache>,
@@ -993,6 +1023,8 @@ struct WidgetState {
     review_control_pressed: bool,
     observed_review_revision: Option<u64>,
     observed_review_identity: Option<crate::model::TerminalId>,
+    requested_review: Option<bool>,
+    review_viewport: RefCell<ReviewViewport>,
     history_total: u64,
     completed_read_only: bool,
     shortcut_keys: Vec<keyboard::key::Physical>,
@@ -1540,14 +1572,22 @@ impl<Message> TerminalWidget<Message> {
             }
             state.observed_review_identity = Some(self.terminal_identity);
             state.observed_review_revision = None;
+            state.requested_review = None;
         }
         if state.observed_review_revision != Some(self.review_revision) {
             let mounted = state.observed_review_revision.is_none();
             state.observed_review_revision = Some(self.review_revision);
             // A remounted surface must still block input under its live owner.
             // Later acknowledgments never resurrect a local exit.
-            if mounted && self.review_active {
-                state.a11y.borrow_mut().review = true;
+            if self.review_active && (mounted || state.requested_review != Some(false)) {
+                let mut a11y = state.a11y.borrow_mut();
+                if !a11y.review {
+                    a11y.review = true;
+                    a11y.move_review(0, 0, false);
+                }
+            }
+            if state.requested_review == Some(self.review_active) {
+                state.requested_review = None;
             }
             // A native action takes effect before its parent callback is handled.
             // Repeated events and old views must not undo that local entry. Only
@@ -1559,15 +1599,31 @@ impl<Message> TerminalWidget<Message> {
                 a11y.selection = None;
             }
         }
+        // A temporary overlay can remove native/model focus without ending
+        // this card's authoritative review owner. Restore it when uncovered;
+        // a locally requested exit still wins over a delayed true model view.
+        if self.model_focused && self.review_active && state.requested_review != Some(false) {
+            state.a11y.borrow_mut().review = true;
+        }
     }
-    fn publish_review(&self, active: bool, shell: &mut Shell<'_, Message>) {
+    fn publish_review(
+        &self,
+        active: bool,
+        requested: &mut Option<bool>,
+        shell: &mut Shell<'_, Message>,
+    ) {
+        *requested = Some(active);
         if let Some(callback) = &self.on_review {
             shell.publish(callback(active));
         }
     }
 
-    fn grid_bounds(bounds: Rectangle) -> Rectangle {
-        let height = REVIEW_BAR_HEIGHT.min(bounds.height);
+    fn grid_bounds(bounds: Rectangle, review: bool) -> Rectangle {
+        let height = if review {
+            REVIEW_BAR_HEIGHT.min(bounds.height)
+        } else {
+            0.0
+        };
         Rectangle {
             y: bounds.y + height,
             height: bounds.height - height,
@@ -1580,6 +1636,46 @@ impl<Message> TerminalWidget<Message> {
             y: bounds.y,
             width: bounds.width.min(164.0),
             height: bounds.height.min(REVIEW_BAR_HEIGHT),
+        }
+    }
+
+    fn reconcile_review_viewport(&self, state: &WidgetState, geometry: TerminalGeometry) {
+        let mut viewport = state.review_viewport.borrow_mut();
+        let mut a11y = state.a11y.borrow_mut();
+        if viewport.terminal != Some(self.terminal_identity) {
+            *viewport = ReviewViewport {
+                terminal: Some(self.terminal_identity),
+                ..ReviewViewport::default()
+            };
+        }
+        let changed = viewport.active.is_some_and(|active| active != a11y.review)
+            || (viewport.active.is_none()
+                && a11y.review
+                && (self.snapshot.rows != geometry.rows
+                    || self.snapshot.columns != geometry.columns));
+        if changed {
+            viewport.pending_frame =
+                Some((self.snapshot.generation, geometry.rows, geometry.columns));
+        }
+        viewport.active = Some(a11y.review);
+        let fresh_frame = viewport
+            .pending_frame
+            .is_some_and(|(generation, rows, columns)| {
+                self.snapshot.generation != generation
+                    && self.snapshot.rows == rows
+                    && self.snapshot.columns == columns
+            });
+        if changed || fresh_frame {
+            // A viewport change and its later reflowed frame are separate
+            // boundaries: old AT coordinates cannot select newly arranged text.
+            a11y.selection = None;
+            a11y.projection = None;
+            for id in &mut a11y.row_ids {
+                *id = Id::unique();
+            }
+        }
+        if fresh_frame {
+            viewport.pending_frame = None;
         }
     }
 
@@ -1626,7 +1722,7 @@ impl<Message> TerminalWidget<Message> {
     /// separators, for one - has to be named here: the generic monospace family
     /// resolves to whatever the system prefers, which need not cover them.
     pub fn font_family(mut self, family: &str) -> Self {
-        self.font_family = intern_family(family);
+        self.font_family = resolved_family(family);
         self
     }
 
@@ -1993,22 +2089,64 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             return A11yTree::default();
         };
         let bounds = layout.bounds() - layout.virtual_offset();
-        let geometry = TerminalGeometry::new(
-            Self::grid_bounds(bounds),
+        let state = tree.state.downcast_ref::<WidgetState>();
+        let mut a11y = state.a11y.borrow_mut();
+        a11y.barrier = self.review_input_barrier.clone();
+        a11y.bind(id, self.terminal_identity);
+        let review_active = a11y.review;
+        let grid = Self::grid_bounds(bounds, review_active);
+        let mut geometry = TerminalGeometry::new(
+            grid,
             self.font_size,
             self.scale_factor,
             self.font_family,
             self.line_height,
             self.padding,
         );
-        let state = tree.state.downcast_ref::<WidgetState>();
-        let mut a11y = state.a11y.borrow_mut();
-        a11y.barrier = self.review_input_barrier.clone();
-        a11y.bind(id, self.terminal_identity);
         a11y.refresh(
             &self.snapshot,
             accessibility::View {
-                rows: if bounds.height > REVIEW_BAR_HEIGHT {
+                rows: if grid.height > 0.0 { geometry.rows } else { 0 },
+                columns: geometry.columns,
+                offset: self.snapshot.scroll.offset,
+                alternate: self.snapshot.scroll.alternate_screen,
+                focused: self.model_focused,
+            },
+            Instant::now(),
+            true,
+        );
+        // Losing focus can leave review during refresh. Publish geometry for
+        // the resulting mode in this same tree, rather than one stale frame.
+        if a11y.review != review_active {
+            geometry = TerminalGeometry::new(
+                Self::grid_bounds(bounds, a11y.review),
+                self.font_size,
+                self.scale_factor,
+                self.font_family,
+                self.line_height,
+                self.padding,
+            );
+            a11y.refresh(
+                &self.snapshot,
+                accessibility::View {
+                    rows: geometry.rows,
+                    columns: geometry.columns,
+                    offset: self.snapshot.scroll.offset,
+                    alternate: self.snapshot.scroll.alternate_screen,
+                    focused: self.model_focused,
+                },
+                Instant::now(),
+                true,
+            );
+        }
+        drop(a11y);
+        self.reconcile_review_viewport(state, geometry);
+        let mut a11y = state.a11y.borrow_mut();
+        let final_review = a11y.review;
+        a11y.refresh(
+            &self.snapshot,
+            accessibility::View {
+                rows: if Self::grid_bounds(bounds, final_review).height > 0.0 {
                     geometry.rows
                 } else {
                     0
@@ -2067,14 +2205,17 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             ),
             if projection.truncated { "; capped" } else { "" }
         ));
-        let visible_selection = state.selection.and_then(|selection| {
-            let (start, end) = selection.span(self.selection_grid());
-            a11y.grid_selection(
-                (start.row, start.column),
-                (end.row, end.column),
-                self.snapshot.scroll.offset,
-            )
-        });
+        let visible_selection = state
+            .selection
+            .filter(|_| state.review_viewport.borrow().pending_frame.is_none())
+            .and_then(|selection| {
+                let (start, end) = selection.span(self.selection_grid());
+                a11y.grid_selection(
+                    (start.row, start.column),
+                    (end.row, end.column),
+                    self.snapshot.scroll.offset,
+                )
+            });
         if let Some(selection) = a11y
             .selection
             .clone()
@@ -2119,13 +2260,17 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             "Review visible terminal"
         });
         review.add_action(Action::Click);
-        let control = Self::review_control(bounds);
-        review.set_bounds(Rect::new(
-            f64::from(control.x),
-            f64::from(control.y),
-            f64::from(control.x + control.width),
-            f64::from(control.y + control.height),
-        ));
+        // The idle action is virtual: it has no pointer hotspot, chrome or
+        // bounds covering text rows. AT traversal can still invoke it by ID.
+        if a11y.review {
+            let control = Self::review_control(bounds);
+            review.set_bounds(Rect::new(
+                f64::from(control.x),
+                f64::from(control.y),
+                f64::from(control.x + control.width),
+                f64::from(control.y + control.height),
+            ));
+        }
         children.push(A11yTree::leaf(
             review,
             a11y.control_id.as_ref().unwrap().clone(),
@@ -2207,14 +2352,6 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         _viewport: &Rectangle,
     ) {
         let bounds = layout.bounds();
-        let geometry = TerminalGeometry::new(
-            Self::grid_bounds(bounds),
-            self.font_size,
-            self.scale_factor,
-            self.font_family,
-            self.line_height,
-            self.padding,
-        );
         let state = tree.state.downcast_mut::<WidgetState>();
         {
             let mut a11y = state.a11y.borrow_mut();
@@ -2226,12 +2363,18 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         if self.on_review.is_some() {
             self.reconcile_review(state);
         }
-        let view = accessibility::View {
-            rows: if bounds.height > REVIEW_BAR_HEIGHT {
-                geometry.rows
-            } else {
-                0
-            },
+        let mut reviewing = state.a11y.borrow().review;
+        let mut grid = Self::grid_bounds(bounds, reviewing);
+        let mut geometry = TerminalGeometry::new(
+            grid,
+            self.font_size,
+            self.scale_factor,
+            self.font_family,
+            self.line_height,
+            self.padding,
+        );
+        let mut view = accessibility::View {
+            rows: if grid.height > 0.0 { geometry.rows } else { 0 },
             columns: geometry.columns,
             offset: self.snapshot.scroll.offset,
             alternate: self.snapshot.scroll.alternate_screen,
@@ -2245,6 +2388,30 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         {
             shell.request_redraw_at(due);
         }
+        if state.a11y.borrow().review != reviewing {
+            reviewing = state.a11y.borrow().review;
+            grid = Self::grid_bounds(bounds, reviewing);
+            geometry = TerminalGeometry::new(
+                grid,
+                self.font_size,
+                self.scale_factor,
+                self.font_family,
+                self.line_height,
+                self.padding,
+            );
+            view.rows = if grid.height > 0.0 { geometry.rows } else { 0 };
+            view.columns = geometry.columns;
+            state
+                .a11y
+                .borrow_mut()
+                .refresh(&self.snapshot, view, Instant::now(), false);
+        }
+        let activated = state.a11y.borrow().projection.is_some();
+        self.reconcile_review_viewport(state, geometry);
+        state
+            .a11y
+            .borrow_mut()
+            .refresh(&self.snapshot, view, Instant::now(), activated);
         if let Event::Mouse(mouse::Event::ButtonReleased(IcedMouseButton::Left)) = event {
             if state.review_control_pressed {
                 state.review_control_pressed = false;
@@ -2255,7 +2422,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         if matches!(
             event,
             Event::Mouse(mouse::Event::ButtonPressed(IcedMouseButton::Left))
-        ) && cursor.is_over(Self::review_control(bounds))
+        ) && reviewing
+            && cursor.is_over(Self::review_control(bounds))
         {
             let mut a11y = state.a11y.borrow_mut();
             a11y.refresh(&self.snapshot, view, Instant::now(), true);
@@ -2269,7 +2437,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             }
             state.preedit = None;
             state.review_control_pressed = true;
-            self.publish_review(a11y.review, shell);
+            self.publish_review(a11y.review, &mut state.requested_review, shell);
             shell.capture_event();
             shell.request_redraw();
             return;
@@ -2279,14 +2447,14 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             event,
             Event::Mouse(mouse::Event::ButtonPressed(_) | mouse::Event::WheelScrolled { .. })
         ) && cursor.is_over(bounds)
-            && !cursor.is_over(Self::grid_bounds(bounds))
+            && !cursor.is_over(Self::grid_bounds(bounds, reviewing))
         {
             shell.capture_event();
             return;
         }
         if matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. }))
             && cursor.is_over(bounds)
-            && !cursor.is_over(Self::grid_bounds(bounds))
+            && !cursor.is_over(Self::grid_bounds(bounds, reviewing))
             && state.pressed_buttons == 0
             && !state.selecting
             && state.scrollbar_drag.is_none()
@@ -2319,7 +2487,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                         a11y.move_review(0, 0, false);
                         state.preedit = None;
                         state.input_focused = true;
-                        self.publish_review(true, shell);
+                        self.publish_review(true, &mut state.requested_review, shell);
                     }
                     Action::Click if control => {
                         a11y.review = !a11y.review;
@@ -2328,7 +2496,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                         if a11y.review {
                             a11y.move_review(0, 0, false);
                         }
-                        self.publish_review(a11y.review, shell);
+                        self.publish_review(a11y.review, &mut state.requested_review, shell);
                     }
                     Action::SetTextSelection if ours => {
                         if let Some(ActionData::SetTextSelection(selection)) = &request.data {
@@ -2336,7 +2504,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                                 a11y.review = true;
                                 a11y.selection = Some(selection.clone());
                                 state.preedit = None;
-                                self.publish_review(true, shell);
+                                self.publish_review(true, &mut state.requested_review, shell);
                             }
                         }
                     }
@@ -2363,7 +2531,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         let consumed_review_input = review_target && state.a11y.borrow_mut().review_input(event);
         if consumed_review_input {
             if was_review && !state.a11y.borrow().review {
-                self.publish_review(false, shell);
+                self.publish_review(false, &mut state.requested_review, shell);
             }
             shell.capture_event();
             shell.request_redraw();
@@ -2380,6 +2548,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         state.selection_reset = self.selection_reset;
         state.history_total = self.snapshot.scroll.total;
         state.completed_read_only = self.read_only;
+        // The active-only status row changes the real viewport. Resize the
+        // child normally so its latest output remains visible after reflow.
         self.synchronize_size(state, geometry, shell);
         if state.select_all_request != self.select_all_request {
             state.select_all_request = self.select_all_request;
@@ -2404,8 +2574,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         // Only the focused terminal's rail is draggable. An unfocused card may
         // still paint one (see [`TerminalScrollbar::visible`]), but the click
         // that reaches it focuses the terminal instead of grabbing the thumb.
-        let scrollbar = TerminalScrollbar::new(Self::grid_bounds(bounds), self.snapshot.scroll)
-            .filter(|_| self.model_focused);
+        let scrollbar =
+            TerminalScrollbar::new(Self::grid_bounds(bounds, reviewing), self.snapshot.scroll)
+                .filter(|_| self.model_focused);
         if scrollbar.is_none() {
             state.scrollbar_drag = None;
         }
@@ -2978,8 +3149,14 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         }
 
         let bounds = layout.bounds();
+        let reviewing = tree
+            .state
+            .downcast_ref::<WidgetState>()
+            .a11y
+            .borrow()
+            .review;
         let geometry = TerminalGeometry::new(
-            Self::grid_bounds(bounds),
+            Self::grid_bounds(bounds, reviewing),
             self.font_size,
             self.scale_factor,
             self.font_family,
@@ -3226,9 +3403,10 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 }
             });
             if let Some(bar) =
-                TerminalScrollbar::new(Self::grid_bounds(bounds), self.snapshot.scroll).filter(
-                    |_| TerminalScrollbar::visible(self.snapshot.scroll, self.model_focused),
-                )
+                TerminalScrollbar::new(Self::grid_bounds(bounds, reviewing), self.snapshot.scroll)
+                    .filter(|_| {
+                        TerminalScrollbar::visible(self.snapshot.scroll, self.model_focused)
+                    })
             {
                 renderer.fill_quad(
                     renderer::Quad {
@@ -3253,85 +3431,82 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         });
         // Create a later clipped layer: drawing into the restored parent
         // would place this chrome beneath the terminal's opaque grid layer.
-        renderer.with_layer(widget_clip, |renderer| {
-            use cosmic::iced::advanced::text::Renderer as _;
-            let review = tree
-                .state
-                .downcast_ref::<WidgetState>()
-                .a11y
-                .borrow()
-                .review;
-            let control = Self::review_control(bounds);
-            let bar = Rectangle {
-                height: bounds.height.min(REVIEW_BAR_HEIGHT),
-                ..bounds
-            };
-            renderer.fill_quad(
-                renderer::Quad {
-                    bounds: bar,
-                    ..renderer::Quad::default()
-                },
-                color(self.snapshot.background),
-            );
-            renderer.fill_quad(
-                renderer::Quad {
-                    bounds: control,
-                    border: Border {
-                        width: 1.0,
-                        color: color(self.snapshot.foreground).scale_alpha(0.3),
-                        ..Border::default()
-                    },
-                    ..renderer::Quad::default()
-                },
-                color(self.snapshot.foreground).scale_alpha(0.08),
-            );
-            renderer.fill_text(
-                text::Text {
-                    content: if review {
-                        "Return to input"
-                    } else {
-                        "Review visible text"
-                    }
-                    .to_owned(),
-                    bounds: control.size(),
-                    size: Pixels(12.0),
-                    line_height: text::LineHeight::Relative(1.2),
-                    font: Font::DEFAULT,
-                    align_x: text::Alignment::Center,
-                    align_y: cosmic::iced::alignment::Vertical::Center,
-                    shaping: text::Shaping::Advanced,
-                    wrapping: text::Wrapping::None,
-                    ellipsize: text::Ellipsize::None,
-                },
-                control.center(),
-                color(self.snapshot.foreground),
-                widget_clip,
-            );
-            if review {
-                let feedback = Rectangle {
-                    width: (bar.width - control.width - 8.0).max(0.0),
-                    x: bar.x + 4.0,
-                    ..bar
+        if reviewing {
+            renderer.with_layer(widget_clip, |renderer| {
+                use cosmic::iced::advanced::text::Renderer as _;
+                let review = tree
+                    .state
+                    .downcast_ref::<WidgetState>()
+                    .a11y
+                    .borrow()
+                    .review;
+                let control = Self::review_control(bounds);
+                let bar = Rectangle {
+                    height: bounds.height.min(REVIEW_BAR_HEIGHT),
+                    ..bounds
                 };
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: bar,
+                        ..renderer::Quad::default()
+                    },
+                    color(self.snapshot.background),
+                );
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: control,
+                        border: Border {
+                            width: 1.0,
+                            color: color(self.snapshot.foreground).scale_alpha(0.3),
+                            ..Border::default()
+                        },
+                        ..renderer::Quad::default()
+                    },
+                    color(self.snapshot.foreground).scale_alpha(0.08),
+                );
                 renderer.fill_text(
                     text::Text {
-                        content: "Review · typing blocked · Esc exits".to_owned(),
-                        bounds: feedback.size(),
+                        content: "Return to input".to_owned(),
+                        bounds: control.size(),
                         size: Pixels(12.0),
                         line_height: text::LineHeight::Relative(1.2),
                         font: Font::DEFAULT,
-                        align_x: text::Alignment::Left,
+                        align_x: text::Alignment::Center,
                         align_y: cosmic::iced::alignment::Vertical::Center,
                         shaping: text::Shaping::Advanced,
                         wrapping: text::Wrapping::None,
                         ellipsize: text::Ellipsize::None,
                     },
-                    Point::new(feedback.x, feedback.center_y()),
+                    control.center(),
                     color(self.snapshot.foreground),
                     widget_clip,
                 );
-            }
-        });
+                if review {
+                    let feedback = Rectangle {
+                        width: (bar.width - control.width - 8.0).max(0.0),
+                        x: bar.x + 4.0,
+                        ..bar
+                    };
+                    renderer.fill_text(
+                        text::Text {
+                            content: "Review · typing blocked · Esc exits".to_owned(),
+                            bounds: feedback.size(),
+                            size: Pixels(12.0),
+                            line_height: text::LineHeight::Relative(1.2),
+                            font: Font::DEFAULT,
+                            align_x: text::Alignment::Left,
+                            align_y: cosmic::iced::alignment::Vertical::Center,
+                            shaping: text::Shaping::Advanced,
+                            wrapping: text::Wrapping::None,
+                            ellipsize: text::Ellipsize::None,
+                        },
+                        Point::new(feedback.x, feedback.center_y()),
+                        color(self.snapshot.foreground),
+                        widget_clip,
+                    );
+                }
+            });
+        }
         if let Some(started) = draw_started {
             // This records CPU draw-command construction, not GPU completion
             // or compositor presentation/scanout.
@@ -3352,17 +3527,26 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         _viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
-        if cursor.is_over(Self::review_control(layout.bounds())) {
+        let reviewing = tree
+            .state
+            .downcast_ref::<WidgetState>()
+            .a11y
+            .borrow()
+            .review;
+        if reviewing && cursor.is_over(Self::review_control(layout.bounds())) {
             return mouse::Interaction::Pointer;
         }
         if self.model_focused
-            && TerminalScrollbar::new(Self::grid_bounds(layout.bounds()), self.snapshot.scroll)
-                .is_some_and(|bar| cursor.is_over(bar.track))
+            && TerminalScrollbar::new(
+                Self::grid_bounds(layout.bounds(), reviewing),
+                self.snapshot.scroll,
+            )
+            .is_some_and(|bar| cursor.is_over(bar.track))
         {
             return mouse::Interaction::Pointer;
         }
         let geometry = TerminalGeometry::new(
-            Self::grid_bounds(layout.bounds()),
+            Self::grid_bounds(layout.bounds(), reviewing),
             self.font_size,
             self.scale_factor,
             self.font_family,
@@ -5009,6 +5193,21 @@ mod tests {
     }
 
     #[test]
+    fn settings_missing_named_font_uses_monospace_for_editor_and_terminal_metrics() {
+        let requested = "Cagents Missing Font Fixture 6C1B";
+        assert_eq!(
+            monospace_font(requested).family,
+            cosmic::iced::font::Family::Monospace
+        );
+        assert_eq!(resolved_family(requested), "");
+        assert_eq!(
+            CellMetrics::resolve(DEFAULT_FONT_SIZE, 1.0, requested).family,
+            ""
+        );
+        assert_eq!(resolved_family("  Cagents Missing Font Fixture 6C1B  "), "");
+    }
+
+    #[test]
     fn a_family_name_is_interned_once_and_an_empty_name_is_the_system_monospace() {
         let first = intern_family("Cagents Interned Family");
         let second = intern_family(&format!("  {first}  "));
@@ -5685,7 +5884,7 @@ mod tests {
         let translation = cosmic::iced::Vector::new(690.0, 0.0);
         let layout = Layout::new(&node).with_virtual_offset(translation);
         let geometry = TerminalGeometry::new(
-            TerminalWidget::<()>::grid_bounds(layout.bounds()),
+            TerminalWidget::<()>::grid_bounds(layout.bounds(), false),
             DEFAULT_FONT_SIZE,
             1.0,
             "",
