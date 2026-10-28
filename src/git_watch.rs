@@ -795,19 +795,21 @@ impl Monitor {
                         owners,
                         mut failures,
                     } = registrations;
-                    let (faulted, retired) = {
+                    // Build and retire the owner index off the mutex shared
+                    // with the owner's drain and native event callbacks.
+                    let next_registrations = desired
+                        .keys()
+                        .map(|path| (path.clone(), owners.get(path).cloned().unwrap_or_default()))
+                        .collect();
+                    let (faulted, retired, previous_registrations) = {
                         let mut pending = state.lock().unwrap_or_else(|p| p.into_inner());
-                        pending.registrations = desired
-                            .keys()
-                            .map(|path| {
-                                (path.clone(), owners.get(path).cloned().unwrap_or_default())
-                            })
-                            .collect();
                         (
                             std::mem::take(&mut pending.faulted),
                             std::mem::take(&mut pending.retired),
+                            std::mem::replace(&mut pending.registrations, next_registrations),
                         )
                     };
+                    drop(previous_registrations);
                     let rearmed = match &mut watcher {
                         Ok(watcher) => {
                             if faulted {
