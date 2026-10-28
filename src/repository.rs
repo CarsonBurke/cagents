@@ -812,6 +812,24 @@ pub struct RemoteRefRecord {
     pub branch: String,
 }
 
+/// Configured remote names can contain slashes. Assign a cached ref to its
+/// longest matching remote before interpreting the remaining branch name.
+fn configured_remote_branch<'a>(
+    reference: &'a RemoteRefRecord,
+    remotes: &'a [RemoteRecord],
+) -> Option<(&'a str, &'a str)> {
+    remotes
+        .iter()
+        .filter_map(|remote| {
+            reference
+                .name
+                .as_str()
+                .strip_prefix(&format!("refs/remotes/{}/", remote.name))
+                .map(|branch| (remote.name.as_str(), branch))
+        })
+        .max_by_key(|(remote, _)| remote.len())
+}
+
 /// A remote's default branch: the target of `refs/remotes/<remote>/HEAD`.
 ///
 /// That ref is a symbolic ref rather than a branch — it has no commit of its
@@ -5630,14 +5648,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             // A plain branch name is local intent. Cached remote-tracking refs
             // can identify an existing remote branch; unknown names create a
             // local branch without a speculative network lookup.
-            let mut candidates: Vec<_> = refs.remote.iter().filter_map(|reference| {
-                remotes.iter().filter_map(|remote| {
-                    reference.name.as_str().strip_prefix(&format!("refs/remotes/{}/", remote.name))
-                        .map(|name| (remote, name))
-                }).max_by_key(|(remote, _)| remote.name.len())
-                    .filter(|(_, name)| *name == branch.as_str())
-                    .map(|(remote, name)| (remote.name.clone(), name.to_owned()))
-            }).collect();
+            let mut candidates: Vec<_> = refs
+                .remote
+                .iter()
+                .filter_map(|reference| configured_remote_branch(reference, &remotes))
+                .filter(|(_, name)| *name == branch.as_str())
+                .map(|(remote, name)| (remote.to_owned(), name.to_owned()))
+                .collect();
             if candidates.len() > 1 {
                 return Err(ValidationError::InvalidBranch(format!(
                     "{} exists on multiple remotes; enter one of: {}",
@@ -5780,9 +5797,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             ))?);
         }
         let branch = ValidatedBranchName::parse(name)?;
-        let mut candidates: Vec<_> = refs.remote.iter()
-            .filter(|reference| remotes.iter().any(|remote| reference.name.as_str() == format!("refs/remotes/{}/{}", remote.name, branch.as_str())))
-            .map(|reference| reference.name.as_str().to_owned()).collect();
+        let mut candidates: Vec<_> = refs
+            .remote
+            .iter()
+            .filter(|reference| {
+                configured_remote_branch(reference, remotes)
+                    .is_some_and(|(_, name)| name == branch.as_str())
+            })
+            .map(|reference| reference.name.as_str().to_owned())
+            .collect();
         if candidates.len() == 1 {
             return Ok(BaseRevision::remote_ref(candidates.remove(0))?);
         }
