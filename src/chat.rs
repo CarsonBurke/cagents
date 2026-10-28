@@ -1975,6 +1975,23 @@ pub struct Item {
     #[serde(default)]
     pub at: Option<u64>,
 }
+
+impl Item {
+    /// Bodies whose complete canonical bytes can be copied through the owned
+    /// transcript source. Provider context uses the same field as ordinary
+    /// prose; other deliveries retain their existing presentation copy rules.
+    pub(crate) fn logical_copy_body(&self) -> Option<&str> {
+        match &self.content {
+            ItemContent::Text { text, .. } => Some(text),
+            ItemContent::Delivery {
+                kind: DeliveryKind::Notice,
+                body,
+                ..
+            } if self.role == Role::System => Some(body),
+            _ => None,
+        }
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Choice {
     pub id: String,

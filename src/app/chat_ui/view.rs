@@ -4320,7 +4320,7 @@ impl Runtime {
                 Icon::Copy
             },
             "Copy this message",
-            if matches!(item.content, ItemContent::Text { .. })
+            if item.logical_copy_body().is_some()
                 && !self
                     .presentation_cache()
                     .get(&item.id)
