@@ -19,7 +19,10 @@ use thiserror::Error;
 
 mod accounts;
 pub use accounts::AccountCommand;
+#[cfg(test)]
+mod agent_start_authority_tests;
 mod agents;
+
 #[cfg(test)]
 mod automation_work_authority_tests;
 mod channel_work;
