@@ -1240,6 +1240,20 @@ fn restore(
                     && restored.proof.as_ref() == Some(proof)
                     && restored.launch.provider == session.launch.provider =>
             {
+                if retry_explicit_start && restored.is_saved_claude_history() {
+                    if restored != session {
+                        return Err(
+                            "The saved-history reader changed the explicit retry request".into(),
+                        );
+                    }
+                    let execution_environment = native_environment(&restored, true);
+                    return Ok(ClientRequest::ChatStart {
+                        session: restored,
+                        source: None,
+                        terminate_source: false,
+                        execution_environment,
+                    });
+                }
                 if session != restored {
                     if UpgradeRecovery::candidate(&session, &restored).is_none() {
                         return Err("The daemon's upgrade replacement changed the saved conversation configuration".into());
@@ -3631,7 +3645,7 @@ mod tests {
 
     #[test]
     fn explicit_retry_classifies_exact_history_reader_and_live_successor() {
-        for state in 0..3 {
+        for state in 0..5 {
             let proof = host_proof("current");
             let mut source = omp_card(Some(CONVERSATION), Some(proof.clone()));
             source.launch.provider = crate::agent::Provider::Claude;
@@ -3641,10 +3655,11 @@ mod tests {
             if state == 1 {
                 hosted.native_continuity =
                     super::super::NativeContinuity::RetainedClaudeActor { protocol: 2 };
-            } else if state == 2 {
+            } else if state == 2 || state == 4 {
                 source.proof = Some(host_proof("previous"));
             }
             let expected = hosted.clone();
+            let expected_source = source.clone();
             let (mut client, mut server) = UnixStream::pair().unwrap();
             let server_proof = proof.clone();
             let worker = thread::spawn(move || {
@@ -3656,10 +3671,23 @@ mod tests {
                     let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
                     let response = match (step, request.request) {
                         (0, ClientRequest::ChatList) => ServerResponse::ChatListed {
-                            sessions: vec![expected.clone()],
+                            sessions: if state < 3 {
+                                vec![expected.clone()]
+                            } else {
+                                vec![]
+                            },
                         },
-                        (1, ClientRequest::ChatPrepareResume { source }) if source == expected => {
+                        (1, ClientRequest::ChatPrepareResume { source })
+                            if state < 3 && source == expected =>
+                        {
                             ServerResponse::ChatResumePrepared {
+                                session: expected.clone(),
+                            }
+                        }
+                        (1, ClientRequest::ResolveUpgradeChat { source })
+                            if state >= 3 && source == expected_source =>
+                        {
+                            ServerResponse::UpgradeChatResolved {
                                 session: expected.clone(),
                             }
                         }
@@ -3689,13 +3717,13 @@ mod tests {
             );
             worker.join().unwrap();
             match state {
-                0 => assert!(
+                0 | 3 => assert!(
                     matches!(result, Ok(ClientRequest::ChatStart { session, source: None, terminate_source: false, .. }) if session == hosted)
                 ),
                 1 => assert!(
                     matches!(result, Ok(ClientRequest::ChatAttach { session }) if session == hosted)
                 ),
-                2 => assert!(
+                2 | 4 => assert!(
                     result
                         .unwrap_err()
                         .message
