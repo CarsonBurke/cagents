@@ -91,6 +91,17 @@ pub enum Layout {
     List,
 }
 
+/// One Work pane lifetime, shared by its watcher and subscription identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WatchOwner(ActivationLifetime);
+
+/// The exact refresh accepted by this pane; it grants no backend authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshTicket {
+    owner: WatchOwner,
+    operation: uuid::Uuid,
+}
+
 /// What the board subscription reports.
 #[derive(Debug, Clone)]
 pub enum Watch {
@@ -107,7 +118,10 @@ pub enum Watch {
 
 #[derive(Debug, Clone)]
 pub enum Action {
-    Watched(Watch),
+    Watched {
+        owner: WatchOwner,
+        watch: Watch,
+    },
     /// The clock moved: relative times are redrawn.
     Tick,
     ScopeMenu(bool),
@@ -117,7 +131,10 @@ pub enum Action {
     Layout(Layout),
     /// Rescans every project and polls GitHub now.
     Refresh,
-    Refreshed(Result<(), String>),
+    Refreshed {
+        ticket: RefreshTicket,
+        result: Result<(), String>,
+    },
     /// The exact rendered destination, checked again against the current card.
     Activate(Activation),
     Menu(Option<CardRef>),
@@ -135,7 +152,7 @@ impl Action {
     pub fn background(&self) -> bool {
         matches!(
             self,
-            Self::Watched(_) | Self::Tick | Self::Refreshed(_) | Self::Pinned { .. }
+            Self::Watched { .. } | Self::Tick | Self::Refreshed { .. } | Self::Pinned { .. }
         )
     }
 }
@@ -150,7 +167,7 @@ pub struct Activation {
     primary: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ActivationLifetime(uuid::Uuid);
 
 impl Default for ActivationLifetime {
@@ -236,7 +253,9 @@ impl Activation {
 /// What only the application can do for this pane.
 #[derive(Debug, Clone)]
 pub enum Effect {
-    Refresh,
+    Refresh {
+        ticket: RefreshTicket,
+    },
     Pin {
         ticket: PinTicket,
         project: PathBuf,
@@ -275,7 +294,7 @@ pub struct State {
     query: String,
     layout: Layout,
     menu: Option<CardRef>,
-    refreshing: bool,
+    refreshing: Option<RefreshTicket>,
     /// The last refresh that failed, independent of pin feedback.
     error: Option<String>,
     pins: Pins,
@@ -295,13 +314,27 @@ impl State {
         };
     }
 
+    pub fn watch_owner(&self) -> WatchOwner {
+        WatchOwner(self.lifetime)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_refresh_ticket(&self) -> Option<RefreshTicket> {
+        self.refreshing.clone()
+    }
+
     pub fn update(&mut self, action: Action) -> Option<Effect> {
         match action {
-            Action::Watched(Watch::Board {
-                revision,
-                board,
-                first,
-            }) => {
+            Action::Watched { owner, .. } if owner != self.watch_owner() => None,
+            Action::Watched {
+                watch:
+                    Watch::Board {
+                        revision,
+                        board,
+                        first,
+                    },
+                ..
+            } => {
                 // A board pushed while the subscription was answered can
                 // arrive before the answer; the newer one stands.
                 if first || revision > self.revision {
@@ -346,7 +379,10 @@ impl State {
                 }
                 None
             }
-            Action::Watched(Watch::Lost(error)) => {
+            Action::Watched {
+                watch: Watch::Lost(error),
+                ..
+            } => {
                 self.pins = Pins::default();
                 self.lost = Some(error);
                 None
@@ -383,15 +419,22 @@ impl State {
                 None
             }
             Action::Refresh => {
-                if self.refreshing {
+                if self.refreshing.is_some() {
                     return None;
                 }
-                self.refreshing = true;
+                let ticket = RefreshTicket {
+                    owner: self.watch_owner(),
+                    operation: uuid::Uuid::new_v4(),
+                };
+                self.refreshing = Some(ticket.clone());
                 self.error = None;
-                Some(Effect::Refresh)
+                Some(Effect::Refresh { ticket })
             }
-            Action::Refreshed(result) => {
-                self.refreshing = false;
+            Action::Refreshed { ticket, result } => {
+                if self.refreshing.as_ref() != Some(&ticket) {
+                    return None;
+                }
+                self.refreshing = None;
                 self.error = result.err();
                 None
             }
@@ -542,7 +585,7 @@ impl State {
                 .on_press(Action::Layout(Layout::List))
                 .into(),
         ]);
-        let refresh: Element<'_, Action> = if self.refreshing {
+        let refresh: Element<'_, Action> = if self.refreshing.is_some() {
             crate::interaction::tooltip(
                 widget::container(crate::ui_controls::activity_spinner(
                     14.0,
@@ -1611,19 +1654,25 @@ mod tests {
     }
 
     fn watched(state: &mut State, revision: u64, board: Arc<Board>) {
-        state.update(Action::Watched(Watch::Board {
-            revision,
-            board,
-            first: false,
-        }));
+        state.update(Action::Watched {
+            owner: state.watch_owner(),
+            watch: Watch::Board {
+                revision,
+                board,
+                first: false,
+            },
+        });
     }
 
     fn connected(state: &mut State, revision: u64, board: Arc<Board>) {
-        state.update(Action::Watched(Watch::Board {
-            revision,
-            board,
-            first: true,
-        }));
+        state.update(Action::Watched {
+            owner: state.watch_owner(),
+            watch: Watch::Board {
+                revision,
+                board,
+                first: true,
+            },
+        });
     }
 
     #[test]
@@ -2142,7 +2191,13 @@ mod tests {
     fn a_pin_failure_preserves_other_cards_even_when_their_success_arrives_first() {
         for success_first in [false, true] {
             let (mut state, a, b) = pin_board();
-            state.update(Action::Refreshed(Err("current refresh failure".into())));
+            let Some(Effect::Refresh { ticket }) = state.update(Action::Refresh) else {
+                panic!("fresh refresh effect")
+            };
+            state.update(Action::Refreshed {
+                ticket,
+                result: Err("current refresh failure".into()),
+            });
             let first = pin(&mut state, &a, Some(Column::Stale));
             let second = pin(&mut state, &b, Some(Column::Active));
             if success_first {
@@ -2218,7 +2273,10 @@ mod tests {
             match boundary {
                 "reset" => state.reset(),
                 "lost" => {
-                    state.update(Action::Watched(Watch::Lost("disconnected".into())));
+                    state.update(Action::Watched {
+                        owner: state.watch_owner(),
+                        watch: Watch::Lost("disconnected".into()),
+                    });
                 }
                 "reconnect" => connected(
                     &mut state,
@@ -2242,7 +2300,13 @@ mod tests {
                     board(vec![item("first", "cagents"), item("second", "cagents")]),
                 );
             }
-            state.update(Action::Refreshed(Err("new refresh failure".into())));
+            let Some(Effect::Refresh { ticket }) = state.update(Action::Refresh) else {
+                panic!("fresh refresh effect")
+            };
+            state.update(Action::Refreshed {
+                ticket,
+                result: Err("new refresh failure".into()),
+            });
             let current = pin(&mut state, &b, Some(Column::Active));
             complete_pin(&mut state, old.clone(), Err("late old failure".into()));
             complete_pin(&mut state, old, Ok(()));
@@ -3161,7 +3225,10 @@ mod tests {
             let activation_lifetime = state.lifetime;
             let pin_lifetime = state.pins.lifetime;
             if change == "lost" {
-                state.update(Action::Watched(Watch::Lost("fixture watch lost".into())));
+                state.update(Action::Watched {
+                    owner: state.watch_owner(),
+                    watch: Watch::Lost("fixture watch lost".into()),
+                });
             }
             if change == "reconnect" {
                 connected(&mut state, 1, board(vec![b.clone()]));
@@ -3240,4 +3307,5 @@ mod tests {
             "3d"
         );
     }
+    include!("work_ui/callback_scope_tests.rs");
 }

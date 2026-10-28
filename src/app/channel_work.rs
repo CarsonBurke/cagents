@@ -2866,13 +2866,14 @@ mod tests {
         );
         let _ = ui.into_cache();
 
-        drop(
-            app.update(Message::WorkUi(BoardAction::Watched(Watch::Board {
+        drop(app.update(Message::WorkUi(BoardAction::Watched {
+            owner: app.work_ui.watch_owner(),
+            watch: Watch::Board {
                 revision: 2,
                 board: workboard_snapshot("updated-branch"),
                 first: false,
-            }))),
-        );
+            },
+        })));
         drop(app.update(Message::WorkUi(BoardAction::Tick)));
         let ui = workboard_native(&app, &mut renderer);
         assert_eq!(workboard_query_value(&ui), "");
@@ -2933,9 +2934,10 @@ mod tests {
             "hidden Pin cannot optimistically move its card"
         );
         let _ = ui.into_cache();
-        drop(app.update(Message::WorkUi(BoardAction::Refreshed(Err(
-            "fixture refresh completed".into(),
-        )))));
+        drop(app.update(Message::WorkUi(BoardAction::Refreshed {
+            ticket: app.work_ui.pending_refresh_ticket().unwrap(),
+            result: Err("fixture refresh completed".into()),
+        })));
         let mut ui = workboard_native(&app, &mut renderer);
         assert!(
             rendered_text(&mut ui, &renderer)
@@ -3937,13 +3939,14 @@ mod tests {
                 .values()
                 .any(|card| matches!(card, CardRuntime::Work))
         );
-        drop(app.update(Message::WorkUi(crate::work_ui::Action::Watched(
-            crate::work_ui::Watch::Board {
+        drop(app.update(Message::WorkUi(crate::work_ui::Action::Watched {
+            owner: app.work_ui.watch_owner(),
+            watch: crate::work_ui::Watch::Board {
                 revision: 1,
                 board: workboard_snapshot("branch"),
                 first: true,
             },
-        ))));
+        })));
         (app, home)
     }
 
