@@ -2342,8 +2342,8 @@ where
         return ExitCode::FAILURE;
     }
     // Retain legacy write scope before installer recovery or an older CLI can
-    // handle the command. Reads and explicit-authority ChannelWork keep their
-    // original routing; a scoped legacy write uses this client's selected host.
+    // handle the command. Legacy reads keep their original routing; a scoped
+    // legacy write uses this client's selected host.
     let project_channel_context =
         legacy_model_command_mutates(&cli.command).then(ProjectChannelContext::capture);
     if let Some(context) = &project_channel_context
@@ -2356,7 +2356,11 @@ where
     // to a staged CLI whose Automation/Work transport may predate this policy.
     let service_context = matches!(
         &cli.command,
-        TopCommand::Automation { .. } | TopCommand::Work { .. }
+        TopCommand::Automation { .. }
+            | TopCommand::Work { .. }
+            | TopCommand::Channel {
+                command: ChannelCommand::Work { .. }
+            }
     )
     .then(ServiceRequestContext::capture);
     if let Some(context) = &service_context
@@ -2598,6 +2602,12 @@ fn execute_with_model_context(
         TopCommand::Project { command } => match project_channel_context {
             Some(context) => execute_project_as(command, &context),
             None => execute_project(command),
+        },
+        TopCommand::Channel {
+            command: ChannelCommand::Work { command },
+        } => match service_context {
+            Some(context) => channel_work::execute_with_context(command, &context),
+            None => channel_work::execute(command),
         },
         TopCommand::Channel { command } => match project_channel_context {
             Some(context) => execute_channel_as(command, &context),
@@ -3517,8 +3527,8 @@ fn protocol_error(error: ControlError) -> AppError {
     }
 }
 
-/// Automation and Work share endpoint selection, while retaining their
-/// distinct business-envelope and connection-authentication contracts.
+/// Automation, Workboard and channel work share endpoint selection, while
+/// retaining their business-envelope and connection-authentication contracts.
 struct ServiceRequestContext {
     authority: Authority,
     remote: bool,
@@ -3540,7 +3550,7 @@ impl ServiceRequestContext {
         if self.scoped() && self.remote {
             return Err(AppError::new(
                 "permission_denied",
-                "Automation and Work commands from an agent session require your own terminal on the remote device",
+                "Automation and work commands from an agent session require your own terminal on the remote device",
             ));
         }
         Ok(())
