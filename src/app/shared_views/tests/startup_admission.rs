@@ -2222,6 +2222,10 @@ fn failed_scope_retry_preserves_a_changed_deleted_or_closed_sibling_and_both_dra
         "canonical_moved_pruned",
         "canonical_moved_managed",
         "canonical_moved_managed_pruned",
+        "initial_moved",
+        "initial_moved_managed",
+        "initial_moved_before_started",
+        "initial_moved_managed_before_started",
         "local_closed",
         "local_removed",
         "title",
@@ -2265,10 +2269,7 @@ fn failed_scope_retry_preserves_a_changed_deleted_or_closed_sibling_and_both_dra
             view.panes.push(sibling.clone());
         }
         let mut canonical = model(identity, active, hidden, view);
-        if matches!(
-            changed,
-            "canonical_moved_managed" | "canonical_moved_managed_pruned"
-        ) {
+        if changed.contains("managed") {
             canonical.agents = vec![managed_chat(&sibling, Scope::Channel(hidden))];
         }
         let connected = app.apply_workspace_model_update(ModelUpdate::Connected(canonical.clone()));
@@ -2277,6 +2278,110 @@ fn failed_scope_retry_preserves_a_changed_deleted_or_closed_sibling_and_both_dra
         let source_seed =
             acknowledge_destination_seed(&mut app, &rx, &scope, Scope::Channel(active), &canonical);
         let failed = framed_seed(source_seed, canonical.clone(), true);
+        if changed.starts_with("initial_moved") {
+            let before_started = changed.ends_with("before_started");
+            let source_members = app.local_view_cards(&scope);
+            let destination = Scope::Channel(active);
+            let destination_members = app.local_view_cards(&destination);
+            let allocations = [&pane, &sibling].map(|pane| {
+                let CardRuntime::Chat(runtime) = &app.cards[&pane.id] else {
+                    unreachable!()
+                };
+                (
+                    &**runtime as *const chat_ui::Runtime as usize,
+                    runtime.target,
+                )
+            });
+            if !before_started {
+                apply_seed_updates(&mut app, vec![failed[0].clone()]);
+            }
+            let mut moved = canonical.clone();
+            moved.sequence += 1;
+            moved
+                .views
+                .iter_mut()
+                .find(|view| view.scope == scope)
+                .unwrap()
+                .panes
+                .retain(|pane| pane.id != sibling.id);
+            moved
+                .views
+                .iter_mut()
+                .find(|view| view.scope == destination)
+                .unwrap()
+                .panes
+                .push(sibling.clone());
+            if changed.contains("managed") {
+                moved.agents = vec![managed_chat(&sibling, destination.clone())];
+                assert!(
+                    crate::workspace_model::views::managed_display(&moved, &moved.agents[0])
+                        .is_some_and(|display| display.scope == destination)
+                );
+            }
+            let read = app.apply_workspace_model_update(ModelUpdate::Read(moved.clone()));
+            settle(&mut app, read);
+            for refused in [false, true] {
+                if refused {
+                    if before_started {
+                        apply_seed_updates(&mut app, vec![failed[0].clone()]);
+                    }
+                    apply_seed_updates(&mut app, vec![failed[1].clone()]);
+                }
+                let seed = &app.shared_views.seed_admissions[&scope];
+                assert_eq!(seed.failed, refused, "{changed}");
+                if !refused {
+                    assert!(seed.failed_chats.is_empty() && seed.retry_sources.is_empty());
+                    assert_eq!(seed.attempt.is_none(), before_started);
+                }
+                assert_eq!(app.local_view_cards(&scope), source_members, "{changed}");
+                assert_eq!(
+                    app.local_view_cards(&destination),
+                    destination_members,
+                    "{changed}"
+                );
+                for (index, original) in [&pane, &sibling].iter().enumerate() {
+                    let CardKind::Chat(source) = &original.kind else {
+                        unreachable!()
+                    };
+                    let CardRuntime::Chat(runtime) = &app.cards[&original.id] else {
+                        unreachable!()
+                    };
+                    assert_eq!(
+                        (
+                            &**runtime as *const chat_ui::Runtime as usize,
+                            runtime.target
+                        ),
+                        allocations[index],
+                        "{changed}"
+                    );
+                    assert!(runtime.awaiting_admission(), "{changed}");
+                    assert_eq!(&runtime.session, source);
+                    assert_eq!(
+                        app.durable.pending_chat_admissions.get(&original.id),
+                        Some(source)
+                    );
+                    let failure = app.shared_chat_admission_failure(original.id);
+                    if refused {
+                        let failure = failure.unwrap();
+                        assert!(failure.retry().is_none());
+                        assert!(failure.message().contains("Close and reopen this window"));
+                    } else {
+                        assert!(failure.is_none(), "a watcher is not a refusal: {changed}");
+                    }
+                }
+                let saved = app.persistent_workspace();
+                for original in [&pane, &sibling] {
+                    assert_eq!(
+                        saved.chat_drafts.get(&original.id),
+                        drafts.get(&original.id)
+                    );
+                }
+                assert_eq!(app.workspace_model, moved);
+                assert!(daemon.requests().is_empty(), "{changed}");
+                assert!(rx.is_empty(), "{changed}: no compensating transfer or seed");
+            }
+            continue;
+        }
         if changed == "deleted_before_refusal" {
             let mut deleted = canonical.clone();
             deleted.sequence += 1;
@@ -2501,6 +2606,8 @@ fn retried_seed_ack_preserves_every_failed_source_across_reordered_snapshots() {
                 "recipe",
                 "canonical_moved",
                 "canonical_moved_managed",
+                "initial_moved",
+                "initial_moved_managed",
                 "title",
                 "legacy_unshared",
             ] {
@@ -2574,7 +2681,7 @@ fn retried_seed_ack_preserves_every_failed_source_across_reordered_snapshots() {
                         .unwrap()
                         .panes
                         .push(destination_pane.clone());
-                    if changed == "canonical_moved_managed" {
+                    if changed.contains("managed") {
                         canonical.agents =
                             vec![managed_chat(&originals[changed_card], scope.clone())];
                     }
@@ -2588,6 +2695,198 @@ fn retried_seed_ack_preserves_every_failed_source_across_reordered_snapshots() {
                         destination.clone(),
                         &canonical,
                     );
+                    if changed.starts_with("initial_moved") {
+                        let source_members = app.local_view_cards(&scope);
+                        let destination_members = app.local_view_cards(&destination);
+                        let allocations = originals.each_ref().map(|pane| {
+                            let CardRuntime::Chat(runtime) = &app.cards[&pane.id] else {
+                                unreachable!()
+                            };
+                            (
+                                &**runtime as *const chat_ui::Runtime as usize,
+                                runtime.target,
+                            )
+                        });
+                        let mut moved = canonical.clone();
+                        moved.sequence += 1;
+                        moved
+                            .views
+                            .iter_mut()
+                            .find(|view| view.scope == scope)
+                            .unwrap()
+                            .panes
+                            .retain(|pane| pane.id != originals[changed_card].id);
+                        let destination_view = moved
+                            .views
+                            .iter_mut()
+                            .find(|view| view.scope == destination)
+                            .unwrap();
+                        destination_view.panes[0].title = "Updated destination browser".into();
+                        destination_view.panes.push(originals[changed_card].clone());
+                        if changed.contains("managed") {
+                            moved.agents =
+                                vec![managed_chat(&originals[changed_card], destination.clone())];
+                            assert!(
+                                crate::workspace_model::views::managed_display(
+                                    &moved,
+                                    &moved.agents[0],
+                                )
+                                .is_some_and(|display| display.scope == destination)
+                            );
+                        }
+                        let mut returned = canonical.clone();
+                        returned.sequence = moved.sequence + 1;
+                        returned
+                            .views
+                            .iter_mut()
+                            .find(|view| view.scope == destination)
+                            .unwrap()
+                            .panes[0]
+                            .title = "Updated destination browser".into();
+                        let accepted = framed_seed(
+                            source_seed,
+                            if earlier_read {
+                                returned.clone()
+                            } else {
+                                moved.clone()
+                            },
+                            false,
+                        );
+                        apply_seed_updates(&mut app, vec![accepted[0].clone()]);
+                        if earlier_read {
+                            let read =
+                                app.apply_workspace_model_update(ModelUpdate::Read(moved.clone()));
+                            settle(&mut app, read);
+                            assert!(!app.shared_views.seed_admissions[&scope].failed, "{case}");
+                            assert_eq!(app.local_view_cards(&scope), source_members, "{case}");
+                            assert_eq!(
+                                app.local_view_cards(&destination),
+                                destination_members,
+                                "{case}"
+                            );
+                            for (index, pane) in originals.iter().enumerate() {
+                                let CardRuntime::Chat(runtime) = &app.cards[&pane.id] else {
+                                    unreachable!()
+                                };
+                                assert_eq!(
+                                    (
+                                        &**runtime as *const chat_ui::Runtime as usize,
+                                        runtime.target
+                                    ),
+                                    allocations[index]
+                                );
+                                assert!(runtime.awaiting_admission(), "{case}");
+                                assert!(
+                                    app.shared_chat_admission_failure(pane.id).is_none(),
+                                    "{case}"
+                                );
+                            }
+                            assert!(daemon.requests().is_empty(), "{case}");
+                        }
+                        let ack = app.apply_workspace_model_update(accepted[1].clone());
+                        if earlier_read {
+                            drop(ack);
+                            assert!(
+                                !app.shared_views.seed_admissions.contains_key(&scope),
+                                "{case}"
+                            );
+                            for pane in &originals {
+                                assert!(
+                                    !app.durable.pending_chat_admissions.contains_key(&pane.id),
+                                    "{case}"
+                                );
+                                assert!(app.chat_start_pending(pane.id), "{case}");
+                            }
+                            let admitted_targets = originals.each_ref().map(|pane| {
+                                let CardRuntime::Chat(runtime) = &app.cards[&pane.id] else {
+                                    unreachable!()
+                                };
+                                runtime.target
+                            });
+                            drop(app.apply_workspace_model_update(accepted[1].clone()));
+                            for (index, pane) in originals.iter().enumerate() {
+                                let CardRuntime::Chat(runtime) = &app.cards[&pane.id] else {
+                                    unreachable!()
+                                };
+                                assert_eq!(runtime.target, admitted_targets[index], "{case}");
+                                assert!(app.chat_start_pending(pane.id), "{case}");
+                            }
+                            // Once the original ACK succeeds, the same peer move
+                            // is ordinary canonical projection, not a lasting fence.
+                            moved.sequence = returned.sequence + 1;
+                            let read =
+                                app.apply_workspace_model_update(ModelUpdate::Read(moved.clone()));
+                            settle(&mut app, read);
+                            assert!(
+                                !app.local_view_cards(&scope)
+                                    .contains(&originals[changed_card].id),
+                                "{case}"
+                            );
+                            assert!(
+                                app.local_view_cards(&destination)
+                                    .contains(&originals[changed_card].id),
+                                "{case}"
+                            );
+                        } else {
+                            settle(&mut app, ack);
+                            assert!(app.shared_views.seed_admissions[&scope].failed, "{case}");
+                            assert_eq!(app.local_view_cards(&scope), source_members, "{case}");
+                            assert_eq!(
+                                app.local_view_cards(&destination),
+                                destination_members,
+                                "{case}"
+                            );
+                            for (index, pane) in originals.iter().enumerate() {
+                                let CardKind::Chat(source) = &pane.kind else {
+                                    unreachable!()
+                                };
+                                let CardRuntime::Chat(runtime) = &app.cards[&pane.id] else {
+                                    unreachable!()
+                                };
+                                assert_eq!(
+                                    (
+                                        &**runtime as *const chat_ui::Runtime as usize,
+                                        runtime.target
+                                    ),
+                                    allocations[index]
+                                );
+                                assert!(runtime.awaiting_admission(), "{case}");
+                                assert_eq!(
+                                    app.durable.pending_chat_admissions.get(&pane.id),
+                                    Some(source),
+                                    "{case}"
+                                );
+                                let failure = app.shared_chat_admission_failure(pane.id).unwrap();
+                                assert!(failure.retry().is_none(), "{case}");
+                                assert!(
+                                    failure.message().contains("Close and reopen this window"),
+                                    "{case}"
+                                );
+                            }
+                        }
+                        assert_eq!(app.workspace_model, moved, "{case}");
+                        assert_eq!(
+                            app.card_state(destination_pane.id).unwrap().title,
+                            "Updated destination browser",
+                            "{case}"
+                        );
+                        let saved = app.persistent_workspace();
+                        for pane in &originals {
+                            assert_eq!(
+                                saved.chat_drafts.get(&pane.id),
+                                drafts.get(&pane.id),
+                                "{case}"
+                            );
+                            assert_eq!(
+                                saved.chat_draft_attachments[&pane.id],
+                                [image.clone()],
+                                "{case}"
+                            );
+                        }
+                        assert!(daemon.requests().is_empty(), "{case}");
+                        assert!(rx.is_empty(), "{case}: no compensating transfer or seed");
+                        continue;
+                    }
                     let refused = framed_seed(source_seed, canonical.clone(), true);
                     apply_seed_updates(&mut app, refused);
                     let source_members = app.local_view_cards(&scope);

@@ -267,8 +267,8 @@ impl Cagents {
         });
     }
 
-    /// A different scope's earlier ACK cannot admit a refused source while its
-    /// original seed is still unresolved. Keep this authority independently of
+    /// A different scope's earlier ACK cannot admit a source while its own seed
+    /// is still unresolved. Keep this authority independently of
     /// error rows, runtimes and pending markers, which can be pruned or closed.
     pub(super) fn shared_chat_admission_scope_conflicts(
         &self,
@@ -276,18 +276,40 @@ impl Cagents {
         card: CardId,
         scope: &Scope,
     ) -> bool {
-        self.shared_views.seed_admissions.values().any(|seed| {
-            seed.registry == registry
-                && seed
-                    .failed_chats
+        self.shared_views
+            .seed_admissions
+            .iter()
+            .any(|(owner, seed)| {
+                seed.registry == registry
+                    && ((owner != scope
+                        && seed
+                            .panes
+                            .iter()
+                            .any(|pane| pane.id == card && matches!(pane.kind, CardKind::Chat(_))))
+                        || seed
+                            .failed_chats
+                            .iter()
+                            .chain(&seed.retry_sources)
+                            .any(|retry| {
+                                retry.0.registry == registry
+                                    && retry.0.card == card
+                                    && &retry.0.scope != scope
+                            }))
+            })
+    }
+
+    fn shared_chat_seed_membership_current(&self, scope: &Scope, panes: &[Pane]) -> bool {
+        panes
+            .iter()
+            .filter(|pane| matches!(pane.kind, CardKind::Chat(_)))
+            .all(|pane| {
+                let mut owners = self
+                    .workspace_model
+                    .views
                     .iter()
-                    .chain(&seed.retry_sources)
-                    .any(|retry| {
-                        retry.0.registry == registry
-                            && retry.0.card == card
-                            && &retry.0.scope != scope
-                    })
-        })
+                    .filter(|view| view.panes.iter().any(|current| current.id == pane.id));
+                owners.next().is_none_or(|view| &view.scope == scope) && owners.next().is_none()
+            })
     }
 
     fn preserve_shared_chat_admission_scopes(
@@ -295,9 +317,14 @@ impl Cagents {
         views: &mut [View],
     ) -> HashMap<CardId, HashSet<Scope>> {
         let mut owners = HashMap::<CardId, HashSet<Scope>>::new();
-        for seed in self.shared_views.seed_admissions.values() {
+        for (scope, seed) in &self.shared_views.seed_admissions {
             if seed.registry != self.workspace_model.identity {
                 continue;
+            }
+            for pane in &seed.panes {
+                if matches!(pane.kind, CardKind::Chat(_)) {
+                    owners.entry(pane.id).or_default().insert(scope.clone());
+                }
             }
             for retry in seed.failed_chats.iter().chain(&seed.retry_sources) {
                 owners
@@ -328,6 +355,11 @@ impl Cagents {
         for scope in changed {
             let seed = &self.shared_views.seed_admissions[&scope];
             if !seed.failed {
+                if seed.retry_sources.is_empty() {
+                    // An initial seed still awaits its real result. A watcher
+                    // move cannot admit it or manufacture a refusal receipt.
+                    continue;
+                }
                 let Some(attempt) = seed.attempt else {
                     // A queued retry has no receipt yet. Its original sources
                     // still fence projection until Started and the seed ACK.
@@ -390,7 +422,7 @@ impl Cagents {
         if registry.is_some_and(|identity| identity != self.workspace_model.identity) {
             return;
         }
-        let Some(seed) = self.shared_views.seed_admissions.get_mut(&scope) else {
+        let Some(seed) = self.shared_views.seed_admissions.get(&scope) else {
             return;
         };
         if !self.shared_views.seeding.contains(&scope)
@@ -400,6 +432,14 @@ impl Cagents {
         {
             return;
         }
+        let membership_current = self.shared_chat_seed_membership_current(&scope, &seed.panes);
+        let retry_available = retry_available && membership_current;
+        let error = if membership_current {
+            error
+        } else {
+            "This saved workspace changed. Close and reopen this window to reconnect. Saved drafts and sessions are retained".into()
+        };
+        let seed = self.shared_views.seed_admissions.get_mut(&scope).unwrap();
         seed.failed = true;
         seed.retry_available = retry_available;
         let registry = seed.registry;
@@ -1480,23 +1520,25 @@ impl Cagents {
                 .pending
                 .retain(|(id, _, _)| *id != operation);
         } else {
-            if let Some(seed) = self.shared_views.seed_admissions.get(&scope)
-                && !seed.retry_sources.is_empty()
-            {
-                // The callback authorizes only the saved sources the user
-                // retried. Keep this fence through the installed ACK snapshot,
-                // including newer watcher reads that preceded that snapshot.
+            if let Some(seed) = self.shared_views.seed_admissions.get(&scope) {
+                // Initial admission preserves the original owner scope; an
+                // explicit retry also preserves each complete source. Check
+                // the installed ACK, including any newer preceding watcher read.
                 if seed.failed || seed.registry != self.workspace_model.identity {
                     return;
                 }
-                let Some(attempt) = seed.attempt else {
+                if !seed.retry_sources.is_empty() && seed.attempt.is_none() {
                     return;
-                };
-                if !seed
-                    .retry_sources
-                    .iter()
-                    .all(|retry| self.shared_chat_retry_source_current(&retry.0))
+                }
+                if !self.shared_chat_seed_membership_current(&scope, &seed.panes)
+                    || !seed
+                        .retry_sources
+                        .iter()
+                        .all(|retry| self.shared_chat_retry_source_current(&retry.0))
                 {
+                    let Some(attempt) = seed.attempt else {
+                        return;
+                    };
                     let registry = seed.registry;
                     self.refuse_shared_view_seed(
                         scope,
