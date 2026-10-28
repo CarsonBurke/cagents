@@ -847,6 +847,21 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
     Ok(result)
 }
 
+/// Preserve typed mailbox backpressure at the service boundary. Existing
+/// operations retain their original validation and String-returning API.
+pub(super) fn process_request(
+    host: &SharedHost,
+    authority: Authority,
+    operation: crate::agent_execution::Operation,
+) -> Result<crate::agent_execution::Reply, crate::agent_execution::AcceptanceError> {
+    match operation {
+        crate::agent_execution::Operation::SendMessage(outgoing) => {
+            mailbox::send(host, &authority, outgoing).map(crate::agent_execution::Reply::Sent)
+        }
+        other => process(host, authority, other).map_err(Into::into),
+    }
+}
+
 pub(super) fn process(
     host: &SharedHost,
     authority: Authority,
@@ -902,9 +917,9 @@ pub(super) fn process(
         Operation::Control { agent, command } => {
             control(host, &authority, agent, command).map(Reply::Requests)
         }
-        Operation::SendMessage(outgoing) => {
-            mailbox::send(host, &authority, outgoing).map(Reply::Sent)
-        }
+        Operation::SendMessage(outgoing) => mailbox::send(host, &authority, outgoing)
+            .map(Reply::Sent)
+            .map_err(|error| error.to_string()),
         Operation::Inbox(query) => mailbox::inbox(host, &authority, query).map(Reply::Inbox),
         Operation::PeekInbox(query) => mailbox::peek(host, &authority, query).map(Reply::Inbox),
         Operation::AcknowledgeInbox(receipt) => {
