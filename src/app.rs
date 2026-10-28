@@ -19960,6 +19960,49 @@ mod tests {
     /// and capacity is the only thing bounding it: the shell raises notices
     /// from a per-poll path, so a repeating failure must not evict the history.
     #[test]
+    fn identical_keyed_notices_preserve_open_details_and_dismissal_identity() {
+        let now = Instant::now();
+        let target = CardId::new();
+        let notice = TransientNotice::error("Could not reopen")
+            .key("chat-resume")
+            .details("The selected account needs to sign in")
+            .targets([target]);
+        let mut log = NoticeLog::default();
+        log.record_at(notice.clone(), now);
+        let original = log.entries.back_mut().unwrap();
+        let id = original.id;
+        original.details_open = true;
+        log.record_at(TransientNotice::warning("Unrelated warning"), now);
+        log.record_at(notice, now + Duration::from_secs(1));
+        let repeated = log.recent().next().unwrap();
+        assert_eq!(repeated.id, id, "a queued dismiss still names this report");
+        assert!(repeated.details_open, "a repeated poll must not close Details");
+        assert_eq!(repeated.repeats, 2);
+        assert_eq!(repeated.notice.targets, [target]);
+        assert_eq!(log.len(), 2);
+        log.dismiss(id);
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.recent().next().unwrap().notice.message, "Unrelated warning");
+
+        log.record_at(
+            TransientNotice::error("Different failure").key("chat-resume"),
+            now,
+        );
+        let replaced = log.recent().next().unwrap().id;
+        log.record_at(
+            TransientNotice::success("Reopened").key("chat-resume"),
+            now + Duration::from_secs(2),
+        );
+        let recovered = log.recent().next().unwrap();
+        assert_ne!(recovered.id, replaced, "changed outcomes replace the report");
+        assert_eq!(recovered.repeats, 1);
+        assert!(!recovered.details_open);
+        log.expire(now + Duration::from_secs(9));
+        assert_eq!(log.len(), 1, "recovery confirmations still expire");
+        assert_eq!(log.recent().next().unwrap().notice.message, "Unrelated warning");
+    }
+
+    #[test]
     fn keyed_notices_replace_and_resolve_failures() {
         let mut log = NoticeLog::default();
         log.record(TransientNotice::error("Could not reopen").key("chat:1"));
