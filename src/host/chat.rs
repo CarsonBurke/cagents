@@ -2,6 +2,8 @@ use super::state::{ClientId, HostLock, HostState, SharedHost};
 #[cfg(test)]
 mod account_isolation_tests;
 pub(super) mod capacity;
+#[cfg(test)]
+mod managed_account_recovery_tests;
 mod native_cleanup;
 mod native_recovery;
 mod owned_listener;
@@ -26,6 +28,8 @@ mod retained_publication_tests;
 #[cfg(test)]
 mod retained_resolution_tests;
 mod retained_resume;
+#[cfg(test)]
+mod saved_account_retained_tests;
 #[cfg(test)]
 mod saved_account_tests;
 #[cfg(test)]
@@ -1699,7 +1703,14 @@ fn start_with_execution(
             .ok_or_else(|| unavailable("Native startup lost its exact reservation"))?;
         let proof = state.proof().clone();
         drop(state);
-        let response = session_snapshot(&record.session, &record.handle).map_err(unavailable)?;
+        #[cfg(test)]
+        let response =
+            saved_account_retained_tests::initial_snapshot_transport(&record.handle, || {
+                session_snapshot(&record.session, &record.handle)
+            });
+        #[cfg(not(test))]
+        let response = session_snapshot(&record.session, &record.handle);
+        let response = response.map_err(unavailable)?;
 
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down
@@ -2198,18 +2209,13 @@ fn saved_account_admission(
             ));
         }
         if !terminal.handle.is_completed() {
-            let hint = terminal
-                .session
-                .resume_hint
-                .as_deref()
-                .and_then(crate::model::agent_recovery::observed_launch_from_hint);
-            let recipe = hint.as_ref().unwrap_or(&terminal.session.launch);
-            if recipe.arguments.iter().any(|argument| {
-                Some(argument.as_str()) == source.launch.session_id.as_deref()
-                    || argument.split_once('=').is_some_and(|(_, value)| {
-                        Some(value) == source.launch.session_id.as_deref()
-                    })
-            }) {
+            if account_recovery_terminal_conflicts(source, &terminal.session)
+                || account_recovery_recipe_conflicts(source, terminal.execution_launch())
+                || terminal.handle.cached_agent_process().is_some_and(|agent| {
+                    account_recovery_recipe_conflicts(source, &agent.launch)
+                        || account_recovery_recipe_conflicts(source, &agent.recovery)
+                })
+            {
                 return Err(account_switch_unavailable(
                     "The saved conversation has a live CLI writer",
                 ));
@@ -2254,9 +2260,131 @@ fn saved_account_admission(
     Ok(completed)
 }
 
+fn account_recovery_recipe_conflicts(
+    source: &Session,
+    recipe: &crate::model::LaunchRecipe,
+) -> bool {
+    source.launch.session_id.as_deref().is_some_and(|thread| {
+        recipe.arguments.iter().any(|argument| {
+            argument == thread
+                || argument
+                    .split_once('=')
+                    .is_some_and(|(_, value)| value == thread)
+        })
+    })
+}
+
+fn account_recovery_terminal_conflicts(
+    source: &Session,
+    terminal: &crate::model::TerminalSession,
+) -> bool {
+    account_recovery_recipe_conflicts(source, &terminal.launch)
+        || terminal
+            .resume_hint
+            .as_deref()
+            .and_then(crate::model::agent_recovery::observed_launch_from_hint)
+            .is_some_and(|recipe| account_recovery_recipe_conflicts(source, &recipe))
+}
+
+/// Positive custody already covered by the cooperative managed inventory.
+/// This is not a claim that arbitrary shell descendants are absent. No missing
+/// foreground observation supplies negative provider-ownership evidence.
+struct AccountRecoveryManagedTerminal {
+    source: crate::model::TerminalSession,
+    execution: crate::model::LaunchRecipe,
+    handle: crate::terminal::TerminalHandle,
+    holder: crate::daemon::holder_registry::Record,
+}
+
+impl AccountRecoveryManagedTerminal {
+    fn capture(
+        state: &HostState,
+        holder: &crate::daemon::holder_registry::Record,
+        proof: &HostSessionProof,
+    ) -> Result<Option<Self>, ProtocolError> {
+        if state.proof() != proof {
+            return Err(account_switch_unavailable(
+                "The current host changed during saved recovery",
+            ));
+        }
+        let Some(current) = state.terminals.get(&holder.terminal) else {
+            return Ok(None);
+        };
+        if current.handle.holder_identity() != Some(holder) {
+            return Err(account_switch_unavailable(
+                "The retained terminal does not match its current exact worker",
+            ));
+        }
+        Ok(Some(Self {
+            source: current.session.clone(),
+            execution: current.execution_launch().clone(),
+            handle: current.handle.clone(),
+            holder: holder.clone(),
+        }))
+    }
+
+    fn matches_inspection(&self, recovery: &crate::terminal::holder::Recovery) -> bool {
+        // Continuity is projected per daemon/subscriber and hints can be
+        // enriched. Compare every remaining issued field and separately check
+        // ALL hints/recipes for a conflicting conversation; never replace
+        // known evidence with the absence of another observation.
+        let same_issued = |issued: &crate::model::TerminalSession| {
+            self.source.id == issued.id
+                && self.source.owned_codex_listener == issued.owned_codex_listener
+                && self.source.recovery_origin == issued.recovery_origin
+                && self.source.predecessor == issued.predecessor
+                && self.source.launch == issued.launch
+                && self.source.transcript_path == issued.transcript_path
+        };
+        (same_issued(&recovery.source) || recovery.previous_sources.iter().any(same_issued))
+            && recovery
+                .execution_recipe
+                .as_ref()
+                .unwrap_or(&recovery.source.launch)
+                == &self.execution
+    }
+
+    fn revalidate(&self, state: &HostState, proof: &HostSessionProof) -> Result<(), ProtocolError> {
+        let id = self.source.id;
+        let matches = state.proof() == proof
+            && state.terminals.get(&id).is_some_and(|current| {
+                current.handle.same_worker(&self.handle)
+                    && current.handle.holder_identity() == Some(&self.holder)
+                    && current.session == self.source
+                    && current.execution_launch() == &self.execution
+            });
+        if !matches
+            || state.spawning.contains(&id)
+            || state.chat_spawning.contains_key(&id)
+            || state
+                .native_actor_startups
+                .values()
+                .any(|pending| pending.source.id == id || pending.requested.id == id)
+            || state
+                .native_closing
+                .values()
+                .any(|closing| closing.source().id == id)
+            || state
+                .chat_handoffs
+                .values()
+                .any(|handoff| handoff.source.id == id || handoff.terminal.id == id)
+            || state
+                .chats
+                .get(&id)
+                .is_some_and(|chat| chat.returning_terminal)
+        {
+            return Err(account_switch_unavailable(
+                "A managed terminal changed or entered a transition during saved recovery",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Missing roster rows do not make orphaned legacy holders harmless. Inspect
 /// every retained endpoint without adopting it or dropping malformed evidence.
 fn account_recovery_retained_discovery(
+    host: &SharedHost,
     source: &Session,
     replacement: &Session,
     members: &[TerminalId],
@@ -2264,7 +2392,7 @@ fn account_recovery_retained_discovery(
     proof: &HostSessionProof,
     deadline: Instant,
     cancelled: &impl Fn() -> bool,
-) -> Result<(), ProtocolError> {
+) -> Result<Vec<AccountRecoveryManagedTerminal>, ProtocolError> {
     use crate::daemon::holder_registry::{self as holders, Kind};
     let check = || {
         retained_resume::account_recovery_census_check(deadline, cancelled)
@@ -2279,6 +2407,7 @@ fn account_recovery_retained_discovery(
                     || confirmed.is_none()
                     || confirmed == source.launch.session_id.as_deref())
     };
+    let mut managed = Vec::new();
     for kind in [Kind::Native, Kind::Terminal] {
         check()?;
         let directory = holders::directory(kind).map_err(account_switch_unavailable)?;
@@ -2300,8 +2429,9 @@ fn account_recovery_retained_discovery(
                         conflicts(alias, inspection.state.confirmed_session.as_deref())
                     })
                 } else {
-                    let (inspection, _) = chat::native_holder::inspect(&owner, proof)
-                        .map_err(account_switch_unavailable)?;
+                    let (inspection, _) =
+                        chat::native_holder::inspect_until(&owner, proof, deadline)
+                            .map_err(account_switch_unavailable)?;
                     conflicts(&inspection.source, inspection.confirmed_thread.as_deref())
                         || inspection
                             .previous_sources
@@ -2314,12 +2444,43 @@ fn account_recovery_retained_discovery(
                     ));
                 }
             } else {
-                let (inspection, _) = crate::terminal::inspect_holder(
+                let tracked = AccountRecoveryManagedTerminal::capture(
+                    &host.lock().unwrap_or_else(|p| p.into_inner()),
+                    &owner,
+                    proof,
+                )?;
+                let (inspection, _) = crate::terminal::inspect_holder_until(
                     &holders::socket(&directory, owner.terminal),
                     &owner,
                     proof,
+                    deadline,
                 )
                 .map_err(account_switch_unavailable)?;
+                if account_recovery_terminal_conflicts(source, &inspection.source)
+                    || inspection
+                        .previous_sources
+                        .iter()
+                        .any(|alias| account_recovery_terminal_conflicts(source, alias))
+                    || inspection
+                        .execution_recipe
+                        .as_ref()
+                        .is_some_and(|recipe| account_recovery_recipe_conflicts(source, recipe))
+                {
+                    return Err(account_switch_unavailable(
+                        "A retained terminal contains known matching conversation ownership",
+                    ));
+                }
+                if let Some(tracked) = tracked {
+                    if related(owner.terminal) || !tracked.matches_inspection(&inspection) {
+                        return Err(account_switch_unavailable(
+                            "The retained terminal changed its issued managed identity",
+                        ));
+                    }
+                    tracked.revalidate(&host.lock().unwrap_or_else(|p| p.into_inner()), proof)?;
+                    managed.push(tracked);
+                    check()?;
+                    continue;
+                }
                 let recipe = inspection
                     .execution_recipe
                     .as_ref()
@@ -2340,7 +2501,7 @@ fn account_recovery_retained_discovery(
         }
     }
     check()?;
-    Ok(())
+    Ok(managed)
 }
 
 fn recover_saved_account(
@@ -2406,12 +2567,11 @@ fn recover_saved_account(
                     "The completed source changed before options were captured",
                 )
             })?;
-        let snapshot = handle.snapshot(None).ok_or_else(|| {
-            account_switch_unavailable(
-                "The completed source's confirmed conversation options are unavailable",
-            )
-        })?;
-        Some(chat::runtime::AccountSwitchOptions::capture(&snapshot))
+        Some(
+            handle
+                .completed_account_options()
+                .map_err(account_switch_unavailable)?,
+        )
     } else {
         None
     };
@@ -2436,7 +2596,8 @@ fn recover_saved_account(
         ));
     }
     check()?;
-    account_recovery_retained_discovery(
+    let managed = account_recovery_retained_discovery(
+        host,
         &source,
         &replacement,
         &members,
@@ -2453,6 +2614,9 @@ fn recover_saved_account(
     let reservation = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         saved_account_admission(&state, &source, &replacement, &members)?;
+        for terminal in &managed {
+            terminal.revalidate(&state, &proof)?;
+        }
         check()?;
         state.chat_spawning.insert(source.id, source.clone());
         AccountSwitchReservation {
@@ -2481,6 +2645,7 @@ fn recover_saved_account(
         execution_environment,
         context,
         options.as_ref(),
+        false,
     )
 }
 
@@ -2676,6 +2841,7 @@ fn recover_account(
         execution_environment,
         context,
         Some(&options),
+        true,
     )
 }
 
@@ -2687,9 +2853,12 @@ fn start_confirmed_account_recovery(
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
     context: Arc<chat::protocol::ExecutionContext>,
     options: Option<&chat::runtime::AccountSwitchOptions>,
+    publish_live_notice: bool,
 ) -> Result<ServerResponse, ProtocolError> {
     let id = replacement.id;
-    start_with_execution(
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let cancelled = || crate::daemon::termination_requested();
+    let started = start_with_execution(
         host,
         client,
         replacement,
@@ -2697,9 +2866,57 @@ fn start_confirmed_account_recovery(
         false,
         None,
         execution_environment,
-        Some(context),
+        Some(context.clone()),
         None,
-    )?;
+    );
+    if let Err(failure) = started {
+        // Installation can precede the first attachment snapshot. A failed
+        // snapshot has no hosted record for ChatClose, but its exact startup
+        // still owns the provider and must settle before another saved retry.
+        let pending = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .native_actor_startups
+            .get(&id)
+            .filter(|pending| Arc::ptr_eq(&pending.context, &context))
+            .cloned();
+        let cleanup = (|| -> Result<(), String> {
+            if let Some(pending) = pending {
+                use crate::daemon::holder_registry::{self as holders, Kind};
+                let directory = holders::directory(Kind::Native)?;
+                let owner =
+                    holders::recovery_candidate(&holders::socket(&directory, id), Kind::Native)?;
+                if let Some(owner) = owner {
+                    // Adopt only for authenticated cleanup, without another
+                    // presentation read. This drains installed semantic/input
+                    // receipts before committing durable helper retirement.
+                    retained_actor::close_unattached(host, &pending.source, Some(owner))?;
+                    context.installed();
+                    retained_actor::forget_startup(host, &pending.source, &context);
+                } else if !retained_actor::reconcile_startup(host, &pending.source)? {
+                    return Err("The exact candidate startup cleanup owner changed".into());
+                }
+            } else {
+                match context.reconcile_cleanup()? {
+                    chat::protocol::LaunchOutcome::NoProvider
+                    | chat::protocol::LaunchOutcome::TeardownProved => {}
+                    chat::protocol::LaunchOutcome::Uncertain => {
+                        return Err(
+                            "The candidate's exact startup cleanup remains unconfirmed".into()
+                        );
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(cleanup) = cleanup {
+            return Err(unavailable(format!(
+                "{}. The candidate could not be confirmed stopped: {cleanup}",
+                failure.message
+            )));
+        }
+        return Err(failure);
+    }
     let handle = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -2711,18 +2928,18 @@ fn start_confirmed_account_recovery(
     let confirmation = confirm_account_conversation(
         &handle,
         source.launch.session_id.as_deref().unwrap(),
-        Instant::now() + Duration::from_secs(15),
-        || crate::daemon::termination_requested(),
+        deadline,
+        &cancelled,
     );
     let response = confirmation.map_err(unavailable).and_then(|()| {
         if let Some(options) = options {
             handle
-                .restore_account_options(options, Instant::now() + Duration::from_secs(15), || {
-                    crate::daemon::termination_requested()
-                })
+                .restore_account_options(options, deadline, &cancelled)
                 .map_err(unavailable)?;
         }
-        handle.account_switch_notice().map_err(unavailable)?;
+        if publish_live_notice {
+            handle.account_switch_notice().map_err(unavailable)?;
+        }
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = attached(&state, client, id)?;
         if !record.handle.same_actor(&handle)
@@ -2738,7 +2955,20 @@ fn start_confirmed_account_recovery(
             record.execution_instance,
         );
         drop(state);
-        current_session_snapshot(host, attachment.0, attachment.1, attachment.2)
+        let response = current_session_snapshot(host, attachment.0, attachment.1, attachment.2)?;
+        // Confirmation precedes control restoration and snapshot hydration. A
+        // later provider rotation or setup failure cannot rebind another thread.
+        if cancelled() || Instant::now() >= deadline {
+            return Err(unavailable("Account recovery expired before its exact attachment was confirmed"));
+        }
+        if !matches!(&response, ServerResponse::ChatAttached { session, snapshot }
+            if session.launch.session_id == source.launch.session_id
+                && snapshot.session_id == source.launch.session_id
+                && snapshot.ready && !snapshot.exited && snapshot.error.is_none())
+        {
+            return Err(unavailable("The provider changed or stopped before confirming the saved conversation attachment"));
+        }
+        Ok(response)
     });
     if let Err(failure) = response {
         if let Err(close) = process(host, client, ClientRequest::ChatClose { chat_id: id }) {
@@ -2770,6 +3000,9 @@ fn confirm_account_conversation(
         if handle.is_completed() {
             return Err("The provider exited before confirming the saved conversation; it remains unchanged".into());
         }
+        if Instant::now() >= deadline {
+            return Err("The provider did not confirm the exact saved conversation in time; it remains unchanged".into());
+        }
         if let Some(actual) = handle.confirmed_session_id() {
             if actual != expected {
                 return Err("The provider opened a different conversation; the saved conversation is unchanged".into());
@@ -2779,9 +3012,6 @@ fn confirm_account_conversation(
             if handle.update_activity().1 {
                 return Ok(());
             }
-        }
-        if Instant::now() >= deadline {
-            return Err("The provider did not confirm the exact saved conversation in time; it remains unchanged".into());
         }
         thread::sleep(Duration::from_millis(20));
     }

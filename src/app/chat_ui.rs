@@ -526,6 +526,8 @@ enum AccountChange {
 struct AccountRecovery {
     source: chat::Session,
     committed: bool,
+    /// Saved recovery reports success only after durable rebind and install.
+    saved: bool,
     /// Only a composer submission that has never reached a provider can be
     /// sent after handoff. An exhausted/failed provider turn is never replayed.
     submit: Option<(u64, PromptMode)>,
@@ -5777,6 +5779,7 @@ impl Cagents {
                 recovery: Some(AccountRecovery {
                     source: source.clone(),
                     committed: false,
+                    saved: matches!(change, AccountChange::SavedRecovery),
                     submit,
                 }),
             }),
@@ -8771,6 +8774,7 @@ impl Cagents {
                 let automatic_submit = recovery.as_ref().and_then(|recovery| recovery.submit);
                 let account_committed =
                     recovery.as_ref().is_some_and(|recovery| recovery.committed);
+                let saved_recovery = recovery.as_ref().is_some_and(|recovery| recovery.saved);
                 let account_source = recovery.map(|recovery| recovery.source);
                 let upgrade_source = result
                     .as_ref()
@@ -8971,7 +8975,15 @@ impl Cagents {
                         }
                         if let Some(source) = &account_source {
                             let replacement = handle.session();
+                            let mut requested = attempt.session.clone();
+                            let mut confirmed = replacement.clone();
+                            // The daemon allocates listener/proof metadata,
+                            // but cannot substitute another candidate/account.
+                            requested.reset_owned_codex_listener();
+                            confirmed.reset_owned_codex_listener();
                             if !chat::is_account_recovery(source, &replacement)
+                                || requested.id != confirmed.id
+                                || requested.launch != confirmed.launch
                                 || handle.snapshot().session_id != source.launch.session_id
                             {
                                 self.status = Some(TransientNotice::error(
@@ -8983,6 +8995,7 @@ impl Cagents {
                                 attempt.recovery = Some(AccountRecovery {
                                     source: source.clone(),
                                     committed: false,
+                                    saved: saved_recovery,
                                     submit: automatic_submit,
                                 });
                                 self.chat_ui
@@ -9109,6 +9122,12 @@ impl Cagents {
                             self.persist();
                         } else {
                             self.commit_chat_session(target.card, session);
+                        }
+                        if saved_recovery && account_committed {
+                            // This describes the installed, durably selected
+                            // account; it is not provider transcript history.
+                            self.status =
+                                Some(TransientNotice::success(chat::ACCOUNT_SWITCH_NOTICE));
                         }
                         if let Some(title) = title
                             && self.apply_reported_title(target.card, title)
@@ -22444,6 +22463,12 @@ mod tests {
     fn account_recovery_keeps_the_saved_identity_until_exact_confirmation() {
         for close_before_ack in [false, true] {
             let mut app = crate::app::tests::context_inspector_test_app(false);
+            let success_notice = |app: &Cagents| {
+                app.status.as_ref().is_some_and(|notice| {
+                    notice.message == chat::ACCOUNT_SWITCH_NOTICE
+                        && notice.severity == NoticeSeverity::Success
+                })
+            };
             let card = live_chat(&mut app, Some(KNOWN_THREAD));
             let mut source = chat_runtime(&app, card).session.clone();
             source
@@ -22550,6 +22575,7 @@ mod tests {
                 CardKind::Chat(source.clone())
             );
             assert!(app.chat_ui.removed_accounts.contains(&card));
+            assert!(!success_notice(&app));
             let retirement = retired(&mut app, card);
             let _ = app.update(Message::ChatUi(Action::Retired(retirement, Ok(()))));
             assert_eq!(saved(&app), CardKind::Chat(source.clone()));
@@ -22566,6 +22592,34 @@ mod tests {
             );
             let retirement = retired(&mut app, card);
             let _ = app.update(Message::ChatUi(Action::Retired(retirement, Ok(()))));
+            for changed in ["candidate", "account"] {
+                let _ = app.update(Message::ChatUi(Action::RecoverAccount(
+                    card,
+                    system.clone(),
+                )));
+                let target = chat_runtime_attempt(&app, card);
+                let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+                let mut wrong = handle.session();
+                if changed == "candidate" {
+                    wrong.id = TerminalId::new();
+                } else {
+                    wrong
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("CODEX_HOME".into(), "/a-different-selected-account".into());
+                }
+                let handle = Arc::new(ClientHandle::fixture(
+                    wrong,
+                    handle.snapshot().as_ref().clone(),
+                ));
+                answer_start(&mut app, target, Ok(handle));
+                assert!(!app.chat_start_pending(card));
+                assert!(!success_notice(&app));
+                assert_eq!(saved(&app), CardKind::Chat(source.clone()));
+                let retirement = retired(&mut app, card);
+                let _ = app.update(Message::ChatUi(Action::Retired(retirement, Ok(()))));
+            }
             let _ = app.update(Message::ChatUi(Action::RecoverAccount(
                 card,
                 system.clone(),
@@ -22595,6 +22649,7 @@ mod tests {
                 Message::ChatUi(Action::AccountCommitted(_, _, Err(_)))
             ));
             let _ = app.update(reply);
+            assert!(!success_notice(&app), "a failed SQL commit is not success");
             assert_eq!(
                 app.card_state(card).unwrap().kind,
                 CardKind::Chat(source.clone())
@@ -22618,6 +22673,10 @@ mod tests {
                 Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
             )));
             assert!(app.chat_start_pending(card));
+            assert!(
+                !success_notice(&app),
+                "confirmation still awaits durable commit"
+            );
             assert_eq!(
                 app.card_state(card).unwrap().kind,
                 CardKind::Chat(source.clone())
@@ -22642,10 +22701,15 @@ mod tests {
                     "commit acknowledgment cannot resurrect a closed card"
                 );
                 assert!(!app.cards.contains_key(&card));
+                assert!(!success_notice(&app), "a closed card cannot report success");
                 retired(&mut app, card);
                 continue;
             }
             let reply = account_commit_reply(task);
+            let Message::ChatUi(Action::AccountCommitted(_, ready, Ok(()))) = &reply else {
+                panic!("account commit succeeded");
+            };
+            let duplicate_ready = Ready(ready.0.clone());
             let _ = app.update(reply);
             let CardKind::Chat(recovered) = &app.card_state(card).unwrap().kind else {
                 panic!("chat retained");
@@ -22658,6 +22722,21 @@ mod tests {
                 "Title edited while committing"
             );
             assert!(!app.chat_ui.removed_accounts.contains(&card));
+            assert!(success_notice(&app));
+            assert!(matches!(
+                chat_runtime(&app, card).connection,
+                Connection::Live(_)
+            ));
+            app.status = None;
+            let _ = app.update(Message::ChatUi(Action::AccountCommitted(
+                target,
+                duplicate_ready,
+                Ok(()),
+            )));
+            assert!(
+                !success_notice(&app),
+                "a repeated acknowledgment cannot repeat success"
+            );
         }
     }
 
@@ -26008,6 +26087,7 @@ mod tests {
                     recovery: Some(AccountRecovery {
                         source: f.source.clone(),
                         committed: false,
+                        saved: false,
                         submit: None,
                     }),
                     upgrade_committed: false,

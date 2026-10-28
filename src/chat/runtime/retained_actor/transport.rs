@@ -37,6 +37,7 @@ use std::{
 const ARGUMENT: &str = "--cagents-native-actor";
 pub(super) const PROTOCOL: u32 = 2;
 const CAPABILITY: &str = registry::RETAINED_CLAUDE_CAPABILITY;
+const ACCOUNT_RECOVERY_CAPABILITY: &str = "account-recovery-controls-v1";
 const TIMEOUT: Duration = Duration::from_secs(5);
 fn payload_digest(bytes: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
@@ -133,6 +134,8 @@ pub(crate) struct Resident {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct ActorInspection {
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     pub identity: ActorIdentity,
     pub source: chat::Session,
     pub previous_sources: Vec<chat::Session>,
@@ -180,6 +183,8 @@ struct Invocation {
 #[derive(Serialize, Deserialize)]
 struct Attached {
     protocol: u32,
+    #[serde(default)]
+    capabilities: Vec<String>,
     close_only: bool,
     identity: ActorIdentity,
     epoch: uuid::Uuid,
@@ -199,6 +204,7 @@ struct Pending {
 }
 struct Remote {
     close_only: bool,
+    account_recovery_controls: bool,
     source: chat::Session,
     identity: ActorIdentity,
     epoch: uuid::Uuid,
@@ -355,6 +361,7 @@ impl RemoteActor {
         };
         Self(Arc::new(Remote {
             close_only: false,
+            account_recovery_controls: false,
             source: fixture_source(),
             identity: ActorIdentity {
                 instance: uuid::Uuid::new_v4(),
@@ -998,6 +1005,10 @@ impl RemoteActor {
         let recovering_inputs = attached.resident.acknowledged_input_count > 0;
         let remote = Self(Arc::new(Remote {
             close_only: attached.close_only,
+            account_recovery_controls: attached
+                .capabilities
+                .iter()
+                .any(|capability| capability == ACCOUNT_RECOVERY_CAPABILITY),
             source: attached.source,
             identity: attached.identity,
             epoch: attached.epoch,
@@ -1116,6 +1127,13 @@ impl RemoteActor {
                     && resident.close.completed))
                 || resident.changed < state.changed
                 || resident.generation < state.generation
+                // Installation is acknowledged independently of observer
+                // revisions. A state RPC issued before commit can arrive
+                // after its ACK with equal changed/generation values.
+                || (state.installed && !resident.installed)
+                || (matches!(state.native_continuity,
+                    chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL })
+                    && resident.native_continuity != state.native_continuity)
             {
                 return false;
             }
@@ -1184,7 +1202,14 @@ impl RemoteActor {
             .unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(snapshot));
         self.0.stop.store(true, Ordering::Release);
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(resident) = resident {
+        if let Some(mut resident) = resident {
+            // A close response may also have been issued before installation
+            // was acknowledged. Keep that actor-scoped fact monotonic while
+            // retaining the exact final snapshot/receipt above unchanged.
+            if state.installed {
+                resident.installed = true;
+                resident.native_continuity = state.native_continuity.clone();
+            }
             *state = Arc::new(resident);
         }
         let state = Arc::make_mut(&mut state);
@@ -1352,6 +1377,16 @@ impl RemoteActor {
         &self,
         payload: InputPayload,
     ) -> Result<crossbeam_channel::Receiver<Result<(), Rejection>>, String> {
+        self.enqueue_payload_until(payload, Instant::now() + TIMEOUT)
+    }
+    fn enqueue_payload_until(
+        &self,
+        payload: InputPayload,
+        deadline: Instant,
+    ) -> Result<crossbeam_channel::Receiver<Result<(), Rejection>>, String> {
+        if Instant::now() >= deadline {
+            return Err("Retained command deadline expired; no input was admitted".into());
+        }
         if self.0.close_only {
             return Err(close_only_refusal());
         }
@@ -1443,7 +1478,9 @@ impl RemoteActor {
         }
         // Preserve the exact identity and envelope before crossing the socket.
         // An ambiguous write keeps the receipt pending and fences new input.
-        if let Ok(receipt) = self.call::<InputReceipt>("input", json!([identity, payload])) {
+        if let Ok(receipt) =
+            self.call_until::<InputReceipt>("input", json!([identity, payload]), deadline)
+        {
             self.apply_receipts(&[receipt]);
         }
         Ok(response)
@@ -1608,6 +1645,99 @@ impl RemoteActor {
             .map_err(String::from)
     }
 
+    pub(in crate::chat::runtime) fn completed_account_options(
+        &self,
+    ) -> Result<super::super::AccountSwitchOptions, String> {
+        // The cache is written only by this exact authenticated attachment's
+        // proved close path. Never fetch a closed helper or page its history.
+        let _publication = self.0.publication.lock().unwrap_or_else(|p| p.into_inner());
+        let state = self.state();
+        if !state.completed
+            || state.owns_work
+            || !state.close.completed
+            || state.close.owns_work
+            || !self.0.stop.load(Ordering::Acquire)
+            || self.0.preserved.load(Ordering::Acquire)
+        {
+            return Err("The retained actor has no positively completed final controls".into());
+        }
+        let cached = self
+            .0
+            .final_snapshot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let snapshot = cached
+            .as_ref()
+            .filter(|snapshot| snapshot.exited)
+            .ok_or("The retained actor's authenticated final control metadata is unavailable")?;
+        Ok(super::super::AccountRecoveryControls::capture(snapshot, true, None, None)?.options)
+    }
+    fn require_account_recovery_controls(&self) -> Result<(), String> {
+        // Only the authenticated exact Attached response grants this optional
+        // operation. Record.build and protocol numbers never grant it.
+        if !self.0.account_recovery_controls {
+            return Err("This retained helper does not support confirmed account recovery controls; its owner was preserved".into());
+        }
+        if self.0.close_only {
+            return Err(close_only_refusal());
+        }
+        if self.0.preserved.load(Ordering::Acquire)
+            || self.0.stop.load(Ordering::Acquire)
+            || !self.state().installed
+            || self.state().completed
+        {
+            return Err(
+                "This retained attachment has no current installed account-recovery owner".into(),
+            );
+        }
+        Ok(())
+    }
+    pub(in crate::chat::runtime) fn account_recovery_controls(
+        &self,
+        requested_model: Option<&str>,
+        deadline: Instant,
+    ) -> Result<super::super::AccountRecoveryControls, String> {
+        self.require_account_recovery_controls()?;
+        if requested_model.is_some_and(|model| model.len() > journal::MAX_METADATA_ENTRY_BYTES) {
+            return Err(
+                "Requested recovery model exceeds the bounded control metadata capacity".into(),
+            );
+        }
+        self.call_until(
+            "account_recovery_controls",
+            json!([requested_model]),
+            deadline,
+        )
+    }
+    pub(in crate::chat::runtime) fn account_recovery_command(
+        &self,
+        command: Command,
+        deadline: Instant,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<(), String> {
+        self.require_account_recovery_controls()?;
+        if cancelled() || Instant::now() >= deadline {
+            return Err("Account recovery stopped before control admission".into());
+        }
+        if !matches!(
+            command,
+            Command::SetModel { .. }
+                | Command::SetPermissionMode { .. }
+                | Command::SetFastMode { .. }
+                | Command::RefreshPermissions
+        ) {
+            return Err("Account recovery may issue only conversation control commands".into());
+        }
+        let reply = self.enqueue_payload_until(
+            InputPayload::Command {
+                run: None,
+                command,
+                decline_only: false,
+            },
+            deadline,
+        )?;
+        super::super::wait_account_recovery_ack(&reply, deadline, cancelled)?.map_err(String::from)
+    }
     pub fn snapshot(&self, after: Option<u64>) -> Option<Snapshot> {
         if let Some(snapshot) = self
             .0
@@ -1622,8 +1752,11 @@ impl RemoteActor {
     }
     pub fn commit_installation(&self) -> Result<(), String> {
         self.call::<()>("commit", Value::Null)?;
-        self.0.installed.store(true, Ordering::Release);
+        // Use the same publication fence as the observer. No local revision
+        // is invented: the next authentic helper publication owns its clocks.
         {
+            let _publication = self.0.publication.lock().unwrap_or_else(|p| p.into_inner());
+            self.0.installed.store(true, Ordering::Release);
             let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
             let state = Arc::make_mut(&mut state);
             state.installed = true;
@@ -2246,6 +2379,7 @@ impl Server {
         self.remember_descriptor(&self.source)?;
         Ok(Attached {
             protocol: PROTOCOL,
+            capabilities: vec![ACCOUNT_RECOVERY_CAPABILITY.into()],
             close_only: self.close_only,
             identity: self.identity.clone(),
             epoch: self.epoch,
@@ -2303,6 +2437,7 @@ impl Server {
             #[cfg(test)]
             tests::after_inspection_sources();
             return serde_json::to_value(ActorInspection {
+                capabilities: vec![ACCOUNT_RECOVERY_CAPABILITY.into()],
                 identity: self.identity.clone(),
                 source: self.source.clone(),
                 previous_sources,
@@ -2397,6 +2532,18 @@ impl Server {
             | "relocate_directory"
             | "exit_output" => {
                 Err("This retained actor protocol does not support this optional operation".into())
+            }
+            "account_recovery_controls" => {
+                if !self.installed || self.attachment_preserved || self.closed_snapshot.is_some() {
+                    return Err(
+                        "Retained provider has no current installed account-recovery owner".into(),
+                    );
+                }
+                let (requested_model,) = decode!((Option<String>,));
+                value!(
+                    self.actor
+                        .account_recovery_controls(requested_model.as_deref())?
+                )
             }
             "recognize_sources" => {
                 if !self.installed {
@@ -4289,6 +4436,135 @@ exec /bin/sleep 60
         assert_eq!(fixture.server.resident().unwrap().prompt_revision, before);
     }
     #[test]
+    fn account_recovery_metadata_never_serializes_history_or_truncates_controls() {
+        let mut fixture = resident_fixture_with_body(Some(
+            "large retained body".repeat(journal::MAX_METADATA_ENTRY_BYTES / 8),
+        ));
+        let proof = fixture.server.proof.clone();
+        let epoch = fixture.server.epoch;
+        let request = |model: Option<String>| Invocation {
+            proof: proof.clone(),
+            epoch: Some(epoch),
+            method: "account_recovery_controls".into(),
+            args: json!([model]),
+        };
+        let metadata = fixture.server.invoke(request(None)).unwrap();
+        assert!(serde_json::to_vec(&metadata).unwrap().len() < 1024);
+        let controls: super::super::super::AccountRecoveryControls =
+            serde_json::from_value(metadata).unwrap();
+        assert!(controls.ready);
+        assert!(controls.options.permissions.is_none());
+        let large = "restriction".repeat(journal::MAX_METADATA_ENTRY_BYTES / 8);
+        fixture.server.actor.0.state.lock().unwrap().permissions = Some(chat::PermissionSettings {
+            rules: vec![chat::PermissionRule {
+                behavior: chat::PermissionBehavior::Deny,
+                rule: large.clone(),
+                source: "fixture".into(),
+            }],
+            environment: vec![],
+        });
+        assert!(
+            fixture
+                .server
+                .invoke(request(None))
+                .unwrap_err()
+                .contains("bounded capacity")
+        );
+        assert_eq!(
+            fixture
+                .server
+                .actor
+                .0
+                .state
+                .lock()
+                .unwrap()
+                .permissions
+                .as_ref()
+                .unwrap()
+                .rules[0]
+                .rule,
+            large
+        );
+        fixture.server.actor.0.state.lock().unwrap().permissions = None;
+        assert!(
+            fixture
+                .server
+                .invoke(request(Some("x".repeat(journal::MAX_METADATA_ENTRY_BYTES))))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn account_recovery_optional_methods_require_exact_installed_current_attachment() {
+        for case in ["epoch", "proof", "close-only", "uninstalled", "preserved"] {
+            let mut fixture = resident_fixture();
+            let proof = fixture.server.proof.clone();
+            let epoch = fixture.server.epoch;
+            match case {
+                "close-only" => fixture.server.close_only = true,
+                "uninstalled" => fixture.server.installed = false,
+                "preserved" => fixture.server.attachment_preserved = true,
+                _ => {}
+            }
+            let generation = fixture.server.actor.0.state.lock().unwrap().generation;
+            for (method, args) in [("account_recovery_controls", json!([null]))] {
+                let mut request = Invocation {
+                    proof: proof.clone(),
+                    epoch: Some(epoch),
+                    method: method.into(),
+                    args,
+                };
+                if case == "epoch" {
+                    request.epoch = Some(uuid::Uuid::new_v4());
+                }
+                if case == "proof" {
+                    request.proof.host_incarnation = "another-owner".into();
+                }
+                assert!(
+                    fixture.server.invoke(request).is_err(),
+                    "{case} must refuse {method}"
+                );
+            }
+            assert_eq!(
+                fixture.server.actor.0.state.lock().unwrap().generation,
+                generation
+            );
+            assert!(fixture.server.pending.is_empty());
+            assert!(!fixture.server.actor.is_completed());
+        }
+    }
+
+    #[test]
+    fn old_attachment_cannot_gain_account_recovery_from_build_metadata() {
+        let fixture = resident_fixture();
+        let mut encoded = serde_json::to_value(fixture.server.attached().unwrap()).unwrap();
+        encoded.as_object_mut().unwrap().remove("capabilities");
+        let old: Attached = serde_json::from_value(encoded).unwrap();
+        assert!(
+            old.capabilities.is_empty(),
+            "missing optional handshake support defaults to refusal"
+        );
+        let mut remote = RemoteActor::fixture();
+        Arc::get_mut(&mut remote.0)
+            .unwrap()
+            .identity
+            .record
+            .build
+            .as_mut()
+            .unwrap()
+            .capabilities
+            .push(ACCOUNT_RECOVERY_CAPABILITY.into());
+        assert!(
+            remote
+                .account_recovery_controls(None, Instant::now() + TIMEOUT)
+                .unwrap_err()
+                .contains("does not support")
+        );
+        assert!(remote.pending_inputs().is_empty());
+        assert!(!remote.0.stop.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn protocol_one_attachment_is_refused_without_starting_or_retiring_its_owner() {
         let original = RemoteActor::fixture();
         let identity = original.identity();
@@ -4296,6 +4572,7 @@ exec /bin/sleep 60
         let result = RemoteActor::from_attached(
             Attached {
                 protocol: 1,
+                capabilities: vec![],
                 close_only: false,
                 identity: identity.clone(),
                 epoch: uuid::Uuid::new_v4(),
@@ -4759,6 +5036,45 @@ exec /bin/sleep 60
     }
 
     #[test]
+    fn completed_options_use_only_the_owned_proved_final_metadata() {
+        let actor = RemoteActor::fixture();
+        assert!(actor.completed_account_options().is_err());
+        actor.publish_closed(Snapshot {
+            generation: 42,
+            exited: true,
+            permission_mode: Some("plan".into()),
+            selected_model: Some("confirmed-model".into()),
+            reasoning: Some("high".into()),
+            items: vec![Arc::new(chat::Item {
+                id: "unpaged-final-body".into(),
+                role: chat::Role::Assistant,
+                content: chat::ItemContent::Text {
+                    text: "large body".repeat(journal::MAX_METADATA_ENTRY_BYTES / 4),
+                    thinking: false,
+                    phase: Default::default(),
+                },
+                started_at: None,
+                at: None,
+            })],
+            ..Default::default()
+        });
+        let before = Arc::as_ptr(actor.0.final_snapshot.lock().unwrap().as_ref().unwrap());
+        let controls = actor.completed_account_options().unwrap();
+        assert_eq!(controls.permission_mode.as_deref(), Some("plan"));
+        assert_eq!(controls.model.as_deref(), Some("confirmed-model"));
+        assert_eq!(controls.reasoning.as_deref(), Some("high"));
+        assert_eq!(
+            Arc::as_ptr(actor.0.final_snapshot.lock().unwrap().as_ref().unwrap()),
+            before
+        );
+        actor.0.final_snapshot.lock().unwrap().take();
+        assert!(
+            actor.completed_account_options().is_err(),
+            "a close fence without final controls never invents defaults"
+        );
+    }
+
+    #[test]
     fn proved_close_wins_over_delayed_live_metadata_and_disconnection_publications() {
         let actor = RemoteActor::fixture();
         let delayed = actor.state().as_ref().clone();
@@ -5057,6 +5373,65 @@ exec /bin/sleep 60
         );
     }
     #[test]
+    fn acknowledged_install_cannot_be_reversed_by_an_inflight_precommit_observation() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = root.path().join("install.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut actor = RemoteActor::fixture();
+        Arc::get_mut(&mut actor.0).unwrap().socket = socket;
+        actor.0.installed.store(false, Ordering::Release);
+        let before = {
+            let mut state = actor.0.state.lock().unwrap();
+            let state = Arc::make_mut(&mut state);
+            state.installed = false;
+            state.native_continuity = chat::NativeContinuity::ReconnectOnly;
+            state.clone()
+        };
+        let proof = actor.0.proof.clone();
+        let epoch = actor.0.epoch;
+        let peer = thread::spawn(move || {
+            let (control, _) = listener.accept().unwrap();
+            let request: Invocation = receive(&control, TIMEOUT).unwrap();
+            assert_eq!(request.method, "commit");
+            assert_eq!(request.proof, proof);
+            assert_eq!(request.epoch, Some(epoch));
+            send(&control, &Ok::<Value, String>(Value::Null), TIMEOUT).unwrap();
+        });
+        actor.commit_installation().unwrap();
+        peer.join().unwrap();
+        // This is the exact precommit response an already-issued observer
+        // RPC can return. Equal revisions cannot revoke a successful ACK.
+        assert!(!actor.publish_resident(before.clone()));
+        let installed = actor.state();
+        assert!(installed.installed);
+        assert_eq!(installed.changed, before.changed);
+        assert_eq!(installed.generation, before.generation);
+        assert_eq!(installed.confirmed_session, before.confirmed_session);
+        assert_eq!(
+            installed.native_continuity,
+            chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL }
+        );
+        let mut contradictory = installed.as_ref().clone();
+        contradictory.changed += 1;
+        contradictory.generation += 1;
+        contradictory.native_continuity = chat::NativeContinuity::ReconnectOnly;
+        assert!(!actor.publish_resident(contradictory));
+        let mut next = installed.as_ref().clone();
+        next.changed += 1;
+        next.generation += 1;
+        assert!(actor.publish_resident(next));
+        assert_eq!(actor.state().generation, before.generation + 1);
+        let final_snapshot = Snapshot {
+            exited: true,
+            ..Default::default()
+        };
+        actor.publish_closed_inner(final_snapshot.clone(), Some(before));
+        assert!(actor.state().completed);
+        assert!(actor.state().installed);
+        assert_eq!(actor.state().native_continuity, installed.native_continuity);
+        assert_eq!(actor.snapshot(None), Some(final_snapshot));
+    }
+    #[test]
     fn synchronous_refresh_publishes_all_transitions_and_rejects_a_delayed_observer_response() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         let socket = root.path().join("refresh.sock");
@@ -5138,6 +5513,7 @@ exec /bin/sleep 60
         let actor = RemoteActor::from_attached_at(
             Attached {
                 protocol: PROTOCOL,
+                capabilities: vec![],
                 close_only: false,
                 identity: fixture.identity(),
                 epoch: uuid::Uuid::new_v4(),

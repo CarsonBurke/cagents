@@ -49,9 +49,10 @@ const PRESENT_INTERVAL: Duration = Duration::from_millis(50);
 const FRAMES_PER_POLL: usize = 256;
 /// Queued stdin bytes above which new commands wait for the provider to read.
 const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
+pub(crate) use super::ACCOUNT_SWITCH_NOTICE;
 /// Current, actor-confirmed controls, separate from the immutable issued recipe.
 /// Codex can stage model/effort for the next prompt without persisting them yet.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct AccountSwitchOptions {
     pub model: Option<String>,
     pub reasoning: Option<String>,
@@ -68,6 +69,214 @@ impl AccountSwitchOptions {
             fast_mode: state.fast_mode.as_ref().map(super::FastMode::enabled),
             permissions: state.permissions.clone(),
         }
+    }
+}
+
+/// Control metadata has the same byte budget as a retained journal metadata row.
+/// Serialization into a counting sink checks borrowed fields before cloning;
+/// oversized permissions are refused intact rather than truncated.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct AccountRecoveryControls {
+    pub ready: bool,
+    pub completed: bool,
+    pub failure: Option<String>,
+    pub options: AccountSwitchOptions,
+    pub requested_model_known: bool,
+}
+impl AccountRecoveryControls {
+    fn capture(
+        state: &Snapshot,
+        completed: bool,
+        requested_model: Option<&str>,
+        failure: Option<&str>,
+    ) -> Result<Self, String> {
+        let failure = failure.or(state.error.as_deref());
+        #[derive(serde::Serialize)]
+        struct Borrowed<'a> {
+            model: &'a Option<String>,
+            reasoning: &'a Option<String>,
+            permission_mode: &'a Option<String>,
+            fast_mode: Option<bool>,
+            permissions: &'a Option<super::PermissionSettings>,
+            failure: Option<&'a str>,
+            requested_model: Option<&'a str>,
+        }
+        check_account_recovery_metadata(&Borrowed {
+            model: &state.selected_model,
+            reasoning: &state.reasoning,
+            permission_mode: &state.permission_mode,
+            fast_mode: state.fast_mode.as_ref().map(super::FastMode::enabled),
+            permissions: &state.permissions,
+            failure,
+            requested_model,
+        })?;
+        Ok(Self {
+            ready: state.ready,
+            completed,
+            failure: failure.map(str::to_owned),
+            options: AccountSwitchOptions::capture(state),
+            requested_model_known: requested_model
+                .is_some_and(|requested| state.models.iter().any(|model| model.id == requested)),
+        })
+    }
+}
+
+fn check_account_recovery_metadata(value: &impl serde::Serialize) -> Result<(), String> {
+    struct Budget(usize);
+    impl std::io::Write for Budget {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.0 {
+                return Err(std::io::Error::other(
+                    "Account recovery control metadata exceeds its bounded capacity",
+                ));
+            }
+            self.0 -= bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(
+        Budget(retained_actor::journal::MAX_METADATA_ENTRY_BYTES.saturating_sub(256)),
+        value,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// An unknown ACK never authorizes replay. Dropping this receiver leaves the
+/// original actor/input receipt responsible for settling the command.
+pub(crate) fn wait_account_recovery_ack<T>(
+    reply: &crossbeam_channel::Receiver<T>,
+    deadline: Instant,
+    cancelled: &impl Fn() -> bool,
+) -> Result<T, String> {
+    loop {
+        if cancelled() || Instant::now() >= deadline {
+            return Err(
+                "Account recovery command acknowledgement is unknown; never retry it automatically"
+                    .into(),
+            );
+        }
+        match reply.recv_timeout(
+            Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
+        ) {
+            Ok(result) => {
+                if cancelled() || Instant::now() >= deadline {
+                    return Err("Account recovery stopped before command acknowledgement was confirmed; never retry it automatically".into());
+                }
+                return Ok(result);
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return Err(
+                "Account recovery command acknowledgement was lost; never retry it automatically"
+                    .into(),
+            ),
+        }
+    }
+}
+
+pub(crate) fn restore_confirmed_account_options(
+    options: &AccountSwitchOptions,
+    deadline: Instant,
+    cancelled: &impl Fn() -> bool,
+    mut observe: impl FnMut() -> Result<AccountRecoveryControls, String>,
+    mut command: impl FnMut(Command) -> Result<(), String>,
+) -> Result<(), String> {
+    if cancelled() || Instant::now() >= deadline {
+        return Err("Account recovery stopped before controls could be inspected".into());
+    }
+    check_account_recovery_metadata(options)?;
+    let mut model_sent = false;
+    let mut permission_sent = false;
+    let mut fast_sent = false;
+    let mut permissions_requested = false;
+    loop {
+        if cancelled() {
+            return Err(
+                "The account switch stopped before the current conversation options were confirmed"
+                    .into(),
+            );
+        }
+        if Instant::now() >= deadline {
+            return Err("The alternate account could not confirm the current model, reasoning, permissions and speed settings; continue separately with an explicit choice".into());
+        }
+        let controls = observe()?;
+        if cancelled() || controls.completed {
+            return Err(
+                "The account switch stopped before the current conversation options were confirmed"
+                    .into(),
+            );
+        }
+        if let Some(failure) = controls.failure {
+            return Err(failure);
+        }
+        if Instant::now() >= deadline {
+            return Err("The alternate account did not confirm conversation options before the recovery deadline".into());
+        }
+        let AccountRecoveryControls {
+            ready,
+            options: current,
+            requested_model_known: model_known,
+            ..
+        } = controls;
+        if ready {
+            let model_matches = options.model.is_none()
+                || (current.model == options.model && current.reasoning == options.reasoning);
+            let permission_matches = options.permission_mode.is_none()
+                || current.permission_mode == options.permission_mode;
+            let fast_matches =
+                options.fast_mode.is_none() || current.fast_mode == options.fast_mode;
+            // Account-owned inherited rules are never rewritten as session
+            // rules. If known permissions differ, refuse the seamless handoff
+            // rather than silently losing a restriction or granting access.
+            let permissions_match =
+                options.permissions.is_none() || current.permissions == options.permissions;
+            if model_matches && permission_matches && fast_matches && permissions_match {
+                return Ok(());
+            }
+            if options.fast_mode == Some(false) && current.fast_mode == Some(true) {
+                // A successor may restart with the issued recipe's fast tier.
+                // Disable it and await confirmation before a non-fast model
+                // can be selected. Enabling follows model restoration below.
+                if !fast_sent {
+                    command(Command::SetFastMode { enabled: false })?;
+                    fast_sent = true;
+                }
+            } else if !model_matches && !model_sent && model_known {
+                command(Command::SetModel {
+                    model: options.model.clone().expect("a differing known model"),
+                    reasoning: options.reasoning.clone(),
+                })?;
+                model_sent = true;
+            } else if model_matches && !permission_matches && !permission_sent {
+                command(Command::SetPermissionMode {
+                    mode: options
+                        .permission_mode
+                        .clone()
+                        .expect("a differing known permission mode"),
+                })?;
+                permission_sent = true;
+            } else if model_matches && permission_matches && !fast_matches && !fast_sent {
+                command(Command::SetFastMode {
+                    enabled: options.fast_mode.expect("a differing known fast mode"),
+                })?;
+                fast_sent = true;
+            } else if model_matches
+                && permission_matches
+                && !permissions_match
+                && !permissions_requested
+            {
+                command(Command::RefreshPermissions)?;
+                permissions_requested = true;
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err("The alternate account could not confirm the current model, reasoning, permissions and speed settings; continue separately with an explicit choice".into());
+        }
+        thread::sleep(
+            Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
 }
 
@@ -879,9 +1088,7 @@ impl LocalHandle {
     }
 
     pub(crate) fn account_switch_notice(&self) -> Result<(), String> {
-        self.ownership_command(ActorCommand::AccountNotice(
-            "Account switched. This is the same saved conversation; provider caches may be rebuilt.".into(),
-        ))
+        self.ownership_command(ActorCommand::AccountNotice(ACCOUNT_SWITCH_NOTICE.into()))
     }
 
     pub(crate) fn close_for_account_switch(
@@ -908,6 +1115,25 @@ impl LocalHandle {
         Ok(admitted)
     }
 
+    /// A bounded projection of resident controls; no Store or transcript read.
+    pub(super) fn account_recovery_controls(
+        &self,
+        requested_model: Option<&str>,
+    ) -> Result<AccountRecoveryControls, String> {
+        let failure = {
+            let failure = self.0.failure.lock().unwrap_or_else(|p| p.into_inner());
+            check_account_recovery_metadata(&*failure)?;
+            failure.clone()
+        };
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        AccountRecoveryControls::capture(
+            &state,
+            self.is_completed(),
+            requested_model,
+            failure.as_deref(),
+        )
+    }
+
     /// Restore controls only after exact-thread confirmation. No prompt is issued,
     /// and the successor's published launch recipe remains the original contract.
     pub(crate) fn restore_account_options(
@@ -916,86 +1142,23 @@ impl LocalHandle {
         deadline: Instant,
         cancelled: impl Fn() -> bool,
     ) -> Result<(), String> {
-        let mut model_sent = false;
-        let mut permission_sent = false;
-        let mut fast_sent = false;
-        let mut permissions_requested = false;
-        loop {
-            if cancelled() || self.is_completed() {
-                return Err("The account switch stopped before the current conversation options were confirmed".into());
-            }
-            if let Some(failure) = self.failure() {
-                return Err(failure);
-            }
-            // Current controls are bounded resident metadata. Restoring them
-            // never pages a transcript or makes a hidden body resident.
-            let (ready, current, model_known) = {
-                let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
-                (
-                    state.ready,
-                    AccountSwitchOptions::capture(&state),
-                    state
-                        .models
-                        .iter()
-                        .any(|model| Some(&model.id) == options.model.as_ref()),
-                )
-            };
-            if ready {
-                let model_matches = options.model.is_none()
-                    || (current.model == options.model && current.reasoning == options.reasoning);
-                let permission_matches = options.permission_mode.is_none()
-                    || current.permission_mode == options.permission_mode;
-                let fast_matches =
-                    options.fast_mode.is_none() || current.fast_mode == options.fast_mode;
-                // Account-owned inherited rules are never rewritten as session
-                // rules. If known permissions differ, refuse the seamless handoff
-                // rather than silently losing a restriction or granting access.
-                let permissions_match =
-                    options.permissions.is_none() || current.permissions == options.permissions;
-                if model_matches && permission_matches && fast_matches && permissions_match {
-                    return Ok(());
+        restore_confirmed_account_options(
+            options,
+            deadline,
+            &cancelled,
+            || self.account_recovery_controls(options.model.as_deref()),
+            |command| {
+                if cancelled() || Instant::now() >= deadline {
+                    return Err("Account recovery stopped before control admission".into());
                 }
-                if options.fast_mode == Some(false) && current.fast_mode == Some(true) {
-                    // A successor may restart with the issued recipe's fast tier.
-                    // Disable it and await confirmation before a non-fast model
-                    // can be selected. Enabling follows model restoration below.
-                    if !fast_sent {
-                        self.command(Command::SetFastMode { enabled: false })?;
-                        fast_sent = true;
-                    }
-                } else if !model_matches && !model_sent && model_known {
-                    self.command(Command::SetModel {
-                        model: options.model.clone().expect("a differing known model"),
-                        reasoning: options.reasoning.clone(),
-                    })?;
-                    model_sent = true;
-                } else if model_matches && !permission_matches && !permission_sent {
-                    self.command(Command::SetPermissionMode {
-                        mode: options
-                            .permission_mode
-                            .clone()
-                            .expect("a differing known permission mode"),
-                    })?;
-                    permission_sent = true;
-                } else if model_matches && permission_matches && !fast_matches && !fast_sent {
-                    self.command(Command::SetFastMode {
-                        enabled: options.fast_mode.expect("a differing known fast mode"),
-                    })?;
-                    fast_sent = true;
-                } else if model_matches
-                    && permission_matches
-                    && !permissions_match
-                    && !permissions_requested
-                {
-                    self.command(Command::RefreshPermissions)?;
-                    permissions_requested = true;
-                }
-            }
-            if Instant::now() >= deadline {
-                return Err("The alternate account could not confirm the current model, reasoning, permissions and speed settings; continue separately with an explicit choice".into());
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
+                let reply = self.enqueue_actor(ActorCommand::Provider {
+                    run: None,
+                    command,
+                    decline_only: false,
+                })?;
+                wait_account_recovery_ack(&reply, deadline, &cancelled)?.map_err(String::from)
+            },
+        )
     }
 
     /// An actor-ordered metadata barrier; never hydrates transcript history.

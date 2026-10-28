@@ -8,7 +8,7 @@ use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path};
 const DEFAULT_BUDGET: usize = 64 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
 pub(super) const MAX_INPUTS: usize = 1024;
-const MAX_METADATA_ENTRY_BYTES: usize = 1024 * 1024;
+pub(in crate::chat::runtime) const MAX_METADATA_ENTRY_BYTES: usize = 1024 * 1024;
 // JSON can encode each source byte as six bytes (for example, \u0000).
 // Finished outcomes carry the public result contract in addition to fixed-size
 // run/state/usage fields. Keep metadata-only outcomes on their smaller limit.

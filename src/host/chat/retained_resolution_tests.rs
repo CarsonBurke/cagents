@@ -44,7 +44,7 @@ fn cleanup_discoveries(directory: &Path) {
 /// Same bounded isolated-subprocess pattern as retained_admission_tests; the
 /// parent retains its directory until the exact child exits and cleans only
 /// discovery records under that child's private runtime on failure.
-fn isolated() -> Option<PathBuf> {
+pub(super) fn isolated() -> Option<PathBuf> {
     const MODE: &str = "CAGENTS_RETAINED_RESOLUTION_TEST";
     let test = thread::current().name().unwrap().to_owned();
     if std::env::var(MODE).as_deref() == Ok(test.as_str()) {

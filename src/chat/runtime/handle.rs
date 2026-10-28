@@ -398,6 +398,23 @@ impl Handle {
             }
         }
     }
+    pub(crate) fn completed_account_options(&self) -> Result<super::AccountSwitchOptions, String> {
+        match &self.0 {
+            Owner::Local(local) => {
+                if !local.is_completed() || local.owns_work() {
+                    return Err("The original actor has no positively completed controls".into());
+                }
+                let controls = local.account_recovery_controls(None)?;
+                if !controls.completed {
+                    return Err(
+                        "The original actor changed before completed controls were captured".into(),
+                    );
+                }
+                Ok(controls.options)
+            }
+            Owner::Remote(remote) => remote.completed_account_options(),
+        }
+    }
     pub(crate) fn restore_account_options(
         &self,
         options: &super::AccountSwitchOptions,
@@ -406,9 +423,13 @@ impl Handle {
     ) -> Result<(), String> {
         match &self.0 {
             Owner::Local(local) => local.restore_account_options(options, deadline, cancelled),
-            Owner::Remote(_) => {
-                Err("This retained actor cannot confirm account handoff controls".into())
-            }
+            Owner::Remote(remote) => super::restore_confirmed_account_options(
+                options,
+                deadline,
+                &cancelled,
+                || remote.account_recovery_controls(options.model.as_deref(), deadline),
+                |command| remote.account_recovery_command(command, deadline, &cancelled),
+            ),
         }
     }
     pub(crate) fn account_switch_notice(&self) -> Result<(), String> {
@@ -773,6 +794,75 @@ impl chat::protocol::LaunchCleanup for Handle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn completed_options_read_does_not_lock_or_clean_the_local_transcript_store() {
+        struct Idle;
+        impl Adapter for Idle {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: vec![],
+            working_directory: directory.path().into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let spec = ProcessSpec::from(&recipe);
+        let mut initial = Step {
+            events: vec![
+                chat::Event::Ready(true),
+                chat::Event::PermissionMode(Some("plan".into())),
+            ],
+            ..Step::default()
+        };
+        let store = super::super::preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, Box::new(Idle), initial, store, None, |_| {}).unwrap();
+        assert!(
+            handle.completed_account_options().is_err(),
+            "live options cannot prove completion"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !handle.update_activity().1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "source initialization did not finish"
+            );
+            std::thread::yield_now();
+        }
+        handle.close().unwrap();
+        let Owner::Local(local) = &handle.0 else {
+            unreachable!()
+        };
+        let mut store = local.0.store.lock().unwrap();
+        store.dirty = true;
+        store.presented_generation = None;
+        let copy = handle.clone();
+        let (send, receive) = crossbeam_channel::bounded(1);
+        let worker = std::thread::spawn(move || {
+            let _ = send.send(copy.completed_account_options());
+        });
+        let options = receive.recv_timeout(std::time::Duration::from_secs(2));
+        // Always release and join before asserting a failure, so a regression
+        // which tries to hydrate the Store cannot strand the fixture thread.
+        assert!(store.dirty);
+        assert_eq!(store.presented_generation, None);
+        drop(store);
+        worker.join().unwrap();
+        let options = options
+            .expect("completed controls must not wait for the transcript Store")
+            .unwrap();
+        assert_eq!(options.permission_mode.as_deref(), Some("plan"));
+    }
+
     #[test]
     fn attachment_identity_distinguishes_new_proxy_epochs_of_the_same_actor() {
         let remote = RemoteActor::fixture();

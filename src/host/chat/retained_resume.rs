@@ -535,8 +535,8 @@ mod tests {
         };
         // No execution registry is installed: reaching any roster work would
         // report its absence instead of the deadline/cancellation refusal.
-        let host = std::sync::Arc::new(super::super::super::HostLock::new(
-            super::super::super::HostState::new(proof.clone()),
+        let host = std::sync::Arc::new(crate::host::state::HostLock::new(
+            crate::host::state::HostState::new(proof.clone()),
         ));
         let source = Session {
             id: TerminalId::new(),

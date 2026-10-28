@@ -16,7 +16,7 @@ use std::{
     sync::Mutex,
 };
 
-const THREAD: &str = "12345678-1234-4234-8234-123456789abc";
+pub(super) const THREAD: &str = "12345678-1234-4234-8234-123456789abc";
 
 struct Idle;
 impl Adapter for Idle {
@@ -31,18 +31,18 @@ impl Adapter for Idle {
     }
 }
 
-struct Fixture {
-    directory: tempfile::TempDir,
-    host: SharedHost,
-    source: Session,
-    replacement: Session,
-    original: Handle,
-    target_transcript: PathBuf,
-    confirmation: PathBuf,
-    starts: PathBuf,
+pub(super) struct Fixture {
+    pub(super) directory: tempfile::TempDir,
+    pub(super) host: SharedHost,
+    pub(super) source: Session,
+    pub(super) replacement: Session,
+    pub(super) original: Handle,
+    pub(super) target_transcript: PathBuf,
+    pub(super) confirmation: PathBuf,
+    pub(super) starts: PathBuf,
 }
 impl Fixture {
-    fn new(completed: bool) -> Self {
+    pub(super) fn new(completed: bool) -> Self {
         Self::with_ready(completed, true)
     }
     fn with_ready(completed: bool, ready: bool) -> Self {
@@ -209,7 +209,7 @@ while time.monotonic() < end:
             starts,
         }
     }
-    fn recover(&self) -> Result<ServerResponse, ProtocolError> {
+    pub(super) fn recover(&self) -> Result<ServerResponse, ProtocolError> {
         self.request(false)
     }
     fn request(&self, explicit: bool) -> Result<ServerResponse, ProtocolError> {
