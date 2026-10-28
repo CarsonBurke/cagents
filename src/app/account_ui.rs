@@ -554,6 +554,36 @@ impl State {
             .any(|account| &account.id != except && account.schedule.in_flight(now))
     }
 
+    /// Only an admitted current discovery owns availability; cache restore
+    /// independently preserves any newer usage or identity observation.
+    fn apply_discovery_presence(
+        &mut self,
+        restored: &[Restored],
+        installed: &BTreeMap<Provider, bool>,
+    ) {
+        for restored in restored {
+            let Some(state) = self.account_mut(&restored.id) else {
+                continue;
+            };
+            if !state.present && restored.present {
+                state.schedule.invalidate();
+            }
+            state.present = restored.present;
+            let absent = format!(
+                "{} is not installed",
+                probe::cli_name(state.account.provider)
+            );
+            if installed.get(&state.account.provider) == Some(&false) {
+                state.failure = Some(absent);
+            } else if state.failure.as_ref() == Some(&absent) {
+                state.failure = None;
+            }
+            if !restored.present && self.popover.as_ref() == Some(&restored.id) {
+                self.popover = None;
+            }
+        }
+    }
+
     /// Takes what a load found for each account: whether it has a CLI to ask,
     /// and what the cache had for it.
     fn restore(&mut self, restored: Vec<Restored>) {
@@ -1745,28 +1775,12 @@ impl Cagents {
     /// Omp's usage record is read beside it, on its own: a read that waits
     /// on Omp writing holds back no other account.
     pub(super) fn load_accounts(&mut self) -> Task<Message> {
+        if crate::device::is_remote() {
+            return self.read_remote_accounts(None);
+        }
         let authority = self.account_ui.authority.clone();
         self.account_ui.discovery_generation = self.account_ui.discovery_generation.wrapping_add(1);
         let generation = self.account_ui.discovery_generation;
-        if crate::device::is_remote() {
-            return cosmic::task::future(async move {
-                let result = tokio::task::spawn_blocking(move || {
-                    match connection::request(
-                        authority.clone(),
-                        crate::device_service::Operation::AccountsRead,
-                    )? {
-                        crate::device_service::Reply::Accounts(value) => {
-                            serde_json::from_value(value).map_err(|error| error.to_string())
-                        }
-                        _ => Err("The device did not return its accounts".into()),
-                    }
-                })
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
-                Message::AccountUi(Action::RemoteLoaded(generation, result))
-            });
-        }
         let store = self.account_ui.store.clone();
         let homes = self.account_ui.homes.clone();
         let cache = self.account_ui.cache.clone();
@@ -1870,30 +1884,38 @@ impl Cagents {
         })
     }
 
+    /// Capture explicit intent before a remote read, never probe against
+    /// availability from the previous discovery.
+    fn read_remote_accounts(&mut self, manual: Option<(AccountId, u64)>) -> Task<Message> {
+        if let Some((id, owner)) = manual {
+            self.account_ui.discovery_manual.insert(id, owner);
+        }
+        let authority = self.account_ui.authority.clone();
+        self.account_ui.discovery_generation = self.account_ui.discovery_generation.wrapping_add(1);
+        let generation = self.account_ui.discovery_generation;
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                match connection::request(
+                    authority.clone(),
+                    crate::device_service::Operation::AccountsRead,
+                )? {
+                    crate::device_service::Reply::Accounts(value) => {
+                        serde_json::from_value(value).map_err(|error| error.to_string())
+                    }
+                    _ => Err("The device did not return its accounts".into()),
+                }
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            Message::AccountUi(Action::RemoteLoaded(generation, result))
+        })
+    }
+
     /// Reads the registry again, for what another window changed.
     pub(super) fn reload_registry(&mut self) -> Task<Message> {
-        let authority = self.account_ui.authority.clone();
         if crate::device::is_remote() {
-            self.account_ui.discovery_generation =
-                self.account_ui.discovery_generation.wrapping_add(1);
-            let generation = self.account_ui.discovery_generation;
-            return cosmic::task::future(async move {
-                let result = tokio::task::spawn_blocking(move || {
-                    match connection::request(
-                        authority.clone(),
-                        crate::device_service::Operation::AccountsRead,
-                    )? {
-                        crate::device_service::Reply::Accounts(value) => {
-                            serde_json::from_value(value).map_err(|error| error.to_string())
-                        }
-                        _ => Err("The device did not return its accounts".into()),
-                    }
-                })
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
-                Message::AccountUi(Action::RemoteLoaded(generation, result))
-            });
+            return self.read_remote_accounts(None);
         }
         let Some(store) = self.account_ui.store.clone() else {
             return Task::none();
@@ -2036,6 +2058,31 @@ impl Cagents {
             }
             Task::none()
         })
+    }
+
+    /// Continue only after current discovery has applied availability.
+    fn continue_account_discovery(&mut self) -> Task<Message> {
+        let manual = std::mem::take(&mut self.account_ui.discovery_manual);
+        if manual.is_empty() {
+            self.probe_accounts(Trigger::Focus)
+        } else {
+            let now = now_ms();
+            self.account_ui.now_ms = now;
+            let current: Vec<_> = manual
+                .into_iter()
+                .filter_map(|(id, owner)| {
+                    self.account_ui
+                        .account(&id)
+                        .is_some_and(|state| state.owner == owner)
+                        .then_some(id)
+                })
+                .collect();
+            Task::batch(
+                current
+                    .iter()
+                    .filter_map(|id| self.probe_account(id, Trigger::Manual, now)),
+            )
+        }
     }
 
     fn probe_accounts(&mut self, trigger: Trigger) -> Task<Message> {
@@ -2387,11 +2434,16 @@ impl Cagents {
                         return Task::none();
                     }
                 };
+                // Registry rejection must reject its whole coherent reply:
+                // cache keys and remote homes belong to that same revision.
+                if snapshot.registry.revision() < self.account_ui.registry.revision() {
+                    return Task::none();
+                }
                 self.account_ui.homes = snapshot.homes;
                 self.account_ui.remote_system_homes = snapshot.system_homes;
                 self.account_ui.set_registry(snapshot.registry.clone());
                 self.account_ui.sync_accounts();
-                let restored = self
+                let restored: Vec<_> = self
                     .account_ui
                     .accounts
                     .iter()
@@ -2408,6 +2460,8 @@ impl Cagents {
                             .and_then(|key| snapshot.entries.get(key).cloned()),
                     })
                     .collect();
+                self.account_ui
+                    .apply_discovery_presence(&restored, &snapshot.installed);
                 self.update_account_ui(Action::Loaded(Loaded {
                     generation,
                     registry: Ok(snapshot.registry),
@@ -2490,7 +2544,7 @@ impl Cagents {
                 let follow_up = if (current_discovery && loaded.provisional) || changed {
                     self.locate_accounts()
                 } else if current_discovery {
-                    self.probe_accounts(Trigger::Focus)
+                    self.continue_account_discovery()
                 } else {
                     Task::none()
                 };
@@ -2508,52 +2562,11 @@ impl Cagents {
                     return Task::none();
                 }
                 self.account_ui.installed = installed;
-                // Fresh detection owns current presence, independently of an
-                // older usage snapshot which remains useful history.
                 let installed = self.account_ui.installed.clone();
-                for restored in &restored {
-                    let Some(state) = self.account_ui.account_mut(&restored.id) else {
-                        continue;
-                    };
-                    if !state.present && restored.present {
-                        state.schedule.invalidate();
-                    }
-                    state.present = restored.present;
-                    let absent = format!(
-                        "{} is not installed",
-                        probe::cli_name(state.account.provider)
-                    );
-                    if installed.get(&state.account.provider) == Some(&false) {
-                        state.failure = Some(absent);
-                    } else if state.failure.as_ref() == Some(&absent) {
-                        state.failure = None;
-                    }
-                    if !restored.present && self.account_ui.popover.as_ref() == Some(&restored.id) {
-                        self.account_ui.popover = None;
-                    }
-                }
+                self.account_ui
+                    .apply_discovery_presence(&restored, &installed);
                 self.account_ui.restore(restored);
-                let manual = std::mem::take(&mut self.account_ui.discovery_manual);
-                if manual.is_empty() {
-                    self.probe_accounts(Trigger::Focus)
-                } else {
-                    let now = now_ms();
-                    self.account_ui.now_ms = now;
-                    let current: Vec<_> = manual
-                        .into_iter()
-                        .filter_map(|(id, owner)| {
-                            self.account_ui
-                                .account(&id)
-                                .is_some_and(|state| state.owner == owner)
-                                .then_some(id)
-                        })
-                        .collect();
-                    Task::batch(
-                        current
-                            .iter()
-                            .filter_map(|id| self.probe_account(id, Trigger::Manual, now)),
-                    )
-                }
+                self.continue_account_discovery()
             }
             Action::Probed { owner, id, outcome } => self.account_probed(id, owner, outcome),
             Action::OmpRead(history) => {
@@ -2566,22 +2579,18 @@ impl Cagents {
                 let Some(state) = self.account_ui.account(&id) else {
                     return Task::none();
                 };
-                if !crate::device::is_remote() && !state.account.is_brokered() {
+                if crate::device::is_remote() {
+                    let owner = state.owner;
+                    return self.read_remote_accounts(Some((id, owner)));
+                }
+                if !state.account.is_brokered() {
                     let owner = state.owner;
                     return self.locate_accounts_for(Some((id, owner)));
                 }
-                let discovery = if crate::device::is_remote() {
-                    self.reload_registry()
-                } else {
-                    Task::none()
-                };
                 let now = now_ms();
                 self.account_ui.now_ms = now;
-                Task::batch([
-                    discovery,
-                    self.probe_account(&id, Trigger::Manual, now)
-                        .unwrap_or_else(Task::none),
-                ])
+                self.probe_account(&id, Trigger::Manual, now)
+                    .unwrap_or_else(Task::none)
             }
             Action::ManualReady => {
                 self.account_ui.now_ms = now_ms();
@@ -6240,6 +6249,7 @@ mod tests {
 #[cfg(test)]
 mod app_tests {
     mod completed_release_regression;
+    mod remote_discovery;
 
     #[test]
     fn codex_device_relogin_keeps_the_home_and_other_browser_preparation() {
