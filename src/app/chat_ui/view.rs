@@ -5781,9 +5781,14 @@ mod tests {
             if transitioning {
                 assert!(messages.is_empty(), "switching disables draft controls");
             } else {
+                // Clicking outside COSMIC's native editor first emits its
+                // ordinary ClearSelection. The following release must admit
+                // exactly one chooser, without editing/submitting the draft.
                 assert!(
-                    matches!(messages.as_slice(), [Message::ChatUi(Action::Attach(found))]
-                    if *found == target),
+                    matches!(messages.as_slice(), [
+                        Message::ChatUi(Action::Composer(editor, text_editor::Action::ClearSelection)),
+                        Message::ChatUi(Action::Attach(found)),
+                    ] if *editor == target && *found == target),
                     "attachment control emitted unexpected messages: {messages:?}; bounds={rect:?}; cursor={cursor:?}; viewport={viewport:?}; captured={captured:?}"
                 );
             }
