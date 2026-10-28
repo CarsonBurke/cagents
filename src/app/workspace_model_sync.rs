@@ -4089,6 +4089,92 @@ mod tests {
         );
     }
 
+    /// Publisher replies and observer echoes use separate connections. A saved
+    /// channel can receive its real rank before its create echo reaches the
+    /// observer; a later channel's reply must not make that first one pending.
+    #[test]
+    fn startup_republication_keeps_ranked_channels_stable_when_create_echoes_arrive_late() {
+        fn ranks(app: &Cagents) -> Vec<(ChannelId, u32)> {
+            crate::sidebar::channels_in_display_order(&app.sidebar_model.projects[0].channels)
+                .into_iter()
+                .map(|channel| (channel.id, channel.ordinal))
+                .collect()
+        }
+        let (mut app, project, repository) = app_with_project();
+        let first = ChannelId::new();
+        let second = ChannelId::new();
+        let mut first_saved = local(first, project, "Saved first", 20);
+        first_saved.shared = true;
+        let mut second_saved = local(second, project, "Saved second", 21);
+        second_saved.shared = true;
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.channels = vec![first_saved, second_saved];
+        durable.workspace_model_identity = Some(uuid::Uuid::new_v4());
+        assert_eq!(app.workspace_model.identity, NO_REGISTRY);
+        let published = intercept_publishes(&mut app);
+        let replacement = registry(Vec::new());
+        drop(app.apply_workspace_model_update(ModelUpdate::Connected(replacement)));
+        let edits = drain(&published);
+        let creates = edits
+            .iter()
+            .filter_map(|edit| match edit {
+                ModelEdit::CreateChannel { id, .. } => Some((*id, edit.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            creates.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [first, second]
+        );
+        assert!(
+            app.workspace_model.channels.is_empty(),
+            "publication is not an observer acknowledgement"
+        );
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence: 1,
+            edit: ModelEdit::OpenProject {
+                repository: repository.clone(),
+                name: "repo".into(),
+                kind: ProjectKind::Git,
+            },
+        }));
+        // The reply wins the race against the originating create's observer
+        // echo, precisely the interleaving possible during startup republishing.
+        drop(app.apply_workspace_model_update(ModelUpdate::Ranked {
+            channel: first,
+            ordinal: 1,
+        }));
+        assert_eq!(ranks(&app), [(second, 2), (first, 1)]);
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence: 2,
+            edit: creates[0].1.clone(),
+        }));
+        assert_eq!(ranks(&app), [(second, 2), (first, 1)]);
+        drop(app.apply_workspace_model_update(ModelUpdate::Ranked {
+            channel: second,
+            ordinal: 2,
+        }));
+        assert_eq!(
+            ranks(&app),
+            [(second, 2), (first, 1)],
+            "a late echo cannot turn the first authoritative rank back into a newer provisional rank"
+        );
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence: 4,
+            edit: creates[1].1.clone(),
+        }));
+        assert_eq!(ranks(&app), [(second, 2), (first, 1)]);
+        let mut settled = app.workspace_model.clone();
+        settled.sequence = 5;
+        settled.channels = vec![
+            shared(first, &repository, "Saved first", 1),
+            shared(second, &repository, "Saved second", 2),
+        ];
+        drop(app.apply_workspace_model_update(ModelUpdate::Read(settled)));
+        assert_eq!(ranks(&app), [(second, 2), (first, 1)]);
+        assert!(app.durable.channels.iter().all(|channel| channel.shared));
+    }
+
     /// The rank the registry assigns replaces the provisional one a local
     /// creation started with, so the window that created a channel and the
     /// window that adopted it agree on where it sorts. The same answer is the
