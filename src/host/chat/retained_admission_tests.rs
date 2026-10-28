@@ -184,6 +184,273 @@ pub(super) fn pause_failed_confirmation(id: TerminalId) {
 }
 
 #[test]
+fn named_claude_resume_waits_for_ready_after_identity_without_replacing_actor() {
+    saved_ready_case(
+        "named_claude_resume_waits_for_ready_after_identity_without_replacing_actor",
+        false,
+    );
+}
+
+#[test]
+fn named_claude_resume_exit_after_identity_before_ready_retires_exact_actor() {
+    saved_ready_case(
+        "named_claude_resume_exit_after_identity_before_ready_retires_exact_actor",
+        true,
+    );
+}
+
+fn saved_ready_case(name: &str, exit_before_ready: bool) {
+    // isolated() deliberately clears its subprocess environment. These tests
+    // may only enter that helper from a genuinely User-owned invocation; do
+    // not turn an inherited agent authority into a User-owned test process.
+    assert!(
+        std::env::var_os("CAGENTS_AGENT_AUTHORITY").is_none(),
+        "saved-ready admission requires a User-owned test invocation"
+    );
+    let Some(root) = isolated(name) else { return };
+    let _helper = super::retained_actor_tests::retained_helper_executable();
+    let provider = root.join("bin/claude");
+    // This SDK fixture has no prompt-producing path and never opens history
+    // for writing. The init identity is deliberately earlier than Ready.
+    fs::write(
+        &provider,
+        r#"#!/usr/bin/python3
+import json, os, pathlib, sys, time, uuid
+os.umask(0o077)
+root=pathlib.Path(__file__).resolve().parent.parent
+if sys.argv[1:2]==['--version']:
+    print('2.1.286 (offline saved-ready fixture)'); raise SystemExit
+if sys.argv[1:2]==['auth']:
+    print(json.dumps(dict(loggedIn=True,email='fixture@example.test',subscriptionType='pro'))); raise SystemExit
+sessions=[arg.split('=',1)[1] for arg in sys.argv[1:] if arg.startswith('--resume=')]
+assert len(sessions)==1 and str(uuid.UUID(sessions[0]))==sessions[0]
+session=sessions[0]
+with (root/'spawns').open('a') as log: log.write('spawn\n')
+def send(value): print(json.dumps(value),flush=True)
+send({'type':'system','subtype':'init','session_id':session})
+for line in sys.stdin:
+    frame=json.loads(line)
+    if frame.get('type')=='control_request':
+        if frame['request'].get('subtype')=='initialize':
+            (root/'initialize-waiting').write_text('waiting')
+            deadline=time.monotonic()+45
+            while not (root/'initialize-release').exists():
+                assert time.monotonic()<deadline, 'fixture initialize barrier timed out'
+                time.sleep(0.01)
+            if (root/'exit-before-ready').exists(): raise SystemExit(75)
+        send({'type':'control_response','response':{'subtype':'success','request_id':frame['request_id'],'response':{}}})
+    elif frame.get('type')=='user':
+        (root/'unexpected-prompt').write_text('unexpected')
+        raise RuntimeError('saved-ready fixture must never receive a prompt')
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(provider, fs::Permissions::from_mode(0o700)).unwrap();
+    let project = root.join("fixture-inputs/workload/project");
+    let (host, proof) = setup(&root, name);
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let notifications = super::super::notifications::Broker::start(
+        &host,
+        crate::notifications::Application::Cagents,
+    )
+    .unwrap();
+    host.lock().unwrap().notifications = Some(notifications.handle());
+    let mut requested = chat::fresh_session(
+        Provider::Claude,
+        TerminalId::new(),
+        project.clone(),
+        &crate::account::Account::system(Provider::Claude),
+    )
+    .unwrap();
+    let expected = uuid::Uuid::new_v4().to_string();
+    requested.launch.session_id = Some(expected.clone());
+    let project_key = project
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>();
+    let history = root
+        .join("fixture-inputs/workload/account-alpha/projects")
+        .join(project_key)
+        .join(format!("{expected}.jsonl"));
+    fs::create_dir_all(history.parent().unwrap()).unwrap();
+    // Synthetic private transcript input only. The normal ChatStart path
+    // creates every allocation, provider, ownership and retirement record.
+    let history_before = format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "assistant", "uuid": "saved-answer", "parentUuid": null,
+            "sessionId": expected, "message": {"id": "saved-answer", "role": "assistant",
+                "content": [{"type": "text", "text": "An existing saved answer."}]}
+        })
+    )
+    .into_bytes();
+    fs::write(&history, &history_before).unwrap();
+    if exit_before_ready {
+        fs::write(root.join("exit-before-ready"), "exit").unwrap();
+    }
+    let (sent, result) = std::sync::mpsc::sync_channel(1);
+    let starting = {
+        let host = host.clone();
+        let requested = requested.clone();
+        thread::spawn(move || {
+            sent.send(process(
+                &host,
+                0,
+                ClientRequest::ChatStart {
+                    session: requested,
+                    source: None,
+                    terminate_source: false,
+                    execution_environment: Default::default(),
+                },
+            ))
+            .unwrap();
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (handle, instance) = loop {
+        let installed = host
+            .lock()
+            .unwrap()
+            .chats
+            .get(&requested.id)
+            .map(|record| (record.handle.clone(), record.execution_instance));
+        if let Some((handle, instance)) = installed {
+            let snapshot = handle.attachment_snapshot();
+            if root.join("initialize-waiting").exists()
+                && handle.confirmed_session_id().as_deref() == Some(expected.as_str())
+                && !snapshot.ready
+                && !snapshot.exited
+                && snapshot.error.is_none()
+            {
+                break (handle, instance);
+            }
+        }
+        match result.try_recv() {
+            Ok(response) => panic!(
+                "normal saved ChatStart completed while initialize was withheld: {response:?}"
+            ),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                panic!("normal saved ChatStart disconnected before Ready")
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        assert!(
+            Instant::now() < deadline,
+            "installed actor never confirmed its identity before Ready"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    let identity = handle.actor_identity().unwrap();
+    let provider_process = handle.provider_process().unwrap();
+    assert_eq!(identity.instance, instance);
+    assert!(provider_process.is_current());
+    assert!(identity.record.holder.is_current() && identity.record.root.is_current());
+    assert!(
+        matches!(
+            result.recv_timeout(Duration::from_millis(250)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ),
+        "confirmed identity must not finish ChatStart while Ready is withheld"
+    );
+    {
+        let state = host.lock().unwrap();
+        let record = &state.chats[&requested.id];
+        assert_eq!(record.execution_instance, instance);
+        assert!(record.handle.same_attachment(&handle));
+        assert_eq!(record.handle.actor_identity().unwrap(), identity);
+        assert_eq!(
+            record.handle.provider_process(),
+            Some(provider_process.clone())
+        );
+        assert!(state.native_actor_startups.contains_key(&requested.id));
+    }
+    let held = handle.attachment_snapshot();
+    assert!(!held.ready && !held.exited && held.error.is_none());
+    assert_eq!(held.session_id.as_deref(), Some(expected.as_str()));
+    assert!(provider_process.is_current());
+    assert!(identity.record.holder.is_current() && identity.record.root.is_current());
+    assert_eq!(fs::read_to_string(root.join("spawns")).unwrap(), "spawn\n");
+    assert_eq!(fs::read(&history).unwrap(), history_before);
+    assert!(!root.join("unexpected-prompt").exists());
+    fs::write(root.join("initialize-release"), "release").unwrap();
+    let response = result.recv_timeout(Duration::from_secs(15)).unwrap();
+    starting.join().unwrap();
+    let registry = super::super::agent_execution::registry(&host).unwrap();
+    if exit_before_ready {
+        let failure = response.unwrap_err();
+        assert!(failure.message.contains("75"), "{}", failure.message);
+        let state = host.lock().unwrap();
+        assert!(!state.chats.contains_key(&requested.id));
+        assert!(state.native_actor_startups.is_empty());
+        assert!(state.chat_spawning.is_empty());
+        drop(state);
+        let registry = registry.lock().unwrap();
+        assert!(
+            registry
+                .retained_agent_authority_source(requested.id)
+                .unwrap()
+                .is_none()
+        );
+        let owners = registry.native_actor_ownerships(None, 128).unwrap();
+        let exact = owners
+            .iter()
+            .filter(|owner| owner.source().id == requested.id)
+            .collect::<Vec<_>>();
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].actor(), identity.instance);
+        let retired = registry
+            .native_actor_retirement(identity.instance)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retired.confirmed_session(), Some(expected.as_str()));
+        assert!(!identity.record.holder.is_current() && !identity.record.root.is_current());
+        assert!(!provider_process.is_current());
+    } else {
+        let ServerResponse::ChatAttached { session, snapshot } = response.unwrap() else {
+            panic!("normal saved ChatStart must publish ChatAttached after Ready");
+        };
+        assert_eq!(session.id, requested.id);
+        assert_eq!(session.launch, requested.launch);
+        assert_eq!(snapshot.session_id.as_deref(), Some(expected.as_str()));
+        assert!(snapshot.ready && !snapshot.exited && snapshot.error.is_none());
+        let state = host.lock().unwrap();
+        let record = &state.chats[&requested.id];
+        assert!(record.handle.same_attachment(&handle));
+        assert_eq!(record.handle.actor_identity().unwrap(), identity);
+        assert_eq!(
+            record.handle.provider_process(),
+            Some(provider_process.clone())
+        );
+        assert!(state.native_actor_startups.is_empty());
+        assert!(state.chat_spawning.is_empty());
+        drop(state);
+        process(
+            &host,
+            0,
+            ClientRequest::ChatClose {
+                chat_id: requested.id,
+            },
+        )
+        .unwrap();
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .retained_agent_authority_source(requested.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!identity.record.holder.is_current() && !identity.record.root.is_current());
+        assert!(!provider_process.is_current());
+    }
+    assert_eq!(fs::read_to_string(root.join("spawns")).unwrap(), "spawn\n");
+    assert_eq!(fs::read(&history).unwrap(), history_before);
+    assert!(!root.join("unexpected-prompt").exists());
+}
+
+#[test]
 fn named_claude_resume_failure_preserves_replacement_attachment() {
     named_resume_case(
         "named_claude_resume_failure_preserves_replacement_attachment",
