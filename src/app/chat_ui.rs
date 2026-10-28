@@ -239,6 +239,8 @@ pub enum Action {
     Submit(Target, PromptMode),
     GoalPanel(Target, bool),
     GoalIntent(Target, goal_dispatch::Control),
+    /// Recheck only the exact unsent Goal's bounded model wait.
+    GoalModelWake(Target, std::sync::Weak<()>),
     /// Recalls the message sent before the one the composer shows, or the
     /// unsent draft again once the recall has walked forward past the newest.
     HistoryOlder(Target),
@@ -448,6 +450,7 @@ impl Action {
                 | Self::RetainedCloseFinished(..)
                 | Self::Retired(..)
                 | Self::DispatchQueued(..)
+                | Self::GoalModelWake(..)
                 | Self::ClearCopied(..)
                 | Self::DisarmInterrupt(..)
                 | Self::Files(..)
@@ -8107,7 +8110,11 @@ impl Cagents {
             sent_attachments,
             queued: step,
         });
-        runtime.error = None;
+        runtime.error = if runtime.supersede_waiting_goal_model(&command) {
+            Some("The selected model or reasoning changed before the goal was sent. Your input is kept; submit it again.".into())
+        } else {
+            None
+        };
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || handle.send(command))
                 .await
@@ -8466,6 +8473,7 @@ impl Cagents {
                 }
                 return self.dispatch_queued(target);
             }
+            Action::GoalModelWake(target, witness) => return self.goal_model_wake(target, witness),
             Action::CancelQueued(target) => return self.cancel_queued(target),
             Action::Switch(card) => {
                 if let Some(reason) = self.chat_switch_blocker(card) {

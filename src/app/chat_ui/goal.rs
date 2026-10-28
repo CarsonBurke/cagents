@@ -24,6 +24,8 @@ pub(super) struct Presentation<'a> {
     pub support: Support,
     pub read: &'a ReadState,
     pub pending: bool,
+    /// Local preparation has not sent the native Goal request yet.
+    pub preparing: bool,
     pub uncertain: bool,
     /// Exact current actor/thread/context, established by the caller.
     pub current: bool,
@@ -202,10 +204,14 @@ pub(super) fn panel_with_focus<'a, Message: Clone + 'a>(
     }
     if state.pending {
         rows.push(
-            design::caption("Goal request awaiting provider confirmation.")
-                .width(Length::Fill)
-                .wrapping(iced::widget::text::Wrapping::Word)
-                .into(),
+            design::caption(if state.preparing {
+                "Preparing the goal request. It has not been sent."
+            } else {
+                "Goal request awaiting provider confirmation."
+            })
+            .width(Length::Fill)
+            .wrapping(iced::widget::text::Wrapping::Word)
+            .into(),
         );
     } else if state.uncertain {
         rows.push(
@@ -391,6 +397,7 @@ mod tests {
             support: Support::Supported,
             read,
             pending: false,
+            preparing: false,
             uncertain: false,
             current: true,
             work_ready: true,
@@ -721,6 +728,16 @@ mod tests {
                         ..presentation(&observed)
                     },
                     "The current goal is unconfirmed for this conversation",
+                    "awaiting provider confirmation",
+                ),
+                (
+                    Presentation {
+                        current: false,
+                        pending: true,
+                        preparing: true,
+                        ..presentation(&observed)
+                    },
+                    "Preparing the goal request. It has not been sent.",
                     "awaiting provider confirmation",
                 ),
                 (
