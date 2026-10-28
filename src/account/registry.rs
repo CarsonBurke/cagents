@@ -561,6 +561,11 @@ impl Registry {
                         .is_some_and(|home| home == path)
             })
             .collect::<Vec<_>>();
+        // An archive retains its registration and conversation identity too.
+        // Refuse ambiguous homes before restoring any one archived row.
+        if matching.len() > 1 {
+            return Err("That account home is already listed".into());
+        }
         if matching.iter().any(|account| {
             !account
                 .registry_key()
@@ -1673,15 +1678,20 @@ mod tests {
         );
         assert_eq!(registry, before);
 
-        // Multiple linked registrations (including an archived collision)
-        // must not choose the first row as the recovered identity.
-        for archived in [false, true] {
+        // Multiple linked registrations must not choose the first row as the
+        // recovered identity, even when both registrations are archived.
+        for (first_archived, duplicate_archived) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
             registry = original.clone();
             let duplicate_key = Uuid::new_v4();
             let mut duplicate = registry.accounts[0].clone();
             duplicate.key = duplicate_key;
             registry.accounts.push(duplicate);
-            if archived {
+            if first_archived {
+                registry.archived.push(key);
+            }
+            if duplicate_archived {
                 registry.archived.push(duplicate_key);
             }
             let before = registry.clone();
