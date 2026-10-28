@@ -99,7 +99,7 @@ pub(crate) fn reconfigure_then_observe(
         |change| {
             change.worktrees.contains(&linked)
                 && change.error.is_none()
-                && change.coverage != Some(false)
+                && change.coverage.is_none()
                 && !change.topology
         },
     );
