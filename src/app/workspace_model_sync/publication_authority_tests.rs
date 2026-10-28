@@ -1456,7 +1456,9 @@ fn confirmed_publication_resolves_its_notice_without_replaying_or_losing_the_loc
     assert!(pending.is_none() && admitted.is_empty());
     peer.finished();
     let update = received.try_recv().unwrap();
-    assert!(matches!(&update, ModelUpdate::Ranked { channel: id, ordinal: 9 } if *id == channel));
+    assert!(
+        matches!(&update, ModelUpdate::Ranked { channel: id, ordinal: 9, .. } if *id == channel)
+    );
     drop(app.apply_workspace_model_update(update));
     assert!(received.try_recv().is_err());
     assert!(!app.notice_stands(NoticeKey::SharedChannel(channel, project)));

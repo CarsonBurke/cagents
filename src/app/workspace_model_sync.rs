@@ -146,6 +146,8 @@ pub enum ModelUpdate {
         error: String,
     },
     Ranked {
+        registry: uuid::Uuid,
+        repository: PathBuf,
         channel: ChannelId,
         ordinal: u32,
     },
@@ -471,6 +473,8 @@ fn send(
         && let Some(channel) = model.channel(id)
     {
         let _ = updates.send_blocking(ModelUpdate::Ranked {
+            registry: model.identity,
+            repository: channel.repository.clone(),
             channel: id,
             ordinal: channel.ordinal,
         });
@@ -819,7 +823,22 @@ impl Cagents {
                 });
                 Task::batch([removed, retired, self.reconcile_workspace_model()])
             }
-            ModelUpdate::Ranked { channel, ordinal } => {
+            ModelUpdate::Ranked {
+                registry,
+                repository,
+                channel,
+                ordinal,
+            } => {
+                // A delayed reply from the previous registry cannot establish
+                // sharing in its replacement: that would turn the next absent
+                // snapshot into permission to retire this window's local work.
+                if (self.workspace_model.identity != NO_REGISTRY
+                    && self.workspace_model.identity != registry)
+                    || self.channel_ui.is_deleting(channel)
+                    || self.channel_ui.was_deleted(channel)
+                {
+                    return Task::none();
+                }
                 let Some(index) = self
                     .durable
                     .channels
@@ -829,6 +848,13 @@ impl Cagents {
                     return Task::none();
                 };
                 let local = &self.durable.channels[index];
+                if !self
+                    .sidebar_model
+                    .project(local.project_id)
+                    .is_some_and(|project| project.repository == repository)
+                {
+                    return Task::none();
+                }
                 if local.ordinal == ordinal && local.shared {
                     return Task::none();
                 }
@@ -4360,7 +4386,7 @@ mod tests {
     /// proof the registry holds it.
     #[test]
     fn the_registry_rank_replaces_the_provisional_one_and_records_the_sharing() {
-        let (mut app, project, _repository) = app_with_project();
+        let (mut app, project, repository) = app_with_project();
         let id = ChannelId::new();
         let provisional = app.next_provisional_ordinal();
         Arc::make_mut(&mut app.durable)
@@ -4369,6 +4395,8 @@ mod tests {
         assert_ne!(provisional, 11);
 
         let _ = app.apply_workspace_model_update(ModelUpdate::Ranked {
+            registry: app.workspace_model.identity,
+            repository,
             channel: id,
             ordinal: 11,
         });
