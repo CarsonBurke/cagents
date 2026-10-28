@@ -2195,6 +2195,74 @@ mod tests {
                 );
             }
         }
+
+        // A close-confirmation return has the same lifetime constraints as
+        // closing Device itself, even while its old global editor ID remains.
+        for reopened in [false, true] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            app.automation_ui.update(crate::automation_ui::Action::New);
+            app.automation_ui
+                .update(crate::automation_ui::Action::Field(
+                    crate::automation_ui::Field::Name,
+                    "Retained close draft".into(),
+                ));
+            app.daemon_health_ui.confirmation = true;
+            app.device_ui.open = true;
+            drop(app.update_device(Action::Read("retained.txt".into())));
+            drop(app.update_device(Action::Loaded {
+                generation: 1,
+                result: Ok(crate::device_service::Reply::Text("original".into())),
+            }));
+            let window = window::Id::unique();
+            app.core.set_main_window_id(Some(window));
+            drop(app.update(Message::WindowCloseRequested(window)));
+            assert_eq!(app.transient_work_close, Some(window));
+            let delayed = app.update(Message::CancelTransientWorkClose);
+            assert!(app.transient_work_close.is_none() && app.device_ui.open);
+            let original_scope = app.device_ui.keyboard_scope.clone();
+            let directory = widget::Id::new("device-tools.directory");
+            let (effects, expected) = if reopened {
+                drop(app.update_device(Action::Close));
+                app.device_ui.open = true;
+                assert_ne!(app.device_ui.keyboard_scope, original_scope);
+                // The new frame intentionally has no native focus. Presence
+                // of the old editor ID alone cannot revive the old operation.
+                (delayed, None)
+            } else {
+                // A newer native choice in the same Device scope also wins.
+                (
+                    iced::widget::operation::focus(directory.clone())
+                        .map(cosmic::Action::App)
+                        .chain(delayed),
+                    Some(directory),
+                )
+            };
+            assert_eq!(
+                super::super::tests::focused_element(app.device_dialog(), effects),
+                expected,
+                "late upper-close return must preserve the current Device epoch/focus: reopened={reopened}",
+            );
+        }
+
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.device_ui.open = true;
+        app.daemon_health_ui.confirmation = true;
+        // Keep the real Read pending without polling its I/O task. Its busy
+        // state is itself a normal transient-close blocker.
+        drop(app.update_device(Action::Read("pending.txt".into())));
+        assert!(app.device_ui.busy);
+        let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
+        drop(app.update(Message::WindowCloseRequested(window)));
+        assert_eq!(app.transient_work_close, Some(window));
+        let restoring = app.update(Message::CancelTransientWorkClose);
+        assert!(app.device_ui.open && app.device_ui.busy);
+        assert!(app.transient_work_close.is_none());
+        assert_eq!(
+            restoring.units(),
+            0,
+            "a busy Device has no editable destination"
+        );
     }
 
     #[test]
