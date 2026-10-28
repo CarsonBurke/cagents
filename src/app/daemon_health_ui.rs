@@ -167,7 +167,7 @@ impl Cagents {
         Task::batch([preparation, health_focus(state, 0)])
     }
 
-    fn daemon_health_is_covered(&self) -> bool {
+    pub(super) fn daemon_health_is_covered(&self) -> bool {
         #[cfg(feature = "integrated-browser")]
         if self.browser_import.open() {
             return true;
@@ -780,6 +780,82 @@ mod tests {
         );
         drop(app.daemon_health_key_event(&key(keyboard::key::Named::Enter), false));
         assert!(!app.daemon_health_ui.confirmation);
+    }
+
+    fn daemon_restart_review_with_dirty_draft() -> Cagents {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.automation_ui.update(crate::automation_ui::Action::New);
+        app.automation_ui
+            .update(crate::automation_ui::Action::Field(
+                crate::automation_ui::Field::Name,
+                "Retained draft".into(),
+            ));
+        app.daemon_health_ui.health = daemon_health::State::Unreachable {
+            since: std::time::SystemTime::UNIX_EPOCH,
+        };
+        drop(app.update(Message::DaemonHealthUi(Action::Open)));
+        drop(app.update(Message::DaemonHealthUi(Action::Prepared {
+            generation: app.daemon_health_ui.generation,
+            target: Ok(Arc::new(crate::daemon::RestartTarget::inert_for_ui_test())),
+        })));
+        drop(app.update(Message::KeyEvent {
+            event: key(keyboard::key::Named::Tab),
+            captured: false,
+        }));
+        assert_eq!(app.daemon_health_ui.focus, 1);
+        assert!(matches!(
+            app.daemon_health_ui.available_action(),
+            Some(Action::Confirm { .. })
+        ));
+        app
+    }
+
+    #[test]
+    fn cancelling_transient_close_returns_daemon_review_to_cancel() {
+        let mut app = daemon_restart_review_with_dirty_draft();
+        let window = window::Id::unique();
+        drop(app.update(Message::WindowCloseRequested(window)));
+        assert_eq!(app.transient_work_close, Some(window));
+        let cancel = dialog_ui::tests::enter_control(
+            app.dialog().unwrap(),
+            widget::Id::new("dialog.transient-close.cancel"),
+        );
+        assert!(matches!(cancel, Message::CancelTransientWorkClose));
+        let restoring = app.update(cancel);
+        assert!(app.transient_work_close.is_none());
+        assert_eq!(app.daemon_health_ui.focus, 0);
+        assert_eq!(
+            super::super::tests::focused_element(app.dialog().unwrap(), restoring),
+            Some(widget::Id::new("daemon-health.cancel")),
+        );
+        drop(app.update(Message::KeyEvent {
+            event: key(keyboard::key::Named::Enter),
+            captured: false,
+        }));
+        assert!(!app.daemon_health_ui.confirmation);
+        assert!(!app.daemon_health_ui.restarting);
+        assert!(app.automation_ui.draft_dirty());
+    }
+
+    #[test]
+    fn transient_close_cancellation_only_resets_a_newly_exposed_daemon_review() {
+        for remaining_cover in [false, true] {
+            let mut app = daemon_restart_review_with_dirty_draft();
+            if remaining_cover {
+                drop(app.update(Message::WindowCloseRequested(window::Id::unique())));
+                assert!(app.transient_work_close.is_some());
+                app.device_ui.open = true;
+            }
+            drop(app.update(Message::CancelTransientWorkClose));
+            assert!(app.transient_work_close.is_none());
+            assert_eq!(
+                app.daemon_health_ui.focus, 1,
+                "only removing the last actual cover may reset the daemon review"
+            );
+            assert!(app.daemon_health_ui.confirmation);
+            assert!(!app.daemon_health_ui.restarting);
+            assert!(app.automation_ui.draft_dirty());
+        }
     }
 
     #[test]
