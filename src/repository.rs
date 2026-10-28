@@ -11120,7 +11120,10 @@ mod tests {
                 )
                 .unwrap();
 
-            assert!(matches!(outcome, MutationOutcome::Applied { .. }));
+            assert!(
+                matches!(&outcome, MutationOutcome::Applied { .. }),
+                "bulk sibling stage: {outcome:?}"
+            );
             assert_eq!(git_output(root, &["rev-parse", "HEAD"]), head);
             assert_eq!(
                 git_output(root, &["diff", "--cached", "--name-status", "-z"]),
