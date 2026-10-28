@@ -283,6 +283,176 @@ mod tests {
                 assert!(!app.browser_import.cancel.load(Ordering::Relaxed));
             }
         }
+
+        for viewport in [Size::new(600.0, 400.0), Size::new(1000.0, 900.0)] {
+            for case in ["intro", "finished report"] {
+                let mut app = super::super::tests::context_inspector_test_app(false);
+                drop(app.update_browser_import(Action::Open));
+                if case == "finished report" {
+                    // Admit the normal workflow, without polling discovery or
+                    // extraction. This finite worker payload models profile
+                    // failures; it does not read any local browser database.
+                    drop(app.update_browser_import(Action::Consent));
+                    let generation = app.browser_import.generation;
+                    let found: Vec<_> = (0..24)
+                        .map(|index| Found {
+                            profile: Profile {
+                                browser: cagents_browser_import::Browser::Firefox,
+                                name: format!(
+                                    "Private fixture profile {index:02} with a descriptive name for a separate browser workspace and saved preferences"
+                                ),
+                                database: PathBuf::from(format!(
+                                    "/private-browser-import-fixture/profile-{index:02}/Cookies"
+                                )),
+                            },
+                            sites: vec![Site {
+                                host: "fixture.example.invalid".into(),
+                                cookies: 1,
+                            }],
+                            selected: BTreeSet::from(["fixture.example.invalid".into()]),
+                            error: None,
+                        })
+                        .collect();
+                    let errors: Vec<_> = found
+                        .iter()
+                        .map(|found| {
+                            format!(
+                                "{} / {}: {}",
+                                found.profile.browser.label(),
+                                found.profile.name,
+                                cagents_browser_import::Error::Unreadable
+                            )
+                        })
+                        .collect();
+                    drop(app.update_browser_import(Action::Scanned(generation, Ok(found))));
+                    drop(app.update_browser_import(Action::Import));
+                    assert!(matches!(app.browser_import.phase, Phase::Extracting));
+                    // The existing fixture has no running browser. Receiving
+                    // extraction errors therefore finishes before the reducer
+                    // can send any cookie import request to a browser handle.
+                    assert!(
+                        !app.cards
+                            .values()
+                            .any(|runtime| matches!(runtime, CardRuntime::Browser(_)))
+                    );
+                    drop(app.update_browser_import(Action::Extracted(
+                        generation,
+                        Arc::new(Transfer {
+                            cookies: Mutex::new(None),
+                            profiles: 0,
+                            skipped: 0,
+                            errors,
+                        }),
+                    )));
+                    assert!(matches!(app.browser_import.phase, Phase::Finished(_)));
+                    assert_eq!(app.browser_import.errors.len(), 24);
+                } else {
+                    assert!(matches!(app.browser_import.phase, Phase::Intro));
+                }
+
+                let renderer = super::super::tests::headless_renderer();
+                let mut element = app.browser_import_dialog().unwrap();
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, viewport),
+                );
+                let mut geometry = Geometry::default();
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut geometry,
+                );
+                let footer = [CANCEL, SCAN].map(|id| {
+                    let bounds = geometry.controls[id];
+                    assert!(
+                        bounds.width > 0.0
+                            && bounds.height > 0.0
+                            && bounds.x >= 0.0
+                            && bounds.y >= 0.0
+                            && bounds.x + bounds.width <= viewport.width + 0.01
+                            && bounds.y + bounds.height <= viewport.height + 0.01,
+                        "{id} must remain reachable for {case} at {viewport:?}: {bounds:?}"
+                    );
+                    (id, bounds)
+                });
+                let scroll = (case == "finished report").then(|| {
+                    assert_eq!(geometry.scrollables.len(), 1);
+                    let scroll = geometry.scrollables[0];
+                    assert!(scroll.0.height > 0.0 && scroll.1.height > scroll.0.height);
+                    scroll
+                });
+                {
+                    let mut pointer = |point, event| {
+                        let mut messages = Vec::new();
+                        element.as_widget_mut().update(
+                            &mut tree,
+                            &Event::Mouse(event),
+                            Layout::new(&node),
+                            mouse::Cursor::Available(point),
+                            &renderer,
+                            &mut clipboard::Null,
+                            &mut Shell::new(&mut messages),
+                            &Rectangle::with_size(viewport),
+                        );
+                        messages
+                    };
+                    for (id, bounds) in &footer {
+                        assert!(
+                            pointer(
+                                bounds.center(),
+                                mouse::Event::ButtonPressed(mouse::Button::Left),
+                            )
+                            .is_empty()
+                        );
+                        let messages = pointer(
+                            bounds.center(),
+                            mouse::Event::ButtonReleased(mouse::Button::Left),
+                        );
+                        assert_eq!(messages.len(), 1, "{id} for {case} at {viewport:?}");
+                        assert!(match &messages[0] {
+                            Message::BrowserImport(Action::Cancel) => *id == CANCEL,
+                            Message::BrowserImport(Action::Consent) => *id == SCAN,
+                            _ => false,
+                        });
+                        // Drop these exact Done/Retry or Skip/Scan messages;
+                        // neither a new scan nor dismissal is dispatched.
+                    }
+                    if let Some((bounds, _, _)) = scroll {
+                        assert!(
+                            pointer(
+                                bounds.center(),
+                                mouse::Event::WheelScrolled {
+                                    delta: mouse::ScrollDelta::Pixels { x: 0.0, y: -120.0 },
+                                },
+                            )
+                            .is_empty()
+                        );
+                    }
+                }
+                let mut after_scroll = Geometry::default();
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut after_scroll,
+                );
+                for (id, bounds) in &footer {
+                    assert_eq!(after_scroll.controls[*id], *bounds);
+                }
+                if let Some((bounds, _, translation)) = scroll {
+                    assert_eq!(after_scroll.scrollables[0].0, bounds);
+                    assert!(after_scroll.scrollables[0].2.y > translation.y);
+                    assert!(matches!(app.browser_import.phase, Phase::Finished(_)));
+                    assert_eq!(app.browser_import.errors.len(), 24);
+                } else {
+                    assert!(matches!(app.browser_import.phase, Phase::Intro));
+                }
+                assert!(!app.browser_import.cancel.load(Ordering::Relaxed));
+            }
+        }
     }
 
     #[test]
@@ -936,14 +1106,29 @@ impl Cagents {
                     for error in &state.errors {
                         content.push(crate::design::body(error.clone()).into());
                     }
-                    content.push(
-                        widget::row::with_children(vec![
-                            button("Done", Action::Cancel),
-                            button("Retry", Action::Consent),
-                        ])
-                        .spacing(space::S)
+                    let actions = widget::row::with_children(vec![
+                        button("Done", Action::Cancel),
+                        button("Retry", Action::Consent),
+                    ])
+                    .spacing(space::S);
+                    let report = widget::column::with_children(vec![
+                        widget::scrollable(
+                            widget::column::with_children(content).spacing(space::L),
+                        )
+                        .height(Length::Fill)
                         .into(),
-                    );
+                        actions.into(),
+                    ])
+                    .spacing(space::L)
+                    .height(Length::Fill);
+                    return Some(dialog_ui::overlay(
+                        widget::container(dialog_ui::surface(report, 620.0))
+                            .max_width(620.0)
+                            .max_height(640.0)
+                            .into(),
+                        Some(message(Action::Cancel)),
+                        1.0,
+                    ));
                 }
                 Phase::Closed => {}
             }
