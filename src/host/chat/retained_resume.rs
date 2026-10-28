@@ -41,8 +41,6 @@ fn validate_retired_identity(
         || evidence.owner != ownership.owner()
         || evidence.owner != retirement.owner()
         || evidence.source.id != evidence.owner.terminal
-        || evidence.source.proof.as_ref() != Some(evidence.proof)
-        || evidence.owner.boot != evidence.proof.boot_id
         || !owns_alias(ownership.source())
         || !owns_alias(retirement.source())
         || retirement.confirmed_session() != evidence.confirmed
