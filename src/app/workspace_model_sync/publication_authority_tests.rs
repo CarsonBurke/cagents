@@ -1573,3 +1573,279 @@ fn publication_notice_does_not_follow_same_id_into_a_successor_project() {
             .any(|local| local.id == channel && local.project_id == successor && !local.shared)
     );
 }
+
+/// Establish a known registry before an explicit local publication. Discard
+/// only bootstrap requests from creation_fixture; no provider task is run.
+fn publication_reconciliation_fixture() -> (
+    tempfile::TempDir,
+    crate::app::Cagents,
+    crate::model::ProjectId,
+    ChannelId,
+    PathBuf,
+    async_channel::Receiver<ModelEdit>,
+    WorkspaceModel,
+) {
+    let (directory, mut app, project, channel, repository, requests) = creation_fixture();
+    while requests.try_recv().is_ok() {}
+    let canonical = WorkspaceModel {
+        identity: uuid::Uuid::new_v4(),
+        sequence: 7,
+        ..WorkspaceModel::default()
+    };
+    app.workspace_model = canonical.clone();
+    std::sync::Arc::make_mut(&mut app.durable).workspace_model_identity = Some(canonical.identity);
+    let card = app
+        .durable
+        .channels
+        .iter()
+        .find(|local| local.id == channel)
+        .unwrap()
+        .cards[0];
+    write_creation_draft(&mut app, card, "Keep the refused local conversation draft");
+    while requests.try_recv().is_ok() {}
+    app.publish_channel_creation(channel, project);
+    (
+        directory, app, project, channel, repository, requests, canonical,
+    )
+}
+
+fn take_creation_publications(requests: &async_channel::Receiver<ModelEdit>) -> Vec<ModelEdit> {
+    let mut creations = Vec::new();
+    while let Ok(edit) = requests.try_recv() {
+        if matches!(
+            edit,
+            ModelEdit::OpenProject { .. } | ModelEdit::CreateChannel { .. }
+        ) {
+            creations.push(edit);
+        }
+    }
+    creations
+}
+
+/// Real publisher connection refusal, real PublicationFailed updates, and the
+/// ordinary app notice drain. Scoped remote refusal invokes no resolver/peer.
+fn refuse_creation_publications(
+    app: &mut crate::app::Cagents,
+    requests: &async_channel::Receiver<ModelEdit>,
+) {
+    use crate::app::Message;
+    let context = PublicationContext {
+        authority: Authority::session("fixture-refused-reconciliation".into()),
+        remote: true,
+        no_start: true,
+    };
+    let (updates, received) = async_channel::unbounded();
+    let mut pending = None;
+    for _ in 0..2 {
+        assert!(!requests.is_empty());
+        let error = publish_with(&updates, requests, &mut pending, || {
+            context.connect_with(
+                || panic!("scoped remote refusal must precede socket lookup"),
+                || panic!("scoped remote refusal must not start a daemon"),
+                |_| panic!("scoped remote refusal must not connect"),
+            )
+        })
+        .unwrap_err();
+        assert!(error.contains("own terminal"));
+        assert!(pending.is_none());
+        let update = received.try_recv().unwrap();
+        assert!(matches!(update, ModelUpdate::PublicationFailed { .. }));
+        drop(app.update(Message::WorkspaceModelObserved(update)));
+    }
+    assert!(requests.is_empty() && received.is_empty());
+}
+
+#[test]
+fn unacknowledged_publication_is_coalesced_across_equal_and_newer_reads() {
+    use crate::app::Message;
+    let (_directory, mut app, _project, _channel, _repository, requests, mut canonical) =
+        publication_reconciliation_fixture();
+    let in_flight = take_creation_publications(&requests);
+    assert_eq!(
+        in_flight.len(),
+        2,
+        "one original project/channel publication"
+    );
+    // Consuming the queued edit is not its ACK. Equal snapshots and unrelated
+    // model sequence changes must not create additional physical requests.
+    for sequence in [7, 7, 8, 9] {
+        canonical.sequence = sequence;
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+                canonical.clone(),
+            ))),
+        );
+        assert!(
+            take_creation_publications(&requests).is_empty(),
+            "sequence {sequence}: the original publication is still in flight"
+        );
+    }
+}
+
+#[test]
+fn permanent_publication_refusal_stays_local_across_reads_and_notice_dismissal() {
+    use crate::app::{Message, NoticeKey};
+    let (_directory, mut app, project, channel, _repository, requests, mut canonical) =
+        publication_reconciliation_fixture();
+    let channels = app.durable.channels.clone();
+    let drafts = app.durable.chat_drafts.clone();
+    refuse_creation_publications(&mut app, &requests);
+    let keys = [
+        NoticeKey::SharedProject(project),
+        NoticeKey::SharedChannel(channel, project),
+    ];
+    assert!(keys.iter().all(|key| app.notice_stands(*key)));
+    let notice_ids = app
+        .notices
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .notice
+                .key
+                .filter(|key| keys.contains(key))
+                .map(|_| entry.id)
+        })
+        .collect::<Vec<_>>();
+    for id in notice_ids {
+        drop(app.update(Message::DismissNotice(id)));
+    }
+    assert!(keys.iter().all(|key| !app.notice_stands(*key)));
+    for sequence in [7, 7, 8, 9] {
+        canonical.sequence = sequence;
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+                canonical.clone(),
+            ))),
+        );
+        assert!(
+            take_creation_publications(&requests).is_empty(),
+            "sequence {sequence}: permanent refusal is not a new user publication intent"
+        );
+        assert!(
+            keys.iter().all(|key| !app.notice_stands(*key)),
+            "ordinary observations must not resurrect dismissed refusal reports"
+        );
+        assert_eq!(app.durable.channels, channels);
+        assert_eq!(app.durable.chat_drafts, drafts);
+        assert_eq!(app.durable.active_channel, Some(channel));
+    }
+}
+
+#[test]
+fn refused_publication_settles_on_ack_and_republishes_into_a_replacement_registry() {
+    use crate::app::{Message, NoticeKey};
+    use crate::workspace_model::{ModelChannel, ModelProject};
+    let (_directory, mut app, project, channel, repository, requests, mut canonical) =
+        publication_reconciliation_fixture();
+    refuse_creation_publications(&mut app, &requests);
+    let drafts = app.durable.chat_drafts.clone();
+    canonical.sequence += 1;
+    canonical.projects.push(ModelProject {
+        repository: repository.clone(),
+        name: "Confirmed project".into(),
+        kind: ProjectKind::Folder,
+        ordinal: 1,
+    });
+    canonical.channels.push(ModelChannel {
+        id: channel,
+        repository: repository.clone(),
+        title: String::new(),
+        title_source: Default::default(),
+        ordinal: 1,
+    });
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+            canonical,
+        ))),
+    );
+    assert!(!app.notice_stands(NoticeKey::SharedProject(project)));
+    assert!(!app.notice_stands(NoticeKey::SharedChannel(channel, project)));
+    assert!(take_creation_publications(&requests).is_empty());
+    let replacement = WorkspaceModel {
+        identity: uuid::Uuid::new_v4(),
+        sequence: 1,
+        ..WorkspaceModel::default()
+    };
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+            replacement,
+        ))),
+    );
+    let republished = take_creation_publications(&requests);
+    assert_eq!(
+        republished.len(),
+        2,
+        "a genuinely replaced registry needs one migration"
+    );
+    assert!(
+        matches!(&republished[0], ModelEdit::OpenProject { repository: actual, .. } if actual == &repository)
+    );
+    assert!(
+        matches!(&republished[1], ModelEdit::CreateChannel { id, repository: actual, .. } if *id == channel && actual == &repository)
+    );
+    assert_eq!(app.durable.chat_drafts, drafts);
+}
+
+#[test]
+fn refused_publication_does_not_block_a_successor_or_new_explicit_channel() {
+    use crate::app::{Message, NoticeKey};
+    use crate::model::{ProjectId, RepositoryId};
+    let (_directory, mut app, project, channel, repository, requests, canonical) =
+        publication_reconciliation_fixture();
+    refuse_creation_publications(&mut app, &requests);
+    let drafts = app.durable.chat_drafts.clone();
+    let successor = ProjectId::new();
+    let successor_repository = repository.join("successor");
+    std::fs::create_dir(&successor_repository).unwrap();
+    app.sidebar_model.projects.push(
+        crate::sidebar::SidebarProject::new(
+            successor,
+            RepositoryId::new(),
+            "Successor".into(),
+            successor_repository.clone(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .with_kind(ProjectKind::Folder),
+    );
+    std::sync::Arc::make_mut(&mut app.durable)
+        .channels
+        .iter_mut()
+        .find(|local| local.id == channel)
+        .unwrap()
+        .project_id = successor;
+    drop(app.update(Message::WindowResized(900.0, 700.0)));
+    assert!(!app.notice_stands(NoticeKey::SharedChannel(channel, project)));
+    drop(
+        app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+            canonical,
+        ))),
+    );
+    let republished = take_creation_publications(&requests);
+    assert_eq!(
+        republished.len(),
+        2,
+        "a changed project association owns a fresh publication"
+    );
+    assert!(
+        matches!(&republished[1], ModelEdit::CreateChannel { id, repository: actual, .. } if *id == channel && actual == &successor_repository)
+    );
+    drop(
+        app.update(Message::ChannelUi(crate::app::channel_ui::Action::Create(
+            successor,
+        ))),
+    );
+    let new_channel = app.durable.active_channel.unwrap();
+    assert_ne!(new_channel, channel);
+    let explicit = take_creation_publications(&requests);
+    assert_eq!(
+        explicit.len(),
+        2,
+        "a new explicit channel must still publish its project and channel"
+    );
+    assert!(
+        matches!(&explicit[1], ModelEdit::CreateChannel { id, repository: actual, .. } if *id == new_channel && actual == &successor_repository)
+    );
+    assert_eq!(app.durable.chat_drafts, drafts);
+}
