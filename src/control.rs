@@ -1902,7 +1902,7 @@ struct CommandOutput {
 }
 
 #[derive(Debug)]
-struct AppError {
+pub(crate) struct AppError {
     kind: &'static str,
     message: String,
     details: Option<Value>,
