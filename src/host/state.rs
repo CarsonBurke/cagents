@@ -342,6 +342,10 @@ pub(crate) struct HostState {
     pub(super) control_gate: Arc<RwLock<()>>,
     pub(super) account_lifecycle: super::account_lifecycle::Reservations,
     pub(super) worktree_removals: super::worktree_removal::Reservations,
+    /// Long Git/copy/setup work runs outside control admission but remains
+    /// owned until committed outcomes and terminal custody are published.
+    pub(super) worktree_mutations: usize,
+    pub(super) setup_starts: BTreeMap<crate::model::CardId, super::worktree_control::SetupStart>,
     upgrade: Option<PreparedUpgrade>,
     pub(super) upgrade_chats: BTreeMap<TerminalId, Vec<crate::upgrade::handoff::ChatSource>>,
     pub(super) chat_resolutions: BTreeMap<ClientId, super::chat::upgrade_resolution::Attempt>,
@@ -416,6 +420,8 @@ impl HostState {
             recover_holders: false,
             account_lifecycle: Default::default(),
             worktree_removals: Default::default(),
+            worktree_mutations: 0,
+            setup_starts: Default::default(),
             proof: Arc::new(proof),
             terminals: BTreeMap::new(),
             spawning: BTreeSet::new(),
@@ -829,6 +835,9 @@ impl HostState {
             model_unavailable(error)
         })?;
         if applied.changed {
+            for start in self.setup_starts.values() {
+                start.observe(&applied.model);
+            }
             self.announce_model_edit(origin, applied.model.sequence, &edit);
         }
         Ok(applied.model)
@@ -4072,6 +4081,68 @@ fn start_terminal_view_owned_reserved(
     execution_recipe: Option<crate::model::LaunchRecipe>,
     transition: Option<&super::chat::TerminalViewReservation<'_>>,
 ) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
+    start_terminal_view_owned_authorized(
+        shared,
+        client_id,
+        session,
+        options,
+        execution_environment,
+        paired,
+        adoption,
+        previous,
+        pending_pane,
+        execution_recipe,
+        transition,
+        None,
+    )
+}
+
+/// Caller retains the canonical journal writer and original setup generation
+/// while this publishes the exact worker. Ordinary wire Spawn cannot call it.
+pub(super) fn spawn_reviewed_setup(
+    shared: &SharedHost,
+    client_id: ClientId,
+    session: TerminalSession,
+    authority: crate::terminal::holder::setup::Authority,
+) -> Result<TerminalDescriptor, ProtocolError> {
+    if !authority.binding.matches_source(&session) {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::InvalidRequest,
+            "Reviewed setup holder authority does not match this exact terminal",
+            false,
+        ));
+    }
+    start_terminal_view_owned_authorized(
+        shared,
+        client_id,
+        session,
+        TerminalSpawnOptions::default(),
+        None,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(authority),
+    )
+    .map(|(descriptor, _)| descriptor)
+}
+
+fn start_terminal_view_owned_authorized(
+    shared: &SharedHost,
+    client_id: ClientId,
+    session: TerminalSession,
+    options: TerminalSpawnOptions,
+    mut execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
+    paired: bool,
+    adoption: Option<std::path::PathBuf>,
+    previous: Option<crate::terminal::holder::Recovery>,
+    pending_pane: Option<crate::model::CardId>,
+    execution_recipe: Option<crate::model::LaunchRecipe>,
+    transition: Option<&super::chat::TerminalViewReservation<'_>>,
+    setup_authority: Option<crate::terminal::holder::setup::Authority>,
+) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
     let recovery = shared
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -4176,7 +4247,10 @@ fn start_terminal_view_owned_reserved(
         // A saved setup recipe is evidence, never automatic replay permission.
         // Existing actor attachment above and authenticated holder adoption
         // below keep their original ownership paths; neither spawns a recipe.
-        if crate::upgrade::is_worktree_setup_recipe(&session.launch) && adoption.is_none() {
+        if crate::upgrade::is_worktree_setup_recipe(&session.launch)
+            && adoption.is_none()
+            && setup_authority.is_none()
+        {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::InvalidRequest,
                 "Worktree setup was interrupted; review and explicitly resume it instead of replaying its saved recipe",
@@ -4203,7 +4277,7 @@ fn start_terminal_view_owned_reserved(
                 return Err(error);
             }
         }
-        state.recover_holders.then(|| {
+        (state.recover_holders || setup_authority.is_some()).then(|| {
             let mut source = session.clone();
             source.continuity = TerminalContinuity::DetachedSameBoot {
                 host_session_id: state.proof.host_session_id.clone(),
@@ -4306,6 +4380,9 @@ fn start_terminal_view_owned_reserved(
         terminal_id,
         worker: OnceLock::new(),
     });
+    let setup_withdrawal = setup_authority
+        .as_ref()
+        .and_then(|authority| authority.pane_withdrawal.clone());
     let config = TerminalConfig {
         agent_authority,
         columns: options.columns,
@@ -4318,6 +4395,7 @@ fn start_terminal_view_owned_reserved(
         execution_environment,
         adoption,
         holder_recovery,
+        setup_authority,
         ..TerminalConfig::default()
     };
     let wake_redraw = Arc::clone(&redraw);
@@ -4439,6 +4517,22 @@ fn start_terminal_view_owned_reserved(
                 "Ordinary exit retained the original startup owner; explicitly Close that actor",
                 false,
             ));
+        }
+        if let Some((pane, withdrawn)) = &setup_withdrawal {
+            if withdrawn.load(Ordering::Acquire) {
+                state.cancel_spawn(terminal_id);
+                drop(state);
+                // Only this unpublished original worker is stopped. Never
+                // resurrect a pane the user withdrew while startup waited.
+                let _ = handle.shutdown();
+                drop(handle);
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    "Setup pane was closed during startup; its original holder is settling cleanup",
+                    false,
+                ));
+            }
+            state.setup_starts.remove(pane);
         }
         if let Some(pane) = pending_pane {
             let validation =

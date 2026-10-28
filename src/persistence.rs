@@ -2327,6 +2327,52 @@ impl StateStore {
         Ok(self.operation_rows(false, Some(id))?.into_iter().next())
     }
 
+    /// Retain the canonical daemon journal's SQLite writer through one exact
+    /// setup startup/publication. The callback must never reenter this store
+    /// or run under HostState; another connection cannot replace the run while
+    /// its original holder is acquiring custody.
+    #[cfg(feature = "host")]
+    pub(crate) fn with_worktree_operation_writer<T>(
+        &self,
+        expected: &PendingOperation,
+        effect: impl FnOnce() -> std::result::Result<T, String>,
+    ) -> std::result::Result<T, String> {
+        let mut inner = self.lock_inner().map_err(|error| error.to_string())?;
+        ensure_open(&inner).map_err(|error| error.to_string())?;
+        let transaction = inner
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let current: Option<(String, String, String, String, String, u64)> = transaction.query_row(
+            "SELECT entity_kind,action,status,payload_json,entity_id,base_generation FROM pending_operations WHERE operation_id=?1",
+            [expected.id.to_string()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((kind, action, status, payload, entity_id, generation)) = current else {
+            return Err("Original setup operation disappeared before startup".into());
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&payload).map_err(|error| error.to_string())?;
+        if kind != "worktree_creation"
+            || action != "create"
+            || status != "applied"
+            || payload != expected.payload
+            || entity_id != expected.entity_id
+            || generation != expected.base_generation
+        {
+            return Err(
+                "Setup creation or reviewed run changed before startup; nothing was replayed"
+                    .into(),
+            );
+        }
+        // No SQL mutation is needed: the retained writer is a current-run CAS
+        // fence. Durable Reserved disposition is published before child spawn.
+        let result = effect();
+        // This transaction only reads. Releasing its writer must not replace
+        // an already accepted terminal result with a post-spawn commit error.
+        drop(transaction);
+        result
+    }
+
     fn operation_rows(
         &self,
         unresolved_only: bool,

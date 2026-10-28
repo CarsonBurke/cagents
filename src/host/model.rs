@@ -221,7 +221,7 @@ impl Registry {
         let changed = match edit {
             ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply(&transaction, edit)?,
             ModelEdit::ResetNavigation { .. } | ModelEdit::ReorderNavigation { .. } => navigation::apply(&transaction, edit)?,
-            ModelEdit::AgentsChanged | ModelEdit::ChannelWorkChanged { .. } => {
+            ModelEdit::AgentsChanged | ModelEdit::ChannelWorkChanged { .. } | ModelEdit::WorktreesChanged { .. } => {
                 return Err("Agent model changes are committed by the execution service".into());
             }
             ModelEdit::OpenProject {

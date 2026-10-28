@@ -28,6 +28,8 @@ mod device_request_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod explicit_authority_server_tests;
 
+mod peer_inspection;
+
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 struct HandshakeReader<'a> {
     stream: &'a mut UnixStream,
@@ -285,6 +287,38 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
         // it is caught here, so it costs its sender one failed request rather
         // than the connection. The panic hook has already recorded it.
         let request = envelope.request;
+        if matches!(
+            &request,
+            ClientRequest::Agent {
+                operation: crate::agent_execution::Operation::InspectChat { .. },
+                ..
+            }
+        ) {
+            // Peer pages recheck canonical permission after the cache read,
+            // outside HostState, then check resident attachments and enqueue.
+            // Keep private staging custody through that sequence instead of
+            // the ordinary handle-return-unlock-push response path below.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                peer_inspection::process(&host, client_id, request_id, &delivery, request)
+            }))
+            .unwrap_or_else(|_| {
+                Err(ProtocolError::new(
+                    ProtocolErrorCode::Internal,
+                    "the daemon failed while handling this request",
+                    false,
+                ))
+            });
+            match outcome {
+                Ok(true) => continue,
+                Ok(false) => break,
+                Err(error) => {
+                    if push_error(&delivery, &host, request_id, error).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
         // Register even before ordinary exit starts: its writer can enter
         // after process_request releases control, before this reply is queued.
         // The final HostMutex seal closes acquisition before any handler effect.
@@ -521,6 +555,29 @@ pub(super) fn process_request(
     ensure_request_open(host, &request)?;
     ensure_startup_recovery_request(host, &request)?;
     let gate = control_gate(host);
+    if let ClientRequest::Worktree {
+        authority,
+        operation,
+    } = &request
+    {
+        let active = {
+            let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
+            ensure_request_open(host, &request)?;
+            ensure_startup_recovery_request(host, &request)?;
+            super::agent_execution::terminals::worktree_caller(host, client_id, authority)?;
+            super::account_lifecycle::admit(host, &request)?;
+            super::worktree_removal::admit(host, &request)?;
+            super::worktree_control::admit(host, operation.mutates())?
+        };
+        let reply = super::worktree_control::process(
+            host,
+            client_id,
+            authority.clone(),
+            operation.clone(),
+            active,
+        )?;
+        return Ok((ServerResponse::Worktree(reply), Vec::new(), false));
+    }
     // The GitHub read must not monopolize the exclusive admission fence. All
     // authorizing local state is checked again only after that fence is held.
     if let ClientRequest::DeviceOperation {
@@ -621,6 +678,11 @@ pub(super) fn process_request(
     }
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
+        ClientRequest::Worktree { .. } => Err(ProtocolError::new(
+            ProtocolErrorCode::InvalidRequest,
+            "Worktree operations require their original scoped admission",
+            false,
+        )),
         ClientRequest::DeviceOperation { operation } => {
             match &operation {
                 crate::device_service::Operation::AccountLifecycle { .. } => {

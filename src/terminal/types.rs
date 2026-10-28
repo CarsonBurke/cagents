@@ -37,6 +37,9 @@ pub struct TerminalConfig {
     pub adoption: Option<std::path::PathBuf>,
     #[cfg(feature = "host")]
     pub holder_recovery: Option<super::holder::Recovery>,
+    /// Actual reviewed setup descriptors; never a serialized recipe or CLI flag.
+    #[cfg(feature = "host")]
+    pub(crate) setup_authority: Option<super::holder::setup::Authority>,
 }
 
 impl TerminalConfig {
@@ -63,6 +66,8 @@ impl Default for TerminalConfig {
             adoption: None,
             #[cfg(feature = "host")]
             holder_recovery: None,
+            #[cfg(feature = "host")]
+            setup_authority: None,
         }
     }
 }

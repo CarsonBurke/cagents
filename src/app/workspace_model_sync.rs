@@ -667,6 +667,20 @@ impl Cagents {
                     };
                 }
 
+                if let ModelEdit::WorktreesChanged { repository } = &edit {
+                    // Inventory invalidation does not advance the canonical
+                    // model watermark, and can arrive after a newer model edit.
+                    // Refresh only this open project, without opening cards.
+                    let project = self
+                        .sidebar_model
+                        .projects
+                        .iter()
+                        .find(|project| project.repository == *repository)
+                        .map(|project| project.id);
+                    return project.map_or_else(Task::none, |id| {
+                        self.repository_load_task(repository.clone(), Some(id), false)
+                    });
+                }
                 if sequence <= self.workspace_model.sequence {
                     return Task::none();
                 }

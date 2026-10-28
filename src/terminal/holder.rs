@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 pub(crate) mod cleanup;
+pub(crate) mod setup;
 
 pub(crate) use crate::daemon::holder_registry::{Process, Record};
 use crate::model::{BootId, TerminalId, TerminalSession};

@@ -37,7 +37,9 @@ pub use messages::{Arrival, AskArgs, InboxArgs, ReplyArgs, SendArgs};
 mod linear;
 pub use linear::LinearCommand;
 mod work;
+mod worktrees;
 pub use work::WorkCommand;
+pub use worktrees::WorktreeCommand;
 #[cfg(feature = "ui")]
 pub(crate) mod invocation;
 
@@ -128,7 +130,7 @@ pub enum TopCommand {
     /// List live agent sessions in this project, whoever started them.
     #[command(visible_alias = "ls")]
     Sessions(SessionsArgs),
-    /// Inspect native resident capacity and explicitly release completed handles.
+    /// Read cached peer conversations, inspect capacity, or explicitly release completed handles.
     Chat {
         #[command(subcommand)]
         command: ChatCommand,
@@ -145,6 +147,11 @@ pub enum TopCommand {
     Work {
         #[command(subcommand)]
         command: WorkCommand,
+    },
+    /// Create, inspect and safely remove daemon-journaled Git worktrees.
+    Worktree {
+        #[command(subcommand)]
+        command: WorktreeCommand,
     },
     /// Manage recurring daemon-owned work and its durable run history.
     #[command(alias = "automations")]
@@ -1560,6 +1567,27 @@ impl ControlClient {
         }
     }
 
+    pub(crate) fn worktree_operation(
+        &mut self,
+        operation: crate::worktree_control::Operation,
+    ) -> Result<crate::worktree_control::Reply, ControlError> {
+        let timeout = if matches!(operation, crate::worktree_control::Operation::Remove { .. }) {
+            Duration::from_secs(15 * 60)
+        } else {
+            Duration::from_secs(120)
+        };
+        match self.request_with_deadline(
+            ClientRequest::Worktree {
+                authority: Authority::from_environment(),
+                operation,
+            },
+            Instant::now() + timeout,
+        )? {
+            ServerResponse::Worktree(reply) => Ok(reply),
+            response => Err(unexpected_response("worktree operation", &response)),
+        }
+    }
+
     /// Exercises the public control wire in host integration fixtures.
     #[cfg(all(test, feature = "host"))]
     pub(crate) fn fixture_request(
@@ -2034,6 +2062,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatTextCopy { .. } => "chat_text_copy",
         ServerResponse::Work(_) => "work",
         ServerResponse::ChannelWork(_) => "channel_work",
+        ServerResponse::Worktree(_) => "worktree",
         ServerResponse::DeviceOperation { .. } => "device_operation",
     }
 }
@@ -2436,6 +2465,7 @@ fn staged_command_requires_daemon(command: &TopCommand) -> bool {
         | TopCommand::Channel { .. }
         | TopCommand::Automation { .. }
         | TopCommand::Work { .. }
+        | TopCommand::Worktree { .. }
         | TopCommand::Account { .. }
         | TopCommand::Chat { .. }
         | TopCommand::Whoami
@@ -2499,6 +2529,7 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
         TopCommand::Linear(command) => linear::execute(command),
         TopCommand::Automation { command } => automations::execute(command),
         TopCommand::Work { command } => work::execute(command),
+        TopCommand::Worktree { command } => worktrees::execute(command),
         TopCommand::Agent { command } => agents::execute(command),
         TopCommand::Whoami => sessions::whoami(),
         TopCommand::Account { command } => accounts::execute(command),

@@ -252,7 +252,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         Ok(values[0].clone())
     }
 
-    #[cfg(feature = "ui")]
+    #[cfg(any(feature = "ui", feature = "host"))]
     pub(super) fn fetch_reviewed_pr_creation_head(
         &self,
         request: &CreateWorktreeRequest,

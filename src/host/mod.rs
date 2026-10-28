@@ -20,6 +20,7 @@ mod service;
 mod shutdown_tests;
 mod state;
 mod work;
+mod worktree_control;
 mod worktree_removal;
 
 use std::{
