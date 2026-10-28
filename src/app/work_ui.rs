@@ -136,7 +136,7 @@ fn control(
 /// Dropping the stream, which iced does when the last Work pane closes, hangs
 /// up the connection: the thread's blocking read then fails, it finds no one
 /// listening, and the daemon forgets the watcher.
-fn watch_board(owner: &WatchOwner) -> impl cosmic::iced::futures::Stream<Item = Action> {
+fn watch_board(owner: &WatchOwner) -> impl cosmic::iced::futures::Stream<Item = Action> + use<> {
     let owner = *owner;
     cosmic::iced::stream::channel(4, async move |mut output| {
         let (sender, receiver) = async_channel::bounded(1);
