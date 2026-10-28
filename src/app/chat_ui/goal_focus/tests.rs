@@ -645,6 +645,9 @@ fn accounting_publication_before_wake_preserves_only_evidence_across_disabled_na
             );
             let point = hit(&ui, control);
             assert!(pointer(&mut ui, &mut renderer, point, true).is_empty());
+            // COSMIC Down clears focus. A real focus operation restores it
+            // without releasing the held press, as in the adjacent control.
+            focus(&mut ui, &renderer, control.id(target));
             let marker = runtime(&app, target)
                 .goal_focus
                 .state
