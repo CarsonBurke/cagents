@@ -383,30 +383,35 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
                 .iter()
                 .any(|worktree| roots.get(&worktree.id).copied() != Some(&worktree.root))
     });
-    let (plan, plan_error) = if membership_changed || change.membership || change.topology {
-        let listed = records
-            .iter()
-            .filter(|record| roots.contains_key(&record.id))
-            .cloned()
-            .collect::<Vec<_>>();
-        match git_watch::Project::read_changed(
-            id,
-            repository.to_path_buf(),
-            &listed,
-            cancellation,
-            previous_plan.as_deref(),
-            &change.worktrees,
-        ) {
-            Ok(plan) => (Some(Arc::new(plan)), None),
-            // Without a plan the project is polled; its cards still stand.
-            Err(error) => (previous_plan, Some(error)),
-        }
-    } else {
-        (
-            previous_plan,
-            previous.and_then(|previous| previous.plan_error.clone()),
-        )
-    };
+    let retry_plan = previous.is_some_and(|previous| previous.plan_error.is_some());
+    let (plan, plan_error) =
+        if membership_changed || change.membership || change.topology || retry_plan {
+            let listed = records
+                .iter()
+                .filter(|record| roots.contains_key(&record.id))
+                .cloned()
+                .collect::<Vec<_>>();
+            match git_watch::Project::read_changed(
+                id,
+                repository.to_path_buf(),
+                &listed,
+                cancellation,
+                // A failed membership read may have lost its changed checkout IDs.
+                // Rebuild all current censuses once instead of clearing the error
+                // by reusing the stale plan on an unrelated later event.
+                previous_plan.as_deref().filter(|_| !retry_plan),
+                &change.worktrees,
+            ) {
+                Ok(plan) => (Some(Arc::new(plan)), None),
+                // Without a plan the project is polled; its cards still stand.
+                Err(error) => (previous_plan, Some(error)),
+            }
+        } else {
+            (
+                previous_plan,
+                previous.and_then(|previous| previous.plan_error.clone()),
+            )
+        };
 
     Ok(Local {
         scanned_at_unix_ms: now_unix_ms,
@@ -869,6 +874,80 @@ mod tests {
                 .worktrees
                 .iter()
                 .any(|worktree| worktree.root == added)
+        );
+    }
+    #[test]
+    fn polling_retries_failed_plan_when_checkout_membership_is_unchanged() {
+        let fixture = fixture();
+        let first = run(&fixture, None, &git_watch::Change::default());
+        let added = fixture.linked.join("new-directory/added.rs");
+        std::fs::create_dir_all(added.parent().unwrap()).unwrap();
+        std::fs::write(&added, "new tracked file\n").unwrap();
+        git(&fixture.linked, &["add", "new-directory/added.rs"]);
+        let marker = fixture.linked.join(".git");
+        let original = std::fs::read(&marker).unwrap();
+        std::fs::write(&marker, "gitdir: /nonexistent/cagents-work-scan\n").unwrap();
+        let failed = run(
+            &fixture,
+            Some(&first),
+            &git_watch::Change {
+                membership: true,
+                worktrees: first.worktrees.iter().map(|worktree| worktree.id).collect(),
+                ..Default::default()
+            },
+        );
+        assert!(failed.plan_error.is_some());
+        assert!(Arc::ptr_eq(
+            first.plan.as_ref().unwrap(),
+            failed.plan.as_ref().unwrap()
+        ));
+        assert_eq!(
+            failed
+                .worktrees
+                .iter()
+                .map(|worktree| (&worktree.id, &worktree.path))
+                .collect::<Vec<_>>(),
+            first
+                .worktrees
+                .iter()
+                .map(|worktree| (&worktree.id, &worktree.path))
+                .collect::<Vec<_>>()
+        );
+        std::fs::write(&marker, original).unwrap();
+        // Shared refs can wake the next scan without checkout IDs. The lost
+        // membership edge still needs a fresh census before its error clears.
+        let recovered = run(
+            &fixture,
+            Some(&failed),
+            &git_watch::Change {
+                references: true,
+                ..Default::default()
+            },
+        );
+        assert!(recovered.plan_error.is_none());
+        let plan = recovered.plan.as_ref().unwrap();
+        assert!(!Arc::ptr_eq(first.plan.as_ref().unwrap(), plan));
+        assert_ne!(first.plan.as_ref().unwrap().worktrees, plan.worktrees);
+        let cancellation = CancellationToken::new();
+        let repository = fixture.root.join(".git");
+        let records = RepositoryService::system("git")
+            .list_worktrees(&repository, &cancellation)
+            .unwrap();
+        let fresh = git_watch::Project::read_changed(
+            plan.id,
+            repository,
+            &records,
+            &cancellation,
+            None,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(plan.worktrees, fresh.worktrees);
+        let unchanged = run(&fixture, Some(&recovered), &git_watch::Change::default());
+        assert!(unchanged.plan_error.is_none());
+        assert!(
+            Arc::ptr_eq(plan, unchanged.plan.as_ref().unwrap()),
+            "successful recovery restores ordinary reuse"
         );
     }
 }
