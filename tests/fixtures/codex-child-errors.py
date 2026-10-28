@@ -29,6 +29,7 @@ class Scenario:
     def __init__(self):
         self.parent, self.child, self.sibling = (str(uuid.uuid4()) for _ in range(3))
         self.turns = {}
+        self.latest = {}
 
     def metadata(self, thread):
         child = thread != self.parent
@@ -40,10 +41,14 @@ class Scenario:
     def notifications(self, text, parent_turn):
         def notify(method, thread, **params):
             return {"method": method, "params": {"threadId": thread, **params}}
-        def turn(thread, status, items=(), error=None):
-            value = {"id": self.turns[thread], "status": status, "items": list(items)}
+        def turn(thread, status, items=None, error=None):
+            previous = self.latest.get(thread, {})
+            retained = previous.get("items", []) if previous.get("id") == self.turns[thread] else []
+            value = {"id": self.turns[thread], "status": status,
+                     "items": list(retained if items is None else items)}
             if error is not None:
                 value["error"] = {"message": error}
+            self.latest[thread] = value
             return value
         self.turns[self.parent] = parent_turn
         frames = [notify("turn/started", self.parent, turn=turn(self.parent, "inProgress"))]
@@ -85,15 +90,21 @@ class Scenario:
             thread = params.get("threadId", self.parent)
             if thread not in (self.parent, self.child, self.sibling):
                 return [{"id": identifier, "error": {"code": -32602, "message": "Unknown fixture thread"}}]
+            latest = self.latest.get(thread)
             result = {"thread": self.metadata(thread), "model": "fixture-mini",
                       "approvalPolicy": "on-request", "sandbox": {"type": "readOnly"},
-                      "initialTurnsPage": {"data": [], "nextCursor": None}}
+                      "initialTurnsPage": {"data": [latest] if latest else [], "nextCursor": None}}
+        elif method == "thread/read":
+            result = {"thread": self.metadata(params["threadId"])}
         elif method == "model/list":
             result = {"data": [{"id": "fixture-mini", "model": "fixture-mini",
                        "displayName": "Offline fixture"}], "nextCursor": None}
         elif method == "thread/list":
             result = {"data": [self.metadata(t) for t in (self.child, self.sibling)], "nextCursor": None}
-        elif method in ("skills/list", "thread/turns/list", "thread/queue/list"):
+        elif method == "thread/turns/list":
+            latest = self.latest.get(params.get("threadId"))
+            result = {"data": [latest] if latest else [], "nextCursor": None}
+        elif method in ("skills/list", "thread/queue/list"):
             result = {"data": [], "nextCursor": None}
         elif method == "account/read":
             result = {"account": {"type": "chatgpt", "email": "fixture@invalid", "planType": "free"}}
