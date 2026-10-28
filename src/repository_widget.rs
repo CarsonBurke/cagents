@@ -13008,10 +13008,16 @@ mod tests {
 
         for cancelled in [false, true] {
             let card = CardId::new();
-            let after = "let café = \"😀\";\r\nsecond\n\rthird\rfourth\n";
-            let (mut runtime, _) = working_diff_runtime(card, "original\n", after);
+            let baseline = "xlet café = \"😀\";\nsecond\r\n\rthird\rfourth";
+            let saved = "let café = \"😀\";\r\nsecond\n\rthird\rfourth\n";
+            let after = "xlet café = \"😀\";\r\nsecond\n\rthird\rfourth\n";
+            let (mut runtime, _) = working_diff_runtime(card, baseline, saved);
             runtime.set_lsp_document(None);
             runtime.source_surface = SourceSurface::Editor;
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+            }));
             runtime.working_diff.applied = None;
             drop(runtime.working_diff_task(card));
             let ticket = runtime.working_diff.timer.unwrap();
@@ -13020,6 +13026,21 @@ mod tests {
                 panic!("native buffer")
             };
             let snapshot = document.content.text_snapshot();
+            let editor_state = |runtime: &RepositoryRuntime| {
+                let DocumentState::Editable(document) = &runtime.document else {
+                    panic!("native buffer")
+                };
+                (
+                    document.saved_text.clone(),
+                    document.saved_history_revision,
+                    document.dirty,
+                    document.revision,
+                    document.history.revision(),
+                    document.content.cursor(),
+                )
+            };
+            let original_state = editor_state(&runtime);
+            assert!(runtime.is_dirty());
             text_editor::take_text_call_count();
 
             let task = runtime.start_working_diff(card, ticket);
@@ -13029,6 +13050,7 @@ mod tests {
                 "starting a debounced diff must not serialize on the UI thread"
             );
             assert_eq!(snapshot.serialization_count(), 0);
+            assert_eq!(editor_state(&runtime), original_state);
             if cancelled {
                 runtime
                     .working_diff
@@ -13059,14 +13081,25 @@ mod tests {
                 assert_eq!(snapshot.serialization_count(), 0);
             } else {
                 let model = result.as_ref().unwrap().as_ref().unwrap();
-                let expected = crate::diff_view::build_diff("original\n", after);
+                let expected = crate::diff_view::build_diff(baseline, after);
+                for marker in ["[LF]", "[CRLF]", "[no newline]"] {
+                    assert!(
+                        expected
+                            .inline_rows
+                            .iter()
+                            .any(|row| row.text.ends_with(marker))
+                    );
+                }
                 assert_eq!(model.line_counts, expected.line_counts);
                 assert_eq!(model.inline_rows, expected.inline_rows);
                 assert_eq!(model.split_rows, expected.split_rows);
                 assert_eq!(snapshot.serialization_count(), 1);
-                drop(runtime.update(completion));
+            }
+            drop(runtime.update(completion));
+            if !cancelled {
                 assert!(runtime.working_annotations_current());
             }
+            assert_eq!(editor_state(&runtime), original_state);
             assert!(
                 !snapshot.is_materialized(),
                 "a transient diff input must not stay cached in native history"
