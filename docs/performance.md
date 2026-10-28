@@ -78,7 +78,7 @@ Each row reports 20 s samples, as a percentage of one core:
 | State | Before (`c07b6f78e`) | After |
 | --- | --- | --- |
 | One busy agent, window focused | 11.1-12.6% (73-86 wakeups/s) | 4.1-4.2% (30-34 wakeups/s) |
-| One busy agent, another window focused | 9.1-9.5% (79 wakeups/s) | not yet measured at the 500 ms cadence |
+| One busy agent, another window focused | 9.1-9.5% (79 wakeups/s) | 1.15-1.25% (5-6 wakeups/s) |
 | Agent interrupted, window focused | not measured | 1.6% (7 wakeups/s) |
 
 Two changes produced the focused result. At the 100 ms cadence alone, the UI
@@ -88,9 +88,10 @@ polled with a zero timeout until that deadline arrived (about 630
 `epoll_pwait` calls per second). The vendored `iced-winit` now replaces an
 elapsed deadline with the requested one; see `vendor/iced-winit/README.cagents.md`.
 Each remaining step still repaints the whole window, which is why a busy
-agent still costs about 3% of a core above idle in this build. An earlier
-revision that stopped unfocused spinners entirely, instead of slowing them,
-measured 1.0-1.6% with another window focused (3 wakeups/s).
+agent still costs about 3% of a core above idle in this build. Slowing
+unfocused spinners instead of stopping them costs little: an earlier revision
+that stopped them entirely measured 1.0-1.6% with another window focused
+(3 wakeups/s).
 
 ## Native chat stage attribution
 
