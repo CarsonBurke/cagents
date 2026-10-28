@@ -20188,10 +20188,12 @@ mod tests {
 
     #[test]
     fn first_pane_width_uses_current_empty_window_and_preserves_measured_panes() {
+        // A free right edge keeps `WINDOW_RESIZE_BORDER` of the window from the
+        // content, so the third case sits exactly at the narrow threshold.
         for (window, seed, with_project, inspector_open, expected, measured) in [
             (1280.0, 1340.0, false, false, 1.0, 1020.0),
             (1600.0, 600.0, false, false, 0.5, 1340.0),
-            (1360.0, 1340.0, false, false, 0.5, 1100.0),
+            (1368.0, 1340.0, false, false, 0.5, 1100.0),
             (1600.0, 1340.0, true, true, 1.0, 960.0),
             (2000.0, 600.0, true, true, 0.5, 1360.0),
             (900.0, 1340.0, true, true, 1.0, 640.0),
