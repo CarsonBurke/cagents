@@ -260,10 +260,83 @@ impl Cagents {
             local
                 .get(id)
                 .is_some_and(|(owner, count)| owner == scope && *count == 1)
-                && canonical
-                    .get(id)
-                    .is_none_or(|(owner, count)| owner == scope && *count == 1)
+                && (!failure.retry_available
+                    || canonical
+                        .get(id)
+                        .is_none_or(|(owner, count)| owner == scope && *count == 1))
         });
+    }
+
+    /// A different scope's earlier ACK cannot admit a refused source while its
+    /// original seed is still unresolved. Keep this authority independently of
+    /// error rows, runtimes and pending markers, which can be pruned or closed.
+    fn preserve_shared_chat_admission_scopes(
+        &mut self,
+        views: &mut [View],
+    ) -> HashMap<CardId, HashSet<Scope>> {
+        let mut owners = HashMap::<CardId, HashSet<Scope>>::new();
+        for seed in self.shared_views.seed_admissions.values() {
+            if seed.registry != self.workspace_model.identity {
+                continue;
+            }
+            for retry in seed.failed_chats.iter().chain(&seed.retry_sources) {
+                owners
+                    .entry(retry.0.card)
+                    .or_default()
+                    .insert(retry.0.scope.clone());
+            }
+        }
+        if owners.is_empty() {
+            return owners;
+        }
+        let mut changed = HashSet::new();
+        for view in views {
+            view.panes.retain(|pane| {
+                let Some(scopes) = owners.get(&pane.id) else {
+                    return true;
+                };
+                let mut keep = true;
+                for scope in scopes {
+                    if scope != &view.scope {
+                        changed.insert(scope.clone());
+                        keep = false;
+                    }
+                }
+                keep
+            });
+        }
+        for scope in changed {
+            let seed = &self.shared_views.seed_admissions[&scope];
+            if !seed.failed {
+                let Some(attempt) = seed.attempt else {
+                    // A queued retry has no receipt yet. Its original sources
+                    // still fence projection until Started and the seed ACK.
+                    continue;
+                };
+                self.refuse_shared_view_seed(
+                    scope.clone(),
+                    attempt,
+                    Some(seed.registry),
+                    "This saved workspace changed. Close and reopen this window to reconnect. Saved drafts and sessions are retained".into(),
+                    false,
+                );
+            }
+            let seed = self.shared_views.seed_admissions.get_mut(&scope).unwrap();
+            seed.retry_available = false;
+            // Rebuild diagnostics from the original refusal if an earlier
+            // publication pruned a row; this never creates retry authority.
+            for retry in &seed.failed_chats {
+                self.shared_views.admission_failures.insert(
+                    retry.0.card,
+                    SharedChatAdmissionFailure {
+                        message: "This saved workspace changed. Close and reopen this window to reconnect. Saved drafts and sessions are retained".into(),
+                        retry: retry.clone(),
+                        retry_available: false,
+                    },
+                );
+            }
+        }
+        owners
     }
 
     pub(super) fn shared_view_seed_started(
@@ -1599,9 +1672,11 @@ impl Cagents {
                 }
             }
         }
+        let admission_scopes = self.preserve_shared_chat_admission_scopes(&mut views);
         let owned = views
             .iter()
             .flat_map(|view| view.panes.iter().map(|pane| pane.id))
+            .chain(admission_scopes.keys().copied())
             .collect::<HashSet<_>>();
         self.prepare_shared_aliases(&views, &owned);
         // Root discovery is immutable during this projection. Keep only owned
@@ -1635,6 +1710,14 @@ impl Cagents {
                         self.status = Some(TransientNotice::error(error));
                     }
                 }
+            }
+            if !admission_scopes.is_empty() {
+                // Reapplying pending edits must not reintroduce a fenced entry.
+                view.panes.retain(|pane| {
+                    admission_scopes
+                        .get(&pane.id)
+                        .is_none_or(|scopes| scopes.iter().all(|scope| scope == &view.scope))
+                });
             }
             let current = match &view.scope {
                 Scope::Channel(_) => self.local_view_cards(&view.scope),
