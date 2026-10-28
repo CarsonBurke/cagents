@@ -603,7 +603,11 @@ impl Cagents {
         let Some(row) = self.sidebar_model.project(project) else {
             return Some("The project is no longer open.".into());
         };
-        if self.project_ui.removing.contains_key(&row.repository)
+        if self
+            .project_ui
+            .removal_attempts
+            .contains_key(&row.repository)
+            || self.project_ui.removing.contains_key(&row.repository)
             || (self.project_ui.closing.contains_key(&project)
                 && !self.project_ui.close_failed.contains(&project))
         {
@@ -823,6 +827,13 @@ impl Cagents {
                     && self.project_review_checkout_blocker(*project).is_none()
                     && !self.project_ui.close_failed.contains(project)
                     && !self.project_ui.close_in_flight.contains(project)
+                    && !self
+                        .project_ui
+                        .closing
+                        .get(project)
+                        .is_some_and(|repository| {
+                            self.project_ui.removal_attempts.contains_key(repository)
+                        })
                     && !self
                         .durable
                         .channels
@@ -1722,6 +1733,12 @@ impl Cagents {
                     }
                     Err(error) => {
                         self.finish_project_removal(&origin);
+                        if self.project_ui.closing.get(&origin.project) == Some(&origin.repository)
+                        {
+                            // A failed explicit retry does not authorize the
+                            // passive close lane to replay its refused effects.
+                            self.project_ui.close_failed.insert(origin.project);
+                        }
                         self.status = Some(TransientNotice::error(format!(
                             "Could not remove project: {error}"
                         )));
