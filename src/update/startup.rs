@@ -3,6 +3,15 @@
 mod window;
 pub use window::{Request, run};
 
+/// Presentation only: a waiting parent already owns the failure/retry screen.
+/// The normal readiness protocol and every startup fence still apply.
+pub const FAILURE_SCREEN_OWNED_ENV: &str = "CAGENTS_UI_FAILURE_SCREEN_OWNED";
+
+pub fn failure_screen_owned() -> bool {
+    crate::instance::ui_launch_handshake_requested()
+        && std::env::var_os(FAILURE_SCREEN_OWNED_ENV).as_deref() == Some("1".as_ref())
+}
+
 use super::{UpdateJob, UpdatePhase, impact::Disposition};
 use std::{
     fs,
@@ -59,6 +68,17 @@ impl Snapshot {
     pub fn can_open(&self) -> bool {
         self.installation_lock == LockState::Free
     }
+    fn opening_refusal(&self) -> Option<&'static str> {
+        match self.installation_lock {
+            LockState::Held => {
+                Some("The installation is still locked. Progress will keep updating here.")
+            }
+            LockState::Unknown => Some(
+                "Installation access could not be verified. Progress will keep checking before opening cagents.",
+            ),
+            LockState::Free => None,
+        }
+    }
     pub fn finished(&self) -> bool {
         self.can_open()
             && self.helper_lock == LockState::Free
@@ -80,7 +100,11 @@ impl Snapshot {
             };
         }
         if self.helper_lock != LockState::Held {
-            return "Waiting for the update owner";
+            return match self.installation_lock {
+                LockState::Free => "Update ownership is unconfirmed",
+                LockState::Unknown => "Checking installation access",
+                LockState::Held => "Waiting for the update owner",
+            };
         }
         match self.job.as_ref().map(|job| &job.phase) {
             Some(UpdatePhase::Starting) => "Preparing the update",
@@ -118,7 +142,11 @@ impl Snapshot {
             return "Update progress could not be verified. Keep this window open to check again, or try focusing an existing cagents window.".into();
         };
         if self.helper_lock != LockState::Held {
-            return "The last update record could not be matched to current helper ownership. The installation is still locked; cagents will keep checking without starting another updater.".into();
+            return match self.installation_lock {
+                LockState::Free => "The last update record could not be matched to current helper ownership. You can try opening cagents through its normal startup checks; this does not restart the updater or discard saved work.",
+                LockState::Unknown => "The last update record could not be matched to current helper ownership, and installation access could not be verified. cagents will keep checking without starting another updater.",
+                LockState::Held => "The last update record could not be matched to current helper ownership. The installation is still locked; cagents will keep checking without starting another updater.",
+            }.into();
         }
         if job.phase == UpdatePhase::Installing && job.startup_delayed {
             return "Restoring saved sessions is taking longer than expected. The update is waiting for startup to finish while keeping saved work protected. Progress keeps updating here; Technical details lets you check diagnostics.".into();

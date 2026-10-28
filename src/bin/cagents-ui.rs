@@ -41,6 +41,10 @@ pub(crate) fn main_with_before_start(
 ) -> std::process::ExitCode {
     // SAFETY: first statement of main, before any thread exists.
     unsafe { cagents::account::detach_inherited_selections() };
+    let failure_screen_owned = cagents::update::startup::failure_screen_owned();
+    // SAFETY: startup is still single-threaded. Presentation ownership belongs
+    // only to this launch, never to its later terminals or child launchers.
+    unsafe { std::env::remove_var(cagents::update::startup::FAILURE_SCREEN_OWNED_ENV) };
     // The document render helper answers before anything else exists. Its
     // stdout is a binary page frame, so a tracing subscriber, a panic hook
     // writing a crash record, the window lease or the launcher handshake
@@ -102,27 +106,27 @@ pub(crate) fn main_with_before_start(
 
     #[cfg(feature = "integrated-browser")]
     let _browser_cleanup = cagents::browser::ProcessShutdown;
+    let request = match cagents::update::startup::Request::new(
+        options.new_window,
+        options.slot.map(str::to_owned),
+        options.source.map(str::to_owned),
+        options.device.map(str::to_owned),
+        options.device_window_scoped,
+    ) {
+        Ok(request) => request,
+        Err(error) => return report(Err(error.into())),
+    };
     let result = run(options);
     match &result {
         Err(error) if cagents::instance::is_update_in_progress(error.as_ref()) => {
             // Expected coordinator ownership is not a crash. Preserve the
             // original public launch context in a capability-free payload.
-            if let Ok(Some(options)) = parse(&arguments) {
-                let request = cagents::update::startup::Request::new(
-                    options.new_window,
-                    options.slot.map(str::to_owned),
-                    options.source.map(str::to_owned),
-                    options.device.map(str::to_owned),
-                    options.device_window_scoped,
-                );
-                match request {
-                    Ok(request) if spawn_startup_update_dialog(&request).is_ok() => (),
-                    _ => tracing::error!("could not open the update progress window"),
-                }
+            if !failure_screen_owned && spawn_startup_update_dialog(&request).is_err() {
+                tracing::error!("could not open the update progress window");
             }
             let _ = cagents::instance::report_ui_startup(&Err("an update is in progress".into()));
         }
-        Err(error) => report_startup_failure(&error.to_string()),
+        Err(error) => report_startup_failure(&error.to_string(), &request, failure_screen_owned),
         // The window reports readiness from its first frame, so reaching here
         // with the handshake unclaimed means no window ever opened.
         Ok(()) => {
@@ -153,7 +157,11 @@ fn report(result: Result<(), Box<dyn std::error::Error>>) -> std::process::ExitC
 /// Makes a startup failure observable. Panics were already durable; an
 /// ordinary `Err` was reported only down a pipe whose reader prints it into a
 /// stderr the desktop session discards.
-fn report_startup_failure(message: &str) {
+fn report_startup_failure(
+    message: &str,
+    request: &cagents::update::startup::Request,
+    failure_screen_owned: bool,
+) {
     let message = truncated(message);
     tracing::error!(error = message, "cagents-ui startup failed");
     cagents::instance::report_startup_failure();
@@ -163,8 +171,8 @@ fn report_startup_failure(message: &str) {
         message == cagents::instance::ApplicationLeaseError::AlreadyRunning.to_string();
     // A terminal run already prints the error. A desktop launch has none, so
     // without this the user double-clicks the icon and nothing happens.
-    if !already_running && !std::io::stderr().is_terminal() {
-        let _ = spawn_startup_error_dialog(message);
+    if !already_running && !failure_screen_owned && !std::io::stderr().is_terminal() {
+        let _ = spawn_startup_error_dialog(message, request);
     }
     // Reported last: the launcher kills this process as soon as it reads a
     // handshake error, so the dialog has to be detached before then.
@@ -181,10 +189,15 @@ fn truncated(message: &str) -> &str {
 /// Re-runs this executable as a detached dialog. The failing process cannot
 /// show the dialog itself: it must answer the launcher's handshake, and the
 /// launcher kills it the moment that answer is an error.
-fn spawn_startup_error_dialog(message: &str) -> std::io::Result<()> {
+fn spawn_startup_error_dialog(
+    message: &str,
+    request: &cagents::update::startup::Request,
+) -> std::io::Result<()> {
+    let context = serde_json::to_string(request).map_err(std::io::Error::other)?;
     std::process::Command::new(std::env::current_exe()?)
         .arg(STARTUP_ERROR)
         .arg(message)
+        .arg(context)
         .env_remove(cagents::instance::UI_LAUNCH_HANDSHAKE_ENV)
         .env_remove(cagents::instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV)
         .stdin(std::process::Stdio::null())
@@ -235,10 +248,19 @@ fn run_internal(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     }
     arguments.next();
     let message = arguments.next().ok_or("missing startup error message")?;
+    let request = match arguments.next() {
+        Some(payload) if payload.len() <= 4096 => {
+            serde_json::from_str::<cagents::update::startup::Request>(payload)?
+        }
+        Some(_) => return Err("invalid startup error context".into()),
+        // Older matched callers carried no public request and opened local.
+        None => cagents::update::startup::Request::new(false, None, None, None, false)?,
+    };
+    request.validate()?;
     if arguments.next().is_some() {
         return Err("invalid startup error arguments".into());
     }
-    run_startup_error_dialog(message)
+    run_startup_error_dialog(message, request)
 }
 
 struct Options<'a> {
@@ -422,26 +444,36 @@ struct StartupError {
     /// Why the last retry could not even start the launcher, shown in place
     /// of a dialog that silently did nothing.
     retry_failure: Option<String>,
+    request: cagents::update::startup::Request,
+    context_ready: bool,
+    working: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum StartupErrorMessage {
     Retry,
+    Retried(Result<(), &'static str>),
     Close,
 }
 
 impl cosmic::Application for StartupError {
     type Executor = cosmic::executor::Default;
-    type Flags = String;
+    type Flags = (String, cagents::update::startup::Request, bool);
     type Message = StartupErrorMessage;
     const APP_ID: &'static str = "dev.cagents.Cagents.StartupError";
 
-    fn init(core: Core, message: String) -> (Self, cosmic::app::Task<StartupErrorMessage>) {
+    fn init(
+        core: Core,
+        (message, request, context_ready): Self::Flags,
+    ) -> (Self, cosmic::app::Task<StartupErrorMessage>) {
         (
             Self {
                 core,
                 message,
-                retry_failure: None,
+                retry_failure: (!context_ready).then(|| "The original device profile is no longer available. Choose that device again before reopening this workspace.".into()),
+                request,
+                context_ready,
+                working: false,
             },
             cosmic::app::Task::none(),
         )
@@ -462,90 +494,107 @@ impl cosmic::Application for StartupError {
     fn update(&mut self, message: StartupErrorMessage) -> cosmic::app::Task<StartupErrorMessage> {
         match message {
             StartupErrorMessage::Close => iced::exit().map(cosmic::Action::App),
-            StartupErrorMessage::Retry => match relaunch() {
-                Ok(()) => iced::exit().map(cosmic::Action::App),
-                Err(error) => {
-                    self.retry_failure = Some(error);
-                    cosmic::app::Task::none()
-                }
-            },
+            StartupErrorMessage::Retry if !self.working && self.context_ready => {
+                self.working = true;
+                let request = self.request.clone();
+                cosmic::task::future(async move {
+                    StartupErrorMessage::Retried(
+                        tokio::task::spawn_blocking(move || request.open())
+                            .await
+                            .unwrap_or(Err(
+                                "cagents could not finish the startup check. You can try again.",
+                            )),
+                    )
+                })
+            }
+            StartupErrorMessage::Retried(Ok(())) => iced::exit().map(cosmic::Action::App),
+            StartupErrorMessage::Retried(Err(error)) => {
+                self.working = false;
+                self.retry_failure = Some(error.into());
+                cosmic::app::Task::none()
+            }
+            StartupErrorMessage::Retry => cosmic::app::Task::none(),
         }
     }
 
     fn view(&self) -> cosmic::Element<'_, StartupErrorMessage> {
+        let wrap = iced::widget::text::Wrapping::WordOrGlyph;
         let mut rows = vec![
-            cagents::design::title("cagents could not start").into(),
-            cagents::design::body(&self.message).into(),
+            cagents::design::title(if self.working {
+                "Opening your workspace"
+            } else {
+                "cagents could not start"
+            })
+            .wrapping(wrap)
+            .into(),
+            cagents::design::body(&self.message).wrapping(wrap).into(),
             cagents::design::body(
-                "This may be temporary. Retry starts cagents again; Close leaves no window open.",
+                "Retry opens the same requested workspace and waits for its startup check. Close dismisses this recovery screen.",
             )
+            .wrapping(wrap)
             .into(),
             cagents::design::body(
                 "Run `cagents diagnostics` to inspect retained private startup evidence.",
             )
+            .wrapping(wrap)
             .into(),
         ];
         if let Some(failure) = &self.retry_failure {
-            rows.push(cagents::design::body(format!("Retry failed: {failure}")).into());
+            rows.push(
+                cagents::design::body(format!("Retry failed: {failure}"))
+                    .wrapping(wrap)
+                    .into(),
+            );
         }
-        rows.push(
-            cosmic::widget::row::with_children(vec![
-                cagents::ui_controls::button::primary("Retry")
-                    .on_press(StartupErrorMessage::Retry)
-                    .into(),
-                cagents::ui_controls::button::secondary("Close")
-                    .on_press(StartupErrorMessage::Close)
-                    .into(),
+        let mut retry = cagents::ui_controls::button::primary(if self.working {
+            "Opening…"
+        } else {
+            "Retry"
+        });
+        if !self.working && self.context_ready {
+            retry = retry.on_press(StartupErrorMessage::Retry);
+        }
+        let footer = cosmic::widget::row::with_children(vec![
+            retry.into(),
+            cagents::ui_controls::button::secondary("Close")
+                .on_press(StartupErrorMessage::Close)
+                .into(),
+        ])
+        .spacing(space::S);
+        cosmic::widget::container(
+            cosmic::widget::column::with_children(vec![
+                cosmic::widget::scrollable(
+                    cosmic::widget::column::with_children(rows)
+                        .spacing(space::L)
+                        .width(iced::Length::Fill),
+                )
+                .height(iced::Length::Fill)
+                .into(),
+                footer.into(),
             ])
-            .spacing(space::S)
-            .into(),
-        );
-        cosmic::widget::container(cosmic::widget::column::with_children(rows).spacing(space::L))
-            .padding(space::XL)
-            .width(iced::Length::Fill)
-            .height(iced::Length::Fill)
-            .into()
+            .spacing(space::L)
+            .height(iced::Length::Fill),
+        )
+        .padding(space::XL)
+        .width(iced::Length::Fill)
+        .height(iced::Length::Fill)
+        .into()
     }
 }
 
-/// Starts the launcher that produced this dialog, detached from it.
-///
-/// The launcher is the `cagents` executable installed beside this one: it is
-/// what the desktop entry runs, it starts the daemon before the window, and
-/// it reuses a window that did manage to open in the meantime instead of
-/// opening a second one. Running `cagents-ui` directly again would skip all
-/// three.
-fn relaunch() -> Result<(), String> {
-    let launcher = cagents::companion::Product::Cli
-        .beside_current()
-        .map_err(|error| error.to_string())?;
-    if !launcher.is_file() {
-        return Err(format!(
-            "the cagents launcher was not found beside this executable at {}",
-            launcher.display()
-        ));
-    }
-    std::process::Command::new(launcher)
-        .arg("ui")
-        .env_remove(cagents::instance::UI_LAUNCH_HANDSHAKE_ENV)
-        .env_remove(cagents::instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .process_group(0)
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
-fn run_startup_error_dialog(message: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn run_startup_error_dialog(
+    message: &str,
+    request: cagents::update::startup::Request,
+) -> Result<(), Box<dyn std::error::Error>> {
     type Shell = Cosmic<StartupError>;
     let message = message.to_owned();
+    let context_ready = request.prepare_context().is_ok();
     cosmic::icon_theme::set_default(cosmic::config::icon_theme());
     iced::daemon(
         move || {
             let (window, open) = iced::window::open(iced::window::Settings {
-                size: iced::Size::new(620.0, 280.0),
+                size: iced::Size::new(640.0, 440.0),
+                min_size: Some(iced::Size::new(420.0, 340.0)),
                 exit_on_close_request: false,
                 // The startup task runs alongside window creation. Supply the
                 // icon here so no update can be dropped before the window opens.
@@ -554,7 +603,8 @@ fn run_startup_error_dialog(message: &str) -> Result<(), Box<dyn std::error::Err
             });
             let mut core = Core::default();
             core.set_main_window_id(Some(window));
-            let (shell, task) = Shell::init((core, message.clone()));
+            let (shell, task) =
+                Shell::init((core, (message.clone(), request.clone(), context_ready)));
             (shell, iced::Task::batch([open.discard(), task]))
         },
         Shell::update,

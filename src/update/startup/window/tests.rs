@@ -24,6 +24,7 @@ fn window(free: bool) -> Window {
         follow: Follow::default(),
         polling: false,
         working: false,
+        opening: false,
         details: false,
         notice: None,
         context_ready: true,
@@ -273,6 +274,147 @@ fn actual_reopen_process_receives_exact_original_device_scoped_window_and_source
             .iter()
             .any(|arg| arg.contains("update-worker") || arg.contains("daemon"))
     );
+}
+
+#[test]
+fn failed_reopen_then_retry_keeps_exact_context_and_waits_for_real_readiness() {
+    use std::{os::unix::fs::PermissionsExt, sync::mpsc, time::Instant};
+    let root = tempfile::tempdir().unwrap();
+    let script = root.path().join("inert-ui");
+    std::fs::write(
+        &script,
+        r#"#!/usr/bin/python3
+import json, os, pathlib, sys, time
+output = pathlib.Path(os.environ['FIXTURE_OUTPUT'])
+output.write_text(json.dumps({'arguments': sys.argv[1:], 'handshake': os.environ.get('CAGENTS_UI_LAUNCH_HANDSHAKE'), 'owned': os.environ.get('CAGENTS_UI_FAILURE_SCREEN_OWNED')}))
+if os.environ.get('FIXTURE_FAIL') == '1':
+    print('error: fixture startup refused', flush=True)
+    sys.exit(1)
+release = pathlib.Path(os.environ['FIXTURE_RELEASE'])
+deadline = time.monotonic() + 5
+while not release.exists() and time.monotonic() < deadline:
+    time.sleep(.01)
+if not release.exists():
+    sys.exit(71)
+print('ready', flush=True)
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for (index, request) in [
+        Request::new(
+            false,
+            Some("device-0123456789abcdef".into()),
+            Some("device-fedcba9876543210".into()),
+            Some("build-host".into()),
+            true,
+        )
+        .unwrap(),
+        Request::new(true, None, Some("window-2".into()), None, false).unwrap(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // This is the capability-free context carried by the detached error
+        // screen, including the already-scoped bit that prevents double hashing.
+        let restored: Request =
+            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        let expected = request.arguments();
+        let failure = root.path().join(format!("failed-{index}.json"));
+        let mut first = reopen_command(&script, &restored);
+        first
+            .env("FIXTURE_FAIL", "1")
+            .env("FIXTURE_OUTPUT", &failure);
+        assert!(
+            wait_for_reopen(&mut first).is_err(),
+            "spawn is not readiness"
+        );
+        let failed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&failure).unwrap()).unwrap();
+        assert_eq!(failed["arguments"], serde_json::json!(expected));
+
+        let output = root.path().join(format!("retry-{index}.json"));
+        let release = root.path().join(format!("release-{index}"));
+        let mut second = reopen_command(&script, &restored);
+        second
+            .env_remove("FIXTURE_FAIL")
+            .env("FIXTURE_OUTPUT", &output)
+            .env("FIXTURE_RELEASE", &release);
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender.send(wait_for_reopen(&mut second)).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !output.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(output.exists(), "the exact retry child actually started");
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        std::fs::write(&release, b"fixture parent permits readiness").unwrap();
+        receiver
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        let retried: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(retried["arguments"], serde_json::json!(expected));
+        assert_eq!(retried["handshake"], "1");
+        assert_eq!(retried["owned"], "1");
+    }
+}
+
+#[test]
+fn exact_open_intent_never_substitutes_another_window_after_missing_target() {
+    let request = Request::new(
+        false,
+        Some("device-0123456789abcdef".into()),
+        Some("device-fedcba9876543210".into()),
+        Some("build-host".into()),
+        true,
+    )
+    .unwrap();
+    let mut attempted = Vec::new();
+    assert!(
+        !request
+            .focus_exact_with(|slot| {
+                attempted.push(slot.to_owned());
+                Ok(false)
+            })
+            .unwrap()
+    );
+    assert_eq!(attempted, ["device-0123456789abcdef"]);
+    assert!(
+        request
+            .focus_exact_with(|_| Err(std::io::Error::other("unavailable")))
+            .is_err()
+    );
+}
+
+#[test]
+fn opening_screen_retains_request_and_recovery_controls_after_failed_startup() {
+    let mut state = window(true);
+    let context = serde_json::to_value(&state.request).unwrap();
+    drop(state.update(Message::Open));
+    assert!(state.working && state.opening);
+    let (labels, messages) = rendered(&state, 420.0, 340.0, Some("Close"));
+    assert_eq!(messages.len(), 1);
+    assert!(labels.iter().any(|label| label == "Opening your workspace"));
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.contains("acknowledges startup"))
+    );
+    drop(state.update(Message::Opened(Err("Fixture startup refused"))));
+    assert!(!state.working && !state.opening);
+    assert_eq!(serde_json::to_value(&state.request).unwrap(), context);
+    let (_, messages) = rendered(&state, 420.0, 340.0, Some("Open cagents"));
+    assert_eq!(messages.len(), 1, "explicit retry remains available");
+    // Startup tasks are unpolled here; the sibling process fixture exercises
+    // the real readiness boundary without launching any native application.
 }
 
 #[test]

@@ -48,6 +48,46 @@ fn projected(phase: UpdatePhase, helper: LockState, fence: LockState) -> Snapsho
 }
 
 #[test]
+fn unverified_helper_copy_and_reopen_refusal_distinguish_free_held_and_unknown_access() {
+    for helper in [LockState::Free, LockState::Unknown] {
+        for phase in [
+            UpdatePhase::Installing,
+            UpdatePhase::Complete,
+            UpdatePhase::Failed,
+        ] {
+            for installation in [LockState::Free, LockState::Held, LockState::Unknown] {
+                let snapshot = projected(phase.clone(), helper, installation);
+                let explanation = snapshot.explanation();
+                assert_eq!(snapshot.can_open(), installation == LockState::Free);
+                match installation {
+                    LockState::Free => {
+                        assert!(snapshot.opening_refusal().is_none());
+                        assert!(!explanation.contains("still locked"));
+                        if helper == LockState::Unknown {
+                            assert_eq!(snapshot.heading(), "Update ownership is unconfirmed");
+                            assert!(explanation.contains("normal startup checks"));
+                        }
+                    }
+                    LockState::Held => {
+                        assert!(explanation.contains("still locked"));
+                        assert!(snapshot.opening_refusal().unwrap().contains("still locked"));
+                    }
+                    LockState::Unknown => {
+                        assert_eq!(snapshot.heading(), "Checking installation access");
+                        assert!(explanation.contains("could not be verified"));
+                        assert!(!explanation.contains("still locked"));
+                        let refusal = snapshot.opening_refusal().unwrap();
+                        assert!(refusal.contains("could not be verified"));
+                        assert!(!refusal.contains("still locked"));
+                    }
+                }
+                assert!(!Follow::default().observe(&snapshot));
+            }
+        }
+    }
+}
+
+#[test]
 fn real_worker_lock_and_unchanged_status_distinguish_active_from_orphan_without_repair() {
     let (_root, executable, state) = installation();
     let job = job(UpdatePhase::WaitingForIdle);

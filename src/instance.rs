@@ -1553,6 +1553,122 @@ pub fn activate_window(slot: &str) -> io::Result<bool> {
     activate_window_in(&runtime_directory()?, slot)
 }
 
+/// Focus an update participant without changing the requested reopen target.
+/// Inventory and device identity reads never create or repair runtime files.
+#[cfg(feature = "ui")]
+pub(crate) fn activate_existing_device_window(preferred: &[String]) -> io::Result<bool> {
+    activate_existing_device_window_in(
+        &runtime_directory()?,
+        crate::device::selected().map(|device| device.name.as_str()),
+        preferred,
+    )
+}
+
+#[cfg(feature = "ui")]
+fn activate_existing_device_window_in(
+    runtime: &Path,
+    device: Option<&str>,
+    preferred: &[String],
+) -> io::Result<bool> {
+    require_owned_runtime_directory(runtime)?;
+    let mut candidates = preferred.to_vec();
+    let prefix = format!("{APPLICATION_LOCK_FILE}.");
+    let mut discovered = Vec::new();
+    for (index, entry) in fs::read_dir(runtime)?.enumerate() {
+        if index >= 8192 {
+            return Err(io::Error::other("window inventory exceeds its entry limit"));
+        }
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(slot) = name.to_str().and_then(|name| name.strip_prefix(&prefix)) else {
+            continue;
+        };
+        if validate_window_slot(slot).is_ok() {
+            if discovered.len() >= 1024 {
+                return Err(io::Error::other("window inventory exceeds its slot limit"));
+            }
+            discovered.push(slot.to_owned());
+        }
+    }
+    discovered.sort();
+    for slot in discovered {
+        if !candidates.contains(&slot) {
+            candidates.push(slot);
+        }
+    }
+    for slot in candidates {
+        validate_window_slot(&slot)?;
+        let Some(_identity) = existing_window_device_identity(runtime, &slot, device)? else {
+            continue;
+        };
+        if !private_lock_is_held(&runtime.join(slot_lock_name(&slot)))? {
+            continue;
+        }
+        if activate_window_in(runtime, &slot)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(feature = "ui")]
+struct ExistingWindowDeviceIdentity {
+    _read_guard: Option<OwnedLock>,
+}
+
+#[cfg(feature = "ui")]
+fn existing_window_device_identity(
+    runtime: &Path,
+    slot: &str,
+    device: Option<&str>,
+) -> io::Result<Option<ExistingWindowDeviceIdentity>> {
+    match (device, slot.starts_with("device-")) {
+        (None, false) => {
+            return Ok(Some(ExistingWindowDeviceIdentity { _read_guard: None }));
+        }
+        (None, true) | (Some(_), false) => return Ok(None),
+        (Some(_), true) => {}
+    }
+    let path = runtime.join(format!("{ACTIVATION_SOCKET_FILE}.{slot}.device"));
+    let safe = |metadata: &fs::Metadata| {
+        metadata.is_file()
+            && metadata.uid() == current_uid()
+            && metadata.mode() & 0o077 == 0
+            && metadata.nlink() == 1
+    };
+    let named = match fs::symlink_metadata(&path) {
+        Ok(metadata) if safe(&metadata) => metadata,
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(&path)?;
+    let opened = file.metadata()?;
+    if !safe(&opened) || named.dev() != opened.dev() || named.ino() != opened.ino() {
+        return Ok(None);
+    }
+    let mut identity = match owned_file_lock(file, libc::LOCK_SH | libc::LOCK_NB) {
+        Ok(identity) => identity,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut bytes = Vec::new();
+    (&mut identity.0).take(129).read_to_end(&mut bytes)?;
+    if bytes.len() > 128 || std::str::from_utf8(&bytes).ok() != device {
+        return Ok(None);
+    }
+    let current = fs::symlink_metadata(&path)?;
+    if !safe(&current) || current.dev() != opened.dev() || current.ino() != opened.ino() {
+        return Ok(None);
+    }
+    Ok(Some(ExistingWindowDeviceIdentity {
+        _read_guard: Some(identity),
+    }))
+}
+
 /// Use a desktop portal's activation token without mutating process-wide env.
 pub fn activate_window_with_token(slot: &str, token: Option<&str>) -> io::Result<bool> {
     validate_window_slot(slot)?;
@@ -2891,6 +3007,162 @@ mod tests {
         assert!(window_matches_selected_device(PRIMARY_WINDOW).unwrap());
         assert!(window_matches_selected_device("window-2").unwrap());
         assert!(!window_matches_selected_device("device-0123456789abcdef").unwrap());
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn update_existing_window_falls_back_locally_without_cross_device_activation_or_file_repair() {
+        let runtime = tempdir().unwrap();
+        let local_slot = "window-2";
+        let foreign_slot = crate::device::scoped_window_slot("other-host", "primary");
+        let _local_lock = owned_lock(
+            &runtime.path().join(slot_lock_name(local_slot)),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        let _foreign_lock = owned_lock(
+            &runtime.path().join(slot_lock_name(&foreign_slot)),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        let (local_sender, local_receiver) = async_channel::unbounded();
+        let (foreign_sender, foreign_receiver) = async_channel::unbounded();
+        let _local = UiActivationListener::bind_named(
+            runtime.path(),
+            slot_socket_name(local_slot),
+            local_sender,
+        )
+        .unwrap();
+        let _foreign = UiActivationListener::bind_named(
+            runtime.path(),
+            slot_socket_name(&foreign_slot),
+            foreign_sender,
+        )
+        .unwrap();
+        let names_before = fs::read_dir(runtime.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        let meta_before = fs::metadata(runtime.path().join(slot_lock_name(local_slot))).unwrap();
+        assert!(
+            activate_existing_device_window_in(
+                runtime.path(),
+                None,
+                &["missing-named-window".into(), PRIMARY_WINDOW.into()],
+            )
+            .unwrap()
+        );
+        let event = local_receiver.recv_blocking().unwrap();
+        assert!(event.session.is_none() && event.update.is_none());
+        assert!(foreign_receiver.try_recv().is_err());
+        let names_after = fs::read_dir(runtime.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        let meta_after = fs::metadata(runtime.path().join(slot_lock_name(local_slot))).unwrap();
+        assert_eq!(
+            names_before, names_after,
+            "no missing slot/sidecar was created"
+        );
+        assert_eq!(
+            (meta_before.ino(), meta_before.mode(), meta_before.len()),
+            (meta_after.ino(), meta_after.mode(), meta_after.len())
+        );
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn update_existing_window_remote_fallback_requires_readable_same_device_identity() {
+        let runtime = tempdir().unwrap();
+        let device = "build-host";
+        let slot = crate::device::scoped_window_slot(device, "editor");
+        let other = crate::device::scoped_window_slot("other-host", "primary");
+        let mut locks = Vec::new();
+        let mut listeners = Vec::new();
+        let mut receivers = Vec::new();
+        for candidate in [PRIMARY_WINDOW, &other, &slot] {
+            locks.push(
+                owned_lock(
+                    &runtime.path().join(slot_lock_name(candidate)),
+                    libc::LOCK_EX | libc::LOCK_NB,
+                )
+                .unwrap(),
+            );
+            let (sender, receiver) = async_channel::unbounded();
+            listeners.push(
+                UiActivationListener::bind_named(
+                    runtime.path(),
+                    slot_socket_name(candidate),
+                    sender,
+                )
+                .unwrap(),
+            );
+            receivers.push(receiver);
+        }
+        let identity_path = runtime
+            .path()
+            .join(format!("{ACTIVATION_SOCKET_FILE}.{slot}.device"));
+        let other_path = runtime
+            .path()
+            .join(format!("{ACTIVATION_SOCKET_FILE}.{other}.device"));
+        let mut other_identity = owned_lock(&other_path, libc::LOCK_EX).unwrap();
+        other_identity.0.write_all(b"other-host").unwrap();
+        drop(other_identity);
+        let preferred = [crate::device::scoped_window_slot(device, "missing")];
+        // Missing metadata never creates an identity or activates a local/foreign peer.
+        assert!(
+            !activate_existing_device_window_in(runtime.path(), Some(device), &preferred).unwrap()
+        );
+        assert!(!identity_path.exists());
+        assert!(
+            receivers
+                .iter()
+                .all(|receiver| receiver.try_recv().is_err())
+        );
+
+        let mut identity = owned_lock(&identity_path, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        identity.0.write_all(device.as_bytes()).unwrap();
+        let original = fs::metadata(&identity_path).unwrap();
+        assert!(
+            !activate_existing_device_window_in(runtime.path(), Some(device), &preferred).unwrap(),
+            "busy identity must not block or fall back across devices"
+        );
+        assert!(
+            receivers
+                .iter()
+                .all(|receiver| receiver.try_recv().is_err())
+        );
+        drop(identity);
+        assert!(
+            activate_existing_device_window_in(runtime.path(), Some(device), &preferred).unwrap()
+        );
+        let event = receivers[2].recv_blocking().unwrap();
+        assert!(event.session.is_none() && event.update.is_none());
+        assert!(
+            receivers[..2]
+                .iter()
+                .all(|receiver| receiver.try_recv().is_err())
+        );
+        let after = fs::metadata(&identity_path).unwrap();
+        assert_eq!(
+            (original.ino(), original.mode(), original.len()),
+            (after.ino(), after.mode(), after.len())
+        );
+        assert_eq!(fs::read(&identity_path).unwrap(), device.as_bytes());
+        fs::remove_file(&identity_path).unwrap();
+        std::os::unix::fs::symlink(&other_path, &identity_path).unwrap();
+        assert!(
+            !activate_existing_device_window_in(runtime.path(), Some(device), &preferred).unwrap()
+        );
+        assert!(
+            receivers
+                .iter()
+                .all(|receiver| receiver.try_recv().is_err())
+        );
+        assert_eq!(fs::read(&other_path).unwrap(), b"other-host");
+        // All leases/listeners remain owned by this private fixture until normal drop.
+        assert_eq!(locks.len(), 3);
+        assert_eq!(listeners.len(), 3);
     }
 
     #[cfg(feature = "ui")]

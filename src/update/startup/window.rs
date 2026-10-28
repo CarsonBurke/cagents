@@ -52,6 +52,22 @@ impl Request {
         }
         Ok(())
     }
+    pub fn prepare_context(&self) -> Result<(), &'static str> {
+        self.validate()?;
+        crate::device::select(self.device.as_deref())
+            .map_err(|_| "The original device profile is no longer available.")
+    }
+    /// Retry the same public request through ordinary startup and readiness.
+    /// Callers keep their recovery screen until this returns successfully.
+    pub fn open(&self) -> Result<(), &'static str> {
+        self.validate()?;
+        let requested = self.device.as_deref().filter(|name| *name != "local");
+        let selected = crate::device::selected().map(|device| device.name.as_str());
+        if requested != selected {
+            return Err("The original device profile is no longer available.");
+        }
+        reopen(self)
+    }
     fn arguments(&self) -> Vec<String> {
         let mut args = Vec::new();
         if let Some(device) = &self.device {
@@ -71,18 +87,43 @@ impl Request {
         }
         args
     }
-    fn focus(&self) -> Result<bool, &'static str> {
-        let slot = if self.scoped {
-            self.slot.clone()
+    fn normalized_slot(&self, slot: Option<&str>) -> Result<Option<String>, &'static str> {
+        if self.scoped && slot.is_some() {
+            Ok(slot.map(str::to_owned))
         } else {
-            crate::device::window_slot(self.slot.as_deref())
-                .map_err(|_| "The requested window could not be identified.")?
-        };
-        match slot {
-            Some(slot) => instance::activate_window(&slot),
-            None => instance::activate_running_ui(),
+            crate::device::window_slot(slot)
+                .map_err(|_| "The requested window could not be identified.")
         }
-        .map_err(|_| "The existing window did not answer. Progress will keep updating here.")
+    }
+    fn focus(&self) -> Result<bool, &'static str> {
+        self.focus_exact_with(instance::activate_window)
+    }
+    fn focus_exact_with(
+        &self,
+        activate: impl FnOnce(&str) -> std::io::Result<bool>,
+    ) -> Result<bool, &'static str> {
+        let slot = self.normalized_slot(self.slot.as_deref())?;
+        activate(slot.as_deref().unwrap_or(instance::PRIMARY_WINDOW))
+            .map_err(|_| "The existing window did not answer. Progress will keep updating here.")
+    }
+    fn focus_existing(&self) -> Result<bool, &'static str> {
+        let mut preferred = Vec::new();
+        for slot in self
+            .slot
+            .iter()
+            .chain(self.source.iter())
+            .map(|slot| Some(slot.as_str()))
+            .chain([None])
+        {
+            let slot = self
+                .normalized_slot(slot)?
+                .unwrap_or_else(|| instance::PRIMARY_WINDOW.into());
+            if !preferred.contains(&slot) {
+                preferred.push(slot);
+            }
+        }
+        instance::activate_existing_device_window(&preferred)
+            .map_err(|_| "The existing window did not answer. Progress will keep updating here.")
     }
 }
 
@@ -106,6 +147,7 @@ struct Window {
     follow: Follow,
     polling: bool,
     working: bool,
+    opening: bool,
     details: bool,
     notice: Option<String>,
     context_ready: bool,
@@ -128,10 +170,11 @@ impl Window {
             return cosmic::app::Task::none();
         }
         self.working = true;
+        self.opening = true;
         self.follow.mark_opened();
         let request = self.request.clone();
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || reopen(&request))
+            let result = tokio::task::spawn_blocking(move || request.open())
                 .await
                 .unwrap_or(Err("cagents could not be opened. You can try again."));
             Message::Opened(result)
@@ -147,7 +190,7 @@ impl cosmic::Application for Window {
         core: Core,
         (request, context_ready): (Request, bool),
     ) -> (Self, cosmic::app::Task<Message>) {
-        let mut window = Self { core, request, snapshot: Snapshot::unavailable(), follow: Follow::default(), polling: false, working: false, details: false, notice: (!context_ready).then(|| "The original device profile is no longer available. Close this screen and choose the device again in cagents.".into()), context_ready };
+        let mut window = Self { core, request, snapshot: Snapshot::unavailable(), follow: Follow::default(), polling: false, working: false, opening: false, details: false, notice: (!context_ready).then(|| "The original device profile is no longer available. Close this screen and choose the device again in cagents.".into()), context_ready };
         let task = window.poll();
         (window, task)
     }
@@ -182,6 +225,7 @@ impl cosmic::Application for Window {
             Message::Opened(Ok(())) => iced::exit().map(cosmic::Action::App),
             Message::Opened(Err(error)) => {
                 self.working = false;
+                self.opening = false;
                 self.notice = Some(error.into());
                 cosmic::app::Task::none()
             }
@@ -190,7 +234,7 @@ impl cosmic::Application for Window {
                 let request = self.request.clone();
                 cosmic::task::future(async move {
                     Message::Focused(
-                        tokio::task::spawn_blocking(move || request.focus())
+                        tokio::task::spawn_blocking(move || request.focus_existing())
                             .await
                             .unwrap_or(Err("The existing window could not be reached.")),
                     )
@@ -226,7 +270,15 @@ impl cosmic::Application for Window {
     }
     fn view(&self) -> cosmic::Element<'_, Message> {
         let wrap = iced::widget::text::Wrapping::WordOrGlyph;
-        let mut body = vec![design::title(self.snapshot.heading()).wrapping(wrap).into()];
+        let mut body = vec![
+            design::title(if self.opening {
+                "Opening your workspace"
+            } else {
+                self.snapshot.heading()
+            })
+            .wrapping(wrap)
+            .into(),
+        ];
         if let Some(version) = self.snapshot.target() {
             body.push(
                 design::heading(format!("Target version {version}"))
@@ -235,7 +287,11 @@ impl cosmic::Application for Window {
             );
         }
         body.push(
-            design::body(self.snapshot.explanation())
+            design::body(if self.opening {
+                "Waiting for the requested workspace to finish its startup check. Saved sessions use the normal recovery flow. This screen stays open until the workspace acknowledges startup.".into()
+            } else {
+                self.snapshot.explanation()
+            })
                 .wrapping(wrap)
                 .into(),
         );
@@ -340,19 +396,20 @@ fn reopen(request: &Request) -> Result<(), &'static str> {
     // Fresh status is still not admission: normal startup reacquires every
     // original fence. Never start an updater or installer from here; the
     // ordinary UI entry point owns daemon readiness.
-    if !super::observe().can_open() {
-        return Err("The installation is still locked. Progress will keep updating here.");
+    if let Some(reason) = super::observe().opening_refusal() {
+        return Err(reason);
     }
-    if !request.new_window && request.focus().unwrap_or(false) {
+    if !request.new_window && request.focus()? {
         return Ok(());
     }
     let executable = crate::update::superseding_ui()
         .or_else(|| std::env::current_exe().ok())
         .ok_or("The cagents executable could not be found.")?;
-    reopen_command(&executable, request)
-        .spawn()
-        .map(|_| ())
-        .map_err(|_| "cagents could not be started. Check diagnostics or try again.")
+    wait_for_reopen(&mut reopen_command(&executable, request))
+}
+fn wait_for_reopen(command: &mut Command) -> Result<(), &'static str> {
+    crate::control::spawn_ui_process(command)
+        .map_err(|_| "cagents did not confirm startup. Check diagnostics or try again; your requested window is still selected.")
 }
 fn reopen_command(executable: &std::path::Path, request: &Request) -> Command {
     let mut command = Command::new(executable);
@@ -360,6 +417,7 @@ fn reopen_command(executable: &std::path::Path, request: &Request) -> Command {
         .args(request.arguments())
         .env_remove(instance::UI_LAUNCH_HANDSHAKE_ENV)
         .env_remove(instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV)
+        .env(super::FAILURE_SCREEN_OWNED_ENV, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -369,7 +427,7 @@ fn reopen_command(executable: &std::path::Path, request: &Request) -> Command {
 
 pub fn run(request: Request) -> Result<(), Box<dyn std::error::Error>> {
     request.validate()?;
-    let context_ready = crate::device::select(request.device.as_deref()).is_ok();
+    let context_ready = request.prepare_context().is_ok();
     type Shell = Cosmic<Window>;
     use cosmic::Application;
     cosmic::icon_theme::set_default(cosmic::config::icon_theme());
