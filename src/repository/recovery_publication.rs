@@ -43,7 +43,7 @@ struct Holding {
     private_metadata: fs::Metadata,
     target: Option<(WorktreeAuthority, RepoPath)>,
     // Armed only after authenticated, read-only blob handoff, and disarmed
-    // before acquiring any destination. Never inferred from directory names.
+    // immediately after acquiring a destination. Never inferred from names.
     recoverable: Option<Proof>,
     context: FilesystemRecoveryContext,
     // Native owners above close before their creation/private charge releases.
@@ -781,9 +781,39 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
         context: &FilesystemRecoveryContext,
     ) -> Result<Option<String>, String> {
+        self.undo_saved_entry_observing(
+            recovery,
+            source,
+            entry,
+            parent,
+            name,
+            cancellation,
+            context,
+            |_| {},
+        )
+    }
+
+    fn undo_saved_entry_observing(
+        &self,
+        recovery: &DiscardRecovery,
+        source: &WorktreeAuthority,
+        entry: &DiscardRecoveryEntry,
+        parent: &fs_safety::Root,
+        name: &OsStr,
+        cancellation: &CancellationToken,
+        context: &FilesystemRecoveryContext,
+        before_acquisition: impl FnOnce(&Holding),
+    ) -> Result<Option<String>, String> {
         let mut holding = Holding::create(parent, recovery, cancellation, context)?;
-        let result =
-            self.publish_saved_entry(source, &mut holding, recovery, entry, name, cancellation);
+        let result = self.publish_saved_entry(
+            source,
+            &mut holding,
+            recovery,
+            entry,
+            name,
+            cancellation,
+            before_acquisition,
+        );
         if !holding.publication.is_removed()
             || result.as_ref().is_ok_and(|warning| warning.is_some())
         {
@@ -800,6 +830,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         entry: &DiscardRecoveryEntry,
         name: &OsStr,
         cancellation: &CancellationToken,
+        before_acquisition: impl FnOnce(&Holding),
     ) -> Result<Option<String>, String> {
         holding.target = Some((source.clone(), entry.path.clone()));
         holding.verify_target(name)?;
@@ -898,9 +929,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             if current.is_some() {
                 holding.validate()?;
                 holding.verify_target(name)?;
-                // Conservatively exclude every acquired-destination path,
-                // including a later successful rollback. Never strand previous.
-                holding.recoverable = None;
+                before_acquisition(holding);
                 fs_safety::rename_new_between(
                     &holding.parent,
                     name,
@@ -908,6 +937,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     previous.as_os_str(),
                 )
                 .map_err(|error| error.to_string())?;
+                // Exclude every successfully acquired destination, including a
+                // later successful rollback. Failed acquisition keeps the
+                // authenticated original recoverable without stranding previous.
+                holding.recoverable = None;
                 moved = true;
                 let proof = Proof::capture(holding, previous, cancellation)?;
                 acquired = Some(proof);
@@ -1108,6 +1141,168 @@ mod tests {
         holding.retain(&recovery);
         let original = recovery.live_recovery.originals().pop().unwrap();
         (directory, recovery, original)
+    }
+
+    #[test]
+    fn tracked_undo_failed_acquisition_retains_exact_original_for_recovery() {
+        if crate::repository::test_fixture::isolated_fixture_case(concat!(
+            module_path!(),
+            "::tracked_undo_failed_acquisition_retains_exact_original_for_recovery"
+        )) {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let git = |arguments: &[&str]| {
+            let command = CommandSpec::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(arguments.iter().copied())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1");
+            let output = SystemProcessExecutor
+                .execute(&command, &CancellationToken::new())
+                .unwrap();
+            assert!(output.success, "Git fixture failed: {:?}", output.stderr);
+        };
+        git(&["init", "-q", "-b", "main"]);
+        let destination = root.join("file");
+        let preserved = root.join("preserved-baseline");
+        fs::write(&destination, b"indexed baseline\n").unwrap();
+        git(&["add", "--", "file"]);
+        fs::write(&destination, b"precious tracked original\n").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o640)).unwrap();
+        let source = WorktreeAuthority::capture(root).unwrap();
+        let service = RepositoryService::system("git")
+            .with_worktree_authority(source)
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let discarded = service
+            .discard_recoverable(
+                &DiscardRequest {
+                    worktree: root.to_owned(),
+                    tracked: vec![PathSelection::new(RepoPath::parse("file").unwrap())],
+                    untracked: vec![],
+                    confirmed: true,
+                },
+                &cancellation,
+                &[root.to_owned()],
+            )
+            .unwrap();
+        assert!(matches!(discarded.outcome, MutationOutcome::Applied { .. }));
+        let recovery = &discarded.recovery;
+        assert_eq!(recovery.entries.len(), 1);
+        let entry = &recovery.entries[0];
+        assert!(matches!(entry.before, SavedEntry::Blob { .. }));
+        assert!(matches!(entry.after, SavedEntry::Blob { .. }));
+        let baseline = fs::metadata(&destination).unwrap();
+        assert_eq!(entry.after_version, Some(metadata_version(&baseline)));
+        assert_eq!(fs::read(&destination).unwrap(), b"indexed baseline\n");
+        // Use the authentic receipt returned after actual Git restore and
+        // authenticate_restore_entries, including its original source/context.
+        let custody = recovery.custody.as_ref().unwrap();
+        let original_service = RepositoryService::new(
+            custody.git.clone(),
+            Arc::new(OriginalRecoveryExecutor(custody.executor.clone())),
+        )
+        .with_worktree_authority(custody.source.clone())
+        .unwrap();
+        let parent = custody.source.retained_worktree_root();
+        let mut before = None;
+        let reason = original_service
+            .undo_saved_entry_observing(
+                recovery,
+                &custody.source,
+                entry,
+                &parent,
+                OsStr::new("file"),
+                &cancellation,
+                &custody.context,
+                |holding| {
+                    let proof = holding.recoverable.as_ref().unwrap();
+                    proof
+                        .verify(holding, Path::new("restored-blob"), &cancellation)
+                        .unwrap();
+                    before = Some((
+                        full_version(&proof.metadata),
+                        proof.digest,
+                        proof.access.clone(),
+                        holding.root().path().to_owned(),
+                    ));
+                    assert_eq!(
+                        Some(metadata_version(&fs::metadata(&destination).unwrap())),
+                        entry.after_version
+                    );
+                    assert!(!holding.root().path().join("previous").exists());
+                    // The version and original parent checks already passed.
+                    // An editor preserves that baseline before acquisition.
+                    fs::rename(&destination, &preserved).unwrap();
+                },
+            )
+            .unwrap_err();
+        assert!(reason.contains("No such file or directory"), "{reason}");
+        let (original_version, digest, access, private) = before.unwrap();
+        assert!(!destination.exists());
+        assert!(!private.join("previous").exists());
+        assert!(!recovery.live_recovery.is_uncertain());
+        assert_eq!(recovery.remaining_paths(), 1);
+        assert!(recovery.live_recovery.needs_resolution());
+        let choices = recovery.live_recovery.recoverable_originals();
+        assert_eq!(choices.len(), 1);
+        let choice = &choices[0];
+        assert_eq!(choice.original_path, destination);
+        assert_eq!(choice.retained_path, private.join("restored-blob"));
+        assert_eq!(choice.sha256, digest.unwrap());
+        let payload = fs::metadata(&choice.retained_path).unwrap();
+        assert_eq!(full_version(&payload), original_version);
+        assert_eq!(
+            fs::read(&choice.retained_path).unwrap(),
+            b"precious tracked original\n"
+        );
+        {
+            let original = recovery.live_recovery.originals().pop().unwrap();
+            let pending = original.cell.lock().unwrap();
+            let pending = pending.as_ref().unwrap();
+            let proof = pending.proof.as_ref().unwrap();
+            assert_eq!(full_version(&proof.metadata), original_version);
+            assert_eq!(proof.digest, digest);
+            assert_eq!(proof.access, access);
+            proof
+                .verify(&pending.holding, Path::new("restored-blob"), &cancellation)
+                .unwrap();
+        }
+        assert!(
+            service
+                .resolve_discard_recovery(recovery, &cancellation)
+                .is_err(),
+            "Resolve cannot consume the unpublished precious original"
+        );
+        assert_eq!(
+            full_version(&fs::metadata(&choice.retained_path).unwrap()),
+            original_version
+        );
+        assert_eq!(recovery.live_recovery.recoverable_originals().len(), 1);
+        let resolved = service
+            .recover_original_file(recovery, choice.nonce, &cancellation)
+            .unwrap();
+        assert_eq!(resolved.remaining_paths, 0);
+        assert_eq!(recovery.remaining_paths(), 0);
+        assert!(!recovery.live_recovery.needs_resolution());
+        assert!(recovery.live_recovery.authority().unwrap().is_resolved());
+        let recovered = fs::metadata(&destination).unwrap();
+        assert_eq!(
+            (recovered.dev(), recovered.ino()),
+            (payload.dev(), payload.ino())
+        );
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"precious tracked original\n"
+        );
+        let saved = fs::metadata(&preserved).unwrap();
+        assert_eq!((saved.dev(), saved.ino()), (baseline.dev(), baseline.ino()));
+        assert_eq!(fs::read(&preserved).unwrap(), b"indexed baseline\n");
+        assert!(!private.exists());
     }
 
     #[test]
