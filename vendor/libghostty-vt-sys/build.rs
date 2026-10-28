@@ -362,21 +362,14 @@ fn fetch_ghostty(out_dir: &Path) -> PathBuf {
     }
 
     eprintln!("Fetching ghostty {GHOSTTY_COMMIT} with tracked prefix fix ...");
-    let mut clone = Command::new("git");
-    clone
-        .arg("clone")
-        .arg("--filter=blob:none")
-        .arg("--no-checkout")
-        .arg(GHOSTTY_REPO)
-        .arg(&src_dir);
-    run(clone, "git clone ghostty");
-
-    let mut checkout = Command::new("git");
-    checkout
-        .arg("checkout")
-        .arg(GHOSTTY_COMMIT)
-        .current_dir(&src_dir);
-    run(checkout, "git checkout ghostty commit");
+    run(
+        ghostty_clone_command(GHOSTTY_REPO, &src_dir),
+        "git clone ghostty",
+    );
+    run(
+        ghostty_checkout_command(&src_dir, GHOSTTY_COMMIT),
+        "git checkout ghostty commit",
+    );
     run(
         ghostty_patch_command(&src_dir, false, true),
         "check tracked Ghostty patch",
@@ -390,17 +383,52 @@ fn fetch_ghostty(out_dir: &Path) -> PathBuf {
     src_dir
 }
 
+/// Select only the requested source repository, never the caller's Git context.
+/// Preserve transport, credential and provider/session environment unchanged.
+fn ghostty_git_command() -> Command {
+    let mut command = Command::new("git");
+    for name in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+
+fn ghostty_clone_command(repository: impl AsRef<std::ffi::OsStr>, source: &Path) -> Command {
+    let mut command = ghostty_git_command();
+    command
+        .args(["clone", "--filter=blob:none", "--no-checkout"])
+        .arg(repository)
+        .arg(source);
+    command
+}
+
+fn ghostty_checkout_command(source: &Path, revision: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = ghostty_git_command();
+    command.arg("checkout").arg(revision).current_dir(source);
+    command
+}
+
 fn ghostty_patch_command(source: &Path, reverse: bool, check: bool) -> Command {
-    let source = source.canonicalize().expect("resolve Ghostty source");
     let patch = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("crate directory"))
         .join("patches/ghostty-prefix-continuation.patch");
-    let mut command = Command::new("git");
+    ghostty_patch_command_at(source, &patch, reverse, check)
+}
+
+fn ghostty_patch_command_at(source: &Path, patch: &Path, reverse: bool, check: bool) -> Command {
+    let source = source.canonicalize().expect("resolve Ghostty source");
+    let mut command = ghostty_git_command();
     command
         .arg("apply")
         .arg("--no-index")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
         .env("GIT_CEILING_DIRECTORIES", &source)
         .current_dir(source);
     if reverse {
@@ -456,3 +484,7 @@ fn zig_target(target: &str) -> String {
     };
     value.to_owned()
 }
+
+#[cfg(test)]
+#[path = "tests/build_git_environment.rs"]
+mod build_git_environment;
