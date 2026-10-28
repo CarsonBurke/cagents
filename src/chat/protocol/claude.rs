@@ -420,6 +420,9 @@ struct Claude {
     /// assistant frame before that block stops, so a message's blocks are
     /// dropped at its `message_stop`, or when its stream starts another message.
     blocks: HashMap<(ScopedId, u64), Item>,
+    /// Unknown block types still own their stream index. Their later deltas
+    /// must not mutate an older block or look like an orphan known block.
+    ignored_blocks: HashSet<(ScopedId, u64)>,
     stream_events: VecDeque<String>,
     carrier_offsets: HashMap<String, usize>,
     message_offsets: HashMap<ScopedId, usize>,
@@ -2298,6 +2301,7 @@ impl Adapter for Claude {
                 self.retired.clear();
                 self.streams.clear();
                 self.blocks.clear();
+                self.ignored_blocks.clear();
                 self.carrier_offsets.clear();
                 self.message_offsets.clear();
                 self.message_order.clear();
@@ -4078,7 +4082,10 @@ impl Claude {
                     .ok_or("Claude block arrived before message_start")?;
                 let message = stream.message.clone();
                 let index = event["index"].as_u64().ok_or("Claude block has no index")?;
-                if self.blocks.len() >= MAX_TOOLS {
+                let key = (ScopedId::new(Some(&parent), &message), index);
+                self.blocks.remove(&key);
+                self.ignored_blocks.remove(&key);
+                if self.blocks.len() + self.ignored_blocks.len() >= MAX_TOOLS {
                     if !stream.truncated {
                         stream.truncated = true;
                         step.events.push(Event::Error {
@@ -4121,6 +4128,7 @@ impl Claude {
                         at: None,
                     },
                     other => {
+                        self.ignored_blocks.insert(key);
                         self.warn_unknown("stream content", other);
                         return Ok(());
                     }
@@ -4140,6 +4148,12 @@ impl Claude {
                     .ok_or("Claude delta arrived before message_start")?;
                 let index = event["index"].as_u64().ok_or("Claude delta has no index")?;
                 let delta = &event["delta"];
+                if self
+                    .ignored_blocks
+                    .contains(&(ScopedId::new(Some(&parent), &stream.message), index))
+                {
+                    return Ok(());
+                }
                 if matches!(string(delta, "type"), "signature_delta" | "citations_delta") {
                     return Ok(());
                 }
@@ -4213,6 +4227,12 @@ impl Claude {
                 let index = event["index"]
                     .as_u64()
                     .ok_or("Claude block stop has no index")?;
+                if self
+                    .ignored_blocks
+                    .remove(&(ScopedId::new(Some(&parent), &message), index))
+                {
+                    return Ok(());
+                }
                 if let Some(mut item) = self
                     .blocks
                     .get(&(ScopedId::new(Some(&parent), &message), index))
@@ -4292,6 +4312,7 @@ impl Claude {
     fn settle(&mut self, parent: Option<&str>, message: &str) {
         let key = ScopedId::new(parent, message);
         self.blocks.retain(|(id, _), _| id != &key);
+        self.ignored_blocks.retain(|(id, _)| id != &key);
     }
 
     fn permission_denied(
@@ -5674,6 +5695,96 @@ mod tests {
         assert!(adapter.unknown_frames.iter().all(|key| {
             key.len() <= "frame:".len() + 128 && !key.chars().any(char::is_control)
         }));
+    }
+
+    #[test]
+    fn unknown_stream_blocks_own_scoped_indices_until_stop_or_settlement() {
+        fn event(adapter: &mut Claude, parent: &str, event: Value) -> Result<Step, String> {
+            adapter
+                .receive(json!({"type":"stream_event","parent_tool_use_id":parent,"event":event}))
+        }
+        let mut adapter = Claude::default();
+        for parent in ["", "child"] {
+            event(
+                &mut adapter,
+                parent,
+                json!({"type":"message_start","message":{"id":"m"}}),
+            )
+            .unwrap();
+        }
+        event(&mut adapter, "", json!({"type":"content_block_start","index":1,"content_block":{"type":"future_content"}})).unwrap();
+        for delta in [
+            json!({"type":"text_delta","text":"omitted text"}),
+            json!({"type":"thinking_delta","thinking":"omitted thinking"}),
+            json!({"type":"input_json_delta","partial_json":"{}"}),
+        ] {
+            assert!(
+                event(
+                    &mut adapter,
+                    "",
+                    json!({"type":"content_block_delta","index":1,"delta":delta})
+                )
+                .unwrap()
+                .events
+                .is_empty()
+            );
+        }
+        assert!(event(&mut adapter, "child", json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"unowned child index"}})).is_err());
+        event(&mut adapter, "", json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"old"}})).unwrap();
+        event(&mut adapter, "", json!({"type":"content_block_start","index":0,"content_block":{"type":"future_content"}})).unwrap();
+        assert!(event(&mut adapter, "", json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"must not append to old"}})).unwrap().events.is_empty());
+        assert!(!adapter.blocks.contains_key(&(ScopedId::new(None, "m"), 0)));
+        event(&mut adapter, "", json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"fresh"}})).unwrap();
+        let delta = event(&mut adapter, "", json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" answer"}})).unwrap();
+        assert!(
+            delta
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TextDelta { delta, .. } if delta == " answer"))
+        );
+        event(
+            &mut adapter,
+            "",
+            json!({"type":"content_block_stop","index":1}),
+        )
+        .unwrap();
+        assert!(adapter.ignored_blocks.is_empty());
+        assert!(event(&mut adapter, "", json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"after stop"}})).is_err());
+        event(&mut adapter, "", json!({"type":"content_block_start","index":2,"content_block":{"type":"future_content"}})).unwrap();
+        event(
+            &mut adapter,
+            "",
+            json!({"type":"message_start","message":{"id":"successor"}}),
+        )
+        .unwrap();
+        assert!(
+            adapter.ignored_blocks.is_empty(),
+            "a new message settles the abandoned stream"
+        );
+        assert!(adapter.blocks.is_empty());
+    }
+
+    #[test]
+    fn unknown_stream_blocks_share_the_existing_block_budget_and_clear_on_reset() {
+        let mut adapter = Claude::default();
+        adapter.receive(json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"m"}}})).unwrap();
+        for index in 0..MAX_TOOLS {
+            adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_start","index":index,"content_block":{"type":"future_content"}}})).unwrap();
+        }
+        assert_eq!(adapter.ignored_blocks.len(), MAX_TOOLS);
+        // Replacement at a full budget releases only that exact index.
+        adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"known"}}})).unwrap();
+        assert_eq!(adapter.blocks.len(), 1);
+        assert_eq!(adapter.ignored_blocks.len(), MAX_TOOLS - 1);
+        adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_start","index":MAX_TOOLS,"content_block":{"type":"future_content"}}})).unwrap();
+        assert_eq!(
+            adapter.blocks.len() + adapter.ignored_blocks.len(),
+            MAX_TOOLS
+        );
+        adapter
+            .receive(json!({"type":"conversation_reset"}))
+            .unwrap();
+        assert!(adapter.blocks.is_empty() && adapter.ignored_blocks.is_empty());
     }
 
     #[test]

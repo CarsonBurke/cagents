@@ -55,7 +55,8 @@ for line in sys.stdin:
         event({"type": "content_block_start", "index": 1,
                "content_block": {"type": "future_content"}})
         event({"type": "content_block_delta", "index": 1,
-               "delta": {"type": "future_delta"}})
+               "delta": {"type": "text_delta", "text": "omitted future-block text"}})
+        event({"type": "content_block_stop", "index": 1})
         event({"type": "content_block_start", "index": 0,
                "content_block": {"type": "text", "text": ""}})
         event({"type": "content_block_delta", "index": 0, "delta": {
