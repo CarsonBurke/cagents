@@ -979,6 +979,12 @@ fn original_old_boot_visual_restores_named_account_history_then_starts_twice_ove
     // Exercise the ordinary account probe against an offline CLI, rather than
     // assigning a fabricated Ok status or changing inherited delegation.
     let runtime = tokio::runtime::Runtime::new().unwrap();
+    let search = runtime.block_on(crate::account::probe::search_path());
+    assert_eq!(
+        crate::account::probe::find_executable("claude", search.as_deref()),
+        Some(root.join("bin/claude")),
+        "account probe must execute only the private offline provider"
+    );
     let probed = runtime.block_on(crate::account::probe::run(account.clone(), None, true));
     let crate::account::probe::Outcome::Answered {
         identity, snapshot, ..
