@@ -1360,7 +1360,7 @@ fn shortcut_input<'a>(
     let chords = settings::parse_chords(value);
     let default = workspace_widget::shortcut_chords(action, &KeyboardShortcuts::default());
     let source = if value == default { "Default" } else { "User" };
-    let mut controls: Vec<Element<'a, Message>> = chords
+    let aliases: Vec<Element<'a, Message>> = chords
         .iter()
         .enumerate()
         .map(|(index, chord)| {
@@ -1374,6 +1374,7 @@ fn shortcut_input<'a>(
                 .into()
         })
         .collect();
+    let mut controls = Vec::with_capacity(2);
     controls.push(
         crate::ui_controls::icon_button(Icon::Keyboard, format!("Record shortcut for {label}"))
             .compact()
@@ -1427,18 +1428,37 @@ fn shortcut_input<'a>(
         }
     }
     let row = widget::row::with_children(vec![
-        // Reserve the source and Terminal policy columns first. Within
-        // the remaining space, keep key controls at their natural width and
-        // let the label wrap instead of shrinking Record/Reset to zero.
+        // Reserve the source and Terminal policy columns first, then share
+        // the remaining width between the label and bounded key controls.
         widget::row::with_children(vec![
             design::body(format!("{label}{required}"))
-                .width(Length::Fill)
+                .width(Length::FillPortion(3))
                 .into(),
-            widget::row::with_children(controls)
-                .spacing(2)
-                .align_y(Alignment::Center)
-                .width(Length::Shrink)
-                .into(),
+            widget::row::with_children(vec![
+                // Reserve the actions before allocating the remaining key
+                // area to scrollable aliases. The label keeps its own share.
+                crate::interaction::horizontal_wheel(
+                    iced::widget::scrollable(
+                        widget::row::with_children(aliases)
+                            .spacing(2)
+                            .align_y(Alignment::Center),
+                    )
+                    .direction(iced::widget::scrollable::Direction::Horizontal(
+                        design::scrollbar(),
+                    ))
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+                ),
+                widget::row::with_children(controls)
+                    .spacing(2)
+                    .align_y(Alignment::Center)
+                    .height(design::DENSE_ROW_HEIGHT)
+                    .into(),
+            ])
+            .spacing(2)
+            .align_y(Alignment::Center)
+            .width(Length::FillPortion(4))
+            .into(),
         ])
         .spacing(space::S)
         .align_y(Alignment::Center)
@@ -1642,6 +1662,7 @@ mod keyboard_table_tests {
         #[derive(Default)]
         struct Controls {
             buttons: Vec<Rectangle>,
+            aliases: Option<Rectangle>,
             advisory: Option<Rectangle>,
             source: Option<Rectangle>,
             terminal: Option<Rectangle>,
@@ -1657,6 +1678,16 @@ mod keyboard_table_tests {
                 _: &mut dyn Focusable,
             ) {
                 self.buttons.push(bounds);
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: Rectangle,
+                _: iced::Vector,
+                _: &mut dyn iced::advanced::widget::operation::Scrollable,
+            ) {
+                assert!(self.aliases.replace(bounds).is_none());
             }
             fn text(&mut self, _: Option<&widget::Id>, bounds: Rectangle, text: &str) {
                 match text {
@@ -1710,8 +1741,12 @@ mod keyboard_table_tests {
                 "{field:?}: {:?}",
                 controls.buttons
             );
+            let aliases = controls.aliases.expect("bounded alias strip");
+            assert!(aliases.width > 0.0 && aliases.height > 0.0);
+            assert!(aliases.x >= 0.0 && aliases.x + aliases.width <= 560.1);
+            let alias_count = settings::parse_chords(value).len();
             let center = controls.buttons[0].center_y();
-            for bounds in &controls.buttons {
+            for (index, bounds) in controls.buttons.iter().enumerate() {
                 assert!(
                     bounds.width > 0.0 && bounds.height > 0.0,
                     "{field:?} has an empty control: {:?}",
@@ -1722,15 +1757,25 @@ mod keyboard_table_tests {
                     "{field:?} controls wrapped: {:?}",
                     controls.buttons
                 );
-                assert!(bounds.x >= 0.0 && bounds.x + bounds.width <= 560.1);
+                // Alias content is allowed beyond its scroll viewport;
+                // pinned actions and policy controls must remain visible.
+                if index >= alias_count {
+                    assert!(bounds.x >= 0.0 && bounds.x + bounds.width <= 560.1);
+                }
             }
-            for adjacent in controls.buttons.windows(2) {
-                assert!(
-                    adjacent[0].x + adjacent[0].width <= adjacent[1].x + 0.1,
-                    "{field:?} controls overlap or reorder: {:?}",
-                    controls.buttons
-                );
+            for group in [
+                &controls.buttons[..alias_count],
+                &controls.buttons[alias_count..],
+            ] {
+                for adjacent in group.windows(2) {
+                    assert!(
+                        adjacent[0].x + adjacent[0].width <= adjacent[1].x + 0.1,
+                        "{field:?} controls overlap or reorder: {:?}",
+                        controls.buttons
+                    );
+                }
             }
+            assert!(aliases.x + aliases.width <= controls.buttons[alias_count].x + 0.1);
             if matches!(
                 field,
                 SettingsField::ShortcutMovePaneLeft
@@ -1799,6 +1844,175 @@ mod keyboard_table_tests {
             );
         }
         assert!(source.x + source.width <= terminal.x + 0.1);
+        for bounds in &controls.buttons[aliases.len()..aliases.len() + 2] {
+            assert!(bounds.width > 0.0 && bounds.height > 0.0, "{bounds:?}");
+            assert!(bounds.x >= 0.0 && bounds.x + bounds.width <= source.x + 0.1);
+        }
+    }
+
+    #[test]
+    fn long_alias_row_keeps_record_reset_and_scrolled_removal_reachable() {
+        use iced::{
+            Event, Point, Rectangle, Size, Vector,
+            advanced::{
+                clipboard, mouse,
+                widget::{
+                    Operation,
+                    operation::{Focusable, Scrollable},
+                },
+            },
+            runtime::{UserInterface, user_interface::Cache},
+        };
+        #[derive(Default)]
+        struct Geometry {
+            buttons: Vec<Rectangle>,
+            strip: Option<(Rectangle, Vector)>,
+            label: Option<Rectangle>,
+        }
+        impl Operation for Geometry {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                self.buttons.push(bounds);
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: Rectangle,
+                translation: Vector,
+                _: &mut dyn Scrollable,
+            ) {
+                assert!(self.strip.replace((bounds, translation)).is_none());
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: Rectangle, text: &str) {
+                if text.starts_with(SettingsField::ShortcutRenamePane.label()) {
+                    assert!(self.label.replace(bounds).is_none());
+                }
+            }
+        }
+        let aliases = (b'a'..=b'z')
+            .map(|key| format!("Ctrl+Alt+Shift+{}", char::from(key)))
+            .collect::<Vec<_>>();
+        let value = settings::format_chords(&aliases);
+        let draft = SettingsDraft::from_settings(&AppSettings::default());
+        let invalid = HashMap::new();
+        let field = SettingsField::ShortcutRenamePane;
+        let action = field.shortcut_action().unwrap();
+        let default = workspace_widget::shortcut_chords(action, &KeyboardShortcuts::default());
+        let row = shortcut_input(
+            field.label(),
+            &value,
+            field,
+            &draft.keyboard_shortcuts,
+            &invalid,
+        );
+        let element = settings_group("Keyboard", "", vec![row])
+            .compact()
+            .view("Keyboard", "")
+            .unwrap();
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut ui = UserInterface::build(
+            element,
+            Size::new(560.0, 300.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        let mut geometry = Geometry::default();
+        ui.operate(&renderer, &mut geometry);
+        let (strip, initial_translation) = geometry.strip.expect("bounded alias viewport");
+        let label = geometry.label.expect("actual visible action label");
+        assert!(label.width > 0.0 && label.height > 0.0);
+        assert!(label.x >= 0.0 && label.x + label.width <= strip.x + 0.1);
+        assert!(label.y >= 0.0 && label.y + label.height <= 300.1);
+        assert!(strip.width > 0.0 && strip.height > 0.0);
+        assert_eq!(initial_translation, Vector::ZERO);
+        let record = geometry.buttons[aliases.len()];
+        let reset = geometry.buttons[aliases.len() + 1];
+        for bounds in [record, reset] {
+            assert!(bounds.width > 0.0 && bounds.height > 0.0);
+            assert!(bounds.x >= strip.x + strip.width - 0.1);
+            assert!(bounds.x + bounds.width <= 560.1);
+        }
+        assert!(record.x + record.width <= reset.x + 0.1);
+        for (point, recording) in [(record.center(), true), (reset.center(), false)] {
+            let mut messages = Vec::new();
+            let _ = ui.update(
+                &[
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ],
+                mouse::Cursor::Available(point),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            if recording {
+                assert_eq!(messages.len(), 1);
+                assert!(matches!(
+                    &messages[0],
+                    Message::Palette(palette_ui::Action::Record(actual)) if *actual == field
+                ));
+            } else {
+                assert_eq!(messages.len(), 1);
+                assert!(matches!(
+                    &messages[0],
+                    Message::SettingsDraftChanged { field: actual, value }
+                        if *actual == field && value == &default
+                ));
+            }
+        }
+        // A real vertical wheel is translated into the horizontal alias
+        // strip, so the last chip can be removed without moving the actions.
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Pixels {
+                    x: 0.0,
+                    y: -100_000.0,
+                },
+            })],
+            mouse::Cursor::Available(strip.center()),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert!(messages.is_empty());
+        let mut scrolled = Geometry::default();
+        ui.operate(&renderer, &mut scrolled);
+        let (after_strip, translation) = scrolled.strip.unwrap();
+        assert_eq!(after_strip, strip);
+        assert!(translation.x > 0.0);
+        assert_eq!(scrolled.buttons[aliases.len()], record);
+        assert_eq!(scrolled.buttons[aliases.len() + 1], reset);
+        let last = scrolled.buttons[aliases.len() - 1];
+        let point: Point = last.center() - translation;
+        assert!(
+            strip.contains(point),
+            "the last alias must be actually visible"
+        );
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ],
+            mouse::Cursor::Available(point),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            &messages[0],
+            Message::SettingsDraftChanged { field: actual, value }
+                if *actual == field && settings::parse_chords(value).as_slice() == &aliases[..aliases.len() - 1]
+        ));
     }
 
     #[test]
