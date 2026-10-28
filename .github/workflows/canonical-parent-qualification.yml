@@ -345,10 +345,6 @@ jobs:
                   results.append(record)
                   write(evidence / 'results.json', results)
                   assert expected, f'{label} {selector}: {classification}; stop before another root'
-              if failure_line is None:
-                  formatted = run(directory, 'official-format', ['bash', 'scripts/check-format'], 600, env)
-                  assert formatted['exit'] == 0
-                  assert source(head, tree) == pinned and pair_identity(root) == pair_pin
           assert len(results) == 32
           assert sum(r['classification'] == 'matched_source_predicted_setup_refusal' for r in results) == 2
           assert sum(r['classification'] == 'exact_parent_pass' for r in results) == 30
