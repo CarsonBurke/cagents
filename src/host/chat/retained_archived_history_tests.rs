@@ -61,9 +61,13 @@ fn isolated() -> Option<std::path::PathBuf> {
         .output_limits(256 * 1024, 256 * 1024);
     let output = SystemProcessExecutor.execute(&command, &CancellationToken::new());
     let retained = root.keep();
+    let (stdout, stderr) = match &output {
+        Ok(output) => (&output.stdout, &output.stderr),
+        Err(error) => (&error.stdout, &error.stderr),
+    };
+    fs::write(retained.join("test.stdout"), stdout).unwrap();
+    fs::write(retained.join("test.stderr"), stderr).unwrap();
     let output = output.expect("bounded archived-history child must settle");
-    fs::write(retained.join("test.stdout"), &output.stdout).unwrap();
-    fs::write(retained.join("test.stderr"), &output.stderr).unwrap();
     assert!(
         output.success,
         "archived-history fixture {}:\n{}\n{}",
@@ -77,9 +81,16 @@ fn isolated() -> Option<std::path::PathBuf> {
 
 fn wait(mut predicate: impl FnMut() -> bool, reason: &str) {
     let deadline = Instant::now() + Duration::from_secs(20);
-    while !predicate() {
+    loop {
         assert!(Instant::now() < deadline, "{reason}");
-        thread::sleep(Duration::from_millis(10));
+        let ready = predicate();
+        assert!(Instant::now() < deadline, "{reason}");
+        if ready {
+            return;
+        }
+        thread::sleep(
+            Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
 }
 
