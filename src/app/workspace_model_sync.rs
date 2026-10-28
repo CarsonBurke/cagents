@@ -79,7 +79,7 @@ pub enum ModelUpdate {
     },
     Ranked {
         channel: ChannelId,
-        ordinal: u32,
+        model: WorkspaceModel,
     },
 }
 
@@ -369,8 +369,8 @@ fn send(
         && let Some(channel) = model.channel(id)
     {
         let _ = updates.send_blocking(ModelUpdate::Ranked {
-            channel: id,
-            ordinal: channel.ordinal,
+            channel: channel.id,
+            model: model.clone(),
         });
     }
     if reordered
@@ -710,37 +710,55 @@ impl Cagents {
                 });
                 Task::batch([removed, retired, self.reconcile_workspace_model()])
             }
-            ModelUpdate::Ranked { channel, ordinal } => {
-                let Some(index) = self
-                    .durable
-                    .channels
-                    .iter()
-                    .position(|local| local.id == channel)
+            ModelUpdate::Ranked { channel, model } => {
+                // The publisher and observer use separate connections. Keep the
+                // complete response: a rank alone cannot fence an older observer
+                // read, and a late create echo must not erase this rank proof.
+                if model.identity == NO_REGISTRY
+                    || model.identity != self.workspace_model.identity
+                    || model.sequence < self.shared_views.snapshot_sequence
+                    || self.channel_ui.is_deleting(channel)
+                    || self.channel_ui.was_deleted(channel)
+                    || !self
+                        .durable
+                        .channels
+                        .iter()
+                        .any(|local| local.id == channel)
+                {
+                    return Task::none();
+                }
+                let Some(receipt) = model
+                    .channel(channel)
+                    .filter(|entry| entry.ordinal != PENDING_ORDINAL)
+                    .cloned()
                 else {
                     return Task::none();
                 };
-                let local = &self.durable.channels[index];
-                if local.ordinal == ordinal && local.shared {
+                if model.sequence < self.workspace_model.sequence
+                    && self.workspace_model.channel(channel).is_none()
+                {
+                    // Newer folded metadata removed this identity. The older
+                    // publisher response cannot introduce it again.
                     return Task::none();
                 }
-                let local = &mut Arc::make_mut(&mut self.durable).channels[index];
-                local.ordinal = ordinal;
-                // The registry answered about this channel, so it holds it. From
-                // here its absence from a later model is a deletion rather than
-                // ignorance, which is the whole point of recording the fact.
-                local.shared = true;
-                if let Some(shared) = self
+                if !self.install_workspace_model_snapshot(model) {
+                    return Task::none();
+                }
+                if let Some(current) = self
                     .workspace_model
                     .channels
                     .iter_mut()
-                    .find(|shared| shared.id == channel)
+                    .find(|entry| entry.id == channel)
+                    && current.repository == receipt.repository
+                    && current.ordinal == PENDING_ORDINAL
                 {
-                    shared.ordinal = ordinal;
+                    // A newer unrelated echo can precede an older full reply.
+                    // Preserve that newer metadata while completing this exact
+                    // channel's still-pending rank from its canonical receipt.
+                    current.ordinal = receipt.ordinal;
                 }
-                self.sort_durable_channels();
-                self.refresh_sidebar_channels();
-                self.persist();
-                Task::none()
+                let closed = self.apply_closed_project_tombstones();
+                Task::batch([closed, self.reconcile_workspace_model()])
             }
         }
     }
@@ -1624,6 +1642,97 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_publisher_keeps_the_complete_canonical_rank_response() {
+        use crate::terminal::ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+            ServerResponse, read_frame, write_frame,
+        };
+        let id = ChannelId::new();
+        let repository = PathBuf::from("/repo/.git");
+        let mut model = registry(vec![shared(id, &repository, "Canonical title", 17)]);
+        model.sequence = 42;
+        model.projects.push(ModelProject {
+            repository: repository.clone(),
+            name: "repo".into(),
+            kind: ProjectKind::Git,
+            ordinal: 3,
+        });
+        let app = super::super::tests::context_inspector_test_app(true);
+        model.views.push(crate::workspace_model::views::View {
+            scope: crate::workspace_model::views::Scope::Channel(id),
+            revision: 9,
+            panes: vec![
+                crate::workspace_model::views::Pane::from_card(&app.durable.cards[0], None)
+                    .unwrap(),
+            ],
+            retired: Vec::new(),
+        });
+        let expected = model.clone();
+        let edit = ModelEdit::CreateChannel {
+            id,
+            repository,
+            title: "Requested title".into(),
+            title_source: Default::default(),
+        };
+        let expected_edit = edit.clone();
+        let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let server = std::thread::spawn(move || {
+            let proof = crate::model::HostSessionProof {
+                host_session_id: "rank-response".into(),
+                boot_id: "rank-boot".into(),
+                host_incarnation: "rank-host".into(),
+            };
+            let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            write_frame(
+                &mut peer,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(hello.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof: proof.clone(),
+                            resumed: Vec::new(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+            let request: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            assert_eq!(
+                request.request,
+                ClientRequest::EditWorkspaceModel {
+                    edit: expected_edit
+                }
+            );
+            write_frame(
+                &mut peer,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request.request_id),
+                    proof,
+                    message: ServerMessage::Response {
+                        response: ServerResponse::WorkspaceModel { model },
+                    },
+                },
+            )
+            .unwrap();
+        });
+        let mut client = ControlClient::from_stream(stream).unwrap();
+        let (sender, updates) = async_channel::unbounded();
+        send(&mut client, edit, &sender).unwrap();
+        let ModelUpdate::Ranked { channel, model } = updates.try_recv().unwrap() else {
+            panic!("a successful create forwards its canonical receipt")
+        };
+        assert_eq!(channel, id);
+        assert_eq!(model, expected);
+        assert!(updates.try_recv().is_err());
+        drop(client);
+        server.join().unwrap();
+    }
 
     #[test]
     fn busy_title_publication_yields_after_three_original_attempts_to_the_next_edit() {
@@ -3247,6 +3356,36 @@ mod tests {
         }
     }
 
+    fn rank_receipt(app: &Cagents, id: ChannelId, ordinal: u32, sequence: u64) -> ModelUpdate {
+        let local = app
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .unwrap();
+        let repository = &app
+            .sidebar_model
+            .project(local.project_id)
+            .unwrap()
+            .repository;
+        let mut model = app.workspace_model.clone();
+        model.sequence = sequence;
+        // A server snapshot contains assigned project/channel ranks, not the
+        // pending placeholders a client folds from observer edges.
+        for project in &mut model.projects {
+            if project.ordinal == PENDING_ORDINAL {
+                project.ordinal = 1;
+            }
+        }
+        model
+            .channels
+            .retain(|channel| channel.id != id && channel.ordinal != PENDING_ORDINAL);
+        model
+            .channels
+            .push(shared(id, repository, &local.title, ordinal));
+        ModelUpdate::Ranked { channel: id, model }
+    }
+
     #[test]
     fn a_reconnecting_window_applies_a_missed_project_close() {
         let (mut app, project, repository) = app_with_project();
@@ -4109,6 +4248,7 @@ mod tests {
         second_saved.shared = true;
         let durable = Arc::make_mut(&mut app.durable);
         durable.channels = vec![first_saved, second_saved];
+        durable.active_channel = Some(second);
         durable.workspace_model_identity = Some(uuid::Uuid::new_v4());
         assert_eq!(app.workspace_model.identity, NO_REGISTRY);
         let published = intercept_publishes(&mut app);
@@ -4140,25 +4280,39 @@ mod tests {
         }));
         // The reply wins the race against the originating create's observer
         // echo, precisely the interleaving possible during startup republishing.
-        drop(app.apply_workspace_model_update(ModelUpdate::Ranked {
-            channel: first,
-            ordinal: 1,
-        }));
+        let first_reply = rank_receipt(&app, first, 1, 2);
+        let ModelUpdate::Ranked {
+            model: first_snapshot,
+            ..
+        } = first_reply.clone()
+        else {
+            unreachable!()
+        };
+        drop(app.apply_workspace_model_update(first_reply));
         assert_eq!(ranks(&app), [(second, 2), (first, 1)]);
         drop(app.apply_workspace_model_update(ModelUpdate::Edited {
             sequence: 2,
             edit: creates[0].1.clone(),
         }));
         assert_eq!(ranks(&app), [(second, 2), (first, 1)]);
-        drop(app.apply_workspace_model_update(ModelUpdate::Ranked {
-            channel: second,
-            ordinal: 2,
-        }));
+        drop(app.apply_workspace_model_update(rank_receipt(&app, second, 2, 4)));
         assert_eq!(
             ranks(&app),
             [(second, 2), (first, 1)],
             "a late echo cannot turn the first authoritative rank back into a newer provisional rank"
         );
+        // The observer took this A-only read before B's publisher committed,
+        // but delivered it after the B reply. It must not retire selected B.
+        drop(app.apply_workspace_model_update(ModelUpdate::Read(first_snapshot)));
+        assert_eq!(ranks(&app), [(second, 2), (first, 1)]);
+        assert_eq!(app.durable.active_channel, Some(second));
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .any(|channel| channel.id == second)
+        );
+        assert_eq!(app.shared_views.snapshot_sequence, 4);
         drop(app.apply_workspace_model_update(ModelUpdate::Edited {
             sequence: 4,
             edit: creates[1].1.clone(),
@@ -4173,6 +4327,179 @@ mod tests {
         drop(app.apply_workspace_model_update(ModelUpdate::Read(settled)));
         assert_eq!(ranks(&app), [(second, 2), (first, 1)]);
         assert!(app.durable.channels.iter().all(|channel| channel.shared));
+    }
+
+    #[test]
+    fn delayed_rank_receipts_preserve_newer_metadata_and_do_not_revive_deleted_channels() {
+        let (mut app, project, repository) = app_with_project();
+        let id = ChannelId::new();
+        app.workspace_model = registry(Vec::new());
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(local(id, project, "Original", 1));
+        let receipt = rank_receipt(&app, id, 7, 2);
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence: 2,
+            edit: ModelEdit::CreateChannel {
+                id,
+                repository: repository.clone(),
+                title: "Original".into(),
+                title_source: Default::default(),
+            },
+        }));
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence: 3,
+            edit: ModelEdit::RetitleChannel {
+                id,
+                title: "Newer user title".into(),
+            },
+        }));
+        assert_eq!(
+            app.workspace_model.channel(id).unwrap().ordinal,
+            PENDING_ORDINAL
+        );
+        drop(app.apply_workspace_model_update(receipt.clone()));
+        let canonical = app.workspace_model.channel(id).unwrap();
+        assert_eq!(canonical.ordinal, 7);
+        assert_eq!(canonical.title, "Newer user title");
+        assert_eq!(app.workspace_model.sequence, 3);
+        assert_eq!(app.shared_views.snapshot_sequence, 2);
+        let local = app
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .unwrap();
+        assert_eq!(local.ordinal, 7);
+        assert_eq!(local.title, "Newer user title");
+        assert!(local.shared);
+        // Ordinary remote pending channels still take a newer provisional rank.
+        let remote = ChannelId::new();
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence: 4,
+            edit: ModelEdit::CreateChannel {
+                id: remote,
+                repository,
+                title: "Still pending".into(),
+                title_source: Default::default(),
+            },
+        }));
+        let before_duplicate = app.durable.channels.clone();
+        drop(app.apply_workspace_model_update(receipt.clone()));
+        assert_eq!(app.durable.channels, before_duplicate);
+        assert_eq!(
+            app.workspace_model.channel(remote).unwrap().ordinal,
+            PENDING_ORDINAL
+        );
+        assert_eq!(
+            app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == remote)
+                .unwrap()
+                .ordinal,
+            8
+        );
+        let mut newer = app.workspace_model.clone();
+        newer.sequence = 5;
+        newer
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == id)
+            .unwrap()
+            .ordinal = 9;
+        newer
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == remote)
+            .unwrap()
+            .ordinal = 10;
+        drop(app.apply_workspace_model_update(ModelUpdate::Read(newer)));
+        drop(app.apply_workspace_model_update(receipt.clone()));
+        assert_eq!(app.workspace_model.channel(id).unwrap().ordinal, 9);
+        assert_eq!(
+            app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == id)
+                .unwrap()
+                .ordinal,
+            9
+        );
+        // A real newer delete goes through the application's retirement path.
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence: 6,
+            edit: ModelEdit::DeleteChannel { id },
+        }));
+        assert!(app.workspace_model.channel(id).is_none());
+        let durable = Arc::clone(&app.durable);
+        let model = app.workspace_model.clone();
+        drop(app.apply_workspace_model_update(receipt));
+        assert_eq!(app.durable, durable);
+        assert_eq!(app.workspace_model, model);
+        assert!(app.workspace_model.channel(id).is_none());
+    }
+
+    #[test]
+    fn rank_receipts_repair_duplicate_proof_and_reject_unknown_foreign_or_stale_sources() {
+        for invalid in [
+            "unknown",
+            "foreign",
+            "stale",
+            "pending",
+            "absent",
+            "newer-delete",
+        ] {
+            let (mut app, project, _) = app_with_project();
+            let id = ChannelId::new();
+            app.workspace_model = registry(Vec::new());
+            app.workspace_model.sequence = 10;
+            app.shared_views.snapshot_sequence = 5;
+            let mut local = local(id, project, "Retained", 7);
+            local.shared = true;
+            Arc::make_mut(&mut app.durable).channels.push(local);
+            let ModelUpdate::Ranked { mut model, .. } = rank_receipt(&app, id, 7, 10) else {
+                unreachable!()
+            };
+            match invalid {
+                "unknown" => model.identity = NO_REGISTRY,
+                "foreign" => model.identity = uuid::Uuid::new_v4(),
+                "stale" => model.sequence = 4,
+                "pending" => model.channels[0].ordinal = PENDING_ORDINAL,
+                "absent" => Arc::make_mut(&mut app.durable).channels.clear(),
+                "newer-delete" => model.sequence = 9,
+                _ => unreachable!(),
+            }
+            let durable = Arc::clone(&app.durable);
+            let current = app.workspace_model.clone();
+            let before_snapshot = app.shared_views.snapshot_sequence;
+            let published = intercept_publishes(&mut app);
+            drop(app.apply_workspace_model_update(ModelUpdate::Ranked { channel: id, model }));
+            assert_eq!(app.durable, durable, "{invalid}");
+            assert_eq!(app.workspace_model, current, "{invalid}");
+            assert_eq!(
+                app.shared_views.snapshot_sequence, before_snapshot,
+                "{invalid}"
+            );
+            assert!(drain(&published).is_empty(), "{invalid}");
+        }
+        // A duplicate real acknowledgement must repair a missing canonical
+        // cache even when local rank/shared already match. Only complete proof
+        // may advance this sequence and fence older observer snapshots.
+        let (mut app, project, _) = app_with_project();
+        let id = ChannelId::new();
+        app.workspace_model = registry(Vec::new());
+        app.workspace_model.sequence = 10;
+        let mut local = local(id, project, "Retained", 7);
+        local.shared = true;
+        Arc::make_mut(&mut app.durable).channels.push(local);
+        app.refresh_sidebar_channels();
+        assert!(app.workspace_model.channel(id).is_none());
+        drop(app.apply_workspace_model_update(rank_receipt(&app, id, 7, 10)));
+        assert_eq!(app.workspace_model.channel(id).unwrap().ordinal, 7);
+        assert_eq!(app.shared_views.snapshot_sequence, 10);
+        assert_eq!(app.durable.channels[0].ordinal, 7);
+        assert!(app.durable.channels[0].shared);
     }
 
     /// The rank the registry assigns replaces the provisional one a local
@@ -4322,10 +4649,7 @@ mod tests {
             );
             assert_ne!(app.next_provisional_ordinal(), PENDING_ORDINAL);
         }
-        drop(app.apply_workspace_model_update(ModelUpdate::Ranked {
-            channel: created[0],
-            ordinal: 600,
-        }));
+        drop(app.apply_workspace_model_update(rank_receipt(&app, created[0], 600, 100)));
         assert_eq!(
             &channel_rows(&app)[..6],
             created.iter().rev().copied().collect::<Vec<_>>()
@@ -4345,10 +4669,12 @@ mod tests {
             "a provisional UI rank never claims a registry assignment"
         );
         for (index, id) in created.iter().enumerate().skip(1) {
-            drop(app.apply_workspace_model_update(ModelUpdate::Ranked {
-                channel: *id,
-                ordinal: 600 + index as u32,
-            }));
+            drop(app.apply_workspace_model_update(rank_receipt(
+                &app,
+                *id,
+                600 + index as u32,
+                100 + index as u64,
+            )));
             assert_eq!(
                 &channel_rows(&app)[..6],
                 created.iter().rev().copied().collect::<Vec<_>>(),
@@ -4524,16 +4850,14 @@ mod tests {
     fn the_registry_rank_replaces_the_provisional_one_and_records_the_sharing() {
         let (mut app, project, _repository) = app_with_project();
         let id = ChannelId::new();
+        app.workspace_model = registry(Vec::new());
         let provisional = app.next_provisional_ordinal();
         Arc::make_mut(&mut app.durable)
             .channels
             .push(local(id, project, "", provisional));
         assert_ne!(provisional, 11);
 
-        let _ = app.apply_workspace_model_update(ModelUpdate::Ranked {
-            channel: id,
-            ordinal: 11,
-        });
+        let _ = app.apply_workspace_model_update(rank_receipt(&app, id, 11, 1));
 
         let ranked = app
             .durable
