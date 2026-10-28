@@ -715,7 +715,7 @@ mod tests {
                     id: id.clone(),
                 })),
                 &trace,
-                Some(Rc::new(HashMap::from([(id, owner)]))),
+                Some(Arc::new(HashMap::from([(id, owner)]))),
                 Some(callback),
             );
             let node = overlay
