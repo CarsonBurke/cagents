@@ -249,7 +249,10 @@ impl Fixture {
         .unwrap();
         handle.commit_native_installation().unwrap();
         context.installed();
-        source.native_continuity = handle.native_continuity();
+        let installed = Handle::inspect_remote(&identity.record, proof).unwrap();
+        assert!(installed.state.installed);
+        assert_eq!(installed.state.confirmed_session, source.launch.session_id);
+        source.native_continuity = installed.state.native_continuity;
         handle
             .update_native_source(source.clone(), None, None)
             .unwrap();
